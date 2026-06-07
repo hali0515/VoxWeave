@@ -72,6 +72,14 @@ PROPER NOUNS & RECURRING ENTITIES (highest-value fixes):
 - For recurring entities NOT in the glossary, infer the canonical form from the
   video's topic/domain and normalize all occurrences consistently; if you cannot
   identify it confidently, leave it unchanged rather than guess.
+- If the transcript is clearly from a SPECIFIC identifiable work (film, show,
+  book, game, franchise), you MAY use that work's established canonical spellings
+  for its characters, places, and INVENTED terminology to repair obviously
+  phonetic ASR garbles (e.g. a sci-fi coinage the ASR spelled by sound). Apply
+  this ONLY to a clear garble of a term you are confident belongs to that work,
+  and prefer the work's specific coined term over a generic common word when the
+  same garbled form recurs (e.g. a coined organism name, not "amoeba"). Never
+  rename a plausibly-correct word and never alter ordinary dialogue.
 
 OUTPUT: JSON only. Report ONLY cues you actually changed (the fixed text MUST
 differ from the original), so the edit is a reviewable diff:
