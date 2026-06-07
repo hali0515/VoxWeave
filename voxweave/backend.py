@@ -157,8 +157,12 @@ CTC_EMIT_WINDOW_S = float(os.environ.get("VOXWEAVE_CTC_WINDOW_S", "30"))
 CTC_EMIT_CONTEXT_S = float(os.environ.get("VOXWEAVE_CTC_CONTEXT_S", "2"))
 _CTC_STRIDE = 320  # wav2vec2 @16k downsamples 320x -> 50fps (20ms/frame)
 # Single global forced-align DP is O(T*L); cap audio length so it stays in memory. Movies past
-# this need DP-chunking at silence anchors (not yet wired). Default ~30min (50fps * 60 * 30).
-CTC_MAX_DP_FRAMES = int(os.environ.get("VOXWEAVE_CTC_MAX_DP_FRAMES", "90000"))
+# this are auto-split at silence anchors (plan_dp_chunks) when cue timestamps are available.
+# Sourced via config (env VOXWEAVE_CTC_MAX_DP_FRAMES > conf ctc_max_dp_frames > 90000≈30min).
+CTC_MAX_DP_FRAMES = config.conf_ctc_max_dp_frames()
+# Per-chunk DP budget as a fraction of CTC_MAX_DP_FRAMES: leaves headroom so an off-by-a-bit
+# silence anchor never pushes a chunk's O(T*L) trellis past the memory cap.
+CTC_DP_CHUNK_FRAC = float(os.environ.get("VOXWEAVE_CTC_DP_CHUNK_FRAC", "0.8"))
 
 _MISSING_HINT = (
     "Local model loading requires voxweave[qwen] (qwen-asr + einops/rotary-embedding-torch/...) + torch. "
@@ -997,35 +1001,18 @@ def _load_mono(wav_path: Path, target_sr: int, *, as_numpy: bool = False):
     return wav
 
 
-def align_blocks_full_ctc(
-    wav_path: Path, texts: list[str], iso: str, model_name: str
-) -> list[list[dict]]:
-    """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
+def _ctc_build_tokens(norm: list[str], nospace: bool, al):
+    """Build the <star>-interleaved token stream for full-pass CTC over cue texts `norm`.
 
-    Concatenates all block texts with a <star> wildcard at every cue boundary and both edges
-    (ctc-forced-aligner star_frequency='segment'), runs ONE windowed-emission + global
-    forced_align over the whole audio, then slices flat units back to each block by word/char
-    count. The global monotone CTC path self-locates every word, immune to the per-cue cropping
-    drift that crammed words into dead air (en "blocks" displaced into a 2.6s silence); the inter-
-    cue stars absorb untranscribed gaps (music/silence between cues) so the path never stretches a
-    real word across a gap. Emission is windowed to survive long audio; the single DP is O(T*L),
-    so audio past CTC_MAX_DP_FRAMES is rejected (movie-length needs silence-anchored DP-chunking,
-    not yet wired). Units are absolute timestamps relative to the full wav.
+    Token stream: <star> word0 <star> word1 <star> ... wordN <star>. A wildcard star sits at
+    EVERY word boundary (not just cue boundaries) and both edges. The star is a None token
+    (-> wildcard column in _ctc_align_logp) at meta=-1 (-> skipped in word grouping AND in
+    _distribute_units, which counts real words/chars). Because a star sits between every pair of
+    words regardless of how cues are grouped, the global monotone path absorbs ANY inter-word gap
+    -- intra-cue music/silence included -- instead of cramming the later word forward (the
+    failure: "...these <2-3s gap> blocks" placed blocks right after these, ignoring the pause).
+    Returns (toks, meta, words); words are flattened in cue order for _distribute_units.
     """
-    from voxweave.realign import NO_SPACE_LANGS
-
-    al = _get_ctc_aligner(iso, model_name)
-    nospace = iso in NO_SPACE_LANGS
-    norm = [(t or "").strip() for t in texts]
-
-    # Token stream: <star> word0 <star> word1 <star> ... wordN <star>. A wildcard star sits at
-    # EVERY word boundary (not just cue boundaries) and both edges. The star is a None token
-    # (-> wildcard column in _ctc_align_logp) at meta=-1 (-> skipped in word grouping AND in
-    # _distribute_units, which counts real words/chars). Because a star sits between every pair of
-    # words regardless of how cues are grouped, the global monotone path absorbs ANY inter-word gap
-    # -- intra-cue music/silence included -- instead of cramming the later word forward (the
-    # failure: "...these <2-3s gap> blocks" placed blocks right after these, ignoring the pause).
-    # Words are flattened in cue order; _distribute_units slices them back per cue by count.
     toks: list[int | None] = []
     meta: list[int] = []
     words: list[str] = []
@@ -1047,22 +1034,89 @@ def align_blocks_full_ctc(
             meta.extend(widx for _ in it)
             words.append(it)
             _star()  # wildcard after every word absorbs the inter-word gap
+    return toks, meta, words
+
+
+def _ctc_full_pass(
+    al, wav, norm: list[str], nospace: bool, iso: str
+) -> list[list[dict]]:
+    """One windowed-emission + global forced_align over `wav` for cue texts `norm`.
+
+    Times are relative to the start of `wav` (caller offsets when `wav` is a chunk). Returns
+    per-cue units in `norm` order; empty/wordless cues get []. The single DP is O(T*L).
+    """
+    toks, meta, words = _ctc_build_tokens(norm, nospace, al)
     if not words:
-        return [[] for _ in texts]
-
-    wav = _load_mono(wav_path, al.sr)
-    frames = wav.shape[-1] / _CTC_STRIDE
-    if frames > CTC_MAX_DP_FRAMES:
-        raise RuntimeError(
-            f"audio ~{frames / 3000:.0f}min exceeds single-pass CTC DP budget "
-            f"(~{CTC_MAX_DP_FRAMES / 3000:.0f}min); movie-length silence-anchored DP-chunking "
-            f"not yet wired (raise VOXWEAVE_CTC_MAX_DP_FRAMES to override)"
-        )
-
+        return [[] for _ in norm]
     logp = _ctc_emit_full(al, wav)
     units = _ctc_align_logp(al, logp, toks, meta, words, nospace, wav.shape[-1])
-    _empty_cache()
     return _distribute_units(units, norm, iso)
+
+
+def align_blocks_full_ctc(
+    wav_path: Path,
+    texts: list[str],
+    iso: str,
+    model_name: str,
+    bounds: list[tuple[float, float] | None] | None = None,
+) -> list[list[dict]]:
+    """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
+
+    Runs ONE windowed-emission + global forced_align over the whole audio, then slices flat
+    units back to each block by word/char count. The global monotone CTC path self-locates every
+    word, immune to the per-cue cropping drift that crammed words into dead air (en "blocks"
+    displaced into a 2.6s silence); inter-cue stars absorb untranscribed gaps (music/silence
+    between cues) so the path never stretches a real word across a gap. Units are absolute
+    timestamps relative to the full wav.
+
+    The single DP is O(T*L), which overflows on movie-length audio. When `frames` exceeds
+    CTC_MAX_DP_FRAMES and cue `bounds` (per-cue (start,end), aligned with `texts`) are available,
+    the audio is split at silence anchors (plan_dp_chunks): each chunk re-runs the full pass over
+    its own crop (within-chunk routing-free, so drift-immunity holds) and units are offset back to
+    absolute time. Boundaries land in inter-cue silence, so no word crosses them. Without bounds an
+    over-budget file is rejected (raise VOXWEAVE_CTC_MAX_DP_FRAMES to force a single pass).
+    """
+    from voxweave.chunking import plan_dp_chunks
+    from voxweave.realign import NO_SPACE_LANGS
+    from voxweave.timestamps import shift_units
+
+    al = _get_ctc_aligner(iso, model_name)
+    nospace = iso in NO_SPACE_LANGS
+    norm = [(t or "").strip() for t in texts]
+
+    wav = _load_mono(wav_path, al.sr)
+    sr = al.sr
+    frames = wav.shape[-1] / _CTC_STRIDE
+    if frames <= CTC_MAX_DP_FRAMES:
+        out = _ctc_full_pass(al, wav, norm, nospace, iso)
+        _empty_cache()
+        return out
+
+    if not bounds or len(bounds) != len(norm):
+        raise RuntimeError(
+            f"audio ~{frames / 3000:.0f}min exceeds single-pass CTC DP budget "
+            f"(~{CTC_MAX_DP_FRAMES / 3000:.0f}min) and cue timestamps are unavailable for "
+            f"silence-anchored DP-chunking (raise VOXWEAVE_CTC_MAX_DP_FRAMES to override)"
+        )
+
+    total_sec = wav.shape[-1] / sr
+    budget_sec = CTC_MAX_DP_FRAMES * _CTC_STRIDE / sr * CTC_DP_CHUNK_FRAC
+    plans = plan_dp_chunks(bounds, max_sec=budget_sec, audio_end=total_sec)
+    log.info(
+        "CTC DP-chunking %.0fmin audio into %d silence-anchored chunks (budget ~%.0fmin)",
+        total_sec / 60,
+        len(plans),
+        budget_sec / 60,
+    )
+    out: list[list[dict]] = []
+    for p in plans:
+        a = max(0, int(p["start"] * sr))
+        b = min(wav.shape[-1], int(p["end"] * sr))
+        sub = _ctc_full_pass(al, wav[a:b], norm[p["lo"] : p["hi"]], nospace, iso)
+        offset = a / sr
+        out.extend(shift_units(u, offset) for u in sub)
+        _empty_cache()
+    return out
 
 
 def align_text_ctc(wav_path: Path, text: str, iso: str, model_name: str) -> list[dict]:

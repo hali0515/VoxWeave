@@ -111,3 +111,26 @@ def test_load_strategy_invalid_falls_back_peak(conf_at, monkeypatch):
     assert (
         config.conf_load_strategy() == "peak"
     )  # invalid value does not crash, falls back to peak
+
+
+def test_ctc_max_dp_frames_default(conf_at, monkeypatch):
+    monkeypatch.delenv("VOXWEAVE_CTC_MAX_DP_FRAMES", raising=False)
+    assert config.conf_ctc_max_dp_frames() == 90000  # ~30min at 50fps
+
+
+def test_ctc_max_dp_frames_from_conf(conf_at, monkeypatch):
+    monkeypatch.delenv("VOXWEAVE_CTC_MAX_DP_FRAMES", raising=False)
+    conf_at.write_text("ctc_max_dp_frames = 150000\n", encoding="utf-8")
+    assert config.conf_ctc_max_dp_frames() == 150000
+
+
+def test_ctc_max_dp_frames_env_overrides_conf(conf_at, monkeypatch):
+    conf_at.write_text("ctc_max_dp_frames = 150000\n", encoding="utf-8")
+    monkeypatch.setenv("VOXWEAVE_CTC_MAX_DP_FRAMES", "200000")
+    assert config.conf_ctc_max_dp_frames() == 200000  # env > file
+
+
+def test_ctc_max_dp_frames_invalid_conf_falls_back(conf_at, monkeypatch):
+    monkeypatch.delenv("VOXWEAVE_CTC_MAX_DP_FRAMES", raising=False)
+    conf_at.write_text('ctc_max_dp_frames = "lots"\n', encoding="utf-8")
+    assert config.conf_ctc_max_dp_frames() == 90000  # non-int does not crash

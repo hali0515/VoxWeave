@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import soundfile as sf
@@ -49,6 +50,112 @@ def pack_speech_segments(segments: list[dict], max_sec: float) -> list[dict]:
             cur_start, cur_end = open_block(seg["start"], seg["end"])
     if cur_start is not None:
         emit(cur_start, cur_end)  # type: ignore[arg-type]  # cur_end is always assigned together with cur_start
+    return chunks
+
+
+def plan_dp_chunks(
+    bounds: Sequence[tuple[float, float] | None],
+    *,
+    max_sec: float,
+    min_gap_sec: float = 1.5,
+    pad_sec: float = 0.5,
+    audio_end: float | None = None,
+) -> list[dict]:
+    """Partition cues into DP chunks split at silence anchors under a duration budget.
+
+    The full-file CTC forced-align DP is O(T*L); movie-length audio overflows it. This splits
+    the cue list into contiguous runs whose audio span stays within ``max_sec``, cutting only at
+    cue boundaries (which never bisect a word — smart_split invariant) and PREFERRING boundaries
+    backed by an inter-cue gap >= ``min_gap_sec`` (real silence, so the crop window has room for
+    the per-chunk ``<star>`` edges to absorb lead-in/out). Each chunk re-runs the routing-free
+    global DP over its own crop, so within-chunk drift-immunity is preserved; boundaries land in
+    silence, so no word crosses them.
+
+    ``bounds[i]`` = ``(start, end)`` of cue i, or ``None`` for a timestamp-less cue (insertion /
+    empty) — it carries no anchor and just rides along in its chunk. Returns
+    ``[{lo, hi, start, end}]`` where ``lo:hi`` is the cue index slice (``hi`` exclusive) and
+    ``start``/``end`` is the audio crop window: adjacent chunks meet at the gap midpoint, file
+    edges are padded by ``pad_sec`` (left clamped to 0, right capped at ``audio_end`` if given).
+    """
+    n = len(bounds)
+    if n == 0:
+        return []
+
+    def _start(i: int) -> float | None:
+        b = bounds[i]
+        return b[0] if b is not None else None
+
+    def _end(i: int) -> float | None:
+        b = bounds[i]
+        return b[1] if b is not None else None
+
+    def _first_start(i: int) -> float | None:
+        for k in range(i, n):
+            if (s := _start(k)) is not None:
+                return s
+        return None
+
+    def _last_end(i: int) -> float | None:
+        for k in range(n - 1, i - 1, -1):
+            if (e := _end(k)) is not None:
+                return e
+        return None
+
+    def _gap(c: int) -> float | None:
+        e, s = _end(c), _start(c + 1)
+        return None if e is None or s is None else s - e
+
+    def _split_time(c: int) -> float:
+        # midpoint of the gap after cue c; if next cue has no timestamp, pad past cue c's end
+        e, s = _end(c), _start(c + 1)
+        if e is None:  # cut cue has no end (pathological): fall back to next known end
+            e = next((_end(k) for k in range(c, n) if _end(k) is not None), None)
+        if e is None:
+            return _last_end(0) or 0.0
+        return e + pad_sec if s is None else (e + s) / 2.0
+
+    cuts: list[int] = []  # split AFTER cue index c
+    i = 0
+    while True:
+        cstart = _first_start(i)
+        rem_end = _last_end(i)
+        if cstart is None or rem_end is None or rem_end - cstart <= max_sec:
+            break  # remaining cues fit in one final chunk
+        last_any: int | None = None
+        last_gap: int | None = None
+        for k in range(i, n - 1):
+            ek = _end(k)
+            if ek is None:
+                continue
+            if ek - cstart > max_sec:
+                break
+            last_any = k
+            g = _gap(k)
+            if g is not None and g >= min_gap_sec:
+                last_gap = k
+        chosen = last_gap if last_gap is not None else last_any
+        if chosen is None:  # leading cue alone exceeds budget; no anchor to do better
+            chosen = i
+        if chosen >= n - 1:  # cut would fall after the last cue: rest is one chunk
+            break
+        cuts.append(chosen)
+        i = chosen + 1
+
+    edges = [0, *[c + 1 for c in cuts], n]
+    chunks: list[dict] = []
+    for lo, hi in zip(edges, edges[1:]):
+        start = (
+            _split_time(lo - 1)
+            if lo > 0
+            else max(0.0, (_first_start(lo) or 0.0) - pad_sec)
+        )
+        if hi < n:
+            end = _split_time(hi - 1)
+        else:
+            end = (
+                audio_end if audio_end is not None else (_last_end(lo) or 0.0) + pad_sec
+            )
+        chunks.append({"lo": lo, "hi": hi, "start": start, "end": end})
     return chunks
 
 

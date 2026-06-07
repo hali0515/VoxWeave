@@ -58,6 +58,13 @@ _TEMPLATE = """\
 # Special value "hybrid" (= CLI --hybrid) -> dual-ASR fusion (whisper text quality + Qwen punctuation).
 # asr_model = "Qwen/Qwen3-ASR-0.6B"
 
+# CTC forced-align single-pass DP frame budget (= env VOXWEAVE_CTC_MAX_DP_FRAMES). Long audio
+# (movies) whose emission exceeds this is auto-split at silence anchors before the O(T*L) DP.
+# Default 90000 (~30min at 50fps). Bigger = fewer/larger chunks = more accurate on long
+# sparse-dialogue audio (the global DP keeps more context), at higher GPU memory; e.g. 150000
+# (~40min chunks) measurably tightens movie alignment on a 24 GB card. Lower it on small cards.
+# ctc_max_dp_frames = 90000
+
 # Model load strategy (= env VOXWEAVE_LOAD_STRATEGY):
 #   peak (default) = serial peak-shaving: all-chunk ASR -> release -> all-chunk align;
 #                    ASR and aligner never co-reside; peak VRAM = max(each model); works on 8 GB cards.
@@ -188,6 +195,31 @@ def conf_load_strategy() -> str:
     v = os.environ.get("VOXWEAVE_LOAD_STRATEGY") or _load().get("load_strategy")
     v = v.strip().lower() if isinstance(v, str) else ""
     return v if v in _LOAD_STRATEGIES else "peak"
+
+
+# CTC forced-align single-pass DP frame budget. Audio whose emission exceeds this is split at
+# silence anchors (chunking.plan_dp_chunks) before the O(T*L) DP; ~30min default (50fps*60*30).
+# Bigger = fewer/larger chunks = more accurate on long sparse-dialogue audio (the global DP gains
+# context), at higher GPU memory. Lower on small cards.
+_CTC_MAX_DP_FRAMES_DEFAULT = 90000
+
+
+def conf_ctc_max_dp_frames() -> int:
+    """Max emission frames for one CTC forced-align DP before silence-anchored chunking kicks in.
+
+    Precedence: env VOXWEAVE_CTC_MAX_DP_FRAMES > conf ``ctc_max_dp_frames`` > 90000 (~30min).
+    Non-integer values (env or file) are ignored and fall through to the next source.
+    """
+    env = os.environ.get("VOXWEAVE_CTC_MAX_DP_FRAMES")
+    if env is not None and env.strip():
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    v = _load().get("ctc_max_dp_frames")
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    return _CTC_MAX_DP_FRAMES_DEFAULT
 
 
 def align_model_for(iso: str) -> str | None:
