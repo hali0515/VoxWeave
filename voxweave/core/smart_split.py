@@ -958,6 +958,51 @@ def _gap_between(a: Dict[str, Any], b: Dict[str, Any]) -> float | None:
     return (bs - ae) if ae is not None and bs is not None else None
 
 
+def _merge_micro_cues(
+    cues: List[Dict[str, Any]],
+    lang: str,
+    *,
+    max_gap_s: float,
+    max_line_length: int,
+    max_cue_s: float,
+) -> List[Dict[str, Any]]:
+    """Merge adjacent cues separated by sub-glue gaps when the merge fits one line.
+
+    Folds rapid micro-sentence chains (そう。だね。 / "Yeah." "Right.") into one
+    readable cue instead of a flicker sequence. Safety mirrors _glue_short_cues:
+    ``max_gap_s`` (0.3s) sits below ``clause_ms`` (0.4s), so a real pause is never
+    crossed. A len-broken pair cannot re-merge (it would not fit one line), a
+    gap-broken pair cannot either (its gap >= clause_ms), and the duration cap
+    keeps a dur-broken pair apart. ``max_gap_s<=0`` disables.
+    """
+    if max_gap_s <= 0 or len(cues) < 2:
+        return cues
+    sep = "" if _no_spaces(lang) else " "
+    out = [dict(cues[0])]
+    for nxt in cues[1:]:
+        cur = out[-1]
+        gap = _gap_between(cur, nxt)
+        merged_text = (cur["text"].rstrip() + sep + nxt["text"].lstrip()).strip()
+        if (
+            gap is not None
+            and gap < max_gap_s
+            and cur.get("start") is not None
+            and nxt.get("end") is not None
+            and nxt["end"] - cur["start"] <= max_cue_s
+            and _fits_budget(merged_text, max_line_length, 1, lang)
+        ):
+            cur["text"] = merged_text
+            cur["end"] = (
+                nxt["end"] if cur.get("end") is None else max(cur["end"], nxt["end"])
+            )
+            cur["word_data"] = list(cur.get("word_data") or []) + list(
+                nxt.get("word_data") or []
+            )
+            continue
+        out.append(dict(nxt))
+    return out
+
+
 def _glue_short_cues(
     cues: List[Dict[str, Any]], lang: str, *, max_gap_s: float
 ) -> List[Dict[str, Any]]:
@@ -1138,6 +1183,13 @@ def smart_split_segments(
         thresholds=th,
     )
     if th is not None:  # cleanup opt-in; legacy callers skip this
+        cues = _merge_micro_cues(
+            cues,
+            lang,
+            max_gap_s=th.glue_gap_s,
+            max_line_length=max_line_length,
+            max_cue_s=th.max_cue_s,
+        )
         cues = _glue_short_cues(cues, lang, max_gap_s=th.glue_gap_s)
         cues = _cleanup_cues(
             cues,
