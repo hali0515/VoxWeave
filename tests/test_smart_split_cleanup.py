@@ -1,7 +1,7 @@
 # tests/test_smart_split_cleanup.py
 import pytest
 
-from voxweave.core.smart_split import _cleanup_cues
+from voxweave.core.timing import _cleanup_cues
 
 
 def test_min_duration_extends_into_following_gap():

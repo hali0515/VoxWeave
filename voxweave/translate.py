@@ -37,7 +37,7 @@ def strip_punct_for_subtitles(text: str) -> str:
 
     Decimal/thousands separators (digit.digit, digit,digit) and name joiners · ・ are preserved.
     """
-    from voxweave.core.smart_split import strip_punct_for_subtitles
+    from voxweave.core.layout import strip_punct_for_subtitles
 
     return strip_punct_for_subtitles(_EXTRA_PUNCT_TO_SPACE_RE.sub(" ", text))
 
@@ -101,7 +101,7 @@ def _layout_translated(text: str, to_iso: str | None) -> str:
     """
     if not to_iso:
         return text
-    from voxweave.core.smart_split import wrap_cue_text
+    from voxweave.core.layout import wrap_cue_text
 
     return wrap_cue_text(text, to_iso, 2)
 

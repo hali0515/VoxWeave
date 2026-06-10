@@ -1,10 +1,7 @@
 # tests/test_smart_split_glue.py
 from voxweave import config
-from voxweave.core.smart_split import (
-    GLUE_MAX_GAP_S,
-    _glue_short_cues,
-    smart_split_segments,
-)
+from voxweave.core.smart_split import smart_split_segments
+from voxweave.core.timing import GLUE_MAX_GAP_S, _glue_short_cues
 
 
 def _cue(text, start, end):

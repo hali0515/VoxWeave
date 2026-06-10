@@ -10,7 +10,7 @@ import subprocess
 import pytest
 
 from voxweave import pipeline, shotdet
-from voxweave.core.smart_split import TWO_FRAME_S, _snap_to_shots
+from voxweave.core.timing import TWO_FRAME_S, _snap_to_shots
 
 
 def _cue(start, end, speech_end=None, text="x"):

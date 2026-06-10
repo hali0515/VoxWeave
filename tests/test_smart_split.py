@@ -1,8 +1,5 @@
-from voxweave.core.smart_split import (
-    strip_punct_for_subtitles,
-    wrap_cue_text,
-    smart_split_segments,
-)
+from voxweave.core.layout import strip_punct_for_subtitles, wrap_cue_text
+from voxweave.core.smart_split import smart_split_segments
 
 
 def _seg_from_words(text, dt=0.5):
@@ -313,7 +310,7 @@ def test_comma_no_split_digit_internal_zh():
 # long content splits into MORE cues instead of wrapping to a second line.
 # --------------------------------------------------------------------------- #
 def test_default_max_lines_cjk_is_single():
-    from voxweave.core.smart_split import default_max_lines
+    from voxweave.core.layout import default_max_lines
 
     assert default_max_lines("ja") == 1  # Japanese: single line
     assert default_max_lines("zh") == 1  # Chinese: also single line
@@ -322,7 +319,7 @@ def test_default_max_lines_cjk_is_single():
 
 
 def test_default_max_line_length_cjk_single_wider():
-    from voxweave.core.smart_split import default_max_line_length
+    from voxweave.core.layout import default_max_line_length
 
     # zh/ja single-line -> per-line budget is wider than ko's two-line 12 (fits a whole short sentence)
     assert default_max_line_length("ja") == 18

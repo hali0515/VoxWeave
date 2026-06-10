@@ -391,7 +391,8 @@ def test_force_break_boundaryless_overrun(monkeypatch):
 
 def test_unit_glyph_binds_to_digit():
     # 92% is one atom: a phrase boundary or gap between 92 and % must never split it
-    from voxweave.core.smart_split import _build_atoms, _tokens
+    from voxweave.core.layout import _tokens
+    from voxweave.core.smart_split import _build_atoms
 
     assert _tokens("上涨92%了", "zh") == ["上", "涨", "92%", "了"]
     wd = [{"start": i * 0.1, "end": i * 0.1 + 0.05} for i in range(5)]  # 上 涨 9 2 %
@@ -401,7 +402,7 @@ def test_unit_glyph_binds_to_digit():
 
 
 def test_unit_glyph_wrap_units():
-    from voxweave.core.smart_split import _wrap_units
+    from voxweave.core.layout import _wrap_units
 
     units = _wrap_units("営業利益92%です", "ja")
     assert ("92%", "") in units
@@ -414,7 +415,8 @@ def test_phrase_boundary_atoms_in_atom_index_space():
     # unit regression: the boundary set must contain atom indices (all < len(atoms));
     # char offsets must not leak in (they can exceed len(atoms) when a Latin run is embedded)
     pytest.importorskip("budoux")
-    from voxweave.core.smart_split import _phrase_boundary_atoms, _tokens
+    from voxweave.core.layout import _tokens
+    from voxweave.core.smart_split import _phrase_boundary_atoms
 
     txt = "GPT-4はAIです"
     atoms = [{"text": t} for t in _tokens(txt, "ja")]  # ['GPT-4','は','AI','で','す']

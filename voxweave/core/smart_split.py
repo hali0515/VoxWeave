@@ -7,41 +7,56 @@ Two stages:
    cues fitting ``max_lines × max_line_length``, with gap/duration breaks.
 
 Each sentence/comma clause is its own cue so timings track real speech
-boundaries; the one exception is ``_glue_short_cues``, which folds a lone-word
-flicker cue onto whichever neighbor abuts it within a sub-0.3s gap (no real
-pause crossed) — forward for leading interjections, backward for tail fragments.
+boundaries; the one exception is ``_glue_short_cues`` (see ``timing``), which
+folds a lone-word flicker cue onto whichever neighbor abuts it within a
+sub-0.3s gap (no real pause crossed) — forward for leading interjections,
+backward for tail fragments.
+
+This module owns the segmentation *engine*: clause/sentence splitting and the
+atom packing loop. Pure text helpers and display wrapping live in ``layout``;
+cue-stream timing polish (glue/merge/cleanup/shot-snap) lives in ``timing``.
 """
 
 from __future__ import annotations
 
-import bisect
 import functools
 import logging
 import re
 from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Optional, Tuple
 
-from .conjunctions import conjunctions_by_language, get_comma
 from .breakpoints import legal_break_index, phrase_atoms
+from .conjunctions import conjunctions_by_language, get_comma
 from .gap_split import gap_qualifies
 from .kinsoku import line_end_penalty
-from .langsets import LANGUAGES_WITHOUT_SPACES
+from .langsets import LANGUAGES_WITHOUT_SPACES as LANGUAGES_WITHOUT_SPACES  # re-export
+from .layout import (
+    WIDE_GLYPH_LANGUAGES,
+    _comma_chars,
+    _fits_budget,
+    _join,
+    _merge_stutters,
+    _no_spaces,
+    _strip_trailing_commas,
+    _token_char_count,
+    _tokens,
+    _visual_len,
+    default_max_line_length,
+    default_max_lines,
+    split_subtitle,
+    strip_punct_for_subtitles,
+    wrap_cue_text,
+)
+from .timing import (
+    GLUE_MAX_GAP_S,
+    _cleanup_cues,
+    _glue_short_cues,
+    _merge_micro_cues,
+    _snap_to_shots,
+)
 
 log = logging.getLogger(__name__)
 
-# Languages whose glyphs render at ~2x the visual width of Latin chars,
-# so the per-line character budget must be roughly halved.
-WIDE_GLYPH_LANGUAGES = {"zh", "ja", "ko"}
-
-DEFAULT_MAX_LINE_LENGTH = 42  # latin / space-delimited
-DEFAULT_MAX_LINE_LENGTH_CJK = 12  # ko: 2 lines × 12 chars (~2x visual width)
-# zh/ja are single-line langs: one line gets a wider budget than ko's 12 so a
-# short sentence fits whole; content over 18 chars splits into more cues, never wraps.
-DEFAULT_MAX_LINE_LENGTH_CJK_SINGLE = 18
-DEFAULT_MAX_LINES = 2
-# zh/ja read best as one line per cue — stacking two lines can break mid-token
-# (e.g. です -> で/す). Long utterances split into more single-line cues instead.
-SINGLE_LINE_LANGS = {"zh", "ja"}
 DEFAULT_MIN_DURATION = 3.0  # reading-speed pad for single cues
 DEFAULT_DESIRED_WPS = 4.0  # target reading speed (English wps)
 
@@ -51,22 +66,7 @@ DEFAULT_DESIRED_WPS = 4.0  # target reading speed (English wps)
 DEFAULT_COMMA_SPLIT_MIN_LEN = 18  # latin / space-delimited
 DEFAULT_COMMA_SPLIT_MIN_LEN_CJK = 6  # zh/ja/ko: chars are ~2x visual width
 
-
-def default_max_lines(lang: str) -> int:
-    """zh/ja: 1 line per cue (long utterances split into more cues). Others: 2."""
-    return 1 if lang in SINGLE_LINE_LANGS else DEFAULT_MAX_LINES
-
-
-def default_max_line_length(lang: str) -> int:
-    """Per-language line length. CJK glyphs render ~2x Latin width, so the budget
-    is halved. Single-line zh/ja gets a wider budget so short sentences fit whole."""
-    if lang in SINGLE_LINE_LANGS:
-        return DEFAULT_MAX_LINE_LENGTH_CJK_SINGLE
-    return (
-        DEFAULT_MAX_LINE_LENGTH_CJK
-        if lang in WIDE_GLYPH_LANGUAGES
-        else DEFAULT_MAX_LINE_LENGTH
-    )
+FORCE_BREAK_FACTOR = 1.5  # boundary-less run may exceed the line budget by at most this before a forced cut
 
 
 def default_comma_split_min_len(lang: str) -> int:
@@ -77,33 +77,6 @@ def default_comma_split_min_len(lang: str) -> int:
         if lang in WIDE_GLYPH_LANGUAGES
         else DEFAULT_COMMA_SPLIT_MIN_LEN
     )
-
-
-# Comma variants for no-space langs: treated as clause boundaries and later stripped to a space
-# by _PUNCT_TO_SPACE_RE. The CJK subset is the single source for both this boundary set and that
-# regex (halfwidth "," is added here but lives in the regex's digit-guarded first branch).
-_CJK_PAUSE_COMMAS = (
-    "，、﹐﹑"  # fullwidth, ideographic, small comma, small ideographic comma
-)
-_PAUSE_COMMAS_NO_SPACE = "," + _CJK_PAUSE_COMMAS  # + halfwidth comma
-
-
-def _comma_chars(lang: str) -> str:
-    """Comma characters treated as clause boundaries for this language."""
-    return _PAUSE_COMMAS_NO_SPACE if _no_spaces(lang) else ","
-
-
-def _strip_trailing_commas(s: str, lang: str) -> str:
-    commas = _comma_chars(lang)
-    while s and s[-1] in commas:
-        s = s[:-1]
-    return s
-
-
-def _visual_len(s: str, lang: str) -> int:
-    """Non-whitespace char count excluding trailing commas (for min-length tests)."""
-    s = _strip_trailing_commas(s.strip(), lang)
-    return sum(1 for c in s if not c.isspace())
 
 
 def _comma_load(s: str, lang: str) -> int:
@@ -168,74 +141,6 @@ def _comma_clauses(sentence: str, lang: str, min_len: int) -> List[str]:
         else:
             clauses.append(buf)
     return clauses
-
-
-def _no_spaces(lang: str) -> bool:
-    return lang in LANGUAGES_WITHOUT_SPACES
-
-
-def _join(words: List[str], lang: str) -> str:
-    return "".join(words) if _no_spaces(lang) else " ".join(words)
-
-
-# Unit glyphs that bind to a preceding digit: 92|% must never split across cues
-# or lines. Covers halfwidth/fullwidth percent, permille, degree, temperature.
-_UNIT_GLYPHS = "%％‰°℃℉"
-
-
-def _tokens(text: str, lang: str) -> List[str]:
-    """Tokenize for word-count alignment with ASR ``words`` entries.
-
-    Space-delimited langs: ``text.split()``. CJK: each CJK char is one token;
-    consecutive ASCII letters/digits/in-word punctuation (possibly with spaces
-    between them) form one inseparable token. This keeps Latin phrases like
-    ``Building in a week`` atomic inside CJK text. A unit glyph (%/℃/...)
-    after a digit merges into that token so 92% stays one atom.
-    """
-    if not _no_spaces(lang):
-        return text.split()
-
-    out: List[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if ch.isspace():
-            i += 1
-            continue
-        if _is_ascii_run_char(ch):
-            j = i
-            while j < n:
-                cj = text[j]
-                if _is_ascii_run_char(cj):
-                    j += 1
-                    continue
-                if cj.isspace():
-                    # Continue ASCII run only if next non-space is ASCII too.
-                    k = j + 1
-                    while k < n and text[k].isspace():
-                        k += 1
-                    if k < n and _is_ascii_run_char(text[k]):
-                        j = k
-                        continue
-                break
-            out.append(text[i:j])
-            i = j
-        else:
-            out.append(ch)
-            i += 1
-    merged: List[str] = []
-    for tok in out:
-        if merged and tok in _UNIT_GLYPHS and merged[-1][-1].isdigit():
-            merged[-1] += tok
-            continue
-        merged.append(tok)
-    return merged
-
-
-def _token_char_count(tok: str) -> int:
-    """Non-whitespace chars in a token — used to advance the char-level word_data cursor."""
-    return sum(1 for c in tok if not c.isspace())
 
 
 def _span_start(items: list[dict], default: float | None = None) -> float | None:
@@ -335,38 +240,6 @@ def _snap_mid_to_phrase_boundary(
     return min(valid, key=lambda b: (left_pen(b), abs(b - target)))
 
 
-def _is_ascii_run_char(c: str) -> bool:
-    """True for ASCII letters, digits, or in-word punctuation (._-).
-    These chars form an inseparable Latin run inside CJK text."""
-    if len(c) != 1 or ord(c) >= 128:
-        return False
-    return c.isalnum() or c in "._-"
-
-
-def split_subtitle(text: str, max_chars: int, lang: str) -> str:
-    """Soft-wrap text to lines of <= max_chars, breaking at token boundaries."""
-    tokens = _tokens(text, lang)
-    if not tokens:
-        return text
-    sep = "" if _no_spaces(lang) else " "
-    lines: List[str] = []
-    current: List[str] = []
-    current_len = 0
-    for tok in tokens:
-        tlen = len(tok)
-        extra = len(sep) if current else 0
-        if current and current_len + tlen + extra > max_chars:
-            lines.append(sep.join(current))
-            current = [tok]
-            current_len = tlen
-        else:
-            current.append(tok)
-            current_len += tlen + extra
-    if current:
-        lines.append(sep.join(current))
-    return "\n".join(lines)
-
-
 @functools.lru_cache(
     maxsize=None
 )  # one pattern per language; avoids recompiling per clause
@@ -404,11 +277,6 @@ def split_sentence_heuristically(
     for clause in clauses:
         out.extend(_fit_split_clause(clause, max_line_length, max_lines, lang))
     return [p for p in out if p]
-
-
-def _fits_budget(text: str, max_line_length: int, max_lines: int, lang: str) -> bool:
-    """True when ``text`` soft-wraps into at most ``max_lines`` lines."""
-    return split_subtitle(text, max_line_length, lang).count("\n") + 1 <= max_lines
 
 
 def _repack_parts(
@@ -913,14 +781,6 @@ def _split_without_timings(
     return out
 
 
-TWO_FRAME_S = 2.0 / 24.0  # ~0.083s Netflix min inter-cue gap
-CHAIN_MAX_GAP_S = 0.5  # gaps below this are "dead zone" -> chain to 2 frames
-VISIBLE_GAP_MIN_S = 1.0  # gaps >= this stay a visible pause (BBC); not enforced in code (CHAIN_MAX_GAP_S=0.5 never reaches them)
-GLUE_MAX_GAP_S = 0.3  # lone-word flicker cue glues onto its nearer neighbor when that gap is below this
-LINGER_CAP_S = 1.0  # CPS-driven extension never lingers more than this past speech end
-FORCE_BREAK_FACTOR = 1.5  # boundary-less run may exceed the line budget by at most this before a forced cut
-
-
 @dataclass(frozen=True)
 class SplitThresholds:
     """Gap-aware segmentation knobs — one typed source for field names + defaults.
@@ -954,255 +814,6 @@ class SplitThresholds:
         """Build from a (possibly partial) mapping, ignoring unknown keys and filling defaults."""
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in known})
-
-
-def _is_short_fragment(text: str, lang: str) -> bool:
-    """A flicker fragment worth gluing: a lone short word (spaced langs) or 1-2 CJK
-    chars (no-space langs). Keeps the glue surgical — real clauses that merely abut
-    a neighbor are not fragments and stay their own cue. Text size, not duration, is
-    the flicker signal (a lone 「ん」 held 0.8s is still a flicker)."""
-    t = text.strip()
-    if not t:
-        return False
-    if _no_spaces(lang):
-        return _visual_len(t, lang) <= 2
-    return len(t.split()) == 1
-
-
-def _gap_between(a: Dict[str, Any], b: Dict[str, Any]) -> float | None:
-    """Inter-cue gap a->b (b.start - a.end), or None if either bound is missing."""
-    ae, bs = a.get("end"), b.get("start")
-    return (bs - ae) if ae is not None and bs is not None else None
-
-
-def _merge_micro_cues(
-    cues: List[Dict[str, Any]],
-    lang: str,
-    *,
-    max_gap_s: float,
-    max_line_length: int,
-    max_cue_s: float,
-) -> List[Dict[str, Any]]:
-    """Merge adjacent cues separated by sub-glue gaps when the merge fits one line.
-
-    Folds rapid micro-sentence chains (そう。だね。 / "Yeah." "Right.") into one
-    readable cue instead of a flicker sequence. Safety mirrors _glue_short_cues:
-    ``max_gap_s`` (0.3s) sits below ``clause_ms`` (0.4s), so a real pause is never
-    crossed. A len-broken pair cannot re-merge (it would not fit one line), a
-    gap-broken pair cannot either (its gap >= clause_ms), and the duration cap
-    keeps a dur-broken pair apart. ``max_gap_s<=0`` disables.
-    """
-    if max_gap_s <= 0 or len(cues) < 2:
-        return cues
-    sep = "" if _no_spaces(lang) else " "
-    out = [dict(cues[0])]
-    for nxt in cues[1:]:
-        cur = out[-1]
-        gap = _gap_between(cur, nxt)
-        merged_text = (cur["text"].rstrip() + sep + nxt["text"].lstrip()).strip()
-        if (
-            gap is not None
-            and gap < max_gap_s
-            and cur.get("start") is not None
-            and nxt.get("end") is not None
-            and nxt["end"] - cur["start"] <= max_cue_s
-            and _fits_budget(merged_text, max_line_length, 1, lang)
-        ):
-            cur["text"] = merged_text
-            cur["end"] = (
-                nxt["end"] if cur.get("end") is None else max(cur["end"], nxt["end"])
-            )
-            cur["word_data"] = list(cur.get("word_data") or []) + list(
-                nxt.get("word_data") or []
-            )
-            continue
-        out.append(dict(nxt))
-    return out
-
-
-def _glue_short_cues(
-    cues: List[Dict[str, Any]], lang: str, *, max_gap_s: float
-) -> List[Dict[str, Any]]:
-    """Glue a super-short single-word flicker cue onto whichever neighbor abuts it
-    closest, when that gap is below ``max_gap_s`` — contiguous speech means a
-    spurious split, not a real pause.
-
-    Bidirectional: an interjection that *leads* the next line (え/ん with a sub-0.3s
-    gap ahead but a real pause behind) glues forward; a tail fragment glues back.
-    The side with the smaller gap wins (ties go backward). Safe re-introduction of
-    the deleted merge_short_cues: ``max_gap_s`` (0.3s) sits below ``clause_ms``
-    (0.4s), so the real-pause side (>=0.4s) is never crossed and a cue is never
-    dragged over silence. ``max_gap_s<=0`` disables. Overflow is left to soft-wrap.
-    """
-    if max_gap_s <= 0 or len(cues) < 2:
-        return cues
-    sep = "" if _no_spaces(lang) else " "
-    work = [dict(c) for c in cues]
-    out: List[Dict[str, Any]] = []
-    i, n = 0, len(work)
-    while i < n:
-        c = work[i]
-        nxt = work[i + 1] if i + 1 < n else None
-        if _is_short_fragment(c["text"], lang):
-            gap_back = _gap_between(out[-1], c) if out else None
-            gap_fwd = _gap_between(c, nxt) if nxt is not None else None
-            back_ok = gap_back is not None and gap_back < max_gap_s
-            fwd_ok = gap_fwd is not None and gap_fwd < max_gap_s
-            # nearer side wins; ties go backward ("append to last cue").
-            go_fwd = fwd_ok and (
-                not back_ok or (gap_fwd is not None and gap_fwd < gap_back)  # type: ignore[operator]
-            )
-            if go_fwd and nxt is not None:  # prepend fragment into next, reprocess it
-                nxt["text"] = (c["text"].rstrip() + sep + nxt["text"].lstrip()).strip()
-                if c.get("start") is not None:
-                    nxt["start"] = (
-                        c["start"]
-                        if nxt.get("start") is None
-                        else min(nxt["start"], c["start"])
-                    )
-                nxt["word_data"] = list(c.get("word_data") or []) + list(
-                    nxt.get("word_data") or []
-                )
-                i += 1
-                continue
-            if back_ok:
-                prev = out[-1]
-                prev["text"] = (
-                    prev["text"].rstrip() + sep + c["text"].lstrip()
-                ).strip()
-                if c.get("end") is not None:
-                    prev["end"] = (
-                        c["end"]
-                        if prev.get("end") is None
-                        else max(prev["end"], c["end"])
-                    )
-                prev["word_data"] = list(prev.get("word_data") or []) + list(
-                    c.get("word_data") or []
-                )
-                i += 1
-                continue
-        out.append(c)
-        i += 1
-    return out
-
-
-def _reading_chars(text: str) -> int:
-    """Non-whitespace char count — the reading-load measure for CPS lingering."""
-    return sum(1 for ch in text if not ch.isspace())
-
-
-def _cleanup_cues(
-    cues: List[Dict[str, Any]],
-    *,
-    min_cue_s: float,
-    max_cue_s: float,
-    cps: float = 0.0,
-    lag_out_s: float = 0.0,
-) -> List[Dict[str, Any]]:
-    """Timing-only pass — never merges content across a real pause.
-
-    - Extends short cues into the following gap (no overlap) up to min_cue_s.
-    - Reading-speed linger (cps>0): a cue displayed for less than reading_chars/cps
-      extends into the gap, at most LINGER_CAP_S past speech end.
-    - Tail pad (lag_out_s>0): every cue end gets a flat pad so text does not vanish
-      the instant speech stops; absorbed by chaining in dense dialogue.
-    - Chains sub-0.5s inter-cue gaps down to 2 frames.
-    - Visible gaps (>=1s) are left untouched.
-    - max_cue_s prevents any extension from re-inflating past the segmentation cap.
-    """
-    out = [dict(c) for c in cues]
-    for i, c in enumerate(out):
-        nxt_start = out[i + 1]["start"] if i + 1 < len(out) else None
-        # desired duration: min-dur floor, CPS reading time (capped linger), tail pad
-        dur = c["end"] - c["start"]
-        desired = dur
-        if min_cue_s > 0:
-            desired = max(desired, min_cue_s)
-        if lag_out_s > 0:
-            desired = max(desired, dur + lag_out_s)
-        if cps > 0:
-            need = _reading_chars(c.get("text", "")) / cps
-            desired = max(desired, min(need, dur + LINGER_CAP_S))
-        if desired > dur:
-            want = c["start"] + desired
-            c["end"] = want if nxt_start is None else min(want, nxt_start)
-        # chaining: close small inter-cue gaps to 2 frames
-        if nxt_start is not None:
-            gap = nxt_start - c["end"]
-            if 0 <= gap < CHAIN_MAX_GAP_S and gap > TWO_FRAME_S:
-                c["end"] = nxt_start - TWO_FRAME_S
-            # overlaps (gap<0) and large gaps (>=CHAIN_MAX_GAP_S) left to caller
-        # never let extension / chaining push a cue past the duration cap
-        if max_cue_s and c["end"] - c["start"] > max_cue_s:
-            c["end"] = c["start"] + max_cue_s
-    return out
-
-
-def _snap_to_shots(
-    cues: List[Dict[str, Any]],
-    shots: List[float],
-    *,
-    snap_s: float,
-    max_cue_s: float,
-) -> List[Dict[str, Any]]:
-    """Snap cue boundaries onto nearby shot changes (runs after _cleanup_cues).
-
-    A boundary within ``snap_s`` of a cut moves onto it, but never at speech's
-    expense:
-
-    - start: moving *earlier* to the cut is a free lead-in (bounded by the
-      previous cue end + 2 frames); moving *later* (pre-cut flash removal) is
-      bounded by ``snap_s`` and must stay below the cue's end.
-    - end: extending to cut - 2 frames is free inside the following gap (and
-      the duration cap); pulling back to cut - 2 frames must not cut speech
-      (never below the last word's end).
-
-    Cues then change exactly on the cut instead of flashing across it.
-    """
-    if snap_s <= 0 or not shots:
-        return cues
-    out = [dict(c) for c in cues]
-
-    def nearest(t: float) -> float | None:
-        i = bisect.bisect_left(shots, t)
-        best: float | None = None
-        for j in (i - 1, i):
-            if 0 <= j < len(shots) and abs(shots[j] - t) <= snap_s:
-                if best is None or abs(shots[j] - t) < abs(best - t):
-                    best = shots[j]
-        return best
-
-    for i, c in enumerate(out):
-        start, end = c.get("start"), c.get("end")
-        if start is None or end is None:
-            continue
-        words = [w for w in c.get("word_data") or [] if w.get("end") is not None]
-        speech_end = max((w["end"] for w in words), default=end)
-        prev_end = out[i - 1].get("end") if i > 0 else None
-        nxt_start = out[i + 1].get("start") if i + 1 < len(out) else None
-
-        cut = nearest(start)
-        if cut is not None and abs(cut - start) > 1e-9:
-            new_start = cut
-            if prev_end is not None:
-                new_start = max(new_start, prev_end + TWO_FRAME_S)
-            if new_start < end - TWO_FRAME_S and (
-                new_start <= start or new_start - start <= snap_s
-            ):
-                c["start"] = new_start
-
-        cut = nearest(end)
-        if cut is not None:
-            target = cut - TWO_FRAME_S
-            if target > end:  # extend to die on the cut
-                if (
-                    nxt_start is None or target <= nxt_start - TWO_FRAME_S
-                ) and target - c["start"] <= max_cue_s:
-                    c["end"] = target
-            elif target < end:  # pull back, never cutting speech
-                if target >= speech_end and target > c["start"]:
-                    c["end"] = target
-    return out
 
 
 def smart_split_segments(
@@ -1298,161 +909,3 @@ def smart_split_segments(
         # changing cue boundaries. Long Latin phrases inside CJK also collapse here.
         cue["text"] = wrap_cue_text(cue["text"], lang, max_lines)
     return cues
-
-
-# "I I" -> "I-I"; ASCII letters only (CJK and digit-containing tokens skipped).
-_STUTTER_RE = re.compile(r"\b([A-Za-z]+)(\s+)(\1)\b", re.IGNORECASE)
-
-
-def _merge_stutters(text: str) -> str:
-    """Merge adjacent repeated ASCII words into hyphenated stutter form.
-
-    "I I I" -> "I-I-I" (iterates to fixpoint for 3+ repetitions). Existing
-    compound words like well-known are unaffected.
-    """
-    prev = None
-    while prev != text:
-        prev = text
-        text = _STUTTER_RE.sub(r"\1-\3", text)
-    return text
-
-
-# Punctuation to replace with a space. "." and "," between digits are kept
-# (e.g. 3.75, 10,000). Covers CJK fullwidth variants.
-_PUNCT_TO_SPACE_RE = re.compile(
-    r"[.,](?!\d)"  # latin . , only when next char is not a digit
-    r"|[;!?:。；！？：﹒﹔﹕﹖﹗"
-    + _CJK_PAUSE_COMMAS
-    + r"]"  # halfwidth punct + CJK set (commas shared)
-)
-_WS_RE = re.compile(r"\s+")
-
-
-def strip_punct_for_subtitles(text: str) -> str:
-    """Replace punctuation with spaces (digit-internal . and , kept), then
-    collapse whitespace runs and trim."""
-    cleaned = _PUNCT_TO_SPACE_RE.sub(" ", text)
-    cleaned = _WS_RE.sub(" ", cleaned).strip()
-    return cleaned
-
-
-def _vis_width(s: str) -> int:
-    """Visual width: CJK/full-width glyphs count 2; ASCII/space counts 1."""
-    return sum(1 if (c.isascii() or c.isspace()) else 2 for c in s)
-
-
-def _wrap_units(text: str, lang: str) -> List[Tuple[str, str]]:
-    """Split a cue into ``(atom, gap_after)`` pairs for display wrapping.
-
-    Line-breaks are legal between units only. ``gap_after`` (" " or "") preserves
-    the original spacing so rejoining atoms reproduces the text exactly.
-
-    - Space-delimited langs: each word is an atom (gap " ").
-    - No-space langs: maximal ASCII runs are one atom; each CJK glyph is its own.
-      Unlike ``_tokens``, this does NOT bridge ASCII runs across spaces, so long
-      embedded English phrases can wrap.
-    """
-    if not _no_spaces(lang):
-        return [(w, " ") for w in text.split()]
-    units: List[Tuple[str, str]] = []
-    i, n = 0, len(text)
-    while i < n:
-        c = text[i]
-        if c.isspace():
-            i += 1
-            continue
-        if _is_ascii_run_char(c):
-            j = i
-            while j < n and _is_ascii_run_char(text[j]):
-                j += 1
-            atom = text[i:j]
-            i = j
-        else:
-            atom = c
-            i += 1
-        gap = ""
-        if i < n and text[i].isspace():
-            gap = " "
-            while i < n and text[i].isspace():
-                i += 1
-        # a unit glyph directly after a digit joins it (92% never line-wraps apart);
-        # only when no gap intervenes — rejoining must reproduce the text exactly
-        if (
-            units
-            and atom in _UNIT_GLYPHS
-            and units[-1][1] == ""
-            and units[-1][0][-1].isdigit()
-        ):
-            prev_atom, _ = units.pop()
-            atom = prev_atom + atom
-        units.append((atom, gap))
-    return units
-
-
-def _join_line(units: List[Tuple[str, str]]) -> str:
-    """Join (atom, gap) units into one line; trailing gap of last atom is dropped."""
-    out: List[str] = []
-    for k, (atom, gap) in enumerate(units):
-        out.append(atom)
-        if k < len(units) - 1:
-            out.append(gap)
-    return "".join(out)
-
-
-def _slide_sticky_line_ends(groups: List[List[Tuple[str, str]]], lang: str) -> None:
-    """Slide sticky trailing tokens (line_end_penalty >= 1) down to the next line.
-
-    The token-level counterpart of apply_kinsoku for spaced languages: a line must
-    not end on a closed-class token (went to the | store). Slides while the donor
-    keeps at least one token and the receiving line stays within the hard visual
-    budget; bottom-heavy output is fine (pyramid shape reads better anyway).
-    """
-    for i in range(len(groups) - 1):
-        top, bot = groups[i], groups[i + 1]
-        while (
-            len(top) > 1
-            and line_end_penalty(top[-1][0], lang) >= 1
-            and _vis_width(_join_line([top[-1], *bot])) <= DEFAULT_MAX_LINE_LENGTH
-        ):
-            bot.insert(0, top.pop())
-
-
-def wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
-    """Soft-wrap a cue into ``<=max_lines`` display lines (``\\n``-joined).
-
-    Only changes rendered layout — cue boundaries and content are untouched.
-    Wraps only when visual width exceeds ``DEFAULT_MAX_LINE_LENGTH``; short CJK
-    cues with brief Latin phrases stay on one line. Lines are balanced at
-    ``ceil(total/max_lines)`` to avoid stranding a fragment on the last line,
-    then line ends are cleaned: kinsoku char rules for ja/zh, sticky-token
-    slide for spaced languages.
-    """
-    units = _wrap_units(text, lang)
-    if len(units) <= 1:
-        return _join_line(units) if units else text
-    total = _vis_width(_join_line(units))
-    if total <= DEFAULT_MAX_LINE_LENGTH:  # fits on one line -> no wrap needed
-        return _join_line(units)
-    target = -(-total // max_lines)  # ceil div: balance across max_lines lines
-    groups: List[List[Tuple[str, str]]] = []
-    cur: List[Tuple[str, str]] = []
-    for u in units:
-        if (
-            cur
-            and _vis_width(_join_line(cur + [u])) > target
-            and len(groups) < max_lines - 1
-        ):
-            groups.append(cur)
-            cur = [u]
-        else:
-            cur.append(u)
-    if cur:
-        groups.append(cur)
-    if not _no_spaces(lang) and len(groups) > 1:
-        _slide_sticky_line_ends(groups, lang)
-    lines = [_join_line(g) for g in groups]
-    if lang in {"ja", "zh"} and len(lines) > 1:
-        from .kinsoku import apply_kinsoku
-
-        lines = apply_kinsoku(lines)
-    return "\n".join(lines)

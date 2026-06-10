@@ -1,6 +1,7 @@
 """Intra-cue stutter merging (_merge_stutters) + em-dash end-to-end splitting."""
 
-from voxweave.core.smart_split import _merge_stutters, smart_split_segments
+from voxweave.core.layout import _merge_stutters
+from voxweave.core.smart_split import smart_split_segments
 
 THRESH = {"clause_ms": 400, "vad_skip_ms": 1000, "offline_ms": 700, "max_cue_s": 7.0}
 

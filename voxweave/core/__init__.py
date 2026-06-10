@@ -1,5 +1,11 @@
-"""voxweave.core — built-in subtitle layout core (inlined from subtitle-core, no longer a separate dependency).
+"""voxweave.core — subtitle segmentation and layout core (pure logic, no models).
 
-Contains only ``smart_split`` and its dependency ``conjunctions`` as used by voxweave;
-``postprocess`` remains in the subtitle-core repo for private use by the whisperx fork.
+- ``layout`` — text primitives, per-language line budgets, display wrapping,
+  punctuation stripping.
+- ``timing`` — timing-only polish over the final cue stream (glue/merge,
+  duration cleanup, shot-change snapping).
+- ``smart_split`` — the segmentation engine (sentence/clause splitting,
+  gap-aware atom packing) and the ``smart_split_segments`` orchestrator.
+- ``kinsoku`` / ``breakpoints`` / ``conjunctions`` / ``gap_split`` /
+  ``langsets`` — leaf tables and scoring shared by the above.
 """
