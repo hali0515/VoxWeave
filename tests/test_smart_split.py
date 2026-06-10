@@ -93,6 +93,20 @@ def test_wrap_embedded_english_in_cjk_uses_latin_budget():
     assert out.replace("\n", " ") == text
 
 
+def test_fit_split_repacks_conjunction_parts_to_budget():
+    # a long sentence over the 2x42 budget splits at conjunctions, but adjacent
+    # parts repack up to the budget instead of one fragment cue per conjunction
+    from voxweave.core.smart_split import split_sentence_heuristically
+
+    s = (
+        "I went to the store and bought milk and eggs and bread "
+        "because we were out of everything"
+    )
+    out = split_sentence_heuristically(s, 42, 2, "en", split_at_comma=True)
+    assert len(out) == 2, out  # not 5 fragments
+    assert " ".join(out) == s  # content preserved
+
+
 def test_wrap_slides_sticky_token_down():
     # balance point lands right after "to the" -> both closed-class tokens slide
     # to line 2 (a line must not end on the/to); content preserved.

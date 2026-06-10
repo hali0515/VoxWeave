@@ -393,6 +393,32 @@ def split_sentence_heuristically(
     return [p for p in out if p]
 
 
+def _fits_budget(text: str, max_line_length: int, max_lines: int, lang: str) -> bool:
+    """True when ``text`` soft-wraps into at most ``max_lines`` lines."""
+    return split_subtitle(text, max_line_length, lang).count("\n") + 1 <= max_lines
+
+
+def _repack_parts(
+    parts: List[str], max_line_length: int, max_lines: int, lang: str
+) -> List[str]:
+    """Greedily merge adjacent terminal/conjunction parts back up to the budget.
+
+    The split pattern marks *candidate* break points, not mandates: keeping every
+    part separate shatters a long sentence into fragment cues ("and bought milk" |
+    "and eggs"). Mirrors the accumulate-then-flush behavior of _comma_clauses.
+    """
+    sep = "" if _no_spaces(lang) else " "
+    packed: List[str] = []
+    for part in parts:
+        if packed:
+            cand = packed[-1] + sep + part
+            if _fits_budget(cand, max_line_length, max_lines, lang):
+                packed[-1] = cand
+                continue
+        packed.append(part)
+    return packed
+
+
 def _fit_split_clause(
     clause: str,
     max_line_length: int,
@@ -400,16 +426,17 @@ def _fit_split_clause(
     lang: str,
 ) -> List[str]:
     """Keep a clause whole if it fits ``max_lines``; otherwise split at
-    terminals/conjunctions, then fall back to an even token split."""
+    terminals/conjunctions (repacked to the budget), then fall back to an even
+    token split."""
     clause = clause.strip()
     if not clause:
         return []
-    formatted = split_subtitle(clause, max_line_length, lang)
-    if formatted.count("\n") + 1 <= max_lines:
+    if _fits_budget(clause, max_line_length, max_lines, lang):
         return [clause]
 
     pattern = _build_split_pattern(lang)
     parts = [p.strip() for p in pattern.split(clause) if p and p.strip()]
+    parts = _repack_parts(parts, max_line_length, max_lines, lang)
 
     final_parts: List[str] = []
     for part in parts:
