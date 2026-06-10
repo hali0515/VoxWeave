@@ -65,6 +65,8 @@ def test_dp_prefers_speech_after_mask():
 
     spans = [(0.0, 10 * SPF)]  # speech = first 10 frames
     masked = _mask_emissions_outside_speech(lp, spans, t * 320, SR, blank)
-    aligned2, _ = AF.forced_align(masked.unsqueeze(0).contiguous(), targets, blank=blank)
+    aligned2, _ = AF.forced_align(
+        masked.unsqueeze(0).contiguous(), targets, blank=blank
+    )
     pos_masked = torch.nonzero(aligned2[0] == 1).flatten()
     assert pos_masked.max() < 10 + int(_VAD_MASK_DILATE_S / SPF) + 1

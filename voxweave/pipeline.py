@@ -1069,7 +1069,8 @@ def translate(
     rep.stage("write translated VTT")
     out_path = _swap_ext(vtt_path, f".{to}.vtt")
     out_path.write_text(
-        translate_mod.render_translated_vtt(blocks, trans), encoding="utf-8"
+        translate_mod.render_translated_vtt(blocks, trans, to_iso=to_iso_or(to, None)),
+        encoding="utf-8",
     )
     log.info("wrote %s (%d cues → %s)", out_path.name, len(blocks), to)
     return out_path

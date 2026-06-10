@@ -337,3 +337,46 @@ def test_build_messages_instructs_use_of_full_context():
 def test_default_batch_threshold_is_large_enough_for_whole_episode():
     # whole-episode single-call translation gives maximum context; real episodes typically 300-500 cues, threshold must be large enough
     assert translate.BATCH_THRESHOLD >= 500
+
+
+# --------------------------------------------------------------------------- #
+# target-language re-layout: cue count/timing are fixed, soft-wrap is the only
+# valve when the translation outgrows the target line budget
+# --------------------------------------------------------------------------- #
+
+
+def _cue_lines(vtt: str) -> list[str]:
+    return [ln for ln in vtt.splitlines() if ln and "-->" not in ln and ln != "WEBVTT"]
+
+
+def test_render_translated_wraps_long_zh_to_two_lines():
+    blocks = [{"start": 1.0, "end": 4.0, "text": "source"}]
+    out = translate.render_translated_vtt(blocks, {0: "字" * 30}, to_iso="zh")
+    lines = _cue_lines(out)
+    assert len(lines) == 2  # 60 visual width -> balanced two lines
+    assert "".join(lines) == "字" * 30  # content preserved
+
+
+def test_render_translated_short_zh_stays_single_line():
+    blocks = [{"start": 1.0, "end": 4.0, "text": "source"}]
+    out = translate.render_translated_vtt(blocks, {0: "字" * 10}, to_iso="zh")
+    assert len(_cue_lines(out)) == 1
+
+
+def test_render_translated_no_iso_keeps_legacy_no_wrap():
+    blocks = [{"start": 1.0, "end": 4.0, "text": "source"}]
+    out = translate.render_translated_vtt(blocks, {0: "字" * 30})
+    assert len(_cue_lines(out)) == 1
+
+
+def test_pipeline_translate_passes_target_iso(tmp_path, monkeypatch):
+    vtt = tmp_path / "a.vtt"
+    vtt.write_text(
+        "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nhello world\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        translate, "translate_cues", lambda payload, **kw: {0: "字" * 30}
+    )
+    out = pipeline.translate(vtt, to="zh", reporter=Reporter())
+    lines = _cue_lines(out.read_text(encoding="utf-8"))
+    assert len(lines) == 2  # wrap applied through the pipeline path

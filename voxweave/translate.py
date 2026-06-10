@@ -90,13 +90,36 @@ def validate_and_fill(blocks: list[dict], trans: dict[int, str]) -> list[int]:
     return [i for i in range(len(blocks)) if not trans.get(i, "").strip()]
 
 
-def render_translated_vtt(blocks: list[dict], trans: dict[int, str]) -> str:
-    """Translated text + per-block timestamps -> VTT; missing translations fall back to the original text; blocks without timestamps produce plain-text cues."""
+def _layout_translated(text: str, to_iso: str | None) -> str:
+    """Soft-wrap a translated cue to the TARGET language's display budget.
+
+    Cue count and timing are fixed by the source speech, so wrapping is the only
+    layout valve for translations that outgrow the line budget (an en cue packed
+    to 2x42 chars can translate into 30+ zh chars). <=2 lines for every target:
+    short text stays on one line (the wrap only triggers past the visual budget),
+    CJK gets kinsoku inside _wrap_cue_text.
+    """
+    if not to_iso:
+        return text
+    from voxweave.core.smart_split import _wrap_cue_text
+
+    return _wrap_cue_text(text, to_iso, 2)
+
+
+def render_translated_vtt(
+    blocks: list[dict], trans: dict[int, str], to_iso: str | None = None
+) -> str:
+    """Translated text + per-block timestamps -> VTT; missing translations fall back
+    to the original text; blocks without timestamps produce plain-text cues.
+    ``to_iso`` enables target-language soft-wrap (see _layout_translated)."""
     rows = [
         (
             b.get("start"),
             b.get("end"),
-            strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]),
+            _layout_translated(
+                strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]),
+                to_iso,
+            ),
         )
         for i, b in enumerate(blocks)
     ]
