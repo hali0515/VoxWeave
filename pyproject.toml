@@ -55,6 +55,11 @@ dependencies = [
   # (voxweave.realign.snap_break_punct); fall back to character-level if import fails.
   "budoux>=0.8",
   "jieba>=0.42",
+  # ja line-end scoring Level 2: POS-based penalties (kinsoku.ja_pos_end_penalties)
+  # distinguish 準体の (legal break) from 格助詞の (binds forward). Lazy-imported;
+  # falls back to the kana char table when absent. unidic-lite ships the dictionary.
+  "fugashi>=1.3",
+  "unidic-lite>=1.0.8",
   # OpenAI subtitle translation (translate sub-command; lazy import).
   "openai>=1.40",
 ]

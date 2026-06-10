@@ -104,3 +104,57 @@ def test_line_end_penalty_zh_whole_word(w):
 def test_line_end_penalty_ja_chars_active_without_lang():
     # kana particle check stays active regardless of lang (cannot false-positive elsewhere)
     assert line_end_penalty("大樹の", "ja") == 2
+
+
+# --------------------------------------------------------------------------- #
+# Level 2: UniDic POS penalties (fugashi + unidic-lite)
+# --------------------------------------------------------------------------- #
+
+
+def test_pos_distinguishes_case_no_from_nominalizer_no():
+    pytest.importorskip("fugashi")
+    from voxweave.core.kinsoku import ja_pos_end_penalties
+
+    pens = ja_pos_end_penalties("大樹の村")
+    assert pens is not None and pens[2] == 2  # 連体の: binds forward
+    pens = ja_pos_end_penalties("走るのが好きだ")
+    # 準体の (offset 2) is a legal break the char table had to penalize
+    assert pens is not None and pens[2] == 0
+
+
+def test_pos_reaches_classes_surface_tables_cannot():
+    pytest.importorskip("fugashi")
+    from voxweave.core.kinsoku import ja_pos_end_penalties
+
+    pens = ja_pos_end_penalties("この村まで")
+    assert pens is not None
+    assert pens[1] == 2  # この 連体詞
+    assert pens[4] == 1  # まで 副助詞
+    pens = ja_pos_end_penalties("お名前は")
+    assert pens is not None
+    assert pens[0] == 2  # お 接頭辞
+    assert pens[3] == 0  # は 係助詞
+
+
+def test_pos_env_kill_switch(monkeypatch):
+    pytest.importorskip("fugashi")
+    from voxweave.core.kinsoku import _load_ja_tagger, ja_pos_end_penalties
+
+    monkeypatch.setenv("VOXWEAVE_JA_POS", "0")
+    _load_ja_tagger.cache_clear()
+    try:
+        assert ja_pos_end_penalties("大樹の村") is None
+    finally:
+        _load_ja_tagger.cache_clear()
+
+
+def test_attach_end_penalties_uses_pos_for_ja():
+    pytest.importorskip("fugashi")
+    from voxweave.core.smart_split import _attach_end_penalties
+
+    atoms = [{"text": c} for c in "走るのが好きだ"]
+    _attach_end_penalties(atoms, {0, 3}, "ja")  # 走るの | が好きだ
+    assert atoms[2]["end_pen"] == 0  # POS: 準体の is a legal break
+    atoms2 = [{"text": c} for c in "大樹の村"]
+    _attach_end_penalties(atoms2, {0, 3}, "ja")
+    assert atoms2[2]["end_pen"] == 2  # POS: 格助詞の binds forward

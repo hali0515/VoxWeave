@@ -1,12 +1,20 @@
-"""JIS X 4051 禁則処理 (line-breaking constraints), pure stdlib.
+"""JIS X 4051 禁則処理 (line-breaking constraints) and line-end break scoring.
 
-After lines are formed, slides breaks so no line starts with a prohibited char
-(closing brackets, small kana, trailing punctuation) or ends with a prohibited
-char (opening bracket/quote). Applied to ja and zh; small-kana entries are inert
-in zh but the CJK punctuation rules apply to both.
+After lines are formed, ``apply_kinsoku`` slides breaks so no line starts with a
+prohibited char (closing brackets, small kana, trailing punctuation) or ends
+with a prohibited char (opening bracket/quote). Applied to ja and zh; small-kana
+entries are inert in zh but the CJK punctuation rules apply to both.
+
+``line_end_penalty`` scores how bad it is to end a line/cue on a given word
+(surface tables for ja kana / zh words / en closed-class tokens); for ja,
+``ja_pos_end_penalties`` upgrades the signal source to UniDic POS (fugashi)
+when available, falling back to the char table otherwise.
 """
 
 from __future__ import annotations
+
+import functools
+import os
 
 # Leading-edge prohibition (行頭禁則): these chars cannot begin a line (must hang on the previous line)
 LINE_START_PROHIBITED = frozenset(
@@ -106,6 +114,67 @@ def line_end_penalty(text: str, lang: str = "") -> int:
         if s in _ZH_BIND_END_MED:
             return 1
     return 0
+
+
+@functools.lru_cache(maxsize=1)
+def _load_ja_tagger():
+    """Lazy fugashi (MeCab + unidic-lite) tagger singleton.
+
+    None when fugashi is absent or env VOXWEAVE_JA_POS=0 forces the Level-1
+    char-table fallback (debug/bisection knob).
+    """
+    if os.environ.get("VOXWEAVE_JA_POS", "").strip() == "0":
+        return None
+    try:
+        from fugashi import Tagger  # type: ignore
+
+        return Tagger()
+    except Exception:
+        return None
+
+
+def _pos_penalty(pos1: str, pos2: str) -> int:
+    """UniDic POS -> line-end penalty (Level 2 of the same scorer).
+
+    Same intent as the char tables, but disambiguated: 準体助詞の (走るの = a
+    legal break) scores 0 where the char table had to penalize every の; and
+    POS reaches classes a surface table cannot (連体詞 この/その, 接頭辞 お/各).
+    接続助詞 (て/が/から) and 係助詞 (は/も) stay 0 — real clause breaks.
+    """
+    if pos1 == "助詞":
+        if pos2 == "格助詞":
+            return 2
+        if pos2 == "副助詞":
+            return 1
+        return 0  # 係助詞 / 接続助詞 / 終助詞 / 準体助詞
+    if pos1 in ("連体詞", "接頭辞"):
+        return 2  # この|村 / お|名前: always binds forward
+    return 0
+
+
+def ja_pos_end_penalties(text: str) -> dict[int, int] | None:
+    """Penalty by non-space char offset of each token's LAST char, or None.
+
+    Offsets count non-space chars only, matching smart_split's atom cursor.
+    Only token-end offsets are present: a break after a mid-token char is not
+    scored here (callers fall back to the char table), so BudouX/MeCab boundary
+    disagreements degrade to Level-1 behavior instead of guessing.
+    """
+    tagger = _load_ja_tagger()
+    if tagger is None:
+        return None
+    pen: dict[int, int] = {}
+    off = 0
+    for word in tagger(text):
+        n = sum(1 for c in word.surface if not c.isspace())
+        if n == 0:
+            continue
+        off += n
+        f = word.feature
+        pen[off - 1] = _pos_penalty(
+            getattr(f, "pos1", "") or "", getattr(f, "pos2", "") or ""
+        )
+    return pen
 
 
 def apply_kinsoku(lines: list[str]) -> list[str]:

@@ -645,19 +645,31 @@ def _attach_end_penalties(
     Spaced langs (``boundary is None``): the atom is a whole word; score it directly
     (en closed-class table). No-space langs: score the *word* — the atom span since
     the last phrase boundary — so zh whole-word semantics hold (目的 never matches
-    的) and the ja kana check still reads the word's last char. Atoms a break cannot
-    legally follow (next atom mid-phrase) score 0; they are never candidates.
+    的) and the ja kana check still reads the word's last char. For ja, UniDic POS
+    (ja_pos_end_penalties) overrides the char table where it scores a token end,
+    disambiguating 準体の from 格助詞の. Atoms a break cannot legally follow (next
+    atom mid-phrase) score 0; they are never candidates.
     """
     n = len(atoms)
+    pos_map: dict[int, int] | None = None
+    if lang == "ja" and boundary is not None:
+        from .kinsoku import ja_pos_end_penalties
+
+        pos_map = ja_pos_end_penalties("".join(a["text"] for a in atoms))
     word_start = 0
+    char_end = 0  # cumulative non-space char count through atom k
     for k, a in enumerate(atoms):
+        char_end += _token_char_count(a["text"])
         if boundary is not None and k in boundary:
             word_start = k
         if boundary is None:
             a["end_pen"] = line_end_penalty(a["text"], lang)
         elif k + 1 >= n or (k + 1) in boundary:
-            word = "".join(x["text"] for x in atoms[word_start : k + 1])
-            a["end_pen"] = line_end_penalty(word, lang)
+            pen = pos_map.get(char_end - 1) if pos_map is not None else None
+            if pen is None:  # no POS source / mid-token offset -> char-table fallback
+                word = "".join(x["text"] for x in atoms[word_start : k + 1])
+                pen = line_end_penalty(word, lang)
+            a["end_pen"] = pen
         else:
             a["end_pen"] = 0
 
