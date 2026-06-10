@@ -15,6 +15,7 @@ pause crossed) — forward for leading interjections, backward for tail fragment
 from __future__ import annotations
 
 import functools
+import logging
 import re
 from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +25,8 @@ from .breakpoints import legal_break_index, phrase_atoms
 from .gap_split import gap_qualifies
 from .kinsoku import line_end_penalty
 from .langsets import LANGUAGES_WITHOUT_SPACES
+
+log = logging.getLogger(__name__)
 
 # Languages whose glyphs render at ~2x the visual width of Latin chars,
 # so the per-line character budget must be roughly halved.
@@ -111,8 +114,12 @@ def _comma_load(s: str, lang: str) -> int:
 
 def _split_keep_comma(sentence: str, lang: str) -> List[str]:
     """Split a sentence after each comma (comma stays on the left part).
-    Commas between digits (e.g. 10,000) are NOT split points."""
+    Commas between digits (e.g. 10,000) are NOT split points. For spaced
+    languages the comma must also end its token (next char is whitespace):
+    a mid-token comma (e.g. ``so,"``) would divide the token and desync the
+    token-to-word_data index zip in ``split_at_sentence_end``."""
     commas = _comma_chars(lang)
+    no_spaces = _no_spaces(lang)
     out: List[str] = []
     buf: List[str] = []
     n = len(sentence)
@@ -121,9 +128,12 @@ def _split_keep_comma(sentence: str, lang: str) -> List[str]:
         if ch in commas:
             prev = sentence[i - 1] if i > 0 else ""
             nxt = sentence[i + 1] if i + 1 < n else ""
-            if not (prev.isdigit() and nxt.isdigit()):
-                out.append("".join(buf))
-                buf = []
+            if prev.isdigit() and nxt.isdigit():
+                continue
+            if not no_spaces and nxt and not nxt.isspace():
+                continue
+            out.append("".join(buf))
+            buf = []
     if buf:
         out.append("".join(buf))
     return out
@@ -422,6 +432,72 @@ def _segment_sentences(text: str, lang: str) -> List[str]:
     return [s for s in re.split(r"(?<=[.!?。！？])\s*", text) if s and s.strip()]
 
 
+def _snap_sentence_breaks(text: str, sentences: List[str], lang: str) -> List[str]:
+    """Drop sentence boundaries that fall inside a whitespace-delimited token.
+
+    ASR tokens can carry internal sentence punctuation (e.g. laughter transcribed
+    as a single CJK run ``哈哈哈哈哈！哇。``). The segmenter splits there, which
+    inflates the token count versus ``word_data`` — and the index zip in
+    ``split_at_sentence_end`` then shifts every later cue's timing for the rest
+    of the segment. Rebuild sentences as exact slices of ``text`` keeping only
+    boundaries adjacent to whitespace. No-space languages pair by char count,
+    which intra-token splits cannot desync.
+    """
+    if _no_spaces(lang) or len(sentences) < 2:
+        return sentences
+    cuts: List[int] = []
+    pos = 0
+    for sent in sentences[:-1]:
+        idx = text.find(sent, pos)
+        if idx < 0:
+            return sentences  # segmenter rewrote content; nothing safe to snap
+        pos = idx + len(sent)
+        cuts.append(pos)
+    pieces: List[str] = []
+    last = 0
+    for cut in cuts:
+        if cut >= len(text) or text[cut].isspace() or text[cut - 1].isspace():
+            piece = text[last:cut]
+            if piece.strip():
+                pieces.append(piece)
+                last = cut
+    tail = text[last:]
+    if tail.strip():
+        pieces.append(tail)
+    return pieces or sentences
+
+
+def _anchor_cursor(
+    word_data: List[Dict[str, Any]],
+    cursor: int,
+    clause_tokens: List[str],
+    max_shift: int = 8,
+) -> Tuple[int, bool]:
+    """Verify the clause's tokens match ``word_data`` at ``cursor``; search nearby on mismatch.
+
+    Returns ``(start_index, ok)``. The index contract can still break on inputs
+    we have not anticipated (ghost or lost units); rather than silently shifting
+    every later cue, re-anchor on content within ``max_shift`` units, else keep
+    the cursor and report ``ok=False``.
+    """
+
+    def _matches(at: int) -> bool:
+        if at < 0 or at + len(clause_tokens) > len(word_data):
+            return False
+        return all(
+            word_data[at + j].get("word") == tok for j, tok in enumerate(clause_tokens)
+        )
+
+    if _matches(cursor):
+        return cursor, True
+    for d in range(1, max_shift + 1):
+        if _matches(cursor + d):
+            return cursor + d, True
+        if _matches(cursor - d):
+            return cursor - d, True
+    return cursor, False
+
+
 def split_at_sentence_end(
     text: str,
     word_data: List[Dict[str, Any]],
@@ -431,9 +507,12 @@ def split_at_sentence_end(
     split_at_comma: bool = True,
     comma_split_min_len: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    sentences = _segment_sentences(text, lang)
+    sentences = _snap_sentence_breaks(text, _segment_sentences(text, lang), lang)
     cues: List[Dict[str, Any]] = []
     cursor = 0
+    # Content verification needs unit texts; legacy callers without a "word"
+    # key keep the blind index cursor.
+    anchored = bool(word_data) and "word" in word_data[0] and not _no_spaces(lang)
     for sent in sentences:
         for clause in split_sentence_heuristically(
             sent, max_line_length, max_lines, lang, split_at_comma, comma_split_min_len
@@ -447,8 +526,19 @@ def split_at_sentence_end(
                 wc = sum(_token_char_count(t) for t in clause_tokens)
             else:
                 wc = len(clause_tokens)
-            chunk_words = word_data[cursor : cursor + wc]
-            cursor += wc
+            start_at = cursor
+            if anchored and clause_tokens:
+                start_at, ok = _anchor_cursor(word_data, cursor, clause_tokens)
+                if start_at != cursor or not ok:
+                    log.warning(
+                        "cue/word desync at %r: cursor %d -> %d (%s)",
+                        clause[:40],
+                        cursor,
+                        start_at,
+                        "resynced" if ok else "unrecovered",
+                    )
+            chunk_words = word_data[start_at : start_at + wc]
+            cursor = start_at + wc
             if chunk_words:
                 start = next((w["start"] for w in chunk_words if "start" in w), None)
                 end = next(

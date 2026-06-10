@@ -649,7 +649,9 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
     from voxweave.core.smart_split import smart_split_segments
     from voxweave.config import gap_thresholds
 
-    json_path = Path(json_path)
+    # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
+    # WEBVTT bytes to json.loads.
+    json_path = _swap_ext(Path(json_path), ".json")
     data = json.loads(json_path.read_text(encoding="utf-8"))
     units = data["word_segments"]
     iso = data.get("language", "en")
