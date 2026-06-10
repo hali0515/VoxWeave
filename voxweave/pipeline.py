@@ -12,6 +12,7 @@ from voxweave import backend
 from voxweave.chunking import (
     decode_to_wav,
     pack_speech_segments,
+    silence_gaps,
     slice_wav,
     vad_speech_segments,
 )
@@ -23,7 +24,7 @@ from voxweave import translate as translate_mod
 from voxweave import asrfix as asrfix_mod
 from voxweave.songdet import (
     detect_song_spans,
-    drop_segments_in_spans,
+    excise_spans_from_segments,
     expand_spans_to_voiced_blocks,
     filter_short_spans,
     group_segments_by_spans,
@@ -47,6 +48,10 @@ SONGDET_SR = 32000
 # audio. Silero default 0.5 misses back-channels (はい/ええ) attenuated by vocal separation;
 # 0.25 catches them. Used only for snap positioning, not for chunk boundary decisions.
 SNAP_VAD_THRESHOLD = float(os.environ.get("VOXWEAVE_SNAP_VAD_THRESHOLD", "0.25"))
+# Fine VAD pass for song excision: a small min-silence (vs the 300ms chunking default)
+# surfaces brief intra-segment pauses, so excision cut points land in real silence and
+# never bisect a dialogue word. Only runs when song spans were detected.
+SONG_FINE_SILENCE_MS = int(os.environ.get("VOXWEAVE_SONG_FINE_SILENCE_MS", "100"))
 # Align-stage cue duration floor. Default 0 (disabled): enforce_min_duration only
 # resolves overlaps without padding, so short back-channels keep their real ~0.6s.
 # Set VOXWEAVE_MIN_CUE_SEC=0.8 to re-enable padding. Distinct from VOXWEAVE_SEG_MIN_CUE_SEC.
@@ -199,25 +204,46 @@ def plan_song_skip(
     segs: list[dict],
     *,
     speech_spans: list[tuple[float, float]] | None = None,
+    silences: list[tuple[float, float]] | None = None,
     min_skip_sec: float,
     max_chunk_sec: float,
 ) -> tuple[
     list[tuple[float, float]], list[tuple[float, float]], list[dict], list[dict]
 ]:
-    """Pure song-skip decision chain: expand -> filter -> drop -> group -> pack.
+    """Pure song-skip decision chain: expand -> filter -> excise -> group -> pack.
 
-    Returns (expanded_spans, final_spans, kept_segs, chunks). Only singable spans trigger
-    block absorption; ``protect=speech_spans`` trims dialogue from song core edges; spans
-    still shorter than min_skip_sec after expansion are kept as content.
-    No side effects, no GPU calls -- shared with scenario replay tests.
+    Returns (expanded_spans, final_spans, kept_segs, chunks). No side effects, no GPU
+    calls -- shared with scenario replay tests.
+
+    Two song scales, two treatments:
+    - Long singing spans (>= min_skip_sec) anchor OP/ED sequences: they absorb their whole
+      voiced block (rap verses PANNs hears as Speech ride along), clean dialogue is trimmed
+      from the block edges (``protect=speech_spans``), and instrumental-only spans still
+      shorter than min_skip_sec after expansion are kept as content (Cecilia guard).
+    - Short singing spans (< min_skip_sec — a hummed bar inside a dialogue block) must NOT
+      absorb their block and must not be discarded by the length filter either: they go
+      straight to excision.
+
+    Excision replaces whole-segment dropping for everything: song intervals are cut OUT of
+    the VAD segments (cut points snapped into real silences), so a segment mixing
+    "speech, brief pause, humming, speech" keeps its dialogue and loses only the
+    song + flanking silence.
     """
+    long_sing = [sp for sp in sing_spans if sp[1] - sp[0] >= min_skip_sec]
     expanded = expand_spans_to_voiced_blocks(
-        segs, song_spans, expandable=sing_spans, protect=speech_spans
+        segs, song_spans, expandable=long_sing, protect=speech_spans
     )
-    final = filter_short_spans(expanded, min_sec=min_skip_sec)
-    if not final:
-        return expanded, final, segs, pack_speech_segments(segs, max_sec=max_chunk_sec)
-    kept = drop_segments_in_spans(segs, final)
+    final_long = filter_short_spans(expanded, min_sec=min_skip_sec)
+    short_sing = [
+        (a, b)
+        for a, b in sing_spans
+        if b - a < min_skip_sec
+        and not any(max(a, fa) < min(b, fb) for fa, fb in final_long)
+    ]
+    to_cut = sorted(final_long + short_sing)
+    if not to_cut:
+        return expanded, [], segs, pack_speech_segments(segs, max_sec=max_chunk_sec)
+    kept, final = excise_spans_from_segments(segs, to_cut, silences=silences)
     chunks: list[dict] = []
     for group in group_segments_by_spans(kept, final):
         chunks.extend(pack_speech_segments(group, max_sec=max_chunk_sec))
@@ -317,13 +343,18 @@ def transcribe(
         rep.stage("VAD chunking")
         segs = vad_speech_segments(wav)
         if song_spans:
+            # Fine VAD (small min-silence) exposes brief intra-segment pauses; excision
+            # snaps its cut points into these so dialogue words are never bisected.
+            fine = vad_speech_segments(wav, min_silence_ms=SONG_FINE_SILENCE_MS)
+            silences = silence_gaps(fine)
             # Decision chain lives in plan_song_skip (pure, shared with scenario tests).
-            before = len(segs)
+            before = sum(s["end"] - s["start"] for s in segs)
             expanded, song_spans, segs, chunks = plan_song_skip(
                 song_spans,
                 sing_spans,
                 segs,
                 speech_spans=speech_spans,
+                silences=silences,
                 min_skip_sec=MIN_SONG_SKIP_SEC,
                 max_chunk_sec=MAX_CHUNK_SEC,
             )
@@ -333,16 +364,17 @@ def transcribe(
             )
             short = [
                 (round(a, 1), round(b, 1))
-                for a, b in expanded
+                for a, b in song_spans
                 if (b - a) < MIN_SONG_SKIP_SEC
             ]
             if short:
                 log.info(
-                    "short song spans kept as content (<%.0fs): %s",
+                    "short singing spans excised in-segment (<%.0fs): %s",
                     MIN_SONG_SKIP_SEC,
                     short,
                 )
-            log.info("dropped %d/%d VAD segs as song", before - len(segs), before)
+            after = sum(s["end"] - s["start"] for s in segs)
+            log.info("excised %.1fs of speech-segment time as song", before - after)
         else:
             chunks = pack_speech_segments(segs, max_sec=MAX_CHUNK_SEC)
         if not chunks:
@@ -440,7 +472,7 @@ def transcribe(
             tmp.append(orig16k)
             orig_segs = vad_speech_segments(orig16k, threshold=SNAP_VAD_THRESHOLD)
             if song_spans:
-                orig_segs = drop_segments_in_spans(orig_segs, song_spans)
+                orig_segs, _ = excise_spans_from_segments(orig_segs, song_spans)
             vad_spans = [(s["start"], s["end"]) for s in orig_segs]
         else:
             vad_spans = [(s["start"], s["end"]) for s in segs]

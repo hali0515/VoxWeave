@@ -5,7 +5,7 @@ from voxweave.songdet import (
     IDX_MUSIC,
     IDX_SING,
     IDX_SPEECH,
-    drop_segments_in_spans,
+    excise_spans_from_segments,
     expand_spans_to_voiced_blocks,
     filter_short_spans,
     group_segments_by_spans,
@@ -113,21 +113,72 @@ def test_merge_spans_splits_on_gap():
     assert spans == [(0.0, 3.0), (6.0, 9.0)]
 
 
-def test_drop_segments_in_spans():
+def test_excise_cuts_song_out_of_segments():
     spans = [(10.0, 20.0)]
     segs = [
-        {"start": 0.0, "end": 5.0},  # outside: kept
-        {"start": 12.0, "end": 18.0},  # fully inside: dropped
-        {"start": 8.0, "end": 12.0},  # overlap 2/4=0.5 >= 0.5: dropped
-        {"start": 8.0, "end": 11.0},  # overlap 1/3~0.33 < 0.5: kept
+        {"start": 0.0, "end": 5.0},  # outside: untouched
+        {"start": 12.0, "end": 18.0},  # fully inside: removed entirely
+        {"start": 8.0, "end": 12.0},  # straddles span start: dialogue half survives
+        {"start": 19.0, "end": 25.0},  # straddles span end: dialogue half survives
     ]
-    kept = drop_segments_in_spans(segs, segs and spans)
-    assert kept == [{"start": 0.0, "end": 5.0}, {"start": 8.0, "end": 11.0}]
+    kept, cut = excise_spans_from_segments(segs, spans)
+    assert cut == [(10.0, 20.0)]  # no silences -> raw span edges
+    assert kept == [
+        {"start": 0.0, "end": 5.0},
+        {"start": 8.0, "end": 10.0},
+        {"start": 20.0, "end": 25.0},
+    ]
 
 
-def test_drop_segments_no_spans_keeps_all():
+def test_excise_mixed_segment_keeps_flanking_dialogue():
+    # The user-reported shape: one VAD segment = speech + brief pause + hummed bar + speech.
+    # Whole-segment dropping would lose both speech runs; excision keeps them.
+    segs = [{"start": 100.0, "end": 130.0}]
+    spans = [(112.0, 118.0)]  # hummed bar inside the segment
+    kept, cut = excise_spans_from_segments(segs, spans)
+    assert kept == [
+        {"start": 100.0, "end": 112.0},
+        {"start": 118.0, "end": 130.0},
+    ]
+    assert cut == [(112.0, 118.0)]
+
+
+def test_excise_snaps_cuts_into_silence():
+    # Fine-VAD silences near the coarse PANNs edges: cuts land at silence midpoints,
+    # so the song leaves with its flanking silence and no dialogue word is bisected.
+    segs = [{"start": 100.0, "end": 130.0}]
+    spans = [(112.0, 118.0)]
+    silences = [(110.8, 111.4), (118.6, 119.0)]  # real pauses around the hum
+    kept, cut = excise_spans_from_segments(segs, spans, silences=silences)
+    assert cut == [(111.1, 118.8)]  # snapped to silence midpoints
+    assert kept == [
+        {"start": 100.0, "end": 111.1},
+        {"start": 118.8, "end": 130.0},
+    ]
+
+
+def test_excise_snap_ignores_far_silence_and_keeps_in_silence_points():
+    # cut already inside a silence stays put; silences beyond snap_sec are ignored
+    segs = [{"start": 0.0, "end": 40.0}]
+    spans = [(10.0, 20.0)]
+    silences = [
+        (9.8, 10.2),
+        (26.0, 27.0),
+    ]  # 10.0 sits in silence; 26.5 too far from 20.0
+    kept, cut = excise_spans_from_segments(segs, spans, silences=silences, snap_sec=1.5)
+    assert cut == [(10.0, 20.0)]
+
+
+def test_excise_drops_sub_minimum_shards():
+    segs = [{"start": 9.8, "end": 20.0}]  # only 0.2s precedes the span
+    kept, _ = excise_spans_from_segments(segs, [(10.0, 20.0)], min_keep_sec=0.4)
+    assert kept == []  # 0.2s shard dropped, nothing else remains
+
+
+def test_excise_no_spans_keeps_all():
     segs = [{"start": 0.0, "end": 5.0}]
-    assert drop_segments_in_spans(segs, []) == segs
+    kept, cut = excise_spans_from_segments(segs, [])
+    assert kept == segs and cut == []
 
 
 def test_expand_spans_grabs_rap_in_same_block():
@@ -196,7 +247,7 @@ def test_expand_music_only_span_does_not_eat_following_speech():
     spans = [(148.0, 151.0)]  # pure-instrumental span detected
     out = expand_spans_to_voiced_blocks(segs, spans, expandable=[])
     assert out == [(148.0, 151.0)]  # no expansion
-    kept = drop_segments_in_spans(segs, out)
+    kept, _ = excise_spans_from_segments(segs, out)
     assert {"start": 153.0, "end": 153.8} in kept  # speech preserved
     assert {"start": 155.4, "end": 156.3} in kept
 

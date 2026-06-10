@@ -199,12 +199,18 @@ def decode_to_wav(
     return out
 
 
-def vad_speech_segments(wav_path: Path, *, threshold: float = 0.5) -> list[dict]:
+def vad_speech_segments(
+    wav_path: Path, *, threshold: float = 0.5, min_silence_ms: int | None = None
+) -> list[dict]:
     """silero VAD → speech segments [{start, end}] in seconds.
 
     threshold=0.5 is the silero default, used for chunking. Lowering to ~0.25 catches
     weakly voiced speech (e.g. secondary speaker attenuated by separation) but increases
     false positives on loud BGM, so only lower in specific scenarios.
+
+    min_silence_ms defaults to VAD_MIN_SILENCE_MS (300ms, anti-overchop for chunking).
+    Pass a smaller value (e.g. 100ms) for a fine pass that surfaces brief intra-segment
+    silences — used by song excision to snap cut points into real silence.
     """
     import torch
     from silero_vad import get_speech_timestamps, load_silero_vad
@@ -222,9 +228,30 @@ def vad_speech_segments(wav_path: Path, *, threshold: float = 0.5) -> list[dict]
         sampling_rate=SAMPLE_RATE,
         return_seconds=True,
         threshold=threshold,
-        min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+        min_silence_duration_ms=(
+            VAD_MIN_SILENCE_MS if min_silence_ms is None else min_silence_ms
+        ),
         speech_pad_ms=100,
     )
+
+
+def silence_gaps(
+    segments: list[dict], *, audio_end: float | None = None
+) -> list[tuple[float, float]]:
+    """Complement of speech segments: silence intervals [(start, end)] including file edges.
+
+    Feed with a fine VAD pass (small min_silence_ms) to expose brief pauses; song excision
+    snaps its cut points into these so dialogue words are never bisected. Pure logic.
+    """
+    gaps: list[tuple[float, float]] = []
+    prev = 0.0
+    for seg in segments:
+        if seg["start"] > prev:
+            gaps.append((prev, seg["start"]))
+        prev = max(prev, seg["end"])
+    if audio_end is not None and audio_end > prev:
+        gaps.append((prev, audio_end))
+    return gaps
 
 
 def slice_wav(wav_path: Path, start: float, end: float) -> Path:

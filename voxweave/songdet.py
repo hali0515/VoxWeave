@@ -47,10 +47,12 @@ WIN_SEC = 2.0
 HOP_SEC = 1.0
 GAP_MERGE_SEC = 2.0
 MIN_SPAN_SEC = 3.0
-DROP_OVERLAP = (
-    0.5  # VAD segment is dropped if overlap fraction with a song span >= this
-)
 BLOCK_GAP_SEC = 3.0  # adjacent VAD segments within this gap are treated as one voiced block (for span expansion)
+# Intra-segment excision: PANNs span edges are coarse (2s windows), so cut points are
+# snapped into the nearest real silence within SNAP_SEC (fine-VAD gaps) — the song goes
+# out together with its flanking silence, and dialogue words are never bisected.
+SNAP_SEC = 1.5
+MIN_KEEP_SEC = 0.4  # excised remainders shorter than this are noise shards, dropped
 
 _model = None  # AudioTagging singleton — lazy-loaded, reused within the process
 
@@ -233,27 +235,87 @@ def merge_spans(
     return [(a, b) for a, b in spans if b - a >= min_span]
 
 
-def drop_segments_in_spans(
+def _snap_cut(c: float, silences: list[tuple[float, float]], snap_sec: float) -> float:
+    """Snap a cut point into the nearest real silence within ±snap_sec; return c unchanged if none.
+
+    A point already inside a silence stays put. Otherwise the candidate is the silence
+    midpoint pulled into the snap window (long silences cut at the window edge — still
+    inside the silence, just closer to the song). Pure function."""
+    best, bd = c, None
+    for sa, sb in silences:
+        if sa <= c <= sb:
+            return c  # already in silence — a fine cut point as-is
+        p = min(max((sa + sb) / 2.0, c - snap_sec), c + snap_sec)
+        if p < sa or p > sb:
+            continue  # silence out of snapping reach
+        d = abs(p - c)
+        if bd is None or d < bd:
+            best, bd = p, d
+    return best
+
+
+def excise_spans_from_segments(
     segments: list[dict],
     spans: list[tuple[float, float]],
     *,
-    overlap: float = DROP_OVERLAP,
-) -> list[dict]:
-    """Drop any VAD speech segment whose overlap fraction with any song span is >= overlap; return the kept segments. Pure function."""
-    if not spans:
-        return segments
-    kept = []
+    silences: list[tuple[float, float]] | None = None,
+    snap_sec: float = SNAP_SEC,
+    min_keep_sec: float = MIN_KEEP_SEC,
+) -> tuple[list[dict], list[tuple[float, float]]]:
+    """Cut song spans OUT of VAD segments instead of dropping whole segments.
+
+    A VAD segment often mixes dialogue and song ("speech, brief pause, a hummed bar,
+    speech again" — silero does not split on sub-threshold pauses). Whole-segment
+    dropping loses the dialogue; whole-segment keeping feeds the song to ASR. This
+    excises only the song interval: each segment is split into the parts outside the
+    spans, so flanking dialogue survives with its own timestamps.
+
+    Span edges come from 2s PANNs windows, so each cut point is snapped into the nearest
+    real silence (``silences`` from a fine VAD pass, see chunking.silence_gaps) within
+    ``snap_sec`` — the song leaves together with its flanking silence and dialogue words
+    are never bisected. With no silence in reach the span edge is used as-is. Remainders
+    shorter than ``min_keep_sec`` are dropped as shards.
+
+    Returns ``(kept_segments, cut_spans)``: cut_spans are the snapped intervals actually
+    excised (one per input span, sorted/merged) — use these for chunk grouping and as the
+    final song spans so downstream holes match what was really removed. Pure function.
+    """
+    if not spans or not segments:
+        return segments, list(spans)
+    sil = silences or []
+    cuts: list[tuple[float, float]] = []
+    for a, b in spans:
+        ca, cb = _snap_cut(a, sil, snap_sec), _snap_cut(b, sil, snap_sec)
+        if cb <= ca:  # snapping inverted a brief span — keep the raw edges
+            ca, cb = a, b
+        cuts.append((ca, cb))
+    cuts.sort()
+    merged: list[list[float]] = [list(cuts[0])]
+    for a, b in cuts[1:]:
+        if a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    cut_spans = [(a, b) for a, b in merged]
+
+    kept: list[dict] = []
     for seg in segments:
-        dur = seg["end"] - seg["start"]
-        if dur <= 0:
-            kept.append(seg)
-            continue
-        ov = 0.0
-        for a, b in spans:
-            ov += max(0.0, min(seg["end"], b) - max(seg["start"], a))
-        if ov / dur < overlap:
-            kept.append(seg)
-    return kept
+        pieces = [(seg["start"], seg["end"])]
+        for ca, cb in cut_spans:
+            nxt: list[tuple[float, float]] = []
+            for s, e in pieces:
+                if ca >= e or cb <= s:  # no overlap with this cut
+                    nxt.append((s, e))
+                    continue
+                if s < ca:
+                    nxt.append((s, ca))
+                if cb < e:
+                    nxt.append((cb, e))
+            pieces = nxt
+        for s, e in pieces:
+            if e - s >= min_keep_sec:
+                kept.append({**seg, "start": s, "end": e})
+    return kept, cut_spans
 
 
 def filter_short_spans(

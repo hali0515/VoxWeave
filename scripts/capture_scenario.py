@@ -22,9 +22,14 @@ import json
 from pathlib import Path
 
 from voxweave import backend
-from voxweave.chunking import decode_to_wav, vad_speech_segments
+from voxweave.chunking import decode_to_wav, silence_gaps, vad_speech_segments
 from voxweave import songdet
-from voxweave.pipeline import plan_song_skip, MIN_SONG_SKIP_SEC, MAX_CHUNK_SEC
+from voxweave.pipeline import (
+    plan_song_skip,
+    MIN_SONG_SKIP_SEC,
+    MAX_CHUNK_SEC,
+    SONG_FINE_SILENCE_MS,
+)
 
 import numpy as np
 import soundfile as sf
@@ -70,6 +75,9 @@ def main() -> None:
 
     segs = vad_speech_segments(voc16)
     vad_segs = [[round(s["start"], 3), round(s["end"], 3)] for s in segs]
+    # Fine VAD silences: excision snaps its cut points into these (mirrors pipeline)
+    fine = vad_speech_segments(voc16, min_silence_ms=SONG_FINE_SILENCE_MS)
+    silences = [[round(a, 3), round(b, 3)] for a, b in silence_gaps(fine)]
 
     # Current (correct) behavior -> golden snapshot
     song = songdet.merge_spans(songdet.song_flags(probs), t)
@@ -81,6 +89,7 @@ def main() -> None:
         sing_spans,
         segs,
         speech_spans=speech_spans,
+        silences=[(a, b) for a, b in silences],
         min_skip_sec=MIN_SONG_SKIP_SEC,
         max_chunk_sec=MAX_CHUNK_SEC,
     )
@@ -98,6 +107,7 @@ def main() -> None:
             "music": [round(float(x), 4) for x in music],
         },
         "vad_segs": vad_segs,
+        "silences": silences,
         "assert": {
             "expected_song_spans": [[round(a, 1), round(b, 1)] for a, b in final],
             "speech_present_at": [],  # fill in manually: timestamps where speech should be present (regression anchors)

@@ -41,11 +41,14 @@ def _replay(fx: dict):
         songdet.speech_flags_from_scores(speech, sing, music), t
     )
     segs = [{"start": a, "end": b} for a, b in fx["vad_segs"]]
+    # silences captured by newer fixtures; older ones replay without snapping (None)
+    silences = [(a, b) for a, b in fx["silences"]] if fx.get("silences") else None
     _, final, kept, chunks = plan_song_skip(
         song,
         sing_spans,
         segs,
         speech_spans=speech_spans,
+        silences=silences,
         min_skip_sec=MIN_SONG_SKIP_SEC,
         max_chunk_sec=MAX_CHUNK_SEC,
     )
@@ -81,3 +84,59 @@ def test_scenario_song_skip(path: Path):
         assert c["end"] - c["start"] <= cap + 1e-6, (
             f"{path.stem}: chunk {c['start']:.1f}-{c['end']:.1f} exceeds {cap}s"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Synthetic decision-chain tests (no fixture): short-hum excision inside a dialogue block
+# --------------------------------------------------------------------------- #
+def test_short_hum_excised_within_mixed_segment():
+    # "speech, brief pause, a hummed bar, speech again" inside ONE VAD segment.
+    # The hum (5s singing span, < min_skip_sec) must not absorb the block, must not be
+    # filtered away, and must be cut out of the segment with the dialogue kept.
+    segs = [
+        {"start": 95.0, "end": 99.0},  # earlier dialogue, same voiced block
+        {
+            "start": 100.0,
+            "end": 130.0,
+        },  # mixed: speech 100-112, hum 112-117, speech 117-130
+    ]
+    sing_spans = [(112.0, 117.0)]
+    silences = [(111.7, 112.1), (117.2, 117.6)]  # fine-VAD pauses around the hum
+    _, final, kept, chunks = plan_song_skip(
+        [(112.0, 117.0)],
+        sing_spans,
+        segs,
+        speech_spans=[(100.0, 111.0), (118.0, 130.0)],
+        silences=silences,
+        min_skip_sec=MIN_SONG_SKIP_SEC,
+        max_chunk_sec=MAX_CHUNK_SEC,
+    )
+    # span start 112.0 already sits inside a silence (kept as-is); span end 117.0 is in
+    # speech and snaps to the next silence midpoint 117.4
+    assert final == [(112.0, 117.4)]
+    assert kept == [
+        {"start": 95.0, "end": 99.0},
+        {"start": 100.0, "end": 112.0},  # dialogue before the hum survives
+        {"start": 117.4, "end": 130.0},  # dialogue after the hum survives
+    ]
+    # chunks must not bridge the excised hum (slice_wav cuts contiguously)
+    for c in chunks:
+        assert not (c["start"] < 112.0 and c["end"] > 117.4)
+
+
+def test_short_instrumental_span_still_kept_as_content():
+    # Cecilia guard: a brief pure-instrumental span (not in sing_spans) is still
+    # filtered out entirely — transcribed as content, no excision, no block split.
+    segs = [{"start": 148.5, "end": 156.3}]
+    _, final, kept, chunks = plan_song_skip(
+        [(148.0, 151.0)],
+        [],  # no singing
+        segs,
+        speech_spans=[(153.0, 156.0)],
+        silences=[],
+        min_skip_sec=MIN_SONG_SKIP_SEC,
+        max_chunk_sec=MAX_CHUNK_SEC,
+    )
+    assert final == []
+    assert kept == segs
+    assert chunks == [{"start": 148.5, "end": 156.3, "offset": 148.5}]
