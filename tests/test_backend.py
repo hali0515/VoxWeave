@@ -231,14 +231,19 @@ def test_align_text_routes_ja_to_mms(monkeypatch, tmp_path):
 
 def test_align_blocks_full_mms_distributes_by_alnum(monkeypatch, tmp_path):
     # full-audio single pass -> slice flat units back by alnum char count per block (punctuation/spaces not counted)
-    monkeypatch.setattr(backend, "_read_wav_16k", lambda p: "WAV")
+    import numpy as np
+
+    arr = np.zeros(
+        16000, dtype=np.float32
+    )  # 1s: far under the DP budget -> single pass
+    monkeypatch.setattr(backend, "_read_wav_16k", lambda p: arr)
     monkeypatch.setattr(backend, "_empty_cache", lambda: None)
     flat = [
         {"text": c, "start": float(i), "end": i + 0.5} for i, c in enumerate("ABCDE")
     ]
 
     def _emit(wav, text, iso):
-        assert wav == "WAV" and iso == "ja"
+        assert wav is arr and iso == "ja"
         return flat
 
     monkeypatch.setattr(backend, "_mms_emit_units", _emit)
@@ -247,6 +252,57 @@ def test_align_blocks_full_mms_distributes_by_alnum(monkeypatch, tmp_path):
     out = backend.align_blocks_full_mms(wav, ["AB", "C。", "D E"], "ja")
     assert [len(b) for b in out] == [2, 1, 2]  # punctuation/spaces not counted as alnum
     assert out[0] == flat[0:2] and out[1] == flat[2:3] and out[2] == flat[3:5]
+
+
+def test_align_blocks_full_mms_dp_chunks_over_budget(monkeypatch, tmp_path):
+    # over the DP budget with bounds -> silence-anchored chunks, each its own full pass,
+    # units from later chunks shifted back to absolute time
+    import numpy as np
+
+    sr = backend.MMS_SR
+    arr = np.zeros(40 * sr, dtype=np.float32)  # 40s = 2000 frames
+    monkeypatch.setattr(backend, "_read_wav_16k", lambda p: arr)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    # budget: 1250 frames = 25s; chunk budget 25s * 0.8 = 20s -> must split
+    monkeypatch.setattr(backend, "CTC_MAX_DP_FRAMES", 1250)
+    calls = []
+
+    def _emit(wav, text, iso):
+        calls.append((len(wav), text))
+        chars = text.replace(" ", "")
+        return [
+            {"text": c, "start": float(i), "end": i + 0.5} for i, c in enumerate(chars)
+        ]
+
+    monkeypatch.setattr(backend, "_mms_emit_units", _emit)
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    bounds = [(0.0, 8.0), (10.0, 18.0), (22.0, 30.0), (32.0, 39.0)]
+    out = backend.align_blocks_full_mms(
+        wav, ["AB", "CD", "EF", "GH"], "ja", bounds=bounds
+    )
+    # split lands in the 18->22 gap (midpoint 20s): two chunks of 20s audio each
+    assert calls == [(20 * sr, "AB CD"), (20 * sr, "EF GH")]
+    assert [len(b) for b in out] == [2, 2, 2, 2]
+    assert out[0][0] == {"text": "A", "start": 0.0, "end": 0.5}
+    # second chunk's units are offset by its 20s crop start
+    assert out[2][0] == {"text": "E", "start": 20.0, "end": 20.5}
+    assert out[3][1] == {"text": "H", "start": 23.0, "end": 23.5}
+
+
+def test_align_blocks_full_mms_over_budget_without_bounds_raises(monkeypatch, tmp_path):
+    import numpy as np
+
+    arr = np.zeros(40 * backend.MMS_SR, dtype=np.float32)
+    monkeypatch.setattr(backend, "_read_wav_16k", lambda p: arr)
+    monkeypatch.setattr(backend, "CTC_MAX_DP_FRAMES", 1250)
+    monkeypatch.setattr(
+        backend, "_mms_emit_units", lambda *a: pytest.fail("must not emit")
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match="DP budget"):
+        backend.align_blocks_full_mms(wav, ["AB", "CD"], "ja")
 
 
 def test_distribute_units_nospace_vs_spaced():
@@ -822,27 +878,33 @@ def _fake_invocab():
     return {c: i for i, c in enumerate(_FAKE_LABELS) if i not in (0, sep)}, sep
 
 
-def test_ctc_tokens_wordlevel_and_oov():
-    invocab, sep = _fake_invocab()
-    toks, meta, words = backend._ctc_tokens("Don't well-known cafe, 2", invocab, sep)
+_FakeCtcAl = collections.namedtuple("_FakeCtcAl", "invocab")
+
+
+def test_ctc_build_tokens_wordlevel_star_and_oov():
+    al = _FakeCtcAl(invocab=_fake_invocab()[0])
+    toks, meta, words = backend._ctc_build_tokens(
+        ["Don't well-known cafe, 2"], False, al
+    )
     assert words == ["Don't", "well-known", "cafe,", "2"]
     assert max(m for m in meta if m >= 0) == 3  # 4 words -> word_idx 0..3
+    assert meta.count(-1) == 5  # <star> at both edges + every word boundary
     assert 0 not in [
         t for t in toks if t is not None
     ]  # hyphen does not mis-hit blank(0)
-    # '-' in well-known (word_idx 1) is OOV -> None
+    # '-' in well-known (word_idx 1) is OOV -> None (wildcard)
     assert any(t is None for t, m in zip(toks, meta) if m == 1)
     # apostrophe is in invocab -> all chars in Don't have non-OOV tokens
     assert all(t is not None for t, m in zip(toks, meta) if m == 0)
 
 
-def test_ctc_tokens_collapses_multispace_and_strips():
-    invocab, sep = _fake_invocab()
-    toks, meta, words = backend._ctc_tokens("  a   b  ", invocab, sep)
+def test_ctc_build_tokens_collapses_multispace_and_strips():
+    al = _FakeCtcAl(invocab=_fake_invocab()[0])
+    toks, meta, words = backend._ctc_build_tokens(["  a   b  "], False, al)
     assert words == ["a", "b"] and max(m for m in meta if m >= 0) == 1
     assert (
-        meta.count(-1) == 1
-    )  # exactly one separator between words (multiple spaces collapsed, leading/trailing stripped)
+        meta.count(-1) == 3
+    )  # stars only at edges and the single word boundary (multiple spaces collapsed)
 
 
 def test_strip_trailing_punct():
@@ -933,46 +995,46 @@ def test_release_clears_ctc(monkeypatch):
 # --------------------------------------------------------------------------- #
 # Japanese (no-space) CTC: per-char tokenization + OOV interpolation fallback (Phase B)
 # --------------------------------------------------------------------------- #
-def test_ctc_tokens_nospace_basic():
-    vocab = {c: i for i, c in enumerate("私の学校はいええ")}
-    toks, meta, words = backend._ctc_tokens_nospace("私の学校", vocab)
+def test_ctc_build_tokens_nospace_per_char():
+    al = _FakeCtcAl(invocab={c: i for i, c in enumerate("私の学校はいええ")})
+    toks, meta, words = backend._ctc_build_tokens(["私の学校"], True, al)
     assert words == ["私", "の", "学", "校"]
-    assert meta == [0, 1, 2, 3]  # per-char, no separator -1
-    assert all(t is not None for t in toks)
+    assert [m for m in meta if m >= 0] == [0, 1, 2, 3]  # per-char word indices
+    assert meta.count(-1) == 5  # <star> at both edges + after every char
+    assert all(t is not None for t, m in zip(toks, meta) if m >= 0)
 
 
-def test_ctc_tokens_nospace_skips_punct_and_space():
-    vocab = {c: i for i, c in enumerate("はいええ")}
-    toks, meta, words = backend._ctc_tokens_nospace("はい。 ええ", vocab)
+def test_ctc_build_tokens_nospace_skips_punct_and_space():
+    al = _FakeCtcAl(invocab={c: i for i, c in enumerate("はいええ")})
+    toks, meta, words = backend._ctc_build_tokens(["はい。 ええ"], True, al)
     assert words == [
         "は",
         "い",
         "え",
         "え",
     ]  # 。 and space are skipped, do not become tokens/units
-    assert meta == [0, 1, 2, 3]
-    assert len(toks) == 4
+    assert [m for m in meta if m >= 0] == [0, 1, 2, 3]
 
 
-def test_ctc_tokens_nospace_oov_keeps_char():
-    vocab = {c: i for i, c in enumerate("私の")}  # 学/校 not in vocab -> OOV
-    toks, meta, words = backend._ctc_tokens_nospace("私の学校", vocab)
+def test_ctc_build_tokens_nospace_oov_keeps_char():
+    al = _FakeCtcAl(invocab={c: i for i, c in enumerate("私の")})  # 学/校 OOV
+    toks, meta, words = backend._ctc_build_tokens(["私の学校"], True, al)
     assert words == [
         "私",
         "の",
         "学",
         "校",
     ]  # OOV chars still enter words, no character dropped
-    assert toks[2] is None and toks[3] is None  # 学/校 OOV -> None (wildcard path)
-    assert meta == [0, 1, 2, 3]
+    real = [t for t, m in zip(toks, meta) if m >= 0]
+    assert real[2] is None and real[3] is None  # 学/校 OOV -> None (wildcard path)
 
 
-def test_ctc_tokens_nospace_no_casing_on_latin():
+def test_ctc_build_tokens_nospace_no_casing_on_latin():
     # critical invariant: no .lower()/.upper() (xlsr-ja vocab has uppercase A/C/P only; lowercasing would make them OOV)
-    vocab = {"A": 10, "C": 11, "P": 12, "私": 13}
-    toks, _, words = backend._ctc_tokens_nospace("A私", vocab)
+    al = _FakeCtcAl(invocab={"A": 10, "C": 11, "P": 12, "私": 13})
+    toks, meta, words = backend._ctc_build_tokens(["A私"], True, al)
     assert words == ["A", "私"]
-    assert toks == [
+    assert [t for t, m in zip(toks, meta) if m >= 0] == [
         10,
         13,
     ]  # A hits directly without case-folding; .lower() would turn it into OOV

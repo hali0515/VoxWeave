@@ -721,24 +721,26 @@ def _align_blocks(
 
     Per-cue slices are appended to ``tmp_chunks`` for the caller's ``finally`` to clean up.
     """
+    # cue (start,end) bounds are used ONLY as silence anchors to split movie-length audio
+    # into memory-sized chunks when it overflows the single-pass DP budget — NOT to crop/route
+    # per cue. align is routing-free because the input VTT timestamps are exactly what may be
+    # wrong (the reason to re-align); the global DP self-locates every word. None for cues
+    # without timestamps. See memory voxweave-alignment-timing.
+    bounds = [
+        (b["start"], b["end"])
+        if b["start"] is not None and b["end"] is not None
+        else None
+        for b in blocks
+    ]
     if mms:
         reporter.task("full-file alignment (MMS)", 1)
-        units = backend.align_blocks_full_mms(wav, [b["text"] for b in blocks], iso)
+        units = backend.align_blocks_full_mms(
+            wav, [b["text"] for b in blocks], iso, bounds=bounds
+        )
         reporter.advance(1)
         return units
     if ctc_model:  # en wav2vec2: windowed emission + single global DP (routing-free)
         reporter.task("full-file alignment (CTC)", 1)
-        # cue (start,end) bounds are used ONLY as silence anchors to split movie-length audio
-        # into memory-sized chunks when it overflows the single-pass DP budget — NOT to crop/route
-        # per cue. align is routing-free because the input VTT timestamps are exactly what may be
-        # wrong (the reason to re-align); the global DP self-locates every word. None for cues
-        # without timestamps. See memory voxweave-alignment-timing.
-        bounds = [
-            (b["start"], b["end"])
-            if b["start"] is not None and b["end"] is not None
-            else None
-            for b in blocks
-        ]
         units = backend.align_blocks_full_ctc(
             wav, [b["text"] for b in blocks], iso, ctc_model, bounds=bounds
         )

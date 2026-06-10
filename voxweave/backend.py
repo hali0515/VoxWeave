@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 from collections import namedtuple
+from collections.abc import Sequence
 from pathlib import Path
 
 from voxweave import config
@@ -810,58 +811,6 @@ def _strip_trailing_punct(word: str) -> str:
     return word[:i] or word
 
 
-def _ctc_tokens(
-    text: str, invocab: dict[str, int], sep_id: int
-) -> tuple[list[int | None], list[int], list[str]]:
-    """English text -> (token ids, per-token word idx, word list).
-
-    Spaces -> sep_id (meta=-1); one separator per word boundary, multiple spaces collapsed.
-    Characters looked up in invocab uppercased; miss -> None (OOV -> wildcard downstream).
-    invocab excludes blank/sep so hyphen falls to OOV rather than colliding with blank.
-    word idx 1:1 with text.split(). Pure logic.
-    """
-    text = text.strip()
-    words = text.split()
-    toks: list[int | None] = []
-    meta: list[int] = []
-    widx = 0
-    n = len(text)
-    for i, ch in enumerate(text):
-        if ch == " ":
-            if toks and meta[-1] != -1:  # one separator per word boundary
-                toks.append(sep_id)
-                meta.append(-1)
-            continue
-        toks.append(invocab.get(ch.upper()))
-        meta.append(widx)
-        if i == n - 1 or text[i + 1] == " ":
-            widx += 1
-    return toks, meta, words
-
-
-def _ctc_tokens_nospace(
-    text: str, invocab: dict[str, int]
-) -> tuple[list[int | None], list[int], list[str]]:
-    """No-space languages (ja/zh/yue) -> per-char (text/meta/words 1:1 per alnum char).
-
-    Whitespace and punctuation skipped (strip-punctuation invariant; reinject_punct interpolates
-    timing from neighbors downstream). OOV chars -> None (wildcard). No case-folding: xlsr-ja
-    vocab has uppercase A/C/P only, .lower() would make them OOV. Pure logic.
-    """
-    toks: list[int | None] = []
-    meta: list[int] = []
-    words: list[str] = []
-    widx = 0
-    for ch in text.strip():
-        if ch.isspace() or not ch.isalnum():
-            continue
-        toks.append(invocab.get(ch))
-        meta.append(widx)
-        words.append(ch)
-        widx += 1
-    return toks, meta, words
-
-
 def interp_missing(units: list[dict]) -> list[dict]:
     """Fill zero-length spans (end<=start) by linear interpolation from neighboring valid spans. Never drops a unit.
 
@@ -1138,44 +1087,32 @@ def _ctc_full_pass(
     return _distribute_units(units, norm, iso)
 
 
-def align_blocks_full_ctc(
-    wav_path: Path,
-    texts: list[str],
-    iso: str,
-    model_name: str,
-    bounds: list[tuple[float, float] | None] | None = None,
+def _dp_chunked_pass(
+    wav,
+    sr: int,
+    norm: list[str],
+    bounds: Sequence[tuple[float, float] | None] | None,
+    pass_fn,
+    label: str,
 ) -> list[list[dict]]:
-    """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
+    """Run `pass_fn(wav_slice, texts) -> per-block units` under the global-DP memory budget.
 
-    Runs ONE windowed-emission + global forced_align over the whole audio, then slices flat
-    units back to each block by word/char count. The global monotone CTC path self-locates every
-    word, immune to the per-cue cropping drift that crammed words into dead air (en "blocks"
-    displaced into a 2.6s silence); inter-cue stars absorb untranscribed gaps (music/silence
-    between cues) so the path never stretches a real word across a gap. Units are absolute
-    timestamps relative to the full wav.
-
-    The single DP is O(T*L), which overflows on movie-length audio. When `frames` exceeds
-    CTC_MAX_DP_FRAMES and cue `bounds` (per-cue (start,end), aligned with `texts`) are available,
-    the audio is split at silence anchors (plan_dp_chunks): each chunk re-runs the full pass over
-    its own crop (within-chunk routing-free, so drift-immunity holds) and units are offset back to
-    absolute time. Boundaries land in inter-cue silence, so no word crosses them. Without bounds an
-    over-budget file is rejected (raise VOXWEAVE_CTC_MAX_DP_FRAMES to force a single pass).
+    Shared by the wav2vec2 and MMS full-pass aligners: both end in a single forced-align
+    trellis that is O(T*L) and overflows on movie-length audio. Within budget the whole wav
+    goes through one pass. Past CTC_MAX_DP_FRAMES, cue `bounds` (per-cue (start,end), aligned
+    with `norm`) are used as silence anchors to split the audio (plan_dp_chunks): each chunk
+    re-runs the full pass over its own crop (within-chunk routing-free, so drift-immunity
+    holds) and units are offset back to absolute time. Boundaries land in inter-cue silence,
+    so no word crosses them. Without bounds an over-budget file is rejected (raise
+    VOXWEAVE_CTC_MAX_DP_FRAMES to force a single pass). `wav` may be a torch tensor or a
+    numpy array; only 1D slicing and shape[-1] are used.
     """
     from voxweave.chunking import plan_dp_chunks
-    from voxweave.realign import NO_SPACE_LANGS
     from voxweave.timestamps import shift_units
 
-    al = _get_ctc_aligner(iso, model_name)
-    nospace = iso in NO_SPACE_LANGS
-    norm = [(t or "").strip() for t in texts]
-
-    wav = _load_mono(wav_path, al.sr)
-    sr = al.sr
     frames = wav.shape[-1] / _CTC_STRIDE
     if frames <= CTC_MAX_DP_FRAMES:
-        out = _ctc_full_pass(al, wav, norm, nospace, iso)
-        _empty_cache()
-        return out
+        return pass_fn(wav, norm)
 
     if not bounds or len(bounds) != len(norm):
         raise RuntimeError(
@@ -1188,7 +1125,8 @@ def align_blocks_full_ctc(
     budget_sec = CTC_MAX_DP_FRAMES * _CTC_STRIDE / sr * CTC_DP_CHUNK_FRAC
     plans = plan_dp_chunks(bounds, max_sec=budget_sec, audio_end=total_sec)
     log.info(
-        "CTC DP-chunking %.0fmin audio into %d silence-anchored chunks (budget ~%.0fmin)",
+        "%s DP-chunking %.0fmin audio into %d silence-anchored chunks (budget ~%.0fmin)",
+        label,
         total_sec / 60,
         len(plans),
         budget_sec / 60,
@@ -1197,11 +1135,42 @@ def align_blocks_full_ctc(
     for p in plans:
         a = max(0, int(p["start"] * sr))
         b = min(wav.shape[-1], int(p["end"] * sr))
-        sub = _ctc_full_pass(al, wav[a:b], norm[p["lo"] : p["hi"]], nospace, iso)
+        sub = pass_fn(wav[a:b], norm[p["lo"] : p["hi"]])
         offset = a / sr
         out.extend(shift_units(u, offset) for u in sub)
-        _empty_cache()
     return out
+
+
+def align_blocks_full_ctc(
+    wav_path: Path,
+    texts: list[str],
+    iso: str,
+    model_name: str,
+    bounds: Sequence[tuple[float, float] | None] | None = None,
+) -> list[list[dict]]:
+    """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
+
+    Runs ONE windowed-emission + global forced_align over the whole audio, then slices flat
+    units back to each block by word/char count. The global monotone CTC path self-locates every
+    word, immune to the per-cue cropping drift that crammed words into dead air (en "blocks"
+    displaced into a 2.6s silence); inter-cue stars absorb untranscribed gaps (music/silence
+    between cues) so the path never stretches a real word across a gap. Units are absolute
+    timestamps relative to the full wav. Movie-length audio is DP-chunked at silence anchors
+    via cue `bounds` (see _dp_chunked_pass).
+    """
+    from voxweave.realign import NO_SPACE_LANGS
+
+    al = _get_ctc_aligner(iso, model_name)
+    nospace = iso in NO_SPACE_LANGS
+    norm = [(t or "").strip() for t in texts]
+    wav = _load_mono(wav_path, al.sr)
+
+    def _pass(w, sub: list[str]) -> list[list[dict]]:
+        out = _ctc_full_pass(al, w, sub, nospace, iso)
+        _empty_cache()
+        return out
+
+    return _dp_chunked_pass(wav, al.sr, norm, bounds, _pass, "CTC")
 
 
 def align_text_ctc(wav_path: Path, text: str, iso: str, model_name: str) -> list[dict]:
@@ -1209,7 +1178,10 @@ def align_text_ctc(wav_path: Path, text: str, iso: str, model_name: str) -> list
 
     Spaced langs -> word-level units. No-space langs (NO_SPACE_LANGS) -> per-char units
     (punctuation skipped; OOV kanji use wildcard; missing spans filled by interp_missing).
-    Forward pass branches on al.kind for torchaudio bundle vs HF Wav2Vec2.
+    Same star-interleaved full pass as the align subcommand (_ctc_full_pass with a single
+    text): a wildcard at every word boundary absorbs intra-chunk gaps (pauses the ASR did
+    not transcribe) instead of cramming the next word forward, and the windowed emission
+    bounds the encoder's O(T^2) self-attention on long chunks.
     Exceptions propagate; align_text catches and falls back to Qwen.
     """
     from voxweave.realign import NO_SPACE_LANGS
@@ -1219,16 +1191,8 @@ def align_text_ctc(wav_path: Path, text: str, iso: str, model_name: str) -> list
         return []
     al = _get_ctc_aligner(iso, model_name)
     nospace = iso in NO_SPACE_LANGS
-    if nospace:
-        toks, meta, words = _ctc_tokens_nospace(text, al.invocab)
-    else:
-        toks, meta, words = _ctc_tokens(text, al.invocab, al.sep_id)
-    if not words or all(m < 0 for m in meta):
-        return []
-
     wav = _load_mono(wav_path, al.sr)
-    logp = _ctc_logp(al, wav)
-    units = _ctc_align_logp(al, logp, toks, meta, words, nospace, wav.shape[-1])
+    units = _ctc_full_pass(al, wav, [text], nospace, iso)[0]
     _empty_cache()
     return units
 
@@ -1365,7 +1329,10 @@ def align_text_mms(wav_path: Path, text: str, iso: str) -> list[dict]:
 
 
 def align_blocks_full_mms(
-    wav_path: Path, texts: list[str], iso: str
+    wav_path: Path,
+    texts: list[str],
+    iso: str,
+    bounds: Sequence[tuple[float, float] | None] | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass MMS alignment (equivalent to whisperx align_ctc).
 
@@ -1378,13 +1345,24 @@ def align_blocks_full_mms(
     malloc assert; crash point varies = cumulative, not input-specific). whisperx avoids this by
     running full-audio in one pass; we do the same.
     Units are absolute timestamps relative to the full wav.
+
+    generate_emissions windows the encoder internally, but get_alignments still builds one
+    full-length O(T*L) trellis — the same movie-length wall as the wav2vec2 path. Past
+    CTC_MAX_DP_FRAMES (MMS-300m is a wav2vec2 backbone: same 320x downsample at 16k, so the
+    budget applies unchanged) the audio is DP-chunked at silence anchors via cue `bounds`
+    (see _dp_chunked_pass). The handful of resulting large ONNX calls stays far below the
+    ~180-call heap-corruption regime.
     """
     wav = _read_wav_16k(wav_path)
     norm = [(t or "").strip() for t in texts]
-    full = " ".join(t for t in norm if t)
-    flat = _mms_emit_units(wav, full, iso)
-    _empty_cache()
-    return _distribute_units(flat, norm, iso)
+
+    def _pass(w, sub: list[str]) -> list[list[dict]]:
+        full = " ".join(t for t in sub if t)
+        flat = _mms_emit_units(w, full, iso)
+        _empty_cache()
+        return _distribute_units(flat, sub, iso)
+
+    return _dp_chunked_pass(wav, MMS_SR, norm, bounds, _pass, "MMS")
 
 
 def _distribute_units(flat: list[dict], texts: list[str], iso: str) -> list[list[dict]]:
