@@ -14,6 +14,7 @@ pause crossed) — forward for leading interjections, backward for tail fragment
 
 from __future__ import annotations
 
+import bisect
 import functools
 import logging
 import re
@@ -931,6 +932,10 @@ class SplitThresholds:
     # constructions (tests/legacy) preserve exact timing.
     cps: float = 0.0
     lag_out_s: float = 0.0
+    # Shot-change snap window (0 = off): a cue boundary within this of a detected
+    # cut moves onto it (see _snap_to_shots). Only consulted when the caller
+    # passes shot_changes.
+    shot_snap_s: float = 0.24
 
     @classmethod
     def from_mapping(cls, d: dict) -> SplitThresholds:
@@ -1121,6 +1126,74 @@ def _cleanup_cues(
     return out
 
 
+def _snap_to_shots(
+    cues: List[Dict[str, Any]],
+    shots: List[float],
+    *,
+    snap_s: float,
+    max_cue_s: float,
+) -> List[Dict[str, Any]]:
+    """Snap cue boundaries onto nearby shot changes (runs after _cleanup_cues).
+
+    A boundary within ``snap_s`` of a cut moves onto it, but never at speech's
+    expense:
+
+    - start: moving *earlier* to the cut is a free lead-in (bounded by the
+      previous cue end + 2 frames); moving *later* (pre-cut flash removal) is
+      bounded by ``snap_s`` and must stay below the cue's end.
+    - end: extending to cut - 2 frames is free inside the following gap (and
+      the duration cap); pulling back to cut - 2 frames must not cut speech
+      (never below the last word's end).
+
+    Cues then change exactly on the cut instead of flashing across it.
+    """
+    if snap_s <= 0 or not shots:
+        return cues
+    out = [dict(c) for c in cues]
+
+    def nearest(t: float) -> float | None:
+        i = bisect.bisect_left(shots, t)
+        best: float | None = None
+        for j in (i - 1, i):
+            if 0 <= j < len(shots) and abs(shots[j] - t) <= snap_s:
+                if best is None or abs(shots[j] - t) < abs(best - t):
+                    best = shots[j]
+        return best
+
+    for i, c in enumerate(out):
+        start, end = c.get("start"), c.get("end")
+        if start is None or end is None:
+            continue
+        words = [w for w in c.get("word_data") or [] if w.get("end") is not None]
+        speech_end = max((w["end"] for w in words), default=end)
+        prev_end = out[i - 1].get("end") if i > 0 else None
+        nxt_start = out[i + 1].get("start") if i + 1 < len(out) else None
+
+        cut = nearest(start)
+        if cut is not None and abs(cut - start) > 1e-9:
+            new_start = cut
+            if prev_end is not None:
+                new_start = max(new_start, prev_end + TWO_FRAME_S)
+            if new_start < end - TWO_FRAME_S and (
+                new_start <= start or new_start - start <= snap_s
+            ):
+                c["start"] = new_start
+
+        cut = nearest(end)
+        if cut is not None:
+            target = cut - TWO_FRAME_S
+            if target > end:  # extend to die on the cut
+                if (
+                    (nxt_start is None or target <= nxt_start - TWO_FRAME_S)
+                    and target - c["start"] <= max_cue_s
+                ):
+                    c["end"] = target
+            elif target < end:  # pull back, never cutting speech
+                if target >= speech_end and target > c["start"]:
+                    c["end"] = target
+    return out
+
+
 def smart_split_segments(
     segments: List[Dict[str, Any]],
     lang: str,
@@ -1133,6 +1206,7 @@ def smart_split_segments(
     *,
     speech_spans: list[tuple[float, float]] | None = None,
     thresholds: SplitThresholds | dict | None = None,
+    shot_changes: list[float] | None = None,
 ) -> List[Dict[str, Any]]:
     """Run the full smart-split pipeline over aligned segments.
 
@@ -1198,6 +1272,13 @@ def smart_split_segments(
             cps=th.cps,
             lag_out_s=th.lag_out_s,
         )
+        if shot_changes:
+            cues = _snap_to_shots(
+                cues,
+                sorted(shot_changes),
+                snap_s=th.shot_snap_s,
+                max_cue_s=th.max_cue_s,
+            )
     for cue in cues:
         cue["text"] = _strip_punct_for_subtitles(cue["text"])
         if th is not None:  # stutter merging opt-in alongside gap-aware mode

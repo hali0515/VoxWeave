@@ -248,6 +248,7 @@ _GLUE_GAP_DEFAULT_MS = 300  # lone-word flicker cue glues back if gap < this (0=
 _CPS_DEFAULTS = {"ja": 7.0, "zh": 9.0, "ko": 9.0}
 _CPS_LATIN_DEFAULT = 17.0  # ~Netflix 20 cps incl. spaces, measured without spaces
 _LAG_OUT_DEFAULT_MS = 250  # flat tail pad after speech ends (0=off)
+_SHOT_SNAP_DEFAULT_MS = 240  # cue boundary within this of a shot change snaps onto it (0=off)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -286,6 +287,7 @@ def gap_thresholds(iso: str) -> dict[str, int | float]:
     glue_gap = _env_int("VOXWEAVE_GLUE_GAP_MS", _GLUE_GAP_DEFAULT_MS) / 1000.0
     cps = _env_float("VOXWEAVE_CPS", _CPS_DEFAULTS.get(iso, _CPS_LATIN_DEFAULT))
     lag_out = _env_int("VOXWEAVE_LAG_OUT_MS", _LAG_OUT_DEFAULT_MS) / 1000.0
+    shot_snap = _env_int("VOXWEAVE_SHOT_SNAP_MS", _SHOT_SNAP_DEFAULT_MS) / 1000.0
     return {
         "clause_ms": clause,
         "vad_skip_ms": skip,
@@ -295,4 +297,5 @@ def gap_thresholds(iso: str) -> dict[str, int | float]:
         "glue_gap_s": glue_gap,
         "cps": cps,
         "lag_out_s": lag_out,
+        "shot_snap_s": shot_snap,
     }

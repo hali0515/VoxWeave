@@ -518,15 +518,21 @@ def _dump_sibling_json(
     segments: list[dict],
     units: list[dict],
     vad_speech: list[tuple[float, float]] | None,
+    shot_changes: list[float] | None = None,
 ) -> None:
-    """Write the sibling JSON document (language + segments + word_segments + optional vad_speech).
+    """Write the sibling JSON document (language + segments + word_segments + optional
+    vad_speech / shot_changes).
 
-    ``vad_speech=None`` omits the key; a list (even empty) writes it coerced to ``[[float, float], ...]``.
+    ``vad_speech=None`` omits the key; a list (even empty) writes it coerced to
+    ``[[float, float], ...]``. ``shot_changes`` behaves the same (written only when not
+    None, so ``split`` can replay shot snapping without re-decoding the video).
     Single source of truth for the sibling-JSON shape shared by process and align.
     """
     data: dict = {"language": language, "segments": segments, "word_segments": units}
     if vad_speech is not None:
         data["vad_speech"] = [[float(s), float(e)] for s, e in vad_speech]
+    if shot_changes is not None:
+        data["shot_changes"] = [float(t) for t in shot_changes]
     json_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -539,6 +545,7 @@ def _write_siblings(
     lang: str,
     vad_speech: list[tuple[float, float]] | None = None,
     timestamps: bool = True,
+    shot_changes: list[float] | None = None,
 ) -> Path:
     """Write sibling .json (ground truth) and .vtt alongside src; return the .vtt path.
 
@@ -554,6 +561,7 @@ def _write_siblings(
         segments=cues,
         units=units,
         vad_speech=vad_speech or [],
+        shot_changes=shot_changes,
     )
     rows = [
         (
@@ -596,14 +604,17 @@ def process(
     asr_model: str | None = None,
     context: str | None = None,
     timestamps: bool = True,
+    shot_snap: bool = True,
 ) -> Path:
     """Full pipeline: transcribe -> smart_split -> write siblings. Return the .vtt path.
 
-    Pass ``word_segments`` to skip transcription (tests / special cases).
+    Pass ``word_segments`` to skip transcription (tests / special cases); that path
+    also skips shot detection (no media decode in unit tests).
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
     vad_speech: list[tuple[float, float]] | None = None
+    shot_changes: list[float] | None = None
     if word_segments is not None:
         iso, units = word_segments
     else:
@@ -619,6 +630,11 @@ def process(
             asr_model=asr_model,
             context=context,
         )
+        if shot_snap:
+            from voxweave import shotdet
+
+            rep.stage("shot detection")
+            shot_changes = shotdet.detect_shot_changes(media_path)
 
     from voxweave.core.smart_split import smart_split_segments
     from voxweave.config import gap_thresholds
@@ -629,12 +645,22 @@ def process(
     seg = _units_to_seg(units, iso)
     rep.stage("smart_split layout")
     cues = smart_split_segments(
-        [seg], lang=iso, speech_spans=vad_speech, thresholds=gap_thresholds(iso)
+        [seg],
+        lang=iso,
+        speech_spans=vad_speech,
+        thresholds=gap_thresholds(iso),
+        shot_changes=shot_changes,
     )
 
     rep.stage("write siblings")
     vtt_out = _write_siblings(
-        media_path, cues, units, iso, vad_speech=vad_speech, timestamps=timestamps
+        media_path,
+        cues,
+        units,
+        iso,
+        vad_speech=vad_speech,
+        timestamps=timestamps,
+        shot_changes=shot_changes,
     )
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
     return vtt_out
@@ -656,6 +682,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
     units = data["word_segments"]
     iso = data.get("language", "en")
     speech_spans = _spans_in(data.get("vad_speech"))
+    shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     units = realign.snap_break_punct(
         units, iso
     )  # zh: snap to jieba boundary (same as process)
@@ -665,10 +692,17 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
         lang=iso,
         speech_spans=speech_spans,
         thresholds=gap_thresholds(iso),
+        shot_changes=shot_changes,
         **smart_split_kwargs,
     )
     vtt_out = _write_siblings(
-        json_path, cues, units, iso, vad_speech=speech_spans, timestamps=timestamps
+        json_path,
+        cues,
+        units,
+        iso,
+        vad_speech=speech_spans,
+        timestamps=timestamps,
+        shot_changes=shot_changes,
     )
     log.info("re-split %s → %d cues", vtt_out.name, len(cues))
     return vtt_out
@@ -723,9 +757,11 @@ def _write_align_json(
     units: list[dict],
     lang: str,
     vad_speech: list[tuple[float, float]] | None = None,
+    shot_changes: list[float] | None = None,
 ) -> None:
-    """Update the sibling JSON with new alignment timing. Passes vad_speech through so
-    split and subsequent align runs can reuse it without recomputing.
+    """Update the sibling JSON with new alignment timing. Passes vad_speech and
+    shot_changes through so split and subsequent align runs can reuse them without
+    recomputing.
     """
     segments = [
         {"text": b["text"], "start": a, "end": e} for b, (a, e) in zip(blocks, spans)
@@ -736,6 +772,7 @@ def _write_align_json(
         segments=segments,
         units=units,
         vad_speech=vad_speech,
+        shot_changes=shot_changes,
     )
 
 
@@ -906,10 +943,13 @@ def align(
 
         rep.stage("write VTT + JSON")
         vtt_path.write_text(realign.render_vtt(blocks, spans_filled), encoding="utf-8")
-        # Preserve vad_speech from the original JSON (computed by transcribe from original
-        # audio; align does not recompute it).
+        # Preserve vad_speech / shot_changes from the original JSON (computed by
+        # transcribe from the original media; align does not recompute them).
         keep_vad = _spans_in(data.get("vad_speech"))
-        _write_align_json(json_path, blocks, spans_filled, all_units, iso, keep_vad)
+        keep_shots = [float(t) for t in data.get("shot_changes") or []] or None
+        _write_align_json(
+            json_path, blocks, spans_filled, all_units, iso, keep_vad, keep_shots
+        )
         log.info(
             "aligned %s → %d cues, %d units", vtt_path.name, len(blocks), len(all_units)
         )

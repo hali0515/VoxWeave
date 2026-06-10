@@ -199,6 +199,14 @@ def cli(verbose: bool) -> None:
     help="Include word-level timestamps in VTT (default: on, same precision as align output, ready to use)."
     " Use --no-timestamps for a plain-text editing draft; run align afterwards to re-assign timing.",
 )
+@click.option(
+    "--shot-snap/--no-shot-snap",
+    default=True,
+    help="Detect video shot changes (one downscaled ffmpeg pass) and snap nearby cue"
+    " boundaries onto the cuts, so subtitles change on the cut instead of flashing across"
+    " it (default: on; audio-only media skips automatically). Cut times persist to the"
+    " sibling JSON for `split` re-runs; window via VOXWEAVE_SHOT_SNAP_MS.",
+)
 def cmd_transcribe(
     media: Path,
     language: str | None,
@@ -210,6 +218,7 @@ def cmd_transcribe(
     context: str | None,
     hybrid: bool,
     timestamps: bool,
+    shot_snap: bool,
 ) -> None:
     """Media -> (vocal separation) -> VAD -> local ASR/alignment -> smart_split -> write VTT+JSON."""
     out = _run(
@@ -224,6 +233,7 @@ def cmd_transcribe(
             asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
             context=context,
             timestamps=timestamps,
+            shot_snap=shot_snap,
         )
     )
     dbg_dir = Path("debug") / media.stem if debug else None
