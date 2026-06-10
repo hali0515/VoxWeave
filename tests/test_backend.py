@@ -2,7 +2,7 @@
 
 import pytest
 
-from voxweave import backend
+from voxweave import align_common, align_ctc, align_mms, backend, runtime
 
 
 @pytest.fixture(autouse=True)
@@ -184,11 +184,11 @@ def test_uses_mms_ja_yes_en_no(monkeypatch):
 
 def test_mms_providers_cuda_uses_gpu():
     # CUDA build: GPU provider first, CPU fallback.
-    assert backend._mms_providers("cuda") == [
+    assert align_mms._mms_providers("cuda") == [
         "CUDAExecutionProvider",
         "CPUExecutionProvider",
     ]
-    assert backend._mms_providers("cuda:0") == [
+    assert align_mms._mms_providers("cuda:0") == [
         "CUDAExecutionProvider",
         "CPUExecutionProvider",
     ]
@@ -197,11 +197,11 @@ def test_mms_providers_cuda_uses_gpu():
 def test_mms_providers_mps_uses_cpu_not_coreml():
     # macOS/MPS: CPU only. CoreML is deliberately NOT selected -- its Metal context segfaults
     # when it coexists with MLX (per-chunk MLX ASR + MMS align in one process).
-    assert backend._mms_providers("mps") == ["CPUExecutionProvider"]
+    assert align_mms._mms_providers("mps") == ["CPUExecutionProvider"]
 
 
 def test_mms_providers_cpu():
-    assert backend._mms_providers("cpu") == ["CPUExecutionProvider"]
+    assert align_mms._mms_providers("cpu") == ["CPUExecutionProvider"]
 
 
 def test_align_text_routes_ja_to_mms(monkeypatch, tmp_path):
@@ -236,7 +236,7 @@ def test_align_blocks_full_mms_distributes_by_alnum(monkeypatch, tmp_path):
     arr = np.zeros(
         16000, dtype=np.float32
     )  # 1s: far under the DP budget -> single pass
-    monkeypatch.setattr(backend, "_read_wav_16k", lambda p: arr)
+    monkeypatch.setattr(align_mms, "_read_wav_16k", lambda p: arr)
     monkeypatch.setattr(backend, "_empty_cache", lambda: None)
     flat = [
         {"text": c, "start": float(i), "end": i + 0.5} for i, c in enumerate("ABCDE")
@@ -246,7 +246,7 @@ def test_align_blocks_full_mms_distributes_by_alnum(monkeypatch, tmp_path):
         assert wav is arr and iso == "ja"
         return flat
 
-    monkeypatch.setattr(backend, "_mms_emit_units", _emit)
+    monkeypatch.setattr(align_mms, "_mms_emit_units", _emit)
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
     out = backend.align_blocks_full_mms(wav, ["AB", "C。", "D E"], "ja")
@@ -259,12 +259,12 @@ def test_align_blocks_full_mms_dp_chunks_over_budget(monkeypatch, tmp_path):
     # units from later chunks shifted back to absolute time
     import numpy as np
 
-    sr = backend.MMS_SR
+    sr = align_mms.MMS_SR
     arr = np.zeros(40 * sr, dtype=np.float32)  # 40s = 2000 frames
-    monkeypatch.setattr(backend, "_read_wav_16k", lambda p: arr)
+    monkeypatch.setattr(align_mms, "_read_wav_16k", lambda p: arr)
     monkeypatch.setattr(backend, "_empty_cache", lambda: None)
     # budget: 1250 frames = 25s; chunk budget 25s * 0.8 = 20s -> must split
-    monkeypatch.setattr(backend, "CTC_MAX_DP_FRAMES", 1250)
+    monkeypatch.setattr(align_common, "CTC_MAX_DP_FRAMES", 1250)
     calls = []
 
     def _emit(wav, text, iso):
@@ -274,7 +274,7 @@ def test_align_blocks_full_mms_dp_chunks_over_budget(monkeypatch, tmp_path):
             {"text": c, "start": float(i), "end": i + 0.5} for i, c in enumerate(chars)
         ]
 
-    monkeypatch.setattr(backend, "_mms_emit_units", _emit)
+    monkeypatch.setattr(align_mms, "_mms_emit_units", _emit)
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
     bounds = [(0.0, 8.0), (10.0, 18.0), (22.0, 30.0), (32.0, 39.0)]
@@ -293,11 +293,11 @@ def test_align_blocks_full_mms_dp_chunks_over_budget(monkeypatch, tmp_path):
 def test_align_blocks_full_mms_over_budget_without_bounds_raises(monkeypatch, tmp_path):
     import numpy as np
 
-    arr = np.zeros(40 * backend.MMS_SR, dtype=np.float32)
-    monkeypatch.setattr(backend, "_read_wav_16k", lambda p: arr)
-    monkeypatch.setattr(backend, "CTC_MAX_DP_FRAMES", 1250)
+    arr = np.zeros(40 * align_mms.MMS_SR, dtype=np.float32)
+    monkeypatch.setattr(align_mms, "_read_wav_16k", lambda p: arr)
+    monkeypatch.setattr(align_common, "CTC_MAX_DP_FRAMES", 1250)
     monkeypatch.setattr(
-        backend, "_mms_emit_units", lambda *a: pytest.fail("must not emit")
+        align_mms, "_mms_emit_units", lambda *a: pytest.fail("must not emit")
     )
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
@@ -308,10 +308,10 @@ def test_align_blocks_full_mms_over_budget_without_bounds_raises(monkeypatch, tm
 def test_distribute_units_nospace_vs_spaced():
     flat = [{"text": str(i), "start": float(i), "end": i + 1.0} for i in range(5)]
     # no-space language: by alnum char count (punctuation/spaces not counted)
-    out = backend._distribute_units(flat, ["AB", "C。", "D E"], "ja")
+    out = align_common._distribute_units(flat, ["AB", "C。", "D E"], "ja")
     assert [len(b) for b in out] == [2, 1, 2]
     # spaced language: by word count
-    out2 = backend._distribute_units(flat, ["a b", "c", "d e"], "en")
+    out2 = align_common._distribute_units(flat, ["a b", "c", "d e"], "en")
     assert [len(b) for b in out2] == [2, 1, 2]
 
 
@@ -864,11 +864,11 @@ def test_release_clears_whisper(monkeypatch):
 
 
 def test_parse_whisper_device_splits_cuda_index(monkeypatch):
-    monkeypatch.setattr(backend, "_DEVICE", "cuda:0")
+    monkeypatch.setattr(runtime, "_DEVICE", "cuda:0")
     assert backend._parse_whisper_device() == ("cuda", 0)
-    monkeypatch.setattr(backend, "_DEVICE", "cuda:1")
+    monkeypatch.setattr(runtime, "_DEVICE", "cuda:1")
     assert backend._parse_whisper_device() == ("cuda", 1)
-    monkeypatch.setattr(backend, "_DEVICE", "cpu")
+    monkeypatch.setattr(runtime, "_DEVICE", "cpu")
     assert backend._parse_whisper_device() == ("cpu", 0)
 
 
@@ -1031,7 +1031,7 @@ _FakeCtcAl = collections.namedtuple("_FakeCtcAl", "invocab")
 
 def test_ctc_build_tokens_wordlevel_star_and_oov():
     al = _FakeCtcAl(invocab=_fake_invocab()[0])
-    toks, meta, words = backend._ctc_build_tokens(
+    toks, meta, words = align_ctc._ctc_build_tokens(
         ["Don't well-known cafe, 2"], False, al
     )
     assert words == ["Don't", "well-known", "cafe,", "2"]
@@ -1048,7 +1048,7 @@ def test_ctc_build_tokens_wordlevel_star_and_oov():
 
 def test_ctc_build_tokens_collapses_multispace_and_strips():
     al = _FakeCtcAl(invocab=_fake_invocab()[0])
-    toks, meta, words = backend._ctc_build_tokens(["  a   b  "], False, al)
+    toks, meta, words = align_ctc._ctc_build_tokens(["  a   b  "], False, al)
     assert words == ["a", "b"] and max(m for m in meta if m >= 0) == 1
     assert (
         meta.count(-1) == 3
@@ -1056,12 +1056,12 @@ def test_ctc_build_tokens_collapses_multispace_and_strips():
 
 
 def test_strip_trailing_punct():
-    assert backend._strip_trailing_punct("cafe,") == "cafe"
-    assert backend._strip_trailing_punct("dogs.") == "dogs"
-    assert backend._strip_trailing_punct("well-known") == "well-known"
-    assert backend._strip_trailing_punct("Don't") == "Don't"
+    assert align_common._strip_trailing_punct("cafe,") == "cafe"
+    assert align_common._strip_trailing_punct("dogs.") == "dogs"
+    assert align_common._strip_trailing_punct("well-known") == "well-known"
+    assert align_common._strip_trailing_punct("Don't") == "Don't"
     assert (
-        backend._strip_trailing_punct("...") == "..."
+        align_common._strip_trailing_punct("...") == "..."
     )  # all punctuation -> return original
 
 
@@ -1072,7 +1072,7 @@ def test_ctc_words_from_spans():
         _Span(1, 4, 5, 0.5),  # sep (meta -1)
         _Span(7, 6, 10, 0.9),  # word1 "cafe,"
     ]
-    units = backend._ctc_words_from_spans(
+    units = align_ctc._ctc_words_from_spans(
         spans, [0, 0, -1, 1], ["ab", "cafe,"], ratio=0.1
     )
     assert len(units) == 2
@@ -1134,10 +1134,10 @@ def test_align_text_qwen_for_unconfigured_lang(monkeypatch, tmp_path):
 
 def test_release_clears_ctc(monkeypatch):
     monkeypatch.setattr(backend, "_empty_cache", lambda: None)
-    backend._ctc = object()
-    backend._ctc_lang = "en"
+    align_ctc._ctc = object()
+    align_ctc._ctc_lang = "en"
     backend.release()
-    assert backend._ctc is None and backend._ctc_lang is None
+    assert align_ctc._ctc is None and align_ctc._ctc_lang is None
 
 
 # --------------------------------------------------------------------------- #
@@ -1145,7 +1145,7 @@ def test_release_clears_ctc(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_ctc_build_tokens_nospace_per_char():
     al = _FakeCtcAl(invocab={c: i for i, c in enumerate("私の学校はいええ")})
-    toks, meta, words = backend._ctc_build_tokens(["私の学校"], True, al)
+    toks, meta, words = align_ctc._ctc_build_tokens(["私の学校"], True, al)
     assert words == ["私", "の", "学", "校"]
     assert [m for m in meta if m >= 0] == [0, 1, 2, 3]  # per-char word indices
     assert meta.count(-1) == 5  # <star> at both edges + after every char
@@ -1154,7 +1154,7 @@ def test_ctc_build_tokens_nospace_per_char():
 
 def test_ctc_build_tokens_nospace_skips_punct_and_space():
     al = _FakeCtcAl(invocab={c: i for i, c in enumerate("はいええ")})
-    toks, meta, words = backend._ctc_build_tokens(["はい。 ええ"], True, al)
+    toks, meta, words = align_ctc._ctc_build_tokens(["はい。 ええ"], True, al)
     assert words == [
         "は",
         "い",
@@ -1166,7 +1166,7 @@ def test_ctc_build_tokens_nospace_skips_punct_and_space():
 
 def test_ctc_build_tokens_nospace_oov_keeps_char():
     al = _FakeCtcAl(invocab={c: i for i, c in enumerate("私の")})  # 学/校 OOV
-    toks, meta, words = backend._ctc_build_tokens(["私の学校"], True, al)
+    toks, meta, words = align_ctc._ctc_build_tokens(["私の学校"], True, al)
     assert words == [
         "私",
         "の",
@@ -1180,7 +1180,7 @@ def test_ctc_build_tokens_nospace_oov_keeps_char():
 def test_ctc_build_tokens_nospace_no_casing_on_latin():
     # critical invariant: no .lower()/.upper() (xlsr-ja vocab has uppercase A/C/P only; lowercasing would make them OOV)
     al = _FakeCtcAl(invocab={"A": 10, "C": 11, "P": 12, "私": 13})
-    toks, meta, words = backend._ctc_build_tokens(["A私"], True, al)
+    toks, meta, words = align_ctc._ctc_build_tokens(["A私"], True, al)
     assert words == ["A", "私"]
     assert [t for t, m in zip(toks, meta) if m >= 0] == [
         10,
@@ -1268,10 +1268,10 @@ def test_get_ctc_aligner_bundle_structure(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "torchaudio", _fake_torchaudio(["FAKE"], _Bundle))
     monkeypatch.setattr(backend, "_empty_cache", lambda: None)
-    backend._ctc = None
-    backend._ctc_lang = None
+    align_ctc._ctc = None
+    align_ctc._ctc_lang = None
     try:
-        al = backend._get_ctc_aligner("en", "FAKE")
+        al = align_ctc._get_ctc_aligner("en", "FAKE")
         assert al.kind == "torchaudio" and al.blank == 0 and al.sep_id == 1
         assert al.proc is None and al.sr == 16000
         assert (
@@ -1279,8 +1279,8 @@ def test_get_ctc_aligner_bundle_structure(monkeypatch):
         )  # blank(0)/sep(1) excluded from invocab
         assert "-" not in al.invocab and "|" not in al.invocab
     finally:
-        backend._ctc = None
-        backend._ctc_lang = None
+        align_ctc._ctc = None
+        align_ctc._ctc_lang = None
 
 
 def test_get_ctc_aligner_hf_structure(monkeypatch):
@@ -1326,10 +1326,10 @@ def test_get_ctc_aligner_hf_structure(monkeypatch):
     monkeypatch.setitem(sys.modules, "torchaudio", _fake_torchaudio([]))
     monkeypatch.setitem(sys.modules, "transformers", tf)
     monkeypatch.setattr(backend, "_empty_cache", lambda: None)
-    backend._ctc = None
-    backend._ctc_lang = None
+    align_ctc._ctc = None
+    align_ctc._ctc_lang = None
     try:
-        al = backend._get_ctc_aligner("ja", "jonatasgrosman/xlsr-ja")
+        al = align_ctc._get_ctc_aligner("ja", "jonatasgrosman/xlsr-ja")
         assert al.kind == "hf" and al.blank == 0 and al.sep_id == 4
         assert al.proc is not None and al.sr == 16000
         assert (
@@ -1338,5 +1338,5 @@ def test_get_ctc_aligner_hf_structure(monkeypatch):
         # processor + model both download into the voxweave align cache subdir
         assert seen_cache == [backend.config.ALIGN_CACHE, backend.config.ALIGN_CACHE]
     finally:
-        backend._ctc = None
-        backend._ctc_lang = None
+        align_ctc._ctc = None
+        align_ctc._ctc_lang = None

@@ -5,28 +5,28 @@ import types
 
 import pytest
 
-from voxweave import backend, backend_mlx
+from voxweave import backend, backend_mlx, runtime
 
 
 # ───────────────────────────── backend selector ──────────────────────────────
 
 
 def test_use_mlx_env_overrides_win(monkeypatch):
-    monkeypatch.setattr(backend, "_DEVICE", "cuda:0")  # device says cuda...
+    monkeypatch.setattr(runtime, "_DEVICE", "cuda:0")  # device says cuda...
     monkeypatch.setenv("VOXWEAVE_BACKEND", "mlx")  # ...but env forces mlx
     assert backend._use_mlx() is True
     monkeypatch.setenv("VOXWEAVE_BACKEND", "torch")
-    monkeypatch.setattr(backend, "_DEVICE", "mps")  # device says mps...
+    monkeypatch.setattr(runtime, "_DEVICE", "mps")  # device says mps...
     assert backend._use_mlx() is False  # ...but env forces torch
 
 
 def test_use_mlx_auto_on_for_mps(monkeypatch):
     monkeypatch.delenv("VOXWEAVE_BACKEND", raising=False)
-    monkeypatch.setattr(backend, "_DEVICE", "mps")
+    monkeypatch.setattr(runtime, "_DEVICE", "mps")
     assert backend._use_mlx() is True
-    monkeypatch.setattr(backend, "_DEVICE", "cuda:0")
+    monkeypatch.setattr(runtime, "_DEVICE", "cuda:0")
     assert backend._use_mlx() is False
-    monkeypatch.setattr(backend, "_DEVICE", "cpu")
+    monkeypatch.setattr(runtime, "_DEVICE", "cpu")
     assert backend._use_mlx() is False
 
 

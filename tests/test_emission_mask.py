@@ -7,7 +7,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from voxweave.backend import (  # noqa: E402
+from voxweave.align_common import (  # noqa: E402
     _VAD_MASK_DILATE_S,
     _VAD_MASK_PENALTY,
     _mask_emissions_outside_speech,
