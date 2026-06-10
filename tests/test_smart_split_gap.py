@@ -394,9 +394,7 @@ def test_unit_glyph_binds_to_digit():
     from voxweave.core.smart_split import _build_atoms, _tokens
 
     assert _tokens("上涨92%了", "zh") == ["上", "涨", "92%", "了"]
-    wd = [
-        {"start": i * 0.1, "end": i * 0.1 + 0.05} for i in range(5)
-    ]  # 上 涨 9 2 %
+    wd = [{"start": i * 0.1, "end": i * 0.1 + 0.05} for i in range(5)]  # 上 涨 9 2 %
     atoms = _build_atoms("上涨92%了", wd + [{"start": 0.5, "end": 0.55}], "zh")
     a = next(x for x in atoms if x["text"] == "92%")
     assert a["start"] == wd[2]["start"] and a["end"] == wd[4]["end"]

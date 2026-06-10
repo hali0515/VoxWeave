@@ -248,7 +248,9 @@ _GLUE_GAP_DEFAULT_MS = 300  # lone-word flicker cue glues back if gap < this (0=
 _CPS_DEFAULTS = {"ja": 7.0, "zh": 9.0, "ko": 9.0}
 _CPS_LATIN_DEFAULT = 17.0  # ~Netflix 20 cps incl. spaces, measured without spaces
 _LAG_OUT_DEFAULT_MS = 250  # flat tail pad after speech ends (0=off)
-_SHOT_SNAP_DEFAULT_MS = 240  # cue boundary within this of a shot change snaps onto it (0=off)
+_SHOT_SNAP_DEFAULT_MS = (
+    240  # cue boundary within this of a shot change snaps onto it (0=off)
+)
 
 
 def _env_int(name: str, default: int) -> int:

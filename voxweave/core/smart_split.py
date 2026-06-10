@@ -1196,9 +1196,8 @@ def _snap_to_shots(
             target = cut - TWO_FRAME_S
             if target > end:  # extend to die on the cut
                 if (
-                    (nxt_start is None or target <= nxt_start - TWO_FRAME_S)
-                    and target - c["start"] <= max_cue_s
-                ):
+                    nxt_start is None or target <= nxt_start - TWO_FRAME_S
+                ) and target - c["start"] <= max_cue_s:
                     c["end"] = target
             elif target < end:  # pull back, never cutting speech
                 if target >= speech_end and target > c["start"]:
@@ -1400,9 +1399,7 @@ def _join_line(units: List[Tuple[str, str]]) -> str:
     return "".join(out)
 
 
-def _slide_sticky_line_ends(
-    groups: List[List[Tuple[str, str]]], lang: str
-) -> None:
+def _slide_sticky_line_ends(groups: List[List[Tuple[str, str]]], lang: str) -> None:
     """Slide sticky trailing tokens (line_end_penalty >= 1) down to the next line.
 
     The token-level counterpart of apply_kinsoku for spaced languages: a line must

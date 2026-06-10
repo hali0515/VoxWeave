@@ -82,7 +82,11 @@ def detect_shot_changes(
         return None
     if proc.returncode != 0:
         # typical: audio-only media (no 0:v:0 stream to map)
-        log.debug("shot detection unavailable for %s (ffmpeg rc=%d)", media.name, proc.returncode)
+        log.debug(
+            "shot detection unavailable for %s (ffmpeg rc=%d)",
+            media.name,
+            proc.returncode,
+        )
         return None
     cuts = sorted({float(m.group(1)) for m in _PTS_RE.finditer(proc.stderr)})
     log.info("detected %d shot changes in %s", len(cuts), media.name)

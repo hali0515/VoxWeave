@@ -3,8 +3,7 @@
 Compares:
   OLD  -- legacy smart_split_segments (no thresholds, length-only)
   NEW  -- gap-aware smart_split_segments (thresholds=gap_thresholds(iso),
-          speech_spans=None → offline-gap degrade, expected for these JSONs
-          which predate vad_speech persistence)
+          speech_spans from the JSON's vad_speech when present)
   EN   -- commercial English subtitle stream embedded in the MKV (ASS format),
           speech styles only (signs/credits excluded)
 
@@ -12,9 +11,14 @@ Run:
     uv run python scripts/calib_segmentation.py [VIDEO_DIR]
 
 Notes:
-  - speech_spans=None because JSONs predate vad_speech persistence (Task 8).
-    NEW path uses offline_ms threshold (700ms * 1.4 for ja = 980ms).
-  - Mid-phrase-cut rate uses BudouX phrase_atoms; requires budoux installed.
+  - JSONs without vad_speech degrade NEW to the offline_ms threshold
+    (700ms * 1.4 for ja = 980ms).
+  - Mid-phrase-cut rate uses phrase_atoms (jieba zh / BudouX ja); offsets are
+    computed over the punctuation-stripped cue stream, never word_segments text.
+  - bad line-end % counts internal boundaries whose left cue ends on a
+    forward-binding token (line_end_penalty >= 2). Sentence-final function
+    words (begin with / lock in) and real >=vad_skip pauses keep an absolute
+    floor — read it as a relative gauge between runs.
   - NEW mid-phrase metric is split into len-break and gap-break halves:
       * len-break mid-phrase % = THE quality gate (BudouX gating signal).
         A boundary with no real acoustic silence that lands inside a phrase
@@ -267,9 +271,7 @@ def _cue_stream_text(cues: list[dict[str, Any]]) -> str:
     Phrase-boundary offsets MUST be computed over this exact stream: cue text has
     punctuation stripped to spaces, so offsets derived from the punctuation-bearing
     word_segments text would desync at every former punctuation mark."""
-    return "".join(
-        c.get("text", "").replace(" ", "").replace("\n", "") for c in cues
-    )
+    return "".join(c.get("text", "").replace(" ", "").replace("\n", "") for c in cues)
 
 
 def mid_phrase_cut_rate(
