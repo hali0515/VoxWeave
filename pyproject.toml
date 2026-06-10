@@ -96,7 +96,7 @@ mps = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pyright>=1.1.390"]
 
 [tool.uv]
 # ctc-forced-aligner (and, on CUDA, faster-whisper) hard-depend on the CPU `onnxruntime` package,
@@ -128,6 +128,16 @@ include = ["voxweave*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.pyright]
+# Production code only: tests are monkeypatch-heavy and would drown the signal.
+# Basic mode, zero errors — the CI gate keeps new type noise from accumulating
+# (warnings were previously unmanaged and the signal had rotted).
+include = ["voxweave"]
+exclude = ["voxweave/vendor"]
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
 
 [tool.ruff]
 # voxweave/vendor contains frozen third-party model code (lucidrains/audio-separator) -- skip lint/format

@@ -114,7 +114,7 @@ def _load_yaml(path: Path) -> dict:
 
     _Loader.add_constructor(
         "tag:yaml.org,2002:python/tuple",
-        lambda loader, node: tuple(loader.construct_sequence(node)),
+        lambda loader, node: tuple(loader.construct_sequence(node)),  # pyright: ignore[reportArgumentType]
     )
     return yaml.load(path.read_text(), Loader=_Loader)
 

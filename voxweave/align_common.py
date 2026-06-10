@@ -55,8 +55,10 @@ def interp_missing(units: list[dict]) -> list[dict]:
             t = lo + (hi - lo) * (i - prev) / (nxt - prev)
         elif prev is not None:
             t = out[prev]["end"]
-        else:
+        elif nxt is not None:
             t = out[nxt]["start"]
+        else:  # unreachable: valid is non-empty, so at least one side exists
+            continue
         u["start"] = u["end"] = round(t, 3)
     return out
 

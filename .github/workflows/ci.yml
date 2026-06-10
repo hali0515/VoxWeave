@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Mirrors `make dev`: core + [cuda] extra + dev group (pytest, pyright).
+      # The cuda wheels install fine on a CPU runner; all model paths are
+      # lazy-imported or mocked in tests, so nothing touches a GPU.
+      - name: Sync environment
+        run: uv sync --extra cuda --dev
+
+      - name: Lint
+        run: |
+          uv run --no-project --with ruff ruff check .
+          uv run --no-project --with ruff ruff format --check .
+
+      - name: Type check
+        run: uv run pyright
+
+      - name: Test
+        run: uv run pytest tests/ -q

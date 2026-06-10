@@ -5,6 +5,7 @@ import logging
 import os
 import subprocess
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -557,7 +558,7 @@ def _dump_sibling_json(
     json_path: Path,
     *,
     language: str,
-    segments: list[dict],
+    segments: Sequence[Mapping[str, Any]],
     units: list[dict],
     vad_speech: list[tuple[float, float]] | None,
     shot_changes: list[float] | None = None,
@@ -582,7 +583,7 @@ def _dump_sibling_json(
 
 def _write_siblings(
     src: Path,
-    cues: list[dict],
+    cues: Sequence[Mapping[str, Any]],
     units: list[dict],
     lang: str,
     vad_speech: list[tuple[float, float]] | None = None,

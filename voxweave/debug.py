@@ -44,6 +44,7 @@ class FileDebugSink(DebugSink):
     """
 
     enabled = True
+    root: Path  # always set in __init__ (the base class None is for the no-op sink)
 
     def __init__(self, stem: str, base: Path | None = None) -> None:
         self.root = (base or Path("debug")) / stem

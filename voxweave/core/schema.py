@@ -2,9 +2,9 @@
 
 These are the de facto contracts of the sibling-file pipeline (see the JSON
 ``word_segments`` produced by transcribe/align); TypedDicts make them explicit
-so a typo'd key is a type error instead of a silently-absent value. All are
-``total=False``: every consumer tolerates missing keys via ``.get()`` (units
-from a timing-less edit have no spans, legacy word_data has no ``word``).
+so a typo'd key is a type error instead of a silently-absent value.
+``Unit``/``Atom`` are ``total=False`` (ghost units lack spans, legacy
+word_data has no ``word``); ``Cue`` keys are required invariants.
 """
 
 from __future__ import annotations
@@ -41,11 +41,12 @@ class Atom(TypedDict, total=False):
     end_pen: int
 
 
-class Cue(TypedDict, total=False):
+class Cue(TypedDict):
     """One subtitle cue: display text + span + its word-level timing source.
 
-    ``word_data`` items are :class:`Unit` shaped (pipeline cues carry
-    char/word-level spans; cues built without timings carry ``[]``).
+    All four keys are invariants of the cue stream (every constructor fills
+    them; timing-less cues carry ``word_data=[]``), so they are required —
+    subscript access is the normal pattern downstream.
     """
 
     text: str

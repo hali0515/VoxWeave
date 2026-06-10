@@ -14,6 +14,7 @@ import os
 from collections import namedtuple
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, cast
 
 from voxweave import config
 from voxweave.align_common import (
@@ -72,11 +73,22 @@ def _get_ctc_aligner(iso: str, model_name: str):
             from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
             # Auto-downloads to config.ALIGN_CACHE on first run; cache hit on subsequent runs.
-            proc = Wav2Vec2Processor.from_pretrained(
-                model_name, cache_dir=config.ALIGN_CACHE
+            # cast(Any): transformers' stubs do not model the dynamic processor
+            # attributes (proc.tokenizer / proc.feature_extractor) or the
+            # from_pretrained return type.
+            proc = cast(
+                Any,
+                Wav2Vec2Processor.from_pretrained(
+                    model_name, cache_dir=config.ALIGN_CACHE
+                ),
             )
             model = (
-                Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=config.ALIGN_CACHE)
+                cast(
+                    Any,
+                    Wav2Vec2ForCTC.from_pretrained(
+                        model_name, cache_dir=config.ALIGN_CACHE
+                    ),
+                )
                 .to(dev)
                 .eval()
             )

@@ -235,8 +235,8 @@ def _snap_to_shots(
         start, end = c.get("start"), c.get("end")
         if start is None or end is None:
             continue
-        words = [w for w in c.get("word_data") or [] if w.get("end") is not None]
-        speech_end = max((w["end"] for w in words), default=end)
+        ends = [e for w in c.get("word_data") or [] if (e := w.get("end")) is not None]
+        speech_end = max(ends, default=end)
         prev_end = out[i - 1].get("end") if i > 0 else None
         nxt_start = out[i + 1].get("start") if i + 1 < len(out) else None
 

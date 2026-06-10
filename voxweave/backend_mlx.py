@@ -71,7 +71,7 @@ def _load(repo: str, cache_dir: str):
     from the hub. Keeps MLX weights under ~/.cache/voxweave alongside the separator/PANNs weights."""
     try:
         from huggingface_hub import snapshot_download
-        from mlx_audio.stt import load
+        from mlx_audio.stt import load  # pyright: ignore[reportMissingImports]
     except ModuleNotFoundError as e:
         raise _require(e.name or "mlx_audio") from e
     local = snapshot_download(repo, cache_dir=cache_dir)
@@ -91,7 +91,7 @@ def _snapshot(repo: str, cache_dir: str) -> str:
 def _clear_cache() -> None:
     """Best-effort MLX Metal cache reclaim (optimization only; failure is harmless)."""
     try:
-        import mlx.core as mx
+        import mlx.core as mx  # pyright: ignore[reportMissingImports]
 
         mx.clear_cache()
     except Exception:  # noqa: BLE001
@@ -221,7 +221,7 @@ class _MlxWhisper:
         word_timestamps: bool = False,
     ) -> tuple[list[_WhisperSegment], _WhisperInfo]:
         try:
-            import mlx_whisper
+            import mlx_whisper  # pyright: ignore[reportMissingImports]
         except ModuleNotFoundError as e:
             raise _require(e.name or "mlx_whisper") from e
         res = mlx_whisper.transcribe(

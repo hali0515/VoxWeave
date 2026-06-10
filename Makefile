@@ -1,4 +1,4 @@
-.PHONY: install reinstall cuda mps uninstall dev test lint
+.PHONY: install reinstall cuda mps uninstall dev test lint typecheck
 
 # Install as a global uv tool (end-user mode): puts the voxweave command on PATH.
 # The separation / layout / song-skip / CJK-break / translation pipeline is baked into the core
@@ -57,3 +57,8 @@ test:
 lint:
 	uv run --no-project --with ruff ruff check --fix .
 	uv run --no-project --with ruff ruff format .
+
+# Static type check (pyright, basic mode, production code only -- see [tool.pyright]).
+# Zero errors is the bar; CI enforces it so type noise cannot accumulate again.
+typecheck:
+	uv run pyright

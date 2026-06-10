@@ -22,14 +22,16 @@ from __future__ import annotations
 import functools
 import logging
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from .breakpoints import legal_break_index, phrase_atoms
 from .conjunctions import conjunctions_by_language, get_comma
 from .gap_split import gap_qualifies
 from .kinsoku import line_end_penalty
 from .langsets import LANGUAGES_WITHOUT_SPACES as LANGUAGES_WITHOUT_SPACES  # re-export
+from .schema import Cue, Unit
 from .layout import (
     WIDE_GLYPH_LANGUAGES,
     _comma_chars,
@@ -143,21 +145,25 @@ def _comma_clauses(sentence: str, lang: str, min_len: int) -> List[str]:
     return clauses
 
 
-def _span_start(items: list[dict], default: float | None = None) -> float | None:
+def _span_start(
+    items: Sequence[Mapping[str, Any]], default: float | None = None
+) -> float | None:
     """First non-None ``start`` across items, else ``default``."""
     return next(
         (it.get("start") for it in items if it.get("start") is not None), default
     )
 
 
-def _span_end(items: list[dict], default: float | None = None) -> float | None:
+def _span_end(
+    items: Sequence[Mapping[str, Any]], default: float | None = None
+) -> float | None:
     """Last non-None ``end`` across items, else ``default``."""
     return next(
         (it.get("end") for it in reversed(items) if it.get("end") is not None), default
     )
 
 
-def _build_atoms(text: str, word_data: list[dict], lang: str) -> list[dict]:
+def _build_atoms(text: str, word_data: list[Unit], lang: str) -> list[dict]:
     """Build non-breakable atoms, each with aggregated start/end from word_data.
 
     Space-delimited: one word per atom (1:1 with word_data). No-space: one atom
@@ -385,7 +391,7 @@ def _snap_sentence_breaks(text: str, sentences: List[str], lang: str) -> List[st
 
 
 def _anchor_cursor(
-    word_data: List[Dict[str, Any]],
+    word_data: List[Unit],
     cursor: int,
     clause_tokens: List[str],
     max_shift: int = 8,
@@ -417,15 +423,15 @@ def _anchor_cursor(
 
 def split_at_sentence_end(
     text: str,
-    word_data: List[Dict[str, Any]],
+    word_data: List[Unit],
     lang: str,
     max_line_length: int,
     max_lines: int,
     split_at_comma: bool = True,
     comma_split_min_len: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+) -> List[Cue]:
     sentences = _snap_sentence_breaks(text, _segment_sentences(text, lang), lang)
-    cues: List[Dict[str, Any]] = []
+    cues: List[Cue] = []
     cursor = 0
     # Content verification needs unit texts; legacy callers without a "word"
     # key keep the blind index cursor.
@@ -725,19 +731,22 @@ def _pack_atoms_into_chunks(
     return chunks
 
 
-def _chunk_to_cue(chunk: List[dict], cue: Dict[str, Any], lang: str) -> Dict[str, Any]:
+def _chunk_to_cue(chunk: List[dict], cue: Cue, lang: str) -> Cue:
     """Materialize a packed atom chunk into a cue dict (first/last non-None span, falling back
     to the parent cue's start/end)."""
+    # the default is the parent cue's (required, non-None) bound, so the span is always a float
+    start = cast(float, _span_start(chunk, cue["start"]))
+    end = cast(float, _span_end(chunk, cue["end"]))
     return {
         "text": _join([a["text"] for a in chunk], lang),
-        "start": _span_start(chunk, cue["start"]),
-        "end": _span_end(chunk, cue["end"]),
+        "start": start,
+        "end": end,
         "word_data": [{"start": a["start"], "end": a["end"]} for a in chunk],
     }
 
 
 def split_long_cues_with_word_timings(
-    cues: List[Dict[str, Any]],
+    cues: List[Cue],
     max_line_length: int,
     max_lines: int,
     min_duration: float,
@@ -745,7 +754,7 @@ def split_long_cues_with_word_timings(
     lang: str,
     speech_spans: list[tuple[float, float]] | None = None,
     thresholds: Optional[SplitThresholds] = None,
-) -> List[Dict[str, Any]]:
+) -> List[Cue]:
     """Pack each cue's atoms into reading-sized cues using gap/duration/length breaks.
 
     ``min_duration`` / ``desired_wps`` are kept for back-compat (unused on the atom-based path).
@@ -762,7 +771,7 @@ def split_long_cues_with_word_timings(
         do_new=do_new,
         speech_spans=speech_spans,
     )
-    new_cues: List[Dict[str, Any]] = []
+    new_cues: List[Cue] = []
     for cue in cues:
         word_data = list(cue.get("word_data") or [])
         if not word_data:
@@ -783,11 +792,11 @@ def split_long_cues_with_word_timings(
 
 
 def _split_without_timings(
-    cue: Dict[str, Any],
+    cue: Cue,
     max_line_length: int,
     max_lines: int,
     lang: str,
-) -> List[Dict[str, Any]]:
+) -> List[Cue]:
     formatted = split_subtitle(cue["text"], max_line_length, lang)
     lines = formatted.split("\n")
     chunks: List[List[str]] = []
@@ -806,7 +815,7 @@ def _split_without_timings(
     total_chars = sum(len(sep.join(c)) for c in chunks) or 1
     start = cue["start"]
     duration = cue["end"] - cue["start"]
-    out: List[Dict[str, Any]] = []
+    out: List[Cue] = []
     for c in chunks:
         # Join without \n — the downstream SubtitlesWriter handles display wrapping.
         text = sep.join(c)
@@ -830,7 +839,7 @@ def smart_split_segments(
     speech_spans: list[tuple[float, float]] | None = None,
     thresholds: SplitThresholds | dict | None = None,
     shot_changes: list[float] | None = None,
-) -> List[Dict[str, Any]]:
+) -> List[Cue]:
     """Run the full smart-split pipeline over aligned segments.
 
     Each segment must have ``text`` and ``words`` (with ``start``/``end``).
@@ -852,7 +861,7 @@ def smart_split_segments(
         if isinstance(thresholds, dict)
         else thresholds
     )
-    all_cues: List[Dict[str, Any]] = []
+    all_cues: List[Cue] = []
     for segment in segments:
         text = segment.get("text", "")
         words = segment.get("words", []) or []
