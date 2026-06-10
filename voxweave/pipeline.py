@@ -392,6 +392,9 @@ def transcribe(
 
         strategy = conf_load_strategy()
         rep.chunks(len(chunks) * backend.chunk_pass_count(asr_model, strategy))
+        # full_wav + bounds let CTC/MMS languages run ONE full-file alignment pass over
+        # the whole audio (chunk windows as DP silence anchors) instead of N per-chunk
+        # calls; Qwen-aligned languages (zh/yue) keep per-chunk inside transcribe_chunks.
         results = backend.transcribe_chunks(
             cwavs,
             lang_override,
@@ -399,6 +402,8 @@ def transcribe(
             context=context,
             on_done=lambda _i: rep.chunk_done(),
             strategy=strategy,
+            full_wav=wav,
+            bounds=[(ch["start"], ch["end"]) for ch in chunks],
         )
         # reinject_punct runs after language resolution (tokenization must match iso),
         # so punctuation cannot be reinjected per-chunk.

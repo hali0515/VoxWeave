@@ -630,10 +630,82 @@ def _transcribe_fusion(
 
 
 def chunk_pass_count(asr_model: str | None, strategy: str = "peak") -> int:
-    """Passes per chunk for transcribe_chunks: sum=1, peak fusion=3, peak others=2."""
-    if strategy == "sum":
-        return 1
+    """Passes per chunk for transcribe_chunks: fusion=3, others=2.
+
+    The pass structure is identical for both load strategies; "sum" merely keeps the
+    singletons resident between passes (peak VRAM = sum of models) instead of releasing
+    them (peak = max). The strategy parameter is kept for call-site compatibility.
+    """
+    del strategy
     return 3 if _select_engine(asr_model)[0] == "fusion" else 2
+
+
+def _weighted_align_lang(asr_out: list[tuple[str | None, str, str]]) -> str | None:
+    """File-level alignment language: chunk align_langs weighted by alnum text length.
+
+    Full-file alignment runs ONE pass for the whole file, so it needs one language
+    (per-chunk languages only steered the per-chunk path). Weighting by text mass
+    mirrors the pipeline's unit-count vote (unit count ~ alnum chars / words), so the
+    two levels agree on mixed-language files.
+    """
+    from collections import Counter
+
+    weight: Counter[str] = Counter()
+    for _, text, align_lang in asr_out:
+        n = sum(1 for c in text if c.isalnum())
+        if n:
+            weight[align_lang] += n
+    return weight.most_common(1)[0][0] if weight else None
+
+
+def _full_pass_units(
+    full_wav: Path | None,
+    bounds: Sequence[tuple[float, float]] | None,
+    texts: list[str],
+    align_lang: str | None,
+) -> list[list[dict]] | None:
+    """Full-file alignment for CTC/MMS languages; None -> caller aligns per chunk.
+
+    One global pass over the whole audio replaces N per-chunk calls: chunk-edge words
+    self-locate on the global monotone path, and the MMS ONNX call count drops from one
+    per chunk (a movie is ~80 chunks, brushing the ~180-small-call heap-corruption
+    regime) to a handful of DP chunks. Returned units are shifted back to chunk-relative
+    times, preserving the transcribe_chunks contract.
+
+    Qwen-aligned languages (no CTC config) return None and stay per-chunk: the NAR
+    aligner is capped at 180s input (qwen_asr MAX_FORCE_ALIGN_INPUT_SECONDS) and has no
+    windowed-emission + global-DP decomposition to scale past it — its timestamps are
+    regressed then monotonized by an LIS pass, with no CTC blank to absorb long spans.
+    Any full-pass failure also returns None (per-chunk fallback), mirroring align_text's
+    CTC->Qwen fallback.
+    """
+    from voxweave.lang import is_supported, to_iso
+
+    if full_wav is None or bounds is None or len(bounds) != len(texts):
+        return None
+    if not align_lang or not is_supported(align_lang):
+        return None
+    iso = to_iso(align_lang)
+    model_name = config.align_model_for(iso)
+    if not model_name:
+        return None
+    from voxweave.timestamps import shift_units
+
+    try:
+        if _is_mms_name(model_name):
+            blocks = align_blocks_full_mms(full_wav, texts, iso, bounds=list(bounds))
+        else:
+            blocks = align_blocks_full_ctc(
+                full_wav, texts, iso, model_name, bounds=list(bounds)
+            )
+    except Exception as e:  # noqa: BLE001 -- any failure falls back to per-chunk alignment
+        log.warning(
+            "full-file alignment failed (%s: %s), falling back to per-chunk alignment",
+            type(e).__name__,
+            e,
+        )
+        return None
+    return [shift_units(u, -b[0]) for u, b in zip(blocks, bounds)]
 
 
 def transcribe_chunks(
@@ -643,17 +715,22 @@ def transcribe_chunks(
     context: str | None = None,
     on_done=None,
     strategy: str = "peak",
+    full_wav: Path | None = None,
+    bounds: list[tuple[float, float]] | None = None,
 ) -> list[tuple[str | None, str, list[dict]]]:
     """Transcribe a list of chunks -> [(lang, text, units)] matching the transcribe_align contract.
 
-    strategy controls model loading (config.conf_load_strategy):
-    - "peak" (default): all-chunks ASR -> release -> all-chunks align; ASR and aligner never
-      co-reside so peak = max(models), not sum. fusion: three passes (whisper ASR -> release ->
-      Qwen ASR -> release -> align + merge). qwen/whisper: two passes.
-    - "sum": per-chunk transcribe_align inline (ASR+alignment co-resident); peak = sum(models);
-      saves pass-switch overhead on high-VRAM cards.
+    Pass structure is fixed: all-chunks ASR pass(es), then one alignment pass (fusion:
+    whisper ASR -> Qwen ASR -> align + merge). strategy controls model residency between
+    passes (config.conf_load_strategy):
+    - "peak" (default): singletons released between passes; peak VRAM = max(models).
+    - "sum": singletons stay resident across passes; peak = sum(models); saves the
+      release/reload overhead on high-VRAM cards.
 
-    on_done(i) called per completed pass; total = N * chunk_pass_count(). Aligner kept alive until release().
+    ``full_wav`` + ``bounds`` (absolute chunk windows on full_wav) enable ONE full-file
+    alignment pass for CTC/MMS file-level languages (see _full_pass_units); Qwen-aligned
+    languages and callers that omit them keep per-chunk alignment. on_done(i) is called
+    per completed pass; total = N * chunk_pass_count(). Aligner kept alive until release().
     """
     counter = [0]
 
@@ -662,48 +739,69 @@ def transcribe_chunks(
             on_done(counter[0])
         counter[0] += 1
 
-    if strategy == "sum":  # co-resident: ASR+alignment inline, peak = sum(models)
-        out_sum: list[tuple[str | None, str, list[dict]]] = []
-        for w in wav_paths:
-            out_sum.append(transcribe_align(w, language, asr_model, context))
-            _empty_cache()
-            _tick()
-        return out_sum
-
+    release = strategy != "sum"  # sum keeps singletons co-resident between passes
     engine, mid = _select_engine(asr_model)
     if engine == "fusion":
         qid = resolve_asr_model(config.conf_fusion_qwen())
         fusion_whisper = config.conf_fusion_whisper()
-        # pass A: whisper ASR all chunks -> release whisper
+        # pass A: whisper ASR all chunks
         w_asr: list[tuple[str | None, str, str]] = []
         for w in wav_paths:
             w_asr.append(_asr_only("whisper", w, language, fusion_whisper, context))
             _tick()
-        _release_whisper()
-        # pass B: Qwen ASR all chunks -> release Qwen
+        if release:
+            _release_whisper()
+        # pass B: Qwen ASR all chunks
         q_asr: list[tuple[str | None, str, str]] = []
         for w in wav_paths:
             q_asr.append(_asr_only("qwen", w, language, qid, context))
             _tick()
-        _release_qwen_asr()
-        # pass C: align both texts, merge punctuation
+        if release:
+            _release_qwen_asr()
+        # pass C: align both texts (whisper units carry the timing; Qwen units only
+        # position punctuation), full-file where the language allows, then merge
+        full_w = _full_pass_units(
+            full_wav, bounds, [t for _, t, _ in w_asr], _weighted_align_lang(w_asr)
+        )
+        full_q = _full_pass_units(
+            full_wav, bounds, [t for _, t, _ in q_asr], _weighted_align_lang(q_asr)
+        )
         out: list[tuple[str | None, str, list[dict]]] = []
-        for w, (dw, tw, aw), (dq, tq, aq) in zip(wav_paths, w_asr, q_asr):
-            uw = align_text(w, tw, aw) if tw.strip() else []
-            uq = align_text(w, tq, aq) if tq.strip() else []
+        for i, (w, (dw, tw, aw), (dq, tq, aq)) in enumerate(
+            zip(wav_paths, w_asr, q_asr)
+        ):
+            uw = (
+                (full_w[i] if full_w is not None else align_text(w, tw, aw))
+                if tw.strip()
+                else []
+            )
+            uq = (
+                (full_q[i] if full_q is not None else align_text(w, tq, aq))
+                if tq.strip()
+                else []
+            )
             out.append(_fuse_chunk((dw, tw, uw), (dq, tq, uq), language))
             _empty_cache()
             _tick()
         return out
-    # qwen / whisper: pass 1 all-chunks ASR -> release -> pass 2 all-chunks align (peak = max not sum)
+    # qwen / whisper: ASR pass -> alignment pass (full-file where the language allows)
     asr_out: list[tuple[str | None, str, str]] = []  # (det_lang, text, align_lang)
     for w in wav_paths:
         asr_out.append(_asr_only(engine, w, language, mid, context))
         _tick()
-    _release_whisper() if engine == "whisper" else _release_qwen_asr()
+    if release:
+        _release_whisper() if engine == "whisper" else _release_qwen_asr()
+    full_units = _full_pass_units(
+        full_wav, bounds, [t for _, t, _ in asr_out], _weighted_align_lang(asr_out)
+    )
     out2: list[tuple[str | None, str, list[dict]]] = []
-    for w, (det, text, align_lang) in zip(wav_paths, asr_out):
-        units = align_text(w, text, align_lang) if text.strip() else []
+    for i, (w, (det, text, align_lang)) in enumerate(zip(wav_paths, asr_out)):
+        if not text.strip():
+            units: list[dict] = []
+        elif full_units is not None:
+            units = full_units[i]
+        else:
+            units = align_text(w, text, align_lang)
         out2.append((det, text, units))
         _empty_cache()  # alignment matrix grows with length; reclaim after each chunk
         _tick()

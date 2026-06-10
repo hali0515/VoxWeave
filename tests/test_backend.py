@@ -641,16 +641,24 @@ def test_transcribe_chunks_two_pass_skips_align_for_empty_text(monkeypatch, tmp_
     assert out[1] == ("ja", "", [])
 
 
-# --- load strategy: sum (parallel co-resident, per-chunk transcribe_align) ---------------------- #
-def test_transcribe_chunks_sum_strategy_per_chunk(monkeypatch, tmp_path):
-    # sum: per-chunk transcribe_align (ASR+alignment co-resident inline), no two passes, N ticks, no ASR release interleaved
+# --- load strategy: sum (co-resident: same pass structure, no release between passes) ----------- #
+def test_transcribe_chunks_sum_strategy_keeps_singletons_resident(
+    monkeypatch, tmp_path
+):
+    # sum: same two-pass structure as peak, but singletons are NOT released between
+    # passes (peak VRAM = sum of models). 2N ticks like peak.
     seq: list[str] = []
 
-    def _ta(w, lang, asr_model=None, context=None):
-        seq.append(f"chunk:{w.name}")
-        return ("Japanese", "はい", [{"text": "はい", "start": 0.0, "end": 1.0}])
+    def _asr(engine, w, lang, mid, ctx):
+        seq.append(f"asr:{w.name}")
+        return ("Japanese", "はい", "ja")
 
-    monkeypatch.setattr(backend, "transcribe_align", _ta)
+    def _align(w, text, alang):
+        seq.append(f"align:{w.name}")
+        return [{"text": "はい", "start": 0.0, "end": 1.0}]
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(backend, "align_text", _align)
     monkeypatch.setattr(backend, "_release_qwen_asr", lambda: seq.append("REL"))
     monkeypatch.setattr(backend, "_release_whisper", lambda: seq.append("RELW"))
     monkeypatch.setattr(backend, "_empty_cache", lambda: None)
@@ -666,11 +674,136 @@ def test_transcribe_chunks_sum_strategy_per_chunk(monkeypatch, tmp_path):
         strategy="sum",
     )
     assert seq == [
-        "chunk:c0.wav",
-        "chunk:c1.wav",
-    ]  # per-chunk, no two-pass or REL interleaved
-    assert len(out) == 2 and ticks == [0, 1]  # N (not 2N)
+        "asr:c0.wav",
+        "asr:c1.wav",
+        "align:c0.wav",
+        "align:c1.wav",
+    ]  # two passes, but no REL between them
+    assert len(out) == 2 and ticks == [0, 1, 2, 3]  # 2N like peak
     assert out[0] == ("Japanese", "はい", [{"text": "はい", "start": 0.0, "end": 1.0}])
+
+
+# --- full-file alignment pass (full_wav + bounds) ----------------------------------------------- #
+def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
+    # CTC-configured file language + full_wav/bounds -> ONE align_blocks_full_ctc call
+    # over the whole audio; per-chunk align_text never runs; units shifted back to
+    # chunk-relative times (transcribe_chunks contract).
+    monkeypatch.setattr(
+        backend, "_asr_only", lambda e, w, lang, m, c: ("English", "hi there", "en")
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    monkeypatch.setattr(
+        backend, "align_text", lambda *a: pytest.fail("per-chunk align must not run")
+    )
+    monkeypatch.setattr(backend.config, "align_model_for", lambda iso: "some-wav2vec2")
+    seen = {}
+
+    def _full(wav, texts, iso, model, bounds=None):
+        seen.update(wav=wav, texts=texts, iso=iso, model=model, bounds=bounds)
+        # absolute units, one per chunk
+        return [
+            [{"text": "hi", "start": 10.5, "end": 11.0}],
+            [{"text": "hi", "start": 130.5, "end": 131.0}],
+        ]
+
+    monkeypatch.setattr(backend, "align_blocks_full_ctc", _full)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    full = tmp_path / "full.wav"
+    full.write_bytes(b"x")
+    bounds = [(10.0, 120.0), (130.0, 240.0)]
+    out = backend.transcribe_chunks(
+        wavs, None, asr_model="qwen3-asr-1.7b", full_wav=full, bounds=bounds
+    )
+    assert seen["wav"] is full and seen["bounds"] == bounds
+    assert seen["texts"] == ["hi there", "hi there"] and seen["iso"] == "en"
+    # absolute -> chunk-relative: each chunk's units shifted by -bounds[i].start
+    assert out[0][2] == [{"text": "hi", "start": 0.5, "end": 1.0}]
+    assert out[1][2] == [{"text": "hi", "start": 0.5, "end": 1.0}]
+
+
+def test_transcribe_chunks_qwen_lang_stays_per_chunk(monkeypatch, tmp_path):
+    # No CTC config for the file language (zh -> Qwen NAR, 180s input cap) -> full-file
+    # pass is skipped even when full_wav/bounds are provided; per-chunk align_text runs.
+    monkeypatch.setattr(
+        backend, "_asr_only", lambda e, w, lang, m, c: ("Chinese", "你好", "zh")
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    monkeypatch.setattr(backend.config, "align_model_for", lambda iso: None)
+    aligned: list[str] = []
+
+    def _align(w, text, alang):
+        aligned.append(w.name)
+        return [{"text": "你好", "start": 0.0, "end": 1.0}]
+
+    monkeypatch.setattr(backend, "align_text", _align)
+    monkeypatch.setattr(
+        backend,
+        "align_blocks_full_ctc",
+        lambda *a, **k: pytest.fail("full pass must not run for Qwen langs"),
+    )
+    monkeypatch.setattr(
+        backend,
+        "align_blocks_full_mms",
+        lambda *a, **k: pytest.fail("full pass must not run for Qwen langs"),
+    )
+    wavs = [tmp_path / "c0.wav"]
+    wavs[0].write_bytes(b"x")
+    full = tmp_path / "full.wav"
+    full.write_bytes(b"x")
+    out = backend.transcribe_chunks(
+        wavs, None, asr_model="qwen3-asr-1.7b", full_wav=full, bounds=[(0.0, 100.0)]
+    )
+    assert aligned == ["c0.wav"]
+    assert out[0][2] == [{"text": "你好", "start": 0.0, "end": 1.0}]
+
+
+def test_transcribe_chunks_full_pass_failure_falls_back_per_chunk(
+    monkeypatch, tmp_path
+):
+    # full-file pass raising -> warning + per-chunk fallback (mirrors align_text's CTC->Qwen fallback)
+    monkeypatch.setattr(
+        backend, "_asr_only", lambda e, w, lang, m, c: ("English", "hi", "en")
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    monkeypatch.setattr(backend.config, "align_model_for", lambda iso: "some-wav2vec2")
+
+    def _boom(*a, **k):
+        raise RuntimeError("emission blew up")
+
+    monkeypatch.setattr(backend, "align_blocks_full_ctc", _boom)
+    aligned: list[str] = []
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda w, t, a: (
+            aligned.append(w.name) or [{"text": "hi", "start": 0.0, "end": 0.5}]
+        ),
+    )
+    wavs = [tmp_path / "c0.wav"]
+    wavs[0].write_bytes(b"x")
+    full = tmp_path / "full.wav"
+    full.write_bytes(b"x")
+    out = backend.transcribe_chunks(
+        wavs, None, asr_model="qwen3-asr-1.7b", full_wav=full, bounds=[(0.0, 100.0)]
+    )
+    assert aligned == ["c0.wav"]  # fell back to per-chunk
+    assert out[0][2] == [{"text": "hi", "start": 0.0, "end": 0.5}]
+
+
+def test_weighted_align_lang_votes_by_text_mass():
+    # long dialogue dominates a short cold-open insert; empty chunks carry no vote
+    asr_out = [
+        ("English", "a" * 10, "en"),
+        ("Japanese", "あ" * 200, "ja"),
+        (None, "", "en"),
+    ]
+    assert backend._weighted_align_lang(asr_out) == "ja"
+    assert backend._weighted_align_lang([(None, "", "en")]) is None
 
 
 def test_transcribe_chunks_default_strategy_is_peak(monkeypatch, tmp_path):
@@ -692,10 +825,11 @@ def test_transcribe_chunks_default_strategy_is_peak(monkeypatch, tmp_path):
 
 
 def test_chunk_pass_count():
+    # pass structure no longer depends on strategy (sum only skips releases between passes)
     assert backend.chunk_pass_count("qwen3-asr-1.7b", "peak") == 2
     assert backend.chunk_pass_count("fusion", "peak") == 3
-    assert backend.chunk_pass_count("qwen3-asr-1.7b", "sum") == 1
-    assert backend.chunk_pass_count("fusion", "sum") == 1
+    assert backend.chunk_pass_count("qwen3-asr-1.7b", "sum") == 2
+    assert backend.chunk_pass_count("fusion", "sum") == 3
 
 
 def test_get_whisper_missing_dep_raises_friendly(monkeypatch):
