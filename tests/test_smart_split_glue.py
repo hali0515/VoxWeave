@@ -149,4 +149,6 @@ def test_wired_through_smart_split_segments():
     cues = smart_split_segments(segments, "en", thresholds=config.gap_thresholds("en"))
     assert len(cues) == 1
     assert cues[0]["text"] == "okay so yes"  # period stripped, fragment glued
-    assert cues[0]["end"] == 0.95
+    # production thresholds carry lag_out/cps lingering, so the end may extend past
+    # speech end (0.95) but never run earlier than it
+    assert cues[0]["end"] >= 0.95

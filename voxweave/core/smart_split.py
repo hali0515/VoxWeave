@@ -850,6 +850,7 @@ TWO_FRAME_S = 2.0 / 24.0  # ~0.083s Netflix min inter-cue gap
 CHAIN_MAX_GAP_S = 0.5  # gaps below this are "dead zone" -> chain to 2 frames
 VISIBLE_GAP_MIN_S = 1.0  # gaps >= this stay a visible pause (BBC); not enforced in code (CHAIN_MAX_GAP_S=0.5 never reaches them)
 GLUE_MAX_GAP_S = 0.3  # lone-word flicker cue glues onto its nearer neighbor when that gap is below this
+LINGER_CAP_S = 1.0  # CPS-driven extension never lingers more than this past speech end
 
 
 @dataclass(frozen=True)
@@ -868,6 +869,13 @@ class SplitThresholds:
     min_cue_s: float = 0.5
     max_cue_s: float = 7.0
     glue_gap_s: float = GLUE_MAX_GAP_S
+    # Reading-speed linger (0 = off): a cue shorter than reading_chars/cps extends
+    # into the following gap, capped at LINGER_CAP_S past speech end. lag_out_s is
+    # a flat tail pad applied to every cue end (0 = off). config.gap_thresholds
+    # supplies per-language values; the dataclass defaults keep both off so direct
+    # constructions (tests/legacy) preserve exact timing.
+    cps: float = 0.0
+    lag_out_s: float = 0.0
 
     @classmethod
     def from_mapping(cls, d: dict) -> SplitThresholds:
@@ -961,22 +969,45 @@ def _glue_short_cues(
     return out
 
 
+def _reading_chars(text: str) -> int:
+    """Non-whitespace char count — the reading-load measure for CPS lingering."""
+    return sum(1 for ch in text if not ch.isspace())
+
+
 def _cleanup_cues(
-    cues: List[Dict[str, Any]], *, min_cue_s: float, max_cue_s: float
+    cues: List[Dict[str, Any]],
+    *,
+    min_cue_s: float,
+    max_cue_s: float,
+    cps: float = 0.0,
+    lag_out_s: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """Timing-only pass — never merges content across a real pause.
 
     - Extends short cues into the following gap (no overlap) up to min_cue_s.
+    - Reading-speed linger (cps>0): a cue displayed for less than reading_chars/cps
+      extends into the gap, at most LINGER_CAP_S past speech end.
+    - Tail pad (lag_out_s>0): every cue end gets a flat pad so text does not vanish
+      the instant speech stops; absorbed by chaining in dense dialogue.
     - Chains sub-0.5s inter-cue gaps down to 2 frames.
     - Visible gaps (>=1s) are left untouched.
-    - max_cue_s prevents min-dur extension from re-inflating past the segmentation cap.
+    - max_cue_s prevents any extension from re-inflating past the segmentation cap.
     """
     out = [dict(c) for c in cues]
     for i, c in enumerate(out):
         nxt_start = out[i + 1]["start"] if i + 1 < len(out) else None
-        # min duration: extend end into available gap, never past next start
-        if min_cue_s > 0 and c["end"] - c["start"] < min_cue_s:
-            want = c["start"] + min_cue_s
+        # desired duration: min-dur floor, CPS reading time (capped linger), tail pad
+        dur = c["end"] - c["start"]
+        desired = dur
+        if min_cue_s > 0:
+            desired = max(desired, min_cue_s)
+        if lag_out_s > 0:
+            desired = max(desired, dur + lag_out_s)
+        if cps > 0:
+            need = _reading_chars(c.get("text", "")) / cps
+            desired = max(desired, min(need, dur + LINGER_CAP_S))
+        if desired > dur:
+            want = c["start"] + desired
             c["end"] = want if nxt_start is None else min(want, nxt_start)
         # chaining: close small inter-cue gaps to 2 frames
         if nxt_start is not None:
@@ -984,7 +1015,7 @@ def _cleanup_cues(
             if 0 <= gap < CHAIN_MAX_GAP_S and gap > TWO_FRAME_S:
                 c["end"] = nxt_start - TWO_FRAME_S
             # overlaps (gap<0) and large gaps (>=CHAIN_MAX_GAP_S) left to caller
-        # never let min-dur extend / chaining push a cue past the duration cap
+        # never let extension / chaining push a cue past the duration cap
         if max_cue_s and c["end"] - c["start"] > max_cue_s:
             c["end"] = c["start"] + max_cue_s
     return out
@@ -1053,7 +1084,13 @@ def smart_split_segments(
     )
     if th is not None:  # cleanup opt-in; legacy callers skip this
         cues = _glue_short_cues(cues, lang, max_gap_s=th.glue_gap_s)
-        cues = _cleanup_cues(cues, min_cue_s=th.min_cue_s, max_cue_s=th.max_cue_s)
+        cues = _cleanup_cues(
+            cues,
+            min_cue_s=th.min_cue_s,
+            max_cue_s=th.max_cue_s,
+            cps=th.cps,
+            lag_out_s=th.lag_out_s,
+        )
     for cue in cues:
         cue["text"] = _strip_punct_for_subtitles(cue["text"])
         if th is not None:  # stutter merging opt-in alongside gap-aware mode
@@ -1153,13 +1190,35 @@ def _join_line(units: List[Tuple[str, str]]) -> str:
     return "".join(out)
 
 
+def _slide_sticky_line_ends(
+    groups: List[List[Tuple[str, str]]], lang: str
+) -> None:
+    """Slide sticky trailing tokens (line_end_penalty >= 1) down to the next line.
+
+    The token-level counterpart of apply_kinsoku for spaced languages: a line must
+    not end on a closed-class token (went to the | store). Slides while the donor
+    keeps at least one token and the receiving line stays within the hard visual
+    budget; bottom-heavy output is fine (pyramid shape reads better anyway).
+    """
+    for i in range(len(groups) - 1):
+        top, bot = groups[i], groups[i + 1]
+        while (
+            len(top) > 1
+            and line_end_penalty(top[-1][0], lang) >= 1
+            and _vis_width(_join_line([top[-1], *bot])) <= DEFAULT_MAX_LINE_LENGTH
+        ):
+            bot.insert(0, top.pop())
+
+
 def _wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
     """Soft-wrap a cue into ``<=max_lines`` display lines (``\\n``-joined).
 
     Only changes rendered layout — cue boundaries and content are untouched.
     Wraps only when visual width exceeds ``DEFAULT_MAX_LINE_LENGTH``; short CJK
     cues with brief Latin phrases stay on one line. Lines are balanced at
-    ``ceil(total/max_lines)`` to avoid stranding a fragment on the last line.
+    ``ceil(total/max_lines)`` to avoid stranding a fragment on the last line,
+    then line ends are cleaned: kinsoku char rules for ja/zh, sticky-token
+    slide for spaced languages.
     """
     units = _wrap_units(text, lang)
     if len(units) <= 1:
@@ -1168,20 +1227,23 @@ def _wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
     if total <= DEFAULT_MAX_LINE_LENGTH:  # fits on one line -> no wrap needed
         return _join_line(units)
     target = -(-total // max_lines)  # ceil div: balance across max_lines lines
-    lines: List[str] = []
+    groups: List[List[Tuple[str, str]]] = []
     cur: List[Tuple[str, str]] = []
     for u in units:
         if (
             cur
             and _vis_width(_join_line(cur + [u])) > target
-            and len(lines) < max_lines - 1
+            and len(groups) < max_lines - 1
         ):
-            lines.append(_join_line(cur))
+            groups.append(cur)
             cur = [u]
         else:
             cur.append(u)
     if cur:
-        lines.append(_join_line(cur))
+        groups.append(cur)
+    if not _no_spaces(lang) and len(groups) > 1:
+        _slide_sticky_line_ends(groups, lang)
+    lines = [_join_line(g) for g in groups]
     if lang in {"ja", "zh"} and len(lines) > 1:
         from .kinsoku import apply_kinsoku
 

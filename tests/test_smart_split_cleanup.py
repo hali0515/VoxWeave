@@ -50,6 +50,54 @@ def test_min_duration_last_cue_extends_freely():
     assert out[0]["end"] == pytest.approx(5.5)  # no successor -> extend freely to want
 
 
+def test_lag_out_pads_into_gap():
+    cues = [
+        {"text": "hello there", "start": 0.0, "end": 2.0, "word_data": []},
+        {"text": "next", "start": 4.0, "end": 5.0, "word_data": []},
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0, lag_out_s=0.25)
+    assert out[0]["end"] == pytest.approx(2.25)
+
+
+def test_lag_out_capped_by_next_start():
+    cues = [
+        {"text": "hello", "start": 0.0, "end": 2.0, "word_data": []},
+        {"text": "next", "start": 2.1, "end": 3.0, "word_data": []},
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0, lag_out_s=0.25)
+    assert out[0]["end"] <= out[1]["start"] + 1e-9
+
+
+def test_cps_linger_extends_flash_cue_with_cap():
+    # 20 chars at cps 10 want 2.0s; natural span 0.8s; gap available -> extends,
+    # but never more than LINGER_CAP_S (1.0) past speech end.
+    cues = [
+        {"text": "a" * 20, "start": 0.0, "end": 0.8, "word_data": []},
+        {"text": "next", "start": 5.0, "end": 6.0, "word_data": []},
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0, cps=10.0)
+    assert out[0]["end"] == pytest.approx(1.8)
+
+
+def test_cps_no_change_when_reading_time_already_met():
+    # slow speech: natural duration exceeds chars/cps -> timing untouched
+    cues = [
+        {"text": "ab", "start": 0.0, "end": 3.0, "word_data": []},
+        {"text": "next", "start": 6.0, "end": 7.0, "word_data": []},
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0, cps=10.0)
+    assert out[0]["end"] == pytest.approx(3.0)
+
+
+def test_cps_and_lag_defaults_off_keep_timing():
+    cues = [
+        {"text": "hello", "start": 0.0, "end": 2.0, "word_data": []},
+        {"text": "next", "start": 4.0, "end": 5.0, "word_data": []},
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(2.0)
+
+
 def test_cleanup_does_not_exceed_max_cue():
     # 6.9s cue + 0.3s gap -> chaining would extend to ~7.12s; must be clamped back to 7.0 by max_cue_s
     cues = [

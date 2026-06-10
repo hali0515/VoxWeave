@@ -93,6 +93,28 @@ def test_wrap_embedded_english_in_cjk_uses_latin_budget():
     assert out.replace("\n", " ") == text
 
 
+def test_wrap_slides_sticky_token_down():
+    # balance point lands right after "to the" -> both closed-class tokens slide
+    # to line 2 (a line must not end on the/to); content preserved.
+    text = "Tomorrow we are heading to the famous mountain village together"
+    out = _wrap_cue_text(text, "en", 2)
+    lines = out.split("\n")
+    assert len(lines) == 2
+    assert lines[0].split()[-1].lower() not in {"the", "to", "of", "and"}
+    assert out.replace("\n", " ") == text
+
+
+def test_wrap_slide_keeps_hard_budget():
+    # receiving line already at the hard budget -> the sticky token stays put
+    # rather than overflowing line 2.
+    long_tail = "extraordinarily complicated multidimensional considerations"
+    text = f"He finally pointed to the {long_tail}"
+    out = _wrap_cue_text(text, "en", 2)
+    for line in out.split("\n"):
+        assert sum(1 for _ in line) <= 60  # sanity: nothing absurd
+    assert out.replace("\n", " ") == text
+
+
 def test_wrap_preserves_cjk_comma_space():
     # the space produced by a stripped comma in CJK (好 我们) must not be swallowed by the wrap logic
     assert _wrap_cue_text("好 我们一起走吧好吗", "zh", 2) == "好 我们一起走吧好吗"

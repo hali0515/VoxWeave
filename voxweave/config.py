@@ -241,6 +241,13 @@ _MIN_CUE_DEFAULT = 0.5
 _MAX_CUE_DEFAULT = 7.0
 _MIN_CUE_CEIL = 5.0 / 6.0  # Netflix floor: never require longer than 5/6s
 _GLUE_GAP_DEFAULT_MS = 300  # lone-word flicker cue glues back if gap < this (0=off); < clause_ms so real pauses never merge
+# Reading-speed linger targets (non-space chars/sec): a cue whose natural span is
+# shorter than chars/cps extends into the following gap (capped in smart_split).
+# These are linger targets for flash cues, not display-rate enforcement — verbatim
+# text cannot be slowed below the speech rate.
+_CPS_DEFAULTS = {"ja": 7.0, "zh": 9.0, "ko": 9.0}
+_CPS_LATIN_DEFAULT = 17.0  # ~Netflix 20 cps incl. spaces, measured without spaces
+_LAG_OUT_DEFAULT_MS = 250  # flat tail pad after speech ends (0=off)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -277,6 +284,8 @@ def gap_thresholds(iso: str) -> dict[str, int | float]:
         "VOXWEAVE_MAX_CUE_SEC", _MAX_CUE_DEFAULT
     )  # intentionally unclamped
     glue_gap = _env_int("VOXWEAVE_GLUE_GAP_MS", _GLUE_GAP_DEFAULT_MS) / 1000.0
+    cps = _env_float("VOXWEAVE_CPS", _CPS_DEFAULTS.get(iso, _CPS_LATIN_DEFAULT))
+    lag_out = _env_int("VOXWEAVE_LAG_OUT_MS", _LAG_OUT_DEFAULT_MS) / 1000.0
     return {
         "clause_ms": clause,
         "vad_skip_ms": skip,
@@ -284,4 +293,6 @@ def gap_thresholds(iso: str) -> dict[str, int | float]:
         "min_cue_s": min_cue,
         "max_cue_s": max_cue,
         "glue_gap_s": glue_gap,
+        "cps": cps,
+        "lag_out_s": lag_out,
     }
