@@ -9,7 +9,7 @@ word_data has no ``word``); ``Cue`` keys are required invariants.
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 class Unit(TypedDict, total=False):
@@ -46,10 +46,13 @@ class Cue(TypedDict):
 
     All four keys are invariants of the cue stream (every constructor fills
     them; timing-less cues carry ``word_data=[]``), so they are required —
-    subscript access is the normal pattern downstream.
+    subscript access is the normal pattern downstream. ``lyric`` marks a cue
+    whose span is mostly sung (keep-lyrics mode); display layers wrap it with
+    music notes while the stored text stays clean.
     """
 
     text: str
     start: float
     end: float
     word_data: list[Unit]
+    lyric: NotRequired[bool]

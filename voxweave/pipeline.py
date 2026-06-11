@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from voxweave import backend
+from voxweave.core.schema import Cue
 from voxweave.chunking import (
     decode_to_wav,
     pack_speech_segments,
@@ -257,18 +258,22 @@ def transcribe(
     lang_override: str | None = None,
     separate: bool = True,
     skip_songs: bool = False,
+    keep_lyrics: bool = False,
     normalize: bool = False,
     reporter: Reporter | None = None,
     debug: bool = False,
     cache_vocals: Path | None = None,
     asr_model: str | None = None,
     context: str | None = None,
-) -> tuple[str, list[dict], list[tuple[float, float]]]:
+) -> tuple[str, list[dict], list[tuple[float, float]], list[tuple[float, float]]]:
     """Run separation -> song skip -> VAD chunking -> ASR -> alignment.
 
-    Returns ``(iso_language, word_segments, vad_spans)``. vad_spans are the original-audio
-    speech intervals, persisted to JSON for gap splitting. All models run in-process
-    (no network calls). smart_split and file writing are handled by :func:`process`.
+    Returns ``(iso_language, word_segments, vad_spans, sing_spans)``. vad_spans are the
+    original-audio speech intervals, persisted to JSON for gap splitting. ``keep_lyrics``
+    runs song detection but skips excision: sung regions go through ASR/alignment like
+    dialogue, and the detected singing spans come back so :func:`process` can flag lyric
+    cues (empty unless keep_lyrics). All models run in-process (no network calls).
+    smart_split and file writing are handled by :func:`process`.
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
@@ -315,11 +320,11 @@ def transcribe(
         song_spans: list[tuple[float, float]] = []
         sing_spans: list[tuple[float, float]] = []  # subset triggering block expansion
         speech_spans: list[tuple[float, float]] = []  # trimmed from song core edges
-        if skip_songs:
+        if skip_songs or keep_lyrics:
             if not separate or voc32 is None:
                 # --no-separate + skip-songs is valid (clean input); skip detection silently.
                 log.debug(
-                    "skip-songs requires separated vocals; skipping with --no-separate"
+                    "song detection requires separated vocals; skipping with --no-separate"
                 )
             else:
                 try:
@@ -343,7 +348,18 @@ def transcribe(
 
         rep.stage("VAD chunking")
         segs = vad_speech_segments(wav)
-        if song_spans:
+        if keep_lyrics:
+            # Keep-lyrics: sung regions stay in the chunk stream and get ASR'd like
+            # dialogue; only the singing spans (human vocals) are kept for cue marking.
+            if sing_spans:
+                log.info(
+                    "keeping %d singing span(s) as lyrics: %s",
+                    len(sing_spans),
+                    [(round(a, 1), round(b, 1)) for a, b in sing_spans],
+                )
+            song_spans = []  # disable excision + VAD-reference exclusion below
+            chunks = pack_speech_segments(segs, max_sec=MAX_CHUNK_SEC)
+        elif song_spans:
             # Fine VAD (small min-silence) exposes brief intra-segment pauses; excision
             # snaps its cut points into these so dialogue words are never bisected.
             fine = vad_speech_segments(wav, min_silence_ms=SONG_FINE_SILENCE_MS)
@@ -500,7 +516,7 @@ def transcribe(
                 "units": len(all_units),
             }
         )
-        return iso, all_units, vad_spans
+        return iso, all_units, vad_spans, sing_spans if keep_lyrics else []
     finally:
         # Release ASR/alignment singleton VRAM (separation self-releases earlier).
         backend.release()
@@ -554,6 +570,37 @@ def _maybe_adaptive_thresholds(th: dict, units: list[dict]) -> dict:
     return out
 
 
+# A cue is a lyric when at least this fraction of its span overlaps detected singing.
+LYRIC_MIN_OVERLAP = 0.5
+
+
+def mark_lyric_cues(
+    cues: Sequence["Cue"], sing_spans: list[tuple[float, float]] | None
+) -> None:
+    """Flag cues whose span mostly overlaps detected singing (``lyric=True``).
+
+    The stored cue text stays clean; display layers (`_write_siblings` VTT rows,
+    SRT/ASS export) wrap flagged cues with music notes per the Netflix lyric
+    convention. Runs in place after smart_split so flags ride the final cues.
+    """
+    if not sing_spans:
+        return
+    for c in cues:
+        start, end = c.get("start"), c.get("end")
+        if start is None or end is None or end - start <= 0:
+            continue
+        overlap = sum(max(0.0, min(end, b) - max(start, a)) for a, b in sing_spans)
+        if overlap / (end - start) >= LYRIC_MIN_OVERLAP:
+            c["lyric"] = True
+
+
+def lyric_display_text(cue: Mapping[str, Any]) -> str:
+    """Cue display text: lyric cues get the Netflix music-note wrap (note + space
+    at the start and end of the subtitle), others pass through unchanged."""
+    text = str(cue["text"])
+    return f"♪ {text} ♪" if cue.get("lyric") else text
+
+
 def _dump_sibling_json(
     json_path: Path,
     *,
@@ -562,13 +609,15 @@ def _dump_sibling_json(
     units: list[dict],
     vad_speech: list[tuple[float, float]] | None,
     shot_changes: list[float] | None = None,
+    sing_spans: list[tuple[float, float]] | None = None,
 ) -> None:
     """Write the sibling JSON document (language + segments + word_segments + optional
-    vad_speech / shot_changes).
+    vad_speech / shot_changes / sing_spans).
 
     ``vad_speech=None`` omits the key; a list (even empty) writes it coerced to
     ``[[float, float], ...]``. ``shot_changes`` behaves the same (written only when not
-    None, so ``split`` can replay shot snapping without re-decoding the video).
+    None, so ``split`` can replay shot snapping without re-decoding the video), as does
+    ``sing_spans`` (so ``split`` can re-flag lyric cues without re-running PANNs).
     Single source of truth for the sibling-JSON shape shared by process and align.
     """
     data: dict = {"language": language, "segments": segments, "word_segments": units}
@@ -576,6 +625,8 @@ def _dump_sibling_json(
         data["vad_speech"] = [[float(s), float(e)] for s, e in vad_speech]
     if shot_changes is not None:
         data["shot_changes"] = [float(t) for t in shot_changes]
+    if sing_spans is not None:
+        data["sing_spans"] = [[float(s), float(e)] for s, e in sing_spans]
     json_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -589,14 +640,16 @@ def _write_siblings(
     vad_speech: list[tuple[float, float]] | None = None,
     timestamps: bool = True,
     shot_changes: list[float] | None = None,
+    sing_spans: list[tuple[float, float]] | None = None,
 ) -> Path:
     """Write sibling .json (ground truth) and .vtt alongside src; return the .vtt path.
 
     ``timestamps=True`` writes a timing line before each cue (word-level precision); cues
     missing start/end fall back to plain text. ``timestamps=False`` writes a plain-text
     edit draft for human editing before re-running ``align``. Both formats are accepted by
-    ``realign.parse_vtt_blocks``. Uses ``swap_ext`` (not ``with_suffix``) to preserve
-    interior dots in filenames.
+    ``realign.parse_vtt_blocks``. Lyric-flagged cues render with the music-note wrap in
+    the VTT only; the JSON keeps clean text + the flag. Uses ``swap_ext`` (not
+    ``with_suffix``) to preserve interior dots in filenames.
     """
     _dump_sibling_json(
         swap_ext(src, ".json"),
@@ -605,12 +658,13 @@ def _write_siblings(
         units=units,
         vad_speech=vad_speech or [],
         shot_changes=shot_changes,
+        sing_spans=sing_spans,
     )
     rows = [
         (
             c.get("start") if timestamps else None,
             c.get("end") if timestamps else None,
-            c["text"],
+            lyric_display_text(c),
         )
         for c in cues
     ]
@@ -643,6 +697,7 @@ def process(
     debug: bool = False,
     normalize: bool = False,
     skip_songs: bool = False,
+    keep_lyrics: bool = False,
     word_segments: tuple[str, list[dict]] | None = None,
     asr_model: str | None = None,
     context: str | None = None,
@@ -652,20 +707,24 @@ def process(
     """Full pipeline: transcribe -> smart_split -> write siblings. Return the .vtt path.
 
     Pass ``word_segments`` to skip transcription (tests / special cases); that path
-    also skips shot detection (no media decode in unit tests).
+    also skips shot detection (no media decode in unit tests). ``keep_lyrics``
+    transcribes detected songs instead of excising them and flags the sung cues
+    (rendered with a music-note wrap; spans persist to JSON for ``split`` replay).
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
     vad_speech: list[tuple[float, float]] | None = None
     shot_changes: list[float] | None = None
+    sing_spans: list[tuple[float, float]] | None = None
     if word_segments is not None:
         iso, units = word_segments
     else:
-        iso, units, vad_speech = transcribe(
+        iso, units, vad_speech, sing_spans = transcribe(
             media_path,
             lang_override=lang_override,
             separate=separate,
             skip_songs=skip_songs,
+            keep_lyrics=keep_lyrics,
             normalize=normalize,
             reporter=reporter,
             debug=debug,
@@ -673,6 +732,7 @@ def process(
             asr_model=asr_model,
             context=context,
         )
+        sing_spans = sing_spans or None
         if shot_snap:
             from voxweave import shotdet
 
@@ -694,6 +754,7 @@ def process(
         thresholds=_maybe_adaptive_thresholds(gap_thresholds(iso), units),
         shot_changes=shot_changes,
     )
+    mark_lyric_cues(cues, sing_spans)
 
     rep.stage("write siblings")
     vtt_out = _write_siblings(
@@ -704,6 +765,7 @@ def process(
         vad_speech=vad_speech,
         timestamps=timestamps,
         shot_changes=shot_changes,
+        sing_spans=sing_spans,
     )
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
     return vtt_out
@@ -726,6 +788,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
     iso = data.get("language", "en")
     speech_spans = _spans_in(data.get("vad_speech"))
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
+    sing_spans = _spans_in(data.get("sing_spans"))
     units = realign.snap_break_punct(
         units, iso
     )  # zh: snap to jieba boundary (same as process)
@@ -738,6 +801,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
         shot_changes=shot_changes,
         **smart_split_kwargs,
     )
+    mark_lyric_cues(cues, sing_spans)
     vtt_out = _write_siblings(
         json_path,
         cues,
@@ -746,6 +810,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
         vad_speech=speech_spans,
         timestamps=timestamps,
         shot_changes=shot_changes,
+        sing_spans=sing_spans,
     )
     log.info("re-split %s → %d cues", vtt_out.name, len(cues))
     return vtt_out

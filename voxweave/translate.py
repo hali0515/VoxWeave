@@ -111,18 +111,16 @@ def render_translated_vtt(
 ) -> str:
     """Translated text + per-block timestamps -> VTT; missing translations fall back
     to the original text; blocks without timestamps produce plain-text cues.
-    ``to_iso`` enables target-language soft-wrap (see _layout_translated)."""
-    rows = [
-        (
-            b.get("start"),
-            b.get("end"),
-            _layout_translated(
-                strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]),
-                to_iso,
-            ),
+    ``to_iso`` enables target-language soft-wrap (see _layout_translated).
+    Lyric-flagged blocks get their music-note wrap restored after layout."""
+
+    def _text(i: int, b: dict) -> str:
+        t = _layout_translated(
+            strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]), to_iso
         )
-        for i, b in enumerate(blocks)
-    ]
+        return f"♪ {t} ♪" if b.get("lyric") else t
+
+    rows = [(b.get("start"), b.get("end"), _text(i, b)) for i, b in enumerate(blocks)]
     return render_cues(rows)
 
 

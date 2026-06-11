@@ -178,6 +178,14 @@ def cli(verbose: bool) -> None:
     " prevents OP/ED/insert song hallucinations). Use --no-skip-songs to transcribe song lyrics or pure music.",
 )
 @click.option(
+    "--keep-lyrics",
+    is_flag=True,
+    default=False,
+    help="Transcribe detected songs instead of skipping them: sung cues are flagged and"
+    " wrapped with music notes (overrides --skip-songs excision; detection still runs;"
+    " export to ASS renders them italic).",
+)
+@click.option(
     "--context",
     default=None,
     envvar="VOXWEAVE_ASR_CONTEXT",
@@ -215,6 +223,7 @@ def cmd_transcribe(
     debug: bool,
     normalize: bool,
     skip_songs: bool,
+    keep_lyrics: bool,
     context: str | None,
     hybrid: bool,
     timestamps: bool,
@@ -230,6 +239,7 @@ def cmd_transcribe(
             debug=debug,
             normalize=normalize,
             skip_songs=skip_songs,
+            keep_lyrics=keep_lyrics,
             asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
             context=context,
             timestamps=timestamps,

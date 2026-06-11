@@ -75,7 +75,16 @@ def parse_vtt_blocks(text: str) -> list[dict]:
         cue = "\n".join(body).strip()
         if not cue:
             continue
-        blocks.append({"text": cue, "start": start, "end": end})
+        block = {"text": cue, "start": start, "end": end}
+        # Keep-lyrics marking: "♪ text ♪" wraps are display decoration, not content.
+        # Strip them so alignment/translation see clean text, and flag the block so
+        # writers (align rewrite, translated VTT) can restore the wrap.
+        if len(cue) > 2 and cue.startswith("♪") and cue.endswith("♪"):
+            block["text"] = cue[1:-1].strip()
+            block["lyric"] = True
+            if not block["text"]:
+                continue
+        blocks.append(block)
     return blocks
 
 
@@ -861,5 +870,11 @@ def render_cues(rows: list[tuple[float | None, float | None, str]]) -> str:
 
 
 def render_vtt(blocks: list[dict], spans: list[tuple[float, float]]) -> str:
-    """Block text + timestamps → standard timestamped VTT string."""
-    return render_cues([(a, e, b["text"]) for b, (a, e) in zip(blocks, spans)])
+    """Block text + timestamps → standard timestamped VTT string. Lyric-flagged
+    blocks (see :func:`parse_vtt_blocks`) get their music-note wrap restored."""
+    return render_cues(
+        [
+            (a, e, f"♪ {b['text']} ♪" if b.get("lyric") else b["text"])
+            for b, (a, e) in zip(blocks, spans)
+        ]
+    )

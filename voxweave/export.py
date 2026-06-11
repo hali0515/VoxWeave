@@ -95,11 +95,16 @@ def _ass_text(text: str) -> str:
 
 
 def render_ass(rows: list[tuple[float, float, str]]) -> str:
-    """Render an ASS script with a single Default style."""
-    events = [
-        f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(end)},Default,,0,0,0,,{_ass_text(text)}"
-        for start, end, text in rows
-    ]
+    """Render an ASS script with a single Default style. Lyric cues (wrapped in
+    music notes by keep-lyrics mode) render italic per the Netflix convention."""
+    events = []
+    for start, end, text in rows:
+        body = _ass_text(text)
+        if text.startswith("♪") and text.endswith("♪"):
+            body = f"{{\\i1}}{body}{{\\i0}}"
+        events.append(
+            f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(end)},Default,,0,0,0,,{body}"
+        )
     return _ASS_HEADER + "\n".join(events) + "\n"
 
 
