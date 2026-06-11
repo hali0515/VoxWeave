@@ -698,6 +698,7 @@ def process(
     normalize: bool = False,
     skip_songs: bool = False,
     keep_lyrics: bool = False,
+    sdh: bool = False,
     word_segments: tuple[str, list[dict]] | None = None,
     asr_model: str | None = None,
     context: str | None = None,
@@ -710,6 +711,8 @@ def process(
     also skips shot detection (no media decode in unit tests). ``keep_lyrics``
     transcribes detected songs instead of excising them and flags the sung cues
     (rendered with a music-note wrap; spans persist to JSON for ``split`` replay).
+    ``sdh`` additionally writes a ``<stem>.sdh.vtt`` sidecar with PANNs-detected
+    non-speech event tags merged into the dialogue (main VTT/JSON untouched).
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
@@ -768,7 +771,38 @@ def process(
         sing_spans=sing_spans,
     )
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
+    if sdh and word_segments is None:
+        _write_sdh_sidecar(media_path, cues, rep)
     return vtt_out
+
+
+def _write_sdh_sidecar(
+    media_path: Path, cues: Sequence[Cue], rep: Reporter
+) -> Path | None:
+    """Detect non-speech events on the ORIGINAL mix (effects are stripped from the
+    separated-vocals stem) and write ``<stem>.sdh.vtt`` (dialogue + event tags).
+    Returns None when panns-inference is missing (warned, non-fatal)."""
+    from voxweave import sdh as sdh_mod
+
+    rep.stage("SDH event detection (PANNs)")
+    wav32 = decode_to_wav(media_path, sample_rate=SONGDET_SR)
+    try:
+        events = sdh_mod.detect_events(
+            wav32, progress=_progress_bridge(rep, "SDH event detection (PANNs)")
+        )
+    except ModuleNotFoundError as e:
+        log.warning(
+            "SDH detection requires panns-inference (not installed: %s); skipping sidecar",
+            e,
+        )
+        return None
+    finally:
+        wav32.unlink(missing_ok=True)
+    events = sdh_mod.fit_events_to_gaps(events, cues)
+    path = swap_ext(media_path, ".sdh.vtt")
+    path.write_text(sdh_mod.render_sdh_vtt(cues, events), encoding="utf-8")
+    log.info("wrote %s (%d event tag(s))", path.name, len(events))
+    return path
 
 
 def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Path:

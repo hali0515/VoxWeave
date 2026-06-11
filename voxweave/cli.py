@@ -186,6 +186,14 @@ def cli(verbose: bool) -> None:
     " export to ASS renders them italic).",
 )
 @click.option(
+    "--sdh",
+    is_flag=True,
+    default=False,
+    help="Also write <stem>.sdh.vtt: PANNs-detected non-speech event tags ([explosion],"
+    " [phone ringing], ...) merged into the dialogue in speech-free gaps; runs on the"
+    " original mix (main VTT/JSON untouched).",
+)
+@click.option(
     "--context",
     default=None,
     envvar="VOXWEAVE_ASR_CONTEXT",
@@ -224,6 +232,7 @@ def cmd_transcribe(
     normalize: bool,
     skip_songs: bool,
     keep_lyrics: bool,
+    sdh: bool,
     context: str | None,
     hybrid: bool,
     timestamps: bool,
@@ -240,6 +249,7 @@ def cmd_transcribe(
             normalize=normalize,
             skip_songs=skip_songs,
             keep_lyrics=keep_lyrics,
+            sdh=sdh,
             asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
             context=context,
             timestamps=timestamps,

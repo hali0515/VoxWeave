@@ -425,6 +425,40 @@ def group_segments_by_spans(
     return groups
 
 
+def window_probs(
+    wav_path: Path, *, batch: int = 32, progress=None
+) -> tuple[np.ndarray, list[float]] | None:
+    """Run PANNs over ``wav_path`` (32 kHz mono) in sliding windows.
+
+    Returns ``(probs, starts_sec)`` — the full ``(n_windows, 527)`` AudioSet
+    probability matrix and each window's start time — or None when the audio is
+    shorter than one window. Shared by song detection (separated vocals input)
+    and SDH event detection (original-mix input); ``progress(done, total)`` is
+    optional, called per batch.
+    """
+    data, sr = sf.read(str(wav_path), dtype="float32")
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    assert sr == SR, f"expected {SR} Hz, got {sr!r} — decode_to_wav(sample_rate={SR})"
+
+    win, hop = int(WIN_SEC * SR), int(HOP_SEC * SR)
+    if len(data) < win:
+        return None
+    starts_idx = list(range(0, len(data) - win + 1, hop))
+    wins = np.stack([data[s : s + win] for s in starts_idx])
+
+    model = _get_model()
+    batch_starts = list(range(0, len(wins), batch))
+    nb = len(batch_starts)
+    probs = []
+    for bi, i in enumerate(batch_starts):
+        out, _ = model.inference(wins[i : i + batch])
+        probs.append(out)
+        if progress is not None:
+            progress(bi + 1, nb)
+    return np.concatenate(probs), [s / SR for s in starts_idx]
+
+
 def detect_song_spans(
     wav_path: Path, *, batch: int = 32, progress=None
 ) -> tuple[
@@ -442,29 +476,10 @@ def detect_song_spans(
     Input must be separated vocals (route ii): instruments stripped, so singing vs. speech
     scores are cleanly separated. ``progress(done, total)`` is optional, called per batch.
     """
-    data, sr = sf.read(str(wav_path), dtype="float32")
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    assert sr == SR, f"expected {SR} Hz, got {sr!r} — decode_to_wav(sample_rate={SR})"
-
-    win, hop = int(WIN_SEC * SR), int(HOP_SEC * SR)
-    if len(data) < win:
+    wp = window_probs(wav_path, batch=batch, progress=progress)
+    if wp is None:
         return [], [], []
-    starts_idx = list(range(0, len(data) - win + 1, hop))
-    wins = np.stack([data[s : s + win] for s in starts_idx])
-
-    model = _get_model()
-    batch_starts = list(range(0, len(wins), batch))
-    nb = len(batch_starts)
-    probs = []
-    for bi, i in enumerate(batch_starts):
-        out, _ = model.inference(wins[i : i + batch])
-        probs.append(out)
-        if progress is not None:
-            progress(bi + 1, nb)
-    P = np.concatenate(probs)
-
-    starts_sec = [s / SR for s in starts_idx]
+    P, starts_sec = wp
     spans = merge_spans(song_flags(P), starts_sec)
     sing_starts = [t for t, f in zip(starts_sec, sing_flags(P), strict=True) if f]
     sing_spans = [(a, b) for (a, b) in spans if any(a <= t < b for t in sing_starts)]
