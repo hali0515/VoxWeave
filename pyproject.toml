@@ -94,6 +94,13 @@ mps = [
   "mlx-audio>=0.4.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
+# Speaker diarization (--diarize): pyannote.audio 3.x + pyannote/speaker-diarization-3.1
+# (MIT, ~1.6 GB VRAM; the 4.x line needs torch>=2.8 and currently peaks ~9.5 GB on the
+# same model — see pyannote-audio#1963). The checkpoint is HF-gated: accept the model
+# card conditions and set VOXWEAVE_HF_TOKEN / HF_TOKEN.
+diarize = [
+  "pyannote-audio>=3.4,<4",
+]
 
 [dependency-groups]
 dev = ["pytest>=8", "pyright>=1.1.390"]

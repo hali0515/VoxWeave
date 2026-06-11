@@ -178,6 +178,17 @@ def conf_fusion_qwen() -> str:
     return _nonempty_str(v) or DEFAULT_FUSION_QWEN
 
 
+def conf_hf_token() -> str | None:
+    """Hugging Face token for gated checkpoints (pyannote diarization).
+    Precedence: env VOXWEAVE_HF_TOKEN > HF_TOKEN > HUGGING_FACE_HUB_TOKEN >
+    conf ``hf_token``; None when nowhere set."""
+    for key in ("VOXWEAVE_HF_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        v = _nonempty_str(os.environ.get(key))
+        if v:
+            return v
+    return _nonempty_str(_load().get("hf_token"))
+
+
 _LOAD_STRATEGIES = ("peak", "sum")
 
 

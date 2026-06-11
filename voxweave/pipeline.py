@@ -259,21 +259,30 @@ def transcribe(
     separate: bool = True,
     skip_songs: bool = False,
     keep_lyrics: bool = False,
+    diarize: bool = False,
     normalize: bool = False,
     reporter: Reporter | None = None,
     debug: bool = False,
     cache_vocals: Path | None = None,
     asr_model: str | None = None,
     context: str | None = None,
-) -> tuple[str, list[dict], list[tuple[float, float]], list[tuple[float, float]]]:
+) -> tuple[
+    str,
+    list[dict],
+    list[tuple[float, float]],
+    list[tuple[float, float]],
+    list[tuple[float, float, str]],
+]:
     """Run separation -> song skip -> VAD chunking -> ASR -> alignment.
 
-    Returns ``(iso_language, word_segments, vad_spans, sing_spans)``. vad_spans are the
-    original-audio speech intervals, persisted to JSON for gap splitting. ``keep_lyrics``
-    runs song detection but skips excision: sung regions go through ASR/alignment like
-    dialogue, and the detected singing spans come back so :func:`process` can flag lyric
-    cues (empty unless keep_lyrics). All models run in-process (no network calls).
-    smart_split and file writing are handled by :func:`process`.
+    Returns ``(iso_language, word_segments, vad_spans, sing_spans, speaker_turns)``.
+    vad_spans are the original-audio speech intervals, persisted to JSON for gap
+    splitting. ``keep_lyrics`` runs song detection but skips excision: sung regions go
+    through ASR/alignment like dialogue, and the detected singing spans come back so
+    :func:`process` can flag lyric cues (empty unless keep_lyrics). ``diarize`` runs
+    pyannote on the separated-vocals wav and returns the speaker turns (empty unless
+    set). All models run in-process (no network calls). smart_split and file writing
+    are handled by :func:`process`.
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
@@ -516,7 +525,22 @@ def transcribe(
                 "units": len(all_units),
             }
         )
-        return iso, all_units, vad_spans, sing_spans if keep_lyrics else []
+        speaker_turns: list[tuple[float, float, str]] = []
+        if diarize:
+            from voxweave import diarize as diarize_mod
+
+            rep.stage("speaker diarization (pyannote)")
+            try:
+                speaker_turns = diarize_mod.diarize_turns(wav)
+            finally:
+                diarize_mod.release()
+        return (
+            iso,
+            all_units,
+            vad_spans,
+            sing_spans if keep_lyrics else [],
+            speaker_turns,
+        )
     finally:
         # Release ASR/alignment singleton VRAM (separation self-releases earlier).
         backend.release()
@@ -529,6 +553,11 @@ def transcribe(
 def _spans_in(raw: Any) -> list[tuple[float, float]] | None:
     """Parse a persisted ``vad_speech`` array (``[[start, end], ...]``) to float tuples; None if absent/empty."""
     return [(float(s), float(e)) for s, e in raw] if raw else None
+
+
+def _turns_in(raw: Any) -> list[tuple[float, float, str]] | None:
+    """Parse persisted ``speaker_turns`` (``[[start, end, label], ...]``); None if absent/empty."""
+    return [(float(s), float(e), str(lb)) for s, e, lb in raw] if raw else None
 
 
 def _maybe_adaptive_thresholds(th: dict, units: list[dict]) -> dict:
@@ -610,15 +639,17 @@ def _dump_sibling_json(
     vad_speech: list[tuple[float, float]] | None,
     shot_changes: list[float] | None = None,
     sing_spans: list[tuple[float, float]] | None = None,
+    speaker_turns: list[tuple[float, float, str]] | None = None,
 ) -> None:
     """Write the sibling JSON document (language + segments + word_segments + optional
-    vad_speech / shot_changes / sing_spans).
+    vad_speech / shot_changes / sing_spans / speaker_turns).
 
     ``vad_speech=None`` omits the key; a list (even empty) writes it coerced to
     ``[[float, float], ...]``. ``shot_changes`` behaves the same (written only when not
-    None, so ``split`` can replay shot snapping without re-decoding the video), as does
-    ``sing_spans`` (so ``split`` can re-flag lyric cues without re-running PANNs).
-    Single source of truth for the sibling-JSON shape shared by process and align.
+    None, so ``split`` can replay shot snapping without re-decoding the video), as do
+    ``sing_spans`` (lyric re-flagging without PANNs) and ``speaker_turns`` (speaker
+    re-formatting without pyannote). Single source of truth for the sibling-JSON shape
+    shared by process and align.
     """
     data: dict = {"language": language, "segments": segments, "word_segments": units}
     if vad_speech is not None:
@@ -627,6 +658,10 @@ def _dump_sibling_json(
         data["shot_changes"] = [float(t) for t in shot_changes]
     if sing_spans is not None:
         data["sing_spans"] = [[float(s), float(e)] for s, e in sing_spans]
+    if speaker_turns is not None:
+        data["speaker_turns"] = [
+            [float(s), float(e), str(lb)] for s, e, lb in speaker_turns
+        ]
     json_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -641,6 +676,7 @@ def _write_siblings(
     timestamps: bool = True,
     shot_changes: list[float] | None = None,
     sing_spans: list[tuple[float, float]] | None = None,
+    speaker_turns: list[tuple[float, float, str]] | None = None,
 ) -> Path:
     """Write sibling .json (ground truth) and .vtt alongside src; return the .vtt path.
 
@@ -659,6 +695,7 @@ def _write_siblings(
         vad_speech=vad_speech or [],
         shot_changes=shot_changes,
         sing_spans=sing_spans,
+        speaker_turns=speaker_turns,
     )
     rows = [
         (
@@ -699,6 +736,7 @@ def process(
     skip_songs: bool = False,
     keep_lyrics: bool = False,
     sdh: bool = False,
+    diarize: bool = False,
     word_segments: tuple[str, list[dict]] | None = None,
     asr_model: str | None = None,
     context: str | None = None,
@@ -713,21 +751,25 @@ def process(
     (rendered with a music-note wrap; spans persist to JSON for ``split`` replay).
     ``sdh`` additionally writes a ``<stem>.sdh.vtt`` sidecar with PANNs-detected
     non-speech event tags merged into the dialogue (main VTT/JSON untouched).
+    ``diarize`` runs pyannote speaker diarization and formats multi-speaker cues
+    (dual-speaker hyphens / speaker-boundary splits; turns persist to JSON).
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
     vad_speech: list[tuple[float, float]] | None = None
     shot_changes: list[float] | None = None
     sing_spans: list[tuple[float, float]] | None = None
+    speaker_turns: list[tuple[float, float, str]] | None = None
     if word_segments is not None:
         iso, units = word_segments
     else:
-        iso, units, vad_speech, sing_spans = transcribe(
+        iso, units, vad_speech, sing_spans, speaker_turns = transcribe(
             media_path,
             lang_override=lang_override,
             separate=separate,
             skip_songs=skip_songs,
             keep_lyrics=keep_lyrics,
+            diarize=diarize,
             normalize=normalize,
             reporter=reporter,
             debug=debug,
@@ -736,6 +778,7 @@ def process(
             context=context,
         )
         sing_spans = sing_spans or None
+        speaker_turns = speaker_turns or None
         if shot_snap:
             from voxweave import shotdet
 
@@ -758,6 +801,10 @@ def process(
         shot_changes=shot_changes,
     )
     mark_lyric_cues(cues, sing_spans)
+    if speaker_turns:
+        from voxweave.diarize import apply_speaker_format
+
+        cues = apply_speaker_format(cues, speaker_turns, iso)
 
     rep.stage("write siblings")
     vtt_out = _write_siblings(
@@ -769,6 +816,7 @@ def process(
         timestamps=timestamps,
         shot_changes=shot_changes,
         sing_spans=sing_spans,
+        speaker_turns=speaker_turns,
     )
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
     if sdh and word_segments is None:
@@ -823,6 +871,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
     speech_spans = _spans_in(data.get("vad_speech"))
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = _spans_in(data.get("sing_spans"))
+    speaker_turns = _turns_in(data.get("speaker_turns"))
     units = realign.snap_break_punct(
         units, iso
     )  # zh: snap to jieba boundary (same as process)
@@ -836,6 +885,10 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
         **smart_split_kwargs,
     )
     mark_lyric_cues(cues, sing_spans)
+    if speaker_turns:
+        from voxweave.diarize import apply_speaker_format
+
+        cues = apply_speaker_format(cues, speaker_turns, iso)
     vtt_out = _write_siblings(
         json_path,
         cues,
@@ -845,6 +898,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
         timestamps=timestamps,
         shot_changes=shot_changes,
         sing_spans=sing_spans,
+        speaker_turns=speaker_turns,
     )
     log.info("re-split %s → %d cues", vtt_out.name, len(cues))
     return vtt_out
@@ -900,13 +954,18 @@ def _write_align_json(
     lang: str,
     vad_speech: list[tuple[float, float]] | None = None,
     shot_changes: list[float] | None = None,
+    sing_spans: list[tuple[float, float]] | None = None,
+    speaker_turns: list[tuple[float, float, str]] | None = None,
 ) -> None:
-    """Update the sibling JSON with new alignment timing. Passes vad_speech and
-    shot_changes through so split and subsequent align runs can reuse them without
-    recomputing.
+    """Update the sibling JSON with new alignment timing. Passes vad_speech,
+    shot_changes, sing_spans, and speaker_turns through so split and subsequent
+    align runs can reuse them without recomputing. Lyric flags survive on the
+    re-timed segments.
     """
     segments = [
-        {"text": b["text"], "start": a, "end": e} for b, (a, e) in zip(blocks, spans)
+        {"text": b["text"], "start": a, "end": e}
+        | ({"lyric": True} if b.get("lyric") else {})
+        for b, (a, e) in zip(blocks, spans)
     ]
     _dump_sibling_json(
         json_path,
@@ -915,6 +974,8 @@ def _write_align_json(
         units=units,
         vad_speech=vad_speech,
         shot_changes=shot_changes,
+        sing_spans=sing_spans,
+        speaker_turns=speaker_turns,
     )
 
 
@@ -1098,8 +1159,18 @@ def align(
         # transcribe from the original media; align does not recompute them).
         keep_vad = _spans_in(data.get("vad_speech"))
         keep_shots = [float(t) for t in data.get("shot_changes") or []] or None
+        keep_sing = _spans_in(data.get("sing_spans"))
+        keep_turns = _turns_in(data.get("speaker_turns"))
         _write_align_json(
-            json_path, blocks, spans_filled, all_units, iso, keep_vad, keep_shots
+            json_path,
+            blocks,
+            spans_filled,
+            all_units,
+            iso,
+            keep_vad,
+            keep_shots,
+            keep_sing,
+            keep_turns,
         )
         log.info(
             "aligned %s → %d cues, %d units", vtt_path.name, len(blocks), len(all_units)

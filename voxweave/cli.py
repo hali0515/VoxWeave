@@ -194,6 +194,14 @@ def cli(verbose: bool) -> None:
     " original mix (main VTT/JSON untouched).",
 )
 @click.option(
+    "--diarize",
+    is_flag=True,
+    default=False,
+    help="Run pyannote speaker diarization: two-speaker cues become Netflix dual-speaker"
+    " events (-line per speaker), 3+ speaker cues split at speaker boundaries. Needs"
+    " 'voxweave[diarize]' + an HF token for the gated checkpoint (VOXWEAVE_HF_TOKEN).",
+)
+@click.option(
     "--context",
     default=None,
     envvar="VOXWEAVE_ASR_CONTEXT",
@@ -233,6 +241,7 @@ def cmd_transcribe(
     skip_songs: bool,
     keep_lyrics: bool,
     sdh: bool,
+    diarize: bool,
     context: str | None,
     hybrid: bool,
     timestamps: bool,
@@ -250,6 +259,7 @@ def cmd_transcribe(
             skip_songs=skip_songs,
             keep_lyrics=keep_lyrics,
             sdh=sdh,
+            diarize=diarize,
             asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
             context=context,
             timestamps=timestamps,
