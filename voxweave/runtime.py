@@ -15,6 +15,7 @@ import os
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger("voxweave")
 
@@ -200,11 +201,11 @@ def _bridged_bars(label: str):
                 _report()
             return super().update(n)
 
-    hub_tqdm_mod.tqdm = _Bridge
+    setattr(hub_tqdm_mod, "tqdm", _Bridge)
     try:
         yield _Bridge
     finally:
-        hub_tqdm_mod.tqdm = base
+        setattr(hub_tqdm_mod, "tqdm", base)
 
 
 def _hf_download(repo: str, filename: str, cache_dir: str | None = None) -> str:
@@ -236,5 +237,5 @@ def _hf_snapshot(repo: str, cache_dir: str) -> str:
     except ModuleNotFoundError as e:
         raise _require(e.name or "huggingface_hub") from e
     with _bridged_bars(repo) as bridge:
-        kwargs = {} if bridge is None else {"tqdm_class": bridge}
+        kwargs: dict[str, Any] = {} if bridge is None else {"tqdm_class": bridge}
         return snapshot_download(repo, cache_dir=cache_dir, **kwargs)

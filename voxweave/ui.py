@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from rich import filesize
 from rich.console import Console
@@ -129,7 +130,7 @@ class RichReporter(Reporter):
         set_download_reporter(None)
         self._progress.stop()
 
-    def _switch(self, label: str, total: int | None, **fields: str) -> None:
+    def _switch(self, label: str, total: int | None, **fields: Any) -> None:
         # remove+add rather than reset: rich treats total=None in update as "no change",
         # so the previous stage's total bleeds through. A fresh add_task properly resets
         # to total=None (BarColumn pulse) and restarts elapsed time for this stage.
