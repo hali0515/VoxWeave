@@ -78,15 +78,21 @@ def main() -> None:
         f"{'t':>7}  {'speech':>6}  {'sing':>6}  {'music':>6}  verdict"
     )
     for t, sp, si, mu, f in zip(starts, speech, sing, music, flags, strict=True):
-        gate = "SONG" if f else (
-            "miss:speech-gate"
-            if (si >= songdet.SING_MIN or mu >= songdet.MUSIC_MIN)
-            else "miss:level-gate"
+        gate = (
+            "SONG"
+            if f
+            else (
+                "miss:speech-gate"
+                if (si >= songdet.SING_MIN or mu >= songdet.MUSIC_MIN)
+                else "miss:level-gate"
+            )
         )
         print(f"{start + t:7.1f}  {sp:6.2f}  {si:6.2f}  {mu:6.2f}  {gate}")
     spans = songdet.merge_spans(flags, starts)
-    print(f"\nmerged song spans within slice (>={songdet.MIN_SPAN_SEC}s): "
-          + (", ".join(f"{start + a:.1f}-{start + b:.1f}" for a, b in spans) or "none"))
+    print(
+        f"\nmerged song spans within slice (>={songdet.MIN_SPAN_SEC}s): "
+        + (", ".join(f"{start + a:.1f}-{start + b:.1f}" for a, b in spans) or "none")
+    )
 
 
 if __name__ == "__main__":
