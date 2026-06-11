@@ -385,6 +385,24 @@ def cmd_translate(
     click.echo(out)
 
 
+@cli.command("export")
+@click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--to",
+    "formats",
+    multiple=True,
+    type=click.Choice(["srt", "ass"]),
+    default=("srt",),
+    help="Output format(s); repeat for several (e.g. --to srt --to ass). Default: srt.",
+)
+def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
+    """Export an aligned VTT to SRT/ASS next to it (VTT + JSON stay the source of truth)."""
+    from voxweave.export import export_subtitles
+
+    for path in export_subtitles(vtt, formats):
+        click.echo(str(path))
+
+
 @cli.command("correct")
 @click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
