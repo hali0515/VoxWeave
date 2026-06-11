@@ -89,7 +89,8 @@ def test_mlx_asr_maps_language_and_context():
         "/tmp/a.wav", language="ja", return_time_stamps=False, context="固有名詞"
     )
     assert fake.calls[0]["language"] == "japanese"  # ISO -> Qwen full name
-    assert fake.calls[0]["system_prompt"] == "固有名詞"  # context -> system_prompt
+    # context -> system_prompt, bare term auto-framed (see backend.format_qwen_context)
+    assert fake.calls[0]["system_prompt"] == "Proper nouns: 固有名詞."
     assert out[0].text == "こんにちは"
     assert out[0].language == "japanese"  # first non-empty of the per-segment list
 

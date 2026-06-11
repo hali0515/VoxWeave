@@ -141,11 +141,12 @@ class _MlxAsr:
         return_time_stamps: bool = False,  # noqa: ARG002 -- qwen-asr arg name; MLX is text-only here
         context: str | None = None,
     ) -> list[_AsrResult]:
+        from voxweave.backend import format_qwen_context
         from voxweave.lang import to_aligner_name
 
         lang = to_aligner_name(language) if language and language.strip() else None
         out = self._m.generate(
-            str(wav_path), language=lang, system_prompt=context or None
+            str(wav_path), language=lang, system_prompt=format_qwen_context(context)
         )
         lang_field = getattr(out, "language", None)
         if isinstance(lang_field, (list, tuple)):

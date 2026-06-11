@@ -206,7 +206,9 @@ def cli(verbose: bool) -> None:
     default=None,
     envvar="VOXWEAVE_ASR_CONTEXT",
     help="ASR bias prompt (free text: names/terms/proper nouns, comma or newline separated);"
-    " biases transcription toward these tokens, reducing errors on names and loanwords. Reused for all chunks.",
+    " biases transcription toward these tokens, reducing errors on names and loanwords."
+    " Bare term lists are auto-framed as 'Proper nouns: ...' for Qwen (a bare list regresses"
+    " accuracy); prose or pre-framed text passes through. Reused for all chunks.",
 )
 @click.option(
     "--hybrid",

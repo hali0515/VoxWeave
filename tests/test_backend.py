@@ -70,7 +70,8 @@ def test_transcribe_align_forwards_context(monkeypatch, tmp_path):
     backend.transcribe_align(
         wav, None, asr_model="qwen3-asr-1.7b", context="艾米莉亚, 帕克"
     )
-    assert calls.get("context") == "艾米莉亚, 帕克"
+    # bare term lists are auto-framed for the Qwen system slot (see format_qwen_context)
+    assert calls.get("context") == "Proper nouns: 艾米莉亚, 帕克."
     assert (
         calls.get("return_time_stamps") is False
     )  # ASR-only, built-in aligner not requested
@@ -1340,3 +1341,26 @@ def test_get_ctc_aligner_hf_structure(monkeypatch):
     finally:
         align_ctc._ctc = None
         align_ctc._ctc_lang = None
+
+
+# --------------------------------------------------------------------------- #
+# Qwen context framing: bare term lists are framed as biasing metadata
+# (a bare list regresses WER -- typewhisper-mac#321); prose and pre-framed
+# input pass through; whisper initial_prompt never sees this helper.
+# --------------------------------------------------------------------------- #
+def test_format_qwen_context_frames_bare_list():
+    out = backend.format_qwen_context("AVAudioEngine, Roformer\nkinsoku")
+    assert out == "Proper nouns: AVAudioEngine, Roformer, kinsoku."
+
+
+def test_format_qwen_context_passthrough_framed_and_prose():
+    framed = "Technical terms: AVAudioEngine, Roformer."
+    assert backend.format_qwen_context(framed) == framed
+    assert backend.format_qwen_context("Vocabulary: a, b") == "Vocabulary: a, b"
+    prose = "A sci-fi story. The hero is called Ryland Grace"
+    assert backend.format_qwen_context(prose) == prose
+
+
+def test_format_qwen_context_blank_is_none():
+    assert backend.format_qwen_context(None) is None
+    assert backend.format_qwen_context("   ") is None

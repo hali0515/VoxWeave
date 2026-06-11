@@ -356,6 +356,36 @@ def _resolve_align_lang(lang: str | None, source: str) -> str:
     return "en"
 
 
+# Qwen3-ASR context framing: the system-prompt slot treats a FRAMED term list as
+# biasing metadata, while a bare list triggers "list dictation mode" and regresses
+# WER below the empty baseline (TypeWhisper/typewhisper-mac#321, 184-run sweep:
+# 87.5% -> 28.1% WER on dense technical audio; only "Technical terms:" /
+# "Vocabulary:" / "Proper nouns:" framings survived). Prose context (sentence
+# punctuation present) is genuine background knowledge and passes through, as
+# does input that already carries one of the known-good framings.
+_CONTEXT_FRAMINGS = ("technical terms:", "vocabulary:", "proper nouns:")
+_PROSE_PUNCT = ".。!?！？"
+
+
+def format_qwen_context(context: str | None) -> str | None:
+    """Frame a bare term list as ``Proper nouns: <terms>.`` for the Qwen system slot.
+
+    Already-framed lists and prose pass through unchanged; None/blank stays None.
+    Whisper's ``initial_prompt`` is a different mechanism (transcript-prefix
+    conditioning) and must NOT receive this framing.
+    """
+    s = (context or "").strip()
+    if not s:
+        return None
+    low = s.lower()
+    if any(low.startswith(p) for p in _CONTEXT_FRAMINGS):
+        return s
+    if any(ch in _PROSE_PUNCT for ch in s):
+        return s
+    terms = [t.strip() for line in s.split("\n") for t in line.split(",")]
+    return f"Proper nouns: {', '.join(t for t in terms if t)}."
+
+
 def _asr_only(
     engine: str,
     wav_path: Path,
@@ -392,7 +422,7 @@ def _asr_only(
         model = _get_asr(model_id)
         kwargs: dict = {"language": language or None, "return_time_stamps": False}
         if context:  # omit kwarg entirely when empty to preserve legacy behavior
-            kwargs["context"] = context
+            kwargs["context"] = format_qwen_context(context)
         r = model.transcribe(str(wav_path), **kwargs)[0]
         det = (r.language or "").split(",")[
             0
