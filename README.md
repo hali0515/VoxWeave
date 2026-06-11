@@ -184,6 +184,7 @@ before ASR+alignment load, so peak usage is ≈ max(sep, asr) rather than their 
 voxweave episode.mkv
 voxweave clip.mp4 --no-separate          # clean speech (podcast/lecture): skip separation
 voxweave episode.mkv --model qwen3-asr-1.7B   # larger, more accurate ASR
+voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias names/terms
 ```
 
 <details>
@@ -195,7 +196,9 @@ voxweave episode.mkv --model qwen3-asr-1.7B   # larger, more accurate ASR
 | `--no-separate`                | Skip vocal separation (for clean speech) to save GPU time.                                              |
 | `--no-skip-songs`              | Keep lyrics / transcribe purely musical content (song-skip is on by default).                           |
 | `--model`                      | Local ASR model (default `Qwen3-ASR-0.6B`; `qwen3-asr-1.7B` is more accurate).                          |
-| `--normalize`                  | Apply loudness normalization (`loudnorm`) to the 16k ASR input.                                         |
+| `--context`                    | ASR bias prompt: names/terms likely to appear (comma or newline separated). Bare term lists are auto-framed as `Proper nouns: ...` for Qwen — a bare list actually *regresses* accuracy ([details](https://github.com/TypeWhisper/typewhisper-mac/issues/321)); prose or pre-framed text passes through. |
+| `--hybrid`                     | Dual-ASR fusion: Whisper text + Qwen punctuation. Whisper's error bias is the opposite of Qwen's (it hallucinates rather than omits), so use this when Qwen drops uncertain words. |
+| `--normalize`                  | Apply loudness normalization (`loudnorm`) to the 16k ASR input — helps when quiet words get dropped; off by default since it also amplifies noise. |
 | `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.    |
 | `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export). |
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps. |
