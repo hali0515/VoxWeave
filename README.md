@@ -75,6 +75,9 @@ breaks) handles Chinese/Japanese/English as first-class.
   drift that breaks wav2vec2-xlsr on rare kanji); line breaks use BudouX phrase atoms + jieba.
 - **Optional LLM steps.** `correct` cleans up ASR typos/garbled names before alignment;
   `translate` does whole-episode context-aware translation while preserving cue count.
+- **Ship the result.** `pack` soft-muxes finished VTTs into the media as titled subtitle
+  tracks (instant stream copy); `burn` hardcodes them at constant quality with NVENC /
+  VideoToolbox acceleration, matching the source bit depth.
 
 ## Setup
 
