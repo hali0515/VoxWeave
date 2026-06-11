@@ -161,12 +161,17 @@ def build_messages(
         "Match the tone and register of the original rather than translating word for word -- "
         "casual vs. formal, calm vs. urgent, playful vs. serious, intimate vs. distant. Render each "
         "line the way a native speaker would actually say it in that situation and emotional moment.",
+        "Translate sense-for-sense, not word-for-word: short idiomatic lines shift meaning with "
+        "the scene (e.g. 'This is it' can mean the end has come, here we are, or this is the one) "
+        "-- always pick the rendering that matches what is happening in that exact moment.",
+        "Express the full meaning of each line: do not flatten emotional color or drop nuance "
+        "for brevity. The words on screen must carry what the line actually means in context.",
         "Preserve the cue count: never merge, split, add, or drop cues -- each source cue maps to "
         "exactly one translated cue.",
         "Keep it colloquial and concise, fit for on-screen subtitles.",
-        "When a literal translation would be too long to read comfortably as a subtitle, condense "
-        "rather than truncate: drop redundancies, false starts, and hesitation fillers while keeping "
-        "the meaning and tone.",
+        "Only condense when the translation would be too long to read comfortably as a subtitle, "
+        "and even then drop only redundancies, false starts, and hesitation fillers -- never the "
+        "meaning, nuance, or tone. Do not over-omit.",
         "Numbers follow target-language subtitle convention: spell out small numbers (one through "
         "ten) in dialogue; use digits for times, dates, scores, measurements, and longer numbers. "
         "Do not convert units of measurement -- render the original units naturally.",
