@@ -8,8 +8,12 @@ import direction acyclic.
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import logging
 import os
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 log = logging.getLogger("voxweave")
@@ -119,13 +123,104 @@ def _load_yaml(path: Path) -> dict:
     return yaml.load(path.read_text(), Loader=_Loader)
 
 
+# Reporter receiving byte progress for HF downloads, installed by the CLI for the lifetime of its
+# RichReporter (see ui.RichReporter.__enter__). None -> huggingface_hub renders its own tqdm bars
+# (library callers, no rich Live to fight with).
+_dl_reporter = None
+
+
+def set_download_reporter(reporter) -> None:
+    """Install (or clear, with None) the progress.Reporter that receives HF download byte progress."""
+    global _dl_reporter
+    _dl_reporter = reporter
+
+
+@contextmanager
+def _bridged_bars(label: str):
+    """Silence huggingface_hub's tqdm bars and forward their byte counts to the active Reporter.
+
+    Raw hub tqdm fights the rich Live region: rich's FileProxy flushes every tqdm refresh as a
+    separate permanent line, and the xet backend only reports per completed ~xorb, so on slow
+    links the bar sits at 0% for minutes and then several lines burst out at once -- users read
+    that as a hang. Bridging into the Reporter row keeps spinner/elapsed animating between
+    bursts and renders one in-place updating line.
+
+    Yields a tqdm-compatible class to pass as ``tqdm_class=`` where the hub API supports it
+    (hub >= 1.x forwards it down to the byte bars; 0.36 accepts it only on snapshot_download's
+    outer bar). For 0.36's byte bars -- constructed from the module-global ``tqdm`` inside
+    ``_get_progress_bar_context`` -- the module global is patched for the duration. Yields
+    ``None`` (and touches nothing) when no Reporter is installed or hub internals moved.
+    """
+    rep = _dl_reporter
+    if rep is None:
+        yield None
+        return
+    try:
+        # importlib, not `import huggingface_hub.utils.tqdm`: the utils package __init__
+        # rebinds its `tqdm` attribute to the class, shadowing the submodule.
+        hub_tqdm_mod = importlib.import_module("huggingface_hub.utils.tqdm")
+
+        base = hub_tqdm_mod.tqdm
+    except Exception:  # noqa: BLE001 -- internals moved; fall back to hub's own bars
+        yield None
+        return
+
+    lock = threading.Lock()
+    bars: dict[int, tuple[int, int]] = {}  # id(bar) -> (done_bytes, total_bytes)
+
+    def _report() -> None:
+        # rep.download inside the lock: keeps deliveries monotonic when xet/snapshot worker
+        # threads land updates concurrently (sum computed and shipped atomically).
+        with lock:
+            done = sum(d for d, _ in bars.values())
+            known = [t for _, t in bars.values() if t > 0]
+            total = sum(known) if bars and len(known) == len(bars) else None
+            rep.download(label, done, total)
+
+    class _Bridge(base):  # type: ignore[misc,valid-type]
+        """Never-rendering tqdm that aggregates byte updates across files into the Reporter."""
+
+        def __init__(self, *args, **kwargs):
+            self._vox_bytes = kwargs.get("unit") == "B"
+            self._vox_total = int(kwargs.get("total") or 0)
+            kwargs["disable"] = True
+            super().__init__(*args, **kwargs)
+            if self._vox_bytes:
+                with lock:
+                    bars[id(self)] = (int(kwargs.get("initial") or 0), self._vox_total)
+                _report()
+
+        def update(self, n: float | None = 1):
+            if self._vox_bytes and n:
+                with lock:
+                    done, _ = bars[id(self)]
+                    # re-read total each update: snapshot aggregators assign .total after construction
+                    total = int(getattr(self, "total", None) or self._vox_total)
+                    bars[id(self)] = (done + int(n), total)
+                _report()
+            return super().update(n)
+
+    hub_tqdm_mod.tqdm = _Bridge
+    try:
+        yield _Bridge
+    finally:
+        hub_tqdm_mod.tqdm = base
+
+
 def _hf_download(repo: str, filename: str, cache_dir: str | None = None) -> str:
     """Download a single file from HF, return local path. cache_dir routes into a voxweave-owned subdir; None keeps HF default."""
     try:
         from huggingface_hub import hf_hub_download
     except ModuleNotFoundError as e:
         raise _require(e.name or "huggingface_hub") from e
-    return hf_hub_download(repo, filename, cache_dir=cache_dir)
+    with _bridged_bars(filename) as bridge:
+        kwargs = {}
+        if (
+            bridge is not None
+            and "tqdm_class" in inspect.signature(hf_hub_download).parameters
+        ):
+            kwargs["tqdm_class"] = bridge
+        return hf_hub_download(repo, filename, cache_dir=cache_dir, **kwargs)
 
 
 def _hf_snapshot(repo: str, cache_dir: str) -> str:
@@ -140,4 +235,6 @@ def _hf_snapshot(repo: str, cache_dir: str) -> str:
         from huggingface_hub import snapshot_download
     except ModuleNotFoundError as e:
         raise _require(e.name or "huggingface_hub") from e
-    return snapshot_download(repo, cache_dir=cache_dir)
+    with _bridged_bars(repo) as bridge:
+        kwargs = {} if bridge is None else {"tqdm_class": bridge}
+        return snapshot_download(repo, cache_dir=cache_dir, **kwargs)

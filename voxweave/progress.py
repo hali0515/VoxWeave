@@ -25,6 +25,15 @@ class Reporter:
     def advance(self, n: int = 1) -> None:
         """Advance the current countable stage by n steps."""
 
+    def download(self, label: str, done: int, total: int | None) -> None:
+        """Report cumulative byte progress for a model download.
+
+        Called repeatedly with the running byte count (``done``) and the expected size
+        (``total``; ``None`` while unknown). Unlike :meth:`task`/:meth:`advance` this is
+        absolute, not incremental -- xet/parallel downloads deliver from worker threads
+        in bursts, and absolute counts stay correct regardless of delivery order.
+        """
+
     def chunks(self, total: int) -> None:
         """Signal that the number of chunks to process is known; begin per-chunk progress (alias for ``task``)."""
         self.task("per-chunk ASR+align", total)

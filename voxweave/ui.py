@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 
+from rich import filesize
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.panel import Panel
@@ -66,9 +67,18 @@ def install_logging(*, verbose: bool = False) -> None:
 
 
 class _MofNIfKnown(ProgressColumn):
-    """Renders ``x/N`` when total is known; renders nothing when total is unknown (avoids misleading ``0/?``)."""
+    """Renders ``x/N`` when total is known; renders nothing when total is unknown (avoids misleading ``0/?``).
+
+    Byte tasks (``unit="B"`` field, used for model downloads) render human-readable sizes
+    (``268.4 MB/913.6 MB``), and show the running count even while total is unknown.
+    """
 
     def render(self, task: Task) -> Text:
+        if task.fields.get("unit") == "B":
+            done = filesize.decimal(int(task.completed))
+            if task.total is None:
+                return Text(done, style="cyan")
+            return Text(f"{done}/{filesize.decimal(int(task.total))}", style="cyan")
         if task.total is None:
             return Text("")
         return Text(f"{int(task.completed)}/{int(task.total)}", style="cyan")
@@ -101,22 +111,32 @@ class RichReporter(Reporter):
             disable=not console.is_terminal,
         )
         self._task_id: TaskID | None = None
+        self._dl_label: str | None = None
 
     def __enter__(self) -> RichReporter:
         self._progress.start()
         self._task_id = self._progress.add_task("starting", total=None)
+        # Route HF model-download byte progress into this row while the UI is live;
+        # hub's own tqdm bars are silenced for the duration (they fight the Live region).
+        from voxweave.runtime import set_download_reporter
+
+        set_download_reporter(self)
         return self
 
     def __exit__(self, *exc: object) -> None:
+        from voxweave.runtime import set_download_reporter
+
+        set_download_reporter(None)
         self._progress.stop()
 
-    def _switch(self, label: str, total: int | None) -> None:
+    def _switch(self, label: str, total: int | None, **fields: str) -> None:
         # remove+add rather than reset: rich treats total=None in update as "no change",
         # so the previous stage's total bleeds through. A fresh add_task properly resets
         # to total=None (BarColumn pulse) and restarts elapsed time for this stage.
+        self._dl_label = None
         if self._task_id is not None:
             self._progress.remove_task(self._task_id)
-        self._task_id = self._progress.add_task(label, total=total)
+        self._task_id = self._progress.add_task(label, total=total, **fields)
 
     def stage(self, label: str) -> None:
         self._switch(label, None)
@@ -127,6 +147,16 @@ class RichReporter(Reporter):
     def advance(self, n: int = 1) -> None:
         if self._task_id is not None:
             self._progress.advance(self._task_id, n)
+
+    def download(self, label: str, done: int, total: int | None) -> None:
+        # Absolute update-in-place (not remove+add): keeps elapsed running and lets total
+        # grow as snapshot downloads discover more files. The row animates at the Live
+        # refresh rate even when xet delivers bytes in minutes-apart bursts.
+        if self._dl_label != label:
+            self._switch(f"downloading {label}", total, unit="B")
+            self._dl_label = label
+        if self._task_id is not None:
+            self._progress.update(self._task_id, completed=done, total=total)
 
 
 def _hint_for(exc: Exception) -> str:

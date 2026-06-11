@@ -61,9 +61,9 @@ def _resolve_panns_ckpt() -> str:
     """Return local path to Cnn14 checkpoint; explicit env path wins, else download from HF (cached)."""
     if PANNS_CKPT and os.path.exists(PANNS_CKPT):
         return PANNS_CKPT
-    from huggingface_hub import hf_hub_download
+    from voxweave.runtime import _hf_download
 
-    return hf_hub_download(PANNS_REPO, PANNS_REPO_FILE, cache_dir=config.AUDIO_CACHE)
+    return _hf_download(PANNS_REPO, PANNS_REPO_FILE, cache_dir=config.AUDIO_CACHE)
 
 
 def _ensure_panns_labels() -> None:
@@ -77,11 +77,9 @@ def _ensure_panns_labels() -> None:
     try:  # prefer HF (cached under AUDIO_CACHE, same source as the checkpoint)
         import shutil
 
-        from huggingface_hub import hf_hub_download
+        from voxweave.runtime import _hf_download
 
-        src = hf_hub_download(
-            PANNS_REPO, PANNS_LABELS_FILE, cache_dir=config.AUDIO_CACHE
-        )
+        src = _hf_download(PANNS_REPO, PANNS_LABELS_FILE, cache_dir=config.AUDIO_CACHE)
         shutil.copyfile(src, dst)
         return
     except Exception:  # noqa: BLE001 -- repo may not host the csv; fall back to the canonical URL
