@@ -516,10 +516,11 @@ class SplitThresholds:
     # constructions (tests/legacy) preserve exact timing.
     cps: float = 0.0
     lag_out_s: float = 0.0
-    # Shot-change snap window (0 = off): a cue boundary within this of a detected
-    # cut moves onto it (see _snap_to_shots). Only consulted when the caller
-    # passes shot_changes.
-    shot_snap_s: float = 0.24
+    # Shot-change pairing window (0 = off): a cue boundary within this of a
+    # detected cut gets the Netflix zone treatment (see _snap_to_shots). 11
+    # frames @24fps covers the outermost adjustment zone. Only consulted when
+    # the caller passes shot_changes.
+    shot_snap_s: float = 11.0 / 24.0
 
     @classmethod
     def from_mapping(cls, d: dict) -> SplitThresholds:

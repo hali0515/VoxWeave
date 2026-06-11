@@ -249,7 +249,8 @@ _CPS_DEFAULTS = {"ja": 7.0, "zh": 9.0, "ko": 9.0}
 _CPS_LATIN_DEFAULT = 17.0  # ~Netflix 20 cps incl. spaces, measured without spaces
 _LAG_OUT_DEFAULT_MS = 250  # flat tail pad after speech ends (0=off)
 _SHOT_SNAP_DEFAULT_MS = (
-    240  # cue boundary within this of a shot change snaps onto it (0=off)
+    458  # shot-change pairing window: 11 frames @24fps, the outermost Netflix
+    # adjustment zone; boundaries past it are left alone (0=off)
 )
 
 

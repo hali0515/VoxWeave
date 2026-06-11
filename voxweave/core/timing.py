@@ -197,6 +197,14 @@ def _cleanup_cues(
     return out
 
 
+# Netflix TTSG shot-change zones, specified in frames at 24 fps. "Half a second"
+# (12 frames) is the landing zone a boundary is pushed out to when it cannot sit
+# on the cut itself.
+_FRAME_S = 1.0 / 24.0
+_SHOT_LANDING_S = 12 * _FRAME_S
+_EPS = 1e-9
+
+
 def _snap_to_shots(
     cues: List[Cue],
     shots: List[float],
@@ -204,19 +212,26 @@ def _snap_to_shots(
     snap_s: float,
     max_cue_s: float,
 ) -> List[Cue]:
-    """Snap cue boundaries onto nearby shot changes (runs after _cleanup_cues).
+    """Adjust cue boundaries near shot changes per the Netflix TTSG zone rules
+    (runs after _cleanup_cues). ``snap_s`` is the search window for pairing a
+    boundary with a cut (<=0 disables snapping entirely).
 
-    A boundary within ``snap_s`` of a cut moves onto it, but never at speech's
-    expense:
+    In-times (asymmetric zones, 24 fps frames):
+    - 1-7 frames before the cut: move onto the cut (removes the pre-cut flash).
+    - 8-11 frames before: pull out to 12 frames before (free lead-in).
+    - 1-9 frames after: move back onto the cut (text appears on the cut).
+    - 10-11 frames after: push out to 12 frames after.
 
-    - start: moving *earlier* to the cut is a free lead-in (bounded by the
-      previous cue end + 2 frames); moving *later* (pre-cut flash removal) is
-      bounded by ``snap_s`` and must stay below the cue's end.
-    - end: extending to cut - 2 frames is free inside the following gap (and
-      the duration cap); pulling back to cut - 2 frames must not cut speech
-      (never below the last word's end).
+    Out-times:
+    - up to 12 frames before the cut: extend to cut - 2 frames (die on the cut).
+    - 1-5 frames after: pull back to cut - 2 frames.
+    - 6-11 frames after: extend out to 12 frames after.
 
-    Cues then change exactly on the cut instead of flashing across it.
+    No move ever sacrifices speech: starts stay clear of the previous cue end
+    + 2 frames and below the cue's own end; ends never pull below the last
+    word's end (dialogue that crosses the cut keeps its subtitle across it,
+    falling back to the 12-frames-after landing zone), never collide with the
+    next cue, and respect the duration cap.
     """
     if snap_s <= 0 or not shots:
         return cues
@@ -241,24 +256,52 @@ def _snap_to_shots(
         nxt_start = out[i + 1].get("start") if i + 1 < len(out) else None
 
         cut = nearest(start)
-        if cut is not None and abs(cut - start) > 1e-9:
-            new_start = cut
+        if cut is not None and abs(cut - start) > _EPS:
+            d = start - cut
+            if -7 * _FRAME_S - _EPS <= d < 0:  # 1-7 frames before -> onto the cut
+                new_start = cut
+            elif d < 0:  # 8-11 frames before -> out to 12 frames before
+                new_start = cut - _SHOT_LANDING_S
+            elif d <= 9 * _FRAME_S + _EPS:  # 1-9 frames after -> back onto the cut
+                new_start = cut
+            else:  # 10-11 frames after -> out to 12 frames after
+                new_start = cut + _SHOT_LANDING_S
             if prev_end is not None:
                 new_start = max(new_start, prev_end + TWO_FRAME_S)
+            # moving earlier is a free lead-in; moving later (flash removal /
+            # landing-zone push) must never delay the text by over half a second
             if new_start < end - TWO_FRAME_S and (
-                new_start <= start or new_start - start <= snap_s
+                new_start <= start or new_start - start <= _SHOT_LANDING_S
             ):
                 c["start"] = new_start
 
         cut = nearest(end)
         if cut is not None:
-            target = cut - TWO_FRAME_S
-            if target > end:  # extend to die on the cut
+            d = end - cut
+            if d <= 5 * _FRAME_S + _EPS:  # up to 12 before / 1-5 after -> die on cut
+                target = cut - TWO_FRAME_S
+            else:  # 6-11 frames after -> out to the 12-frames-after landing zone
+                target = cut + _SHOT_LANDING_S
+            applied = False
+            if target > end + _EPS:  # extend into the following gap (free)
                 if (
                     nxt_start is None or target <= nxt_start - TWO_FRAME_S
                 ) and target - c["start"] <= max_cue_s:
                     c["end"] = target
-            elif target < end:  # pull back, never cutting speech
+                    applied = True
+            elif target < end - _EPS:  # pull back, never cutting speech
                 if target >= speech_end and target > c["start"]:
+                    c["end"] = target
+                    applied = True
+            # speech crosses the cut so the pull-back was vetoed: the subtitle
+            # legitimately crosses; land 12 frames after instead of flashing out
+            # just past the cut (TTSG last resort)
+            if not applied and 0 < d <= 5 * _FRAME_S + _EPS:
+                target = cut + _SHOT_LANDING_S
+                if (
+                    target > end
+                    and (nxt_start is None or target <= nxt_start - TWO_FRAME_S)
+                    and target - c["start"] <= max_cue_s
+                ):
                     c["end"] = target
     return out

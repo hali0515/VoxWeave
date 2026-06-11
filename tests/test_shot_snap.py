@@ -1,16 +1,18 @@
 # tests/test_shot_snap.py
-# Shot-change snapping: cue boundaries within the snap window move onto cuts —
-# start may lead in earlier (or shift later only within the window, removing a
-# pre-cut flash), end may extend to cut-2frames inside the gap or pull back only
-# down to the last word's end. Detection itself is one ffmpeg pass parsed from
-# showinfo stderr; audio-only media degrades to None.
+# Shot-change snapping per Netflix TTSG zones (24fps frames): in-times 1-7
+# before / 1-9 after a cut land on it, 8-11 before pull out to 12 before, 10-11
+# after push to 12 after; out-times die on cut-2frames (up to 12 before / 1-5
+# after) or land 12 after (6-11 after, or as last resort when speech crosses
+# the cut). Speech is never sacrificed: ends never pull below the last word.
+# Detection itself is one ffmpeg pass parsed from showinfo stderr; audio-only
+# media degrades to None.
 import json
 import subprocess
 
 import pytest
 
 from voxweave import pipeline, shotdet
-from voxweave.core.timing import TWO_FRAME_S, _snap_to_shots
+from voxweave.core.timing import _FRAME_S, _SHOT_LANDING_S, TWO_FRAME_S, _snap_to_shots
 
 
 def _cue(start, end, speech_end=None, text="x"):
@@ -33,11 +35,13 @@ def test_end_pull_back_respects_speech():
         [_cue(1.0, 2.3, speech_end=2.0)], [2.2], snap_s=0.24, max_cue_s=7.0
     )
     assert out[0]["end"] == pytest.approx(2.2 - TWO_FRAME_S)
-    # speech runs through the cut -> no pull-back (never cut a word short)
+    # speech runs through the cut -> never cut a word short; the subtitle
+    # legitimately crosses, so it lands 12 frames after the cut instead of
+    # flashing out just past it (TTSG last resort)
     out = _snap_to_shots(
         [_cue(1.0, 2.3, speech_end=2.25)], [2.2], snap_s=0.24, max_cue_s=7.0
     )
-    assert out[0]["end"] == pytest.approx(2.3)
+    assert out[0]["end"] == pytest.approx(2.2 + _SHOT_LANDING_S)
 
 
 def test_start_leads_in_to_cut():
@@ -68,6 +72,33 @@ def test_end_extension_respects_next_cue_and_cap():
     out = _snap_to_shots(cues, [2.2], snap_s=0.24, max_cue_s=7.0)
     # extending to 2.2-2f would collide with next start 2.1 -> stay put
     assert out[0]["end"] == pytest.approx(2.0)
+
+
+def test_start_zone_8_to_11_before_pulls_out_to_12():
+    # start 9 frames before the cut -> free lead-in out to 12 frames before
+    cut = 5.0
+    start = cut - 9 * _FRAME_S
+    out = _snap_to_shots([_cue(start, 7.0)], [cut], snap_s=0.458, max_cue_s=7.0)
+    assert out[0]["start"] == pytest.approx(cut - _SHOT_LANDING_S)
+
+
+def test_start_zone_10_to_11_after_pushes_out_to_12():
+    # start 10 frames after the cut -> pushed out to the 12-frames-after zone
+    cut = 5.0
+    start = cut + 10 * _FRAME_S
+    out = _snap_to_shots([_cue(start, 7.0)], [cut], snap_s=0.458, max_cue_s=7.0)
+    assert out[0]["start"] == pytest.approx(cut + _SHOT_LANDING_S)
+
+
+def test_end_zone_6_to_11_after_lands_12_after():
+    # end 8 frames after the cut -> extends out to 12 frames after, not pulled
+    # back across the cut
+    cut = 5.0
+    end = cut + 8 * _FRAME_S
+    out = _snap_to_shots(
+        [_cue(3.0, end, speech_end=end)], [cut], snap_s=0.458, max_cue_s=7.0
+    )
+    assert out[0]["end"] == pytest.approx(cut + _SHOT_LANDING_S)
 
 
 def test_snap_disabled_when_window_zero():
