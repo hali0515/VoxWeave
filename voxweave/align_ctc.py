@@ -113,26 +113,37 @@ def _get_ctc_aligner(iso: str, model_name: str):
     return _ctc
 
 
-def _ctc_logp(al, wav):
-    """Single forward pass: 1D waveform tensor @ al.sr -> [T,V] log-probs (softmax of raw logits).
+def _ctc_logp_batch(al, wavs):
+    """One batched forward: equal-length 1D waveforms @ al.sr -> list of [T,V] log-probs.
 
-    HF models need the processor's z-score normalization (skipping it shifts argmax); torchaudio
+    HF models need the processor's z-score normalization (skipping it shifts argmax; the
+    feature extractor normalizes per-sequence, so batched == per-window). torchaudio
     bundles take the raw waveform. Must log_softmax the raw logits before forced_align.
     """
     import torch
 
-    if wav.shape[-1] < 400:  # wav2vec2 conv minimum input length, prevents crash
-        wav = torch.nn.functional.pad(wav, (0, 400 - wav.shape[-1]))
+    wavs = [
+        torch.nn.functional.pad(w, (0, 400 - w.shape[-1]))
+        if w.shape[-1] < 400  # wav2vec2 conv minimum input length, prevents crash
+        else w
+        for w in wavs
+    ]
     with torch.inference_mode():
         if al.kind == "hf":  # HF: processor z-score normalization required
             inp = al.proc(
-                wav.cpu().numpy(), sampling_rate=al.sr, return_tensors="pt"
+                [w.cpu().numpy() for w in wavs],
+                sampling_rate=al.sr,
+                return_tensors="pt",
             ).input_values
-            logits = al.model(inp.to(get_device())).logits[0]
+            logits = al.model(inp.to(get_device())).logits  # [B,T,V]
         else:  # torchaudio bundle: raw wav, returns (emissions, lengths)
-            emis, _ = al.model(wav.unsqueeze(0).to(get_device()))
-            logits = emis[0]
-        return torch.log_softmax(logits, dim=-1)  # [T,V]
+            logits, _ = al.model(torch.stack(wavs).to(get_device()))
+        return [torch.log_softmax(lg, dim=-1) for lg in logits]  # each [T,V]
+
+
+def _ctc_logp(al, wav):
+    """Single forward pass: 1D waveform tensor @ al.sr -> [T,V] log-probs."""
+    return _ctc_logp_batch(al, [wav])[0]
 
 
 def _ctc_emit_full(al, wav):
@@ -151,20 +162,36 @@ def _ctc_emit_full(al, wav):
     n = wav.shape[-1]
     if n <= win + 2 * ctx:
         return _ctc_logp(al, wav)  # short enough for a single pass
-    parts = []
+    wins = []  # (pos, a, b, end) per window
     pos = 0
     while pos < n:
         a = max(0, pos - ctx)
         b = min(n, pos + win + ctx)
-        lp = _ctc_logp(al, wav[a:b])  # [t,V]
-        stride = (b - a) / lp.shape[0]  # samples/frame for this window (~320)
         end = min(pos + win, n)
+        wins.append((pos, a, b, end))
+        pos = end
+    # Batch consecutive same-length windows into one forward (conf [batch].ctc): the
+    # interior windows all span win+2*ctx so they batch cleanly; the unequal first/last
+    # windows fall out as singleton groups (stacking unequal lengths would need padding,
+    # which shifts frame counts and the stride mapping below).
+    bs = config.conf_batch("ctc")
+    logps: list = []
+    i = 0
+    while i < len(wins):
+        length = wins[i][2] - wins[i][1]
+        j = i + 1
+        while j < len(wins) and j - i < bs and wins[j][2] - wins[j][1] == length:
+            j += 1
+        logps.extend(_ctc_logp_batch(al, [wav[a:b] for _, a, b, _ in wins[i:j]]))
+        i = j
+    parts = []
+    for (pos, a, b, end), lp in zip(wins, logps):
+        stride = (b - a) / lp.shape[0]  # samples/frame for this window (~320)
         lo = round((pos - a) / stride)  # drop prepended left-context frames
         hi = lp.shape[0] - (round((b - end) / stride) if end < n else 0)
         lo = max(0, min(lo, lp.shape[0]))
         hi = max(lo, min(hi, lp.shape[0]))
         parts.append(lp[lo:hi])
-        pos = end
     return torch.cat(parts, dim=0)
 
 

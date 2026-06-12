@@ -228,11 +228,13 @@ def _load_separator():
     return model, cfg
 
 
-def _demix(model, mix, cfg, progress=None):
+def _demix(model, mix, cfg, progress=None, batch=None):
     """Chunked overlap-add inference: mix [ch, t] float32 -> vocals [ch, t].
 
     Hann window + >=2x overlap satisfies COLA; tail normalized by window sum. num_stems=1
     output may or may not have a stem dimension -- both shapes are handled.
+    Windows are stacked `batch` at a time into one forward (default conf [batch].separate;
+    1 unless configured -- batch=1 already saturates 8 GB-class GPUs, see config._BATCH_DEFAULTS).
     progress(done, total) called after each window if provided.
     """
     import torch
@@ -250,21 +252,28 @@ def _demix(model, mix, cfg, progress=None):
     dev = next(model.parameters()).device
     starts = list(range(0, total, step))
     nwin = len(starts)
+    bs = batch if batch is not None else config.conf_batch("separate")
     with torch.no_grad():
-        for k, start in enumerate(starts):
-            seg = mix[:, start : start + chunk]
-            n = seg.shape[1]
-            if n < chunk:  # pad final segment to full chunk size
-                seg = torch.nn.functional.pad(seg, (0, chunk - n))
-            out = model(seg.unsqueeze(0).to(dev))  # [1, (stems,) ch, t]
-            if out.dim() == 4:  # [1, stems, ch, t] -> take first (vocals) stem
+        for i in range(0, nwin, bs):
+            grp = starts[i : i + bs]
+            segs, lens = [], []
+            for start in grp:
+                seg = mix[:, start : start + chunk]
+                n = seg.shape[1]
+                lens.append(n)
+                if n < chunk:  # pad final segment to full chunk size
+                    seg = torch.nn.functional.pad(seg, (0, chunk - n))
+                segs.append(seg)
+            out = model(torch.stack(segs).to(dev))  # [B, (stems,) ch, t]
+            if out.dim() == 4:  # [B, stems, ch, t] -> take first (vocals) stem
                 out = out[:, 0]
-            out = out[0].float().cpu()  # [ch, chunk]
-            w = window[:n]
-            result[:, start : start + n] += out[:, :n] * w
-            weight[start : start + n] += w
-            if progress is not None:
-                progress(k + 1, nwin)
+            out = out.float().cpu()  # [B, ch, chunk]
+            for j, (start, n) in enumerate(zip(grp, lens)):
+                w = window[:n]
+                result[:, start : start + n] += out[j, :, :n] * w
+                weight[start : start + n] += w
+                if progress is not None:
+                    progress(i + j + 1, nwin)
     return result / weight.clamp_min(1e-8)
 
 

@@ -417,10 +417,33 @@ def test_demix_reports_progress_per_window():
     cfg = {"audio": {"chunk_size": 16}, "inference": {"num_overlap": 4}}
     mix = torch.zeros(2, 40)  # step=16//4=4, range(0,40,4) -> 10 windows
     calls: list[tuple[int, int]] = []
-    backend._demix(_Identity(), mix, cfg, progress=lambda d, t: calls.append((d, t)))
+    backend._demix(
+        _Identity(), mix, cfg, progress=lambda d, t: calls.append((d, t)), batch=3
+    )
     assert len(calls) == 10
     assert calls[0] == (1, 10) and calls[-1] == (10, 10)
     assert [d for d, _ in calls] == list(range(1, 11))  # monotonically increasing
+
+
+def test_demix_batched_matches_sequential():
+    # window batching is pure bookkeeping: stacking B windows into one forward must
+    # reproduce batch=1 overlap-add output exactly (incl. the padded final window)
+    torch = pytest.importorskip("torch")
+
+    class _Scale(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, x):  # [B, ch, chunk] -> per-sample op, batch-size invariant
+            return x * 0.5 + 0.1
+
+    cfg = {"audio": {"chunk_size": 16}, "inference": {"num_overlap": 4}}
+    mix = torch.randn(2, 43)  # not a multiple of step -> exercises final-window padding
+    ref = backend._demix(_Scale(), mix, cfg, batch=1)
+    for bs in (2, 3, 64):  # 64 > window count -> single batch
+        out = backend._demix(_Scale(), mix, cfg, batch=bs)
+        assert torch.equal(out, ref)
 
 
 def test_resolve_asr_model():
@@ -1083,6 +1106,36 @@ def test_ctc_words_from_spans():
         "start": 0.6,
         "end": 1.0,
     }  # trailing punctuation stripped; timing covers full word
+
+
+def test_ctc_emit_full_batched_matches_sequential(monkeypatch):
+    # same-length window batching is pure grouping: emissions must equal the
+    # batch=1 pass bit-for-bit (per-sample model, identical reduction order)
+    torch = pytest.importorskip("torch")
+
+    class _FakeW2V(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, x):  # [B, n] -> ([B, T, V], lengths), 320x downsample
+            b, n = x.shape
+            t = n // 320
+            f = x[:, : t * 320].reshape(b, t, 320).mean(dim=-1, keepdim=True)
+            return torch.cat([f, -f, 2 * f, torch.ones_like(f)], dim=-1), None
+
+    sr = 16000
+    torch.manual_seed(0)
+    # 100s @ 30s window + 2s context -> spans 32s / 34s / 34s / 12s:
+    # exercises singleton groups (unequal first/last) AND a batched interior pair
+    wav = torch.randn(100 * sr)
+    al = align_ctc.CtcAligner("torchaudio", _FakeW2V(), sr, 0, 1, {}, None)
+    monkeypatch.setenv("VOXWEAVE_CTC_BATCH", "1")
+    ref = align_ctc._ctc_emit_full(al, wav)
+    monkeypatch.setenv("VOXWEAVE_CTC_BATCH", "4")
+    out = align_ctc._ctc_emit_full(al, wav)
+    assert torch.equal(out, ref)
+    assert abs(out.shape[0] - 100 * sr // 320) <= 4  # seamless tiling, no frame loss
 
 
 def test_align_text_dispatches_ctc_for_configured_lang(monkeypatch, tmp_path):

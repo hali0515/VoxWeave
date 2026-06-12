@@ -80,6 +80,15 @@ _TEMPLATE = """\
 # whisper = "large-v3-turbo"
 # qwen = "Qwen/Qwen3-ASR-1.7B"
 
+# Inference batch sizes: windows per GPU forward pass (= env VOXWEAVE_SEP_BATCH /
+# VOXWEAVE_CTC_BATCH / VOXWEAVE_MMS_BATCH). On an 8 GB-class card batch=1 already
+# saturates compute (measured: no speedup at 2/4, just +~0.8 GiB VRAM per extra
+# separation window) -- only worth raising on much wider GPUs, and only after measuring.
+[batch]
+# separate = 1   # vocal separation (MelBandRoformer) 8s windows
+# ctc = 1        # wav2vec2 CTC emission 30s windows (en aligner)
+# mms = 4        # MMS-300m emission batch (ja aligner, ctc-forced-aligner generate_emissions)
+
 # Per-language forced-alignment models; unlisted languages use Qwen3-ForcedAligner (built-in default).
 # Values: "mms" (MMS-300m + uroman, full-file single pass; bundled in core) |
 #         HF wav2vec2 id (downloaded to the voxweave align cache ~/.cache/voxweave/align) | torchaudio bundle name (-> torch.hub cache).
@@ -231,6 +240,40 @@ def conf_ctc_max_dp_frames() -> int:
     if isinstance(v, int) and not isinstance(v, bool):
         return v
     return _CTC_MAX_DP_FRAMES_DEFAULT
+
+
+# Inference batch sizes (windows per GPU forward). Defaults = 1: measured on an RTX 4070
+# Laptop (8 GB), separation batch=1 already saturates compute (steady-state latency scales
+# linearly with batch; same for the wav2vec2 CTC emission), so batching only costs VRAM
+# (~+0.8 GiB per extra separation window). The knob exists for much wider GPUs, where
+# per-window kernels may underfill the SMs — measure before raising. mms=4 is the
+# ctc-forced-aligner upstream default (ONNX path, pre-existing behavior).
+_BATCH_DEFAULTS = {"separate": 1, "ctc": 1, "mms": 4}
+_BATCH_ENV = {
+    "separate": "VOXWEAVE_SEP_BATCH",
+    "ctc": "VOXWEAVE_CTC_BATCH",
+    "mms": "VOXWEAVE_MMS_BATCH",  # pre-[batch] env name, kept for back-compat
+}
+
+
+def conf_batch(key: str) -> int:
+    """Inference batch size for stage ``key`` ("separate" | "ctc" | "mms"), min 1.
+
+    Precedence: env _BATCH_ENV[key] > conf ``[batch].<key>`` > _BATCH_DEFAULTS.
+    Non-integer values (env or file) are ignored and fall through to the next source.
+    """
+    env = os.environ.get(_BATCH_ENV[key])
+    if env is not None and env.strip():
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    batch = _load().get("batch")
+    if isinstance(batch, dict):
+        v = batch.get(key)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return max(1, v)
+    return _BATCH_DEFAULTS[key]
 
 
 def align_model_for(iso: str) -> str | None:

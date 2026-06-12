@@ -134,3 +134,49 @@ def test_ctc_max_dp_frames_invalid_conf_falls_back(conf_at, monkeypatch):
     monkeypatch.delenv("VOXWEAVE_CTC_MAX_DP_FRAMES", raising=False)
     conf_at.write_text('ctc_max_dp_frames = "lots"\n', encoding="utf-8")
     assert config.conf_ctc_max_dp_frames() == 90000  # non-int does not crash
+
+
+# --- inference batch sizes ([batch] separate/ctc/mms) --------------------- #
+@pytest.fixture
+def no_batch_env(monkeypatch):
+    for v in config._BATCH_ENV.values():
+        monkeypatch.delenv(v, raising=False)
+
+
+def test_conf_batch_defaults(conf_at, no_batch_env):
+    assert config.conf_batch("separate") == 1
+    assert config.conf_batch("ctc") == 1
+    assert config.conf_batch("mms") == 4
+
+
+def test_conf_batch_from_conf(conf_at, no_batch_env):
+    conf_at.write_text("[batch]\nseparate = 4\nmms = 8\n", encoding="utf-8")
+    assert config.conf_batch("separate") == 4
+    assert config.conf_batch("mms") == 8
+    assert config.conf_batch("ctc") == 1  # unlisted key keeps its default
+
+
+def test_conf_batch_env_overrides_conf(conf_at, no_batch_env, monkeypatch):
+    conf_at.write_text("[batch]\nseparate = 4\n", encoding="utf-8")
+    monkeypatch.setenv("VOXWEAVE_SEP_BATCH", "8")
+    assert config.conf_batch("separate") == 8  # env > file
+    # mms keeps its pre-[batch] env name for back-compat
+    monkeypatch.setenv("VOXWEAVE_MMS_BATCH", "2")
+    assert config.conf_batch("mms") == 2
+
+
+def test_conf_batch_invalid_falls_back(conf_at, no_batch_env, monkeypatch):
+    monkeypatch.setenv("VOXWEAVE_CTC_BATCH", "lots")  # non-int env -> next source
+    conf_at.write_text('[batch]\nctc = "many"\n', encoding="utf-8")  # non-int file too
+    assert config.conf_batch("ctc") == 1
+
+
+def test_conf_batch_clamps_to_min_1(conf_at, no_batch_env):
+    conf_at.write_text("[batch]\nseparate = 0\n", encoding="utf-8")
+    assert config.conf_batch("separate") == 1
+
+
+def test_default_template_has_batch_section(conf_at):
+    config.ensure_default_config()
+    txt = conf_at.read_text(encoding="utf-8")
+    assert "[batch]" in txt and "VOXWEAVE_SEP_BATCH" in txt

@@ -462,6 +462,15 @@ asr_model = "Qwen/Qwen3-ASR-1.7B"        # built-in default: Qwen/Qwen3-ASR-0.6B
 #                      model swap round-trips (faster on large-VRAM cards).
 load_strategy = "sum"
 
+# Inference batch sizes: windows per GPU forward (env: VOXWEAVE_SEP_BATCH / VOXWEAVE_CTC_BATCH /
+# VOXWEAVE_MMS_BATCH). On an 8 GB-class card batch=1 already saturates compute — measured no
+# speedup at 2/4, just ~+0.8 GiB VRAM per extra separation window — so the defaults stay at 1.
+# Only worth raising on much wider GPUs, and only after measuring.
+[batch]
+separate = 1                             # vocal separation (MelBandRoformer) 8s windows
+ctc      = 1                             # wav2vec2 CTC emission 30s windows (en aligner)
+mms      = 4                             # MMS-300m emission batch (ja aligner)
+
 # dual-ASR fusion sub-models — only consulted when running with --hybrid.
 [fusion]
 whisper = "large-v3-turbo"               # Whisper size: large-v3 (best) | large-v3-turbo (~5x faster); faster-whisper on cuda, mlx-whisper on mps

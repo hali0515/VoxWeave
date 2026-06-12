@@ -33,7 +33,6 @@ _mms = None  # CtcMms
 # config [align] aliases that route to align_text_mms instead of wav2vec2
 _MMS_NAMES = {"mms", "mms_fa", "ctc", "ctc-forced-aligner", "mms-300m"}
 MMS_SR = 16000  # ctc-forced-aligner requires fixed 16k
-MMS_BATCH = int(os.environ.get("VOXWEAVE_MMS_BATCH", "4"))
 # VOXWEAVE_MMS_MODEL (explicit local path) wins if it exists; otherwise pulled from HF -> config.ALIGN_CACHE.
 MMS_MODEL = os.path.expanduser(os.environ.get("VOXWEAVE_MMS_MODEL", ""))
 MMS_REPO = os.environ.get("VOXWEAVE_MMS_REPO", "deskpai/ctc_forced_aligner")
@@ -130,7 +129,7 @@ def _mms_emit_units(wav, text: str, iso: str) -> list[dict]:
     mm = _get_mms_aligner()
     iso3 = to_iso3(iso)
     emissions, stride = generate_emissions(
-        mm.session, wav.astype(np.float32), batch_size=MMS_BATCH
+        mm.session, wav.astype(np.float32), batch_size=config.conf_batch("mms")
     )
     toks_starred, text_starred = preprocess_text(text, romanize=True, language=iso3)
     segments, scores, blank = get_alignments(emissions, toks_starred, mm.tokenizer)
