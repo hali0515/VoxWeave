@@ -24,11 +24,21 @@ insert songs. Local-first Qwen3 ASR, forced alignment, and edit-and-resync — C
 </div>
 
 > [!NOTE]
-> **100% local.** Separation, ASR, and forced alignment all run in-process on your GPU — no
+> **Local-first.** Separation, ASR, and forced alignment all run in-process on your GPU — no
 > network endpoints, no audio leaves the machine. Runs on **NVIDIA CUDA** (PyTorch) and on
 > **Apple Silicon**, where ASR + alignment use the native **MLX** Qwen3 models. Weights download
 > once on first run. (Translation and ASR-correction are the only optional features that call an
 > external LLM, and only when you invoke them.)
+
+> [!NOTE]
+> **Hardware.** The default pipeline (`Qwen3-ASR-0.6B`, `peak` load strategy) runs in **~8 GB of
+> VRAM** — the separator is freed before ASR + alignment load, so peak ≈ `max(stage)`, not their
+> sum. `--model qwen3-asr-1.7B` adds roughly **+2 GB** and still fits 8 GB under the default `peak`
+> strategy. `load_strategy = "sum"` (concurrent, faster on big cards) makes peak the **sum** of the
+> resident models — plan for 12 GB+. On **Apple Silicon** the MLX 8-bit weights roughly halve the
+> Qwen footprint (so 1.7B fits comfortably in 16 GB unified memory). `--hybrid` loads a Whisper
+> engine alongside Qwen to trade VRAM for accuracy — it does **not** save memory; the only knob that
+> lowers it is staying on `0.6B` + the `peak` strategy.
 
 VoxWeave derives from the WhisperX "edit-and-resync" workflow: transcribe once, then edit
 the text and re-align it against the original audio for frame-accurate timestamps. Where it
