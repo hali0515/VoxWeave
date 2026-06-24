@@ -18,7 +18,12 @@ dependencies = [
   # Core runtime: VAD + audio I/O + CLI.
   "silero-vad>=5",
   "soundfile>=0.12",
-  "numpy>=1.26",
+  # Upper bound tracks numba's numpy ceiling: librosa -> numba, and every numba with a
+  # py3.12 wheel (<=0.65.1) pins numpy<2.5. Without this cap uv maximizes numpy to the
+  # latest (>=2.5.0), finds no modern numba, and backtracks to numba 0.53.1 — an sdist
+  # with no py3.12 wheel that fails to build (RuntimeError: only py >=3.6,<3.10), pulling
+  # the unbuildable llvmlite 0.36.0 with it. Raise when numba ships a numpy>=2.5 release.
+  "numpy>=1.26,<2.5",
   "click>=8.1",
   "rich>=13",
   # Model downloads (separator / PANNs / MLX snapshots) go through huggingface_hub directly —
