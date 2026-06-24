@@ -235,7 +235,10 @@ def pack(
     """Soft-mux one or more VTTs into the media as subtitle tracks; return the output path."""
     if not vtts:
         raise ValueError("at least one VTT is required")
+    from voxweave.pipeline import require_vtt
+
     for v in vtts:
+        require_vtt(v)
         _timed_vtt_check(v)
     src = resolve_media(vtts[0], media)
     cont = container or _default_container(src)
@@ -473,10 +476,12 @@ def burn(
     output; return its path. The styled ASS is generated at the actual frame
     size so proportions match the export defaults at any resolution."""
     from voxweave.export import _timed_rows, ass_header, render_ass
+    from voxweave.pipeline import require_vtt
     from voxweave.realign import parse_vtt_blocks
 
     if container not in ("mp4", "mkv"):
         raise ValueError(f"unsupported container {container!r} (choose mp4 or mkv)")
+    require_vtt(vtt)
     src = resolve_media(vtt, media)
     rows = _timed_rows(parse_vtt_blocks(Path(vtt).read_text(encoding="utf-8")))
 

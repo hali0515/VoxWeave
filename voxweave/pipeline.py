@@ -141,6 +141,22 @@ def swap_ext(path: Path, new_ext: str) -> Path:
     return path.with_name(path.name + new_ext)
 
 
+def require_vtt(path: Path) -> Path:
+    """Reject non-VTT inputs for translate/pack/burn; return the path unchanged.
+
+    These commands only support ``.vtt`` for now: the VTT (plus its ``.json`` sibling)
+    is the source of truth, whereas exported ``.srt``/``.ass`` carry no word-level data
+    and would be silently mis-parsed as plain text. Run the command on the ``.vtt``.
+    """
+    p = Path(path)
+    if p.suffix.lower() != ".vtt":
+        raise ValueError(
+            f"{p.name}: only .vtt is supported for now"
+            f" (got {p.suffix or 'no extension'!r}); work from the .vtt source"
+        )
+    return p
+
+
 def _find_sibling_media(ref: Path) -> Path | None:
     """Find the source media alongside ref by trying known extensions; return first match."""
     ref = Path(ref)
@@ -1211,7 +1227,7 @@ def translate(
     Missing translations are retried once; any remaining are back-filled with source text.
     Output cue count always equals input cue count.
     """
-    vtt_path = Path(vtt_path)
+    vtt_path = require_vtt(vtt_path)
     rep = reporter or Reporter()
     blocks = _load_cues(vtt_path)
     if any(b.get("start") is None for b in blocks):

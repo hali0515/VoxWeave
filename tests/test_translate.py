@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from voxweave import pipeline, translate
 from voxweave.progress import Reporter
 
@@ -251,6 +253,13 @@ def test_pipeline_translate_writes_sibling(tmp_path, monkeypatch):
     assert "00:00:01.000 --> 00:00:02.000\n你好" in txt
     assert "00:00:03.000 --> 00:00:04.000\n世界" in txt
     assert "hello" in vtt.read_text(encoding="utf-8")
+
+
+def test_pipeline_translate_rejects_non_vtt(tmp_path):
+    srt = tmp_path / "ep.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="only .vtt is supported"):
+        pipeline.translate(srt, to="zh")
 
 
 def test_pipeline_translate_fills_missing_with_retry_then_original(

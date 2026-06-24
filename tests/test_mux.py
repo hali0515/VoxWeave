@@ -148,6 +148,20 @@ def test_pack_rejects_plain_text_draft(tmp_path):
         mux.pack([vtt])
 
 
+def test_pack_rejects_non_vtt(tmp_path):
+    srt = tmp_path / "ep.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="only .vtt is supported"):
+        mux.pack([srt])
+
+
+def test_burn_rejects_non_vtt(tmp_path):
+    ass = tmp_path / "ep.ass"
+    ass.write_text("[Script Info]\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="only .vtt is supported"):
+        mux.burn(ass)
+
+
 # --- burn building blocks ----------------------------------------------------
 
 
