@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
+from voxweave import fsio
 from voxweave.realign import render_cues
 
 log = logging.getLogger("voxweave")
+
+# Injectable for tests (backoff sleeps must not slow the suite down).
+_sleep = time.sleep
+# Two backoffs = three attempts per window; long enough to ride out rate-limit
+# blips, short enough that a hard failure surfaces within seconds.
+_RETRY_DELAYS = (2.0, 8.0)
 
 TRANSLATE_MODEL = os.environ.get("VOXWEAVE_TRANSLATE_MODEL", "gpt-5.3-chat-latest")
 # Set high (800) so a typical episode (300-500 cues) fits in one call — full-episode context
@@ -262,6 +271,66 @@ def _call(client, model: str, messages: list[dict], on_entry=None) -> str:
     return "".join(buf)
 
 
+def _call_with_retry(client, model: str, messages: list[dict], on_entry=None) -> str:
+    """:func:`_call` with exponential backoff on transient failures (network,
+    rate limit, 5xx). A streamed retry re-counts entries already reported to
+    ``on_entry`` — the bar may overshoot, the translations do not."""
+    for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
+        try:
+            return _call(client, model, messages, on_entry=on_entry)
+        except Exception as e:
+            if delay is None:
+                raise
+            log.warning(
+                "translate call failed (attempt %d/%d: %s); retrying in %.0fs",
+                attempt + 1,
+                len(_RETRY_DELAYS) + 1,
+                e,
+                delay,
+            )
+            _sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def payload_signature(payload: list[dict]) -> str:
+    """Stable fingerprint of a translate payload; guards progress files against
+    being replayed onto a since-edited subtitle."""
+    doc = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(doc.encode("utf-8")).hexdigest()
+
+
+def save_progress(path: Path, sig: str | None, trans: dict[int, str]) -> None:
+    """Persist completed translations (atomic) so an interrupted multi-window
+    run can resume instead of re-translating from zero."""
+    doc = {"sig": sig, "translations": {str(i): t for i, t in trans.items()}}
+    fsio.atomic_write_text(Path(path), json.dumps(doc, ensure_ascii=False))
+
+
+def load_progress(path: Path, sig: str | None) -> dict[int, str]:
+    """Load a progress file written by :func:`save_progress`; empty dict when
+    the file is missing, unreadable, or was written for a different payload."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(doc, dict) or doc.get("sig") != sig:
+        log.warning("%s does not match the current subtitle; ignoring it", p.name)
+        return {}
+    items = doc.get("translations", {})
+    if not isinstance(items, dict):
+        return {}
+    out: dict[int, str] = {}
+    for k, v in items.items():
+        try:
+            out[int(k)] = str(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def translate_cues(
     payload: list[dict],
     *,
@@ -275,11 +344,15 @@ def translate_cues(
     batch: int = BATCH_THRESHOLD,
     context_tail: int = CONTEXT_TAIL,
     reporter=None,
+    progress_path: Path | None = None,
+    progress_sig: str | None = None,
 ) -> dict[int, str]:
     """Numbered payload -> {index: translated text}.
 
     Single call when len <= batch (whole-episode context); sequential windows with continuity
-    tail otherwise. ``client`` injectable for tests.
+    tail otherwise. ``client`` injectable for tests. With ``progress_path``, completed windows
+    are persisted after each call and fully-covered windows are skipped on a rerun, so a
+    mid-run failure costs only the window that failed.
     """
     if not payload:
         return {}
@@ -294,9 +367,21 @@ def translate_cues(
         reporter.task(f"translate -> {to}", len(payload))
         on_entry = reporter.advance
     result: dict[int, str] = {}
+    if progress_path is not None:
+        result.update(load_progress(progress_path, progress_sig))
     tail: list[tuple[str, str]] = []
     for win in windows:
-        msgs = build_messages(win, to=to, context=context, glossary=glossary, tail=tail)
-        result.update(parse_response(_call(client, model, msgs, on_entry=on_entry)))
+        if all(result.get(c["i"], "").strip() for c in win):
+            if on_entry is not None:
+                on_entry(len(win))  # resumed from progress: count it as done
+        else:
+            msgs = build_messages(
+                win, to=to, context=context, glossary=glossary, tail=tail
+            )
+            result.update(
+                parse_response(_call_with_retry(client, model, msgs, on_entry=on_entry))
+            )
+            if progress_path is not None:
+                save_progress(progress_path, progress_sig, result)
         tail = [(c["t"], result.get(c["i"], "")) for c in win[-context_tail:]]
     return result

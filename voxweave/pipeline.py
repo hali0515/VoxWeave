@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from voxweave import backend
+from voxweave import fsio
 from voxweave.core.schema import Cue
 from voxweave.chunking import (
     decode_to_wav,
@@ -117,15 +118,20 @@ def cache_16k_path(media_path: Path) -> Path:
 
 
 def _encode_flac(src_wav: Path, dst_flac: Path) -> None:
-    """Encode wav to flac for caching (lossless); caller treats failure as non-fatal."""
+    """Encode wav to flac for caching (lossless); caller treats failure as non-fatal.
+
+    Atomic: an interrupted encode must not leave a truncated flac at the cache
+    path — every later run would treat it as a cache hit and fail obscurely.
+    """
     dst_flac.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["ffmpeg", "-nostdin", "-y", "-i", str(src_wav), "-c:a", "flac", str(dst_flac)],
-        check=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    with fsio.atomic_path(dst_flac) as tmp:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-i", str(src_wav), "-c:a", "flac", str(tmp)],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def swap_ext(path: Path, new_ext: str) -> Path:
@@ -684,9 +690,7 @@ def _dump_sibling_json(
         data["speaker_turns"] = [
             [float(s), float(e), str(lb)] for s, e, lb in speaker_turns
         ]
-    json_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    fsio.atomic_write_text(json_path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _write_siblings(
@@ -728,7 +732,7 @@ def _write_siblings(
         for c in cues
     ]
     vtt_path = swap_ext(src, ".vtt")
-    vtt_path.write_text(realign.render_cues(rows), encoding="utf-8")
+    fsio.atomic_write_text(vtt_path, realign.render_cues(rows))
     return vtt_path
 
 
@@ -870,7 +874,7 @@ def _write_sdh_sidecar(
         wav32.unlink(missing_ok=True)
     events = sdh_mod.fit_events_to_gaps(events, cues)
     path = swap_ext(media_path, ".sdh.vtt")
-    path.write_text(sdh_mod.render_sdh_vtt(cues, events), encoding="utf-8")
+    fsio.atomic_write_text(path, sdh_mod.render_sdh_vtt(cues, events))
     log.info("wrote %s (%d event tag(s))", path.name, len(events))
     return path
 
@@ -1176,7 +1180,7 @@ def align(
         )
 
         rep.stage("write VTT + JSON")
-        vtt_path.write_text(realign.render_vtt(blocks, spans_filled), encoding="utf-8")
+        fsio.atomic_write_text(vtt_path, realign.render_vtt(blocks, spans_filled))
         # Preserve vad_speech / shot_changes from the original JSON (computed by
         # transcribe from the original media; align does not recompute them).
         keep_vad = _spans_in(data.get("vad_speech"))
@@ -1241,6 +1245,9 @@ def translate(
         )
 
     payload = translate_mod.build_payload(blocks)
+    # Progress sidecar: completed windows survive a mid-run failure (network,
+    # rate limit), so rerunning the same command resumes instead of restarting.
+    progress_path = swap_ext(vtt_path, f".{to}.progress.json")
     tx_kwargs: dict[str, Any] = dict(
         to=to,
         model=model,
@@ -1248,24 +1255,35 @@ def translate(
         glossary=glossary,
         base_url=base_url,
         api_key=api_key,
+        progress_path=progress_path,
+        progress_sig=translate_mod.payload_signature(payload),
     )
     rep.stage(f"translate {len(payload)} cues -> {to}")
-    trans = translate_mod.translate_cues(payload, **tx_kwargs, reporter=rep)
+    try:
+        trans = translate_mod.translate_cues(payload, **tx_kwargs, reporter=rep)
 
-    missing = translate_mod.validate_and_fill(blocks, trans)
-    if missing:
-        rep.stage(f"retry translate {len(missing)} cues")
-        retry_payload = [payload[i] for i in missing]
-        trans.update(
-            translate_mod.translate_cues(retry_payload, **tx_kwargs, reporter=rep)
-        )
-        still = translate_mod.validate_and_fill(blocks, trans)
-        if still:
-            log.warning(
-                "%d cues still untranslated, back-filling with source text: %s",
-                len(still),
-                still,
+        missing = translate_mod.validate_and_fill(blocks, trans)
+        if missing:
+            rep.stage(f"retry translate {len(missing)} cues")
+            retry_payload = [payload[i] for i in missing]
+            trans.update(
+                translate_mod.translate_cues(retry_payload, **tx_kwargs, reporter=rep)
             )
+            still = translate_mod.validate_and_fill(blocks, trans)
+            if still:
+                log.warning(
+                    "%d cues still untranslated, back-filling with source text: %s",
+                    len(still),
+                    still,
+                )
+    except Exception:
+        if progress_path.exists():
+            log.warning(
+                "translation interrupted; progress saved to %s -- rerun the same "
+                "command to resume",
+                progress_path.name,
+            )
+        raise
 
     rep.stage(f"write translated {ext.lstrip('.').upper()}")
     rows = translate_mod.translated_rows(blocks, trans, to_iso=to_iso_or(to, None))
@@ -1281,7 +1299,8 @@ def translate(
         ]
         content = render_srt(timed) if ext == ".srt" else render_ass(timed)
     out_path = swap_ext(vtt_path, f".{to}{ext}")
-    out_path.write_text(content, encoding="utf-8")
+    fsio.atomic_write_text(out_path, content)
+    progress_path.unlink(missing_ok=True)  # translation landed; sidecar done
     log.info("wrote %s (%d cues → %s)", out_path.name, len(blocks), to)
     return out_path
 
@@ -1327,20 +1346,20 @@ def correct(
     if apply:
         # in-place edit: overwrite the original, no sidecar json (diff lives in the summary)
         rep.stage("overwrite VTT in place")
-        vtt_path.write_text(rendered, encoding="utf-8")
+        fsio.atomic_write_text(vtt_path, rendered)
         out_path = vtt_path
     else:
         rep.stage("write sidecar VTT + audit json")
         out_path = swap_ext(vtt_path, ".asrfix.vtt")
-        out_path.write_text(rendered, encoding="utf-8")
+        fsio.atomic_write_text(out_path, rendered)
         audit_path = swap_ext(vtt_path, ".asrfix.json")
-        audit_path.write_text(
+        fsio.atomic_write_text(
+            audit_path,
             json.dumps(
                 {"applied": applied, "rejected": rejected},
                 ensure_ascii=False,
                 indent=2,
             ),
-            encoding="utf-8",
         )
     log.info(
         "asrfix %s: %d applied / %d rejected → %s",

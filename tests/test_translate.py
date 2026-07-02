@@ -428,3 +428,136 @@ def test_pipeline_translate_passes_target_iso(tmp_path, monkeypatch):
     out = pipeline.translate(vtt, to="zh", reporter=Reporter())
     lines = _cue_lines(out.read_text(encoding="utf-8"))
     assert len(lines) == 2  # wrap applied through the pipeline path
+
+
+# --- retry + progress persistence -------------------------------------------
+
+
+class FlakyClient:
+    """Raises for the first ``fail_times`` create() calls, then serves the queue."""
+
+    def __init__(self, contents, fail_times=0):
+        self._contents = list(contents)
+        self.fail_times = fail_times
+        self.calls = 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, *, model, messages, **kw):
+        self.calls += 1
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise ConnectionError("transient network error")
+        content = self._contents.pop(0)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+
+def _payload(n):
+    return [{"i": i, "t": f"line {i}"} for i in range(n)]
+
+
+def _resp(indices):
+    import json as _json
+
+    return _json.dumps({"translations": [{"i": i, "t": f"tx {i}"} for i in indices]})
+
+
+def test_translate_cues_retries_transient_failures(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(translate, "_sleep", sleeps.append)
+    client = FlakyClient([_resp(range(2))], fail_times=2)
+    out = translate.translate_cues(_payload(2), to="zh", model="m", client=client)
+    assert out == {0: "tx 0", 1: "tx 1"}
+    assert client.calls == 3  # 2 failures + 1 success
+    assert len(sleeps) == 2  # backoff between attempts
+
+
+def test_translate_cues_raises_after_retries_exhausted(monkeypatch):
+    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
+    client = FlakyClient([], fail_times=99)
+    with pytest.raises(ConnectionError):
+        translate.translate_cues(_payload(2), to="zh", model="m", client=client)
+
+
+def test_window_failure_persists_completed_windows(tmp_path, monkeypatch):
+    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
+    # window 1 (cues 0-1) succeeds; window 2 (cues 2-3) fails every attempt
+    client = FlakyClient([_resp(range(2))], fail_times=0)
+    orig = client._create
+
+    def create(*, model, messages, **kw):
+        if not client._contents:  # window 1 consumed -> window 2 always fails
+            raise ConnectionError("down")
+        return orig(model=model, messages=messages, **kw)
+
+    client.chat.completions.create = create
+    progress = tmp_path / "ep.zh.progress.json"
+    payload = _payload(4)
+    sig = translate.payload_signature(payload)
+    with pytest.raises(ConnectionError):
+        translate.translate_cues(
+            payload,
+            to="zh",
+            model="m",
+            client=client,
+            batch=2,
+            progress_path=progress,
+            progress_sig=sig,
+        )
+    saved = translate.load_progress(progress, sig)
+    assert saved == {0: "tx 0", 1: "tx 1"}
+
+
+def test_resume_skips_completed_windows(tmp_path):
+    payload = _payload(4)
+    sig = translate.payload_signature(payload)
+    progress = tmp_path / "ep.zh.progress.json"
+    translate.save_progress(progress, sig, {0: "tx 0", 1: "tx 1"})
+    client = FakeClient([_resp(range(2, 4))])  # only window 2 should be called
+    out = translate.translate_cues(
+        payload,
+        to="zh",
+        model="m",
+        client=client,
+        batch=2,
+        progress_path=progress,
+        progress_sig=sig,
+    )
+    assert out == {0: "tx 0", 1: "tx 1", 2: "tx 2", 3: "tx 3"}
+    assert len(client.calls) == 1
+
+
+def test_progress_sig_mismatch_ignored(tmp_path):
+    payload = _payload(2)
+    progress = tmp_path / "ep.zh.progress.json"
+    translate.save_progress(progress, "stale-sig", {0: "old"})
+    client = FakeClient([_resp(range(2))])
+    out = translate.translate_cues(
+        payload,
+        to="zh",
+        model="m",
+        client=client,
+        progress_path=progress,
+        progress_sig=translate.payload_signature(payload),
+    )
+    assert out == {0: "tx 0", 1: "tx 1"}  # stale progress not reused
+    assert len(client.calls) == 1
+
+
+def test_pipeline_translate_cleans_progress_on_success(tmp_path, monkeypatch):
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
+    seen = {}
+
+    def fake_cues(payload, progress_path=None, progress_sig=None, **kw):
+        seen["progress_path"] = progress_path
+        if progress_path is not None:
+            translate.save_progress(progress_path, progress_sig, {0: "你好"})
+        return {0: "你好"}
+
+    monkeypatch.setattr(pipeline.translate_mod, "translate_cues", fake_cues)
+    out = pipeline.translate(vtt, to="zh")
+    assert out.read_text(encoding="utf-8")  # translation written
+    assert seen["progress_path"] is not None
+    assert not Path(seen["progress_path"]).exists()  # cleaned up on success
