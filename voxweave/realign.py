@@ -7,8 +7,11 @@ timestamps. Model inference and audio preparation live in :mod:`voxweave.pipelin
 
 from __future__ import annotations
 
+import logging
 import re
 from difflib import SequenceMatcher
+
+log = logging.getLogger("voxweave")
 
 # Korean uses spaces, so excluded.
 NO_SPACE_LANGS = {"zh", "ja", "yue"}
@@ -50,6 +53,7 @@ def parse_vtt_blocks(text: str) -> list[dict]:
     Cue id lines, WEBVTT headers, and NOTE/STYLE/REGION blocks are discarded.
     """
     blocks: list[dict] = []
+    music_only = 0
     text = text.lstrip("\ufeff")  # a leading BOM must not defeat the header check
     for raw in re.split(r"\n[ \t]*\n", text.replace("\r\n", "\n").replace("\r", "\n")):
         lines = [ln for ln in raw.split("\n")]
@@ -84,8 +88,13 @@ def parse_vtt_blocks(text: str) -> list[dict]:
             block["text"] = cue[1:-1].strip()
             block["lyric"] = True
             if not block["text"]:
+                music_only += 1
                 continue
         blocks.append(block)
+    if music_only:
+        log.info(
+            "dropped %d music-only cue(s) (no text inside the note wrap)", music_only
+        )
     return blocks
 
 

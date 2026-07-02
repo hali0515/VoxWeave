@@ -148,6 +148,113 @@ def test_load_vtt_content_in_srt_is_tolerated(tmp_path):
     assert load_subtitle_blocks(p)[0]["text"] == "hello"
 
 
+# --- italics in combined overrides / malformed lines / ordering --------------
+
+
+def test_parse_ass_combined_override_italic():
+    # italic toggles packed with other tags ({\i1\fad(...)}) used to be eaten by
+    # the generic override stripper, leaving a dangling </i>
+    doc = (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\i1\\fad(200,200)}Hello{\\i0} there\n"
+    )
+    blocks = parse_ass_blocks(doc)
+    assert blocks[0]["text"] == "<i>Hello</i> there"
+
+
+def test_parse_ass_dangling_italic_close_dropped():
+    doc = (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello{\\i0}\n"
+    )
+    assert parse_ass_blocks(doc)[0]["text"] == "Hello"
+
+
+def test_parse_ass_unclosed_italic_autoclosed():
+    doc = (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\i1\\b1}Hello\n"
+    )
+    assert parse_ass_blocks(doc)[0]["text"] == "<i>Hello</i>"
+
+
+def test_parse_ass_combined_fullline_italic_lyric():
+    # whole-line italic wrap with extra tags still unwraps into the lyric flag
+    doc = (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\i1\\fad(200,200)}♪ la la ♪{\\i0}\n"
+    )
+    blocks = parse_ass_blocks(doc)
+    assert blocks == [{"text": "la la", "start": 1.0, "end": 2.0, "lyric": True}]
+
+
+def test_parse_ass_malformed_dialogue_warns(caplog):
+    doc = (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00\n"  # too few fields
+        "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,fine\n"
+    )
+    with caplog.at_level("WARNING", logger="voxweave"):
+        blocks = parse_ass_blocks(doc)
+    assert [b["text"] for b in blocks] == ["fine"]
+    assert any("Dialogue" in r.message for r in caplog.records)
+
+
+def test_load_vtt_out_of_order_cues_sorted(tmp_path):
+    # ASS input is sorted by start; VTT/SRT must behave the same
+    p = tmp_path / "ep.vtt"
+    p.write_text(
+        "WEBVTT\n\n"
+        "00:00:05.000 --> 00:00:06.000\nsecond\n\n"
+        "00:00:01.000 --> 00:00:02.000\nfirst\n",
+        encoding="utf-8",
+    )
+    assert [b["text"] for b in load_subtitle_blocks(p)] == ["first", "second"]
+
+
+def test_load_vtt_inverted_timestamps_swapped(tmp_path, caplog):
+    p = tmp_path / "ep.vtt"
+    p.write_text(
+        "WEBVTT\n\n00:00:03.000 --> 00:00:01.000\nbackwards\n", encoding="utf-8"
+    )
+    with caplog.at_level("WARNING", logger="voxweave"):
+        blocks = load_subtitle_blocks(p)
+    assert blocks[0]["start"] == 1.0 and blocks[0]["end"] == 3.0
+    assert any("inverted" in r.message for r in caplog.records)
+
+
+def test_load_vtt_music_only_cue_drop_logged(tmp_path, caplog):
+    p = tmp_path / "ep.vtt"
+    p.write_text(
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:02.000\n♪ ♪\n\n"
+        "00:00:03.000 --> 00:00:04.000\nreal line\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level("INFO", logger="voxweave"):
+        blocks = load_subtitle_blocks(p)
+    assert [b["text"] for b in blocks] == ["real line"]
+    assert any("music-only" in r.message for r in caplog.records)
+
+
+def test_parse_ass_music_only_cue_drop_logged(caplog):
+    doc = (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,♪ ♪\n"
+        "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,real\n"
+    )
+    with caplog.at_level("INFO", logger="voxweave"):
+        blocks = parse_ass_blocks(doc)
+    assert [b["text"] for b in blocks] == ["real"]
+    assert any("music-only" in r.message for r in caplog.records)
+
+
 # --- encoding tolerance ------------------------------------------------------
 
 SRT_DOC = "1\n00:00:00,000 --> 00:00:01,000\ncafé naïve\n"

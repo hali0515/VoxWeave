@@ -35,27 +35,54 @@ _ASS_DEFAULT_FIELDS = [
     "text",
 ]
 
-_ASS_FULL_ITALIC_RE = re.compile(r"\{\\i1\}(.*)\{\\i0\}\Z", re.DOTALL)
-_ASS_ITALIC_ON_RE = re.compile(r"\{\\i1\}")
-_ASS_ITALIC_OFF_RE = re.compile(r"\{\\i0?\}")
 _ASS_OVERRIDE_RE = re.compile(r"\{[^}]*\}")
+# \i1 / \i0 anywhere inside an override block, even packed with other tags
+# ({\i1\fad(200,200)}); the (?![0-9]) guard keeps \i10 etc. from matching.
+_ASS_ITALIC_TAG_RE = re.compile(r"\\i([01])(?![0-9])")
+_ITALIC_WRAP_RE = re.compile(r"<i>(.*)</i>\Z", re.DOTALL)
+_ITALIC_TOKEN_RE = re.compile(r"(<i>|</i>)")
+
+
+def _override_to_italic(m: re.Match) -> str:
+    """Override block -> its italic effect: the last \\i toggle wins; blocks
+    without one are dropped."""
+    tags = _ASS_ITALIC_TAG_RE.findall(m.group(0))
+    if not tags:
+        return ""
+    return "<i>" if tags[-1] == "1" else "</i>"
+
+
+def _balance_italics(t: str) -> str:
+    """Drop dangling ``</i>`` and auto-close unclosed ``<i>`` (ASS italics run
+    to end of line), so renderers never see a stray tag."""
+    out: list[str] = []
+    depth = 0
+    for tok in _ITALIC_TOKEN_RE.split(t):
+        if tok == "<i>":
+            depth += 1
+        elif tok == "</i>":
+            if depth == 0:
+                continue
+            depth -= 1
+        out.append(tok)
+    out.append("</i>" * depth)
+    return "".join(out)
 
 
 def _ass_plain_text(raw: str) -> str:
     """ASS event text -> cue text: ``\\N``/``\\n`` become line breaks, ``\\h``
     a space, italic overrides become inline ``<i>``/``</i>`` tags (the form the
-    SRT/ASS renderers understand), all other override blocks are dropped.
+    SRT/ASS renderers understand) even when packed with other tags, all other
+    override blocks are dropped, and stray italic tags are balanced.
 
     A whole-line italic wrap is removed entirely: it is styling (typically a
     song line), and keeping it would mask the music-note lyric detection below.
     """
-    t = raw.strip()
-    m = _ASS_FULL_ITALIC_RE.fullmatch(t)
-    if m and "{" not in m.group(1):
+    t = _ASS_OVERRIDE_RE.sub(_override_to_italic, raw.strip())
+    m = _ITALIC_WRAP_RE.fullmatch(t)
+    if m and "<i>" not in m.group(1) and "</i>" not in m.group(1):
         t = m.group(1)
-    t = _ASS_ITALIC_ON_RE.sub("<i>", t)
-    t = _ASS_ITALIC_OFF_RE.sub("</i>", t)
-    t = _ASS_OVERRIDE_RE.sub("", t)
+    t = _balance_italics(t)
     t = t.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ")
     return "\n".join(ln.strip() for ln in t.split("\n")).strip()
 
@@ -84,6 +111,7 @@ def parse_ass_blocks(text: str) -> list[dict]:
     blocks: list[dict] = []
     fields: list[str] | None = None
     in_events = False
+    music_only = 0
     for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = raw.strip()
         if line.startswith("["):
@@ -102,15 +130,29 @@ def parse_ass_blocks(text: str) -> list[dict]:
         names = fields or _ASS_DEFAULT_FIELDS
         parts = val.split(",", len(names) - 1)
         if len(parts) < len(names):
+            log.warning(
+                "malformed ASS Dialogue line dropped (%d fields, expected %d): %.60s",
+                len(parts),
+                len(names),
+                line,
+            )
             continue
         row = dict(zip(names, parts))
         start = _parse_ts(row.get("start", ""))
         end = _parse_ts(row.get("end", ""))
         if start is None or end is None:
             continue
-        block = _lyric_block(_ass_plain_text(row.get("text", "")), start, end)
-        if block is not None:
-            blocks.append(block)
+        cue = _ass_plain_text(row.get("text", ""))
+        block = _lyric_block(cue, start, end)
+        if block is None:
+            if cue:
+                music_only += 1
+            continue
+        blocks.append(block)
+    if music_only:
+        log.info(
+            "dropped %d music-only cue(s) (no text inside the note wrap)", music_only
+        )
     blocks.sort(key=lambda b: (b["start"], b["end"]))
     return blocks
 
@@ -205,4 +247,20 @@ def load_subtitle_blocks(path: Path) -> list[dict]:
     blocks = parse_ass_blocks(text) if is_ass else parse_vtt_blocks(text)
     if not blocks:
         raise RuntimeError(f"no cues in {p.name}")
+    _sanitize_block_order(blocks, p.name)
     return blocks
+
+
+def _sanitize_block_order(blocks: list[dict], name: str) -> None:
+    """Swap inverted timestamps (logged) and sort timed cues by start, so
+    VTT/SRT input behaves like the ASS parser (which already sorts) and
+    downstream global alignment never sees a non-monotonic cue list."""
+    for b in blocks:
+        s, e = b.get("start"), b.get("end")
+        if s is not None and e is not None and s > e:
+            log.warning("%s: inverted timestamps (%.3f > %.3f), swapping", name, s, e)
+            b["start"], b["end"] = e, s
+    if all(b.get("start") is not None for b in blocks):
+        blocks.sort(
+            key=lambda b: (b["start"], b["end"] if b["end"] is not None else b["start"])
+        )
