@@ -11,6 +11,8 @@ import soundfile as sf
 SAMPLE_RATE = 16000
 # Raised from silero default 100ms to 300ms: 200ms chops natural mid-sentence pauses.
 VAD_MIN_SILENCE_MS = int(os.environ.get("VOXWEAVE_VAD_MIN_SILENCE_MS", "300"))
+# Wall-clock cap for a single ffmpeg decode; overridable via VOXWEAVE_FFMPEG_TIMEOUT.
+FFMPEG_TIMEOUT = float(os.environ.get("VOXWEAVE_FFMPEG_TIMEOUT", "3600"))
 
 
 def pack_speech_segments(segments: list[dict], max_sec: float) -> list[dict]:
@@ -176,26 +178,35 @@ def decode_to_wav(
     out = Path(path)
     ac = ["-ac", "1"] if mono else []
     af = ["-af", audio_filter] if audio_filter else []
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-nostdin",
-            "-y",
-            "-i",
-            str(media_path),
-            *af,
-            *ac,
-            "-ar",
-            str(sample_rate),
-            "-f",
-            "wav",
-            str(out),
-        ],
-        check=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(media_path),
+                *af,
+                *ac,
+                "-ar",
+                str(sample_rate),
+                "-f",
+                "wav",
+                str(out),
+            ],
+            check=True,
+            timeout=FFMPEG_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        out.unlink(missing_ok=True)
+        err = e.stderr
+        if isinstance(err, bytes):
+            err = err.decode("utf-8", "replace")
+        tail = (err or "").strip() or "(no stderr)"
+        raise RuntimeError(f"ffmpeg failed to decode {media_path.name}: {tail}") from e
     return out
 
 

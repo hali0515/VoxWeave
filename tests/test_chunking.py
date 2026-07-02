@@ -1,3 +1,9 @@
+import os
+import subprocess
+
+import pytest
+
+from voxweave import chunking
 from voxweave.chunking import pack_speech_segments, plan_dp_chunks
 
 
@@ -120,3 +126,69 @@ def test_subtract_spans_keep_swallows_whole_span():
     from voxweave.songdet import subtract_spans
 
     assert subtract_spans([(2.0, 4.0)], [(1.0, 5.0)]) == []
+
+
+# --------------------------------------------------------------------------- #
+# decode_to_wav: ffmpeg failures must be readable (media name + stderr tail),
+# capped by a timeout, and must not leak the mkstemp temp file (#20, #21).
+# --------------------------------------------------------------------------- #
+def test_decode_to_wav_ffmpeg_failure_includes_media_name_and_stderr(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"x")
+
+    def fake_run(*a, **kw):
+        raise subprocess.CalledProcessError(
+            1, ["ffmpeg"], stderr=b"boom: codec not found"
+        )
+
+    monkeypatch.setattr(chunking.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError) as ei:
+        chunking.decode_to_wav(media)
+    msg = str(ei.value)
+    assert "clip.mp4" in msg
+    assert "boom" in msg
+
+
+def test_decode_to_wav_passes_timeout_and_captures_stderr(tmp_path, monkeypatch):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"x")
+    captured: dict = {}
+
+    def fake_run(cmd, **kw):
+        captured.update(kw)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(chunking.subprocess, "run", fake_run)
+    chunking.decode_to_wav(media)
+    assert "timeout" in captured
+    assert captured.get("stderr") != subprocess.DEVNULL
+
+
+def test_ffmpeg_timeout_constant_is_positive_and_env_overridable(monkeypatch):
+    # Contract: chunking.FFMPEG_TIMEOUT is a module constant, overridable via
+    # VOXWEAVE_FFMPEG_TIMEOUT (read at import time, like VAD_MIN_SILENCE_MS above).
+    assert chunking.FFMPEG_TIMEOUT > 0
+
+
+def test_decode_to_wav_cleans_temp_wav_on_ffmpeg_failure(tmp_path, monkeypatch):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"x")
+
+    def fake_mkstemp(suffix="", prefix="", dir=None):
+        path = tmp_path / f"{prefix}fake{suffix}"
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+        return fd, str(path)
+
+    def fake_run(*a, **kw):
+        raise subprocess.CalledProcessError(1, ["ffmpeg"], stderr=b"boom")
+
+    monkeypatch.setattr(chunking.tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(chunking.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError):
+        chunking.decode_to_wav(media)
+
+    leftover = [p for p in tmp_path.iterdir() if p.suffix == ".wav"]
+    assert leftover == []

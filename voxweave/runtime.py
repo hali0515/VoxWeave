@@ -110,6 +110,14 @@ def _require(mod: str, hint: str = _MISSING_HINT) -> RuntimeError:
     return RuntimeError(hint.format(mod=mod))
 
 
+def _hf_error(repo: str, err: Exception) -> RuntimeError:
+    """Wrap a raw huggingface_hub download failure with an actionable auth/network hint."""
+    return RuntimeError(
+        f"failed to download {repo!r} from Hugging Face: {err}. "
+        "Check network access; gated repos need HF_TOKEN (or VOXWEAVE_HF_TOKEN) set."
+    )
+
+
 def _load_yaml(path: Path) -> dict:
     """SafeLoader + !!python/tuple support (used by window sizes in MSST-style configs)."""
     import yaml
@@ -221,7 +229,12 @@ def _hf_download(repo: str, filename: str, cache_dir: str | None = None) -> str:
             and "tqdm_class" in inspect.signature(hf_hub_download).parameters
         ):
             kwargs["tqdm_class"] = bridge
-        return hf_hub_download(repo, filename, cache_dir=cache_dir, **kwargs)
+        try:
+            return hf_hub_download(repo, filename, cache_dir=cache_dir, **kwargs)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise _hf_error(repo, e) from e
 
 
 def _hf_snapshot(repo: str, cache_dir: str) -> str:
@@ -238,4 +251,9 @@ def _hf_snapshot(repo: str, cache_dir: str) -> str:
         raise _require(e.name or "huggingface_hub") from e
     with _bridged_bars(repo) as bridge:
         kwargs: dict[str, Any] = {} if bridge is None else {"tqdm_class": bridge}
-        return snapshot_download(repo, cache_dir=cache_dir, **kwargs)
+        try:
+            return snapshot_download(repo, cache_dir=cache_dir, **kwargs)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise _hf_error(repo, e) from e
