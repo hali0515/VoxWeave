@@ -38,10 +38,18 @@ DIARIZE_MODEL = os.environ.get(
 # turn (seconds); below it the atom inherits its neighbors (guards 20ms grazes).
 MIN_ATOM_OVERLAP_S = 0.05
 
-# A speaker run whose total atom duration is below this is pyannote label thrash
-# (labels flip every 40-130ms at atom granularity): absorb it into the adjacent
-# longer run so a word is never cut into two speaker cues.
+# A speaker run whose total atom duration is below this is a candidate for
+# absorption into an adjacent run (a word is never cut into two speaker cues).
+# Whether a sub-floor run is actually absorbed is position-aware (see
+# _absorb_tiny_runs): mid-phrase thrash goes, real edge utterances stay.
 MIN_RUN_S = 0.2
+
+# A sub-MIN_RUN_S run that is *not* a same-speaker (A-B-A) sandwich -- i.e. one at
+# a cue edge or between two different speakers (A-B-C) -- is a real short
+# utterance and is kept when at least this long; only shorter fragments are
+# pyannote noise. Keeps e.g. a 160ms trailing '你好' as its own speaker cue while
+# still dropping an 80ms mid-phrase fragment.
+EDGE_RUN_MIN_S = 0.12
 
 # Turn-list smoothing (raw pyannote turns are noisy: 16-31% run <0.5s, and
 # overlap-track fragments sit fully inside another speaker's turn). Module
@@ -319,18 +327,41 @@ def _coalesce_runs(
     return out
 
 
+def _absorbable(i: int, durs: list[float], runs: list[tuple[str, list[dict]]]) -> bool:
+    """Whether run ``i`` (already known sub-``MIN_RUN_S``) should be absorbed.
+
+    Position-aware policy:
+    - A run sandwiched between two runs of the *same* speaker (A-B-A) is label
+      thrash and is always absorbed, regardless of ``EDGE_RUN_MIN_S``.
+    - A run at a cue edge, or between two *different* speakers (A-B-C), is a real
+      short utterance: kept when >= ``EDGE_RUN_MIN_S``, absorbed only below it.
+    """
+    has_left = i > 0
+    has_right = i + 1 < len(runs)
+    sandwiched_same = has_left and has_right and runs[i - 1][0] == runs[i + 1][0]
+    return sandwiched_same or durs[i] < EDGE_RUN_MIN_S
+
+
 def _absorb_tiny_runs(
     runs: list[tuple[str, list[dict]]],
 ) -> list[tuple[str, list[dict]]]:
-    """Fold every sub-``MIN_RUN_S`` run into its longer neighbor (collapses A-B-A
-    thrash to a single run). Repeats until no run is under the floor."""
+    """Fold absorbable sub-``MIN_RUN_S`` runs into their longer neighbor.
+
+    Collapses A-B-A label thrash to a single run while keeping real short edge or
+    A-B-C utterances (see ``_absorbable``). Repeats to a fixpoint: absorbing one
+    run and re-coalescing can turn a surviving run into a new same-speaker
+    sandwich, which the next pass then absorbs."""
     runs = [(lb, list(ats)) for lb, ats in runs]
     while len(runs) > 1:
         durs = [_run_dur(ats) for _, ats in runs]
-        tiny = [(durs[i], i) for i in range(len(runs)) if durs[i] < MIN_RUN_S]
+        tiny = [
+            (durs[i], i)
+            for i in range(len(runs))
+            if durs[i] < MIN_RUN_S and _absorbable(i, durs, runs)
+        ]
         if not tiny:
             break
-        _, i = min(tiny)  # shortest run first
+        _, i = min(tiny)  # shortest absorbable run first
         left = durs[i - 1] if i > 0 else -1.0
         right = durs[i + 1] if i + 1 < len(runs) else -1.0
         if left < 0 and right < 0:

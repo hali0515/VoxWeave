@@ -200,3 +200,84 @@ def test_genuine_second_speaker_run_still_splits():
         "你好",
         "朋友",
     ]
+
+
+# --- Fix 4: position-aware tiny-run absorption -------------------------------
+# A blanket "absorb any run < MIN_RUN_S" also ate real short trailing/leading
+# second-speaker utterances. Policy is now position-aware: A-B-A thrash is always
+# absorbed, but an edge run (or an A-B-C middle run) survives when it is at least
+# EDGE_RUN_MIN_S long.
+
+
+def test_trailing_edge_second_speaker_run_kept():
+    # Real case: zh cue '我想听听普通话 你好' -- speaker 02 speaks 3.3s, then a
+    # 160ms '你好' trailing run by speaker 00. 0.16s < MIN_RUN_S but it is a real
+    # edge utterance >= EDGE_RUN_MIN_S, so it must be KEPT and split off cleanly.
+    atoms = _atoms(
+        [
+            ("我", 0.0, 0.5),
+            ("想", 0.5, 1.0),
+            ("听", 1.0, 1.5),
+            ("听", 1.5, 2.0),
+            ("普", 2.0, 2.5),
+            ("通", 2.5, 3.0),
+            ("话", 3.0, 3.3),
+            ("你", 3.8, 3.88),
+            ("好", 3.88, 3.96),  # 0.16s trailing edge run
+        ]
+    )
+    turns = [(0.0, 3.5, "SPEAKER_02"), (3.74, 5.0, "SPEAKER_00")]
+    runs = _speaker_runs(atoms, turns, "zh")
+    assert len(runs) == 2
+    assert runs[0][0] == "SPEAKER_02"
+    assert runs[1][0] == "SPEAKER_00"
+    # the trailing piece is the complete word, not a fragment
+    assert "".join(a["text"] for a in runs[1][1]) == "你好"
+
+
+def test_leading_edge_sub_floor_fragment_absorbed():
+    # An 80ms '来' fragment at the leading edge is pyannote noise (< EDGE_RUN_MIN_S):
+    # absorb it so the cue stays one speaker.
+    atoms = _atoms(
+        [
+            ("来", 0.0, 0.08),  # 0.08s leading edge fragment
+            ("我", 0.2, 0.7),
+            ("们", 0.7, 1.2),
+            ("走", 1.2, 1.7),
+            ("吧", 1.7, 2.1),
+        ]
+    )
+    turns = [(0.0, 0.1, "SPEAKER_01"), (0.1, 2.5, "SPEAKER_00")]
+    runs = _speaker_runs(atoms, turns, "zh")
+    assert len(runs) == 1
+    assert runs[0][0] == "SPEAKER_00"
+
+
+def test_same_speaker_sandwich_absorbed_regardless_of_edge_floor():
+    # A-B-A with B=0.16s: even though 0.16 >= EDGE_RUN_MIN_S, a same-speaker
+    # sandwich is thrash and must be absorbed (rule 1 overrides the edge floor).
+    atoms = _atoms([("我", 0.0, 0.5), ("好", 0.5, 0.66), ("吗", 0.66, 1.2)])
+    turns = [(0.0, 0.5, "A"), (0.5, 0.66, "B"), (0.66, 1.5, "A")]
+    runs = _speaker_runs(atoms, turns, "zh")
+    assert len(runs) == 1
+    assert runs[0][0] == "A"
+
+
+def test_abc_middle_run_kept_above_edge_floor():
+    # A-B-C middle run 0.16s between two *different* speakers: not a same-speaker
+    # sandwich, and >= EDGE_RUN_MIN_S, so kept -> three runs. (en isolates the
+    # policy from jieba phrase snapping.)
+    atoms = _atoms([("hello", 0.0, 0.5), ("hi", 0.5, 0.66), ("bye", 0.66, 1.2)])
+    turns = [(0.0, 0.5, "SPK_A"), (0.5, 0.66, "SPK_B"), (0.66, 1.5, "SPK_C")]
+    runs = _speaker_runs(atoms, turns, "en")
+    assert [lb for lb, _ in runs] == ["SPK_A", "SPK_B", "SPK_C"]
+    assert "".join(a["text"] for a in runs[1][1]) == "hi"
+
+
+def test_abc_middle_run_absorbed_below_edge_floor():
+    # A-B-C middle run 0.08s (< EDGE_RUN_MIN_S): pyannote noise, absorbed.
+    atoms = _atoms([("hello", 0.0, 0.5), ("hi", 0.5, 0.58), ("bye", 0.58, 1.2)])
+    turns = [(0.0, 0.5, "SPK_A"), (0.5, 0.58, "SPK_B"), (0.58, 1.5, "SPK_C")]
+    runs = _speaker_runs(atoms, turns, "en")
+    assert len(runs) == 2
+    assert "SPK_B" not in [lb for lb, _ in runs]
