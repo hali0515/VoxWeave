@@ -1,5 +1,8 @@
 """voxweave.config — ~/.config/voxweave.conf (TOML) loading, precedence, and first-run creation. Pure stdlib, no model dependency."""
 
+import logging
+from pathlib import Path
+
 import pytest
 
 from voxweave import config
@@ -180,3 +183,81 @@ def test_default_template_has_batch_section(conf_at):
     config.ensure_default_config()
     txt = conf_at.read_text(encoding="utf-8")
     assert "[batch]" in txt and "VOXWEAVE_SEP_BATCH" in txt
+
+
+# --- #24 config silently swallows errors ----------------------------------- #
+# (a) unknown/misspelled top-level key -> log.warning naming the key, known
+#     keys in the same file still load normally.
+def test_unknown_top_level_key_warns(conf_at, caplog):
+    conf_at.write_text(
+        'asr_model = "Qwen/Qwen3-ASR-1.7B"\nfrobnicate = "typo"\n', encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        conf = config._load()
+    assert "unknown config key" in caplog.text.lower()
+    assert "frobnicate" in caplog.text
+    assert conf.get("asr_model") == "Qwen/Qwen3-ASR-1.7B"  # known key still loads
+
+
+# (b) type-mismatched value for a known key -> log.warning naming the key,
+#     accessor falls back to its built-in default (never raises, never
+#     silently misuses the wrongly-typed value).
+def test_asr_model_type_mismatch_warns_and_falls_back(conf_at, caplog):
+    conf_at.write_text("asr_model = 123\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        result = config.conf_asr_model()
+    assert result is None  # caller falls back to env/built-in default
+    assert "asr_model" in caplog.text
+
+
+def test_ctc_max_dp_frames_type_mismatch_warns(conf_at, monkeypatch, caplog):
+    monkeypatch.delenv("VOXWEAVE_CTC_MAX_DP_FRAMES", raising=False)
+    conf_at.write_text('ctc_max_dp_frames = "lots"\n', encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        result = config.conf_ctc_max_dp_frames()
+    assert result == 90000  # built-in default
+    assert "ctc_max_dp_frames" in caplog.text
+
+
+def test_align_model_for_type_mismatch_falls_back_to_builtin(conf_at, caplog):
+    # A stray int under [align] must fall back to the per-language built-in
+    # default, not be silently conflated with an explicit "" (= disable, use
+    # Qwen). Currently both collapse to None via _nonempty_str -> misuse.
+    conf_at.write_text("[align]\nen = 123\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        result = config.align_model_for("en")
+    assert result == "facebook/wav2vec2-large-960h-lv60-self"
+    assert "align" in caplog.text or "en" in caplog.text
+
+
+# (c) syntactically invalid TOML -> log.warning naming the file, defaults used.
+def test_load_malformed_logs_warning_with_filename(conf_at, caplog):
+    conf_at.write_text("this is = = not [ valid toml", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        conf = config._load()
+    assert conf_at.name in caplog.text
+    assert conf == {}
+
+
+# --- #25 migration failure silent ------------------------------------------ #
+def test_migration_rename_failure_names_old_path(tmp_path, monkeypatch, caplog):
+    """When migrating legacy ~/.config/qsub.conf fails (e.g. cross-device
+    rename), the warning must name the OLD config path so the user can
+    migrate the file by hand."""
+    old = tmp_path / "qsub.conf"
+    old.write_text('asr_model = "custom"\n', encoding="utf-8")
+    new = tmp_path / ".config" / "voxweave.conf"
+    monkeypatch.delenv("VOXWEAVE_CONFIG", raising=False)
+    monkeypatch.setattr(config, "_LEGACY_CONFIG", old)
+    monkeypatch.setattr(config, "config_path", lambda: new)
+
+    def _raise_rename(self, target):
+        raise OSError("cross-device link")
+
+    monkeypatch.setattr(Path, "rename", _raise_rename)
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        config.ensure_default_config()
+
+    assert str(old) in caplog.text
+    assert new.exists()  # still falls back to writing a fresh template

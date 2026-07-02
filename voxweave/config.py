@@ -108,17 +108,36 @@ def config_path() -> Path:
     return Path(env) if env else Path.home() / ".config" / "voxweave.conf"
 
 
+# Recognized top-level keys; anything else in the file is a typo/stale setting.
+_KNOWN_KEYS = frozenset(
+    {
+        "asr_model",
+        "ctc_max_dp_frames",
+        "load_strategy",
+        "hf_token",
+        "fusion",
+        "batch",
+        "align",
+    }
+)
+
+
 def _load() -> dict:
-    """Parse the config TOML. Missing or malformed file returns {} (no crash)."""
+    """Parse the config TOML. Missing or malformed file returns {} (no crash).
+    Unknown top-level keys are warned about but do not stop known keys loading."""
     p = config_path()
     if not p.exists():
         return {}
     try:
         with p.open("rb") as f:
-            return tomllib.load(f)
+            data = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError) as e:
         log.warning("config %s read failed (%r), treating as empty", p, e)
         return {}
+    for key in data:
+        if key not in _KNOWN_KEYS:
+            log.warning("unknown config key %r in %s (ignored)", key, p)
+    return data
 
 
 # Legacy config path from when the tool was named "qsub"; auto-migrated on first run.
@@ -162,7 +181,13 @@ def _nonempty_str(v: object) -> str | None:
 
 def conf_asr_model() -> str | None:
     """ASR model from config; None if unset (caller falls back to env/built-in)."""
-    return _nonempty_str(_load().get("asr_model"))
+    v = _load().get("asr_model")
+    if v is not None and not isinstance(v, str):
+        log.warning(
+            "config key %r has wrong type (expected string), ignoring", "asr_model"
+        )
+        return None
+    return _nonempty_str(v)
 
 
 def _conf_fusion(key: str) -> str | None:
@@ -239,6 +264,11 @@ def conf_ctc_max_dp_frames() -> int:
     v = _load().get("ctc_max_dp_frames")
     if isinstance(v, int) and not isinstance(v, bool):
         return v
+    if v is not None:
+        log.warning(
+            "config key %r has wrong type (expected integer), using default",
+            "ctc_max_dp_frames",
+        )
     return _CTC_MAX_DP_FRAMES_DEFAULT
 
 
@@ -284,7 +314,12 @@ def align_model_for(iso: str) -> str | None:
     """
     align = _load().get("align")
     if isinstance(align, dict) and iso in align:
-        return _nonempty_str(align[iso])
+        v = align[iso]
+        if isinstance(v, str):
+            return _nonempty_str(v)  # "" = explicit disable (fall back to Qwen)
+        log.warning(
+            "config [align].%s has wrong type (expected string), using default", iso
+        )
     return DEFAULT_ALIGN_MODELS.get(iso)
 
 
