@@ -202,6 +202,19 @@ def cli(verbose: bool) -> None:
     " 'voxweave[diarize]' + an HF token for the gated checkpoint (VOXWEAVE_HF_TOKEN).",
 )
 @click.option(
+    "--min-speakers",
+    type=int,
+    default=None,
+    help="Lower bound on the number of speakers for diarization (only used with --diarize;"
+    " pass both --min-speakers and --max-speakers when the count is known to steer pyannote).",
+)
+@click.option(
+    "--max-speakers",
+    type=int,
+    default=None,
+    help="Upper bound on the number of speakers for diarization (only used with --diarize).",
+)
+@click.option(
     "--context",
     default=None,
     envvar="VOXWEAVE_ASR_CONTEXT",
@@ -253,6 +266,8 @@ def cmd_transcribe(
     keep_lyrics: bool,
     sdh: bool,
     diarize: bool,
+    min_speakers: int | None,
+    max_speakers: int | None,
     context: str | None,
     hybrid: bool,
     timestamps: bool,
@@ -274,6 +289,8 @@ def cmd_transcribe(
             keep_lyrics=keep_lyrics,
             sdh=sdh,
             diarize=diarize,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
             asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
             context=context,
             timestamps=timestamps,

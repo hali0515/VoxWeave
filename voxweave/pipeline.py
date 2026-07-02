@@ -330,6 +330,8 @@ def transcribe(
     cache_vocals: Path | None = None,
     asr_model: str | None = None,
     context: str | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
 ) -> tuple[
     str,
     list[dict],
@@ -605,7 +607,9 @@ def transcribe(
 
             rep.stage("speaker diarization (pyannote)")
             try:
-                speaker_turns = diarize_mod.diarize_turns(wav)
+                speaker_turns = diarize_mod.diarize_turns(
+                    wav, min_speakers=min_speakers, max_speakers=max_speakers
+                )
             finally:
                 diarize_mod.release()
         return (
@@ -840,6 +844,8 @@ def process(
     context: str | None = None,
     timestamps: bool = True,
     shot_snap: bool = True,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
 ) -> Path:
     """Full pipeline: transcribe -> smart_split -> write siblings. Return the .vtt path.
 
@@ -874,6 +880,8 @@ def process(
             cache_vocals=cache_vocals_path(media_path),
             asr_model=asr_model,
             context=context,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
         )
         sing_spans = sing_spans or None
         speaker_turns = speaker_turns or None
@@ -891,18 +899,20 @@ def process(
     units = realign.snap_break_punct(units, iso)
     seg = _units_to_seg(units, iso)
     rep.stage("smart_split layout")
+    thresholds = _maybe_adaptive_thresholds(gap_thresholds(iso), units)
     cues = smart_split_segments(
         [seg],
         lang=iso,
         speech_spans=vad_speech,
-        thresholds=_maybe_adaptive_thresholds(gap_thresholds(iso), units),
+        thresholds=thresholds,
         shot_changes=shot_changes,
     )
     mark_lyric_cues(cues, sing_spans)
     if speaker_turns:
         from voxweave.diarize import apply_speaker_format
 
-        cues = apply_speaker_format(cues, speaker_turns, iso)
+        # Same thresholds as smart_split so speaker splits get timing polish too.
+        cues = apply_speaker_format(cues, speaker_turns, iso, thresholds=thresholds)
 
     rep.stage("write siblings")
     vtt_out = _write_siblings(
@@ -979,11 +989,12 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
         units, iso
     )  # zh: snap to jieba boundary (same as process)
     seg = _units_to_seg(units, iso)
+    thresholds = _maybe_adaptive_thresholds(gap_thresholds(iso), units)
     cues = smart_split_segments(
         [seg],
         lang=iso,
         speech_spans=speech_spans,
-        thresholds=_maybe_adaptive_thresholds(gap_thresholds(iso), units),
+        thresholds=thresholds,
         shot_changes=shot_changes,
         **smart_split_kwargs,
     )
@@ -991,7 +1002,8 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
     if speaker_turns:
         from voxweave.diarize import apply_speaker_format
 
-        cues = apply_speaker_format(cues, speaker_turns, iso)
+        # Same thresholds as smart_split so speaker splits get timing polish too.
+        cues = apply_speaker_format(cues, speaker_turns, iso, thresholds=thresholds)
     vtt_out = _write_siblings(
         json_path,
         cues,
