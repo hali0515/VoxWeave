@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence, cast
+from typing import Any, List, Sequence, cast
 
 from voxweave import config
 from voxweave.core.schema import Cue
@@ -39,11 +40,93 @@ Turn = tuple[float, float, str]
 _pipeline = None  # pyannote Pipeline singleton -- lazy-loaded, released after use
 
 
+def _ensure_torchaudio_compat() -> None:
+    """Restore torchaudio symbols pyannote.audio 3.4 imports but 2.11 removed.
+
+    ``pyannote/audio/core/io.py`` annotates a function ``-> torchaudio.AudioMetaData``
+    at import time and calls ``torchaudio.info`` / ``torchaudio.list_audio_backends``
+    for file-path inputs; torchaudio 2.11 dropped all three. We never touch
+    torchaudio I/O at runtime (diarize_turns feeds a decoded waveform dict), but
+    the import-time annotation still resolves the attribute, so the shims must
+    exist before ``import pyannote.audio``.
+
+    Each shim installs only if missing (hasattr guard) so it is idempotent and an
+    older torchaudio that still ships the real symbols is left untouched.
+    """
+    import torchaudio
+
+    ta: Any = torchaudio
+    if not hasattr(ta, "AudioMetaData"):
+
+        @dataclass
+        class AudioMetaData:
+            sample_rate: int
+            num_frames: int
+            num_channels: int
+            bits_per_sample: int = 0
+            encoding: str = ""
+
+        ta.AudioMetaData = AudioMetaData
+    if not hasattr(ta, "info"):
+
+        def info(filepath, *_a, **_k):
+            import soundfile as sf
+
+            meta = sf.info(str(filepath))
+            return ta.AudioMetaData(
+                sample_rate=int(meta.samplerate),
+                num_frames=int(meta.frames),
+                num_channels=int(meta.channels),
+            )
+
+        ta.info = info
+    if not hasattr(ta, "list_audio_backends"):
+
+        def list_audio_backends():
+            return ["soundfile"]
+
+        ta.list_audio_backends = list_audio_backends
+
+
+def _load_pipeline(pipeline_cls, token: str):
+    """Load the pyannote checkpoint under torch 2.11's weights_only default.
+
+    torch >= 2.6 loads with ``weights_only=True``, which rejects the plain Python
+    objects pyannote pickles into its checkpoints ("Unsupported global"). We
+    allowlist exactly the classes the load names -- all in trusted torch /
+    pyannote namespaces, discovered empirically against the official
+    ``pyannote/speaker-diarization-3.1`` repo (a gated repo the user has accepted;
+    the token is verified before we get here) -- via
+    ``torch.serialization.safe_globals``. That context is a no-op on older torch
+    that already defaults to ``weights_only=False``.
+    """
+    import torch
+    from pyannote.audio.core.task import (  # pyright: ignore[reportMissingImports]
+        Problem,
+        Resolution,
+        Specifications,
+    )
+    from torch.torch_version import TorchVersion
+
+    allow = [TorchVersion, Specifications, Problem, Resolution]
+    safe_globals = getattr(torch.serialization, "safe_globals", None)
+    if safe_globals is None:  # torch < 2.4: weights_only already defaults to False
+        return pipeline_cls.from_pretrained(
+            DIARIZE_MODEL, use_auth_token=token, cache_dir=config.AUDIO_CACHE
+        )
+    with safe_globals(allow):
+        return pipeline_cls.from_pretrained(
+            DIARIZE_MODEL, use_auth_token=token, cache_dir=config.AUDIO_CACHE
+        )
+
+
 def _get_pipeline(token: str):
     global _pipeline
     if _pipeline is None:
         try:
             import torch
+
+            _ensure_torchaudio_compat()  # must precede the pyannote import
             from pyannote.audio import (  # pyright: ignore[reportMissingImports]
                 Pipeline,
             )
@@ -52,9 +135,7 @@ def _get_pipeline(token: str):
                 "diarization requires pyannote.audio (not installed); "
                 "install with: pip install 'voxweave[diarize]'"
             ) from e
-        pl = Pipeline.from_pretrained(
-            DIARIZE_MODEL, use_auth_token=token, cache_dir=config.AUDIO_CACHE
-        )
+        pl = _load_pipeline(Pipeline, token)
         if pl is None:
             raise RuntimeError(
                 f"could not load {DIARIZE_MODEL}: accept the user conditions on "
@@ -95,8 +176,9 @@ def diarize_turns(
     if not token:
         raise RuntimeError(
             f"diarization needs a Hugging Face token for the gated {DIARIZE_MODEL} "
-            "checkpoint: accept the conditions on its model card, then set "
-            "VOXWEAVE_HF_TOKEN / HF_TOKEN (or hf_token in ~/.config/voxweave.conf)"
+            "checkpoint: accept the conditions on its model card, then either log "
+            "in once with `hf auth login`, or set VOXWEAVE_HF_TOKEN / HF_TOKEN "
+            "(or hf_token in ~/.config/voxweave.conf)"
         )
     pl = _get_pipeline(token)
     kwargs: dict[str, int] = {}
@@ -104,7 +186,18 @@ def diarize_turns(
         kwargs["min_speakers"] = min_speakers
     if max_speakers is not None:
         kwargs["max_speakers"] = max_speakers
-    annotation = pl(str(wav_path), **kwargs)
+    # Feed a decoded waveform dict rather than a path: pyannote's file-path branch
+    # goes through torchaudio.info/load, which torchaudio 2.11 broke. This dict
+    # form is a first-class pyannote input and sidesteps its runtime audio I/O.
+    import soundfile as sf
+    import torch
+
+    data, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)  # (T, C)
+    wav = torch.from_numpy(data).T.contiguous()  # (C, T)
+    if wav.shape[0] > 1:  # defensive stereo downmix -> mono (1, T)
+        wav = wav.mean(dim=0, keepdim=True)
+    wav = wav.to(torch.float32)
+    annotation = pl({"waveform": wav, "sample_rate": int(sr)}, **kwargs)
     turns = [
         (float(seg.start), float(seg.end), str(label))
         for seg, _, label in annotation.itertracks(yield_label=True)
