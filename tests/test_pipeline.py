@@ -94,6 +94,30 @@ def test_find_sibling_media_matches_dotted_name(tmp_path):
     assert pipeline._find_sibling_media(vtt) == media
 
 
+def test_split_corrupt_sibling_json_raises_readable_error(tmp_path):
+    j = tmp_path / "ep.json"
+    j.write_text('{"word_segments": [truncated', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ep.json.*corrupt"):
+        pipeline.split(j)
+
+
+def test_split_missing_word_segments_raises_readable_error(tmp_path):
+    j = tmp_path / "ep.json"
+    j.write_text('{"language": "en"}', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="word_segments"):
+        pipeline.split(j)
+
+
+def test_align_corrupt_sibling_json_raises_readable_error(tmp_path):
+    # a half-written .json next to the .vtt must fail with a message naming the
+    # file, not a bare JSONDecodeError deep in the stack
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
+    (tmp_path / "ep.json").write_text("{broken", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ep.json.*corrupt"):
+        pipeline.align(vtt)
+
+
 def test_separate_self_cleans_partial_temps_on_failure(tmp_path, monkeypatch):
     # Regression: _separate_to_16k_32k must unlink already-decoded temps if a later step raises.
     # Callers register the returned paths in their `tmp` cleanup list only AFTER a clean return,

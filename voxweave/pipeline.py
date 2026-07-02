@@ -210,6 +210,31 @@ def _separate_to_16k_32k(
         raise
 
 
+def _load_sibling_json(json_path: Path, *, require: str | None = None) -> dict:
+    """Load a sibling ``.json`` with readable failures: a corrupt file or a
+    missing required key names the file and points at regeneration instead of
+    surfacing a bare JSONDecodeError/KeyError deep in the stack."""
+    json_path = Path(json_path)
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"{json_path.name} is corrupt JSON ({e.msg} at line {e.lineno});"
+            " re-run transcribe/process to regenerate it"
+        ) from e
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"{json_path.name}: expected a JSON object, got {type(data).__name__};"
+            " re-run transcribe/process to regenerate it"
+        )
+    if require is not None and require not in data:
+        raise RuntimeError(
+            f"{json_path.name} has no {require!r} key;"
+            " re-run transcribe/process to regenerate it"
+        )
+    return data
+
+
 def _load_cues(vtt_path: Path) -> list[dict]:
     """Parse subtitle cue blocks by extension (VTT/SRT/ASS/SSA); raise if the
     file has no cues. Shared guard for align/translate/correct."""
@@ -891,7 +916,7 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
     json_path = swap_ext(Path(json_path), ".json")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
+    data = _load_sibling_json(json_path, require="word_segments")
     units = data["word_segments"]
     iso = data.get("language", "en")
     speech_spans = _spans_in(data.get("vad_speech"))
@@ -1090,9 +1115,7 @@ def align(
     vtt_path = require_vtt(Path(vtt_path))  # align overwrites the input as VTT
     rep = reporter or Reporter()
     json_path = swap_ext(vtt_path, ".json")
-    data = (
-        json.loads(json_path.read_text(encoding="utf-8")) if json_path.exists() else {}
-    )
+    data = _load_sibling_json(json_path) if json_path.exists() else {}
     word_segments = data.get("word_segments", [])
 
     blocks = _load_cues(vtt_path)
