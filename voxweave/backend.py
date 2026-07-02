@@ -607,6 +607,9 @@ def _full_pass_units(
             type(e).__name__,
             e,
         )
+        # an OOM'd full pass leaves fragmented VRAM; reclaim it or the
+        # fallback path can cascade into OOM as well
+        _empty_cache()
         return None
     return [shift_units(u, -b[0]) for u, b in zip(blocks, bounds)]
 
@@ -930,6 +933,7 @@ def align_text(wav_path: Path, text: str, language: str) -> list[dict]:
                     type(e).__name__,
                     e,
                 )
+                _empty_cache()  # reclaim CTC debris before loading the Qwen aligner
 
     if (
         _use_mlx()

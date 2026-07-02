@@ -665,6 +665,52 @@ def test_transcribe_chunks_two_pass_skips_align_for_empty_text(monkeypatch, tmp_
     assert out[1] == ("ja", "", [])
 
 
+# --- fallback paths reclaim VRAM first ------------------------------------- #
+def test_full_pass_failure_empties_cache_before_fallback(monkeypatch, tmp_path):
+    # an OOM'd full-file pass leaves fragmented VRAM; the per-chunk fallback
+    # must start from a clean cache or it cascades into OOM too
+    calls: list[str] = []
+    monkeypatch.setattr(backend, "_empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setattr(
+        backend.config, "align_model_for", lambda iso: "facebook/wav2vec2-large"
+    )
+
+    def _boom(*a, **k):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(backend, "align_blocks_full_ctc", _boom)
+    wav = tmp_path / "full.wav"
+    wav.write_bytes(b"x")
+    out = backend._full_pass_units(wav, [(0.0, 1.0)], ["hello"], "english")
+    assert out is None  # still falls back
+    assert calls == ["empty"]
+
+
+def test_ctc_failure_empties_cache_before_qwen_fallback(monkeypatch, tmp_path):
+    calls: list[str] = []
+    monkeypatch.setattr(backend, "_empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setattr(backend.config, "align_model_for", lambda iso: "some/ctc")
+
+    def _boom(*a, **k):
+        raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setattr(backend, "align_text_ctc", _boom)
+    monkeypatch.setattr(backend, "_use_mlx", lambda: False)
+    seen: list[list[str]] = []
+
+    class _FakeAligner:
+        def align(self, wav, text, lang):
+            seen.append(list(calls))  # snapshot: cache state when Qwen runs
+            return [[]]
+
+    monkeypatch.setattr(backend, "_get_aligner", lambda: _FakeAligner())
+    wav = tmp_path / "c.wav"
+    wav.write_bytes(b"x")
+    out = backend.align_text(wav, "hello", "english")
+    assert out == []
+    assert seen == [["empty"]]  # cache emptied BEFORE the fallback aligner ran
+
+
 # --- per-chunk failure containment ---------------------------------------- #
 def test_transcribe_chunks_survives_single_asr_failure(monkeypatch, tmp_path):
     # one chunk's ASR blowing up must not kill the whole run: it degrades to
