@@ -7,6 +7,7 @@ import pytest
 from voxweave.export import (
     _ass_ts,
     _srt_ts,
+    ass_header,
     export_subtitles,
     render_ass,
     render_srt,
@@ -105,6 +106,19 @@ def test_export_ass_input_to_srt(tmp_path):
     assert [p.name for p in paths] == ["ep.srt"]
     srt = (tmp_path / "ep.srt").read_text(encoding="utf-8")
     assert "1\n00:00:01,000 --> 00:00:02,000\nhi there" in srt
+
+
+def test_ass_header_strips_commas_from_font_name():
+    # a comma in the font name would shift every field after Fontname in the
+    # "Style:" line (ASS is comma-delimited), corrupting the style entirely.
+    default_line = next(
+        line for line in ass_header().splitlines() if line.startswith("Style:")
+    )
+    default_commas = default_line.count(",")
+    h = ass_header(font="Weird, Font")
+    style_line = next(line for line in h.splitlines() if line.startswith("Style:"))
+    assert "Weird Font" in style_line
+    assert style_line.count(",") == default_commas
 
 
 def test_export_restores_lyric_wrap(tmp_path):

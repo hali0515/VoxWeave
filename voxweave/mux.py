@@ -29,13 +29,25 @@ logger = logging.getLogger(__name__)
 # Containers pack/burn can write, mapped to the text subtitle codec each stores.
 SUB_CODEC = {"mkv": "srt", "mp4": "mov_text", "webm": "webvtt"}
 
+# Video/audio codecs each non-mkv container can stream-copy (mkv holds anything).
+# pack stream-copies A/V, so an unlisted codec cannot be remuxed as-is.
+_PACK_VIDEO_ALLOW = {
+    "mp4": {"h264", "hevc", "av1", "vp9", "mpeg4"},
+    "webm": {"vp8", "vp9", "av1"},
+}
+_PACK_AUDIO_ALLOW = {
+    "webm": {"opus", "vorbis"},
+}
+
 # Subtitle codecs that can be transcoded to another text format (image-based
 # subs like hdmv_pgs/dvd_subtitle cannot and are dropped when the target
 # container will not store them as-is).
 _TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
 
 # Audio codecs safe to stream-copy into mp4; anything else is re-encoded to AAC.
-_MP4_SAFE_AUDIO = {"aac", "ac3", "eac3", "mp3", "alac"}
+# The mov/mp4 muxer stores flac/opus/dts natively, so those copy rather than
+# transcode.
+_MP4_SAFE_AUDIO = {"aac", "ac3", "eac3", "mp3", "alac", "flac", "opus", "dts"}
 
 _SOFTWARE_ENCODER = {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}
 
@@ -53,40 +65,60 @@ _DEFAULT_QUALITY = {
 }
 
 
+def _missing_binary_error(binary: str) -> RuntimeError:
+    """A friendly RuntimeError for a missing ffmpeg/ffprobe executable."""
+    return RuntimeError(
+        f"{binary} not found; install ffmpeg and make sure it is on your PATH"
+    )
+
+
 def _run_ffmpeg(cmd: list[str], *, capture: bool) -> None:
     """Run an ffmpeg/ffprobe command; raise RuntimeError with the stderr tail on failure.
 
     -nostdin + stdin=DEVNULL is a hard requirement: ffmpeg competing for the
     inherited stdin hangs the process (see pipeline.decode_to_wav).
     """
-    proc = subprocess.run(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        capture_output=capture,
-        text=capture,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=capture,
+            text=capture,
+        )
+    except FileNotFoundError as e:
+        raise _missing_binary_error(cmd[0]) from e
     if proc.returncode != 0:
-        tail = (proc.stderr or "").strip().splitlines()[-8:] if capture else []
-        detail = ("\n" + "\n".join(tail)) if tail else ""
+        detail = ""
+        if capture:
+            lines = (proc.stderr or "").strip().splitlines()
+            n = len(lines)
+            # keep the last 8 lines plus any "error" line, even buried earlier
+            keep = set(range(max(0, n - 8), n))
+            keep |= {i for i, ln in enumerate(lines) if "error" in ln.lower()}
+            picked = [lines[i] for i in sorted(keep)]
+            detail = ("\n" + "\n".join(picked)) if picked else ""
         raise RuntimeError(f"{cmd[0]} failed (exit {proc.returncode}){detail}")
 
 
 def probe_streams(media: Path) -> list[dict]:
     """ffprobe the media and return its stream dicts (codec_type/codec_name/...)."""
-    proc = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_streams",
-            str(media),
-        ],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                str(media),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as e:
+        raise _missing_binary_error("ffprobe") from e
     if proc.returncode != 0:
         raise RuntimeError(f"ffprobe failed for {media.name}: {proc.stderr.strip()}")
     return json.loads(proc.stdout).get("streams", [])
@@ -110,13 +142,44 @@ def track_title(iso: str | None) -> str:
     return f"VoxWeave {lang.display_name(iso)}" if iso else "VoxWeave"
 
 
+def _find_sibling_media(ref: Path) -> Path | None:
+    """Find the source media next to ``ref`` by known extension (case-insensitive).
+
+    Extension matching is case-insensitive so "ep.MP4" is found for "ep.vtt".
+    When several candidates exist the first in MEDIA_EXTS order wins and the
+    ambiguity is logged (mirrors pipeline._find_sibling_media).
+    """
+    from voxweave.pipeline import MEDIA_EXTS, swap_ext
+
+    ref = Path(ref)
+    try:
+        siblings = {p.name.lower(): p for p in ref.parent.iterdir() if p.is_file()}
+    except OSError:
+        return None
+    matches: list[Path] = []
+    for ext in MEDIA_EXTS:
+        hit = siblings.get(swap_ext(ref, ext).name.lower())
+        if hit is not None:
+            matches.append(hit)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        logger.warning(
+            "multiple sibling media files for %s (%s); using %s",
+            ref.name,
+            ", ".join(m.name for m in matches),
+            matches[0].name,
+        )
+    return matches[0]
+
+
 def resolve_media(vtt: Path, media: Path | None) -> Path:
     """Return the explicit media path, or find the sibling media next to the VTT.
 
     Translated VTTs carry a language tag ("X.zh.vtt") while the media is named
     "X.<ext>", so the lookup also retries with the language token stripped.
     """
-    from voxweave.pipeline import _find_sibling_media, swap_ext
+    from voxweave.pipeline import swap_ext
 
     if media is not None:
         return Path(media)
@@ -178,6 +241,32 @@ def _packed_sub_codec(sub: Path, container: str) -> str:
     if container == "mkv" and Path(sub).suffix.lower() in (".ass", ".ssa"):
         return "ass"
     return SUB_CODEC[container]
+
+
+def _check_pack_compat(container: str, streams: list[dict]) -> None:
+    """Reject stream-copying source codecs the target container cannot hold.
+
+    Raised before any ffmpeg run so the caller gets a clear message (and the
+    mkv escape hatch) instead of a cryptic muxer failure. mkv holds everything.
+    """
+    checks = (
+        ("video", _PACK_VIDEO_ALLOW.get(container)),
+        ("audio", _PACK_AUDIO_ALLOW.get(container)),
+    )
+    for kind, allow in checks:
+        if allow is None:
+            continue
+        for s in streams:
+            if s.get("codec_type") != kind:
+                continue
+            if s.get("disposition", {}).get("attached_pic") == 1:
+                continue  # cover art, not a real track
+            name = s.get("codec_name")
+            if name and name not in allow:
+                raise ValueError(
+                    f"{container} cannot store {name} {kind}; "
+                    f"pack into mkv instead (--container mkv)"
+                )
 
 
 def build_pack_cmd(
@@ -279,10 +368,10 @@ def pack(
     out = _check_output_clear_of_source(
         output or default_output(src, cont, "pack"), src
     )
+    streams = probe_streams(src)
+    _check_pack_compat(cont, streams)  # raise before any ffmpeg run
     with fsio.atomic_path(out) as tmp_out:
-        cmd = build_pack_cmd(
-            src, vtts, tmp_out, container=cont, source_streams=probe_streams(src)
-        )
+        cmd = build_pack_cmd(src, vtts, tmp_out, container=cont, source_streams=streams)
         _run_ffmpeg(cmd, capture=True)
     return out
 
@@ -296,53 +385,63 @@ _ENCODER_WORKS: dict[str, bool] = {}
 
 
 def _available_encoders() -> frozenset[str]:
-    """Encoder names this ffmpeg build was compiled with (cached)."""
+    """Encoder names this ffmpeg build was compiled with (cached on success only)."""
     global _ENCODER_CACHE
-    if _ENCODER_CACHE is None:
-        proc = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
+    if _ENCODER_CACHE is not None:
+        return _ENCODER_CACHE
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        # do not cache a failed probe; a later healthy call must re-probe
+        logger.warning(
+            "ffmpeg -encoders failed (exit %s); cannot list encoders", proc.returncode
         )
-        names = set()
-        for line in proc.stdout.splitlines():
-            parts = line.split()
-            # flag column starts with V for video encoders; skip the "V..... = Video" legend
-            if len(parts) >= 2 and parts[0].startswith("V") and parts[1] != "=":
-                names.add(parts[1])
-        _ENCODER_CACHE = frozenset(names)
+        return frozenset()
+    names = set()
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        # flag column starts with V for video encoders; skip the "V..... = Video" legend
+        if len(parts) >= 2 and parts[0].startswith("V") and parts[1] != "=":
+            names.add(parts[1])
+    _ENCODER_CACHE = frozenset(names)
     return _ENCODER_CACHE
 
 
 def _encoder_works(name: str) -> bool:
     """True when a 3-frame test encode succeeds — being compiled in does not mean
     the hardware/driver is present (nvenc on a GPU-less box fails at runtime)."""
-    if name not in _ENCODER_WORKS:
-        proc = subprocess.run(
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-hide_banner",
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=size=256x256:rate=30",
-                "-frames:v",
-                "3",
-                "-c:v",
-                name,
-                "-f",
-                "null",
-                "-",
-            ],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-        )
-        _ENCODER_WORKS[name] = proc.returncode == 0
-    return _ENCODER_WORKS[name]
+    if _ENCODER_WORKS.get(name):
+        return True  # only positive results are cached
+    proc = subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=size=256x256:rate=30",
+            "-frames:v",
+            "3",
+            "-c:v",
+            name,
+            "-f",
+            "null",
+            "-",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        _ENCODER_WORKS[name] = True
+        return True
+    return False  # do not cache a failure (driver/hardware may appear later)
 
 
 def pick_encoder(codec: str, *, force: str | None = None) -> str:
@@ -398,22 +497,34 @@ def _encoder_args(encoder: str, quality: int) -> list[str]:
     return ["-preset", "slow", "-crf", str(quality)]  # libx264 / libx265
 
 
-_BIT_DEPTH_RE = re.compile(r"(\d+)(?:le|be)$")
+# Ordered pix_fmt depth probes: endianness-suffixed digits, planar/semi-planar
+# depth after a 'p' marker (yuv420p10, p010), or grayscale depth (gray16). This
+# deliberately ignores trailing layout digits like nv12's "12".
+_BIT_DEPTH_RES = (
+    re.compile(r"(\d+)(?:le|be)$"),
+    re.compile(r"p(\d+)$"),
+    re.compile(r"gray(\d+)$"),
+)
 
 
 def src_bit_depth(video_stream: dict) -> int:
     """Per-component bit depth of the source video stream (8 when unknown).
 
     ``bits_per_raw_sample`` is authoritative when ffprobe reports it; otherwise
-    the depth is parsed from the pix_fmt's trailing endianness-suffixed digits
-    ("yuv420p10le" -> 10). Plain 8-bit formats ("yuv420p", "nv12") carry no such
-    suffix and fall through to 8 -- the 12 in nv12 is layout, not depth.
+    the depth is parsed from the pix_fmt: endianness-suffixed digits
+    ("yuv420p10le" -> 10), suffix-less planar depth ("yuv420p10", "p010" -> 10),
+    or grayscale depth ("gray16" -> 16). Plain 8-bit formats ("yuv420p", "nv12")
+    carry no depth marker and fall through to 8 -- the 12 in nv12 is layout.
     """
     raw = str(video_stream.get("bits_per_raw_sample") or "")
     if raw.isdigit():
         return int(raw)
-    m = _BIT_DEPTH_RE.search(str(video_stream.get("pix_fmt") or ""))
-    return int(m.group(1)) if m else 8
+    pix = str(video_stream.get("pix_fmt") or "").lower()
+    for pat in _BIT_DEPTH_RES:
+        m = pat.search(pix)
+        if m:
+            return int(m.group(1))
+    return 8
 
 
 def _burn_pix_fmt(encoder: str, src_depth: int) -> str:
@@ -521,11 +632,22 @@ def burn(
     rows = None if native_ass else _timed_rows(load_subtitle_blocks(Path(vtt)))
 
     streams = probe_streams(src)
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    videos = [s for s in streams if s.get("codec_type") == "video"]
+    # skip cover-art/thumbnail streams (disposition.attached_pic) when choosing
+    # the real video track
+    video = next(
+        (s for s in videos if s.get("disposition", {}).get("attached_pic") != 1),
+        None,
+    ) or (videos[0] if videos else None)
     if video is None:
         raise RuntimeError(f"{src.name} has no video stream to burn into")
-    width = int(video.get("width") or 1920)
-    height = int(video.get("height") or 1080)
+    width = int(video.get("width") or 0)
+    height = int(video.get("height") or 0)
+    if width <= 0 or height <= 0:
+        logger.warning(
+            "could not read video resolution from %s; assuming 1920x1080", src.name
+        )
+        width, height = 1920, 1080
     depth = src_bit_depth(video)
     audio_codecs = [
         str(s.get("codec_name") or "")

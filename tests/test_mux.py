@@ -4,11 +4,13 @@
 # (language tag stripped), ffmpeg argv builders (stream mapping, sub codec per
 # container, hvc1 tagging, pixel-format/bit-depth policy, mp4 audio fallback),
 # and encoder selection. No ffmpeg/ffprobe execution; probed data is injected.
+import logging
 from pathlib import Path
 
 import pytest
 
 from voxweave import mux
+from voxweave import export as export_mod
 from voxweave.export import ass_header
 
 VTT_BODY = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n"
@@ -18,6 +20,15 @@ def has_seq(cmd, *seq):
     """True when seq appears as a contiguous run inside cmd."""
     n = len(seq)
     return any(tuple(cmd[i : i + n]) == seq for i in range(len(cmd) - n + 1))
+
+
+class _Proc:
+    """Minimal stand-in for subprocess.CompletedProcess (mirrors test_shot_snap.py)."""
+
+    def __init__(self, rc, stdout="", stderr=""):
+        self.returncode = rc
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 # --- language / title / path helpers ---------------------------------------
@@ -201,6 +212,75 @@ def test_build_pack_cmd_keeps_ass_codec_in_mkv():
     assert cmd[i_srt + 1] == "srt"
 
 
+# --- pack container/codec compatibility --------------------------------------
+
+
+def test_pack_rejects_incompatible_video_codec_for_webm(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: _streams(
+            {"codec_type": "video", "codec_name": "h264"},
+            {"codec_type": "audio", "codec_name": "opus"},
+        ),
+    )
+    called = []
+    monkeypatch.setattr(mux, "_run_ffmpeg", lambda cmd, *, capture: called.append(cmd))
+    with pytest.raises(ValueError) as exc:
+        mux.pack([vtt], container="webm")
+    assert not called, "ffmpeg must not run before the codec/container check"
+    msg = str(exc.value).lower()
+    assert "h264" in msg and "webm" in msg and "mkv" in msg
+
+
+def test_pack_rejects_incompatible_audio_codec_for_webm(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: _streams(
+            {"codec_type": "video", "codec_name": "vp9"},
+            {"codec_type": "audio", "codec_name": "aac"},
+        ),
+    )
+    called = []
+    monkeypatch.setattr(mux, "_run_ffmpeg", lambda cmd, *, capture: called.append(cmd))
+    with pytest.raises(ValueError) as exc:
+        mux.pack([vtt], container="webm")
+    assert not called, "ffmpeg must not run before the codec/container check"
+    msg = str(exc.value).lower()
+    assert "aac" in msg and "webm" in msg and "mkv" in msg
+
+
+def test_pack_rejects_incompatible_video_codec_for_mp4(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: _streams(
+            {"codec_type": "video", "codec_name": "prores"},
+            {"codec_type": "audio", "codec_name": "aac"},
+        ),
+    )
+    called = []
+    monkeypatch.setattr(mux, "_run_ffmpeg", lambda cmd, *, capture: called.append(cmd))
+    with pytest.raises(ValueError) as exc:
+        mux.pack([vtt], container="mp4")
+    assert not called, "ffmpeg must not run before the codec/container check"
+    msg = str(exc.value).lower()
+    assert "prores" in msg and "mp4" in msg and "mkv" in msg
+
+
 # --- burn building blocks ----------------------------------------------------
 
 
@@ -214,6 +294,16 @@ def test_src_bit_depth_parsing():
     assert mux.src_bit_depth({"pix_fmt": "yuv420p"}) == 8
     assert mux.src_bit_depth({"pix_fmt": "nv12"}) == 8  # 12 is layout, not depth
     assert mux.src_bit_depth({}) == 8
+
+
+def test_src_bit_depth_recognizes_suffixless_pix_fmt():
+    # some ffprobe builds report pix_fmt without the le/be endianness suffix;
+    # the trailing digits still encode the per-component depth.
+    assert mux.src_bit_depth({"pix_fmt": "yuv420p10"}) == 10
+    assert mux.src_bit_depth({"pix_fmt": "gray16"}) == 16
+    # existing suffixed/plain behavior must remain unchanged
+    assert mux.src_bit_depth({"pix_fmt": "yuv420p10le"}) == 10
+    assert mux.src_bit_depth({"pix_fmt": "yuv420p"}) == 8
 
 
 def test_burn_pix_fmt_matches_source_depth():
@@ -265,7 +355,7 @@ def test_build_burn_cmd_hevc_mp4():
     assert has_seq(cmd, "-map", "0:v:0") and has_seq(cmd, "-map", "0:a?")
     assert "-sn" not in cmd  # subs dropped by explicit mapping, not -sn
     assert has_seq(cmd, "-tag:v", "hvc1")
-    assert has_seq(cmd, "-c:a", "aac")  # flac cannot live in mp4
+    assert has_seq(cmd, "-c:a", "copy")  # mp4 muxer stores flac natively
     assert cmd[-1] == "ep.mp4"
 
 
@@ -284,6 +374,74 @@ def test_build_burn_cmd_mkv_copies_audio_no_tag():
     assert has_seq(cmd, "-c:a", "copy")
     assert "-tag:v" not in cmd
     assert "format=yuv420p" in cmd[cmd.index("-vf") + 1]
+
+
+def test_build_burn_cmd_copies_flac_opus_dts_into_mp4():
+    # mp4's mov/mp4 muxer stores flac/opus/dts natively; only genuinely
+    # incompatible codecs should fall back to an AAC re-encode.
+    for codec in ("flac", "opus", "dts"):
+        cmd = mux.build_burn_cmd(
+            Path("ep.mkv"),
+            Path("/tmp/s.ass"),
+            Path("ep.mp4"),
+            encoder="hevc_nvenc",
+            quality=23,
+            container="mp4",
+            src_depth=8,
+            audio_codecs=[codec],
+        )
+        assert has_seq(cmd, "-c:a", "copy"), f"{codec} should stream-copy into mp4"
+
+
+# --- encoder-probe caching ----------------------------------------------------
+
+
+def test_available_encoders_warns_and_is_not_cached_on_ffmpeg_failure(
+    monkeypatch, caplog
+):
+    monkeypatch.setattr(mux, "_ENCODER_CACHE", None)
+    monkeypatch.setattr(
+        mux.subprocess,
+        "run",
+        lambda *a, **k: _Proc(1, stderr="ffmpeg: error while loading shared libraries"),
+    )
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        result = mux._available_encoders()
+    assert result == frozenset()
+    assert any("ffmpeg" in rec.message.lower() for rec in caplog.records)
+
+    # a later, healthy call must not be stuck with the empty cached result
+    monkeypatch.setattr(
+        mux.subprocess,
+        "run",
+        lambda *a, **k: _Proc(0, stdout="Encoders:\n V..... libx264   H.264 / AVC\n"),
+    )
+    result2 = mux._available_encoders()
+    assert "libx264" in result2
+
+
+def test_encoder_works_reprobes_after_negative_but_caches_positive(monkeypatch):
+    monkeypatch.setattr(mux, "_ENCODER_WORKS", {})
+    calls = []
+
+    def fake_fail(*a, **k):
+        calls.append("probe")
+        return _Proc(1)
+
+    monkeypatch.setattr(mux.subprocess, "run", fake_fail)
+    assert mux._encoder_works("hevc_nvenc") is False
+    assert len(calls) == 1
+
+    def fake_ok(*a, **k):
+        calls.append("probe")
+        return _Proc(0)
+
+    monkeypatch.setattr(mux.subprocess, "run", fake_ok)
+    assert mux._encoder_works("hevc_nvenc") is True  # negative result must be re-probed
+    assert len(calls) == 2
+
+    assert mux._encoder_works("hevc_nvenc") is True  # positive result stays cached
+    assert len(calls) == 2  # no extra subprocess call
 
 
 def test_pick_encoder_prefers_hardware(monkeypatch):
@@ -440,3 +598,107 @@ def test_burn_rejects_output_equal_to_media(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="source media"):
         mux.burn(vtt, output=media, container="mkv")
     assert media.read_bytes() == b"src"
+
+
+# --- burn source-stream selection & diagnostics ------------------------------
+
+
+def test_burn_warns_when_probed_resolution_is_zero(tmp_path, monkeypatch, caplog):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: [
+            {"codec_type": "video", "codec_name": "h264", "width": 0, "height": 0}
+        ],
+    )
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "libx264")
+    monkeypatch.setattr(
+        mux, "_run_ffmpeg", lambda cmd, *, capture: Path(cmd[-1]).write_bytes(b"x")
+    )
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        mux.burn(vtt, output=tmp_path / "out.mkv", container="mkv")
+    assert any("resolution" in rec.message.lower() for rec in caplog.records)
+
+
+def test_burn_skips_attached_pic_cover_art_stream(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    streams = [
+        {
+            "codec_type": "video",
+            "codec_name": "mjpeg",
+            "width": 300,
+            "height": 300,
+            "disposition": {"attached_pic": 1},
+        },
+        {
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 1920,
+            "height": 1080,
+            "disposition": {"attached_pic": 0},
+        },
+    ]
+    monkeypatch.setattr(mux, "probe_streams", lambda _m: streams)
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "libx264")
+    monkeypatch.setattr(
+        mux, "_run_ffmpeg", lambda cmd, *, capture: Path(cmd[-1]).write_bytes(b"x")
+    )
+    captured = {}
+    real_ass_header = export_mod.ass_header
+
+    def spy_header(**kwargs):
+        captured.update(kwargs)
+        return real_ass_header(**kwargs)
+
+    monkeypatch.setattr(export_mod, "ass_header", spy_header)
+    mux.burn(vtt, output=tmp_path / "out.mkv", container="mkv")
+    assert captured.get("width") == 1920  # not the 300x300 attached_pic cover
+    assert captured.get("height") == 1080
+
+
+# --- ffmpeg execution & probing robustness -----------------------------------
+
+
+def test_run_ffmpeg_error_surfaces_lines_beyond_the_last_8(monkeypatch):
+    stderr_lines = ["Error: width not divisible by 2"] + [
+        f"info line {i}" for i in range(40)
+    ]
+    monkeypatch.setattr(
+        mux.subprocess,
+        "run",
+        lambda *a, **k: _Proc(1, stderr="\n".join(stderr_lines)),
+    )
+    with pytest.raises(RuntimeError) as exc:
+        mux._run_ffmpeg(["ffmpeg", "-i", "x"], capture=True)
+    assert "divisible" in str(exc.value)
+
+
+def test_probe_streams_missing_ffprobe_raises_friendly_error(monkeypatch):
+    def raise_fnf(*a, **k):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'ffprobe'")
+
+    monkeypatch.setattr(mux.subprocess, "run", raise_fnf)
+    with pytest.raises(RuntimeError) as exc:
+        mux.probe_streams(Path("ep.mkv"))
+    msg = str(exc.value).lower()
+    assert "ffmpeg" in msg
+    assert "path" in msg or "install" in msg
+
+
+def test_run_ffmpeg_missing_binary_raises_friendly_error(monkeypatch):
+    def raise_fnf(*a, **k):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'ffmpeg'")
+
+    monkeypatch.setattr(mux.subprocess, "run", raise_fnf)
+    with pytest.raises(RuntimeError) as exc:
+        mux._run_ffmpeg(["ffmpeg", "-i", "x"], capture=True)
+    msg = str(exc.value).lower()
+    assert "ffmpeg" in msg
+    assert "path" in msg or "install" in msg

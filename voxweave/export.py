@@ -31,6 +31,9 @@ def ass_header(
     canvas and scale linearly with the actual height, so burning onto e.g. a 2160p
     frame keeps the same visual proportions.
     """
+    # ASS "Style:" lines are comma-delimited; a comma in the font name would
+    # shift every field after Fontname, so strip commas from it.
+    font = font.replace(",", "")
     scale = height / 1080
     size = font_size if font_size is not None else round(72 * scale)
     outline = round(3 * scale, 1)
