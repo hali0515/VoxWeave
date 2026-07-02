@@ -113,6 +113,27 @@ def test_no_space_ghost_unit_resyncs():
         assert chars == [c for c in cue["text"] if not c.isspace()]
 
 
+def test_no_space_units_with_trailing_space_do_not_warn(caplog):
+    # Real-world zh stream (Netcap.m4a): reinject glues the CJK<->Latin boundary
+    # space onto the preceding unit ('开 ', 't ', '的 '). The cursor arithmetic is
+    # whitespace-insensitive, so pairing is correct -- the content anchor must
+    # strip before comparing instead of flagging every mixed-script cue.
+    text = "我们打开napcat的界面。"
+    chars = [c for c in text if not c.isspace()]
+    word_data = [
+        {"word": c, "start": i * 0.2, "end": i * 0.2 + 0.1} for i, c in enumerate(chars)
+    ]
+    word_data[3]["word"] = "开 "  # trailing space glued by reinject
+    word_data[9]["word"] = "t "
+    word_data[10]["word"] = "的 "
+    with caplog.at_level(logging.WARNING):
+        cues = split_at_sentence_end(text, word_data, "zh", 20, 1)
+    assert not any("desync" in r.message for r in caplog.records)
+    for cue in cues:
+        got = [w["word"].strip() for w in cue["word_data"]]
+        assert got == [c for c in cue["text"] if not c.isspace()]
+
+
 def test_no_space_clean_stream_pairs_exactly():
     text = "今日は。晴れ。"
     word_data = _char_word_data(text)

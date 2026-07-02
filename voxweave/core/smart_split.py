@@ -407,8 +407,12 @@ def _anchor_cursor(
     def _matches(at: int) -> bool:
         if at < 0 or at + len(clause_tokens) > len(word_data):
             return False
+        # reinject can glue a boundary space onto a unit ('开 ' at CJK<->Latin
+        # seams); the cursor arithmetic is whitespace-insensitive, so compare
+        # stripped content.
         return all(
-            word_data[at + j].get("word") == tok for j, tok in enumerate(clause_tokens)
+            (word_data[at + j].get("word") or "").strip() == tok.strip()
+            for j, tok in enumerate(clause_tokens)
         )
 
     if _matches(cursor):
