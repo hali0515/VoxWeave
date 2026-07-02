@@ -180,6 +180,34 @@ def test_apply_fixes_allows_artifact_deletion_and_word_rejoin():
     assert len(applied) == 2 and not rejected
 
 
+def test_pipeline_correct_sidecar_pair_cleaned_on_audit_failure(tmp_path, monkeypatch):
+    # sidecar VTT + audit JSON are a pair: if the audit write fails after the
+    # VTT landed, the half-pair must not be left behind
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
+    monkeypatch.setattr(
+        pipeline.asrfix_mod,
+        "correct_cues",
+        lambda payload, **kw: [
+            {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "x"}
+        ],
+    )
+    real_write = pipeline.fsio.atomic_write_text
+
+    def flaky_write(dst, text, **kw):
+        if str(dst).endswith(".asrfix.json"):
+            raise OSError("disk full")
+        return real_write(dst, text, **kw)
+
+    monkeypatch.setattr(pipeline.fsio, "atomic_write_text", flaky_write)
+    import pytest
+
+    with pytest.raises(OSError):
+        pipeline.correct(vtt)
+    assert not (tmp_path / "ep.asrfix.vtt").exists()  # no orphaned half-pair
+    assert vtt.read_text(encoding="utf-8").count("hello") == 1  # source untouched
+
+
 # --------------------------- build_messages / glossary --------------------------- #
 _GLOSSARY_MARK = "canonical entities for THIS video"
 

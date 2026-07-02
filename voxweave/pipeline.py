@@ -161,13 +161,34 @@ def require_vtt(path: Path) -> Path:
 
 
 def _find_sibling_media(ref: Path) -> Path | None:
-    """Find the source media alongside ref by trying known extensions; return first match."""
+    """Find the source media alongside ref by stem, matching extensions case-insensitively.
+
+    Returns the best candidate by ``MEDIA_EXTS`` order (``.mkv`` before ``.mp4`` ...);
+    when more than one media sibling exists the ambiguity is logged and the selection
+    stays deterministic. ``None`` when no sibling is found.
+    """
     ref = Path(ref)
-    for ext in MEDIA_EXTS:
-        cand = swap_ext(ref, ext)
-        if cand.exists():
-            return cand
-    return None
+    base = swap_ext(ref, "").name  # stem without the reference extension (dot-safe)
+    order = {ext: i for i, ext in enumerate(MEDIA_EXTS)}
+    matches: list[tuple[int, Path]] = []
+    parent = ref.parent if str(ref.parent) else Path(".")
+    if parent.exists():
+        for p in parent.iterdir():
+            if p.is_file() and swap_ext(p, "").name == base:
+                rank = order.get(p.suffix.lower())
+                if rank is not None:
+                    matches.append((rank, p))
+    if not matches:
+        return None
+    matches.sort(key=lambda m: (m[0], str(m[1])))
+    if len(matches) > 1:
+        log.warning(
+            "multiple sibling media files for %s: %s; using %s",
+            ref.name,
+            [m[1].name for m in matches],
+            matches[0][1].name,
+        )
+    return matches[0][1]
 
 
 def _separate_to_16k_32k(
@@ -604,13 +625,39 @@ def transcribe(
 
 
 def _spans_in(raw: Any) -> list[tuple[float, float]] | None:
-    """Parse a persisted ``vad_speech`` array (``[[start, end], ...]``) to float tuples; None if absent/empty."""
-    return [(float(s), float(e)) for s, e in raw] if raw else None
+    """Parse a persisted ``vad_speech`` array (``[[start, end], ...]``) to float tuples.
+
+    Malformed entries (wrong arity, non-numeric bounds) are skipped with a warning
+    rather than crashing the whole re-split. None if absent/empty or nothing survives.
+    """
+    if not raw:
+        return None
+    out: list[tuple[float, float]] = []
+    for entry in raw:
+        try:
+            s, e = entry
+            out.append((float(s), float(e)))
+        except (TypeError, ValueError):
+            log.warning("skipping malformed vad_speech entry: %r", entry)
+    return out or None
 
 
 def _turns_in(raw: Any) -> list[tuple[float, float, str]] | None:
-    """Parse persisted ``speaker_turns`` (``[[start, end, label], ...]``); None if absent/empty."""
-    return [(float(s), float(e), str(lb)) for s, e, lb in raw] if raw else None
+    """Parse persisted ``speaker_turns`` (``[[start, end, label], ...]``).
+
+    Malformed entries (wrong arity, non-numeric bounds) are skipped with a warning.
+    None if absent/empty or nothing survives.
+    """
+    if not raw:
+        return None
+    out: list[tuple[float, float, str]] = []
+    for entry in raw:
+        try:
+            s, e, lb = entry
+            out.append((float(s), float(e), str(lb)))
+        except (TypeError, ValueError):
+            log.warning("skipping malformed speaker_turns entry: %r", entry)
+    return out or None
 
 
 def _maybe_adaptive_thresholds(th: dict, units: list[dict]) -> dict:
@@ -871,7 +918,12 @@ def process(
     )
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
     if sdh and word_segments is None:
-        _write_sdh_sidecar(media_path, cues, rep)
+        # The main VTT/JSON already landed; an SDH sidecar failure (PANNs OOM, missing
+        # model) must not lose that primary output.
+        try:
+            _write_sdh_sidecar(media_path, cues, rep)
+        except Exception as e:
+            log.warning("SDH sidecar failed (non-fatal): %r", e)
     return vtt_out
 
 
@@ -1289,8 +1341,17 @@ def translate(
         if missing:
             rep.stage(f"retry translate {len(missing)} cues")
             retry_payload = [payload[i] for i in missing]
+            # Continuity tail: hand the retry window the already-translated cues that
+            # precede the first gap so the model keeps register/terminology consistent.
+            tail = [
+                (payload[j]["t"], trans[j])
+                for j in range(missing[0])
+                if trans.get(j, "").strip()
+            ][-translate_mod.CONTEXT_TAIL :]
             trans.update(
-                translate_mod.translate_cues(retry_payload, **tx_kwargs, reporter=rep)
+                translate_mod.translate_cues(
+                    retry_payload, **tx_kwargs, tail=tail, reporter=rep
+                )
             )
             still = translate_mod.validate_and_fill(blocks, trans)
             if still:
@@ -1376,14 +1437,20 @@ def correct(
         out_path = swap_ext(vtt_path, ".asrfix.vtt")
         fsio.atomic_write_text(out_path, rendered)
         audit_path = swap_ext(vtt_path, ".asrfix.json")
-        fsio.atomic_write_text(
-            audit_path,
-            json.dumps(
-                {"applied": applied, "rejected": rejected},
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
+        try:
+            fsio.atomic_write_text(
+                audit_path,
+                json.dumps(
+                    {"applied": applied, "rejected": rejected},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+        except Exception:
+            # Sidecar VTT + audit JSON are a pair; if the audit write fails, unlink
+            # the VTT so no orphaned half-pair is left behind (source stays untouched).
+            out_path.unlink(missing_ok=True)
+            raise
     log.info(
         "asrfix %s: %d applied / %d rejected → %s",
         vtt_path.name,

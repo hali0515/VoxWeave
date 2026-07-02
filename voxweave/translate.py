@@ -93,9 +93,14 @@ def parse_response(raw: object) -> dict[int, str]:
     out: dict[int, str] = {}
     for it in items:
         try:
-            out[int(it["i"])] = str(it["t"])
+            idx = int(it["i"])
+            txt = str(it["t"])
         except (KeyError, TypeError, ValueError):
+            log.warning("dropping malformed translation entry: %r", it)
             continue
+        if idx in out:
+            log.warning("duplicate index %d in translations; last one wins", idx)
+        out[idx] = txt
     return out
 
 
@@ -157,9 +162,17 @@ def format_glossary(glossary: dict[str, str] | str | None) -> str:
 def load_glossary(path) -> dict[str, str] | str:
     """Load a glossary file: .json is parsed into a dict; any other extension is returned as a raw string."""
     p = Path(path)
+    if not p.exists():
+        raise RuntimeError(f"glossary file not found: {p}")
     text = p.read_text(encoding="utf-8")
     if p.suffix.lower() == ".json":
-        return json.loads(text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"invalid JSON in glossary {p.name}: {e}") from e
+        if not isinstance(data, dict):
+            raise RuntimeError(f"glossary {p.name} must be a JSON object")
+        return data
     return text.strip()
 
 
@@ -172,6 +185,8 @@ def build_messages(
     tail: list[tuple[str, str]] | None = None,
 ) -> list[dict]:
     """Assemble OpenAI chat messages: system (instructions + context + glossary + continuity tail) + user (numbered payload JSON)."""
+    if not to or not to.strip() or "\n" in to:
+        raise ValueError("target language must be a non-empty single-line string")
     parts = [
         f"You are a professional subtitle translator. Translate each subtitle cue into the target language: {to}.",
         "Translate every cue in light of the full context: use the surrounding cues to disambiguate "
@@ -230,12 +245,14 @@ def _make_client(base_url: str | None, api_key: str | None):
         raise RuntimeError(
             "translate requires openai (not installed); install with: pip install 'voxweave[translate]' or make install"
         ) from e
-    kw = {}
-    if api_key:
-        kw["api_key"] = api_key
+    key = api_key or os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not set; pass api_key= or set the OPENAI_API_KEY environment variable"
+        )
     if base_url:
-        kw["base_url"] = base_url
-    return OpenAI(**kw)
+        return OpenAI(api_key=key, base_url=base_url)
+    return OpenAI(api_key=key)
 
 
 def _call(client, model: str, messages: list[dict], on_entry=None) -> str:
@@ -370,6 +387,7 @@ def translate_cues(
     batch: int = BATCH_THRESHOLD,
     char_budget: int = WINDOW_CHARS,
     context_tail: int = CONTEXT_TAIL,
+    tail: list[tuple[str, str]] | None = None,
     reporter=None,
     progress_path: Path | None = None,
     progress_sig: str | None = None,
@@ -378,7 +396,9 @@ def translate_cues(
 
     Single call when the whole payload fits both the cue-count cap and the char
     budget (whole-episode context); sequential windows with continuity tail
-    otherwise. ``client`` injectable for tests. With ``progress_path``, completed
+    otherwise. ``client`` injectable for tests. ``tail`` seeds the first window's
+    continuity context (e.g. an already-translated preceding cue on retry), the
+    same channel inter-window tails already use. With ``progress_path``, completed
     windows are persisted after each call and fully-covered windows are skipped
     on a rerun, so a mid-run failure costs only the window that failed.
     """
@@ -394,7 +414,7 @@ def translate_cues(
     result: dict[int, str] = {}
     if progress_path is not None:
         result.update(load_progress(progress_path, progress_sig))
-    tail: list[tuple[str, str]] = []
+    tail = list(tail) if tail else []
     for win in windows:
         if all(result.get(c["i"], "").strip() for c in win):
             if on_entry is not None:
@@ -403,9 +423,16 @@ def translate_cues(
             msgs = build_messages(
                 win, to=to, context=context, glossary=glossary, tail=tail
             )
-            result.update(
-                parse_response(_call_with_retry(client, model, msgs, on_entry=on_entry))
+            parsed = parse_response(
+                _call_with_retry(client, model, msgs, on_entry=on_entry)
             )
+            win_ids = {c["i"] for c in win}
+            stray = [i for i in parsed if i not in win_ids]
+            if stray:
+                log.warning("dropping out-of-window indices %s from response", stray)
+                for i in stray:
+                    del parsed[i]
+            result.update(parsed)
             if progress_path is not None:
                 save_progress(progress_path, progress_sig, result)
         tail = [(c["t"], result.get(c["i"], "")) for c in win[-context_tail:]]

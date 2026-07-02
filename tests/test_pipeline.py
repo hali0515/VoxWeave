@@ -4,6 +4,7 @@ Key concern: filenames with interior dots (e.g. ``...`` in YouTube titles) must 
 silently truncated by ``Path.with_suffix`` when deriving .vtt/.json sibling paths.
 """
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -142,3 +143,88 @@ def test_separate_self_cleans_partial_temps_on_failure(tmp_path, monkeypatch):
         )
     # fullband was decoded before separation failed -> helper must have cleaned it up
     assert created and not created[0].exists()
+
+
+# --- #18: _spans_in / _turns_in must skip malformed persisted entries instead of crashing ---
+
+
+def test_spans_in_skips_malformed_entries_and_warns(caplog):
+    # [2] has wrong arity (missing end); [3, "x"] has a non-numeric end.
+    # Both must be skipped (not raise) while the well-formed entry survives.
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        result = pipeline._spans_in([[0, 1], [2], [3, "x"]])
+    assert result == [(0.0, 1.0)]
+    assert any("malformed" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_spans_in_all_malformed_returns_none(caplog):
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        result = pipeline._spans_in([[1], ["a", "b"]])
+    assert result is None
+
+
+def test_turns_in_skips_malformed_entries_and_warns(caplog):
+    # [2] has wrong arity (missing end + label); the well-formed entry survives.
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        result = pipeline._turns_in([[0, 1, "A"], [2]])
+    assert result == [(0.0, 1.0, "A")]
+    assert any("malformed" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_turns_in_all_malformed_returns_none(caplog):
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        result = pipeline._turns_in([[1], ["a", "b", "c", "d"]])
+    assert result is None
+
+
+# --- #23: SDH sidecar failure must not lose the already-written main VTT ---
+
+
+def test_process_sdh_sidecar_failure_does_not_lose_main_vtt(
+    tmp_path, monkeypatch, caplog
+):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"x")
+    units = [{"text": "hello", "start": 0.0, "end": 1.0}]
+
+    def fake_transcribe(*a, **kw):
+        return ("en", units, None, [], [])
+
+    def boom_sdh(*a, **kw):
+        raise RuntimeError("PANNs exploded")
+
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    monkeypatch.setattr(pipeline, "_write_sdh_sidecar", boom_sdh)
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        out = pipeline.process(media, sdh=True, shot_snap=False)
+
+    assert out == tmp_path / "ep.vtt"
+    assert out.exists()
+    assert any("sdh" in r.getMessage().lower() for r in caplog.records)
+
+
+# --- #26: sibling media lookup must be case-insensitive and warn on ambiguous matches ---
+
+
+def test_find_sibling_media_case_insensitive_extension(tmp_path):
+    media = tmp_path / "ep.MP4"
+    media.write_bytes(b"x")
+    vtt = tmp_path / "ep.vtt"
+    assert pipeline._find_sibling_media(vtt) == media
+
+
+def test_find_sibling_media_multiple_candidates_warns_and_is_deterministic(
+    tmp_path, caplog
+):
+    # Both ep.mkv and ep.mp4 exist; MEDIA_EXTS lists ".mkv" before ".mp4", so the
+    # first-by-order candidate must win, and the ambiguity must be logged.
+    mkv = tmp_path / "ep.mkv"
+    mkv.write_bytes(b"x")
+    mp4 = tmp_path / "ep.mp4"
+    mp4.write_bytes(b"x")
+    vtt = tmp_path / "ep.vtt"
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        found = pipeline._find_sibling_media(vtt)
+    assert found == mkv
+    assert any("multiple" in r.getMessage().lower() for r in caplog.records)
