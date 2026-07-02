@@ -106,3 +106,55 @@ def test_cleanup_does_not_exceed_max_cue():
     ]
     out = _cleanup_cues(cues, min_cue_s=0.5, max_cue_s=7.0)
     assert out[0]["end"] - out[0]["start"] <= 7.0 + 1e-9
+
+
+# --- Defect B: max_cue_s clamp must not truncate a still-sounding word -------
+
+
+def _held_cue(next_start: float):
+    # 'pearl My pearl' held/sung: last word_data end (11.7) is 4.7s past
+    # start+max_cue_s (7.0). Clamping to 7.0 would drop the subtitle 4.7s before
+    # the vocal ends.
+    return [
+        {
+            "text": "pearl My pearl",
+            "start": 0.0,
+            "end": 11.7,
+            "word_data": [
+                {"word": "pearl", "start": 0.0, "end": 1.0},
+                {"word": "My", "start": 1.0, "end": 2.0},
+                {"word": "pearl", "start": 2.0, "end": 11.7},
+            ],
+        },
+        {"text": "next", "start": next_start, "end": next_start + 1.0, "word_data": []},
+    ]
+
+
+def test_max_cue_extends_to_last_word_when_held():
+    # (a) last word ends 4.7s past the cap, next cue far away -> end extends all
+    # the way to the last word end (speech must not vanish mid-utterance).
+    out = _cleanup_cues(_held_cue(next_start=30.0), min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(11.7)
+
+
+def test_max_cue_extension_capped_by_next_start():
+    # (b) same held cue but the next cue starts 1s after the cap -> extend only up
+    # to next.start (never overlap the following cue).
+    out = _cleanup_cues(_held_cue(next_start=8.0), min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(8.0)
+
+
+def test_max_cue_clamps_when_words_end_before_cap():
+    # (c) word_data ends before the cap -> ordinary clamp to start+max_cue_s (a
+    # long-linger cue whose own words already stopped is still capped).
+    cues = [
+        {
+            "text": "hello",
+            "start": 0.0,
+            "end": 10.0,
+            "word_data": [{"word": "hello", "start": 0.0, "end": 5.0}],
+        },
+        {"text": "next", "start": 30.0, "end": 31.0, "word_data": []},
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(7.0)

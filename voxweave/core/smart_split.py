@@ -900,6 +900,8 @@ def smart_split_segments(
             max_gap_s=th.glue_gap_s,
             max_line_length=max_line_length,
             max_cue_s=th.max_cue_s,
+            min_cue_s=th.min_cue_s,
+            max_lines=max_lines,
         )
         cues = _glue_short_cues(cues, lang, max_gap_s=th.glue_gap_s)
         cues = _cleanup_cues(

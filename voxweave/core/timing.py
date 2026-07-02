@@ -12,7 +12,7 @@ from __future__ import annotations
 import bisect
 from typing import List, cast
 
-from .layout import _fits_budget, _no_spaces, _reading_chars, _visual_len
+from .layout import _fits_budget, _no_spaces, _reading_chars, _visual_len, wrap_cue_text
 from .schema import Cue
 
 TWO_FRAME_S = 2.0 / 24.0  # ~0.083s Netflix min inter-cue gap
@@ -20,6 +20,12 @@ CHAIN_MAX_GAP_S = 0.5  # gaps below this are "dead zone" -> chain to 2 frames
 VISIBLE_GAP_MIN_S = 1.0  # gaps >= this stay a visible pause (BBC); not enforced in code (CHAIN_MAX_GAP_S=0.5 never reaches them)
 GLUE_MAX_GAP_S = 0.3  # lone-word flicker cue glues onto its nearer neighbor when that gap is below this
 LINGER_CAP_S = 1.0  # CPS-driven extension never lingers more than this past speech end
+DEGENERATE_CUE_S = (
+    0.08  # a cue this short is a forced-alignment collapse artifact, not real timing
+)
+HELD_CUE_CEILING_FACTOR = (
+    2.0  # a still-sounding word may stretch a clamped cue up to this many x max_cue_s
+)
 
 
 def _is_short_fragment(text: str, lang: str) -> bool:
@@ -48,41 +54,78 @@ def _merge_micro_cues(
     max_gap_s: float,
     max_line_length: int,
     max_cue_s: float,
+    min_cue_s: float = 0.0,
+    max_lines: int = 1,
 ) -> List[Cue]:
-    """Merge adjacent cues separated by sub-glue gaps when the merge fits one line.
+    """Merge adjacent cues separated by sub-glue gaps.
 
-    Folds rapid micro-sentence chains (そう。だね。 / "Yeah." "Right.") into one
-    readable cue instead of a flicker sequence. Safety mirrors _glue_short_cues:
-    ``max_gap_s`` (0.3s) sits below ``clause_ms`` (0.4s), so a real pause is never
-    crossed. A len-broken pair cannot re-merge (it would not fit one line), a
-    gap-broken pair cannot either (its gap >= clause_ms), and the duration cap
-    keeps a dur-broken pair apart. ``max_gap_s<=0`` disables.
+    Two folding rules, both gated by ``max_gap_s`` (0.3s, below ``clause_ms``
+    0.4s) so a real pause is never crossed:
+
+    - Ordinary micro-sentence chaining (そう。だね。 / "Yeah." "Right.") merges
+      only when the join still fits one display line and the duration cap, so
+      len-/gap-/dur-broken pairs stay apart.
+    - Degenerate-collapse escape: a forced-alignment failure can pack a run of
+      sub-frame cues into a few dozen ms (ASR text overrunning its aligned span
+      -> uniform 2-12ms word timestamps). Such flicker is unreadable, so when
+      adjacent cues are BOTH below ``DEGENERATE_CUE_S`` (~0.08s), or a run of
+      abutting cues collectively spans less than ``min_cue_s``, they are folded
+      regardless of the line budget and the merged text is re-wrapped with the
+      layout soft-wrap so it renders legally. The escape never fires on real
+      cues: a 1.5s+1.5s pair is far above the floor, and a lone 0.3s interjection
+      with a real pause fails the gap gate.
+
+    ``max_gap_s<=0`` disables the pass; ``min_cue_s<=0`` disables the run-length
+    branch of the escape.
     """
     if max_gap_s <= 0 or len(cues) < 2:
         return cues
     sep = "" if _no_spaces(lang) else " "
     out = [cast(Cue, dict(cues[0]))]
+    escaped = [False]  # cue was force-merged over budget -> needs a re-wrap
     for nxt in cues[1:]:
         cur = out[-1]
         gap = _gap_between(cur, nxt)
         merged_text = (cur["text"].rstrip() + sep + nxt["text"].lstrip()).strip()
-        if (
-            gap is not None
-            and gap < max_gap_s
-            and cur.get("start") is not None
-            and nxt.get("end") is not None
-            and nxt["end"] - cur["start"] <= max_cue_s
+        cur_start, cur_end = cur.get("start"), cur.get("end")
+        nxt_start, nxt_end = nxt.get("start"), nxt.get("end")
+        contiguous = gap is not None and gap < max_gap_s
+        fits = (
+            contiguous
+            and cur_start is not None
+            and nxt_end is not None
+            and nxt_end - cur_start <= max_cue_s
             and _fits_budget(merged_text, max_line_length, 1, lang)
-        ):
+        )
+        both_below_floor = (
+            cur_start is not None
+            and cur_end is not None
+            and nxt_start is not None
+            and nxt_end is not None
+            and (cur_end - cur_start) < DEGENERATE_CUE_S
+            and (nxt_end - nxt_start) < DEGENERATE_CUE_S
+        )
+        run_below_min = (
+            min_cue_s > 0
+            and cur_start is not None
+            and nxt_end is not None
+            and (nxt_end - cur_start) < min_cue_s
+        )
+        degenerate = contiguous and (both_below_floor or run_below_min)
+        if fits or degenerate:
             cur["text"] = merged_text
-            cur["end"] = (
-                nxt["end"] if cur.get("end") is None else max(cur["end"], nxt["end"])
-            )
+            cur["end"] = nxt["end"] if cur_end is None else max(cur_end, nxt["end"])
             cur["word_data"] = list(cur.get("word_data") or []) + list(
                 nxt.get("word_data") or []
             )
+            if degenerate and not fits:
+                escaped[-1] = True
             continue
         out.append(cast(Cue, dict(nxt)))
+        escaped.append(False)
+    for cue, was_escaped in zip(out, escaped):
+        if was_escaped:  # over-budget forced merge -> re-wrap so it renders legally
+            cue["text"] = wrap_cue_text(cue["text"], lang, max_lines)
     return out
 
 
@@ -191,9 +234,26 @@ def _cleanup_cues(
             if 0 <= gap < CHAIN_MAX_GAP_S and gap > TWO_FRAME_S:
                 c["end"] = nxt_start - TWO_FRAME_S
             # overlaps (gap<0) and large gaps (>=CHAIN_MAX_GAP_S) left to caller
-        # never let extension / chaining push a cue past the duration cap
+        # never let extension / chaining push a cue past the duration cap, but
+        # never truncate a subtitle while its own words are still sounding: a
+        # held/sung word whose word_data end runs past the cap keeps its cue up
+        # to that end (capped by the next cue's start and a hard ceiling against
+        # degenerate word_data). Ordinary long-linger cues (words already stopped)
+        # still clamp exactly to start+max_cue_s.
         if max_cue_s and c["end"] - c["start"] > max_cue_s:
-            c["end"] = c["start"] + max_cue_s
+            cap = c["start"] + max_cue_s
+            word_ends = [
+                e for w in c.get("word_data") or [] if (e := w.get("end")) is not None
+            ]
+            last_word_end = max(word_ends, default=None)
+            if last_word_end is not None and last_word_end > cap:
+                ceiling = c["start"] + max_cue_s * HELD_CUE_CEILING_FACTOR
+                target = min(last_word_end, ceiling)
+                if nxt_start is not None:
+                    target = min(target, nxt_start)
+                c["end"] = max(cap, target)
+            else:
+                c["end"] = cap
     return out
 
 
