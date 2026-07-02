@@ -1,7 +1,7 @@
 # tests/test_smart_split_cleanup.py
 import pytest
 
-from voxweave.core.timing import _cleanup_cues
+from voxweave.core.timing import HELD_WORD_MAX_GAP_S, TWO_FRAME_S, _cleanup_cues
 
 
 def test_min_duration_extends_into_following_gap():
@@ -157,4 +157,142 @@ def test_max_cue_clamps_when_words_end_before_cap():
         {"text": "next", "start": 30.0, "end": 31.0, "word_data": []},
     ]
     out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(7.0)
+
+
+# --- P2-1: _cleanup_cues must be idempotent (diarize runs it twice) ----------
+
+
+def _dense_chained_stream():
+    # Fully-dense stream whose first cleanup pass produces a *chained two-frame*
+    # gap (A->B) plus a sub-frame gap (B->C), with the last cue clamped by
+    # max_cue_s. Every source of non-idempotency here is the gap interaction, so
+    # after the fix cleanup(cleanup(x)) == cleanup(x) exactly.
+    return [
+        {
+            "text": "a",
+            "start": 0.0,
+            "end": 1.0,
+            "word_data": [{"start": 0.0, "end": 1.0}],
+        },
+        {
+            "text": "b",
+            "start": 1.45,
+            "end": 2.0,
+            "word_data": [{"start": 1.45, "end": 2.0}],
+        },
+        {
+            "text": "c",
+            "start": 2.3,
+            "end": 9.5,
+            "word_data": [{"start": 2.3, "end": 9.5}],
+        },
+    ]
+
+
+def test_cleanup_is_idempotent_over_chained_gaps():
+    # (a) IDEMPOTENCY PROPERTY: a chained two-frame gap survives a second pass.
+    kw = dict(min_cue_s=0.0, max_cue_s=7.0, lag_out_s=0.25)
+    once = _cleanup_cues(_dense_chained_stream(), **kw)
+    # precondition: the first pass really does mint a chained two-frame gap.
+    assert once[1]["start"] - once[0]["end"] == pytest.approx(TWO_FRAME_S)
+    twice = _cleanup_cues(once, **kw)
+    assert len(twice) == len(once)
+    for a, b in zip(once, twice):
+        assert a["text"] == b["text"]
+        assert a["start"] == pytest.approx(b["start"])
+        assert a["end"] == pytest.approx(b["end"])
+
+
+def test_two_frame_gap_in_input_survives_cleanup():
+    # (b) a two-frame gap present in the input is left intact by lag-out.
+    cues = [
+        {
+            "text": "a",
+            "start": 0.0,
+            "end": 1.0,
+            "word_data": [{"start": 0.0, "end": 1.0}],
+        },
+        {
+            "text": "b",
+            "start": 1.0 + TWO_FRAME_S,
+            "end": 2.0,
+            "word_data": [{"start": 1.0 + TWO_FRAME_S, "end": 2.0}],
+        },
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0, lag_out_s=0.25)
+    assert out[1]["start"] - out[0]["end"] == pytest.approx(TWO_FRAME_S)
+
+
+def test_gap_above_two_frames_still_lags_out():
+    # (c) a gap wider than the 2-frame floor still gets the normal flat lag-out
+    # pad (existing behavior must not regress).
+    cues = [
+        {
+            "text": "a",
+            "start": 0.0,
+            "end": 2.0,
+            "word_data": [{"start": 0.0, "end": 2.0}],
+        },
+        {
+            "text": "b",
+            "start": 4.0,
+            "end": 5.0,
+            "word_data": [{"start": 4.0, "end": 5.0}],
+        },
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0, lag_out_s=0.25)
+    assert out[0]["end"] == pytest.approx(2.25)
+
+
+# --- P2-2: held-word max_cue escape must not cross internal dead air ----------
+
+
+def test_held_word_stops_before_dead_air_gap():
+    # (a) ja shape: continuous words end ~2s past the cap, then a 3.7s silent
+    # gap, then one isolated 80ms syllable. The escape must stop at the last word
+    # before the gap (9.0) and NOT extend across dead air to the stray syllable.
+    cue = {
+        "text": "abcd",
+        "start": 0.0,
+        "end": 12.78,
+        "word_data": [
+            {"start": 0.0, "end": 3.0},
+            {"start": 3.0, "end": 6.0},
+            {"start": 6.0, "end": 9.0},  # cap (7.0) + ~2s, last continuous word
+            {"start": 12.7, "end": 12.78},  # stray syllable after 3.7s dead air
+        ],
+    }
+    out = _cleanup_cues([cue], min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(9.0)
+
+
+def test_held_word_extends_across_small_sustain_gaps():
+    # (b) en 'pearl My pearl' shape: continuous sustain with a 0.84s internal gap
+    # (< HELD_WORD_MAX_GAP_S) ending 4.7s past the cap -> still extends to the
+    # last word end (regression guard for today's earlier held-word fix).
+    assert HELD_WORD_MAX_GAP_S > 0.84  # sustain-with-breath must pass the gate
+    cue = {
+        "text": "pearl My pearl",
+        "start": 0.0,
+        "end": 11.7,
+        "word_data": [
+            {"word": "pearl", "start": 0.0, "end": 1.0},
+            {"word": "My", "start": 1.0, "end": 2.0},
+            {"word": "pearl", "start": 2.84, "end": 11.7},
+        ],
+    }
+    out = _cleanup_cues([cue], min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(11.7)
+
+
+def test_held_word_words_before_cap_plain_clamp():
+    # (c) all words end before the cap -> exact old clamp to start+max_cue_s.
+    cue = {
+        "text": "hello",
+        "start": 0.0,
+        "end": 10.0,
+        "word_data": [{"word": "hello", "start": 0.0, "end": 5.0}],
+    }
+    out = _cleanup_cues([cue], min_cue_s=0.0, max_cue_s=7.0)
     assert out[0]["end"] == pytest.approx(7.0)

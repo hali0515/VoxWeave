@@ -26,6 +26,9 @@ DEGENERATE_CUE_S = (
 HELD_CUE_CEILING_FACTOR = (
     2.0  # a still-sounding word may stretch a clamped cue up to this many x max_cue_s
 )
+HELD_WORD_MAX_GAP_S = 1.0  # a held-word extension may cross word gaps up to this (sung
+# sustain with breaths ~0.84s passes); a wider silence past the cap is dead air the
+# extension must refuse (stops at the last word before it)
 
 
 def _is_short_fragment(text: str, lang: str) -> bool:
@@ -227,7 +230,16 @@ def _cleanup_cues(
             desired = max(desired, min(need, dur + LINGER_CAP_S))
         if desired > dur:
             want = c["start"] + desired
-            c["end"] = want if nxt_start is None else min(want, nxt_start)
+            if nxt_start is None:
+                c["end"] = want
+            elif nxt_start - c["end"] > TWO_FRAME_S:
+                c["end"] = min(want, nxt_start)
+            # else: the inter-cue gap is already at/under the 2-frame floor —
+            # leave it untouched. This keeps _cleanup_cues idempotent (the
+            # diarize path runs it twice): without the guard a second lag-out
+            # pass would extend over a chained 2-frame gap and collapse it to
+            # zero, which the chaining branch then cannot restore. Gaps wider
+            # than the floor still lag-out exactly as before.
         # chaining: close small inter-cue gaps to 2 frames
         if nxt_start is not None:
             gap = nxt_start - c["end"]
@@ -242,13 +254,33 @@ def _cleanup_cues(
         # still clamp exactly to start+max_cue_s.
         if max_cue_s and c["end"] - c["start"] > max_cue_s:
             cap = c["start"] + max_cue_s
-            word_ends = [
-                e for w in c.get("word_data") or [] if (e := w.get("end")) is not None
-            ]
-            last_word_end = max(word_ends, default=None)
+            timed = sorted(
+                (
+                    (s, e)
+                    for w in c.get("word_data") or []
+                    if (s := w.get("start")) is not None
+                    and (e := w.get("end")) is not None
+                ),
+                key=lambda se: se[0],
+            )
+            last_word_end = max((e for _s, e in timed), default=None)
             if last_word_end is not None and last_word_end > cap:
+                # A still-sounding word may hold the cue past the cap, but only
+                # across CONTINUOUS speech. Walk the words in time order and stop
+                # at the first silence gap wider than HELD_WORD_MAX_GAP_S that
+                # lands at or past the cap: the extension target is the last word
+                # end before that gap. This keeps a sung sustain (breaths ~0.84s)
+                # visible while refusing to drag the cue across dead air to a
+                # stray final syllable (real ja case: words end ~2s past the cap,
+                # then a 3.7s gap, then one 80ms syllable). If the held region
+                # ends before the cap, max() clamps back to plain cap behavior.
+                held_end = timed[0][1]
+                for (_ps, pe), (ns, ne) in zip(timed, timed[1:]):
+                    if ns - pe > HELD_WORD_MAX_GAP_S and ns >= cap:
+                        break
+                    held_end = ne
                 ceiling = c["start"] + max_cue_s * HELD_CUE_CEILING_FACTOR
-                target = min(last_word_end, ceiling)
+                target = min(held_end, ceiling)
                 if nxt_start is not None:
                     target = min(target, nxt_start)
                 c["end"] = max(cap, target)
