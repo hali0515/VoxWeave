@@ -214,13 +214,28 @@ def conf_fusion_qwen() -> str:
 
 def conf_hf_token() -> str | None:
     """Hugging Face token for gated checkpoints (pyannote diarization).
+
     Precedence: env VOXWEAVE_HF_TOKEN > HF_TOKEN > HUGGING_FACE_HUB_TOKEN >
-    conf ``hf_token``; None when nowhere set."""
+    conf ``hf_token`` > huggingface_hub stored token; None when nowhere set.
+
+    The lowest-precedence source is the token written by ``hf auth login``
+    (``~/.cache/huggingface/token``), read via ``huggingface_hub.get_token``.
+    The import is lazy and any failure (missing package, IO error) is treated
+    as "no token".
+    """
     for key in ("VOXWEAVE_HF_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         v = _nonempty_str(os.environ.get(key))
         if v:
             return v
-    return _nonempty_str(_load().get("hf_token"))
+    v = _nonempty_str(_load().get("hf_token"))
+    if v:
+        return v
+    try:
+        import huggingface_hub
+
+        return _nonempty_str(huggingface_hub.get_token())
+    except Exception:
+        return None
 
 
 _LOAD_STRATEGIES = ("peak", "sum")

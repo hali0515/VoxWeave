@@ -1,6 +1,8 @@
 """voxweave.config — ~/.config/voxweave.conf (TOML) loading, precedence, and first-run creation. Pure stdlib, no model dependency."""
 
 import logging
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -183,6 +185,55 @@ def test_default_template_has_batch_section(conf_at):
     config.ensure_default_config()
     txt = conf_at.read_text(encoding="utf-8")
     assert "[batch]" in txt and "VOXWEAVE_SEP_BATCH" in txt
+
+
+# --- hf token precedence (env > conf > huggingface_hub stored token) -------- #
+@pytest.fixture
+def no_hf_env(monkeypatch):
+    """Remove all HF token env vars so file / hub fallbacks are exercised."""
+    for v in ("VOXWEAVE_HF_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        monkeypatch.delenv(v, raising=False)
+
+
+def _fake_hub(token_or_exc):
+    """Fake ``huggingface_hub`` module whose get_token returns a value or raises."""
+    mod = types.ModuleType("huggingface_hub")
+
+    def get_token():
+        if isinstance(token_or_exc, Exception):
+            raise token_or_exc
+        return token_or_exc
+
+    mod.get_token = get_token  # type: ignore[attr-defined]
+    return mod
+
+
+def test_conf_hf_token_from_hub_when_unset(conf_at, no_hf_env, monkeypatch):
+    # nothing in env or file -> fall back to the huggingface CLI stored token
+    monkeypatch.setitem(sys.modules, "huggingface_hub", _fake_hub("hub-tok"))
+    assert config.conf_hf_token() == "hub-tok"
+
+
+def test_conf_hf_token_env_wins_over_hub(conf_at, no_hf_env, monkeypatch):
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "env-tok")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", _fake_hub("hub-tok"))
+    assert config.conf_hf_token() == "env-tok"  # env > hub
+
+
+def test_conf_hf_token_conf_wins_over_hub(conf_at, no_hf_env, monkeypatch):
+    conf_at.write_text('hf_token = "file-tok"\n', encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "huggingface_hub", _fake_hub("hub-tok"))
+    assert config.conf_hf_token() == "file-tok"  # conf > hub
+
+
+def test_conf_hf_token_hub_raises_returns_none(conf_at, no_hf_env, monkeypatch):
+    monkeypatch.setitem(sys.modules, "huggingface_hub", _fake_hub(RuntimeError("boom")))
+    assert config.conf_hf_token() is None  # hub failure is swallowed
+
+
+def test_conf_hf_token_hub_empty_returns_none(conf_at, no_hf_env, monkeypatch):
+    monkeypatch.setitem(sys.modules, "huggingface_hub", _fake_hub(""))
+    assert config.conf_hf_token() is None  # empty stored token -> None
 
 
 # --- #24 config silently swallows errors ----------------------------------- #
