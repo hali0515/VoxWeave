@@ -611,6 +611,62 @@ def _full_pass_units(
     return [shift_units(u, -b[0]) for u, b in zip(blocks, bounds)]
 
 
+def _asr_chunk_safe(
+    engine: str,
+    wav: Path,
+    language: str | None,
+    model_id: str,
+    context: str | None,
+    idx: int,
+    total: int,
+    failures: list[Exception],
+) -> tuple[str | None, str, str]:
+    """One chunk's ASR with failure containment: an exception degrades to empty
+    text (the same path as genuine silence downstream) instead of killing the
+    run, so hours of prior chunks are not thrown away."""
+    try:
+        return _asr_only(engine, wav, language, model_id, context)
+    except Exception as e:  # noqa: BLE001 -- one bad chunk must not kill the run
+        failures.append(e)
+        log.warning(
+            "ASR failed on chunk %d/%d (%s: %s); continuing with empty text",
+            idx + 1,
+            total,
+            type(e).__name__,
+            e,
+        )
+        _empty_cache()
+        return (None, "", "")
+
+
+def _align_chunk_safe(
+    wav: Path, text: str, align_lang: str, idx: int, total: int
+) -> list[dict]:
+    """One chunk's per-chunk alignment with failure containment: the transcript
+    text survives, only its word timing is lost."""
+    try:
+        return align_text(wav, text, align_lang)
+    except Exception as e:  # noqa: BLE001 -- one bad chunk must not kill the run
+        log.warning(
+            "alignment failed on chunk %d/%d (%s: %s); keeping text without word timing",
+            idx + 1,
+            total,
+            type(e).__name__,
+            e,
+        )
+        _empty_cache()
+        return []
+
+
+def _raise_if_all_failed(failures: list[Exception], total: int) -> None:
+    """Every chunk erroring is a broken run, not a silent empty transcript."""
+    if total and len(failures) >= total:
+        e = failures[-1]
+        raise RuntimeError(
+            f"ASR failed on all {total} chunks (last error: {type(e).__name__}: {e})"
+        )
+
+
 def transcribe_chunks(
     wav_paths: list[Path],
     language: str | None,
@@ -648,20 +704,33 @@ def transcribe_chunks(
     if engine == "fusion":
         qid = resolve_asr_model(config.conf_fusion_qwen())
         fusion_whisper = config.conf_fusion_whisper()
+        n = len(wav_paths)
         # pass A: whisper ASR all chunks
+        w_fail: list[Exception] = []
         w_asr: list[tuple[str | None, str, str]] = []
-        for w in wav_paths:
-            w_asr.append(_asr_only("whisper", w, language, fusion_whisper, context))
+        for i, w in enumerate(wav_paths):
+            w_asr.append(
+                _asr_chunk_safe(
+                    "whisper", w, language, fusion_whisper, context, i, n, w_fail
+                )
+            )
             _tick()
         if release:
             _release_whisper()
         # pass B: Qwen ASR all chunks
+        q_fail: list[Exception] = []
         q_asr: list[tuple[str | None, str, str]] = []
-        for w in wav_paths:
-            q_asr.append(_asr_only("qwen", w, language, qid, context))
+        for i, w in enumerate(wav_paths):
+            q_asr.append(
+                _asr_chunk_safe("qwen", w, language, qid, context, i, n, q_fail)
+            )
             _tick()
         if release:
             _release_qwen_asr()
+        # both engines failing everywhere = broken run; one engine surviving
+        # anywhere still fuses into usable output
+        if len(w_fail) >= n:
+            _raise_if_all_failed(q_fail, n)
         # pass C: align both texts (whisper units carry the timing; Qwen units only
         # position punctuation), full-file where the language allows, then merge
         full_w = _full_pass_units(
@@ -683,12 +752,20 @@ def transcribe_chunks(
             zip(wav_paths, w_asr, q_asr)
         ):
             uw = (
-                (full_w[i] if full_w is not None else align_text(w, tw, aw))
+                (
+                    full_w[i]
+                    if full_w is not None
+                    else _align_chunk_safe(w, tw, aw, i, n)
+                )
                 if tw.strip()
                 else []
             )
             uq = (
-                (full_q[i] if full_q is not None else align_text(w, tq, aq))
+                (
+                    full_q[i]
+                    if full_q is not None
+                    else _align_chunk_safe(w, tq, aq, i, n)
+                )
                 if tq.strip()
                 else []
             )
@@ -697,12 +774,17 @@ def transcribe_chunks(
             _tick()
         return out
     # qwen / whisper: ASR pass -> alignment pass (full-file where the language allows)
+    n = len(wav_paths)
+    failures: list[Exception] = []
     asr_out: list[tuple[str | None, str, str]] = []  # (det_lang, text, align_lang)
-    for w in wav_paths:
-        asr_out.append(_asr_only(engine, w, language, mid, context))
+    for i, w in enumerate(wav_paths):
+        asr_out.append(
+            _asr_chunk_safe(engine, w, language, mid, context, i, n, failures)
+        )
         _tick()
     if release:
         _release_whisper() if engine == "whisper" else _release_qwen_asr()
+    _raise_if_all_failed(failures, n)
     full_units = _full_pass_units(
         full_wav,
         bounds,
@@ -717,7 +799,7 @@ def transcribe_chunks(
         elif full_units is not None:
             units = full_units[i]
         else:
-            units = align_text(w, text, align_lang)
+            units = _align_chunk_safe(w, text, align_lang, i, n)
         out2.append((det, text, units))
         _empty_cache()  # alignment matrix grows with length; reclaim after each chunk
         _tick()

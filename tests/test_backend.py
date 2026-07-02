@@ -665,6 +665,110 @@ def test_transcribe_chunks_two_pass_skips_align_for_empty_text(monkeypatch, tmp_
     assert out[1] == ("ja", "", [])
 
 
+# --- per-chunk failure containment ---------------------------------------- #
+def test_transcribe_chunks_survives_single_asr_failure(monkeypatch, tmp_path):
+    # one chunk's ASR blowing up must not kill the whole run: it degrades to
+    # empty text (same path as genuine silence) and the rest proceeds
+    def _asr(engine, w, lang, mid, ctx):
+        if w.name == "c1.wav":
+            raise RuntimeError("CUDA error: device-side assert")
+        return ("ja", "はい", "ja")
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 1.0}]
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav", tmp_path / "c2.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    ticks: list[int] = []
+    out = backend.transcribe_chunks(
+        wavs, None, asr_model="qwen3-asr-1.7b", on_done=lambda i: ticks.append(i)
+    )
+    assert out[1] == (None, "", [])
+    assert out[0][1] == "はい" and out[2][1] == "はい"
+    assert ticks == [0, 1, 2, 3, 4, 5]  # failed chunk still ticks progress
+
+
+def test_transcribe_chunks_survives_single_align_failure(monkeypatch, tmp_path):
+    # per-chunk alignment failure keeps the transcript text, just without units
+    def _align(w, text, alang):
+        if w.name == "c1.wav":
+            raise RuntimeError("boom")
+        return [{"text": text, "start": 0.0, "end": 1.0}]
+
+    monkeypatch.setattr(
+        backend, "_asr_only", lambda e, w, lang, m, c: ("ja", "はい", "ja")
+    )
+    monkeypatch.setattr(backend, "align_text", _align)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    out = backend.transcribe_chunks(wavs, None, asr_model="qwen3-asr-1.7b")
+    assert out[0][2] and out[1] == ("ja", "はい", [])
+
+
+def test_transcribe_chunks_raises_when_all_chunks_fail(monkeypatch, tmp_path):
+    # every chunk erroring is a broken run, not a silent empty transcript
+    def _asr(engine, w, lang, mid, ctx):
+        raise RuntimeError("model exploded")
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match="all 2 chunks"):
+        backend.transcribe_chunks(wavs, None, asr_model="qwen3-asr-1.7b")
+
+
+def test_transcribe_chunks_all_empty_asr_is_not_an_error(monkeypatch, tmp_path):
+    # genuine silence (ASR returns empty text, no exception) keeps the old
+    # behavior: empty results, pipeline decides what to do
+    monkeypatch.setattr(backend, "_asr_only", lambda e, w, lang, m, c: ("ja", "", "ja"))
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wav = tmp_path / "c0.wav"
+    wav.write_bytes(b"x")
+    out = backend.transcribe_chunks([wav], None, asr_model="qwen3-asr-1.7b")
+    assert out == [("ja", "", [])]
+
+
+def test_transcribe_chunks_fusion_survives_one_engine_failure(monkeypatch, tmp_path):
+    # fusion: whisper failing on a chunk leaves the Qwen side to carry it
+    def _asr(engine, w, lang, mid, ctx):
+        if engine == "whisper" and w.name == "c0.wav":
+            raise RuntimeError("whisper died")
+        return ("ja", f"{engine}-{w.name}", "ja")
+
+    fused: list[tuple] = []
+
+    def _fuse(wr, qr, lang):
+        fused.append((wr, qr))
+        return ("ja", "fused", [])
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 0.2}]
+    )
+    monkeypatch.setattr(backend, "_fuse_chunk", _fuse)
+    monkeypatch.setattr(backend, "_release_whisper", lambda: None)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    out = backend.transcribe_chunks(wavs, None, asr_model="fusion")
+    assert len(out) == 2
+    # chunk 0: whisper side degraded to empty, qwen side intact
+    assert fused[0][0][1] == "" and fused[0][1][1] == "qwen-c0.wav"
+
+
 # --- load strategy: sum (co-resident: same pass structure, no release between passes) ----------- #
 def test_transcribe_chunks_sum_strategy_keeps_singletons_resident(
     monkeypatch, tmp_path
