@@ -105,6 +105,81 @@ def test_apply_fixes_norm_tolerates_wrapped_newline():
     assert new[0] == "U S Marshal" and len(applied) == 1 and not rejected
 
 
+def test_apply_fixes_rejects_empty_replacement():
+    # a fix must substitute, never erase the cue outright
+    blocks = _blocks(["real spoken line", "another line"])
+    fixes = [
+        {"i": 0, "orig": "real spoken line", "fixed": "", "reason": "x"},
+        {"i": 1, "orig": "another line", "fixed": "   ", "reason": "x"},
+    ]
+    new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == [b["text"] for b in blocks]
+    assert not applied and len(rejected) == 2
+    assert all("empty" in r["_why"] for r in rejected)
+
+
+def test_apply_fixes_rejects_expansion():
+    # hallucinated sentence completion: fixed far longer than the cue
+    blocks = _blocks(["I think we should"])
+    fixes = [
+        {
+            "i": 0,
+            "orig": "I think we should",
+            "fixed": "I think we should go to the store and buy some milk today",
+            "reason": "completed sentence",
+        }
+    ]
+    new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == ["I think we should"]
+    assert not applied and "expansion" in rejected[0]["_why"]
+
+
+def test_apply_fixes_rejects_full_rewrite():
+    # same-length but unrelated content: a rephrase, not a substitution
+    blocks = _blocks(["今天的天气真的非常好我们出去玩吧"])
+    fixes = [
+        {
+            "i": 0,
+            "orig": "今天的天气真的非常好我们出去玩吧",
+            "fixed": "股票市场午盘大幅下跌投资者恐慌",
+            "reason": "x",
+        }
+    ]
+    new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == [blocks[0]["text"]]
+    assert not applied and "rewrite" in rejected[0]["_why"]
+
+
+def test_apply_fixes_allows_short_cross_script_glossary_fix():
+    # short garbled proper noun replaced wholesale (e.g. via glossary) stays legal:
+    # too short for the similarity gate, within the growth budget
+    blocks = _blocks(["阿米巴"])
+    fixes = [{"i": 0, "orig": "阿米巴", "fixed": "Astrophage", "reason": "glossary"}]
+    new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == ["Astrophage"] and len(applied) == 1 and not rejected
+
+
+def test_apply_fixes_allows_artifact_deletion_and_word_rejoin():
+    blocks = _blocks(["我们一定能做到到", "you ne ed to focus on this task"])
+    fixes = [
+        {
+            "i": 0,
+            "orig": "我们一定能做到到",
+            "fixed": "我们一定能做到",
+            "reason": "重复",
+        },
+        {
+            "i": 1,
+            "orig": "you ne ed to focus on this task",
+            "fixed": "you need to focus on this task",
+            "reason": "split word",
+        },
+    ]
+    new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == ["我们一定能做到", "you need to focus on this task"]
+    assert len(applied) == 2 and not rejected
+
+
 # --------------------------- build_messages / glossary --------------------------- #
 _GLOSSARY_MARK = "canonical entities for THIS video"
 

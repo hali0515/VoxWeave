@@ -6,8 +6,9 @@ which re-derives timestamps, absorbing any length changes.
 
 Conservative by design: the model is told to substitute only, never invent or rephrase.
 A hard SAFETY GATE (:func:`apply_fixes`) applies a fix only when its quoted ``orig``
-matches the actual cue text, rejecting cross-cue word splits, hallucinated quotes, and
-no-ops. Enforced in code, not trusted to the prompt.
+matches the actual cue text and the replacement stays a minimal edit, rejecting
+cross-cue word splits, hallucinated quotes, no-ops, cue erasure, expansions, and
+wholesale rewrites. Enforced in code, not trusted to the prompt.
 
 Reuses OpenAI plumbing from :mod:`voxweave.translate`; only the system prompt and
 response schema differ (fixes diff instead of translations).
@@ -15,6 +16,7 @@ response schema differ (fixes diff instead of translations).
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
@@ -132,15 +134,41 @@ def _norm(s: str) -> str:
     return " ".join(s.split())
 
 
+# Semantic gates on the fixed text. Growth budget: legit fixes substitute or
+# shrink; the only legal growth is a short garble replaced by a canonical term
+# (often cross-script, e.g. a 3-hanzi garble -> a Latin glossary entry), which
+# the absolute slack covers. The similarity gate only judges cues long enough
+# for SequenceMatcher to be meaningful; short cues rely on the growth budget.
+_GROWTH_FACTOR = 1.5
+_GROWTH_SLACK = 8
+_REWRITE_MIN_LEN = 12
+_REWRITE_MIN_RATIO = 0.4
+
+
+def _semantic_reject(actual_n: str, fixed_n: str) -> str | None:
+    """Why ``fixed`` violates the minimal-edit promise, or None when it is fine."""
+    if not fixed_n:
+        return "empty replacement"
+    if len(fixed_n) > _GROWTH_FACTOR * len(actual_n) + _GROWTH_SLACK:
+        return "expansion (added content)"
+    if len(actual_n) >= _REWRITE_MIN_LEN:
+        ratio = difflib.SequenceMatcher(None, actual_n, fixed_n).ratio()
+        if ratio < _REWRITE_MIN_RATIO:
+            return f"rewrite (similarity {ratio:.2f})"
+    return None
+
+
 def apply_fixes(
     blocks: list[dict], fixes: list[dict]
 ) -> tuple[list[str], list[dict], list[dict]]:
     """SAFETY GATE. Returns ``(new_texts, applied, rejected)``.
 
     A fix is applied only when: index is in range, ``orig`` matches the actual cue text
-    (whitespace-normalized), and ``fixed`` differs. Everything else is rejected with a
-    ``_why`` reason — this blocks cross-cue word splits, hallucinated quotes, and no-ops
-    observed in testing. Enforced in code, never trusted to the model.
+    (whitespace-normalized), ``fixed`` differs, and ``fixed`` honors the minimal-edit
+    promise (non-empty, within the growth budget, not a wholesale rewrite). Everything
+    else is rejected with a ``_why`` reason — this blocks cross-cue word splits,
+    hallucinated quotes, no-ops, cue erasure, and sentence "completion". Enforced in
+    code, never trusted to the model.
     """
     n = len(blocks)
     new_texts = [b["text"] for b in blocks]
@@ -152,11 +180,17 @@ def apply_fixes(
             rejected.append({**f, "_why": "index out of range"})
             continue
         actual = blocks[i]["text"]
-        if _norm(f["orig"]) != _norm(actual):
+        actual_n = _norm(actual)
+        fixed_n = _norm(f["fixed"])
+        if _norm(f["orig"]) != actual_n:
             rejected.append({**f, "_why": "orig != cue (cross-cue split / misquote)"})
             continue
-        if _norm(f["fixed"]) == _norm(actual):
+        if fixed_n == actual_n:
             rejected.append({**f, "_why": "no-op"})
+            continue
+        why = _semantic_reject(actual_n, fixed_n)
+        if why is not None:
+            rejected.append({**f, "_why": why})
             continue
         new_texts[i] = f["fixed"]
         applied.append(f)
