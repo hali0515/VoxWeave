@@ -101,3 +101,55 @@ def test_load_empty_file_raises(tmp_path):
 def test_require_subtitle_custom_exts():
     with pytest.raises(ValueError, match="expected vtt"):
         require_subtitle(Path("ep.srt"), exts=(".vtt",))
+
+
+# --- encoding tolerance ------------------------------------------------------
+
+SRT_DOC = "1\n00:00:00,000 --> 00:00:01,000\ncafé naïve\n"
+VTT_DOC = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n"
+
+
+def test_load_vtt_with_utf8_bom(tmp_path):
+    p = tmp_path / "ep.vtt"
+    p.write_bytes(b"\xef\xbb\xbf" + VTT_DOC.encode("utf-8"))
+    blocks = load_subtitle_blocks(p)
+    # BOM must not turn the WEBVTT header into a phantom text cue
+    assert [b["text"] for b in blocks] == ["hello"]
+    assert blocks[0]["start"] == 0.0
+
+
+def test_load_srt_utf16(tmp_path):
+    p = tmp_path / "ep.srt"
+    p.write_bytes(SRT_DOC.encode("utf-16"))  # BOM included by the codec
+    blocks = load_subtitle_blocks(p)
+    assert [b["text"] for b in blocks] == ["café naïve"]
+
+
+def test_load_srt_utf16_be(tmp_path):
+    p = tmp_path / "ep.srt"
+    p.write_bytes(b"\xfe\xff" + SRT_DOC.encode("utf-16-be"))
+    blocks = load_subtitle_blocks(p)
+    assert [b["text"] for b in blocks] == ["café naïve"]
+
+
+def test_load_srt_gbk_fallback(tmp_path):
+    p = tmp_path / "ep.srt"
+    doc = "1\n00:00:00,000 --> 00:00:01,000\n你好世界\n"
+    p.write_bytes(doc.encode("gbk"))
+    blocks = load_subtitle_blocks(p)
+    assert [b["text"] for b in blocks] == ["你好世界"]
+
+
+def test_load_srt_undecodable_raises_readable_error(tmp_path):
+    p = tmp_path / "ep.srt"
+    # invalid in utf-8, gb18030 and cp1252 alike
+    p.write_bytes(b"1\n00:00:00,000 --> 00:00:01,000\n\xff\x81\x00\x80\xff\n")
+    with pytest.raises(RuntimeError, match="encoding"):
+        load_subtitle_blocks(p)
+
+
+def test_parse_vtt_blocks_tolerates_leading_bom():
+    from voxweave.realign import parse_vtt_blocks
+
+    blocks = parse_vtt_blocks("﻿" + VTT_DOC)
+    assert [b["text"] for b in blocks] == ["hello"]

@@ -50,6 +50,7 @@ def parse_vtt_blocks(text: str) -> list[dict]:
     Cue id lines, WEBVTT headers, and NOTE/STYLE/REGION blocks are discarded.
     """
     blocks: list[dict] = []
+    text = text.lstrip("\ufeff")  # a leading BOM must not defeat the header check
     for raw in re.split(r"\n[ \t]*\n", text.replace("\r\n", "\n").replace("\r", "\n")):
         lines = [ln for ln in raw.split("\n")]
         # strip leading/trailing blank lines from block

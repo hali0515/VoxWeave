@@ -8,10 +8,14 @@ dedicated parser. All loaders return the realign block contract:
 
 from __future__ import annotations
 
+import codecs
+import logging
 import re
 from pathlib import Path
 
 from voxweave.realign import _parse_ts, parse_vtt_blocks
+
+log = logging.getLogger("voxweave")
 
 # Subtitle formats the file-based commands (export/translate/pack/burn) accept.
 SUBTITLE_EXTS = (".vtt", ".srt", ".ass", ".ssa")
@@ -123,11 +127,53 @@ def require_subtitle(path: Path, *, exts: tuple[str, ...] = SUBTITLE_EXTS) -> Pa
     return p
 
 
+# BOM checks are decisive; UTF-32 first (its LE BOM starts with the UTF-16 LE
+# BOM bytes). The utf-*-sig/utf-16/utf-32 codecs strip the BOM themselves.
+_BOM_ENCODINGS = (
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+# BOM-less non-UTF-8 fallbacks, tried in order. gb18030 goes first: it fails
+# fast on most Western single-byte text while GBK-encoded CJK subtitles are the
+# common wild case here; cp1252 catches the Western leftovers.
+_FALLBACK_ENCODINGS = ("gb18030", "cp1252")
+
+
+def read_subtitle_text(path: Path) -> str:
+    """Read a subtitle file tolerating the encodings found in the wild: any BOM
+    (UTF-8/16/32) decides outright, then strict UTF-8, then the fallback chain
+    (logged, since the guess can be wrong). Raises RuntimeError with a
+    convert-to-UTF-8 hint when nothing decodes."""
+    p = Path(path)
+    data = p.read_bytes()
+    for bom, enc in _BOM_ENCODINGS:
+        if data.startswith(bom):
+            return data.decode(enc)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    for enc in _FALLBACK_ENCODINGS:
+        try:
+            text = data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        log.warning("%s is not UTF-8; decoded as %s", p.name, enc)
+        return text
+    raise RuntimeError(
+        f"{p.name}: cannot determine text encoding"
+        f" (tried utf-8, {', '.join(_FALLBACK_ENCODINGS)}); convert the file to UTF-8"
+    )
+
+
 def load_subtitle_blocks(path: Path) -> list[dict]:
     """Read and parse a subtitle file by extension -> cue blocks; raise when the
     format is unsupported or the file yields no cues."""
     p = require_subtitle(path)
-    text = p.read_text(encoding="utf-8")
+    text = read_subtitle_text(p)
     if p.suffix.lower() in (".ass", ".ssa"):
         blocks = parse_ass_blocks(text)
     else:  # .vtt and .srt share a parser
