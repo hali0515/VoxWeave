@@ -330,3 +330,113 @@ def test_ass_header_scales_to_frame():
     assert ",144," in h  # 72 * 2 font size
     h = ass_header(width=1920, height=1080, font="Noto Sans CJK SC", font_size=58)
     assert "Style: Default,Noto Sans CJK SC,58," in h
+
+
+# --- atomic output ----------------------------------------------------------
+
+
+def _fake_ffmpeg_dies_mid_write(cmd, *, capture):
+    """Simulate ffmpeg crashing after partially writing its output file
+    (last argv element is always the output path)."""
+    Path(cmd[-1]).write_bytes(b"half-written garbage")
+    raise RuntimeError("ffmpeg failed (exit 1)")
+
+
+def test_pack_failure_leaves_no_output(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(mux, "probe_streams", lambda _m: [])
+    monkeypatch.setattr(mux, "_run_ffmpeg", _fake_ffmpeg_dies_mid_write)
+    out = tmp_path / "ep.pack.mkv"
+    with pytest.raises(RuntimeError):
+        mux.pack([vtt], output=out)
+    assert not out.exists()
+    assert not list(tmp_path.glob("*.part*"))  # temp cleaned up
+
+
+def test_pack_failure_preserves_previous_output(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    out = tmp_path / "ep.pack.mkv"
+    out.write_bytes(b"good output from yesterday")
+    monkeypatch.setattr(mux, "probe_streams", lambda _m: [])
+    monkeypatch.setattr(mux, "_run_ffmpeg", _fake_ffmpeg_dies_mid_write)
+    with pytest.raises(RuntimeError):
+        mux.pack([vtt], output=out)
+    assert out.read_bytes() == b"good output from yesterday"
+
+
+def test_pack_success_lands_at_output(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+
+    def fake_ok(cmd, *, capture):
+        Path(cmd[-1]).write_bytes(b"muxed")
+
+    monkeypatch.setattr(mux, "probe_streams", lambda _m: [])
+    monkeypatch.setattr(mux, "_run_ffmpeg", fake_ok)
+    out = mux.pack([vtt])
+    assert out == tmp_path / "ep.pack.mkv"
+    assert out.read_bytes() == b"muxed"
+    assert not list(tmp_path.glob("*.part*"))
+
+
+def test_burn_failure_leaves_no_output(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: [
+            {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720}
+        ],
+    )
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "libx264")
+    monkeypatch.setattr(mux, "_run_ffmpeg", _fake_ffmpeg_dies_mid_write)
+    out = tmp_path / "ep.burn.mp4"
+    with pytest.raises(RuntimeError):
+        mux.burn(vtt, output=out)
+    assert not out.exists()
+    assert not list(tmp_path.glob("*.part*"))
+
+
+# --- output must never be the source media ----------------------------------
+
+
+def test_pack_rejects_output_equal_to_media(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(mux, "probe_streams", lambda _m: [])
+    monkeypatch.setattr(mux, "_run_ffmpeg", lambda cmd, *, capture: None)
+    with pytest.raises(ValueError, match="source media"):
+        mux.pack([vtt], output=media)
+    assert media.read_bytes() == b"src"
+
+
+def test_burn_rejects_output_equal_to_media(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: [
+            {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720}
+        ],
+    )
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "libx264")
+    monkeypatch.setattr(mux, "_run_ffmpeg", lambda cmd, *, capture: None)
+    with pytest.raises(ValueError, match="source media"):
+        mux.burn(vtt, output=media, container="mkv")
+    assert media.read_bytes() == b"src"

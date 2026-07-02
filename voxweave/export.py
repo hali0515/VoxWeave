@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from voxweave import fsio
 from voxweave.realign import render_cues
 
 
@@ -171,6 +172,6 @@ def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
     out: list[Path] = []
     for fmt in dict.fromkeys(formats):  # dedupe, keep order
         path = swap_ext(sub_path, f".{fmt}")
-        path.write_text(_RENDERERS[fmt](rows), encoding="utf-8")
+        fsio.atomic_write_text(path, _RENDERERS[fmt](rows))
         out.append(path)
     return out

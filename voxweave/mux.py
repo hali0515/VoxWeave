@@ -22,7 +22,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from voxweave import lang
+from voxweave import fsio, lang
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +151,17 @@ def default_output(media: Path, container: str, tag: str) -> Path:
     return out
 
 
+def _check_output_clear_of_source(out: Path, media: Path) -> Path:
+    """Reject an output path that resolves to the source media: ffmpeg reading
+    and writing the same file truncates the source. Only reachable via an
+    explicit ``-o`` (default_output already sidesteps the collision)."""
+    if Path(out).resolve() == Path(media).resolve():
+        raise ValueError(
+            f"output {Path(out).name} is the source media; pick a different -o/--output"
+        )
+    return Path(out)
+
+
 def _default_container(media: Path) -> str:
     """Keep the source container when pack can write it, else fall back to mkv."""
     ext = Path(media).suffix.lower().lstrip(".")
@@ -265,11 +276,14 @@ def pack(
         raise ValueError(
             f"unsupported container {cont!r} (choose from {', '.join(SUB_CODEC)})"
         )
-    out = output or default_output(src, cont, "pack")
-    cmd = build_pack_cmd(
-        src, vtts, out, container=cont, source_streams=probe_streams(src)
+    out = _check_output_clear_of_source(
+        output or default_output(src, cont, "pack"), src
     )
-    _run_ffmpeg(cmd, capture=True)
+    with fsio.atomic_path(out) as tmp_out:
+        cmd = build_pack_cmd(
+            src, vtts, tmp_out, container=cont, source_streams=probe_streams(src)
+        )
+        _run_ffmpeg(cmd, capture=True)
     return out
 
 
@@ -521,7 +535,9 @@ def burn(
 
     enc = pick_encoder(codec, force=encoder)
     q = quality if quality is not None else _DEFAULT_QUALITY.get(enc, 23)
-    out = output or default_output(src, container, "burn")
+    out = _check_output_clear_of_source(
+        output or default_output(src, container, "burn"), src
+    )
 
     tmp_ass: Path | None = None
     if native_ass:
@@ -539,18 +555,19 @@ def burn(
         tmp_ass.write_text(render_ass(rows, header=header), encoding="utf-8")
         ass_path = tmp_ass
     try:
-        cmd = build_burn_cmd(
-            src,
-            ass_path,
-            out,
-            encoder=enc,
-            quality=q,
-            container=container,
-            src_depth=depth,
-            audio_codecs=audio_codecs,
-        )
-        logger.info("burning with %s (quality %s, %s)", enc, q, container)
-        _run_ffmpeg(cmd, capture=False)  # let ffmpeg -stats stream to the terminal
+        with fsio.atomic_path(out) as tmp_out:
+            cmd = build_burn_cmd(
+                src,
+                ass_path,
+                tmp_out,
+                encoder=enc,
+                quality=q,
+                container=container,
+                src_depth=depth,
+                audio_codecs=audio_codecs,
+            )
+            logger.info("burning with %s (quality %s, %s)", enc, q, container)
+            _run_ffmpeg(cmd, capture=False)  # ffmpeg -stats streams to the terminal
     finally:
         if tmp_ass is not None:
             tmp_ass.unlink(missing_ok=True)
