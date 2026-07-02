@@ -56,12 +56,53 @@ def strip_punct_for_subtitles(text: str) -> str:
     return strip_punct_for_subtitles(_EXTRA_PUNCT_TO_SPACE_RE.sub(" ", text))
 
 
+# Netflix dual-speaker cue: exactly two lines, each starting with a hyphen, one
+# speaker per line (``-line A\n-line B``, hyphen without a following space --
+# emitted by voxweave.diarize). Detected on the ASCII hyphen the diarizer writes.
+_DASH_SOURCE_LINE_RE = re.compile(r"^-\s*\S")
+# Any leading dash (ASCII/en/em, possibly repeated, with surrounding space) the
+# model may prepend to a half despite instructions -- stripped so our code owns
+# the hyphen formatting.
+_LEADING_DASH_RE = re.compile(r"^\s*[-–—]+\s*")
+# Stable, collision-free index namespace for the second half of a dash cue. Block
+# indices are far below this (subtitle files hold well under a million cues), so a
+# dash cue's halves take indices ``k`` and ``k + _DASH_UNIT_BASE`` regardless of
+# whether translate_cues is called with the full payload or a retry subset -- keeps
+# the progress sidecar consistent across both.
+_DASH_UNIT_BASE = 1_000_000
+
+
+def is_dash_cue(text: str) -> bool:
+    """True when ``text`` is a two-line dual-speaker cue (each line a hyphen +
+    content). Single lines that start with '-' and 3+ line texts are ordinary."""
+    lines = text.split("\n")
+    return len(lines) == 2 and all(_DASH_SOURCE_LINE_RE.match(ln) for ln in lines)
+
+
+def _dash_parts(text: str) -> list[str]:
+    """Two-line dash cue -> its two speaker halves with the leading hyphen removed."""
+    return [_LEADING_DASH_RE.sub("", ln, count=1).strip() for ln in text.split("\n")]
+
+
+def _clean_half(text: str) -> str:
+    """Strip any model-prepended dash and flatten internal whitespace so a half is
+    always a single line (dash cues recombine two halves on one ``\\n``)."""
+    return " ".join(_LEADING_DASH_RE.sub("", text.strip(), count=1).split())
+
+
 def build_payload(blocks: list[dict]) -> list[dict]:
-    """Cue blocks -> numbered list [{i, t}]; multi-line cue text is joined into a single string."""
-    return [
-        {"i": idx, "t": " ".join(b["text"].split("\n")).strip()}
-        for idx, b in enumerate(blocks)
-    ]
+    """Cue blocks -> numbered list [{i, t}]; multi-line cue text is joined into a
+    single string. A dual-speaker dash cue (see :func:`is_dash_cue`) additionally
+    carries ``parts`` = its two speaker halves, so translate_cues can translate
+    each speaker as a separate unit without bleeding across them."""
+    out: list[dict] = []
+    for idx, b in enumerate(blocks):
+        text = b["text"]
+        entry = {"i": idx, "t": " ".join(text.split("\n")).strip()}
+        if not b.get("lyric") and is_dash_cue(text):
+            entry["parts"] = _dash_parts(text)
+        out.append(entry)
+    return out
 
 
 def _loads_salvage(raw: object) -> dict:
@@ -125,15 +166,35 @@ def _layout_translated(text: str, to_iso: str | None) -> str:
     return wrap_cue_text(text, to_iso, 2)
 
 
+def _layout_dash_cue(block: dict, trans_text: str | None) -> str:
+    """Render a dual-speaker dash cue as exactly two lines ``-X\\n-Y``, one per
+    speaker. Each half is punct-stripped but NEVER soft-wrapped: a dash cue must
+    stay two lines (one per speaker) even when a half is over budget, and the two
+    halves must never merge onto one line. The leading hyphen is re-applied here
+    (our code owns it); a half missing its translation falls back to the source."""
+    src = _dash_parts(block["text"])
+    halves = trans_text.split("\n") if trans_text and trans_text.strip() else []
+    out: list[str] = []
+    for idx in range(2):
+        raw = _clean_half(halves[idx]) if idx < len(halves) else ""
+        if not raw:
+            raw = src[idx] if idx < len(src) else ""
+        out.append(f"-{strip_punct_for_subtitles(raw)}")
+    return "\n".join(out)
+
+
 def translated_rows(
     blocks: list[dict], trans: dict[int, str], to_iso: str | None = None
 ) -> list[tuple[float | None, float | None, str]]:
     """Translated text + per-block timestamps -> (start, end, text) rows;
     missing translations fall back to the original text. ``to_iso`` enables
     target-language soft-wrap (see _layout_translated). Lyric-flagged blocks
-    get their music-note wrap restored after layout."""
+    get their music-note wrap restored after layout. Dual-speaker dash cues are
+    rendered as two unwrapped speaker lines (see :func:`_layout_dash_cue`)."""
 
     def _text(i: int, b: dict) -> str:
+        if not b.get("lyric") and is_dash_cue(b["text"]):
+            return _layout_dash_cue(b, trans.get(i))
         t = _layout_translated(
             strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]), to_iso
         )
@@ -374,6 +435,41 @@ def _plan_windows(
     return windows
 
 
+def _expand_to_units(payload: list[dict]) -> list[dict]:
+    """Block payload -> per-speaker translation units. A dash cue (carrying
+    ``parts``) becomes two adjacent units with indices ``k`` and
+    ``k + _DASH_UNIT_BASE`` so each speaker translates independently; every other
+    cue passes through unchanged (index == block index, so ordinary cues behave
+    exactly as before)."""
+    units: list[dict] = []
+    for c in payload:
+        parts = c.get("parts")
+        if parts:
+            units.append({"i": c["i"], "t": parts[0]})
+            units.append({"i": c["i"] + _DASH_UNIT_BASE, "t": parts[1]})
+        else:
+            units.append({"i": c["i"], "t": c["t"]})
+    return units
+
+
+def _collapse_units(payload: list[dict], unit_trans: dict[int, str]) -> dict[int, str]:
+    """Per-unit translations -> per-block translations (external cue count). A dash
+    cue recombines its two halves as ``X\\n-less`` joined by ``\\n`` only when BOTH
+    are present -- a partial cue is left absent so the pipeline retries the whole
+    cue instead of emitting a blank speaker line. Ordinary cues pass through."""
+    out: dict[int, str] = {}
+    for c in payload:
+        k = c["i"]
+        if c.get("parts"):
+            a = _clean_half(unit_trans.get(k, ""))
+            b = _clean_half(unit_trans.get(k + _DASH_UNIT_BASE, ""))
+            if a and b:
+                out[k] = f"{a}\n{b}"
+        elif k in unit_trans:
+            out[k] = unit_trans[k]
+    return out
+
+
 def translate_cues(
     payload: list[dict],
     *,
@@ -405,11 +501,15 @@ def translate_cues(
     if not payload:
         return {}
     client = client or _make_client(base_url, api_key)
-    windows = _plan_windows(payload, batch=batch, char_budget=char_budget)
+    # Dual-speaker dash cues expand into two per-speaker units before windowing so
+    # each speaker translates in isolation; the result is collapsed back to one
+    # entry per block afterwards, keeping the external cue count conserved.
+    units = _expand_to_units(payload)
+    windows = _plan_windows(units, batch=batch, char_budget=char_budget)
     # With streaming the bar advances as entries arrive; also works for a single batch.
     on_entry = None
     if reporter is not None:
-        reporter.task(f"translate -> {to}", len(payload))
+        reporter.task(f"translate -> {to}", len(units))
         on_entry = reporter.advance
     result: dict[int, str] = {}
     if progress_path is not None:
@@ -436,4 +536,4 @@ def translate_cues(
             if progress_path is not None:
                 save_progress(progress_path, progress_sig, result)
         tail = [(c["t"], result.get(c["i"], "")) for c in win[-context_tail:]]
-    return result
+    return _collapse_units(payload, result)

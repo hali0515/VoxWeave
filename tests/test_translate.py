@@ -699,3 +699,203 @@ def test_pipeline_translate_cleans_progress_on_success(tmp_path, monkeypatch):
     assert out.read_text(encoding="utf-8")  # translation written
     assert seen["progress_path"] is not None
     assert not Path(seen["progress_path"]).exists()  # cleaned up on success
+
+
+# --------------------------------------------------------------------------- #
+# Netflix dual-speaker dash cues (`-line A\n-line B`, hyphen without a following
+# space, one speaker per line). Each speaker half must translate as a SEPARATE
+# unit (no cross-speaker bleed); the external cue count is still conserved.
+# --------------------------------------------------------------------------- #
+
+
+class DashEchoClient:
+    """Translates each received cue by table lookup on its text, echoing the same
+    index back. Robust to whatever internal indices translate_cues assigns to the
+    two halves of a dash cue. ``drop_missing`` omits any cue whose text is not in
+    the table (simulating a half the model failed to translate)."""
+
+    def __init__(self, table, drop_missing=False):
+        self.table = dict(table)
+        self.drop_missing = drop_missing
+        self.calls = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _payload(self, messages):
+        import json
+
+        self.calls.append(messages)
+        cues = json.loads(messages[-1]["content"])["cues"]
+        items = []
+        for c in cues:
+            if c["t"] in self.table:
+                items.append({"i": c["i"], "t": self.table[c["t"]]})
+            elif not self.drop_missing:
+                items.append({"i": c["i"], "t": c["t"]})  # echo untranslated
+        return json.dumps({"translations": items})
+
+    def _create(self, *, model, messages, stream=False, **kw):
+        content = self._payload(messages)
+        if stream:
+            return iter(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(delta=SimpleNamespace(content=content))
+                        ]
+                    )
+                ]
+            )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+
+def _received_cues(messages):
+    import json
+
+    return json.loads(messages[-1]["content"])["cues"]
+
+
+def test_dash_cue_sent_to_model_as_two_separate_units():
+    # contract #3: the two speaker halves reach the model as SEPARATE numbered
+    # cues so translations cannot bleed across speakers
+    blocks = [{"text": "-Hello there\n-Go away", "start": 1.0, "end": 2.0}]
+    payload = translate.build_payload(blocks)
+    client = DashEchoClient({"Hello there": "你好", "Go away": "走开"})
+    translate.translate_cues(payload, to="zh", model="m", client=client)
+    cues = _received_cues(client.calls[0])
+    assert len(cues) == 2  # one external cue expanded into two internal units
+    texts = [c["t"] for c in cues]
+    assert texts == ["Hello there", "Go away"]  # halves separate, dashes stripped
+    assert len({c["i"] for c in cues}) == 2  # distinct indices
+
+
+def test_dash_cue_renders_two_speaker_lines():
+    # contract #2: output is again -X\n-Y with per-half translation
+    blocks = [{"text": "-Hello\n-Bye", "start": 1.0, "end": 2.0}]
+    payload = translate.build_payload(blocks)
+    client = DashEchoClient({"Hello": "你好", "Bye": "再见"})
+    trans = translate.translate_cues(payload, to="zh", model="m", client=client)
+    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    assert _cue_lines(out) == ["-你好", "-再见"]
+    assert out.count("-->") == 1  # still one cue
+
+
+def test_dash_cue_strips_model_prepended_dash_and_reapplies_our_own():
+    # contract #2: never trust the model to echo the dash; strip any dash it adds
+    # and re-apply exactly one hyphen ourselves (no doubling, no en/em dash leak)
+    blocks = [{"text": "-Hello\n-Bye", "start": 1.0, "end": 2.0}]
+    payload = translate.build_payload(blocks)
+    client = DashEchoClient({"Hello": "- 你好", "Bye": "—再见"})
+    trans = translate.translate_cues(payload, to="zh", model="m", client=client)
+    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    assert _cue_lines(out) == ["-你好", "-再见"]
+
+
+def test_dash_cue_halves_never_merge_or_wrap_even_over_budget():
+    # contract #4: exactly two lines (one per speaker); an over-budget half stays
+    # on its single line, never wrapped and never merged with the other half
+    blocks = [{"text": "-A\n-B", "start": 1.0, "end": 4.0}]
+    payload = translate.build_payload(blocks)
+    long = "字" * 30  # width 60: a normal cue would wrap this to two lines
+    client = DashEchoClient({"A": long, "B": "短"})
+    trans = translate.translate_cues(payload, to="zh", model="m", client=client)
+    lines = _cue_lines(translate.render_translated_vtt(blocks, trans, to_iso="zh"))
+    assert len(lines) == 2  # not 3+; the long half was NOT wrapped
+    assert lines[0] == "-" + long  # over-budget half stays on one line
+    assert lines[1] == "-短"
+
+
+def test_dash_cue_conserves_count_in_mixed_batch():
+    # contract #1: mixing dash and ordinary cues conserves the external cue count
+    blocks = [
+        {"text": "plain one", "start": 0.0, "end": 1.0},
+        {"text": "-A\n-B", "start": 1.0, "end": 2.0},
+        {"text": "plain two", "start": 2.0, "end": 3.0},
+    ]
+    payload = translate.build_payload(blocks)
+    client = DashEchoClient({"plain one": "甲", "A": "a", "B": "b", "plain two": "乙"})
+    trans = translate.translate_cues(payload, to="zh", model="m", client=client)
+    out = translate.render_translated_vtt(blocks, trans)
+    assert out.count("-->") == 3  # three cues in, three cues out
+    assert "-a\n-b" in out  # dash cue kept its two speaker lines
+
+
+def test_dash_cue_missing_translation_falls_back_to_source_two_lines():
+    # both halves missing -> fall back to the source cue, still exactly two lines,
+    # still unwrapped (dash structure preserved even on fallback)
+    blocks = [{"text": "-Hello\n-Bye", "start": 1.0, "end": 2.0}]
+    out = translate.render_translated_vtt(blocks, {}, to_iso="zh")
+    assert _cue_lines(out) == ["-Hello", "-Bye"]
+
+
+def test_dash_cue_partial_half_is_reported_missing_for_retry():
+    # a dash cue with only one translated half must be flagged missing so the
+    # pipeline retries the whole cue rather than emitting a blank speaker line
+    blocks = [{"text": "-Hello\n-Bye", "start": 1.0, "end": 2.0}]
+    payload = translate.build_payload(blocks)
+    client = DashEchoClient({"Hello": "你好"}, drop_missing=True)  # "Bye" dropped
+    trans = translate.translate_cues(payload, to="zh", model="m", client=client)
+    assert translate.validate_and_fill(blocks, trans) == [0]
+
+
+def test_single_dash_line_is_ordinary_cue():
+    # contract #5: a single line starting with '-' is NOT dual-speaker
+    blocks = [{"text": "-just one line", "start": 1.0, "end": 2.0}]
+    payload = translate.build_payload(blocks)
+    assert "parts" not in payload[0]
+    client = DashEchoClient({"-just one line": "仅一行"})
+    trans = translate.translate_cues(payload, to="zh", model="m", client=client)
+    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    assert _cue_lines(out) == ["仅一行"]  # single line, no re-applied dash
+
+
+def test_three_dash_lines_is_ordinary_cue():
+    # contract #5: 3+ lines are handled as before (flattened to one unit)
+    blocks = [{"text": "-A\n-B\n-C", "start": 1.0, "end": 2.0}]
+    payload = translate.build_payload(blocks)
+    assert "parts" not in payload[0]
+    client = DashEchoClient({"-A -B -C": "甲乙丙"})
+    trans = translate.translate_cues(payload, to="zh", model="m", client=client)
+    cues = _received_cues(client.calls[0])
+    assert len(cues) == 1  # one unit, not expanded
+    assert _cue_lines(translate.render_translated_vtt(blocks, trans, to_iso="zh")) == [
+        "甲乙丙"
+    ]
+
+
+def test_lyric_flagged_dash_lines_not_treated_as_dual_speaker():
+    # contract #2 detection excludes lyric cues; the music-note wrap owns display
+    blocks = [{"text": "-la\n-la", "start": 1.0, "end": 2.0, "lyric": True}]
+    payload = translate.build_payload(blocks)
+    assert "parts" not in payload[0]
+    client = DashEchoClient({"-la -la": "啦啦"})
+    trans = translate.translate_cues(payload, to="zh", model="m", client=client)
+    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    assert "♪ 啦啦 ♪" in out
+    assert "-啦" not in out  # not rendered as a dash cue
+
+
+def test_dash_cue_round_trips_through_vtt_parse():
+    # contract #6: dash cues arriving from VTT parsing keep working (newline kept)
+    from voxweave.realign import parse_vtt_blocks
+
+    vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n-Hello\n-Bye\n"
+    blocks = parse_vtt_blocks(vtt)
+    assert blocks[0]["text"] == "-Hello\n-Bye"
+    payload = translate.build_payload(blocks)
+    client = DashEchoClient({"Hello": "你好", "Bye": "再见"})
+    trans = translate.translate_cues(payload, to="zh", model="m", client=client)
+    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    assert _cue_lines(out) == ["-你好", "-再见"]
+
+
+def test_dash_cue_streaming_progress_counts_each_half():
+    # streaming bar advances per unit; a dash cue contributes two "i" entries
+    blocks = [{"text": "-A\n-B", "start": 1.0, "end": 2.0}]
+    payload = translate.build_payload(blocks)
+    client = DashEchoClient({"A": "甲", "B": "乙"})
+    rep = _RecordingReporter()
+    translate.translate_cues(payload, to="zh", model="m", client=client, reporter=rep)
+    assert rep.total == 2  # denominator = internal unit count
+    assert rep.advances == 2
