@@ -12,6 +12,14 @@
 # Override the torch index per-invocation if needed, e.g. CPU-only: make install TORCH_BACKEND=cpu
 VARIANT ?= cuda
 
+# Optional extras stacked on top of the platform variant. Defaults to diarize (pyannote
+# speaker diarization; the feature itself stays opt-in behind --diarize and needs a HF
+# token for the gated checkpoint). Disable with `make install EXTRAS=` or stack more:
+# `make install EXTRAS=diarize,foo`.
+EXTRAS ?= diarize
+comma := ,
+INSTALL_SPEC = .[$(VARIANT)$(if $(EXTRAS),$(comma)$(EXTRAS))]
+
 ifeq ($(VARIANT),mps)
   TORCH_BACKEND ?= auto
 else
@@ -23,7 +31,7 @@ endif
 # faster-whisper) races onnxruntime-gpu for the shared import directory and can silently
 # drop CUDAExecutionProvider. See overrides.txt.
 install:
-	uv tool install --force --torch-backend=$(TORCH_BACKEND) --overrides overrides.txt ".[$(VARIANT)]"
+	uv tool install --force --torch-backend=$(TORCH_BACKEND) --overrides overrides.txt "$(INSTALL_SPEC)"
 	@voxweave --version
 	@git diff --quiet 2>/dev/null && echo "installed (git $$(git rev-parse --short HEAD))" || echo "installed (git $$(git rev-parse --short HEAD), uncommitted changes present)"
 
@@ -36,7 +44,7 @@ mps:
 
 # Force reinstall after pulling new code.
 reinstall:
-	uv tool install --force --reinstall --torch-backend=$(TORCH_BACKEND) --overrides overrides.txt ".[$(VARIANT)]"
+	uv tool install --force --reinstall --torch-backend=$(TORCH_BACKEND) --overrides overrides.txt "$(INSTALL_SPEC)"
 	@voxweave --version
 	@git diff --quiet 2>/dev/null && echo "reinstalled (git $$(git rev-parse --short HEAD))" || echo "reinstalled (git $$(git rev-parse --short HEAD), uncommitted changes present)"
 
