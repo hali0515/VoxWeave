@@ -26,6 +26,11 @@ TRANSLATE_MODEL = os.environ.get("VOXWEAVE_TRANSLATE_MODEL", "gpt-5.3-chat-lates
 BATCH_THRESHOLD = int(os.environ.get("VOXWEAVE_TRANSLATE_BATCH", "800"))
 # Tail cues from the previous window carried into the next for stylistic continuity.
 CONTEXT_TAIL = int(os.environ.get("VOXWEAVE_TRANSLATE_CONTEXT_TAIL", "3"))
+# Second windowing gate: total cue characters per window. The cue-count cap alone
+# lets a dense compilation (800 long cues) build a prompt past the model's context
+# window; CJK text runs ~1 token/char and the response echoes the input size, so
+# 60k chars keeps request+response comfortably inside current context limits.
+WINDOW_CHARS = int(os.environ.get("VOXWEAVE_TRANSLATE_WINDOW_CHARS", "60000"))
 
 
 # Decorative punctuation GPT commonly produces but not covered by voxweave’s base stripper.
@@ -331,6 +336,27 @@ def load_progress(path: Path, sig: str | None) -> dict[int, str]:
     return out
 
 
+def _plan_windows(
+    payload: list[dict], *, batch: int, char_budget: int
+) -> list[list[dict]]:
+    """Split the payload into sequential windows capped by BOTH cue count and
+    total cue characters. A single cue larger than the budget still gets its own
+    window (translated, never dropped). One window when everything fits."""
+    windows: list[list[dict]] = []
+    cur: list[dict] = []
+    cur_chars = 0
+    for c in payload:
+        clen = len(c["t"])
+        if cur and (len(cur) >= batch or cur_chars + clen > char_budget):
+            windows.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(c)
+        cur_chars += clen
+    if cur:
+        windows.append(cur)
+    return windows
+
+
 def translate_cues(
     payload: list[dict],
     *,
@@ -342,6 +368,7 @@ def translate_cues(
     api_key: str | None = None,
     client=None,
     batch: int = BATCH_THRESHOLD,
+    char_budget: int = WINDOW_CHARS,
     context_tail: int = CONTEXT_TAIL,
     reporter=None,
     progress_path: Path | None = None,
@@ -349,18 +376,16 @@ def translate_cues(
 ) -> dict[int, str]:
     """Numbered payload -> {index: translated text}.
 
-    Single call when len <= batch (whole-episode context); sequential windows with continuity
-    tail otherwise. ``client`` injectable for tests. With ``progress_path``, completed windows
-    are persisted after each call and fully-covered windows are skipped on a rerun, so a
-    mid-run failure costs only the window that failed.
+    Single call when the whole payload fits both the cue-count cap and the char
+    budget (whole-episode context); sequential windows with continuity tail
+    otherwise. ``client`` injectable for tests. With ``progress_path``, completed
+    windows are persisted after each call and fully-covered windows are skipped
+    on a rerun, so a mid-run failure costs only the window that failed.
     """
     if not payload:
         return {}
     client = client or _make_client(base_url, api_key)
-    if len(payload) <= batch:
-        windows = [payload]
-    else:
-        windows = [payload[i : i + batch] for i in range(0, len(payload), batch)]
+    windows = _plan_windows(payload, batch=batch, char_budget=char_budget)
     # With streaming the bar advances as entries arrive; also works for a single batch.
     on_entry = None
     if reporter is not None:

@@ -202,6 +202,46 @@ def test_translate_cues_windows_when_over_threshold():
     assert "B" in second_system
 
 
+def test_plan_windows_splits_on_char_budget():
+    # dense cues: the char budget, not the cue-count cap, decides the split
+    payload = [{"i": i, "t": "x" * 50} for i in range(4)]
+    wins = translate._plan_windows(payload, batch=800, char_budget=120)
+    assert [len(w) for w in wins] == [2, 2]
+    assert [c["i"] for w in wins for c in w] == [0, 1, 2, 3]  # order preserved
+
+
+def test_plan_windows_oversized_cue_gets_own_window():
+    payload = [
+        {"i": 0, "t": "a" * 10},
+        {"i": 1, "t": "b" * 500},  # alone exceeds the budget: own window, kept
+        {"i": 2, "t": "c" * 10},
+    ]
+    wins = translate._plan_windows(payload, batch=800, char_budget=100)
+    assert [[c["i"] for c in w] for w in wins] == [[0], [1], [2]]
+
+
+def test_plan_windows_under_both_limits_is_single_window():
+    payload = [{"i": i, "t": "short"} for i in range(10)]
+    assert translate._plan_windows(payload, batch=800, char_budget=60000) == [payload]
+
+
+def test_translate_cues_windows_on_char_budget_even_under_batch():
+    # 4 cues is far below the batch cap, but their combined size busts the char
+    # budget -> two sequential calls instead of one oversized prompt
+    payload = [{"i": i, "t": f"{'x' * 49}{i}"} for i in range(4)]
+    client = FakeClient(
+        [
+            '{"translations":[{"i":0,"t":"A"},{"i":1,"t":"B"}]}',
+            '{"translations":[{"i":2,"t":"C"},{"i":3,"t":"D"}]}',
+        ]
+    )
+    out = translate.translate_cues(
+        payload, to="zh", model="m", client=client, char_budget=120, context_tail=1
+    )
+    assert out == {0: "A", 1: "B", 2: "C", 3: "D"}
+    assert len(client.calls) == 2
+
+
 def test_translate_cues_streams_progress_per_cue():
     # reporter provided -> streaming mode; progress bar advances per cue ("i" key) as they arrive (works even for a single batch)
     payload = [{"i": 0, "t": "a"}, {"i": 1, "t": "b"}, {"i": 2, "t": "c"}]
