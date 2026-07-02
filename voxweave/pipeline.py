@@ -142,19 +142,16 @@ def swap_ext(path: Path, new_ext: str) -> Path:
 
 
 def require_vtt(path: Path) -> Path:
-    """Reject non-VTT inputs for translate/pack/burn; return the path unchanged.
+    """Reject non-VTT inputs for align/correct; return the path unchanged.
 
-    These commands only support ``.vtt`` for now: the VTT (plus its ``.json`` sibling)
-    is the source of truth, whereas exported ``.srt``/``.ass`` carry no word-level data
-    and would be silently mis-parsed as plain text. Run the command on the ``.vtt``.
+    Both commands write VTT back (align overwrites the input in place, correct's
+    ``--apply`` does too), so running them on ``.srt``/``.ass`` would corrupt the
+    file with VTT content. translate/pack/burn/export accept the other formats
+    via :func:`voxweave.subformats.require_subtitle`.
     """
-    p = Path(path)
-    if p.suffix.lower() != ".vtt":
-        raise ValueError(
-            f"{p.name}: only .vtt is supported for now"
-            f" (got {p.suffix or 'no extension'!r}); work from the .vtt source"
-        )
-    return p
+    from voxweave.subformats import require_subtitle
+
+    return require_subtitle(path, exts=(".vtt",))
 
 
 def _find_sibling_media(ref: Path) -> Path | None:
@@ -208,12 +205,11 @@ def _separate_to_16k_32k(
 
 
 def _load_cues(vtt_path: Path) -> list[dict]:
-    """Parse VTT cue blocks; raise if the file has no cues. Shared guard for align/translate/correct."""
-    vtt_path = Path(vtt_path)
-    blocks = realign.parse_vtt_blocks(vtt_path.read_text(encoding="utf-8"))
-    if not blocks:
-        raise RuntimeError(f"no cues in {vtt_path.name}")
-    return blocks
+    """Parse subtitle cue blocks by extension (VTT/SRT/ASS/SSA); raise if the
+    file has no cues. Shared guard for align/translate/correct."""
+    from voxweave.subformats import load_subtitle_blocks
+
+    return load_subtitle_blocks(Path(vtt_path))
 
 
 def plan_song_skip(
@@ -1087,7 +1083,7 @@ def align(
     and aligns locally, interpolates insertion blocks, then writes timing. ASR is not
     re-run; smart_split is not touched. All models run in-process (no network calls).
     """
-    vtt_path = Path(vtt_path)
+    vtt_path = require_vtt(Path(vtt_path))  # align overwrites the input as VTT
     rep = reporter or Reporter()
     json_path = swap_ext(vtt_path, ".json")
     data = (
@@ -1222,15 +1218,23 @@ def translate(
     api_key: str | None = None,
     reporter: Reporter | None = None,
 ) -> Path:
-    """Translate VTT cues via OpenAI; write <stem>.<to>.vtt (source untouched).
+    """Translate subtitle cues via OpenAI; write <stem>.<to>.<ext> (source untouched).
 
-    Missing translations are retried once; any remaining are back-filled with source text.
-    Output cue count always equals input cue count.
+    Accepts VTT/SRT/ASS/SSA; the output mirrors the input format (SSA is written
+    back as ASS). Missing translations are retried once; any remaining are
+    back-filled with source text. Output cue count always equals input cue count.
     """
-    vtt_path = require_vtt(vtt_path)
+    from voxweave.subformats import require_subtitle
+
+    vtt_path = require_subtitle(Path(vtt_path))
+    ext = ".ass" if vtt_path.suffix.lower() == ".ssa" else vtt_path.suffix.lower()
     rep = reporter or Reporter()
     blocks = _load_cues(vtt_path)
     if any(b.get("start") is None for b in blocks):
+        if ext != ".vtt":
+            raise ValueError(
+                f"{vtt_path.name} has cues without timestamps; cannot render {ext}"
+            )
         log.warning(
             "%s has no timestamps; translated output will be plain-text blocks (run align first)",
             vtt_path.name,
@@ -1263,12 +1267,21 @@ def translate(
                 still,
             )
 
-    rep.stage("write translated VTT")
-    out_path = swap_ext(vtt_path, f".{to}.vtt")
-    out_path.write_text(
-        translate_mod.render_translated_vtt(blocks, trans, to_iso=to_iso_or(to, None)),
-        encoding="utf-8",
-    )
+    rep.stage(f"write translated {ext.lstrip('.').upper()}")
+    rows = translate_mod.translated_rows(blocks, trans, to_iso=to_iso_or(to, None))
+    if ext == ".vtt":
+        content = realign.render_cues(rows)
+    else:
+        from voxweave.export import render_ass, render_srt
+
+        timed = [
+            (float(s), float(e), t)
+            for s, e, t in rows
+            if s is not None and e is not None
+        ]
+        content = render_srt(timed) if ext == ".srt" else render_ass(timed)
+    out_path = swap_ext(vtt_path, f".{to}{ext}")
+    out_path.write_text(content, encoding="utf-8")
     log.info("wrote %s (%d cues → %s)", out_path.name, len(blocks), to)
     return out_path
 
@@ -1298,7 +1311,7 @@ def correct(
 
     Returns ``{out, audit, applied, rejected, n_cues, applied_in_place, aligned}``.
     """
-    vtt_path = Path(vtt_path)
+    vtt_path = require_vtt(Path(vtt_path))  # --apply overwrites the input as VTT
     rep = reporter or Reporter()
     blocks = _load_cues(vtt_path)
 

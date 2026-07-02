@@ -393,11 +393,15 @@ def cmd_align(
 
 
 @cli.command("translate")
-@click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument(
+    "vtt",
+    metavar="SUBTITLE",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
 @click.option(
     "--to",
     default="zh",
-    help="Target language code (written to <stem>.<to>.vtt); default: zh.",
+    help="Target language code (written to <stem>.<to>.<ext>); default: zh.",
 )
 @click.option(
     "--context", default=None, help="Show/tone context injected into the prompt."
@@ -421,7 +425,8 @@ def cmd_translate(
     base_url: str | None,
     api_key_env: str,
 ) -> None:
-    """Translate after align: call OpenAI to translate each cue in an aligned VTT, write <stem>.<to>.vtt (original unchanged)."""
+    """Translate after align: call OpenAI to translate each cue in a subtitle file
+    (VTT/SRT/ASS), write <stem>.<to>.<ext> mirroring the input format (original unchanged)."""
     from voxweave.translate import load_glossary
 
     gloss = load_glossary(glossary) if glossary else None
@@ -442,17 +447,26 @@ def cmd_translate(
 
 
 @cli.command("export")
-@click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument(
+    "vtt",
+    metavar="SUBTITLE",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
 @click.option(
     "--to",
     "formats",
     multiple=True,
-    type=click.Choice(["srt", "ass"]),
+    type=click.Choice(["srt", "ass", "vtt"]),
     default=("srt",),
     help="Output format(s); repeat for several (e.g. --to srt --to ass). Default: srt.",
 )
 def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
-    """Export an aligned VTT to SRT/ASS next to it (VTT + JSON stay the source of truth)."""
+    """Convert between subtitle formats: VTT/SRT/ASS in, SRT/ASS/VTT out.
+
+    The aligned VTT + JSON stay the source of truth for voxweave-produced
+    subtitles; foreign SRT/ASS files can be exported to VTT to enter the
+    editing workflow.
+    """
     from voxweave.export import export_subtitles
 
     for path in export_subtitles(vtt, formats):
@@ -462,7 +476,7 @@ def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
 @cli.command("pack")
 @click.argument(
     "vtts",
-    metavar="VTT...",
+    metavar="SUBTITLE...",
     nargs=-1,
     required=True,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -496,12 +510,14 @@ def cmd_pack(
     container: str | None,
     output: Path | None,
 ) -> None:
-    """Mux VTT(s) into the media as soft subtitle tracks (stream copy, no re-encode).
+    """Mux subtitle file(s) (VTT/SRT/ASS) into the media as soft subtitle tracks
+    (stream copy, no re-encode).
 
     Each track is titled "VoxWeave <Language>" with the container language tag set
-    from the VTT filename (episode.zh.vtt -> chi / "VoxWeave Chinese"); the first
-    packed track is flagged default. Existing streams are preserved (mp4/webm
-    targets drop image-based subtitle tracks they cannot store).
+    from the filename (episode.zh.vtt -> chi / "VoxWeave Chinese"); the first
+    packed track is flagged default. ASS keeps its styling in mkv targets.
+    Existing streams are preserved (mp4/webm targets drop image-based subtitle
+    tracks they cannot store).
     """
     from voxweave import mux
 
@@ -515,7 +531,11 @@ def cmd_pack(
 
 
 @cli.command("burn")
-@click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument(
+    "vtt",
+    metavar="SUBTITLE",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
 @click.option(
     "--media",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -583,12 +603,13 @@ def cmd_burn(
     font_size: int | None,
     output: Path | None,
 ) -> None:
-    """Burn the VTT into the video pixels (hardcoded subs) and drop all subtitle tracks.
+    """Burn subtitles (VTT/SRT/ASS) into the video pixels and drop all subtitle tracks.
 
-    Renders a styled ASS sized to the actual frame, re-encodes video at constant
-    quality with hardware acceleration when available (NVENC / VideoToolbox),
-    preserves the source bit depth (10-bit stays 10-bit on hevc/av1), and
-    stream-copies audio (mp4 targets re-encode incompatible codecs to AAC).
+    VTT/SRT inputs render to a styled ASS sized to the actual frame; ASS inputs
+    keep their own styling. Video re-encodes at constant quality with hardware
+    acceleration when available (NVENC / VideoToolbox), preserves the source
+    bit depth (10-bit stays 10-bit on hevc/av1), and audio is stream-copied
+    (mp4 targets re-encode incompatible codecs to AAC).
     """
     from voxweave import mux
 

@@ -106,13 +106,13 @@ def _layout_translated(text: str, to_iso: str | None) -> str:
     return wrap_cue_text(text, to_iso, 2)
 
 
-def render_translated_vtt(
+def translated_rows(
     blocks: list[dict], trans: dict[int, str], to_iso: str | None = None
-) -> str:
-    """Translated text + per-block timestamps -> VTT; missing translations fall back
-    to the original text; blocks without timestamps produce plain-text cues.
-    ``to_iso`` enables target-language soft-wrap (see _layout_translated).
-    Lyric-flagged blocks get their music-note wrap restored after layout."""
+) -> list[tuple[float | None, float | None, str]]:
+    """Translated text + per-block timestamps -> (start, end, text) rows;
+    missing translations fall back to the original text. ``to_iso`` enables
+    target-language soft-wrap (see _layout_translated). Lyric-flagged blocks
+    get their music-note wrap restored after layout."""
 
     def _text(i: int, b: dict) -> str:
         t = _layout_translated(
@@ -120,8 +120,15 @@ def render_translated_vtt(
         )
         return f"♪ {t} ♪" if b.get("lyric") else t
 
-    rows = [(b.get("start"), b.get("end"), _text(i, b)) for i, b in enumerate(blocks)]
-    return render_cues(rows)
+    return [(b.get("start"), b.get("end"), _text(i, b)) for i, b in enumerate(blocks)]
+
+
+def render_translated_vtt(
+    blocks: list[dict], trans: dict[int, str], to_iso: str | None = None
+) -> str:
+    """Translated blocks -> VTT (see :func:`translated_rows`); blocks without
+    timestamps produce plain-text cues."""
+    return render_cues(translated_rows(blocks, trans, to_iso))
 
 
 def format_glossary(glossary: dict[str, str] | str | None) -> str:

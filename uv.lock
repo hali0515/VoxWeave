@@ -4880,7 +4880,7 @@ wheels = [
 
 [[package]]
 name = "voxweave"
-version = "0.4.1"
+version = "0.4.2"
 source = { editable = "." }
 dependencies = [
     { name = "beartype" },
@@ -4944,7 +4944,7 @@ requires-dist = [
     { name = "librosa", specifier = ">=0.10" },
     { name = "mlx-audio", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mps'", specifier = ">=0.4.4" },
     { name = "mlx-whisper", marker = "platform_machine == 'arm64' and sys_platform == 'darwin' and extra == 'mps'", specifier = ">=0.4" },
-    { name = "numpy", specifier = ">=1.26" },
+    { name = "numpy", specifier = ">=1.26,<2.5" },
     { name = "onnxruntime", marker = "sys_platform == 'darwin' and extra == 'mps'", specifier = ">=1.20" },
     { name = "onnxruntime-gpu", marker = "sys_platform != 'darwin' and extra == 'cuda'", specifier = ">=1.20" },
     { name = "openai", specifier = ">=1.40" },

@@ -289,12 +289,15 @@ voxweave align episode.vtt
 
 ### Translate
 
-`voxweave translate <vtt>` — **after align**, translate each cue with whole-episode context,
-preserving cue count, into `<stem>.<to>.vtt` (the original is left unchanged).
+`voxweave translate <subtitle>` — **after align**, translate each cue with whole-episode
+context, preserving cue count, into `<stem>.<to>.<ext>` (the original is left unchanged).
+Accepts `.vtt`/`.srt`/`.ass`/`.ssa`; the output mirrors the input format
+(`episode.srt` → `episode.zh.srt`).
 
 ```bash
 voxweave translate episode.vtt --to zh
 voxweave translate episode.vtt --to en --context "sci-fi, formal register" --glossary terms.json
+voxweave translate downloaded.srt --to zh               # foreign SRT in, SRT out
 ```
 
 <details>
@@ -302,7 +305,7 @@ voxweave translate episode.vtt --to en --context "sci-fi, formal register" --glo
 
 | Option                         | Description                                                                          |
 | ------------------------------ | ------------------------------------------------------------------------------------ |
-| `--to`                         | Target language code, written to `<stem>.<to>.vtt` (default `zh`).                   |
+| `--to`                         | Target language code, written to `<stem>.<to>.<ext>` (default `zh`).                 |
 | `--context`                    | Show/tone context injected into the prompt.                                          |
 | `--glossary`                   | Term/name glossary (`.json` → mapping; other → raw prompt).                          |
 | `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env or `gpt-5.3-chat-latest`). |
@@ -312,22 +315,25 @@ voxweave translate episode.vtt --to en --context "sci-fi, formal register" --glo
 
 ### Export
 
-`voxweave export <vtt>` — render an aligned VTT into SRT and/or ASS next to it (the VTT + JSON
-pair stays the source of truth). ASS carries a Default style; lyric cues (`♪ ... ♪`) render
-italic.
+`voxweave export <subtitle>` — convert between subtitle formats: VTT/SRT/ASS/SSA in,
+SRT/ASS/VTT out (written next to the input; the VTT + JSON pair stays the source of truth
+for voxweave-produced subtitles). ASS output carries a Default style; lyric cues (`♪ ... ♪`)
+render italic. Foreign SRT/ASS files can be exported to VTT to enter the editing workflow.
 
 ```bash
 voxweave export episode.vtt --to srt
 voxweave export episode.vtt --to srt --to ass
+voxweave export downloaded.ass --to vtt        # foreign ASS -> VTT for editing/translate
 ```
 
 ### Pack (soft subtitles)
 
-`voxweave pack <vtt>...` — remux the source media with the VTT(s) added as proper subtitle
-tracks. Pure stream copy (instant, lossless, reversible); each track is titled
-`VoxWeave <Language>` with the container language tag taken from the VTT filename
-(`episode.zh.vtt` → `chi` / "VoxWeave Chinese"), and the first packed track is flagged
-default so players select it.
+`voxweave pack <subtitle>...` — remux the source media with the subtitle file(s)
+(VTT/SRT/ASS) added as proper subtitle tracks. Pure stream copy (instant, lossless,
+reversible); each track is titled `VoxWeave <Language>` with the container language tag
+taken from the filename (`episode.zh.vtt` → `chi` / "VoxWeave Chinese"), and the first
+packed track is flagged default so players select it. ASS inputs keep their styling in
+mkv targets (mp4/webm store text-only codecs, so styling is dropped there).
 
 ```bash
 voxweave pack episode.zh.vtt                    # finds episode.<ext>, keeps its container
@@ -342,9 +348,10 @@ video+audio and existing _text_ subtitle tracks only. HEVC video muxed into mp4 
 
 ### Burn (hard subtitles)
 
-`voxweave burn <vtt>` — render the subtitles into the pixels and write a clean file with
-**all subtitle tracks removed**. A styled ASS is generated at the actual frame size (same
-look as `export`, lyric cues italic), then the video is re-encoded at constant quality with
+`voxweave burn <subtitle>` — render the subtitles (VTT/SRT/ASS) into the pixels and write a
+clean file with **all subtitle tracks removed**. For VTT/SRT input a styled ASS is generated
+at the actual frame size (same look as `export`, lyric cues italic); ASS/SSA input goes to
+libass as-is, keeping its own styling. The video is re-encoded at constant quality with
 hardware acceleration when available: **NVENC** on NVIDIA, **VideoToolbox** on macOS,
 libx264/libx265/libsvt-av1 software fallback. Audio is stream-copied (mp4 targets re-encode
 mp4-incompatible codecs to AAC).

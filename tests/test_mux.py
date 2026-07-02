@@ -23,13 +23,16 @@ def has_seq(cmd, *seq):
 # --- language / title / path helpers ---------------------------------------
 
 
-def test_detect_vtt_language():
-    assert mux.detect_vtt_language(Path("ep.zh.vtt")) == "zh"
-    assert mux.detect_vtt_language(Path("ep.en.vtt")) == "en"
-    assert mux.detect_vtt_language(Path("Show S01E01.ja.vtt")) == "ja"
-    assert mux.detect_vtt_language(Path("ep.vtt")) is None
-    assert mux.detect_vtt_language(Path("ep.sdh.vtt")) is None  # not a language
-    assert mux.detect_vtt_language(Path("ep...vtt")) is None  # interior dots
+def test_detect_subtitle_language():
+    assert mux.detect_subtitle_language(Path("ep.zh.vtt")) == "zh"
+    assert mux.detect_subtitle_language(Path("ep.en.vtt")) == "en"
+    assert mux.detect_subtitle_language(Path("Show S01E01.ja.vtt")) == "ja"
+    assert mux.detect_subtitle_language(Path("ep.vtt")) is None
+    assert mux.detect_subtitle_language(Path("ep.sdh.vtt")) is None  # not a language
+    assert mux.detect_subtitle_language(Path("ep...vtt")) is None  # interior dots
+    assert mux.detect_subtitle_language(Path("ep.zh.srt")) == "zh"
+    assert mux.detect_subtitle_language(Path("ep.ja.ass")) == "ja"
+    assert mux.detect_subtitle_language(Path("ep.ass")) is None
 
 
 def test_track_title():
@@ -148,18 +151,54 @@ def test_pack_rejects_plain_text_draft(tmp_path):
         mux.pack([vtt])
 
 
-def test_pack_rejects_non_vtt(tmp_path):
+def test_pack_rejects_unknown_format(tmp_path):
+    txt = tmp_path / "ep.txt"
+    txt.write_text("hello", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported subtitle format"):
+        mux.pack([txt])
+
+
+def test_burn_rejects_unknown_format(tmp_path):
+    txt = tmp_path / "ep.txt"
+    txt.write_text("hello", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported subtitle format"):
+        mux.burn(txt)
+
+
+def test_pack_accepts_srt_past_the_gate(tmp_path):
+    # .srt passes the format gate and the timed-cue check; it fails later only
+    # because there is no sibling media in tmp_path.
     srt = tmp_path / "ep.srt"
     srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="only .vtt is supported"):
+    with pytest.raises(FileNotFoundError, match="no sibling media"):
         mux.pack([srt])
 
 
-def test_burn_rejects_non_vtt(tmp_path):
+def test_burn_accepts_ass_past_the_gate(tmp_path):
     ass = tmp_path / "ep.ass"
-    ass.write_text("[Script Info]\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="only .vtt is supported"):
+    ass.write_text(
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR,"
+        " MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,hi\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(FileNotFoundError, match="no sibling media"):
         mux.burn(ass)
+
+
+def test_build_pack_cmd_keeps_ass_codec_in_mkv():
+    streams = _streams({"codec_type": "video", "codec_name": "h264"})
+    cmd = mux.build_pack_cmd(
+        Path("ep.mkv"),
+        [Path("ep.zh.ass"), Path("ep.ja.srt")],
+        Path("out.mkv"),
+        container="mkv",
+        source_streams=streams,
+    )
+    i_ass = cmd.index("-c:s:0")
+    i_srt = cmd.index("-c:s:1")
+    assert cmd[i_ass + 1] == "ass"  # ASS input kept native in mkv
+    assert cmd[i_srt + 1] == "srt"
 
 
 # --- burn building blocks ----------------------------------------------------

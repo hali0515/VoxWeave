@@ -1,6 +1,6 @@
-"""Pack (soft-mux) or burn (hard-sub) VTT subtitles into video files.
+"""Pack (soft-mux) or burn (hard-sub) subtitle files (VTT/SRT/ASS) into video files.
 
-``pack`` remuxes the source media with the VTT added as a proper subtitle track
+``pack`` remuxes the source media with the subtitles added as a proper subtitle track
 (stream copy, instant, reversible). ``burn`` renders the subtitles into the
 pixels via a styled ASS + libass filter and re-encodes the video (constant
 quality, hardware encoder when available: NVENC on NVIDIA, VideoToolbox on
@@ -92,11 +92,14 @@ def probe_streams(media: Path) -> list[dict]:
     return json.loads(proc.stdout).get("streams", [])
 
 
-def detect_vtt_language(vtt: Path) -> str | None:
-    """ISO code from a language-tagged VTT filename ("X.zh.vtt" -> "zh"), else None."""
-    stem = Path(vtt).name
-    if stem.lower().endswith(".vtt"):
-        stem = stem[:-4]
+def detect_subtitle_language(sub: Path) -> str | None:
+    """ISO code from a language-tagged subtitle filename ("X.zh.vtt" -> "zh"), else None."""
+    from voxweave.subformats import SUBTITLE_EXTS
+
+    p = Path(sub)
+    stem = p.name
+    if p.suffix.lower() in SUBTITLE_EXTS:
+        stem = stem[: -len(p.suffix)]
     if "." not in stem:
         return None
     return lang.to_iso_or(stem.rsplit(".", 1)[1], None)
@@ -119,7 +122,7 @@ def resolve_media(vtt: Path, media: Path | None) -> Path:
         return Path(media)
     vtt = Path(vtt)
     found = _find_sibling_media(vtt)
-    if found is None and detect_vtt_language(vtt) is not None:
+    if found is None and detect_subtitle_language(vtt) is not None:
         found = _find_sibling_media(swap_ext(vtt, ""))  # drop ".zh" tag and retry
     if found is None:
         raise FileNotFoundError(
@@ -128,12 +131,13 @@ def resolve_media(vtt: Path, media: Path | None) -> Path:
     return found
 
 
-def _timed_vtt_check(vtt: Path) -> None:
-    """Raise early (with the standard hint) when the VTT is a plain-text edit draft."""
+def _timed_subtitle_check(sub: Path) -> None:
+    """Raise early (with the standard hint) when the subtitle file parses to no
+    timestamped cues (e.g. a plain-text VTT edit draft)."""
     from voxweave.export import _timed_rows
-    from voxweave.realign import parse_vtt_blocks
+    from voxweave.subformats import load_subtitle_blocks
 
-    _timed_rows(parse_vtt_blocks(Path(vtt).read_text(encoding="utf-8")))
+    _timed_rows(load_subtitle_blocks(Path(sub)))
 
 
 def default_output(media: Path, container: str, tag: str) -> Path:
@@ -157,6 +161,14 @@ def _default_container(media: Path) -> str:
 # pack — soft-mux subtitle tracks
 
 
+def _packed_sub_codec(sub: Path, container: str) -> str:
+    """Codec for an appended subtitle input: mkv stores ASS/SSA natively (keeps
+    styling); everything else transcodes to the container's text codec."""
+    if container == "mkv" and Path(sub).suffix.lower() in (".ass", ".ssa"):
+        return "ass"
+    return SUB_CODEC[container]
+
+
 def build_pack_cmd(
     media: Path,
     vtts: list[Path],
@@ -165,9 +177,9 @@ def build_pack_cmd(
     container: str,
     source_streams: list[dict],
 ) -> list[str]:
-    """Build the ffmpeg argv that remuxes ``media`` with each VTT appended as a
-    subtitle track (everything stream-copied, new subs transcoded to the
-    container's text codec).
+    """Build the ffmpeg argv that remuxes ``media`` with each subtitle file
+    (VTT/SRT/ASS) appended as a subtitle track (everything stream-copied, new
+    subs transcoded to the container's text codec; ASS into mkv is kept as-is).
 
     mkv targets carry every source stream (including attachments/fonts); mp4 and
     webm targets keep video+audio and only those existing subtitle tracks that
@@ -200,11 +212,17 @@ def build_pack_cmd(
 
     cmd += ["-c", "copy"]
     if container == "mkv":
-        # existing subs stream-copy; only the appended VTTs are transcoded
-        for i in range(len(vtts)):
-            cmd += [f"-c:s:{kept_subs + i}", sub_codec]
+        # existing subs stream-copy; only the appended files are transcoded
+        for i, vtt in enumerate(vtts):
+            cmd += [f"-c:s:{kept_subs + i}", _packed_sub_codec(vtt, container)]
     else:
         cmd += ["-c:s", sub_codec]  # every kept text sub must be transcoded anyway
+        if any(Path(v).suffix.lower() in (".ass", ".ssa") for v in vtts):
+            logger.warning(
+                "ASS styling is lost when packing into %s (stored as %s)",
+                container,
+                sub_codec,
+            )
 
     video = next(
         (s for s in source_streams if s.get("codec_type") == "video"),
@@ -214,7 +232,7 @@ def build_pack_cmd(
         cmd += ["-tag:v", "hvc1"]  # Apple players require the hvc1 brand
 
     for i, vtt in enumerate(vtts):
-        iso = detect_vtt_language(vtt)
+        iso = detect_subtitle_language(vtt)
         spec = f"s:{kept_subs + i}"
         if iso:
             cmd += [f"-metadata:s:{spec}", f"language={lang.to_iso3(iso)}"]
@@ -232,14 +250,15 @@ def pack(
     container: str | None = None,
     output: Path | None = None,
 ) -> Path:
-    """Soft-mux one or more VTTs into the media as subtitle tracks; return the output path."""
+    """Soft-mux one or more subtitle files (VTT/SRT/ASS) into the media as
+    subtitle tracks; return the output path."""
     if not vtts:
-        raise ValueError("at least one VTT is required")
-    from voxweave.pipeline import require_vtt
+        raise ValueError("at least one subtitle file is required")
+    from voxweave.subformats import require_subtitle
 
     for v in vtts:
-        require_vtt(v)
-        _timed_vtt_check(v)
+        require_subtitle(v)
+        _timed_subtitle_check(v)
     src = resolve_media(vtts[0], media)
     cont = container or _default_container(src)
     if cont not in SUB_CODEC:
@@ -472,18 +491,20 @@ def burn(
     font_size: int | None = None,
     output: Path | None = None,
 ) -> Path:
-    """Burn the VTT into the video pixels and write a clean (subtitle-track-free)
-    output; return its path. The styled ASS is generated at the actual frame
-    size so proportions match the export defaults at any resolution."""
+    """Burn the subtitles into the video pixels and write a clean
+    (subtitle-track-free) output; return its path. VTT/SRT inputs are rendered
+    to a styled ASS at the actual frame size so proportions match the export
+    defaults at any resolution; ASS/SSA inputs go to libass as-is, keeping
+    their own styling (--font/--font-size are ignored)."""
     from voxweave.export import _timed_rows, ass_header, render_ass
-    from voxweave.pipeline import require_vtt
-    from voxweave.realign import parse_vtt_blocks
+    from voxweave.subformats import load_subtitle_blocks, require_subtitle
 
     if container not in ("mp4", "mkv"):
         raise ValueError(f"unsupported container {container!r} (choose mp4 or mkv)")
-    require_vtt(vtt)
+    require_subtitle(vtt)
+    native_ass = Path(vtt).suffix.lower() in (".ass", ".ssa")
     src = resolve_media(vtt, media)
-    rows = _timed_rows(parse_vtt_blocks(Path(vtt).read_text(encoding="utf-8")))
+    rows = None if native_ass else _timed_rows(load_subtitle_blocks(Path(vtt)))
 
     streams = probe_streams(src)
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
@@ -502,15 +523,25 @@ def burn(
     q = quality if quality is not None else _DEFAULT_QUALITY.get(enc, 23)
     out = output or default_output(src, container, "burn")
 
-    header = ass_header(width=width, height=height, font=font, font_size=font_size)
-    fd, tmp_name = tempfile.mkstemp(suffix=".ass", prefix="voxweave-burn-")
-    os.close(fd)  # mkstemp fds leak one per call unless closed explicitly
-    tmp_ass = Path(tmp_name)
-    try:
+    tmp_ass: Path | None = None
+    if native_ass:
+        if font != "Arial" or font_size is not None:
+            logger.warning(
+                "ASS input keeps its own styling; --font/--font-size ignored"
+            )
+        ass_path = Path(vtt)
+    else:
+        header = ass_header(width=width, height=height, font=font, font_size=font_size)
+        fd, tmp_name = tempfile.mkstemp(suffix=".ass", prefix="voxweave-burn-")
+        os.close(fd)  # mkstemp fds leak one per call unless closed explicitly
+        tmp_ass = Path(tmp_name)
+        assert rows is not None
         tmp_ass.write_text(render_ass(rows, header=header), encoding="utf-8")
+        ass_path = tmp_ass
+    try:
         cmd = build_burn_cmd(
             src,
-            tmp_ass,
+            ass_path,
             out,
             encoder=enc,
             quality=q,
@@ -521,5 +552,6 @@ def burn(
         logger.info("burning with %s (quality %s, %s)", enc, q, container)
         _run_ffmpeg(cmd, capture=False)  # let ffmpeg -stats stream to the terminal
     finally:
-        tmp_ass.unlink(missing_ok=True)
+        if tmp_ass is not None:
+            tmp_ass.unlink(missing_ok=True)
     return out

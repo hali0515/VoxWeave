@@ -255,11 +255,50 @@ def test_pipeline_translate_writes_sibling(tmp_path, monkeypatch):
     assert "hello" in vtt.read_text(encoding="utf-8")
 
 
-def test_pipeline_translate_rejects_non_vtt(tmp_path):
+def test_pipeline_translate_rejects_unknown_format(tmp_path):
+    txt = tmp_path / "ep.txt"
+    txt.write_text("hello", encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported subtitle format"):
+        pipeline.translate(txt, to="zh")
+
+
+def test_pipeline_translate_srt_mirrors_format(tmp_path, monkeypatch):
     srt = tmp_path / "ep.srt"
-    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="only .vtt is supported"):
-        pipeline.translate(srt, to="zh")
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nhello\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nworld\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline.translate_mod,
+        "translate_cues",
+        lambda payload, **kw: {0: "你好", 1: "世界"},
+    )
+    out = pipeline.translate(srt, to="zh")
+    assert out == tmp_path / "ep.zh.srt"
+    txt = out.read_text(encoding="utf-8")
+    assert "1\n00:00:01,000 --> 00:00:02,000\n你好" in txt
+    assert "2\n00:00:03,000 --> 00:00:04,000\n世界" in txt
+
+
+def test_pipeline_translate_ass_mirrors_format(tmp_path, monkeypatch):
+    ass = tmp_path / "ep.ass"
+    ass.write_text(
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,hello\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline.translate_mod,
+        "translate_cues",
+        lambda payload, **kw: {0: "你好"},
+    )
+    out = pipeline.translate(ass, to="zh")
+    assert out == tmp_path / "ep.zh.ass"
+    txt = out.read_text(encoding="utf-8")
+    assert "[V4+ Styles]" in txt  # rendered as a full ASS script
+    assert "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好" in txt
 
 
 def test_pipeline_translate_fills_missing_with_retry_then_original(

@@ -1,10 +1,12 @@
-"""Export sibling VTT subtitles to SRT and ASS.
+"""Export subtitles between formats (VTT/SRT/ASS in, VTT/SRT/ASS out).
 
 The VTT + JSON pair stays the source of truth; export renders presentation
 formats from it. SRT is a plain re-rendering (inline ``<i>`` tags pass through
 unchanged -- mainstream players honor them). ASS carries a Default dialogue
 style and translates ``<i>``/``</i>`` into ``{\\i1}``/``{\\i0}`` override tags,
 giving styled features (lyrics italics, raised positioning) a native target.
+Foreign SRT/ASS files can also be exported to VTT to enter the voxweave
+editing workflow (they carry no word-level JSON, so align works from scratch).
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from voxweave.realign import parse_vtt_blocks
+from voxweave.realign import render_cues
 
 
 def ass_header(
@@ -81,16 +83,23 @@ def _ass_ts(seconds: float) -> str:
 def _timed_rows(
     blocks: list[dict],
 ) -> list[tuple[float, float, str]]:
-    """Cue blocks -> (start, end, text) rows; raises when the VTT carries no
-    timestamps at all (a plain-text edit draft -- run ``align`` first)."""
+    """Cue blocks -> (start, end, text) rows; raises when the file carries no
+    timestamps at all (a plain-text edit draft -- run ``align`` first).
+
+    Lyric-flagged blocks (parsers strip the music-note wrap into the flag) get
+    their display wrap restored here so renderers see the on-screen text."""
     rows = [
-        (float(b["start"]), float(b["end"]), str(b["text"]))
+        (
+            float(b["start"]),
+            float(b["end"]),
+            f"♪ {b['text']} ♪" if b.get("lyric") else str(b["text"]),
+        )
         for b in blocks
         if b.get("start") is not None and b.get("end") is not None
     ]
     if not rows:
         raise ValueError(
-            "VTT has no cue timestamps (plain-text edit draft?); run 'voxweave align' first"
+            "no cue timestamps found (plain-text edit draft?); run 'voxweave align' first"
         )
     return rows
 
@@ -137,21 +146,31 @@ def render_ass(
     return (header if header is not None else _ASS_HEADER) + "\n".join(events) + "\n"
 
 
-_RENDERERS = {"srt": render_srt, "ass": render_ass}
+def render_vtt_rows(rows: list[tuple[float, float, str]]) -> str:
+    """Render timed rows as WEBVTT (thin adapter over :func:`render_cues`)."""
+    return render_cues([(s, e, t) for s, e, t in rows])
 
 
-def export_subtitles(vtt_path: Path, formats: tuple[str, ...]) -> list[Path]:
-    """Render ``vtt_path`` into each requested format next to it; return the
-    written paths. Unknown format names raise ValueError."""
+_RENDERERS = {"srt": render_srt, "ass": render_ass, "vtt": render_vtt_rows}
+
+
+def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
+    """Render ``sub_path`` (VTT/SRT/ASS/SSA) into each requested format next to
+    it; return the written paths. Unknown format names and a target format equal
+    to the source raise ValueError."""
     from voxweave.pipeline import swap_ext
+    from voxweave.subformats import load_subtitle_blocks
 
     unknown = [f for f in formats if f not in _RENDERERS]
     if unknown:
         raise ValueError(f"unknown export format(s): {', '.join(unknown)}")
-    rows = _timed_rows(parse_vtt_blocks(vtt_path.read_text(encoding="utf-8")))
+    src_fmt = sub_path.suffix.lower().lstrip(".")
+    if src_fmt in formats:
+        raise ValueError(f"{sub_path.name} is already .{src_fmt}; pick another --to")
+    rows = _timed_rows(load_subtitle_blocks(sub_path))
     out: list[Path] = []
     for fmt in dict.fromkeys(formats):  # dedupe, keep order
-        path = swap_ext(vtt_path, f".{fmt}")
+        path = swap_ext(sub_path, f".{fmt}")
         path.write_text(_RENDERERS[fmt](rows), encoding="utf-8")
         out.append(path)
     return out
