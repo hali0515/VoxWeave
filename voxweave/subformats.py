@@ -169,15 +169,40 @@ def read_subtitle_text(path: Path) -> str:
     )
 
 
+def sniff_format(text: str) -> str | None:
+    """Guess the parser family from the first non-empty line: ``"vtt"`` for a
+    WEBVTT header, ``"ass"`` for an ASS/SSA section header ([Script Info],
+    [V4* Styles], or a headerless [Events]); None when undecided (SRT has no
+    magic, so it never sniffs)."""
+    for line in text.lstrip("\ufeff").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low.startswith("webvtt"):
+            return "vtt"
+        if low.startswith(("[script info]", "[v4", "[events]")):
+            return "ass"
+        return None
+    return None
+
+
 def load_subtitle_blocks(path: Path) -> list[dict]:
     """Read and parse a subtitle file by extension -> cue blocks; raise when the
-    format is unsupported or the file yields no cues."""
+    format is unsupported, the content belongs to the other parser family (an
+    ASS file renamed ``.vtt`` would otherwise parse into garbage cues), or the
+    file yields no cues."""
     p = require_subtitle(path)
     text = read_subtitle_text(p)
-    if p.suffix.lower() in (".ass", ".ssa"):
-        blocks = parse_ass_blocks(text)
-    else:  # .vtt and .srt share a parser
-        blocks = parse_vtt_blocks(text)
+    is_ass = p.suffix.lower() in (".ass", ".ssa")
+    sniffed = sniff_format(text)
+    if sniffed is not None and (sniffed == "ass") != is_ass:
+        actual = "ASS/SSA" if sniffed == "ass" else "WebVTT"
+        raise RuntimeError(
+            f"{p.name}: content is {actual} but the extension says"
+            f" {p.suffix.lower().lstrip('.')}; rename the file to its real format"
+        )
+    blocks = parse_ass_blocks(text) if is_ass else parse_vtt_blocks(text)
     if not blocks:
         raise RuntimeError(f"no cues in {p.name}")
     return blocks

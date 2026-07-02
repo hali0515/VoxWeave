@@ -103,6 +103,51 @@ def test_require_subtitle_custom_exts():
         require_subtitle(Path("ep.srt"), exts=(".vtt",))
 
 
+# --- content sniffing (extension vs actual format) ---------------------------
+
+
+def test_load_rejects_ass_content_renamed_vtt(tmp_path):
+    # ASS renamed .vtt used to parse [Script Info] lines into garbage cues and,
+    # via align --apply, could overwrite the file with bogus VTT
+    p = tmp_path / "ep.vtt"
+    p.write_text(ASS_DOC, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ASS/SSA"):
+        load_subtitle_blocks(p)
+
+
+def test_load_rejects_ass_content_renamed_srt(tmp_path):
+    p = tmp_path / "ep.srt"
+    p.write_text(ASS_DOC, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ASS/SSA"):
+        load_subtitle_blocks(p)
+
+
+def test_load_rejects_vtt_content_renamed_ass(tmp_path):
+    p = tmp_path / "ep.ass"
+    p.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="WebVTT"):
+        load_subtitle_blocks(p)
+
+
+def test_load_ass_starting_at_events_still_loads(tmp_path):
+    # headerless-but-valid ASS (no [Script Info]) must not trip the sniffer
+    p = tmp_path / "ep.ass"
+    p.write_text(
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,plain\n",
+        encoding="utf-8",
+    )
+    assert load_subtitle_blocks(p) == [{"text": "plain", "start": 1.0, "end": 2.0}]
+
+
+def test_load_vtt_content_in_srt_is_tolerated(tmp_path):
+    # .vtt and .srt share a parser; a WEBVTT doc named .srt still loads fine
+    p = tmp_path / "ep.srt"
+    p.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
+    assert load_subtitle_blocks(p)[0]["text"] == "hello"
+
+
 # --- encoding tolerance ------------------------------------------------------
 
 SRT_DOC = "1\n00:00:00,000 --> 00:00:01,000\ncafé naïve\n"
