@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import overload
+
+log = logging.getLogger("voxweave")
 
 # 11 languages supported by Qwen3-ForcedAligner; ISO <-> Qwen full name (all lowercase)
 _ISO_TO_NAME = {
@@ -47,7 +50,8 @@ _ISO1_TO_ISO3 = {
 def _canon(raw: str | None) -> str:
     if not raw or not raw.strip():
         raise ValueError("language is required")
-    return raw.strip().lower()
+    # Drop BCP-47 region/script subtags: "en-US"/"zh_CN" -> "en"/"zh".
+    return raw.strip().lower().replace("_", "-").split("-", 1)[0]
 
 
 def is_supported(raw: str) -> bool:
@@ -102,6 +106,8 @@ def to_iso_or(raw: str | None, default: str | None) -> str | None:
 def to_iso3(iso: str) -> str:
     """ISO-639-1 -> ISO-639-3 for uroman/ctc-forced-aligner. Unknown codes pass through unchanged."""
     code = (iso or "").lower()
+    if code not in _ISO1_TO_ISO3:
+        log.warning("unknown language %r; passing through unchanged", code)
     return _ISO1_TO_ISO3.get(code, code)
 
 

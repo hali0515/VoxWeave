@@ -163,6 +163,12 @@ class RichReporter(Reporter):
 def _hint_for(exc: Exception) -> str:
     if isinstance(exc, FileNotFoundError):
         return "File not found, or ffmpeg is not on PATH."
+    if type(exc).__module__.startswith("openai"):
+        return "OpenAI API error: check OPENAI_API_KEY and network access."
+    if "out of memory" in str(exc).lower():
+        return (
+            "GPU out of memory: lower VOXWEAVE_MAX_CHUNK_SEC or pick a smaller --model."
+        )
     if isinstance(exc, RuntimeError):
         return "Pipeline aborted (no speech detected or no alignment result)."
     return ""
