@@ -223,3 +223,126 @@ def test_cli_translate_loads_glossary(tmp_path, monkeypatch):
     res = runner.invoke(cli, ["translate", str(vtt), "--glossary", str(g)])
     assert res.exit_code == 0, res.output
     assert captured["glossary"] == {"A": "甲"}
+
+
+# --- conf [defaults] flag resolution (CLI flag > conf > builtin) ---
+
+
+def _write_conf(tmp_path, body):
+    (tmp_path / "voxweave.conf").write_text(body, encoding="utf-8")
+
+
+def test_process_conf_default_separate_off(tmp_path):
+    _write_conf(tmp_path, "[defaults]\nseparate = false\n")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["separate"] is False
+
+
+def test_process_cli_flag_beats_conf_default(tmp_path):
+    _write_conf(tmp_path, "[defaults]\nseparate = false\n")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, ["--separate", str(media)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["separate"] is True
+
+
+def test_process_conf_default_normalize_on(tmp_path):
+    _write_conf(tmp_path, "[defaults]\nnormalize = true\n")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["normalize"] is True
+
+
+def test_process_no_normalize_beats_conf_default(tmp_path):
+    _write_conf(tmp_path, "[defaults]\nnormalize = true\n")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, ["--no-normalize", str(media)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["normalize"] is False
+
+
+def test_align_conf_default_separate_off(tmp_path):
+    _write_conf(tmp_path, "[defaults]\nseparate = false\n")
+    v = _vtt(tmp_path)
+    with patch("voxweave.pipeline.align", return_value=v) as m:
+        r = CliRunner().invoke(cli, ["align", str(v)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["separate"] is False
+
+
+def test_split_conf_default_timestamps_off(tmp_path):
+    _write_conf(tmp_path, "[defaults]\ntimestamps = false\n")
+    j = tmp_path / "a.json"
+    j.write_text("{}", encoding="utf-8")
+    with patch("voxweave.pipeline.split", return_value=tmp_path / "a.vtt") as m:
+        r = CliRunner().invoke(cli, ["split", str(j)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["timestamps"] is False
+
+
+def test_process_conf_default_vad_mask_sets_env(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.delenv("VOXWEAVE_VAD_EMISSION_MASK", raising=False)
+    _write_conf(tmp_path, "[defaults]\nvad_mask = true\n")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out):
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert os.environ.get("VOXWEAVE_VAD_EMISSION_MASK") == "1"
+
+
+def test_process_no_vad_mask_beats_env(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setenv("VOXWEAVE_VAD_EMISSION_MASK", "1")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out):
+        r = CliRunner().invoke(cli, ["--no-vad-mask", str(media)])
+    assert r.exit_code == 0, r.output
+    assert os.environ.get("VOXWEAVE_VAD_EMISSION_MASK") == "0"
+
+
+def test_process_env_vad_mask_beats_conf_off(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setenv("VOXWEAVE_VAD_EMISSION_MASK", "1")
+    _write_conf(tmp_path, "[defaults]\nvad_mask = false\n")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out):
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert os.environ.get("VOXWEAVE_VAD_EMISSION_MASK") == "1"
+
+
+def test_process_conf_default_diarize_on(tmp_path):
+    _write_conf(tmp_path, "[defaults]\ndiarize = true\n")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["diarize"] is True
+
+
+def test_process_no_diarize_beats_conf_default(tmp_path):
+    _write_conf(tmp_path, "[defaults]\ndiarize = true\n")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, ["--no-diarize", str(media)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["diarize"] is False
+
+
+def test_process_diarize_default_off(tmp_path):
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["diarize"] is False

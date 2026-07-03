@@ -89,6 +89,17 @@ _TEMPLATE = """\
 # ctc = 1        # wav2vec2 CTC emission 30s windows (en aligner)
 # mms = 4        # MMS-300m emission batch (ja aligner, ctc-forced-aligner generate_emissions)
 
+# Default on/off for the boolean pipeline flags. Explicit CLI flags always win
+# (e.g. separate = false here, --separate on the command line for one run).
+[defaults]
+# separate = true      # vocal separation before ASR/alignment (--separate/--no-separate)
+# skip_songs = true    # PANNs music detection + skip before ASR (--skip-songs/--no-skip-songs)
+# normalize = false    # loudnorm on the 16k input (--normalize/--no-normalize)
+# diarize = false      # pyannote speaker diarization; needs voxweave[diarize] + HF token (--diarize/--no-diarize)
+# timestamps = true    # word-level timestamps in the VTT (--timestamps/--no-timestamps)
+# shot_snap = true     # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
+# vad_mask = false     # suppress CTC emissions outside speech spans (--vad-mask/--no-vad-mask)
+
 # Per-language forced-alignment models; unlisted languages use Qwen3-ForcedAligner (built-in default).
 # Values: "mms" (MMS-300m + uroman, full-file single pass; bundled in core) |
 #         HF wav2vec2 id (downloaded to the voxweave align cache ~/.cache/voxweave/align) | torchaudio bundle name (-> torch.hub cache).
@@ -118,6 +129,7 @@ _KNOWN_KEYS = frozenset(
         "fusion",
         "batch",
         "align",
+        "defaults",
     }
 )
 
@@ -319,6 +331,25 @@ def conf_batch(key: str) -> int:
         if isinstance(v, int) and not isinstance(v, bool):
             return max(1, v)
     return _BATCH_DEFAULTS[key]
+
+
+def conf_default_flag(key: str, builtin: bool) -> bool:
+    """Default for the boolean pipeline flag ``key`` from ``[defaults]``.
+
+    Precedence is resolved by the CLI: an explicit CLI flag wins; otherwise this
+    value applies. Non-boolean values are warned about and fall back to
+    ``builtin``.
+    """
+    defaults = _load().get("defaults")
+    if isinstance(defaults, dict) and key in defaults:
+        v = defaults[key]
+        if isinstance(v, bool):
+            return v
+        log.warning(
+            "config [defaults].%s has wrong type (expected boolean), using default",
+            key,
+        )
+    return builtin
 
 
 def align_model_for(iso: str) -> str | None:

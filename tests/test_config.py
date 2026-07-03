@@ -312,3 +312,34 @@ def test_migration_rename_failure_names_old_path(tmp_path, monkeypatch, caplog):
 
     assert str(old) in caplog.text
     assert new.exists()  # still falls back to writing a fresh template
+
+
+# --- [defaults] boolean pipeline flag defaults ---
+
+
+def test_conf_default_flag_from_file(conf_at):
+    conf_at.write_text("[defaults]\nseparate = false\n", encoding="utf-8")
+    assert config.conf_default_flag("separate", True) is False
+
+
+def test_conf_default_flag_true_from_file(conf_at):
+    conf_at.write_text("[defaults]\nvad_mask = true\n", encoding="utf-8")
+    assert config.conf_default_flag("vad_mask", False) is True
+
+
+def test_conf_default_flag_missing_uses_builtin(conf_at):
+    assert config.conf_default_flag("separate", True) is True
+    assert config.conf_default_flag("normalize", False) is False
+
+
+def test_conf_default_flag_wrong_type_warns_and_falls_back(conf_at, caplog):
+    conf_at.write_text('[defaults]\nseparate = "yes"\n', encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_default_flag("separate", True) is True
+    assert "wrong type" in caplog.text
+
+
+def test_default_template_documents_defaults_section(conf_at):
+    config.ensure_default_config()
+    txt = conf_at.read_text(encoding="utf-8")
+    assert "[defaults]" in txt and "# separate = true" in txt

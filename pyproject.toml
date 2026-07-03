@@ -26,6 +26,8 @@ dependencies = [
   "numpy>=1.26,<2.5",
   "click>=8.1",
   "rich>=13",
+  # Rich-rendered --help panels (drop-in click wrapper; pure Python, depends only on click+rich).
+  "rich-click>=1.8",
   # Model downloads (separator / PANNs / MLX snapshots) go through huggingface_hub directly —
   # an explicit core dep so it doesn't rely on qwen-asr/mlx-audio (which live in the extras) to
   # pull it transitively.

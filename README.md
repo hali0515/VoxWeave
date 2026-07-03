@@ -225,14 +225,19 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--model`                      | Local ASR model (default `Qwen3-ASR-0.6B`; `qwen3-asr-1.7B` is more accurate).                                                                                                                                                                                                                           |
 | `--context`                    | ASR bias prompt: names/terms likely to appear (comma or newline separated). Bare term lists are auto-framed as `Proper nouns: ...` for Qwen — a bare list actually _regresses_ accuracy ([details](https://github.com/TypeWhisper/typewhisper-mac/issues/321)); prose or pre-framed text passes through. |
 | `--hybrid`                     | Dual-ASR fusion: Whisper text + Qwen punctuation. Whisper's error bias is the opposite of Qwen's (it hallucinates rather than omits), so use this when Qwen drops uncertain words.                                                                                                                       |
-| `--normalize`                  | Apply loudness normalization (`loudnorm`) to the 16k ASR input — helps when quiet words get dropped; off by default since it also amplifies noise.                                                                                                                                                       |
+| `--normalize/--no-normalize`   | Apply loudness normalization (`loudnorm`) to the 16k ASR input — helps when quiet words get dropped; off by default since it also amplifies noise.                                                                                                                                                       |
 | `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.                                                                                                                                                                                                     |
 | `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export).                                                                                                                                                                                              |
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
 | `--diarize`                    | pyannote speaker diarization: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). Needs `voxweave[diarize]` + an HF token for the gated checkpoint (`VOXWEAVE_HF_TOKEN` / `HF_TOKEN` / conf `hf_token`, or just `hf auth login` once). Speaker turns persist to the sibling JSON, so `voxweave split` replays the formatting without re-running the model. |
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
+| `--vad-mask/--no-vad-mask`     | Suppress CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                    |
 | `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`.                                                                                                                                                                                                  |
+
+The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--timestamps`,
+`--shot-snap`, `--vad-mask`) can have their defaults set persistently via the `[defaults]`
+section of `~/.config/voxweave.conf` — an explicit CLI flag always wins for that run.
 
 </details>
 
@@ -257,7 +262,11 @@ voxweave align episode.vtt --no-separate   # align on the original audio (clean 
 | `--media`       | Source media path (default: same-name file in the same directory). |
 | `--language`    | Force language (ISO code or full name); default: read from JSON.   |
 | `--no-separate` | Align on the original audio instead of separated vocals.           |
-| `--normalize`   | Apply `loudnorm` to the 16k alignment input.                       |
+| `--normalize/--no-normalize` | Apply `loudnorm` to the 16k alignment input.          |
+| `--vad-mask/--no-vad-mask`   | Suppress CTC emissions outside the JSON's `vad_speech` spans (see the transcribe option of the same name). |
+
+`--separate`, `--normalize`, and `--vad-mask` also honor the `[defaults]` section of
+`~/.config/voxweave.conf` when not passed explicitly.
 
 </details>
 
@@ -498,6 +507,17 @@ load_strategy = "sum"
 separate = 1                             # vocal separation (MelBandRoformer) 8s windows
 ctc      = 1                             # wav2vec2 CTC emission 30s windows (en aligner)
 mms      = 4                             # MMS-300m emission batch (ja aligner)
+
+# Default on/off for the boolean pipeline flags. An explicit CLI flag always wins
+# (e.g. separate = false here, --separate on the command line for one run).
+[defaults]
+separate   = true                        # vocal separation before ASR/alignment (--separate/--no-separate)
+skip_songs = true                        # PANNs music detection + skip before ASR (--skip-songs/--no-skip-songs)
+normalize  = false                       # loudnorm on the 16k input (--normalize/--no-normalize)
+diarize    = false                       # pyannote speaker diarization (--diarize/--no-diarize; needs voxweave[diarize] + HF token)
+timestamps = true                        # word-level timestamps in the VTT (--timestamps/--no-timestamps)
+shot_snap  = true                        # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
+vad_mask   = false                       # suppress CTC emissions outside speech (--vad-mask/--no-vad-mask)
 
 # dual-ASR fusion sub-models — only consulted when running with --hybrid.
 [fusion]

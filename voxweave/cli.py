@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-import click
+import rich_click as click
 
 from voxweave import config, pipeline
 from voxweave.ui import (
@@ -31,6 +31,23 @@ def _run(fn, *, reporter: bool = True):
     except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
         error_panel(exc)
         sys.exit(1)
+
+
+def _flag(value: bool | None, key: str, builtin: bool) -> bool:
+    """Resolve a tri-state boolean flag: explicit CLI value > conf ``[defaults].<key>`` > builtin."""
+    return value if value is not None else config.conf_default_flag(key, builtin)
+
+
+def _apply_vad_mask(vad_mask: bool | None) -> None:
+    """Propagate the --vad-mask flag to VOXWEAVE_VAD_EMISSION_MASK (read by the backend
+    at align time). Precedence: explicit CLI flag > pre-set env > conf [defaults].vad_mask."""
+    env = "VOXWEAVE_VAD_EMISSION_MASK"
+    if vad_mask is not None:
+        os.environ[env] = "1" if vad_mask else "0"
+    elif not os.environ.get(env, "").strip() and config.conf_default_flag(
+        "vad_mask", False
+    ):
+        os.environ[env] = "1"
 
 
 def llm_options(model_envvar: str, model_help: str):
@@ -76,8 +93,12 @@ def _resolve_llm(
     return api_key, kwargs
 
 
-class DefaultGroup(click.Group):
+class DefaultGroup(click.RichGroup):
     """`voxweave <media>` runs transcription without an explicit subcommand.
+
+    Subclasses RichGroup (not the plain re-exported click.Group) so the group and
+    its subcommands render rich help panels — rich-click only defaults to RichGroup
+    when no explicit ``cls=`` is passed.
 
     ``default_cmd`` is not in ``self.commands`` (invisible in help, not callable as
     `voxweave transcribe`). When the first token is not a known subcommand or group
@@ -155,8 +176,9 @@ def cli(verbose: bool) -> None:
 )
 @click.option(
     "--separate/--no-separate",
-    default=True,
-    help="Separate vocals to remove BGM (default: on; use --no-separate for clean speech to skip GPU separation).",
+    default=None,
+    help="Separate vocals to remove BGM (default: on, or conf [defaults].separate;"
+    " use --no-separate for clean speech to skip GPU separation).",
 )
 @click.option(
     "--debug",
@@ -166,16 +188,17 @@ def cli(verbose: bool) -> None:
     " inspection (implies local mode: artifacts are only written during local orchestration).",
 )
 @click.option(
-    "--normalize",
-    is_flag=True,
-    default=False,
-    help="Apply loudnorm to the 16k ASR input; useful for uneven volume or quiet post-separation audio (may boost noise).",
+    "--normalize/--no-normalize",
+    default=None,
+    help="Apply loudnorm to the 16k ASR input; useful for uneven volume or quiet"
+    " post-separation audio (may boost noise). Default: off, or conf [defaults].normalize.",
 )
 @click.option(
     "--skip-songs/--no-skip-songs",
-    default=True,
-    help="Use PANNs to detect and skip music segments on separated vocals before ASR (default: on;"
-    " prevents OP/ED/insert song hallucinations). Use --no-skip-songs to transcribe song lyrics or pure music.",
+    default=None,
+    help="Use PANNs to detect and skip music segments on separated vocals before ASR"
+    " (default: on, or conf [defaults].skip_songs; prevents OP/ED/insert song hallucinations)."
+    " Use --no-skip-songs to transcribe song lyrics or pure music.",
 )
 @click.option(
     "--keep-lyrics",
@@ -194,12 +217,12 @@ def cli(verbose: bool) -> None:
     " original mix (main VTT/JSON untouched).",
 )
 @click.option(
-    "--diarize",
-    is_flag=True,
-    default=False,
+    "--diarize/--no-diarize",
+    default=None,
     help="Run pyannote speaker diarization: two-speaker cues become Netflix dual-speaker"
     " events (-line per speaker), 3+ speaker cues split at speaker boundaries. Needs"
-    " 'voxweave[diarize]' + an HF token for the gated checkpoint (VOXWEAVE_HF_TOKEN).",
+    " 'voxweave[diarize]' + an HF token for the gated checkpoint (VOXWEAVE_HF_TOKEN)."
+    " Default: off, or conf [defaults].diarize.",
 )
 @click.option(
     "--min-speakers",
@@ -234,49 +257,54 @@ def cli(verbose: bool) -> None:
 )
 @click.option(
     "--timestamps/--no-timestamps",
-    default=True,
-    help="Include word-level timestamps in VTT (default: on, same precision as align output, ready to use)."
+    default=None,
+    help="Include word-level timestamps in VTT (default: on, or conf [defaults].timestamps;"
+    " same precision as align output, ready to use)."
     " Use --no-timestamps for a plain-text editing draft; run align afterwards to re-assign timing.",
 )
 @click.option(
     "--shot-snap/--no-shot-snap",
-    default=True,
+    default=None,
     help="Detect video shot changes (one downscaled ffmpeg pass) and snap nearby cue"
     " boundaries onto the cuts, so subtitles change on the cut instead of flashing across"
-    " it (default: on; audio-only media skips automatically). Cut times persist to the"
-    " sibling JSON for `split` re-runs; window via VOXWEAVE_SHOT_SNAP_MS.",
+    " it (default: on, or conf [defaults].shot_snap; audio-only media skips automatically)."
+    " Cut times persist to the sibling JSON for `split` re-runs; window via VOXWEAVE_SHOT_SNAP_MS.",
 )
 @click.option(
-    "--vad-mask",
-    is_flag=True,
-    default=False,
+    "--vad-mask/--no-vad-mask",
+    default=None,
     help="Suppress CTC emissions outside speech spans during alignment so words cannot"
     " park in music/silence (recommended for sparse-dialogue movies with songs; keep"
-    " off when VAD may misjudge sung/whispered speech). Same as"
-    " VOXWEAVE_VAD_EMISSION_MASK=1.",
+    " off when VAD may misjudge sung/whispered speech). Default: off, or conf"
+    " [defaults].vad_mask; same as VOXWEAVE_VAD_EMISSION_MASK=1.",
 )
 def cmd_transcribe(
     media: Path,
     language: str | None,
     model: str | None,
-    separate: bool,
+    separate: bool | None,
     debug: bool,
-    normalize: bool,
-    skip_songs: bool,
+    normalize: bool | None,
+    skip_songs: bool | None,
     keep_lyrics: bool,
     sdh: bool,
-    diarize: bool,
+    diarize: bool | None,
     min_speakers: int | None,
     max_speakers: int | None,
     context: str | None,
     hybrid: bool,
-    timestamps: bool,
-    shot_snap: bool,
-    vad_mask: bool,
+    timestamps: bool | None,
+    shot_snap: bool | None,
+    vad_mask: bool | None,
 ) -> None:
     """Media -> (vocal separation) -> VAD -> local ASR/alignment -> smart_split -> write VTT+JSON."""
-    if vad_mask:  # flag form of the env knob; backend reads the env at align time
-        os.environ["VOXWEAVE_VAD_EMISSION_MASK"] = "1"
+    _apply_vad_mask(vad_mask)
+    separate = _flag(separate, "separate", True)
+    normalize = _flag(normalize, "normalize", False)
+    skip_songs = _flag(skip_songs, "skip_songs", True)
+    diarize = _flag(diarize, "diarize", False)
+    timestamps = _flag(timestamps, "timestamps", True)
+    shot_snap = _flag(shot_snap, "shot_snap", True)
     out = _run(
         lambda rep: pipeline.process(
             media,
@@ -324,16 +352,18 @@ cli.default_cmd = (
 @click.option("--max-lines", type=int, default=None, help="Maximum lines per cue.")
 @click.option(
     "--timestamps/--no-timestamps",
-    default=True,
-    help="Include timestamps in VTT (default: on; use --no-timestamps for a plain-text editing draft).",
+    default=None,
+    help="Include timestamps in VTT (default: on, or conf [defaults].timestamps;"
+    " use --no-timestamps for a plain-text editing draft).",
 )
 def cmd_split(
     json_path: Path,
     max_line_length: int | None,
     max_lines: int | None,
-    timestamps: bool,
+    timestamps: bool | None,
 ) -> None:
     """Offline re-layout: re-run smart_split from <stem>.json without running any models."""
+    timestamps = _flag(timestamps, "timestamps", True)
     kwargs: dict = {}
     if max_line_length is not None:
         kwargs["max_line_length"] = max_line_length
@@ -361,40 +391,40 @@ def cmd_split(
 )
 @click.option(
     "--separate/--no-separate",
-    default=True,
-    help="Use separated vocals at 16k for alignment (default: on, prevents BGM interference;"
-    " cache hit skips separation; use --no-separate for clean audio sources).",
+    default=None,
+    help="Use separated vocals at 16k for alignment (default: on, or conf"
+    " [defaults].separate; prevents BGM interference; cache hit skips separation;"
+    " use --no-separate for clean audio sources).",
 )
 @click.option(
-    "--normalize",
-    is_flag=True,
-    default=False,
-    help="Apply loudnorm to the 16k alignment input.",
+    "--normalize/--no-normalize",
+    default=None,
+    help="Apply loudnorm to the 16k alignment input (default: off, or conf [defaults].normalize).",
 )
 @click.option(
-    "--vad-mask",
-    is_flag=True,
-    default=False,
+    "--vad-mask/--no-vad-mask",
+    default=None,
     help="Suppress CTC emissions outside the JSON's vad_speech spans so words cannot"
     " park in music/silence (recommended for sparse-dialogue movies with songs;"
-    " keep off when VAD may misjudge sung/whispered speech). Same as"
-    " VOXWEAVE_VAD_EMISSION_MASK=1.",
+    " keep off when VAD may misjudge sung/whispered speech). Default: off, or conf"
+    " [defaults].vad_mask; same as VOXWEAVE_VAD_EMISSION_MASK=1.",
 )
 def cmd_align(
     vtt: Path,
     media: Path | None,
     language: str | None,
-    separate: bool,
-    normalize: bool,
-    vad_mask: bool,
+    separate: bool | None,
+    normalize: bool | None,
+    vad_mask: bool | None,
 ) -> None:
     """Re-align after editing: run forced alignment on edited VTT text against the original audio,
     overwrite VTT with timestamps, and update JSON.
 
     **Loads alignment/separation models locally** (in-process PyTorch, see voxweave.backend); no endpoint calls.
     """
-    if vad_mask:  # flag form of the env knob; backend reads the env at align time
-        os.environ["VOXWEAVE_VAD_EMISSION_MASK"] = "1"
+    _apply_vad_mask(vad_mask)
+    separate = _flag(separate, "separate", True)
+    normalize = _flag(normalize, "normalize", False)
     out = _run(
         lambda rep: pipeline.align(
             vtt,

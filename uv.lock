@@ -3835,6 +3835,20 @@ wheels = [
 ]
 
 [[package]]
+name = "rich-click"
+version = "1.9.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-8-voxweave-cuda' and extra == 'extra-8-voxweave-mps')" },
+    { name = "rich" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f7/ea/21e4867ea0ef881ffd4c0550fc21a061435e50d6324bcd034396633cbc18/rich_click-1.9.8.tar.gz", hash = "sha256:4008f921da88b5d91646c134ec881c1500e5a6b3f093e90e8f29400e09608371", size = 75363, upload-time = "2026-05-28T19:54:59.144Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6d/97/a87901aef6b7e7e4a34c6dd6cc17dca8594a592ef9d9dd765fca2b7facf7/rich_click-1.9.8-py3-none-any.whl", hash = "sha256:12873865396e6927835d4eabb1cc3996edcd65b7ac9b2391a29eca4f335a2f93", size = 72189, upload-time = "2026-05-28T19:54:57.867Z" },
+]
+
+[[package]]
 name = "rotary-embedding-torch"
 version = "0.6.5"
 source = { registry = "https://pypi.org/simple" }
@@ -4899,6 +4913,7 @@ dependencies = [
     { name = "pysbd" },
     { name = "pyyaml" },
     { name = "rich" },
+    { name = "rich-click" },
     { name = "rotary-embedding-torch" },
     { name = "silero-vad" },
     { name = "soundfile" },
@@ -4954,6 +4969,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6" },
     { name = "qwen-asr", marker = "extra == 'cuda'", specifier = ">=0.0.4" },
     { name = "rich", specifier = ">=13" },
+    { name = "rich-click", specifier = ">=1.8" },
     { name = "rotary-embedding-torch", specifier = ">=0.6" },
     { name = "silero-vad", specifier = ">=5" },
     { name = "soundfile", specifier = ">=0.12" },
