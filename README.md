@@ -149,11 +149,15 @@ Japanese/CJK), layout, song-skip — plus CJK line-break and translation are bak
 **From source** (for development or pulling new code):
 
 ```bash
-make cuda          # NVIDIA/Linux  — uv tool install --torch-backend=cu128 ".[cuda]"
-make mps           # Apple Silicon — force-reinstall ".[mps]" (always picks up new source)
-make reinstall     # after pulling new code (honours VARIANT, default cuda)
+make install       # auto-detects the platform: Apple Silicon -> [mps], anything else -> [cuda]
+                   # (cu128 torch wheel with an NVIDIA driver, CPU wheel without); includes
+                   # [diarize] by default and keeps whatever extras the existing venv already has
+make reinstall     # after pulling new code (same auto-detection, preserves installed extras)
 make uninstall
 ```
+
+Override the detection per invocation: `make install VARIANT=mps`, `make install EXTRAS=`
+(no extras), `make install TORCH_BACKEND=cpu`.
 
 <details>
 <summary><b>Extras & what each pulls</b></summary>
