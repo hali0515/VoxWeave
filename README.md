@@ -84,7 +84,8 @@ breaks) handles Chinese/Japanese/English as first-class.
 - **CJK-aware.** Japanese aligns with MMS-300m + uroman (zero-OOV, immune to the per-cue
   drift that breaks wav2vec2-xlsr on rare kanji); line breaks use BudouX phrase atoms + jieba.
 - **Optional LLM steps.** `correct` cleans up ASR typos/garbled names before alignment;
-  `translate` does whole-episode context-aware translation while preserving cue count.
+  `translate` does whole-episode context-aware translation while preserving cue count
+  (dual-speaker `-line`/`-line` cues are translated one speaker at a time and re-assembled).
 - **Ship the result.** `pack` soft-muxes finished VTTs into the media as titled subtitle
   tracks (instant stream copy); `burn` hardcodes them at constant quality with NVENC /
   VideoToolbox acceleration, matching the source bit depth.
@@ -171,6 +172,10 @@ Override the detection per invocation: `make install VARIANT=mps`, `make install
   (Apple Silicon/macOS): `mlx-audio` + plain `onnxruntime`. Declared **conflicting** in
   `[tool.uv]` (incompatible `transformers` pins), so `uv` resolves each in its own fork — pick one
   per host (`make dev VARIANT=mps` on Apple Silicon).
+- **`[diarize]`** (stackable on either variant): `pyannote-audio` 3.x for `--diarize`. The
+  `pyannote/speaker-diarization-3.1` checkpoint is HF-gated — accept its model-card conditions
+  (and segmentation-3.0's) once, then any stored token works (`hf auth login` is enough).
+  Stay on pyannote 3.x: 4.x peaks ~9.5 GB VRAM on the same model (pyannote-audio#1963).
 - The device is auto-detected at runtime (cuda → mps → cpu); override with `VOXWEAVE_DEVICE`. On
   mps the MLX backend is selected automatically; force it either way with `VOXWEAVE_BACKEND=mlx|torch`.
 - **Development**: `make dev` (= `uv sync --extra cuda --dev`; on Apple Silicon use
@@ -224,7 +229,8 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.                                                                                                                                                                                                     |
 | `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export).                                                                                                                                                                                              |
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
-| `--diarize`                    | pyannote speaker diarization: two-speaker cues become dual-speaker events (`-line` per speaker). Needs `voxweave[diarize]` + an HF token (`VOXWEAVE_HF_TOKEN`) for the gated checkpoint.                                                                                                                 |
+| `--diarize`                    | pyannote speaker diarization: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). Needs `voxweave[diarize]` + an HF token for the gated checkpoint (`VOXWEAVE_HF_TOKEN` / `HF_TOKEN` / conf `hf_token`, or just `hf auth login` once). Speaker turns persist to the sibling JSON, so `voxweave split` replays the formatting without re-running the model. |
+| `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
 | `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`.                                                                                                                                                                                                  |
 
