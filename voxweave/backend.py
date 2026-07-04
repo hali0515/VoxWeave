@@ -561,6 +561,7 @@ def _full_pass_units(
     texts: list[str],
     align_lang: str | None,
     speech_spans: list[tuple[float, float]] | None = None,
+    song_spans: list[tuple[float, float]] | None = None,
 ) -> list[list[dict]] | None:
     """Full-file alignment for CTC/MMS languages; None -> caller aligns per chunk.
 
@@ -590,13 +591,21 @@ def _full_pass_units(
     from voxweave.timestamps import shift_units
 
     try:
-        # crop_to_envelope=True is safe ONLY here: these bounds are fresh VAD chunk windows
-        # computed on this very audio (post-excise), so cropping to their envelope removes a
-        # leading/trailing skipped song without trusting any external timestamp. The align
-        # subcommand passes input-VTT bounds and must keep the default False (routing-free).
+        # crop_to_envelope=True and mute_spans are safe ONLY here: bounds are fresh VAD
+        # chunk windows and song_spans the intervals this run's song detection excised —
+        # both computed on this very audio, no external timestamp trusted. The align
+        # subcommand passes input-VTT bounds and must keep the defaults (routing-free,
+        # unmuted). Muting kills mid-file smear the envelope crop cannot reach: an
+        # excised song has no transcript by construction, so zeroing its samples only
+        # removes acoustic bait for neighbouring sentences.
         if _is_mms_name(model_name):
             blocks = align_blocks_full_mms(
-                full_wav, texts, iso, bounds=list(bounds), crop_to_envelope=True
+                full_wav,
+                texts,
+                iso,
+                bounds=list(bounds),
+                crop_to_envelope=True,
+                mute_spans=song_spans,
             )
         else:
             blocks = align_blocks_full_ctc(
@@ -607,6 +616,7 @@ def _full_pass_units(
                 bounds=list(bounds),
                 speech_spans=speech_spans,
                 crop_to_envelope=True,
+                mute_spans=song_spans,
             )
     except Exception as e:  # noqa: BLE001 -- any failure falls back to per-chunk alignment
         log.warning(
@@ -687,6 +697,7 @@ def transcribe_chunks(
     full_wav: Path | None = None,
     bounds: list[tuple[float, float]] | None = None,
     speech_spans: list[tuple[float, float]] | None = None,
+    song_spans: list[tuple[float, float]] | None = None,
 ) -> list[tuple[str | None, str, list[dict]]]:
     """Transcribe a list of chunks -> [(lang, text, units)] matching the transcribe_align contract.
 
@@ -749,6 +760,7 @@ def transcribe_chunks(
             [t for _, t, _ in w_asr],
             _weighted_align_lang(w_asr),
             speech_spans=speech_spans,
+            song_spans=song_spans,
         )
         full_q = _full_pass_units(
             full_wav,
@@ -756,6 +768,7 @@ def transcribe_chunks(
             [t for _, t, _ in q_asr],
             _weighted_align_lang(q_asr),
             speech_spans=speech_spans,
+            song_spans=song_spans,
         )
         out: list[tuple[str | None, str, list[dict]]] = []
         for i, (w, (dw, tw, aw), (dq, tq, aq)) in enumerate(
@@ -801,6 +814,7 @@ def transcribe_chunks(
         [t for _, t, _ in asr_out],
         _weighted_align_lang(asr_out),
         speech_spans=speech_spans,
+        song_spans=song_spans,
     )
     out2: list[tuple[str | None, str, list[dict]]] = []
     for i, (w, (det, text, align_lang)) in enumerate(zip(wav_paths, asr_out)):

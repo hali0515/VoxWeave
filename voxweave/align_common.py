@@ -111,6 +111,50 @@ def _distribute_units(flat: list[dict], texts: list[str], iso: str) -> list[list
     return out
 
 
+# Song muting: excised song intervals are removed from the ASR text and chunk bounds but
+# stay in the waveform handed to the full-file aligner. The envelope crop removes leading/
+# trailing untranscribed regions, but a MID-FILE excised song remains acoustically present:
+# sung vocals emit spurious char probabilities and neighbouring sentence fragments smear
+# into the song (observed: 8 shard cues sprinkled through a 96s OP). Muting is decisive
+# where the soft VAD mask is not: an excised interval BY CONSTRUCTION has no transcript, so
+# zeroing its samples cannot displace any legitimate word — blanks/stars absorb the silence.
+# Short linear fades avoid step transients at the cut edges. Transcribe-path only (the
+# spans come from this run's song detection); the align subcommand has no fresh spans.
+MUTE_FADE_S = 0.05
+
+
+def mute_spans_in_wav(wav, sr: int, spans: Sequence[tuple[float, float]]):
+    """Zero ``wav`` samples inside ``spans`` (absolute seconds), with linear edge fades.
+
+    Mutates and returns ``wav``. Accepts a 1-D torch tensor or numpy array (only slicing,
+    ``shape[-1]`` and in-place arithmetic are used). Out-of-range spans are clamped; empty
+    or degenerate spans are ignored.
+    """
+    import numpy as np
+
+    n = wav.shape[-1]
+    for a, b in spans:
+        ia, ib = max(0, int(a * sr)), min(n, int(b * sr))
+        if ib <= ia:
+            continue
+        fade = min(int(MUTE_FADE_S * sr), (ib - ia) // 2)
+        wav[ia + fade : ib - fade if fade else ib] = 0
+        if fade:
+            if isinstance(wav, np.ndarray):
+                down = np.linspace(1.0, 0.0, fade, dtype=wav.dtype)
+                up = np.linspace(0.0, 1.0, fade, dtype=wav.dtype)
+            else:  # torch tensor
+                import torch
+
+                down = torch.linspace(
+                    1.0, 0.0, fade, dtype=wav.dtype, device=wav.device
+                )
+                up = torch.linspace(0.0, 1.0, fade, dtype=wav.dtype, device=wav.device)
+            wav[ia : ia + fade] = wav[ia : ia + fade] * down
+            wav[ib - fade : ib] = wav[ib - fade : ib] * up
+    return wav
+
+
 # Non-speech emission masking (stable-ts analogue): outside VAD speech spans, non-blank
 # log-probs are penalized so the global DP cannot park words inside music/silence — the
 # residual "Pattern A" tail slide on sparse-dialogue movies. Soft penalty (not -inf): a

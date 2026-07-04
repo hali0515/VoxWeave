@@ -22,6 +22,7 @@ from voxweave.align_common import (
     _dp_chunked_pass,
     _load_mono,
     _strip_trailing_punct,
+    mute_spans_in_wav,
 )
 from voxweave.runtime import _empty_cache, _hf_download, _require, get_device
 
@@ -178,6 +179,7 @@ def align_blocks_full_mms(
     iso: str,
     bounds: Sequence[tuple[float, float] | None] | None = None,
     crop_to_envelope: bool = False,
+    mute_spans: Sequence[tuple[float, float]] | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass MMS alignment (equivalent to whisperx align_ctc).
 
@@ -199,6 +201,11 @@ def align_blocks_full_mms(
     ~180-call heap-corruption regime.
     """
     wav = _read_wav_16k(wav_path)
+    if mute_spans:
+        # excised song intervals: no transcript belongs there by construction, so zeroing
+        # them only removes the acoustic bait that smears neighbouring sentences (mid-file
+        # songs survive the envelope crop). Transcribe-path only (fresh spans of this run).
+        wav = mute_spans_in_wav(wav, MMS_SR, mute_spans)
     norm = [(t or "").strip() for t in texts]
 
     # offset_s is part of the _dp_chunked_pass pass_fn contract (used by the CTC

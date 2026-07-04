@@ -79,3 +79,33 @@ def test_dp_chunked_pass_no_bounds_runs_full_pass():
 
     assert rec["len"] == wav.shape[-1]
     assert rec["offset"] == 0.0
+
+
+def test_mute_spans_zeroes_interior_with_fades_numpy():
+    sr = 16000
+    wav = np.ones(int(10.0 * sr), dtype="float32")
+    out = align_common.mute_spans_in_wav(wav, sr, [(2.0, 5.0)])
+    assert out is wav  # in-place
+    fade = int(align_common.MUTE_FADE_S * sr)
+    ia, ib = int(2.0 * sr), int(5.0 * sr)
+    assert wav[ia + fade : ib - fade].max() == 0.0  # interior fully muted
+    assert wav[ia] == 1.0 and wav[ia + fade - 1] < 0.01  # fade-out into the span
+    assert wav[ib - 1] > 0.99 and wav[ib - fade] < 0.01  # fade-in out of the span
+    assert wav[:ia].min() == 1.0 and wav[ib:].min() == 1.0  # outside untouched
+
+
+def test_mute_spans_torch_and_clamping():
+    import torch
+
+    sr = 100
+    wav = torch.ones(1000)
+    align_common.mute_spans_in_wav(wav, sr, [(-5.0, 2.0), (9.0, 99.0), (5.0, 5.0)])
+    assert float(wav[50]) == 0.0  # clamped leading span muted
+    assert float(wav[950]) == 0.0  # clamped trailing span muted
+    assert float(wav[400]) == 1.0  # untouched middle; degenerate span ignored
+
+
+def test_mute_spans_empty_noop():
+    wav = np.ones(100, dtype="float32")
+    align_common.mute_spans_in_wav(wav, 100, [])
+    assert wav.min() == 1.0

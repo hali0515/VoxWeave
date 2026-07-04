@@ -24,6 +24,7 @@ from voxweave.align_common import (
     _mask_emissions_outside_speech,
     _strip_trailing_punct,
     interp_missing,
+    mute_spans_in_wav,
 )
 from voxweave.runtime import _empty_cache, get_device
 
@@ -327,6 +328,7 @@ def align_blocks_full_ctc(
     bounds: Sequence[tuple[float, float] | None] | None = None,
     speech_spans: list[tuple[float, float]] | None = None,
     crop_to_envelope: bool = False,
+    mute_spans: Sequence[tuple[float, float]] | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
 
@@ -348,6 +350,10 @@ def align_blocks_full_ctc(
     nospace = iso in NO_SPACE_LANGS
     norm = [(t or "").strip() for t in texts]
     wav = _load_mono(wav_path, al.sr)
+    if mute_spans:
+        # excised song intervals (see align_blocks_full_mms): no transcript belongs there,
+        # muting only removes the acoustic bait that smears neighbouring sentences.
+        wav = mute_spans_in_wav(wav, al.sr, mute_spans)
 
     def _pass(w, sub: list[str], offset_s: float = 0.0) -> list[list[dict]]:
         spans_rel = None

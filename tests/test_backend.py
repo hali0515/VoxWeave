@@ -874,7 +874,14 @@ def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
     seen = {}
 
     def _full(
-        wav, texts, iso, model, bounds=None, speech_spans=None, crop_to_envelope=False
+        wav,
+        texts,
+        iso,
+        model,
+        bounds=None,
+        speech_spans=None,
+        crop_to_envelope=False,
+        mute_spans=None,
     ):
         seen.update(
             wav=wav,
@@ -884,6 +891,7 @@ def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
             bounds=bounds,
             speech_spans=speech_spans,
             crop_to_envelope=crop_to_envelope,
+            mute_spans=mute_spans,
         )
         # absolute units, one per chunk
         return [
@@ -899,6 +907,7 @@ def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
     full.write_bytes(b"x")
     bounds = [(10.0, 120.0), (130.0, 240.0)]
     spans = [(10.0, 60.0), (130.0, 200.0)]
+    songs = [(60.0, 120.0)]
     out = backend.transcribe_chunks(
         wavs,
         None,
@@ -906,12 +915,15 @@ def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
         full_wav=full,
         bounds=bounds,
         speech_spans=spans,
+        song_spans=songs,
     )
     assert seen["wav"] is full and seen["bounds"] == bounds
     assert seen["speech_spans"] == spans  # VAD spans reach the full-pass aligner
     # transcribe path opts in: bounds here are fresh VAD chunk windows (trusted), unlike
     # the align subcommand whose input-VTT bounds must never crop (routing-free).
     assert seen["crop_to_envelope"] is True
+    # excised song intervals reach the aligner for waveform muting (mid-file smear guard)
+    assert seen["mute_spans"] == songs
     assert seen["texts"] == ["hi there", "hi there"] and seen["iso"] == "en"
     # absolute -> chunk-relative: each chunk's units shifted by -bounds[i].start
     assert out[0][2] == [{"text": "hi", "start": 0.5, "end": 1.0}]
