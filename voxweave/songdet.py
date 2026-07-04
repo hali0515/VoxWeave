@@ -60,6 +60,12 @@ SONG_CORE_MERGE_SEC = float(os.environ.get("VOXWEAVE_SONG_CORE_MERGE_SEC", "15.0
 # out together with its flanking silence, and dialogue words are never bisected.
 SNAP_SEC = 1.5
 MIN_KEEP_SEC = 0.4  # excised remainders shorter than this are noise shards, dropped
+# Speech rescue: silero occasionally scores real dialogue far below threshold for many seconds
+# (observed: a 14s theatrical cold open at speech-prob < 0.25 while PANNs scores the same
+# separated audio 0.66-0.83 Speech). A PANNs clean-dialogue stretch of at least this length
+# with NO waveform-VAD coverage is a genuine miss and is rescued into the chunk stream;
+# shorter remainders are inter-sentence pauses (PANNs 2s windows blur them) and stay out.
+SPEECH_RESCUE_MIN_SEC = float(os.environ.get("VOXWEAVE_SPEECH_RESCUE_MIN_S", "3.0"))
 
 _model = None  # AudioTagging singleton — lazy-loaded, reused within the process
 
@@ -490,6 +496,30 @@ def subtract_spans(
         if cur < b:
             out.append((cur, b))
     return out
+
+
+def rescue_speech_segments(
+    speech_spans: list[tuple[float, float]],
+    segs: list[dict],
+    *,
+    min_sec: float = SPEECH_RESCUE_MIN_SEC,
+) -> list[dict]:
+    """Synthetic segments for PANNs clean-dialogue stretches the waveform VAD missed.
+
+    silero can score real dialogue far below threshold for many seconds (theatrical
+    delivery; observed on a 14s cold open) while PANNs Speech on the same separated
+    vocals is unambiguous. Remainders of ``speech_spans`` not covered by ``segs`` that
+    are at least ``min_sec`` long become rescue segments so the chunk stream (and thus
+    ASR) covers them. Sub-``min_sec`` remainders are inter-sentence pauses — PANNs 2s
+    windows blur across them — and are NOT rescued (they would only reshape voiced
+    blocks and chunk packing without adding speech).
+    """
+    cover = [(s["start"], s["end"]) for s in segs]
+    return [
+        {"start": a, "end": b}
+        for a, b in subtract_spans(speech_spans, cover)
+        if b - a >= min_sec
+    ]
 
 
 def window_probs(

@@ -444,3 +444,37 @@ def test_group_segments_no_spans():
     segs = [{"start": 0.0, "end": 5.0}]
     assert group_segments_by_spans(segs, []) == [segs]
     assert group_segments_by_spans([], [(1.0, 2.0)]) == []
+
+
+def test_rescue_speech_segments_recovers_uncovered_island():
+    # Meido cold open: PANNs clean-speech 2-16.5 with only a fragment of silero coverage;
+    # the uncovered >=3s remainders become rescue segments so ASR chunks cover them.
+    from voxweave.songdet import rescue_speech_segments
+
+    speech_spans = [(2.0, 16.5)]
+    segs = [{"start": 10.7, "end": 11.3}, {"start": 16.3, "end": 20.6}]
+    out = rescue_speech_segments(speech_spans, segs, min_sec=3.0)
+    assert out == [
+        {"start": 2.0, "end": 10.7},
+        {"start": 11.3, "end": 16.3},
+    ]
+
+
+def test_rescue_speech_segments_ignores_pause_shards():
+    # Isekai shape: dense dialogue, speech_spans blur across <3s inter-sentence pauses;
+    # those remainders must NOT become segments (they would reshape chunk packing).
+    from voxweave.songdet import rescue_speech_segments
+
+    speech_spans = [(92.0, 120.0)]
+    segs = [
+        {"start": 92.5, "end": 99.8},
+        {"start": 100.1, "end": 114.4},
+        {"start": 114.6, "end": 120.0},
+    ]
+    assert rescue_speech_segments(speech_spans, segs, min_sec=3.0) == []
+
+
+def test_rescue_speech_segments_no_speech_spans():
+    from voxweave.songdet import rescue_speech_segments
+
+    assert rescue_speech_segments([], [{"start": 0.0, "end": 5.0}]) == []

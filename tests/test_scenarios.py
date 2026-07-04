@@ -140,3 +140,16 @@ def test_short_instrumental_span_still_kept_as_content():
     assert final == []
     assert kept == segs
     assert chunks == [{"start": 148.5, "end": 156.3, "offset": 148.5}]
+
+
+def test_expected_fixtures_present():
+    # Guard against silent fixture loss (untracked file, bad glob): every named replay
+    # guard must be discovered, or its regression protection quietly disappears.
+    names = {p.stem for p in SCENARIOS}
+    assert names >= {
+        "cecilia-bgm-debut",
+        "isekai-ed-overeat",
+        "isekai-op-sting",
+        "meido-head-rescue",
+        "yofukashi-rap-op",
+    }, f"missing scenario fixtures: {names}"

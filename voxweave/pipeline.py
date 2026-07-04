@@ -31,6 +31,8 @@ from voxweave.songdet import (
     expand_spans_to_voiced_blocks,
     filter_short_spans,
     group_segments_by_spans,
+    rescue_speech_segments,
+    subtract_spans,
 )
 from voxweave.timestamps import shift_units
 
@@ -294,11 +296,39 @@ def plan_song_skip(
     the VAD segments (cut points snapped into real silences), so a segment mixing
     "speech, brief pause, humming, speech" keeps its dialogue and loses only the
     song + flanking silence.
+
+    After expansion (and before excision), PANNs clean-dialogue spans rescue waveform-VAD
+    misses: a >=3s stretch silero left uncovered but PANNs scored as Speech joins ``segs``
+    (see :func:`songdet.rescue_speech_segments`), so the cold-open dialogue silero
+    under-scores still reaches ASR. Rescue is deliberately AFTER expansion — rescue
+    segments widen chunk coverage only and must not reshape voiced blocks or the edge trim.
     """
     long_sing = [sp for sp in sing_spans if sp[1] - sp[0] >= min_skip_sec]
     expanded = expand_spans_to_voiced_blocks(
         segs, song_spans, expandable=long_sing, protect=speech_spans
     )
+    # Rescue AFTER expansion, before excision: rescue segments must only widen chunk/ASR
+    # coverage — they must not reshape voiced blocks. A rescue segment can fill the one >3s
+    # gap separating a dialogue block from a song block, gluing them into one block whose
+    # edge trim then stops at the first non-clean segment far from the song (observed:
+    # +131s over-excision). Songs are still cut out of rescued segments by excision below.
+    if speech_spans:
+        rescued = rescue_speech_segments(speech_spans, segs)
+        if rescued:
+            log.info(
+                "speech rescue: %d PANNs-only segment(s) silero missed: %s",
+                len(rescued),
+                [(round(s["start"], 1), round(s["end"], 1)) for s in rescued],
+            )
+            segs = sorted(segs + rescued, key=lambda s: s["start"])
+            if silences:
+                # Fine-VAD calls the whole rescued region silence (silero under-scored
+                # it — that is why it needed rescuing), so excision snapping could pull
+                # a cut up to SNAP_SEC into rescued dialogue. Remove rescued intervals
+                # from the snap targets; genuine silences elsewhere still snap.
+                silences = subtract_spans(
+                    list(silences), [(r["start"], r["end"]) for r in rescued]
+                )
     final_long = filter_short_spans(expanded, min_sec=min_skip_sec)
     short_sing = [
         (a, b)
@@ -423,6 +453,14 @@ def transcribe(
 
         rep.stage("VAD chunking")
         segs = vad_speech_segments(wav)
+        # PANNs speech rescue, computed once against the raw silero segs (same inputs as
+        # plan_song_skip's internal rescue, so the two lists are identical on the song
+        # branch). Used to (a) widen chunk coverage on the keep-lyrics / no-song branches,
+        # which never reach plan_song_skip, and (b) union into the persisted vad_speech
+        # below — without (b) the timing reference calls the rescued dialogue silence and
+        # a later `align --vad-mask` would evict exactly the words the rescue recovered.
+        rescued = rescue_speech_segments(speech_spans, segs) if speech_spans else []
+        rescued_spans = [(r["start"], r["end"]) for r in rescued]
         if keep_lyrics:
             # Keep-lyrics: sung regions stay in the chunk stream and get ASR'd like
             # dialogue; only the singing spans (human vocals) are kept for cue marking.
@@ -433,6 +471,13 @@ def transcribe(
                     [(round(a, 1), round(b, 1)) for a, b in sing_spans],
                 )
             song_spans = []  # disable excision + VAD-reference exclusion below
+            if rescued:
+                log.info(
+                    "speech rescue: %d PANNs-only segment(s) silero missed: %s",
+                    len(rescued),
+                    rescued_spans,
+                )
+                segs = sorted(segs + rescued, key=lambda s: s["start"])
             chunks = pack_speech_segments(segs, max_sec=MAX_CHUNK_SEC)
         elif song_spans:
             # Fine VAD (small min-silence) exposes brief intra-segment pauses; excision
@@ -468,6 +513,15 @@ def transcribe(
             after = sum(s["end"] - s["start"] for s in segs)
             log.info("excised %.1fs of speech-segment time as song", before - after)
         else:
+            # skip_songs on but nothing detected: rescue still applies (silero misses are
+            # orthogonal to song presence — a recap episode has no OP yet can lose a cold open).
+            if rescued:
+                log.info(
+                    "speech rescue: %d PANNs-only segment(s) silero missed: %s",
+                    len(rescued),
+                    rescued_spans,
+                )
+                segs = sorted(segs + rescued, key=lambda s: s["start"])
             chunks = pack_speech_segments(segs, max_sec=MAX_CHUNK_SEC)
         if not chunks:
             raise RuntimeError(f"no speech detected in {media_path.name}")
@@ -499,6 +553,10 @@ def transcribe(
             # post-excise speech segments on the separated wav: the CTC full pass
             # soft-masks emissions outside these so words cannot park in music/silence
             speech_spans=[(s["start"], s["end"]) for s in segs],
+            # final excised song intervals: muted in the full-pass waveform so mid-file
+            # songs (which survive the envelope crop) cannot host smeared sentence
+            # fragments. Empty under --keep-lyrics (songs stay transcribed -> unmuted).
+            song_spans=song_spans or None,
         )
         # reinject_punct runs after language resolution (tokenization must match iso),
         # so punctuation cannot be reinjected per-chunk.
@@ -578,14 +636,31 @@ def transcribe(
                 # emission mask forbid those words' true location and the aligner
                 # smears them across the song (observed on movie dialogue-over-
                 # montage: a 15s exchange stretched over 65s).
-                from voxweave.songdet import subtract_spans
-
                 orig_segs, _ = excise_spans_from_segments(
                     orig_segs, subtract_spans(song_spans, speech_spans)
                 )
             vad_spans = [(s["start"], s["end"]) for s in orig_segs]
         else:
             vad_spans = [(s["start"], s["end"]) for s in segs]
+        if rescued_spans:
+            # Rescued regions are PANNs-confirmed speech BOTH silero passes under-score
+            # (the separated pass by premise; the original-mix pass credibly too — same
+            # theatrical delivery plus BGM). Union them into the timing reference, minus
+            # any excised song overlap, or downstream consumers (position_units_with_vad,
+            # smart_split gaps, a later `align --vad-mask`) treat the rescued dialogue as
+            # silence — the mask would evict exactly the words the rescue recovered.
+            add = (
+                subtract_spans(rescued_spans, sorted(song_spans))
+                if song_spans
+                else rescued_spans
+            )
+            merged = sorted(vad_spans + [(a, b) for a, b in add if b > a])
+            vad_spans = []
+            for a, b in merged:
+                if vad_spans and a <= vad_spans[-1][1]:
+                    vad_spans[-1] = (vad_spans[-1][0], max(vad_spans[-1][1], b))
+                else:
+                    vad_spans.append((a, b))
         # Qwen aligner has no CTC blank token, so word durations bleed into silence.
         # position_units_with_vad carves true gaps, giving smart_split an accurate signal.
         all_units = realign.position_units_with_vad(all_units, vad_spans)
