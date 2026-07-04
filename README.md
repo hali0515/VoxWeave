@@ -427,10 +427,10 @@ them. Edit the text freely; `align` puts the timing back.
 | Stage           | What runs                                                                                                                                                        |
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Separation**  | Mel-Band Roformer (full-band 44.1k stereo, vendored pure-torch) isolates vocals; downsampled to 16k afterwards.                                                  |
-| **Song-skip**   | PANNs (route ii) flags singing/music on the separated vocals before ASR.                                                                                         |
+| **Song-skip**   | PANNs (route ii) flags singing/music on the separated vocals before ASR; songs are excised mid-segment with cuts snapped into real silences, and PANNs clean-speech evidence rescues dialogue the waveform VAD under-scores. |
 | **Chunking**    | Silero VAD splits speech into ≤120s chunks (longer risks ASR repetition-loop collapse).                                                                          |
 | **ASR + align** | Qwen3-ASR (default, text + units in one pass) / Whisper hybrid (faster-whisper on cuda, mlx-whisper on mps) / dual-ASR fusion — the pipeline is engine-agnostic. |
-| **Alignment**   | `ja` → MMS-300m + uroman (full-file single pass, WhisperX-gold); `en` → wav2vec2-LV60K CTC per-cue; `zh`·`yue` → Qwen.                                           |
+| **Alignment**   | `ja` → MMS-300m + uroman, `en` → wav2vec2-LV60K CTC (both full-file single pass, WhisperX-gold); `zh`·`yue` → Qwen. During transcribe the pass is cropped to the transcribed envelope and excised songs are muted, so untranscribed music can never host stretched words. |
 | **Layout**      | gap-aware `smart_split`: word-level gaps + BudouX phrase atoms + line-length, on a shared timeline forked per language.                                          |
 
 ## Configuration
@@ -474,6 +474,15 @@ to point at an explicit local file (which, if it exists, skips the HF download):
 - `VOXWEAVE_MIN_CUE_SEC` (default 0.8; minimum cue display duration in `align`)
 - `VOXWEAVE_SNAP_VAD_THRESHOLD` (default 0.25; sensitive VAD used when repositioning
   zero-duration units against the original audio)
+- `VOXWEAVE_SONG_CORE_MERGE_SEC` (default 15; song spans within this gap of a long OP/ED
+  cluster into one song "core" that stops the dialogue edge trim — an isolated brief sting
+  farther away is trimmed through instead of anchoring dialogue into the excised song)
+- `VOXWEAVE_SPEECH_RESCUE_MIN_S` (default 3; minimum length of a PANNs clean-dialogue
+  stretch with no silero coverage to be rescued into the chunk stream — catches dialogue
+  silero under-scores, e.g. theatrical delivery)
+- `VOXWEAVE_CTC_ENVELOPE_PAD_SEC` (default 2; lead-in/out pad when the full-file alignment
+  pass is cropped to the transcribed chunk envelope during transcribe, keeping a skipped
+  leading/trailing song out of the aligner's waveform)
 
 </details>
 
