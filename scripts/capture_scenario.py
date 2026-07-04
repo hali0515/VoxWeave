@@ -26,9 +26,11 @@ from voxweave.chunking import decode_to_wav, silence_gaps, vad_speech_segments
 from voxweave import songdet
 from voxweave.pipeline import (
     plan_song_skip,
+    ASR_LOUDNORM,
     MIN_SONG_SKIP_SEC,
     MAX_CHUNK_SEC,
     SONG_FINE_SILENCE_MS,
+    cache_vocals_path,
 )
 
 import numpy as np
@@ -46,18 +48,34 @@ def main() -> None:
         action="store_true",
         help="use original audio (default: separate vocals, route ii)",
     )
+    ap.add_argument(
+        "--normalize",
+        action="store_true",
+        help="apply the pipeline's loudnorm filter to the VAD input (mirror `normalize=true` runs;"
+        " loudnorm changes VAD segment boundaries and thus voiced-block structure — a fixture"
+        " meant to replay a normalized run MUST capture with this flag). PANNs scoring input"
+        " stays unfiltered, exactly like the pipeline.",
+    )
     args = ap.parse_args()
 
     media = Path(args.media)
-    print(f"[capture] decode + separate: {media.name}")
+    af = ASR_LOUDNORM if args.normalize else None
     if args.no_separate:
-        voc16 = decode_to_wav(media)
+        print(f"[capture] decode (no separation): {media.name}")
+        voc16 = decode_to_wav(media, audio_filter=af)
         voc32 = decode_to_wav(media, sample_rate=songdet.SR)
     else:
-        fb = decode_to_wav(media, sample_rate=44100, mono=False)
-        voc = backend.separate_vocals(fb)
-        voc16 = decode_to_wav(voc)
-        voc32 = decode_to_wav(voc, sample_rate=songdet.SR)
+        cache = cache_vocals_path(media)
+        if cache.exists():
+            print(f"[capture] reuse cached vocals: {cache}")
+            voc16 = decode_to_wav(cache, audio_filter=af)
+            voc32 = cache
+        else:
+            print(f"[capture] decode + separate: {media.name}")
+            fb = decode_to_wav(media, sample_rate=44100, mono=False)
+            voc = backend.separate_vocals(fb)
+            voc16 = decode_to_wav(voc, audio_filter=af)
+            voc32 = decode_to_wav(voc, sample_rate=songdet.SR)
 
     # PANNs per-window scoring (mirrors the internals of detect_song_spans)
     data, sr = sf.read(str(voc32), dtype="float32")
@@ -98,6 +116,7 @@ def main() -> None:
         "name": args.name,
         "desc": args.desc,
         "lang": args.lang,
+        "normalize": args.normalize,
         "win_sec": songdet.WIN_SEC,
         "hop_sec": songdet.HOP_SEC,
         "scores": {

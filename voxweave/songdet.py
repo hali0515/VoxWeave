@@ -48,6 +48,13 @@ HOP_SEC = 1.0
 GAP_MERGE_SEC = 2.0
 MIN_SPAN_SEC = 3.0
 BLOCK_GAP_SEC = 3.0  # adjacent VAD segments within this gap are treated as one voiced block (for span expansion)
+# Song-core clustering: song spans within this gap of a long expandable span are the same song
+# (tolerates rap/instrumental interludes between sung windows — e.g. a 3s sung OP intro sitting
+# ~12s before the chorus). A short song span farther than this from any long core is an isolated
+# sting embedded in dialogue; it must NOT stop the edge trim (else it anchors the whole dialogue
+# tail into the song). Bounds the two known cases: yofukashi rap-OP intro (~12s) is protected,
+# an Isekai in-dialogue sting (~49s from the OP) is isolated.
+SONG_CORE_MERGE_SEC = float(os.environ.get("VOXWEAVE_SONG_CORE_MERGE_SEC", "15.0"))
 # Intra-segment excision: PANNs span edges are coarse (2s windows), so cut points are
 # snapped into the nearest real silence within SNAP_SEC (fine-VAD gaps) — the song goes
 # out together with its flanking silence, and dialogue words are never bisected.
@@ -355,7 +362,13 @@ def expand_spans_to_voiced_blocks(
     :func:`speech_flags`): before absorbing a block, dialogue segments at the leading/trailing
     edges are trimmed inward until a non-dialogue segment is hit. Interior segments (rap verses
     between song windows) are NOT trimmed and are still absorbed (preserves pit-2 protection).
-    The song core itself is always preserved; trimming only affects what block expansion adds.
+    The song **core** (an expandable OP/ED span plus any song span contiguous with it, gap
+    <= block_gap) is always preserved; trimming only affects what block expansion adds. The
+    trim stop keys on that core, NOT on every ``spans`` entry: a brief embedded sting (a short,
+    non-expandable song span sitting inside a dialogue block far from any core — e.g. a 3s
+    musical hit) must not anchor the whole dialogue tail into the song. Such stings are trimmed
+    through here and re-covered by the short-span excision path (``plan_song_skip`` short_sing).
+    A short sung intro flush against a long core stays part of the core and still stops the trim.
     """
     if not spans or not segments:
         return spans
@@ -369,9 +382,38 @@ def expand_spans_to_voiced_blocks(
         else:
             blocks.append([s])
 
+    # Song "cores": song spans clustered within SONG_CORE_MERGE_SEC, keeping the MEMBER spans of
+    # clusters that reach a long expandable span — NOT the cluster hull. A hull would also cover
+    # the gaps BETWEEN member spans, and clean dialogue sitting in such a gap (e.g. a line between
+    # the OP and a title-card sting 12s later) must stay trimmable. A short sung intro/outro near
+    # a long OP/ED core is part of the song and must stop the edge trim; an isolated sting
+    # embedded in dialogue (no long core within SONG_CORE_MERGE_SEC) is NOT a core, so the trim
+    # passes through it — the dialogue on the far side is freed and the sting is re-covered by
+    # plan_song_skip's short_sing excision.
+    cores: list[tuple[float, float]] = []
+    if exp:
+
+        def _touches_exp(cluster: list[tuple[float, float]]) -> bool:
+            return any(max(a, ea) < min(b, eb) for a, b in cluster for ea, eb in exp)
+
+        cluster: list[tuple[float, float]] = []
+        cluster_end = 0.0
+        for a, b in sorted(spans):
+            if cluster and a - cluster_end <= SONG_CORE_MERGE_SEC:
+                cluster.append((a, b))
+                cluster_end = max(cluster_end, b)
+            else:
+                if cluster and _touches_exp(cluster):
+                    cores.extend(cluster)
+                cluster = [(a, b)]
+                cluster_end = b
+        if cluster and _touches_exp(cluster):
+            cores.extend(cluster)
+
     def _clean_speech(seg: dict) -> bool:
-        # Song-core segments are never trimmed even if speech score is high.
-        return _overlaps(seg, prot) and not _overlaps(seg, spans)
+        # Never trim a segment on a song core (expandable OP/ED + its contiguous short spans),
+        # even if its speech score is high; trim clean dialogue everywhere else.
+        return _overlaps(seg, prot) and not _overlaps(seg, cores)
 
     out = list(spans)
     for blk in blocks:

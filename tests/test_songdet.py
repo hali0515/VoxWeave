@@ -352,6 +352,61 @@ def test_expand_keeps_interior_rap_between_choruses():
     assert out == [(66.0, 112.0)]  # interior verse stays within the song span
 
 
+def test_expand_trims_dialogue_past_isolated_sting():
+    # Isekai bug: an OP core (26-89) merged via one marginal VAD gap with a long dialogue block
+    # that contains a brief embedded sting (138-141) far (49s) from the core. The sting must NOT
+    # anchor the whole dialogue tail into the song: dialogue 92-145 is freed, sting kept as its
+    # own (short) span. Old code stopped the trailing trim at the sting -> absorbed 26-145.
+    segs = [
+        {"start": 26.0, "end": 89.0},  # OP core (singing, expandable)
+        {"start": 92.0, "end": 137.0},  # clean dialogue
+        {"start": 138.0, "end": 145.0},  # dialogue tail clipping a 3s sting (138-141)
+    ]
+    spans = [(26.0, 89.0), (138.0, 141.0)]  # OP core + isolated sting
+    out = expand_spans_to_voiced_blocks(
+        segs, spans, expandable=[(26.0, 89.0)], protect=[(92.0, 145.0)]
+    )
+    assert out == [(26.0, 89.0), (138.0, 141.0)]  # dialogue freed; sting isolated
+
+
+def test_expand_trims_dialogue_in_gap_between_core_and_clustered_sting():
+    # Cores are the cluster's MEMBER spans, not its hull: dialogue in the 12s gap between the
+    # OP end and a clustered (non-expandable) sting overlaps no actual song span and must be
+    # trimmed, not absorbed. (A hull 100-178 would cover 161-169 and swallow its subtitles.)
+    segs = [
+        {"start": 100.0, "end": 160.0},  # OP core
+        {"start": 161.0, "end": 169.0},  # clean dialogue in the gap
+    ]
+    spans = [
+        (100.0, 160.0),
+        (172.0, 178.0),
+    ]  # OP + sting 12s past OP end (same cluster)
+    out = expand_spans_to_voiced_blocks(
+        segs, spans, expandable=[(100.0, 160.0)], protect=[(161.0, 169.0)]
+    )
+    assert out == [
+        (100.0, 160.0),
+        (172.0, 178.0),
+    ]  # gap dialogue trimmed, spans untouched
+
+
+def test_expand_keeps_short_sting_clustered_with_core():
+    # Counterpart: a short sung span within SONG_CORE_MERGE_SEC of a long core (a rap-OP intro
+    # ~12s before the chorus) is part of the song -> the block absorbs through the interlude.
+    segs = [
+        {"start": 60.0, "end": 63.0},  # short sung intro
+        {"start": 64.0, "end": 120.0},  # rap interlude (clean) + chorus (expandable)
+    ]
+    spans = [
+        (60.0, 63.0),
+        (75.0, 120.0),
+    ]  # intro 12s before chorus (< SONG_CORE_MERGE_SEC)
+    out = expand_spans_to_voiced_blocks(
+        segs, spans, expandable=[(75.0, 120.0)], protect=[(64.0, 75.0)]
+    )
+    assert out == [(60.0, 120.0)]  # intro clustered into the core; whole block absorbed
+
+
 def test_expand_no_protect_is_legacy_whole_block():
     # protect=None (default) -> legacy whole-block absorption behavior, backward compatible
     segs = [
