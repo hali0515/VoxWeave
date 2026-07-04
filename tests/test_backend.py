@@ -873,7 +873,9 @@ def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
     monkeypatch.setattr(backend.config, "align_model_for", lambda iso: "some-wav2vec2")
     seen = {}
 
-    def _full(wav, texts, iso, model, bounds=None, speech_spans=None):
+    def _full(
+        wav, texts, iso, model, bounds=None, speech_spans=None, crop_to_envelope=False
+    ):
         seen.update(
             wav=wav,
             texts=texts,
@@ -881,6 +883,7 @@ def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
             model=model,
             bounds=bounds,
             speech_spans=speech_spans,
+            crop_to_envelope=crop_to_envelope,
         )
         # absolute units, one per chunk
         return [
@@ -906,6 +909,9 @@ def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
     )
     assert seen["wav"] is full and seen["bounds"] == bounds
     assert seen["speech_spans"] == spans  # VAD spans reach the full-pass aligner
+    # transcribe path opts in: bounds here are fresh VAD chunk windows (trusted), unlike
+    # the align subcommand whose input-VTT bounds must never crop (routing-free).
+    assert seen["crop_to_envelope"] is True
     assert seen["texts"] == ["hi there", "hi there"] and seen["iso"] == "en"
     # absolute -> chunk-relative: each chunk's units shifted by -bounds[i].start
     assert out[0][2] == [{"text": "hi", "start": 0.5, "end": 1.0}]

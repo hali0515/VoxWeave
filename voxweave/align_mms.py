@@ -177,6 +177,7 @@ def align_blocks_full_mms(
     texts: list[str],
     iso: str,
     bounds: Sequence[tuple[float, float] | None] | None = None,
+    crop_to_envelope: bool = False,
 ) -> list[list[dict]]:
     """Full-audio single-pass MMS alignment (equivalent to whisperx align_ctc).
 
@@ -208,7 +209,9 @@ def align_blocks_full_mms(
         _empty_cache()
         return _distribute_units(flat, sub, iso)
 
-    return _dp_chunked_pass(wav, MMS_SR, norm, bounds, _pass, "MMS")
+    return _dp_chunked_pass(
+        wav, MMS_SR, norm, bounds, _pass, "MMS", crop_to_envelope=crop_to_envelope
+    )
 
 
 def release_mms() -> None:

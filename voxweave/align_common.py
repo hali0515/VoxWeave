@@ -25,6 +25,13 @@ CTC_MAX_DP_FRAMES = config.conf_ctc_max_dp_frames()
 # Per-chunk DP budget as a fraction of CTC_MAX_DP_FRAMES: leaves headroom so an off-by-a-bit
 # silence anchor never pushes a chunk's O(T*L) trellis past the memory cap.
 CTC_DP_CHUNK_FRAC = float(os.environ.get("VOXWEAVE_CTC_DP_CHUNK_FRAC", "0.8"))
+# Even within budget, the single global pass is cropped to the transcribed cue envelope
+# [first_bound - pad, last_bound + pad]: skipped songs BEFORE the first cue / AFTER the last
+# are excised from the ASR text but not from `wav`, and a routing-free monotone DP would
+# stretch the leading/trailing sentence's head across that untranscribed region (a sung OP's
+# romaji vocals emit spurious char probabilities the DP latches onto). This pad keeps a small
+# lead-in so a word onset just before its cue boundary is never clipped.
+CTC_ENVELOPE_PAD_SEC = float(os.environ.get("VOXWEAVE_CTC_ENVELOPE_PAD_SEC", "2.0"))
 
 
 def _strip_trailing_punct(word: str) -> str:
@@ -156,6 +163,8 @@ def _dp_chunked_pass(
     bounds: Sequence[tuple[float, float] | None] | None,
     pass_fn,
     label: str,
+    *,
+    crop_to_envelope: bool = False,
 ) -> list[list[dict]]:
     """Run `pass_fn(wav_slice, texts, offset_s) -> per-block units` under the global-DP memory budget.
 
@@ -174,6 +183,22 @@ def _dp_chunked_pass(
 
     frames = wav.shape[-1] / _CTC_STRIDE
     if frames <= CTC_MAX_DP_FRAMES:
+        # Crop the single global pass to the transcribed cue envelope so a leading/trailing
+        # skipped song (present in `wav`, absent from the text) cannot host stretched tokens.
+        # Opt-in (`crop_to_envelope`) because it TRUSTS the bounds: only the transcribe path
+        # may enable it (bounds there are fresh VAD chunk windows of this very audio). The
+        # align subcommand must NOT — its bounds are input-VTT timestamps, exactly what may
+        # be wrong; cropping to them would confine every word to a possibly-shifted window
+        # (the documented B-path failure). align stays fully routing-free.
+        starts = [b[0] for b in (bounds or []) if b is not None]
+        ends = [b[1] for b in (bounds or []) if b is not None]
+        if crop_to_envelope and starts and ends:
+            total_sec = wav.shape[-1] / sr
+            lo = max(0.0, min(starts) - CTC_ENVELOPE_PAD_SEC)
+            hi = min(total_sec, max(ends) + CTC_ENVELOPE_PAD_SEC)
+            a, b = int(lo * sr), int(hi * sr)
+            if a < b and (a > 0 or b < wav.shape[-1]):
+                return [shift_units(u, lo) for u in pass_fn(wav[a:b], norm, lo)]
         return pass_fn(wav, norm, 0.0)
 
     if not bounds or len(bounds) != len(norm):

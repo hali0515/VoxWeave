@@ -590,8 +590,14 @@ def _full_pass_units(
     from voxweave.timestamps import shift_units
 
     try:
+        # crop_to_envelope=True is safe ONLY here: these bounds are fresh VAD chunk windows
+        # computed on this very audio (post-excise), so cropping to their envelope removes a
+        # leading/trailing skipped song without trusting any external timestamp. The align
+        # subcommand passes input-VTT bounds and must keep the default False (routing-free).
         if _is_mms_name(model_name):
-            blocks = align_blocks_full_mms(full_wav, texts, iso, bounds=list(bounds))
+            blocks = align_blocks_full_mms(
+                full_wav, texts, iso, bounds=list(bounds), crop_to_envelope=True
+            )
         else:
             blocks = align_blocks_full_ctc(
                 full_wav,
@@ -600,6 +606,7 @@ def _full_pass_units(
                 model_name,
                 bounds=list(bounds),
                 speech_spans=speech_spans,
+                crop_to_envelope=True,
             )
     except Exception as e:  # noqa: BLE001 -- any failure falls back to per-chunk alignment
         log.warning(

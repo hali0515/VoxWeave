@@ -326,6 +326,7 @@ def align_blocks_full_ctc(
     model_name: str,
     bounds: Sequence[tuple[float, float] | None] | None = None,
     speech_spans: list[tuple[float, float]] | None = None,
+    crop_to_envelope: bool = False,
 ) -> list[list[dict]]:
     """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
 
@@ -361,7 +362,9 @@ def align_blocks_full_ctc(
         _empty_cache()
         return out
 
-    return _dp_chunked_pass(wav, al.sr, norm, bounds, _pass, "CTC")
+    return _dp_chunked_pass(
+        wav, al.sr, norm, bounds, _pass, "CTC", crop_to_envelope=crop_to_envelope
+    )
 
 
 def align_text_ctc(wav_path: Path, text: str, iso: str, model_name: str) -> list[dict]:
