@@ -71,7 +71,12 @@ TINY_CUE_TARGET = float(os.environ.get("VOXWEAVE_TINY_CUE_TARGET", "0.5"))
 # Vocals cache: <media_dir>/cache/<stem>.vocals.32k.flac (32k mono, no BGM).
 # Shared by process and align; PANNs eats it directly, ASR/alignment downsample to 16k.
 # Legacy <stem>.16k.flac caches are still accepted by align for backward compatibility.
+# A cache hit also requires the durations to match (_vocals_cache_fresh): a replaced or
+# trimmed source silently invalidates the old separation, so it is re-run and overwritten.
 CACHE_DIRNAME = "cache"
+# Max |cache - media| duration drift still treated as the same source. Covers
+# container-vs-stream duration jitter; real source edits move duration by seconds.
+CACHE_DUR_TOL_SEC = float(os.environ.get("VOXWEAVE_CACHE_DUR_TOL_SEC", "0.5"))
 # Extensions tried when locating the source media by stem (align only receives the VTT).
 MEDIA_EXTS = (
     ".mkv",
@@ -117,6 +122,60 @@ def cache_16k_path(media_path: Path) -> Path:
     """Return the legacy 16k vocals cache path: <media_dir>/cache/<stem>.16k.flac (read-only backward compat)."""
     media_path = Path(media_path)
     return media_path.parent / CACHE_DIRNAME / f"{media_path.stem}.16k.flac"
+
+
+def _probe_duration(path: Path) -> float | None:
+    """Media duration in seconds via ffprobe, or None if unreadable."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _vocals_cache_fresh(cache: Path, media: Path) -> bool:
+    """True if the cached vocals still match the source media duration.
+
+    An unreadable cache is stale (truncated/corrupt flac must not be trusted);
+    an unprobeable media keeps the cache hit — decoding will surface the real
+    error later, and burning a separation pass on a maybe-valid cache helps nobody.
+    """
+    cache_dur = _probe_duration(cache)
+    if cache_dur is None:
+        log.warning("vocals cache unreadable, re-separating: %s", cache)
+        return False
+    media_dur = _probe_duration(media)
+    if media_dur is None:
+        return True
+    if abs(cache_dur - media_dur) <= CACHE_DUR_TOL_SEC:
+        return True
+    log.warning(
+        "vocals cache stale (cache %.2fs vs media %.2fs), re-separating: %s",
+        cache_dur,
+        media_dur,
+        cache,
+    )
+    return False
 
 
 def _encode_flac(src_wav: Path, dst_flac: Path) -> None:
@@ -393,7 +452,11 @@ def transcribe(
         fullband: Path | None = None
         voc32: Path | None = None  # 32k mono vocals: PANNs input + cache source
         if separate:
-            if cache_vocals is not None and Path(cache_vocals).exists():
+            if (
+                cache_vocals is not None
+                and Path(cache_vocals).exists()
+                and _vocals_cache_fresh(Path(cache_vocals), media_path)
+            ):
                 # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
                 rep.stage("vocals cache (32k)")
                 log.info("reuse cached vocals %s", cache_vocals)
@@ -1105,18 +1168,20 @@ def _prepare_16k_for_align(
     """Prepare 16k vocals for align; append temp paths to tmp. Return the 16k wav path.
 
     Cache priority: 32k vocals flac -> legacy 16k flac -> re-run separation -> decode raw.
+    Either cache is used only while its duration still matches the source media
+    (_vocals_cache_fresh); a stale hit falls through to separation, which overwrites it.
     """
     af = ASR_LOUDNORM if normalize else None
     if separate:
         cache = cache_vocals_path(media)
-        if cache.exists():
+        if cache.exists() and _vocals_cache_fresh(cache, media):
             reporter.stage("vocals cache (32k)")
             log.info("reuse cached vocals %s", cache)
             wav = decode_to_wav(cache, audio_filter=af)  # 32k flac -> 16k
             tmp.append(wav)
             return wav
         legacy = cache_16k_path(media)
-        if legacy.exists():
+        if legacy.exists() and _vocals_cache_fresh(legacy, media):
             reporter.stage("vocals cache (16k legacy)")
             log.info("reuse legacy 16k vocals %s", legacy)
             return legacy
