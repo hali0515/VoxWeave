@@ -33,12 +33,14 @@ class Atom(TypedDict, total=False):
     Spaced langs: one word. No-space langs: one CJK char or Latin run.
     ``end_pen`` is the precomputed line-end break penalty attached by
     ``_attach_end_penalties`` (0 = clean break point).
+    ``forced_boundary`` exposes spaces inside an overlong embedded Latin run.
     """
 
     text: str
     start: float | None
     end: float | None
     end_pen: int
+    forced_boundary: bool
 
 
 class Cue(TypedDict):

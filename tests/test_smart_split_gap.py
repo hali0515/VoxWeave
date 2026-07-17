@@ -1,5 +1,6 @@
 # tests/test_smart_split_gap.py
 import pytest
+from voxweave.core.layout import _vis_width
 from voxweave.core.smart_split import smart_split_segments
 
 # thresholds opt-in (gap-split + dur-cap gated on this); min_cue_s=0 so cleanup
@@ -88,6 +89,58 @@ def test_max_cue_duration_hard_cap():
         [_seg(words, "ja")], "ja", speech_spans=None, thresholds=TH
     )
     assert all(c["end"] - c["start"] <= 7.0 + 1e-6 for c in cues)
+
+
+def test_coarse_single_atom_is_split_to_display_and_duration_limits():
+    # Wrong-language or coarse alignment can put a whole no-space paragraph in
+    # one timed atom. The first atom must not bypass both hard limits merely
+    # because the packing loop has no previous atom to break before.
+    paragraph = (
+        "这是连续书写的一整段文字用于验证粗粒度对齐不会生成超长且无法阅读的单条字幕"
+    )
+    closing = "最后还有一个正常结尾"
+    words = [
+        {"word": paragraph, "start": 0.0, "end": 18.0},
+        {"word": "AI", "start": 18.1, "end": 18.2},
+        {"word": closing, "start": 18.3, "end": 20.0},
+    ]
+    segment = {"text": f"{paragraph} AI {closing}", "words": words}
+    cues = smart_split_segments([segment], "en", thresholds=TH)
+    assert "".join(c["text"].replace(" ", "") for c in cues) == (
+        paragraph + "AI" + closing
+    )
+    assert all(c["end"] - c["start"] <= TH["max_cue_s"] + 1e-9 for c in cues)
+    assert all(_vis_width(c["text"]) <= 42 for c in cues)
+    assert [c["start"] for c in cues] == sorted(c["start"] for c in cues)
+    for cue in cues:
+        assigned_end = max(
+            (word["end"] for word in cue["word_data"] if word.get("end") is not None),
+            default=cue["end"],
+        )
+        assert cue["end"] >= assigned_end
+
+
+def test_timingless_indivisible_token_still_obeys_physical_line_budget():
+    token = "无空格粗粒度文本" * 8
+    cues = smart_split_segments([{"text": token, "words": []}], "en", thresholds=TH)
+    assert "".join(c["text"].replace(" ", "").replace("\n", "") for c in cues) == token
+    assert len(cues) > 1
+    assert all(_vis_width(line) <= 42 for c in cues for line in c["text"].split("\n"))
+    assert [c["start"] for c in cues] == sorted(c["start"] for c in cues)
+
+
+def test_long_latin_run_inside_chinese_splits_at_spaces_with_real_timings():
+    text = "Building in a week with Anthropic Claude Code for every developer team"
+    chars = [ch for ch in text if not ch.isspace()]
+    words = [
+        {"word": ch, "start": i * 0.3, "end": i * 0.3 + 0.2}
+        for i, ch in enumerate(chars)
+    ]
+    cues = smart_split_segments([{"text": text, "words": words}], "zh", thresholds=TH)
+    assert " ".join(" ".join(c["text"].split()) for c in cues) == text
+    assert len(cues) > 1
+    assert all(c["end"] - c["start"] <= TH["max_cue_s"] + 1e-9 for c in cues)
+    assert all(_vis_width(c["text"]) <= 36 for c in cues)
 
 
 def test_vad_confirmed_split():
@@ -425,3 +478,116 @@ def test_phrase_boundary_atoms_in_atom_index_space():
         0 <= i < len(atoms) for i in b
     )  # all are atom indices; no stale char-offset (e.g. 6) remaining
     assert 0 in b  # first atom must be a phrase start
+
+
+def _contiguous_segments(parts, step=0.2, gap=0.0):
+    segments = []
+    clock = 0.0
+    for part_index, text in enumerate(parts):
+        if part_index:
+            clock += gap
+        words = []
+        for char in text:
+            words.append({"word": char, "start": clock, "end": clock + step})
+            clock += step
+        segments.append({"text": text, "words": words})
+    return segments
+
+
+def test_timing_first_layout_keeps_de_with_its_complete_noun_phrase():
+    # Real regression: text-only midpoint first produced 肉身|的特性, then the
+    # timing pass also cut at 特性|也是.  Timed layout should choose only the
+    # heard, grammatical boundary.
+    text = "这是他们没有实体肉身的特性也是一种限制"
+    spans = (
+        (0, 10, 33.380, 35.580),
+        (10, 13, 35.580, 37.060),
+        (13, 19, 37.060, 38.453),
+    )
+    words = []
+    for first, last, start, end in spans:
+        for index in range(first, last):
+            unit_start = start + (end - start) * (index - first) / (last - first)
+            unit_end = start + (end - start) * (index - first + 1) / (last - first)
+            words.append({"word": text[index], "start": unit_start, "end": unit_end})
+
+    cues = smart_split_segments([{"text": text, "words": words}], "zh", thresholds=TH)
+
+    assert [cue["text"] for cue in cues] == [
+        "这是他们没有实体肉身的特性",
+        "也是一种限制",
+    ]
+    assert not any(cue["text"].startswith("的") for cue in cues)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "particle"),
+    [
+        ("你真的认为这件事情完全不存在任何问题", "呢"),
+        ("这项工作我们已经按照原定计划顺利完成", "了"),
+    ],
+)
+def test_connected_cross_segment_particle_never_becomes_a_lone_cue(prefix, particle):
+    # The first ASR segment exactly fills the 18-char display budget.  A plain
+    # merge cannot fit, so the repair must move a phrase boundary while keeping
+    # every character and aligned source unit.
+    cues = smart_split_segments(
+        _contiguous_segments([prefix, particle]),
+        "zh",
+        thresholds={**TH, "min_cue_s": 0.0},
+    )
+
+    assert "".join(cue["text"] for cue in cues) == prefix + particle
+    assert all(cue["text"] != particle for cue in cues)
+    assert all(not cue["text"].startswith(particle) for cue in cues[1:])
+    assert sum(len(cue["word_data"]) for cue in cues) == len(prefix + particle)
+
+
+def test_particle_repair_does_not_misclassify_lexical_liao():
+    prefix = "关于这件事情我们还需要进一步认真讨论"
+    cues = smart_split_segments(
+        _contiguous_segments([prefix, "了解情况"]),
+        "zh",
+        thresholds={**TH, "min_cue_s": 0.0},
+    )
+
+    assert cues[-1]["text"] == "了解情况"
+
+
+def test_true_long_pause_before_particle_is_not_rewritten():
+    cues = smart_split_segments(
+        _contiguous_segments(["工作已经完成", "了"], gap=1.2),
+        "zh",
+        thresholds={**TH, "min_cue_s": 0.0},
+    )
+
+    assert [cue["text"] for cue in cues] == ["工作已经完成", "了"]
+
+
+def test_len_break_prefers_subthreshold_breath_over_connected_edge():
+    from voxweave.core.smart_split import (
+        SplitContext,
+        SplitThresholds,
+        _best_len_break_pos,
+    )
+
+    atoms = []
+    clock = 0.0
+    for index, char in enumerate("甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未"):
+        if index == 6:
+            clock += 0.18  # audible, but below the 0.4s mandatory-gap threshold
+        atoms.append({"text": char, "start": clock, "end": clock + 0.1})
+        clock += 0.1
+    incoming = {"text": "申", "start": clock, "end": clock + 0.1}
+    ctx = SplitContext("zh", 18, 1, SplitThresholds(), True, None)
+
+    assert (
+        _best_len_break_pos(
+            atoms,
+            [True] * len(atoms),
+            at_boundary_next=True,
+            next_atom=incoming,
+            ctx=ctx,
+        )
+        == 6
+    )

@@ -28,6 +28,11 @@ def test_ja_multiplier(monkeypatch):
     assert c["clause_ms"] == 560 and c["offline_ms"] == 980  # x1.4
 
 
+def test_yue_uses_chinese_reading_speed(monkeypatch):
+    monkeypatch.delenv("VOXWEAVE_CPS", raising=False)
+    assert _reload().gap_thresholds("yue")["cps"] == 9.0
+
+
 def test_env_override(monkeypatch):
     monkeypatch.setenv("VOXWEAVE_GAP_CLAUSE_MS", "300")
     monkeypatch.setenv("VOXWEAVE_SEG_MIN_CUE_SEC", "0")

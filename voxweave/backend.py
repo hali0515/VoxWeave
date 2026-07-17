@@ -3,8 +3,10 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Sequence
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from voxweave import config
@@ -140,6 +142,10 @@ _BUNDLED_SEPARATOR_CONFIG = (
 
 # Empty -> float16 on cuda, int8 on cpu/mps (ctranslate2/faster-whisper is CUDA-or-CPU only).
 WHISPER_COMPUTE = os.environ.get("VOXWEAVE_WHISPER_COMPUTE", "")
+# A 120-second dense transcript can legitimately exceed qwen-asr's 512-token
+# constructor default.  Raising only the ceiling does not change ordinary greedy
+# decodes (generation still stops at EOS), but avoids silent tail truncation.
+QWEN_MAX_NEW_TOKENS = int(os.environ.get("VOXWEAVE_QWEN_MAX_NEW_TOKENS", "1024"))
 
 # ASR/alignment process-level singletons; call release() at end of episode.
 # Separator is not kept resident (self-loads, self-releases).
@@ -340,11 +346,12 @@ def _get_asr(asr_model: str | None = None):
         log.info("loading ASR=%s (text-only) on %s", mid, dev)
         # Use snapshot so model + processor both land in config.ASR_CACHE (see _hf_snapshot docstring).
         local = _hf_snapshot(mid, config.ASR_CACHE)
-        _asr = Qwen3ASRModel.from_pretrained(
-            local,
-            dtype=_model_dtype(dev),
-            device_map=dev,
-        )
+        load_kwargs = {"dtype": _model_dtype(dev), "device_map": dev}
+        if "max_new_tokens" in inspect.signature(
+            Qwen3ASRModel.from_pretrained
+        ).parameters:
+            load_kwargs["max_new_tokens"] = QWEN_MAX_NEW_TOKENS
+        _asr = Qwen3ASRModel.from_pretrained(local, **load_kwargs)
         _asr_id = mid
         log.info("ASR ready")
     return _asr
@@ -373,7 +380,22 @@ def _resolve_align_lang(lang: str | None, source: str) -> str:
 # punctuation present) is genuine background knowledge and passes through, as
 # does input that already carries one of the known-good framings.
 _CONTEXT_FRAMINGS = ("technical terms:", "vocabulary:", "proper nouns:")
-_PROSE_PUNCT = ".。!?！？"
+_CONTEXT_TERM_SPLIT_RE = re.compile(r"[,，\n]+")
+_ASCII_SENTENCE_RE = re.compile(r"[.!?](?:\s+|$)")
+
+
+def _looks_like_prose_context(text: str) -> bool:
+    """Distinguish background prose from a term/version list conservatively."""
+    if any(ch in "。！？" for ch in text):
+        return True
+    words = text.split()
+    if _ASCII_SENTENCE_RE.search(text) and len(words) >= 4:
+        return True
+    return "," not in text and "，" not in text and "\n" not in text and len(words) >= 8
+
+
+def _context_terms(text: str) -> list[str]:
+    return [term.strip() for term in _CONTEXT_TERM_SPLIT_RE.split(text) if term.strip()]
 
 
 def format_qwen_context(context: str | None) -> str | None:
@@ -389,10 +411,74 @@ def format_qwen_context(context: str | None) -> str | None:
     low = s.lower()
     if any(low.startswith(p) for p in _CONTEXT_FRAMINGS):
         return s
-    if any(ch in _PROSE_PUNCT for ch in s):
+    if _looks_like_prose_context(s):
         return s
-    terms = [t.strip() for line in s.split("\n") for t in line.split(",")]
-    return f"Proper nouns: {', '.join(t for t in terms if t)}."
+    return f"Proper nouns: {', '.join(_context_terms(s))}."
+
+
+def whisper_hotwords(context: str | None) -> str | None:
+    """Extract an explicit term list for faster-whisper's hotword bias.
+
+    Background prose remains only an ``initial_prompt``.  Bare lists and the
+    same framed lists accepted by :func:`format_qwen_context` additionally use
+    faster-whisper's purpose-built hotword channel.  No inferred vocabulary is
+    injected here: every term comes from the user's context.
+    """
+    s = (context or "").strip()
+    if not s:
+        return None
+    for line in s.splitlines():
+        low = line.strip().lower()
+        for framing in _CONTEXT_FRAMINGS:
+            if low.startswith(framing):
+                payload = line.strip()[len(framing) :].strip().rstrip(".")
+                terms = _context_terms(payload)
+                return ", ".join(terms) or None
+    if _looks_like_prose_context(s):
+        return None
+    return ", ".join(_context_terms(s)) or None
+
+
+_ASR_LOOP_END_PUNCT = set(".!?。！？")
+_ASR_LOOP_MIN_CONTENT = 12
+_ASR_LOOP_MIN_REPEATS = 4
+
+
+def stabilize_asr_text(text: str) -> str:
+    """Strip edges and collapse only high-confidence generation loops at EOF.
+
+    ASR failure loops characteristically repeat the same long, punctuated span
+    until the token limit.  Restricting cleanup to four or more *exact* terminal
+    copies with at least 12 alphanumeric characters leaves stutters, emphasis,
+    short refrains, and non-terminal repetition untouched.
+    """
+    from voxweave.lang import transcript_content_weight
+
+    clean = (text or "").strip()
+    n = len(clean)
+    best = clean
+    best_removed = 0
+    for width in range(1, n // _ASR_LOOP_MIN_REPEATS + 1):
+        unit = clean[n - width :]
+        if not unit or unit[0].isspace() or unit[-1] not in _ASR_LOOP_END_PUNCT:
+            continue
+        if transcript_content_weight(unit) < _ASR_LOOP_MIN_CONTENT:
+            continue
+        end = n
+        starts: list[int] = []
+        while end >= width and clean[end - width : end] == unit:
+            starts.append(end - width)
+            end -= width
+            while end > 0 and clean[end - 1].isspace():
+                end -= 1
+        if len(starts) < _ASR_LOOP_MIN_REPEATS:
+            continue
+        candidate = (clean[: starts[-1]] + unit).rstrip()
+        removed = n - len(candidate)
+        if removed > best_removed:
+            best = candidate
+            best_removed = removed
+    return best
 
 
 def _asr_only(
@@ -402,14 +488,16 @@ def _asr_only(
     model_id: str,
     context: str | None,
 ) -> tuple[str | None, str, str]:
-    """Transcribe only (no alignment): returns (detected language | None, punctuated text, align_lang).
+    """Transcribe only: return (effective language, punctuated text, align_lang).
 
     First pass of the two-pass peak strategy: alignment deferred to pass two after ASR is released.
+    Explicit language always wins; auto-detected labels are reconciled with the
+    transcript script before choosing the aligner.
     align_lang pre-computed here; falls back to 'en' for empty text (skipped in pass two anyway).
     """
-    if engine == "whisper":
-        from voxweave.lang import to_iso_or
+    from voxweave.lang import reconcile_detected_language, to_iso_or
 
+    if engine == "whisper":
         model = _get_whisper(model_id)
         lang_iso = to_iso_or(language, None)
         if (
@@ -420,12 +508,13 @@ def _asr_only(
             str(wav_path),
             language=lang_iso,
             initial_prompt=context or None,
+            hotwords=whisper_hotwords(context),
             condition_on_previous_text=False,  # prevents repetition hallucination
             vad_filter=False,  # VAD chunking already done upstream
             word_timestamps=False,  # hybrid uses Qwen for timestamps, not whisper
         )
-        text = "".join(s.text for s in segments)  # segments is a generator
-        det = info.language
+        raw_text = "".join(s.text for s in segments)  # segments is a generator
+        raw_det = info.language
         src = "whisper"
     else:  # qwen
         model = _get_asr(model_id)
@@ -433,12 +522,26 @@ def _asr_only(
         if context:  # omit kwarg entirely when empty to preserve legacy behavior
             kwargs["context"] = format_qwen_context(context)
         r = model.transcribe(str(wav_path), **kwargs)[0]
-        det = (r.language or "").split(",")[
-            0
-        ].strip() or None  # "Chinese,English" -> take first
-        text = r.text
+        raw_det = r.language or None
+        raw_text = r.text
         src = "ASR"
-    align_lang = _resolve_align_lang(language or det, src) if text.strip() else "en"
+    text = stabilize_asr_text(raw_text)
+    if len(text) < len(raw_text.strip()):
+        log.warning(
+            "%s removed a repeated generation tail (%d -> %d characters)",
+            src,
+            len(raw_text.strip()),
+            len(text),
+        )
+    det = reconcile_detected_language(raw_det, text, override=language)
+    if not language and raw_det and det and det.casefold() != raw_det.strip().casefold():
+        log.info(
+            "%s language %r reconciled to %r from transcript script",
+            src,
+            raw_det,
+            det,
+        )
+    align_lang = _resolve_align_lang(det, src) if text.strip() else "en"
     return det, text, align_lang
 
 
@@ -477,6 +580,19 @@ def _transcribe_whisper_align(
     return det, text, units
 
 
+_FUSION_PUNCT = set("。、！？，,.!?")
+_FUSION_MIN_CONTENT_AGREEMENT = 0.50
+
+
+def _asr_content_agreement(left: str, right: str) -> float:
+    """Case-insensitive alphanumeric agreement between two ASR hypotheses."""
+    a = [ch.casefold() for ch in left if ch.isalnum()]
+    b = [ch.casefold() for ch in right if ch.isalnum()]
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+
 def _fuse_chunk(
     w_res: tuple[str | None, str, list[dict]],
     q_res: tuple[str | None, str, list[dict]],
@@ -494,6 +610,17 @@ def _fuse_chunk(
     from voxweave.realign import NO_SPACE_LANGS, fuse_punct_into_text, reinject_punct
 
     det_q, text_q, units_q = q_res
+    # Punctuation transfer is an enhancement, never a reason to destroy a good
+    # Whisper hypothesis.  With no Qwen punctuation/alignment, or when the two
+    # decoders substantially disagree, there is no trustworthy content anchor;
+    # retain Whisper's own punctuation verbatim.
+    if (
+        not text_q.strip()
+        or not units_q
+        or not any(ch in _FUSION_PUNCT for ch in text_q)
+        or _asr_content_agreement(text_w, text_q) < _FUSION_MIN_CONTENT_AGREEMENT
+    ):
+        return det_w or det_q, text_w, units_w
     cand = language or det_w or det_q or "en"
     iso = to_iso_or(cand, "en")
     qwen_punct = reinject_punct(
@@ -542,16 +669,18 @@ def _weighted_align_lang(asr_out: list[tuple[str | None, str, str]]) -> str | No
 
     Full-file alignment runs ONE pass for the whole file, so it needs one language
     (per-chunk languages only steered the per-chunk path). Weighting by text mass
-    mirrors the pipeline's unit-count vote (unit count ~ alnum chars / words), so the
-    two levels agree on mixed-language files.
+    mirrors the pipeline's transcript-content vote, so the two levels agree even
+    when a bad aligner would have produced a misleading number of units.
     """
     from collections import Counter
+    from voxweave.lang import to_iso_or, transcript_content_weight
 
     weight: Counter[str] = Counter()
     for _, text, align_lang in asr_out:
-        n = sum(1 for c in text if c.isalnum())
+        n = transcript_content_weight(text)
         if n:
-            weight[align_lang] += n
+            key = to_iso_or(align_lang, None) or align_lang
+            weight[key] += n
     return weight.most_common(1)[0][0] if weight else None
 
 

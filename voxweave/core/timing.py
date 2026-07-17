@@ -23,12 +23,10 @@ LINGER_CAP_S = 1.0  # CPS-driven extension never lingers more than this past spe
 DEGENERATE_CUE_S = (
     0.08  # a cue this short is a forced-alignment collapse artifact, not real timing
 )
-HELD_CUE_CEILING_FACTOR = (
-    2.0  # a still-sounding word may stretch a clamped cue up to this many x max_cue_s
-)
 HELD_WORD_MAX_GAP_S = 1.0  # a held-word extension may cross word gaps up to this (sung
 # sustain with breaths ~0.84s passes); a wider silence past the cap is dead air the
 # extension must refuse (stops at the last word before it)
+SHORT_FRAGMENT_MAX_CHARS = 12  # generous upper bound for one short lexical word
 
 
 def _is_short_fragment(text: str, lang: str) -> bool:
@@ -41,7 +39,10 @@ def _is_short_fragment(text: str, lang: str) -> bool:
         return False
     if _no_spaces(lang):
         return _visual_len(t, lang) <= 2
-    return len(t.split()) == 1
+    # A misdetected language can send an unspaced Han paragraph through the
+    # space-delimited path.  ``split()`` sees that entire paragraph as one word;
+    # retain an explicit size bound so only an actually short token can glue.
+    return len(t.split()) == 1 and _visual_len(t, lang) <= SHORT_FRAGMENT_MAX_CHARS
 
 
 def _gap_between(a: Cue, b: Cue) -> float | None:
@@ -132,7 +133,15 @@ def _merge_micro_cues(
     return out
 
 
-def _glue_short_cues(cues: List[Cue], lang: str, *, max_gap_s: float) -> List[Cue]:
+def _glue_short_cues(
+    cues: List[Cue],
+    lang: str,
+    *,
+    max_gap_s: float,
+    max_line_length: int,
+    max_lines: int,
+    max_cue_s: float,
+) -> List[Cue]:
     """Glue a super-short single-word flicker cue onto whichever neighbor abuts it
     closest, when that gap is below ``max_gap_s`` — contiguous speech means a
     spurious split, not a real pause.
@@ -142,7 +151,9 @@ def _glue_short_cues(cues: List[Cue], lang: str, *, max_gap_s: float) -> List[Cu
     The side with the smaller gap wins (ties go backward). Safe re-introduction of
     the deleted merge_short_cues: ``max_gap_s`` (0.3s) sits below ``clause_ms``
     (0.4s), so the real-pause side (>=0.4s) is never crossed and a cue is never
-    dragged over silence. ``max_gap_s<=0`` disables. Overflow is left to soft-wrap.
+    dragged over silence. A merge must also fit the configured display budget
+    and duration cap, so glue cannot undo a length- or duration-driven split.
+    ``max_gap_s<=0`` disables.
     """
     if max_gap_s <= 0 or len(cues) < 2:
         return cues
@@ -156,14 +167,42 @@ def _glue_short_cues(cues: List[Cue], lang: str, *, max_gap_s: float) -> List[Cu
         if _is_short_fragment(c["text"], lang):
             gap_back = _gap_between(out[-1], c) if out else None
             gap_fwd = _gap_between(c, nxt) if nxt is not None else None
-            back_ok = gap_back is not None and gap_back < max_gap_s
-            fwd_ok = gap_fwd is not None and gap_fwd < max_gap_s
+            back_text = (
+                (out[-1]["text"].rstrip() + sep + c["text"].lstrip()).strip()
+                if out
+                else ""
+            )
+            fwd_text = (
+                (c["text"].rstrip() + sep + nxt["text"].lstrip()).strip()
+                if nxt is not None
+                else ""
+            )
+            back_start = out[-1].get("start") if out else None
+            back_end = c.get("end")
+            fwd_start = c.get("start")
+            fwd_end = nxt.get("end") if nxt is not None else None
+            back_ok = (
+                gap_back is not None
+                and gap_back < max_gap_s
+                and back_start is not None
+                and back_end is not None
+                and back_end - back_start <= max_cue_s
+                and _fits_budget(back_text, max_line_length, max_lines, lang)
+            )
+            fwd_ok = (
+                gap_fwd is not None
+                and gap_fwd < max_gap_s
+                and fwd_start is not None
+                and fwd_end is not None
+                and fwd_end - fwd_start <= max_cue_s
+                and _fits_budget(fwd_text, max_line_length, max_lines, lang)
+            )
             # nearer side wins; ties go backward ("append to last cue").
             go_fwd = fwd_ok and (
                 not back_ok or (gap_fwd is not None and gap_fwd < gap_back)  # type: ignore[operator]
             )
             if go_fwd and nxt is not None:  # prepend fragment into next, reprocess it
-                nxt["text"] = (c["text"].rstrip() + sep + nxt["text"].lstrip()).strip()
+                nxt["text"] = fwd_text
                 if c.get("start") is not None:
                     nxt["start"] = (
                         c["start"]
@@ -177,9 +216,7 @@ def _glue_short_cues(cues: List[Cue], lang: str, *, max_gap_s: float) -> List[Cu
                 continue
             if back_ok:
                 prev = out[-1]
-                prev["text"] = (
-                    prev["text"].rstrip() + sep + c["text"].lstrip()
-                ).strip()
+                prev["text"] = back_text
                 if c.get("end") is not None:
                     prev["end"] = (
                         c["end"]
@@ -249,9 +286,8 @@ def _cleanup_cues(
         # never let extension / chaining push a cue past the duration cap, but
         # never truncate a subtitle while its own words are still sounding: a
         # held/sung word whose word_data end runs past the cap keeps its cue up
-        # to that end (capped by the next cue's start and a hard ceiling against
-        # degenerate word_data). Ordinary long-linger cues (words already stopped)
-        # still clamp exactly to start+max_cue_s.
+        # to that end (capped by the next cue's start). Ordinary long-linger cues
+        # whose words already stopped still clamp exactly to start+max_cue_s.
         if max_cue_s and c["end"] - c["start"] > max_cue_s:
             cap = c["start"] + max_cue_s
             timed = sorted(
@@ -261,7 +297,7 @@ def _cleanup_cues(
                     if (s := w.get("start")) is not None
                     and (e := w.get("end")) is not None
                 ),
-                key=lambda se: se[0],
+                key=lambda unit: unit[0],
             )
             last_word_end = max((e for _s, e in timed), default=None)
             if last_word_end is not None and last_word_end > cap:
@@ -279,8 +315,7 @@ def _cleanup_cues(
                     if ns - pe > HELD_WORD_MAX_GAP_S and ns >= cap:
                         break
                     held_end = ne
-                ceiling = c["start"] + max_cue_s * HELD_CUE_CEILING_FACTOR
-                target = min(held_end, ceiling)
+                target = held_end
                 if nxt_start is not None:
                     target = min(target, nxt_start)
                 c["end"] = max(cap, target)

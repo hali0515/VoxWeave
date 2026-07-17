@@ -1,4 +1,10 @@
-from voxweave.core.layout import strip_punct_for_subtitles, wrap_cue_text
+from voxweave.core.layout import (
+    _fits_budget,
+    _vis_width,
+    split_subtitle,
+    strip_punct_for_subtitles,
+    wrap_cue_text,
+)
 from voxweave.core.smart_split import smart_split_segments
 
 
@@ -90,6 +96,21 @@ def test_wrap_embedded_english_in_cjk_uses_latin_budget():
     assert out.replace("\n", " ") == text
 
 
+def test_split_subtitle_mixed_latin_uses_visual_width_in_cjk_budget():
+    # 18 zh cells equal 36 half-width units. Raw len() incorrectly charged each
+    # ASCII letter as a whole Han cell and split this compact product phrase.
+    text = "Anthropic旗下Claude开发者中心宣布"
+    assert _vis_width(text) <= 36
+    assert split_subtitle(text, 18, "zh") == text
+    assert _fits_budget(text, 18, 1, "zh")
+
+
+def test_display_budget_rejects_one_indivisible_overlong_token():
+    token = "x" * 43
+    assert split_subtitle(token, 42, "en") == token  # no legal soft break
+    assert not _fits_budget(token, 42, 2, "en")
+
+
 def test_fit_split_repacks_conjunction_parts_to_budget():
     # a long sentence over the 2x42 budget splits at conjunctions, but adjacent
     # parts repack up to the budget instead of one fragment cue per conjunction
@@ -102,6 +123,17 @@ def test_fit_split_repacks_conjunction_parts_to_budget():
     out = split_sentence_heuristically(s, 42, 2, "en", split_at_comma=True)
     assert len(out) == 2, out  # not 5 fragments
     assert " ".join(out) == s  # content preserved
+
+
+def test_fit_split_splits_long_part_before_repacking_short_prefix():
+    from voxweave.core.smart_split import split_sentence_heuristically
+
+    text = "另外，Anthropic旗下Claude开发者中心宣布将推出新的开发工具帮助所有团队"
+    out = split_sentence_heuristically(text, 18, 1, "zh")
+    assert out[0].startswith("另外，")
+    assert out[0] != "另外，"
+    assert "".join(out) == text
+    assert all(_fits_budget(part, 18, 1, "zh") for part in out)
 
 
 def test_wrap_slides_sticky_token_down():
@@ -334,6 +366,7 @@ def test_default_max_lines_cjk_is_single():
 
     assert default_max_lines("ja") == 1  # Japanese: single line
     assert default_max_lines("zh") == 1  # Chinese: also single line
+    assert default_max_lines("yue") == 1  # Cantonese uses the Chinese script policy
     assert default_max_lines("ko") == 2  # Korean (space-delimited): still two lines
     assert default_max_lines("en") == 2
 
@@ -341,9 +374,10 @@ def test_default_max_lines_cjk_is_single():
 def test_default_max_line_length_cjk_single_wider():
     from voxweave.core.layout import default_max_line_length
 
-    # zh/ja single-line -> per-line budget is wider than ko's two-line 12 (fits a whole short sentence)
+    # zh/yue/ja single-line -> wider than ko's two-line 12
     assert default_max_line_length("ja") == 18
     assert default_max_line_length("zh") == 18
+    assert default_max_line_length("yue") == 18
     assert default_max_line_length("ko") == 12  # unchanged
 
 
@@ -364,3 +398,15 @@ def test_smart_split_chinese_never_double_line():
     assert len(cues) >= 2
     for c in cues:
         assert "\n" not in c["text"], c["text"]
+
+
+def test_smart_split_cantonese_uses_no_space_single_line_policy():
+    text = "今日天氣真係幾好我哋一齊出去行下啦"
+    words = [
+        {"word": ch, "start": i * 0.2, "end": i * 0.2 + 0.1}
+        for i, ch in enumerate(text)
+    ]
+    seg = {"start": 0.0, "end": words[-1]["end"], "text": text, "words": words}
+    cues = smart_split_segments([seg], lang="yue")
+    assert "".join(c["text"] for c in cues) == text
+    assert all("\n" not in c["text"] for c in cues)

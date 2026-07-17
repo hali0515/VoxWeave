@@ -21,6 +21,10 @@ DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 # 0.6B emits no punctuation, so fusion must use 1.7B.
 DEFAULT_FUSION_WHISPER = "large-v3"
 DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
+# Optional semantic subtitle boundary selector.  Kept separate from the ASR
+# model: it is loaded only behind --semantic-split in an isolated worker.  The
+# configured id is deliberately not size/version allow-listed.
+DEFAULT_SEMANTIC_MODEL = "Qwen/Qwen3.5-0.8B"
 # Per-language aligner defaults. Unlisted languages fall back to Qwen3-ForcedAligner.
 #
 # en: facebook/wav2vec2-large-960h-lv60-self loaded via HF (same LV60K-self weights as
@@ -99,6 +103,15 @@ _TEMPLATE = """\
 # timestamps = true    # word-level timestamps in the VTT (--timestamps/--no-timestamps)
 # shot_snap = true     # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
 # vad_mask = false     # suppress CTC emissions outside speech spans (--vad-mask/--no-vad-mask)
+# semantic_split = false # Qwen semantic boundary selection; deterministic splitter remains fallback
+
+# Optional semantic cue-boundary model.  It never rewrites transcript text or
+# timestamps; it only chooses among host-validated word/phrase boundaries.
+# Any compatible full Qwen3.5/Qwen3.6 Hugging Face id is accepted as written.
+[semantic]
+# model = "Qwen/Qwen3.5-0.8B"
+# model = "Qwen/Qwen3.5-2B"
+# model = "Qwen/Qwen3.6-27B-FP8"
 
 # Per-language forced-alignment models; unlisted languages use Qwen3-ForcedAligner (built-in default).
 # Values: "mms" (MMS-300m + uroman, full-file single pass; bundled in core) |
@@ -130,6 +143,7 @@ _KNOWN_KEYS = frozenset(
         "batch",
         "align",
         "defaults",
+        "semantic",
     }
 )
 
@@ -200,6 +214,31 @@ def conf_asr_model() -> str | None:
         )
         return None
     return _nonempty_str(v)
+
+
+def conf_semantic_model() -> str:
+    """Semantic boundary model.
+
+    Precedence: ``VOXWEAVE_SEMANTIC_MODEL`` > ``[semantic].model`` > the
+    built-in multilingual Qwen3.5 model.  The configured full model id is not
+    restricted by a size/version allow-list.  Loading remains opt-in; resolving
+    this string never imports a model runtime or downloads weights.
+    """
+    env = _nonempty_str(os.environ.get("VOXWEAVE_SEMANTIC_MODEL"))
+    if env:
+        return env
+    semantic = _load().get("semantic")
+    if isinstance(semantic, dict):
+        value = semantic.get("model")
+        if value is not None and not isinstance(value, str):
+            log.warning(
+                "config [semantic].model has wrong type (expected string), using default"
+            )
+        else:
+            configured = _nonempty_str(value)
+            if configured:
+                return configured
+    return DEFAULT_SEMANTIC_MODEL
 
 
 def _conf_fusion(key: str) -> str | None:
@@ -380,7 +419,7 @@ _GLUE_GAP_DEFAULT_MS = 300  # lone-word flicker cue glues back if gap < this (0=
 # shorter than chars/cps extends into the following gap (capped in smart_split).
 # These are linger targets for flash cues, not display-rate enforcement — verbatim
 # text cannot be slowed below the speech rate.
-_CPS_DEFAULTS = {"ja": 7.0, "zh": 9.0, "ko": 9.0}
+_CPS_DEFAULTS = {"ja": 7.0, "zh": 9.0, "yue": 9.0, "ko": 9.0}
 _CPS_LATIN_DEFAULT = 17.0  # ~Netflix 20 cps incl. spaces, measured without spaces
 _LAG_OUT_DEFAULT_MS = 250  # flat tail pad after speech ends (0=off)
 _SHOT_SNAP_DEFAULT_MS = (

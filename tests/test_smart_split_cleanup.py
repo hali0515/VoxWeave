@@ -296,3 +296,39 @@ def test_held_word_words_before_cap_plain_clamp():
     }
     out = _cleanup_cues([cue], min_cue_s=0.0, max_cue_s=7.0)
     assert out[0]["end"] == pytest.approx(7.0)
+
+
+def test_paragraph_sized_aligned_unit_is_not_truncated_as_a_held_word():
+    # Real regression: Mandarin was labelled as English, so the aligner emitted
+    # an entire paragraph as one 18.374s "word", followed by two normal units.
+    # Cleanup cannot safely split that text; it must not hide everything after
+    # 122.982 while the assigned units remain continuous through 130.018.
+    start, clipped_end, speech_end = 108.982, 122.982, 130.018
+    paragraph = "该模型可自动模拟各类网络攻击用于检测人工智能大模型的安全漏洞采用自博弈强化学习训练"
+    cue = {
+        "text": paragraph + "AI日报就到这里谢谢收看明天见",
+        "start": start,
+        "end": clipped_end,
+        "word_data": [
+            {"word": paragraph, "start": start, "end": 127.356},
+            {"word": "AI", "start": 127.476, "end": 127.577},
+            {
+                "word": "日报就到这里谢谢收看明天见",
+                "start": 127.697,
+                "end": speech_end,
+            },
+        ],
+    }
+    out = _cleanup_cues([cue], min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(speech_end)
+
+
+def test_genuine_single_held_word_remains_visible_for_full_sustain():
+    cue = {
+        "text": "pearl",
+        "start": 0.0,
+        "end": 18.0,
+        "word_data": [{"word": "pearl", "start": 0.0, "end": 18.0}],
+    }
+    out = _cleanup_cues([cue], min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(18.0)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 from collections import Counter
@@ -20,7 +21,12 @@ from voxweave.chunking import (
     vad_speech_segments,
 )
 from voxweave.debug import DebugSink, FileDebugSink
-from voxweave.lang import is_supported, to_iso_or
+from voxweave.lang import (
+    is_supported,
+    reconcile_detected_language,
+    to_iso_or,
+    transcript_content_weight,
+)
 from voxweave.progress import Reporter
 from voxweave import realign
 from voxweave import translate as translate_mod
@@ -94,6 +100,45 @@ MEDIA_EXTS = (
     ".opus",
     ".ogg",
 )
+
+
+def _release_semantic_engine(engine: Any | None) -> None:
+    """Best-effort optional-model cleanup; never replace deterministic output."""
+
+    if engine is None:
+        return
+    try:
+        engine.release()
+    except Exception as exc:  # noqa: BLE001 - cleanup must not overturn baseline cues
+        log.warning("semantic splitter cleanup failed: %s", exc)
+
+
+def _select_transcript_language(
+    results: Sequence[tuple[str | None, str, Sequence[dict]]],
+    override: str | None = None,
+) -> str:
+    """Select the file language from pre-alignment transcript content.
+
+    Unit counts cannot be used here: a wrong aligner is liable to collapse Han
+    prose into a few units (or fragment another script), making the original
+    classification error self-reinforcing.  Normalize equivalent labels and
+    weight each reconciled label by its transcript's alphanumeric content.
+    """
+    if override and override.strip():
+        return override.strip()
+
+    weights: Counter[str] = Counter()
+    for detected, text, _units in results:
+        if not text.strip():
+            continue
+        effective = reconcile_detected_language(detected, text)
+        if not effective:
+            continue
+        key = to_iso_or(effective, None) or effective.strip().casefold()
+        mass = transcript_content_weight(text)
+        if mass:
+            weights[key] += mass
+    return weights.most_common(1)[0][0] if weights else "english"
 
 
 def _progress_bridge(rep: Reporter, label: str):
@@ -625,7 +670,6 @@ def transcribe(
         # so punctuation cannot be reinjected per-chunk.
         chunk_pairs: list[tuple[str, list[dict]]] = []
         detected: list[str] = []  # per-chunk detected language (debug meta only)
-        lang_weight: Counter[str] = Counter()  # vote weighted by aligned unit count
         for idx, (ch, cwav, (det_lang, text, units)) in enumerate(
             zip(chunks, cwavs, results)
         ):
@@ -644,7 +688,6 @@ def transcribe(
                 continue
             if det_lang:
                 detected.append(det_lang)
-                lang_weight[det_lang] += len(units)
             dbg.chunk(
                 idx,
                 wav=cwav,
@@ -660,13 +703,9 @@ def transcribe(
         if not chunk_pairs:
             raise RuntimeError(f"no aligned units for {media_path.name}")
 
-        # Unit-count weighting lets long dialogue dominate over short cold-open/insert segments.
-        if lang_override:
-            lang_name = lang_override
-        elif lang_weight:
-            lang_name = lang_weight.most_common(1)[0][0]
-        else:
-            lang_name = "english"
+        # Transcript-content weighting lets long dialogue dominate without
+        # trusting the aligner whose language choice we are validating.
+        lang_name = _select_transcript_language(results, lang_override)
         if not is_supported(lang_name):
             log.warning(
                 "language %r not in aligner set; smart_split may misbehave", lang_name
@@ -966,6 +1005,154 @@ def _units_to_seg(units: list[dict], iso: str) -> dict:
     }
 
 
+def _reconcile_word_segment_language(
+    language: str | None,
+    units: list[dict],
+    *,
+    override: str | None = None,
+) -> tuple[str, list[dict]]:
+    """Repair a strong persisted language/tokenization mismatch before splitting.
+
+    Older outputs can say ``en`` even when their transcript is overwhelmingly
+    Han.  Those files also carry the damage from the English aligner: a whole
+    Chinese paragraph may be stored as one 10--20 second ``word``.  Merely
+    changing the smart-split language cannot recover from that coarse timing.
+
+    Reconstruct the text using the *stored* unit contract, reconcile its script,
+    and only for a strong spaced -> no-space correction rebuild per-character
+    timings through :func:`realign.reinject_punct`.  That helper retains
+    punctuation and spaces inside Latin runs (``GPT Red``) while distributing
+    each coarse unit's existing span; no ASR/alignment model is called.
+    """
+    if not units:
+        raise RuntimeError("no word segments to split")
+
+    original_units = units
+    stored_iso = to_iso_or(language, "en")
+    pieces = [str(unit.get("text") or "") for unit in units]
+    meaningful = [piece for piece in pieces if piece.strip()]
+    if not meaningful:
+        return stored_iso, units
+
+    # A correctly reinjected no-space stream has exactly one visible character
+    # per unit; spaces inside Latin phrases ride on the preceding unit (``T ``).
+    # If only the persisted label is stale, joining such a stream with the
+    # label's English separator would invent ``G P T``.  Recognize the
+    # representation itself and preserve its exact whitespace instead.
+    char_grained = len(meaningful) == len(units) and all(
+        sum(not ch.isspace() for ch in piece) == 1 for piece in meaningful
+    )
+    if char_grained:
+        text = "".join(pieces)
+    else:
+        stored_sep = "" if stored_iso in realign.NO_SPACE_LANGS else " "
+        text = stored_sep.join(meaningful)
+
+    effective = reconcile_detected_language(language, text, override=override)
+    effective_iso = to_iso_or(effective, stored_iso)
+    if effective_iso == stored_iso:
+        return stored_iso, units
+
+    stored_no_space = stored_iso in realign.NO_SPACE_LANGS
+    effective_no_space = effective_iso in realign.NO_SPACE_LANGS
+    if stored_no_space == effective_no_space:
+        log.warning(
+            "word-segment language/script mismatch: %s -> %s; "
+            "reusing compatible timings",
+            stored_iso,
+            effective_iso,
+        )
+        return effective_iso, units
+
+    # A char-grained stream already satisfies every no-space target's unit
+    # contract.  Relabel it directly instead of destructively reinjecting.
+    if char_grained and effective_no_space:
+        log.warning(
+            "word-segment language/script mismatch: %s -> %s; "
+            "reusing existing character timings",
+            stored_iso,
+            effective_iso,
+        )
+        return effective_iso, units
+
+    def _timings(seq: Sequence[Mapping[str, Any]]) -> list[tuple[float, float]] | None:
+        rows: list[tuple[float, float]] = []
+        for unit in seq:
+            try:
+                start = float(unit["start"])
+                end = float(unit["end"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if not math.isfinite(start) or not math.isfinite(end) or end < start:
+                return None
+            rows.append((start, end))
+        return rows or None
+
+    source_times = _timings(units)
+    if source_times is None:
+        log.warning(
+            "cannot repair word-segment language %s -> %s: malformed source timings",
+            stored_iso,
+            effective_iso,
+        )
+        return stored_iso, original_units
+
+    try:
+        rebuilt = realign.reinject_punct(text, units, effective_iso)
+    except Exception as exc:  # noqa: BLE001 -- persisted input may be arbitrarily malformed
+        log.warning(
+            "cannot repair word-segment language %s -> %s: %s",
+            stored_iso,
+            effective_iso,
+            exc,
+        )
+        return stored_iso, original_units
+
+    rebuilt_times = _timings(rebuilt)
+    source_monotone = all(
+        a[0] <= b[0] and a[1] <= b[1]
+        for a, b in zip(source_times, source_times[1:])
+    )
+    rebuilt_monotone = rebuilt_times is not None and all(
+        a[0] <= b[0] and a[1] <= b[1]
+        for a, b in zip(rebuilt_times, rebuilt_times[1:])
+    )
+    if effective_no_space:
+        round_trip_ok = "".join(str(u.get("text") or "") for u in rebuilt) == text
+    else:
+        rebuilt_text = " ".join(str(u.get("text") or "") for u in rebuilt)
+        round_trip_ok = " ".join(rebuilt_text.split()) == " ".join(text.split())
+    envelope_ok = rebuilt_times is not None and all(
+        math.isclose(a, b, abs_tol=1e-6)
+        for a, b in zip(
+            (min(s for s, _e in source_times), max(e for _s, e in source_times)),
+            (
+                min(s for s, _e in rebuilt_times),
+                max(e for _s, e in rebuilt_times),
+            ),
+        )
+    )
+    if not rebuilt or not round_trip_ok or not envelope_ok or (
+        source_monotone and not rebuilt_monotone
+    ):
+        log.warning(
+            "cannot repair word-segment language %s -> %s without changing "
+            "content/timing; keeping persisted representation",
+            stored_iso,
+            effective_iso,
+        )
+        return stored_iso, original_units
+
+    noun = "character" if effective_no_space else "word"
+    log.warning(
+        "word-segment language/script mismatch: %s -> %s; rebuilding %s timings",
+        stored_iso,
+        effective_iso,
+        noun,
+    )
+    return effective_iso, rebuilt
+
+
 def process(
     media_path: Path,
     lang_override: str | None = None,
@@ -984,6 +1171,8 @@ def process(
     shot_snap: bool = True,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
+    semantic_split: bool = False,
+    semantic_model: str | None = None,
 ) -> Path:
     """Full pipeline: transcribe -> smart_split -> write siblings. Return the .vtt path.
 
@@ -995,6 +1184,9 @@ def process(
     non-speech event tags merged into the dialogue (main VTT/JSON untouched).
     ``diarize`` runs pyannote speaker diarization and formats multi-speaker cues
     (dual-speaker hyphens / speaker-boundary splits; turns persist to JSON).
+    ``semantic_split`` optionally lets a small model choose among legal cue
+    boundaries.  The deterministic splitter remains the source of truth and
+    automatic fallback; model output can never replace text or timestamps.
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
@@ -1004,6 +1196,9 @@ def process(
     speaker_turns: list[tuple[float, float, str]] | None = None
     if word_segments is not None:
         iso, units = word_segments
+        iso, units = _reconcile_word_segment_language(
+            iso, units, override=lang_override
+        )
     else:
         iso, units, vad_speech, sing_spans, speaker_turns = transcribe(
             media_path,
@@ -1038,13 +1233,29 @@ def process(
     seg = _units_to_seg(units, iso)
     rep.stage("smart_split layout")
     thresholds = _maybe_adaptive_thresholds(gap_thresholds(iso), units)
-    cues = smart_split_segments(
-        [seg],
-        lang=iso,
-        speech_spans=vad_speech,
-        thresholds=thresholds,
-        shot_changes=shot_changes,
-    )
+    semantic_engine = None
+    if semantic_split:
+        try:
+            from voxweave.semantic_breaks import SemanticBreakEngine
+
+            semantic_engine = SemanticBreakEngine()
+            rep.stage("semantic subtitle boundaries")
+        except Exception as exc:  # noqa: BLE001 - optional stage must degrade safely
+            log.warning(
+                "semantic splitter unavailable; using deterministic layout (%s)", exc
+            )
+    try:
+        cues = smart_split_segments(
+            [seg],
+            lang=iso,
+            speech_spans=vad_speech,
+            thresholds=thresholds,
+            shot_changes=shot_changes,
+            semantic_engine=semantic_engine,
+            semantic_model=semantic_model,
+        )
+    finally:
+        _release_semantic_engine(semantic_engine)
     mark_lyric_cues(cues, sing_spans)
     if speaker_turns:
         from voxweave.diarize import apply_speaker_format
@@ -1104,11 +1315,18 @@ def _write_sdh_sidecar(
     return path
 
 
-def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Path:
-    """Re-run smart_split from persisted word_segments without any model calls.
+def split(
+    json_path: Path,
+    timestamps: bool = True,
+    semantic_split: bool = False,
+    semantic_model: str | None = None,
+    **smart_split_kwargs,
+) -> Path:
+    """Re-run smart_split from persisted word_segments.
 
     Reuses ``vad_speech`` from the sibling JSON for gap splitting; falls back to gap-only
-    mode if absent. ``timestamps`` behaves as in :func:`process`.
+    mode if absent. ``timestamps`` behaves as in :func:`process`.  This remains model-free
+    by default; ``semantic_split=True`` opts into the isolated boundary selector.
     """
     from voxweave.core.smart_split import smart_split_segments
     from voxweave.config import gap_thresholds
@@ -1118,7 +1336,9 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
     json_path = swap_ext(Path(json_path), ".json")
     data = _load_sibling_json(json_path, require="word_segments")
     units = data["word_segments"]
-    iso = data.get("language", "en")
+    iso, units = _reconcile_word_segment_language(
+        data.get("language", "en"), units
+    )
     speech_spans = _spans_in(data.get("vad_speech"))
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = _spans_in(data.get("sing_spans"))
@@ -1128,14 +1348,29 @@ def split(json_path: Path, timestamps: bool = True, **smart_split_kwargs) -> Pat
     )  # zh: snap to jieba boundary (same as process)
     seg = _units_to_seg(units, iso)
     thresholds = _maybe_adaptive_thresholds(gap_thresholds(iso), units)
-    cues = smart_split_segments(
-        [seg],
-        lang=iso,
-        speech_spans=speech_spans,
-        thresholds=thresholds,
-        shot_changes=shot_changes,
-        **smart_split_kwargs,
-    )
+    semantic_engine = None
+    if semantic_split:
+        try:
+            from voxweave.semantic_breaks import SemanticBreakEngine
+
+            semantic_engine = SemanticBreakEngine()
+        except Exception as exc:  # noqa: BLE001 - optional stage must degrade safely
+            log.warning(
+                "semantic splitter unavailable; using deterministic layout (%s)", exc
+            )
+    try:
+        cues = smart_split_segments(
+            [seg],
+            lang=iso,
+            speech_spans=speech_spans,
+            thresholds=thresholds,
+            shot_changes=shot_changes,
+            semantic_engine=semantic_engine,
+            semantic_model=semantic_model,
+            **smart_split_kwargs,
+        )
+    finally:
+        _release_semantic_engine(semantic_engine)
     mark_lyric_cues(cues, sing_spans)
     if speaker_turns:
         from voxweave.diarize import apply_speaker_format

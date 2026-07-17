@@ -87,3 +87,4 @@ def test_no_space_sets_in_sync():
     from voxweave.core.smart_split import LANGUAGES_WITHOUT_SPACES
 
     assert _NO_SPACE == LANGUAGES_WITHOUT_SPACES
+    assert "yue" in _NO_SPACE

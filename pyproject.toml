@@ -142,6 +142,8 @@ where = ["."]
 include = ["voxweave*"]
 
 [tool.setuptools.package-data]
+# Locked PEP 723 environment for the optional, isolated Qwen3.5/Qwen3.6 FP8 worker.
+"voxweave" = ["semantic_worker.py.lock"]
 # Separator config bundled with the package (must match the frozen MelBandRoformer
 # architecture vendored in voxweave.vendor).
 "voxweave.vendor" = ["*.yaml"]

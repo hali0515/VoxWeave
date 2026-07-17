@@ -278,6 +278,27 @@ def cli(verbose: bool) -> None:
     " off when VAD may misjudge sung/whispered speech). Default: off, or conf"
     " [defaults].vad_mask; same as VOXWEAVE_VAD_EMISSION_MASK=1.",
 )
+@click.option(
+    "--semantic-split/--no-semantic-split",
+    default=None,
+    help=(
+        "Use the optional Qwen semantic boundary selector after alignment. It may only"
+        " choose host-validated word/phrase boundaries; text and source timing are"
+        " immutable, while line width, maximum duration, real pauses, and guarded"
+        " timing/readability scores remain host-controlled."
+        " Default: off, or conf [defaults].semantic_split; every failure falls back"
+        " to the normal splitter."
+    ),
+)
+@click.option(
+    "--semantic-model",
+    default=None,
+    envvar="VOXWEAVE_SEMANTIC_MODEL",
+    help=(
+        "Full Qwen3.5/Qwen3.6 boundary model id (default: "
+        "Qwen/Qwen3.5-0.8B; no size allow-list). Used only with --semantic-split."
+    ),
+)
 def cmd_transcribe(
     media: Path,
     language: str | None,
@@ -296,6 +317,8 @@ def cmd_transcribe(
     timestamps: bool | None,
     shot_snap: bool | None,
     vad_mask: bool | None,
+    semantic_split: bool | None,
+    semantic_model: str | None,
 ) -> None:
     """Media -> (vocal separation) -> VAD -> local ASR/alignment -> smart_split -> write VTT+JSON."""
     _apply_vad_mask(vad_mask)
@@ -305,6 +328,7 @@ def cmd_transcribe(
     diarize = _flag(diarize, "diarize", False)
     timestamps = _flag(timestamps, "timestamps", True)
     shot_snap = _flag(shot_snap, "shot_snap", True)
+    semantic_split = _flag(semantic_split, "semantic_split", False)
     out = _run(
         lambda rep: pipeline.process(
             media,
@@ -323,6 +347,8 @@ def cmd_transcribe(
             context=context,
             timestamps=timestamps,
             shot_snap=shot_snap,
+            semantic_split=semantic_split,
+            semantic_model=semantic_model or config.conf_semantic_model(),
         )
     )
     dbg_dir = Path("debug") / media.stem if debug else None
@@ -356,21 +382,47 @@ cli.default_cmd = (
     help="Include timestamps in VTT (default: on, or conf [defaults].timestamps;"
     " use --no-timestamps for a plain-text editing draft).",
 )
+@click.option(
+    "--semantic-split/--no-semantic-split",
+    default=None,
+    help=(
+        "Optionally reselect cue boundaries with Qwen; deterministic layout is the"
+        " default and automatic fallback."
+    ),
+)
+@click.option(
+    "--semantic-model",
+    default=None,
+    envvar="VOXWEAVE_SEMANTIC_MODEL",
+    help=(
+        "Full Qwen3.5/Qwen3.6 model id used with --semantic-split "
+        "(default: Qwen/Qwen3.5-0.8B; no size allow-list)."
+    ),
+)
 def cmd_split(
     json_path: Path,
     max_line_length: int | None,
     max_lines: int | None,
     timestamps: bool | None,
+    semantic_split: bool | None,
+    semantic_model: str | None,
 ) -> None:
-    """Offline re-layout: re-run smart_split from <stem>.json without running any models."""
+    """Re-layout from <stem>.json; model-free unless --semantic-split is enabled."""
     timestamps = _flag(timestamps, "timestamps", True)
+    semantic_split = _flag(semantic_split, "semantic_split", False)
     kwargs: dict = {}
     if max_line_length is not None:
         kwargs["max_line_length"] = max_line_length
     if max_lines is not None:
         kwargs["max_lines"] = max_lines
     out = _run(
-        lambda _rep: pipeline.split(json_path, timestamps=timestamps, **kwargs),
+        lambda _rep: pipeline.split(
+            json_path,
+            timestamps=timestamps,
+            semantic_split=semantic_split,
+            semantic_model=semantic_model or config.conf_semantic_model(),
+            **kwargs,
+        ),
         reporter=False,
     )
     click.echo(out)

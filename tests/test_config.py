@@ -61,6 +61,38 @@ def test_conf_asr_model_none_when_absent(conf_at):
     assert config.conf_asr_model() is None
 
 
+def test_semantic_model_default_and_precedence(conf_at, monkeypatch):
+    monkeypatch.delenv("VOXWEAVE_SEMANTIC_MODEL", raising=False)
+    assert config.conf_semantic_model() == "Qwen/Qwen3.5-0.8B"
+    conf_at.write_text('[semantic]\nmodel = "local/custom"\n', encoding="utf-8")
+    assert config.conf_semantic_model() == "local/custom"
+    monkeypatch.setenv("VOXWEAVE_SEMANTIC_MODEL", "env/custom")
+    assert config.conf_semantic_model() == "env/custom"
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+        "Qwen/Qwen3.6-27B-FP8",
+    ],
+)
+def test_semantic_model_config_has_no_family_size_allowlist(conf_at, model_id):
+    conf_at.write_text(f'[semantic]\nmodel = "{model_id}"\n', encoding="utf-8")
+    assert config.conf_semantic_model() == model_id
+
+
+def test_default_template_documents_optional_semantic_split(conf_at):
+    config.ensure_default_config()
+    text = conf_at.read_text(encoding="utf-8")
+    assert "semantic_split = false" in text
+    assert '[semantic]' in text
+    assert 'Qwen/Qwen3.5-0.8B' in text
+    assert 'Qwen/Qwen3.5-2B' in text
+    assert 'Qwen/Qwen3.6-27B-FP8' in text
+
+
 def test_align_model_for_en_builtin(conf_at):
     # no config file -> built-in en -> large wav2vec2 CTC (HF path -> ~/.cache/huggingface/hub)
     assert config.align_model_for("en") == "facebook/wav2vec2-large-960h-lv60-self"

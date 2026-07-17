@@ -108,8 +108,8 @@ def legal_break_index(tokens: list[str], lang: str, target: int) -> int:
     return target
 
 
-# _NO_SPACE is the shared LANGUAGES_WITHOUT_SPACES (imported above). yue is intentionally absent
-# — smart_split treats yue as space-delimited.
+# _NO_SPACE is the shared LANGUAGES_WITHOUT_SPACES (imported above), including
+# yue so Cantonese follows the same character-level policy as written Chinese.
 
 
 @functools.lru_cache(maxsize=8)

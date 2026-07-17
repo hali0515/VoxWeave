@@ -1,7 +1,11 @@
 # tests/test_kinsoku.py
 import pytest
 
-from voxweave.core.kinsoku import apply_kinsoku, line_end_penalty
+from voxweave.core.kinsoku import (
+    apply_kinsoku,
+    line_end_penalty,
+    line_start_penalty,
+)
 
 
 def test_no_line_starts_with_small_kana():
@@ -104,6 +108,16 @@ def test_line_end_penalty_zh_whole_word(w):
 def test_line_end_penalty_ja_chars_active_without_lang():
     # kana particle check stays active regardless of lang (cannot false-positive elsewhere)
     assert line_end_penalty("大樹の", "ja") == 2
+
+
+@pytest.mark.parametrize("particle", ["的", "地", "得", "了", "呢", "吗", "吧"])
+def test_line_start_penalty_zh_independent_particles(particle):
+    assert line_start_penalty(particle, "zh") == 2
+
+
+@pytest.mark.parametrize("word", ["了解", "地方", "得到", "的确"])
+def test_line_start_penalty_zh_does_not_match_lexical_prefix(word):
+    assert line_start_penalty(word, "zh") == 0
 
 
 # --------------------------------------------------------------------------- #

@@ -217,6 +217,7 @@ class _MlxWhisper:
         *,
         language: str | None = None,
         initial_prompt: str | None = None,
+        hotwords: str | None = None,  # noqa: ARG002 -- mlx-whisper has no hotword channel
         condition_on_previous_text: bool = False,
         vad_filter: bool = False,  # noqa: ARG002 -- faster-whisper arg; mlx_whisper has none (VAD upstream)
         word_timestamps: bool = False,

@@ -17,27 +17,27 @@ from .langsets import LANGUAGES_WITHOUT_SPACES
 
 # Languages whose glyphs render at ~2x the visual width of Latin chars,
 # so the per-line character budget must be roughly halved.
-WIDE_GLYPH_LANGUAGES = {"zh", "ja", "ko"}
+WIDE_GLYPH_LANGUAGES = {"zh", "yue", "ja", "ko"}
 
 DEFAULT_MAX_LINE_LENGTH = 42  # latin / space-delimited
 DEFAULT_MAX_LINE_LENGTH_CJK = 12  # ko: 2 lines × 12 chars (~2x visual width)
-# zh/ja are single-line langs: one line gets a wider budget than ko's 12 so a
+# zh/yue/ja are single-line langs: one line gets a wider budget than ko's 12 so a
 # short sentence fits whole; content over 18 chars splits into more cues, never wraps.
 DEFAULT_MAX_LINE_LENGTH_CJK_SINGLE = 18
 DEFAULT_MAX_LINES = 2
-# zh/ja read best as one line per cue — stacking two lines can break mid-token
+# zh/yue/ja read best as one line per cue — stacking two lines can break mid-token
 # (e.g. です -> で/す). Long utterances split into more single-line cues instead.
-SINGLE_LINE_LANGS = {"zh", "ja"}
+SINGLE_LINE_LANGS = {"zh", "yue", "ja"}
 
 
 def default_max_lines(lang: str) -> int:
-    """zh/ja: 1 line per cue (long utterances split into more cues). Others: 2."""
+    """zh/yue/ja: 1 line per cue (long utterances split more). Others: 2."""
     return 1 if lang in SINGLE_LINE_LANGS else DEFAULT_MAX_LINES
 
 
 def default_max_line_length(lang: str) -> int:
     """Per-language line length. CJK glyphs render ~2x Latin width, so the budget
-    is halved. Single-line zh/ja gets a wider budget so short sentences fit whole."""
+    is halved. Single-line zh/yue/ja gets a wider budget for short sentences."""
     if lang in SINGLE_LINE_LANGS:
         return DEFAULT_MAX_LINE_LENGTH_CJK_SINGLE
     return (
@@ -155,33 +155,52 @@ def _reading_chars(text: str) -> int:
     return sum(1 for ch in text if not ch.isspace())
 
 
+def _line_budget_width(max_chars: int, lang: str) -> int:
+    """Return a line budget in half-width visual units.
+
+    ``max_chars`` is configured in native cells: CJK presets count one wide
+    glyph per cell, while Latin presets already count half-width characters.
+    Converting both sides to the same unit lets mixed-script text use the spare
+    half-width capacity instead of charging every ASCII letter as one Han cell.
+    """
+    return max_chars * 2 if lang in WIDE_GLYPH_LANGUAGES else max_chars
+
+
 def split_subtitle(text: str, max_chars: int, lang: str) -> str:
-    """Soft-wrap text to lines of <= max_chars, breaking at token boundaries."""
+    """Soft-wrap text within the visual line budget, at token boundaries."""
     tokens = _tokens(text, lang)
     if not tokens:
         return text
     sep = "" if _no_spaces(lang) else " "
+    budget = _line_budget_width(max_chars, lang)
     lines: List[str] = []
     current: List[str] = []
-    current_len = 0
+    current_width = 0
     for tok in tokens:
-        tlen = len(tok)
-        extra = len(sep) if current else 0
-        if current and current_len + tlen + extra > max_chars:
+        tok_width = _vis_width(tok)
+        extra = _vis_width(sep) if current else 0
+        if current and current_width + tok_width + extra > budget:
             lines.append(sep.join(current))
             current = [tok]
-            current_len = tlen
+            current_width = tok_width
         else:
             current.append(tok)
-            current_len += tlen + extra
+            current_width += tok_width + extra
     if current:
         lines.append(sep.join(current))
     return "\n".join(lines)
 
 
 def _fits_budget(text: str, max_line_length: int, max_lines: int, lang: str) -> bool:
-    """True when ``text`` soft-wraps into at most ``max_lines`` lines."""
-    return split_subtitle(text, max_line_length, lang).count("\n") + 1 <= max_lines
+    """True when every soft-wrapped line fits and line count stays in budget.
+
+    The explicit per-line width check matters for an indivisible token wider
+    than a line: ``split_subtitle`` cannot invent a token-internal break, so
+    merely counting its one output line would otherwise report a false fit.
+    """
+    lines = split_subtitle(text, max_line_length, lang).split("\n")
+    budget = _line_budget_width(max_line_length, lang)
+    return len(lines) <= max_lines and all(_vis_width(line) <= budget for line in lines)
 
 
 # "I I" -> "I-I"; ASCII letters only (CJK and digit-containing tokens skipped).
@@ -381,7 +400,7 @@ def wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
         if not _no_spaces(lang) and len(groups) > 1:
             _slide_sticky_line_ends(groups, lang)
     lines = [_join_line(g) for g in groups]
-    if lang in {"ja", "zh"} and len(lines) > 1:
+    if lang in {"ja", "zh", "yue"} and len(lines) > 1:
         from .kinsoku import apply_kinsoku
 
         lines = apply_kinsoku(lines)

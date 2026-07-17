@@ -233,10 +233,12 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
 | `--vad-mask/--no-vad-mask`     | Suppress CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                    |
+| `--semantic-split`             | Optional Qwen3.5/Qwen3.6 boundary selection for more natural clauses, with no glossary or per-video prompt required. The model can only choose host-approved word/phrase cuts; visual width, maximum duration, real pauses, text, and timestamps remain hard constraints, while timing/readability scores prevent a semantic choice from becoming materially worse than the deterministic path. Disabled by default; every failure returns the normal deterministic result. |
+| `--semantic-model`             | Full Qwen3.5/Qwen3.6 Hugging Face model id used only with `--semantic-split`; there is no size allow-list (default `Qwen/Qwen3.5-0.8B`). |
 | `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`.                                                                                                                                                                                                  |
 
 The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--timestamps`,
-`--shot-snap`, `--vad-mask`) can have their defaults set persistently via the `[defaults]`
+`--shot-snap`, `--vad-mask`, `--semantic-split`) can have their defaults set persistently via the `[defaults]`
 section of `~/.config/voxweave.conf` — an explicit CLI flag always wins for that run.
 
 </details>
@@ -272,13 +274,34 @@ voxweave align episode.vtt --no-separate   # align on the original audio (clean 
 
 ### Re-layout offline
 
-`voxweave split <json>` — re-run smart_split from `<stem>.json` **without any models** (adjust
-line width / sentence breaks instantly).
+`voxweave split <json>` — re-run smart_split from `<stem>.json` without any models by default
+(adjust line width / sentence breaks instantly). Add `--semantic-split` to opt into the semantic
+boundary selector; model failure leaves the deterministic output unchanged.
 
 ```bash
 voxweave split episode.json --max-line-length 14 --max-lines 1
 voxweave split episode.json --no-timestamps   # plain-text editing draft
+voxweave split episode.json --semantic-split  # optional semantic boundary pass
 ```
+
+The built-in semantic route defaults to `Qwen/Qwen3.5-0.8B` in a persistent,
+isolated `uv` worker. `[semantic].model`, `--semantic-model`, or
+`VOXWEAVE_SEMANTIC_MODEL` may name any compatible Qwen3.5/Qwen3.6 Hugging Face
+model without a size allow-list. On first use it prepares that locked runtime and downloads the model;
+later runs reuse both caches under `~/.cache/voxweave/semantic` (or
+`$VOXWEAVE_CACHE_ROOT/semantic`). The compute-heavy, block-compatible linear
+stack runs dynamic W8A8 FP8 on a supported NVIDIA CUDA GPU and is never silently
+dequantized wholesale to BF16. Qwen's non-linear recurrent state plus tiny
+non-tileable gate matrices retain native BF16 for numerical range; the loader
+requires at least 80% of text linear layers to be verified FP8 and limits
+full-precision linear residual weights to under 1%. The local model never
+rewrites subtitles and does not generate a JSON decision: it compares
+only host-approved layouts using symmetric fixed-label logits, while timing and
+display constraints remain deterministic. A missing runtime, unsupported GPU,
+download error, OOM, timeout, non-finite score, or host validation failure leaves
+the ordinary deterministic subtitles unchanged. An explicitly configured
+OpenAI-compatible endpoint owns its own precision and is therefore not covered by
+the local FP8 guarantee.
 
 ### ASR correction
 
@@ -444,6 +467,9 @@ default config is written on first run (migrated automatically from a pre-rename
 **Models**
 
 - `VOXWEAVE_ASR_MODEL` (default `Qwen/Qwen3-ASR-0.6B`; same as `--model`)
+- `VOXWEAVE_SEMANTIC_MODEL` (default `Qwen/Qwen3.5-0.8B`; only read with `--semantic-split`)
+- `VOXWEAVE_SEMANTIC_TIMEOUT` (local semantic worker deadline in seconds; default `900` so first-use setup can finish)
+- `VOXWEAVE_SEMANTIC_BASE_URL` / `VOXWEAVE_SEMANTIC_API_KEY` (optional user-managed OpenAI-compatible endpoint; unset uses the isolated local FP8 worker)
 - `VOXWEAVE_ALIGNER_MODEL` (default `Qwen/Qwen3-ForcedAligner-0.6B`)
 - `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)
 - `VOXWEAVE_BACKEND` (`mlx` | `torch`; default: `mlx` on mps, else `torch`) — picks the ASR/alignment backend
@@ -453,7 +479,7 @@ default config is written on first run (migrated automatically from a pre-rename
   and the Whisper repo tracks the Whisper size (`--model large-v3` → `mlx-community/whisper-large-v3-mlx`);
   set the matching var to hard-pin a specific quant (e.g. a 4-bit build) regardless of `--model`.
 
-All model weights (torch + MLX) are cached under `~/.cache/voxweave/{asr,align,audio}`
+All model weights (torch + MLX) are cached under `~/.cache/voxweave/{asr,align,audio,semantic}`
 (auto-downloaded on first use; override the root with `VOXWEAVE_CACHE_ROOT`), so a container only
 needs to bind-mount that one directory. Each model exposes an env override to swap the HF repo, or
 to point at an explicit local file (which, if it exists, skips the HF download):
@@ -527,6 +553,12 @@ diarize    = false                       # pyannote speaker diarization (--diari
 timestamps = true                        # word-level timestamps in the VTT (--timestamps/--no-timestamps)
 shot_snap  = true                        # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
 vad_mask   = false                       # suppress CTC emissions outside speech (--vad-mask/--no-vad-mask)
+semantic_split = false                  # optional Qwen semantic boundaries; deterministic fallback stays active
+
+[semantic]
+model = "Qwen/Qwen3.5-0.8B"
+# model = "Qwen/Qwen3.5-2B"
+# model = "Qwen/Qwen3.6-27B-FP8"
 
 # dual-ASR fusion sub-models — only consulted when running with --hybrid.
 [fusion]

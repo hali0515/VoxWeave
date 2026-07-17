@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import unicodedata
 from typing import overload
 
 log = logging.getLogger("voxweave")
@@ -101,6 +103,154 @@ def to_iso_or(raw: str | None, default: str | None) -> str | None:
     if key in _NAME_TO_ISO:
         return _NAME_TO_ISO[key]
     return default
+
+
+_LANGUAGE_LABEL_SEP_RE = re.compile(r"[,，;；|/]+")
+_LATIN_LANGUAGE_ISOS = {"en", "fr", "de", "it", "pt", "es"}
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*")
+
+
+def detected_language_candidates(raw: str | None) -> list[str]:
+    """Return ordered, de-duplicated labels from an ASR language field.
+
+    Qwen can report multilingual audio as a comma-separated string such as
+    ``"English,Chinese"``.  Treating that value as one label (or blindly taking
+    its first item) makes the result depend on model formatting rather than the
+    transcript.  Full-width punctuation is accepted because localized wrappers
+    occasionally preserve it.
+    """
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in _LANGUAGE_LABEL_SEP_RE.split(str(raw)):
+        label = part.strip().strip("\"'").strip()
+        if not label:
+            continue
+        key = to_iso_or(label, None) or label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(label)
+    return out
+
+
+def transcript_content_weight(text: str) -> int:
+    """Stable language-vote mass derived from transcript content, not alignment.
+
+    Alignment unit counts are an unsafe vote: selecting the wrong tokenizer can
+    itself collapse or multiply units.  Unicode alphanumeric characters exist
+    before alignment and therefore give every engine the same evidence.
+    """
+    return sum(ch.isalnum() for ch in text)
+
+
+def _is_han(codepoint: int) -> bool:
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x2FA1F
+        or 0x30000 <= codepoint <= 0x323AF
+    )
+
+
+def _dominant_transcript_script(text: str) -> str | None:
+    """Return only strong script evidence; short/mixed snippets stay undecided."""
+    han = kana = hangul = latin = other = 0
+    for ch in text:
+        cp = ord(ch)
+        if _is_han(cp):
+            han += 1
+        elif (
+            0x3040 <= cp <= 0x30FF
+            or 0x31F0 <= cp <= 0x31FF
+            or 0xFF66 <= cp <= 0xFF9D
+        ):
+            kana += 1
+        elif (
+            0x1100 <= cp <= 0x11FF
+            or 0x3130 <= cp <= 0x318F
+            or 0xA960 <= cp <= 0xA97F
+            or 0xAC00 <= cp <= 0xD7AF
+            or 0xD7B0 <= cp <= 0xD7FF
+        ):
+            hangul += 1
+        elif ch.isalpha() and "LATIN" in unicodedata.name(ch, ""):
+            latin += 1
+        elif ch.isalpha():
+            other += 1
+
+    total = han + kana + hangul + latin + other
+    if not total:
+        return None
+    if hangul >= 4 and hangul * 5 >= total * 3:
+        return "ko"
+
+    # Japanese normally mixes kana and Han.  Requiring a meaningful kana share
+    # avoids classifying Chinese prose containing a short Japanese product name.
+    cjk = han + kana
+    if (
+        kana >= 2
+        and cjk >= 4
+        and cjk * 5 >= total * 3
+        and kana * 6 >= cjk
+    ):
+        return "ja"
+    if han >= 4 and han * 5 >= total * 3 and kana * 6 < cjk:
+        return "han"
+
+    # Latin cannot distinguish English from the other supported Latin-script
+    # languages.  It is useful only for selecting one of the model's candidates,
+    # and only for sentence-like text rather than a couple of product names.
+    if (
+        latin >= 12
+        and len(_LATIN_WORD_RE.findall(text)) >= 4
+        and latin * 5 >= total * 4
+    ):
+        return "latin"
+    return None
+
+
+def reconcile_detected_language(
+    detected: str | None, text: str, override: str | None = None
+) -> str | None:
+    """Choose the effective ASR language using labels plus transcript script.
+
+    An explicit CLI language is authoritative.  In auto mode, strong script
+    evidence selects the matching item from a multilingual Qwen label.  It can
+    also repair an impossible single-label result (most importantly a Han-heavy
+    transcript reported as English).  Weak evidence deliberately keeps the first
+    model label so short mixed/proper-noun chunks cannot flip the file language.
+    """
+    if override and override.strip():
+        return override.strip()
+
+    candidates = detected_language_candidates(detected)
+    primary = candidates[0] if candidates else None
+    pairs = [(label, to_iso_or(label, None)) for label in candidates]
+    script = _dominant_transcript_script(text)
+
+    if script == "han":
+        # Han alone cannot distinguish Chinese, Cantonese, and Japanese.
+        # Prefer a model-supplied CJK candidate (especially when it is the only
+        # one) instead of manufacturing Chinese from an inherently ambiguous
+        # script.  Candidate order remains the model's tie-break for multiple
+        # CJK labels.
+        for label, iso in pairs:
+            if iso in {"zh", "yue", "ja"}:
+                return label
+        return "zh"
+    if script in {"ja", "ko"}:
+        for label, iso in pairs:
+            if iso == script:
+                return label
+        return script
+    if script == "latin":
+        for label, iso in pairs:
+            if iso in _LATIN_LANGUAGE_ISOS:
+                return label
+    return primary
 
 
 def to_iso3(iso: str) -> str:

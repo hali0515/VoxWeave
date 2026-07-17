@@ -1,5 +1,6 @@
 # tests/test_smart_split_glue.py
 from voxweave import config
+from voxweave.core.layout import default_max_line_length, default_max_lines
 from voxweave.core.smart_split import smart_split_segments
 from voxweave.core.timing import GLUE_MAX_GAP_S, _glue_short_cues
 
@@ -8,10 +9,21 @@ def _cue(text, start, end):
     return {"text": text, "start": start, "end": end, "word_data": []}
 
 
+def _glue(cues, lang, *, max_gap_s=GLUE_MAX_GAP_S, **overrides):
+    kwargs = {
+        "max_gap_s": max_gap_s,
+        "max_line_length": default_max_line_length(lang),
+        "max_lines": default_max_lines(lang),
+        "max_cue_s": 7.0,
+        **overrides,
+    }
+    return _glue_short_cues(cues, lang, **kwargs)
+
+
 def test_short_word_with_tiny_gap_glues_back():
     # "that" is a lone word 0.1s after the previous cue (no real pause) -> glued
     cues = [_cue("I think", 1.0, 2.0), _cue("that", 2.1, 2.25)]
-    out = _glue_short_cues(cues, "en", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "en")
     assert len(out) == 1
     assert out[0]["text"] == "I think that"
     assert out[0]["end"] == 2.25  # end extended to the fragment's end
@@ -20,21 +32,31 @@ def test_short_word_with_tiny_gap_glues_back():
 def test_real_pause_above_threshold_not_glued():
     # 0.45s gap > 0.3s -> a real micro-pause, kept separate
     cues = [_cue("I think", 1.0, 2.0), _cue("that", 2.45, 2.6)]
-    out = _glue_short_cues(cues, "en", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "en")
     assert len(out) == 2
 
 
 def test_multiword_cue_not_a_fragment():
     # tiny gap but the second cue is not a lone word -> not a flicker fragment
     cues = [_cue("I think", 1.0, 2.0), _cue("that we go", 2.1, 2.8)]
-    out = _glue_short_cues(cues, "en", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "en")
     assert len(out) == 2
+
+
+def test_mislabelled_english_does_not_glue_unspaced_han_paragraph():
+    # Language detection can occasionally label Mandarin as English.  A whole
+    # unspaced Han paragraph is one item to str.split(), but it is not a short
+    # lexical fragment and must not be folded into its neighbor.
+    paragraph = "该模型可自动模拟各类网络攻击用于检测人工智能大模型的安全漏洞采用自博弈强化学习训练"
+    cues = [_cue("OpenAI says", 0.0, 1.0), _cue(paragraph, 1.05, 5.5)]
+    out = _glue(cues, "en")
+    assert [c["text"] for c in out] == ["OpenAI says", paragraph]
 
 
 def test_cjk_single_particle_glues_no_space():
     # ja lone particle joins with no separator
     cues = [_cue("そう", 1.0, 1.6), _cue("ね", 1.65, 1.75)]
-    out = _glue_short_cues(cues, "ja", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "ja")
     assert len(out) == 1
     assert out[0]["text"] == "そうね"
     assert out[0]["end"] == 1.75
@@ -43,13 +65,13 @@ def test_cjk_single_particle_glues_no_space():
 def test_cjk_long_tail_not_fragment():
     # 3+ CJK chars is not a flicker fragment even with a tiny gap; neither side glues
     cues = [_cue("わかった", 1.0, 1.6), _cue("ですね", 1.65, 2.0)]
-    out = _glue_short_cues(cues, "ja", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "ja")
     assert len(out) == 2
 
 
 def test_disabled_when_threshold_zero():
     cues = [_cue("I think", 1.0, 2.0), _cue("that", 2.1, 2.25)]
-    out = _glue_short_cues(cues, "en", max_gap_s=0.0)
+    out = _glue(cues, "en", max_gap_s=0.0)
     assert len(out) == 2  # disabled -> untouched
 
 
@@ -60,16 +82,33 @@ def test_chained_fragments_all_glue():
         _cue("I", 1.45, 1.55),
         _cue("guess", 1.6, 1.9),
     ]
-    out = _glue_short_cues(cues, "en", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "en")
     assert len(out) == 1
     assert out[0]["text"] == "well I guess"
     assert out[0]["end"] == 1.9
 
 
+def test_glue_never_recreates_cue_over_duration_cap():
+    cues = [
+        _cue("a long setup", 0.0, 6.8),
+        _cue("that", 6.85, 7.1),
+    ]
+    out = _glue(cues, "en", max_cue_s=7.0)
+    assert [c["text"] for c in out] == ["a long setup", "that"]
+    assert all(c["end"] - c["start"] <= 7.0 for c in out)
+
+
+def test_glue_never_recreates_cue_over_display_budget():
+    # Both source cues fit two 7-char lines; joining needs three lines.
+    cues = [_cue("one two three", 0.0, 1.0), _cue("four", 1.05, 1.2)]
+    out = _glue(cues, "en", max_line_length=7, max_lines=2)
+    assert [c["text"] for c in out] == ["one two three", "four"]
+
+
 def test_leading_fragment_glues_forward():
     # first cue has no predecessor; tiny gap ahead -> glues forward into the next cue
     cues = [_cue("I", 1.0, 1.1), _cue("really think so", 1.15, 2.0)]
-    out = _glue_short_cues(cues, "en", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "en")
     assert len(out) == 1
     assert out[0]["text"] == "I really think so"
     assert out[0]["start"] == 1.0  # next cue's start pulled back to the fragment
@@ -82,7 +121,7 @@ def test_filler_leads_next_line_glues_forward():
         _cue("え", 10.1, 10.857),
         _cue("開国祭では結構", 10.94, 12.0),
     ]
-    out = _glue_short_cues(cues, "ja", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "ja")
     assert [c["text"] for c in out] == ["ヨハンもそうさね", "え開国祭では結構"]
     assert out[1]["start"] == 10.1
 
@@ -94,7 +133,7 @@ def test_nearer_side_wins_backward():
         _cue("ん", 9.04, 9.857),
         _cue("次の話", 9.94, 11.0),
     ]
-    out = _glue_short_cues(cues, "ja", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "ja")
     assert out[0]["text"] == "報酬で得た自分のお金ん"
     assert [c["text"] for c in out] == ["報酬で得た自分のお金ん", "次の話"]
 
@@ -102,7 +141,7 @@ def test_nearer_side_wins_backward():
 def test_isolated_fragment_real_pause_both_sides_kept():
     # real pauses on both sides -> genuine standalone utterance, not merged
     cues = [_cue("そう", 1.0, 1.6), _cue("ん", 2.5, 3.0), _cue("次", 4.0, 4.5)]
-    out = _glue_short_cues(cues, "ja", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "ja")
     assert len(out) == 3
 
 
@@ -121,7 +160,7 @@ def test_word_data_is_concatenated():
             "word_data": [{"start": 2.1, "end": 2.25}],
         },
     ]
-    out = _glue_short_cues(cues, "en", max_gap_s=GLUE_MAX_GAP_S)
+    out = _glue(cues, "en")
     assert len(out[0]["word_data"]) == 2
     assert out[0]["word_data"][-1]["end"] == 2.25
 

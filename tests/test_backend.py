@@ -48,6 +48,36 @@ def test_transcribe_align_missing_models_raises_friendly(monkeypatch, tmp_path):
         backend.transcribe_align(wav, language=None, asr_model="qwen3-asr-1.7b")
 
 
+def test_get_asr_raises_qwen_decode_ceiling_when_supported(monkeypatch):
+    import sys
+    import types
+
+    seen: dict = {}
+    sentinel = object()
+
+    class _Model:
+        @classmethod
+        def from_pretrained(cls, path, *, max_new_tokens=None, **kwargs):
+            seen.update(path=path, max_new_tokens=max_new_tokens, kwargs=kwargs)
+            return sentinel
+
+    mod = types.ModuleType("qwen_asr")
+    mod.Qwen3ASRModel = _Model
+    monkeypatch.setitem(sys.modules, "qwen_asr", mod)
+    monkeypatch.setattr(backend, "_hf_snapshot", lambda mid, cache: "/model")
+    monkeypatch.setattr(backend, "get_device", lambda: "cpu")
+    monkeypatch.setattr(backend, "_model_dtype", lambda dev: "float32")
+    monkeypatch.setattr(backend, "QWEN_MAX_NEW_TOKENS", 1024)
+    backend._asr = None
+    backend._asr_id = None
+    try:
+        assert backend._get_asr("qwen3-asr-0.6b") is sentinel
+        assert seen["max_new_tokens"] == 1024
+    finally:
+        backend._asr = None
+        backend._asr_id = None
+
+
 def test_transcribe_align_forwards_context(monkeypatch, tmp_path):
     # --context bias: when non-empty, forwarded to model.transcribe(context=...); ASR-only so return_time_stamps=False
     calls: dict = {}
@@ -126,6 +156,45 @@ def test_qwen_align_routes_all_langs_through_align_text(monkeypatch, tmp_path):
     assert lang == "Japanese" and text == "はい"
     assert units == [{"text": "はい", "start": 33.6, "end": 33.9}]
     assert seen == {"text": "はい", "lang": "Japanese"}
+
+
+def test_qwen_align_uses_han_script_to_choose_multilingual_label(
+    monkeypatch, tmp_path
+):
+    text = (
+        "GPT Red。该模型可自动模拟各类网络攻击，用于检测 AI 大模型的安全漏洞。"
+        "采用自博弈强化学习训练，简单说就是用一个网络攻击模型和一个网络防御模型"
+        "同步进行对抗。采用这种方式训练和迭代模型。OpenAI"
+    )
+
+    class _Res:
+        language = "English,Chinese"
+
+    _Res.text = text
+
+    class _Model:
+        def transcribe(self, path, **kw):
+            return [_Res()]
+
+    seen: dict = {}
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _Model())
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda w, t, lng: (
+            seen.update(lang=lng) or [{"text": "该", "start": 0, "end": 1}]
+        ),
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+
+    lang, got, _units = backend.transcribe_align(
+        wav, None, asr_model="qwen3-asr-1.7b"
+    )
+
+    assert (lang, got) == ("Chinese", text)
+    assert seen["lang"] == "Chinese"
 
 
 def test_qwen_align_empty_text_skips_align(monkeypatch, tmp_path):
@@ -545,6 +614,27 @@ def test_fusion_merges_whisper_text_with_qwen_punct(monkeypatch, tmp_path):
     assert units == w_units  # units come from whisper
 
 
+def test_fusion_preserves_whisper_punctuation_when_qwen_alignment_is_empty():
+    w_units = [{"text": "hello", "start": 0.0, "end": 0.5}]
+    out = backend._fuse_chunk(
+        ("en", "hello, world.", w_units),
+        ("en", "hello world", []),
+        None,
+    )
+    assert out == ("en", "hello, world.", w_units)
+
+
+def test_fusion_preserves_whisper_when_punctuation_source_disagrees():
+    w_units = [{"text": "accurate", "start": 0.0, "end": 0.5}]
+    q_units = [{"text": "unrelated.", "start": 0.0, "end": 0.5}]
+    out = backend._fuse_chunk(
+        ("en", "accurate words, stay.", w_units),
+        ("en", "completely unrelated output.", q_units),
+        None,
+    )
+    assert out == ("en", "accurate words, stay.", w_units)
+
+
 def test_transcribe_chunks_fusion_three_pass_order(monkeypatch, tmp_path):
     # fusion three-pass: all-chunks whisper ASR -> release whisper -> all-chunks Qwen ASR -> release Qwen ->
     # all-chunks align (only CTC resident at this point; whisper/Qwen both released -> fixes Qwen+CTC co-resident OOM on 8GB cards)
@@ -622,6 +712,35 @@ def test_transcribe_chunks_non_fusion_two_pass_order(monkeypatch, tmp_path):
     ]
     assert len(out) == 2 and ticks == [0, 1, 2, 3]  # 2N progress ticks
     assert out[0] == ("Japanese", "はい", [{"text": "はい", "start": 0.0, "end": 1.0}])
+
+
+def test_transcribe_chunks_forwards_context_to_every_asr_chunk(monkeypatch, tmp_path):
+    contexts: list[str | None] = []
+
+    def _asr(engine, wav, language, model_id, context):
+        contexts.append(context)
+        return ("en", "hello", "en")
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda w, t, a: [{"text": t, "start": 0.0, "end": 0.5}],
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = [tmp_path / f"c{i}.wav" for i in range(3)]
+    for wav in wavs:
+        wav.write_bytes(b"x")
+
+    backend.transcribe_chunks(
+        wavs,
+        None,
+        asr_model="qwen3-asr-1.7b",
+        context="Proper nouns: ExampleName.",
+    )
+
+    assert contexts == ["Proper nouns: ExampleName."] * 3
 
 
 def test_transcribe_chunks_two_pass_releases_whisper_for_whisper_engine(
@@ -1108,6 +1227,61 @@ def test_whisper_align_basic_returns_contract(monkeypatch, tmp_path):
     assert model.calls.get("word_timestamps") is False
 
 
+def test_whisper_align_repairs_english_label_for_han_heavy_text(
+    monkeypatch, tmp_path
+):
+    text = (
+        "GPT Red。该模型可自动模拟各类网络攻击，用于检测 AI 大模型的安全漏洞。"
+        "采用自博弈强化学习训练，简单说就是用一个网络攻击模型和一个网络防御模型"
+        "同步进行对抗。采用这种方式训练和迭代模型。OpenAI"
+    )
+    model = _fake_whisper([text], "en")
+    seen: dict = {}
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: model)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda w, t, lng: (
+            seen.update(lang=lng) or [{"text": "该", "start": 0, "end": 1}]
+        ),
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+
+    lang, got, _units = backend.transcribe_align(
+        wav, None, asr_model="large-v3-turbo"
+    )
+
+    assert (lang, got) == ("zh", text)
+    assert seen["lang"] == "zh"
+
+
+def test_whisper_align_explicit_language_beats_transcript_script(
+    monkeypatch, tmp_path
+):
+    text = "该模型采用自博弈强化学习训练，并自动模拟各类网络攻击。"
+    model = _fake_whisper([text], "zh")
+    seen: dict = {}
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: model)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda w, t, lng: (
+            seen.update(lang=lng) or [{"text": "forced", "start": 0, "end": 1}]
+        ),
+    )
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"x")
+
+    lang, _text, _units = backend.transcribe_align(
+        wav, "en", asr_model="large-v3-turbo"
+    )
+
+    assert lang == "en"
+    assert model.calls["language"] == "en"
+    assert seen["lang"] == "en"
+
+
 def test_whisper_align_override_language_maps_to_iso(monkeypatch, tmp_path):
     model = _fake_whisper(["こんにちは"], "ja")
     align_calls: dict = {}
@@ -1157,6 +1331,7 @@ def test_whisper_align_context_maps_to_initial_prompt(monkeypatch, tmp_path):
     wav.write_bytes(b"x")
     backend.transcribe_align(wav, None, asr_model="large-v3", context="艾米莉亚")
     assert model.calls.get("initial_prompt") == "艾米莉亚"
+    assert model.calls.get("hotwords") == "艾米莉亚"
 
 
 def test_whisper_align_empty_text_skips_alignment(monkeypatch, tmp_path):
@@ -1582,6 +1757,38 @@ def test_format_qwen_context_passthrough_framed_and_prose():
     assert backend.format_qwen_context(prose) == prose
 
 
+def test_format_qwen_context_frames_dotted_product_and_version_terms():
+    assert backend.format_qwen_context("Node.js, GPT-5.3") == (
+        "Proper nouns: Node.js, GPT-5.3."
+    )
+
+
+def test_whisper_hotwords_uses_term_lists_but_not_background_prose():
+    assert backend.whisper_hotwords("Node.js, GPT-5.3") == "Node.js, GPT-5.3"
+    assert (
+        backend.whisper_hotwords("Proper nouns: Ryland Grace, Rocky.")
+        == "Ryland Grace, Rocky"
+    )
+    assert backend.whisper_hotwords("A sci-fi story. The hero is called Ryland") is None
+
+
 def test_format_qwen_context_blank_is_none():
     assert backend.format_qwen_context(None) is None
     assert backend.format_qwen_context("   ") is None
+
+
+def test_stabilize_asr_text_collapses_only_long_exact_terminal_loops():
+    phrase = "This is a long generated failure sentence."
+    looped = "Introduction. " + " ".join([phrase] * 4)
+    assert backend.stabilize_asr_text(looped) == "Introduction. " + phrase
+
+
+def test_stabilize_asr_text_preserves_normal_and_short_repetition():
+    phrase = "This is a long intentional sentence."
+    assert backend.stabilize_asr_text(" ".join([phrase] * 3)) == " ".join(
+        [phrase] * 3
+    )
+    assert backend.stabilize_asr_text("No! No! No! No!") == "No! No! No! No!"
+    assert backend.stabilize_asr_text("echo. echo. echo. echo. Final answer.") == (
+        "echo. echo. echo. echo. Final answer."
+    )

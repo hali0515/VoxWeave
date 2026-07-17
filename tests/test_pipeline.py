@@ -4,6 +4,7 @@ Key concern: filenames with interior dots (e.g. ``...`` in YouTube titles) must 
 silently truncated by ``Path.with_suffix`` when deriving .vtt/.json sibling paths.
 """
 
+import json
 import logging
 from pathlib import Path
 
@@ -15,6 +16,36 @@ from voxweave import backend, pipeline
 DOTTED = (
     "Fuwawa一次播放所有音樂來轟炸鄰居...氣到Kronii受不了【Hololive 中文】 [s6r36ux1d4Q]"
 )
+
+
+def test_select_transcript_language_votes_by_text_not_aligned_units():
+    results = [
+        ("English", "short intro", [{"text": "x"}] * 500),
+        ("Chinese", "这是占据绝大多数内容的中文正文" * 8, [{"text": "整段"}]),
+    ]
+    assert pipeline._select_transcript_language(results) == "zh"
+
+
+def test_select_transcript_language_reconciles_han_heavy_english_label():
+    results = [
+        (
+            "English",
+            "GPT Red。该模型可自动模拟各类网络攻击，用于检测 AI 大模型的安全漏洞。"
+            "采用自博弈强化学习训练，并持续迭代模型。OpenAI",
+            [],
+        )
+    ]
+    assert pipeline._select_transcript_language(results) == "zh"
+
+
+def test_select_transcript_language_explicit_override_wins():
+    results = [("English,Chinese", "这是中文正文" * 20, [])]
+    assert pipeline._select_transcript_language(results, "en") == "en"
+
+
+def test_select_transcript_language_can_infer_script_without_model_label():
+    results = [(None, "这是没有语言标签但脚本特征明确的中文正文" * 4, [])]
+    assert pipeline._select_transcript_language(results) == "zh"
 
 
 def test_swap_ext_preserves_mid_name_dots():
@@ -71,6 +102,139 @@ def test_process_no_timestamps_strips(tmp_path):
     body = out.read_text(encoding="utf-8")
     assert "-->" not in body
     assert "hi" in body
+
+
+def test_process_repairs_persisted_english_alignment_of_chinese(tmp_path, caplog):
+    """The real failure shape: ``en`` turns a Han paragraph into one 14s word.
+
+    Recovery must happen before smart-split, persist the corrected language, and
+    preserve both the final timing and mixed-script product names.
+    """
+    media = tmp_path / "ai-daily.mp3"
+    units = [
+        {
+            "text": "OpenAI对外公开了内部网络安全专用模型",
+            "start": 0.0,
+            "end": 3.0,
+        },
+        {"text": "GPT", "start": 3.1, "end": 3.4},
+        {
+            "text": (
+                "Red。该模型可自动模拟各类网络攻击，用于检测AI大模型的安全漏洞。"
+                "采用自博弈强化学习训练，简单说就是用一个网络攻击模型和一个网络"
+                "防御模型同步进行对抗。"
+            ),
+            "start": 3.5,
+            "end": 17.8,
+        },
+        {"text": "今天的", "start": 18.0, "end": 18.4},
+        {"text": "AI", "start": 18.5, "end": 18.7},
+        {
+            "text": "日报就到这里，谢谢收看，明天见。",
+            "start": 18.8,
+            "end": 21.0,
+        },
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        pipeline.process(media, word_segments=("en", units))
+
+    data = json.loads((tmp_path / "ai-daily.json").read_text(encoding="utf-8"))
+    cues = data["segments"]
+    persisted_units = data["word_segments"]
+    assert data["language"] == "zh"
+    assert max(cue["end"] - cue["start"] for cue in cues) <= 7.0
+    assert max(u["end"] - u["start"] for u in persisted_units) < 1.0
+    assert max(unit["end"] for unit in persisted_units) == pytest.approx(21.0)
+    assert cues[-1]["end"] >= 21.0
+    assert any("GPT Red" in cue["text"] for cue in cues)
+    assert all("\n" not in cue["text"] for cue in cues)
+    for cue in cues:
+        assigned_ends = [
+            word["end"]
+            for word in cue.get("word_data", [])
+            if word.get("end") is not None
+        ]
+        if assigned_ends:
+            assert cue["end"] >= max(assigned_ends)
+    assert any("rebuilding character timings" in r.getMessage() for r in caplog.records)
+
+
+def test_split_repairs_wrong_language_in_existing_sibling(tmp_path):
+    units = [
+        {
+            "text": "该模型存在过度思考、速度较慢等问题。希望未来解决这些问题，"
+            "该模型预计将在极短时间内正式发布。今天的",
+            "start": 0.0,
+            "end": 18.374,
+        },
+        {"text": "AI", "start": 18.494, "end": 18.595},
+        {
+            "text": "日报就到这里，谢谢收看，明天见。",
+            "start": 18.715,
+            "end": 21.036,
+        },
+    ]
+    json_path = tmp_path / "old.json"
+    json_path.write_text(
+        json.dumps(
+            {"language": "en", "segments": [], "word_segments": units},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    pipeline.split(json_path)
+
+    repaired = json.loads(json_path.read_text(encoding="utf-8"))
+    assert repaired["language"] == "zh"
+    assert max(c["end"] - c["start"] for c in repaired["segments"]) <= 7.0
+    assert max(u["end"] for u in repaired["word_segments"]) == pytest.approx(21.036)
+    assert repaired["segments"][-1]["end"] >= 21.036
+
+
+def test_replay_relabels_existing_character_stream_without_inventing_spaces():
+    text = "今天我们打开 OpenAI Codex 的界面并测试所有功能是否正常运行。"
+    coarse = [{"text": text, "start": 1.0, "end": 7.0}]
+    char_units = pipeline.realign.reinject_punct(text, coarse, "zh")
+
+    iso, repaired = pipeline._reconcile_word_segment_language("en", char_units)
+
+    assert iso == "zh"
+    assert repaired is char_units
+    assert "".join(u["text"] for u in repaired) == text
+    assert "O p e n" not in "".join(u["text"] for u in repaired)
+
+
+def test_replay_regrains_both_directions_when_override_changes_tokenizer():
+    text = "这是中文 OpenAI Codex test"
+    coarse = [{"text": text, "start": 0.0, "end": 4.0}]
+    char_units = pipeline.realign.reinject_punct(text, coarse, "zh")
+
+    iso, words = pipeline._reconcile_word_segment_language(
+        "zh", char_units, override="en"
+    )
+
+    assert iso == "en"
+    assert " ".join(u["text"] for u in words) == text
+    assert max(u["end"] for u in words) == pytest.approx(4.0)
+
+
+def test_replay_repair_rejects_malformed_timing_without_relabeling(caplog):
+    units = [
+        {
+            "text": "这是足够长且脚本特征明确的中文正文内容",
+            "start": 0.0,
+            "end": float("nan"),
+        }
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        iso, repaired = pipeline._reconcile_word_segment_language("en", units)
+
+    assert iso == "en"
+    assert repaired is units
+    assert any("malformed source timings" in r.getMessage() for r in caplog.records)
 
 
 def test_write_siblings_drops_ts_line_when_cue_time_missing(tmp_path):
@@ -228,3 +392,14 @@ def test_find_sibling_media_multiple_candidates_warns_and_is_deterministic(
         found = pipeline._find_sibling_media(vtt)
     assert found == mkv
     assert any("multiple" in r.getMessage().lower() for r in caplog.records)
+
+
+def test_semantic_engine_cleanup_is_best_effort(caplog):
+    class Engine:
+        @staticmethod
+        def release():
+            raise RuntimeError("worker cleanup failed")
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        pipeline._release_semantic_engine(Engine())
+    assert any("cleanup" in record.getMessage() for record in caplog.records)

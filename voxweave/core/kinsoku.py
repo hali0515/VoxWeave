@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import os
+from collections.abc import Sequence
 
 # Leading-edge prohibition (行頭禁則): these chars cannot begin a line (must hang on the previous line)
 LINE_START_PROHIBITED = frozenset(
@@ -80,6 +81,39 @@ _ZH_BIND_END_MED = frozenset(
     }
 )
 
+# A cue may not begin with an independently tokenised structural/modal particle.
+# These are whole-token tables, not character prefixes: ``了解`` and ``地方``
+# must remain ordinary words while a lone ``了``/``地`` is kept with its host
+# phrase.  Callers therefore pass the first segmented phrase, not arbitrary cue
+# text, whenever that information is available.
+_ZH_BIND_START_HIGH = frozenset(
+    {"的", "地", "得", "了", "着", "过", "吗", "呢", "吧", "啊", "呀", "嘛", "啦", "呐"}
+)
+_JA_BIND_START_HIGH = frozenset({"の", "を", "に", "へ"})
+_JA_BIND_START_MED = frozenset({"で", "が", "と"})
+
+_ZH_ASPECT_PARTICLES = frozenset({"了", "着", "过"})
+_ZH_CATEGORY_WORDS = frozenset(
+    {
+        "模型",
+        "产品",
+        "系统",
+        "平台",
+        "工具",
+        "服务",
+        "版本",
+        "助手",
+        "model",
+        "product",
+        "system",
+        "platform",
+        "tool",
+        "service",
+        "version",
+        "assistant",
+    }
+)
+
 _EN_TOKEN_STRIP = ".,!?;:'\"”’"
 
 
@@ -93,7 +127,7 @@ def line_end_penalty(text: str, lang: str = "") -> int:
       and a particle is always the final char of its BudouX phrase. Always active: kana
       can't false-positive in other scripts.
     - en: whole token against breakpoints._FORBIDDEN_LEFT (articles/preps/aux/conj).
-    - zh: whole word (jieba token) against the zh particle/preposition tables.
+    - zh/yue: whole word against the Chinese particle/preposition tables.
     """
     s = text.rstrip()
     if not s:
@@ -108,12 +142,142 @@ def line_end_penalty(text: str, lang: str = "") -> int:
 
         if s.strip(_EN_TOKEN_STRIP).lower() in _FORBIDDEN_LEFT:
             return 2
-    elif lang == "zh":
+    elif lang in {"zh", "yue"}:
         if s in _ZH_BIND_END_HIGH:
             return 2
         if s in _ZH_BIND_END_MED:
             return 1
     return 0
+
+
+def line_start_penalty(text: str, lang: str = "") -> int:
+    """Penalty for beginning a cue with the segmented phrase ``text``.
+
+    This is the right-edge counterpart of :func:`line_end_penalty`.  Matching
+    is deliberately whole-token for Chinese so lexical words such as ``了解``
+    and ``地方`` are not mistaken for the independent particles ``了``/``地``.
+    ``2`` means the boundary is strongly undesirable, ``1`` mildly so.
+    """
+
+    s = text.lstrip()
+    if not s:
+        return 0
+    if s[0] in LINE_START_PROHIBITED:
+        return 2
+    if lang in {"zh", "yue"}:
+        return 2 if s in _ZH_BIND_START_HIGH else 0
+    if lang == "ja":
+        if s in _JA_BIND_START_HIGH:
+            return 2
+        if s in _JA_BIND_START_MED:
+            return 1
+    return 0
+
+
+def zh_pos_boundary_penalties(
+    atoms: Sequence[str], candidate_indices: Sequence[int], lang: str
+) -> dict[int, int]:
+    """High-precision Chinese modifier/head damage at candidate boundaries.
+
+    The score is shared by deterministic and model-assisted splitting.  Jieba
+    is only a soft optional signal: absence, tokenisation disagreement, or any
+    runtime error returns an empty mapping and leaves the surface rules active.
+    Atom indices are converted to non-space character offsets so embedded Latin
+    runs remain aligned with the subtitle atom stream.
+    """
+
+    if lang not in {"zh", "yue"}:
+        return {}
+    try:
+        import jieba.posseg as pseg  # type: ignore
+    except (ImportError, ModuleNotFoundError):
+        return {}
+
+    def width(surface: str) -> int:
+        return sum(not char.isspace() for char in surface)
+
+    text = "".join(atoms)
+    previous: dict[int, tuple[str, str]] = {}
+    following: dict[int, tuple[str, str]] = {}
+    cursor = 0
+    try:
+        for token in pseg.cut(text, HMM=False):
+            surface = str(token.word)
+            token_width = width(surface)
+            if token_width < 1:
+                continue
+            start, end = cursor, cursor + token_width
+            following[start] = (surface, str(token.flag))
+            previous[end] = (surface, str(token.flag))
+            cursor = end
+    except Exception:  # noqa: BLE001 - optional POS hint must stay fail-safe
+        return {}
+
+    atom_offsets = [0]
+    for atom in atoms:
+        atom_offsets.append(atom_offsets[-1] + width(atom))
+    penalties: dict[int, int] = {}
+    for boundary in candidate_indices:
+        if not 0 < boundary < len(atom_offsets):
+            continue
+        offset = atom_offsets[boundary]
+        left = previous.get(offset)
+        right = following.get(offset)
+        if left is None or right is None:
+            continue
+        left_word, left_pos = left
+        right_word, right_pos = right
+        penalty = 0
+        if left_pos == "c":
+            penalty += 4
+        elif left_pos in {"m", "q", "r"}:
+            penalty += 4
+        elif left_pos == "p":
+            penalty += 5
+        elif left_pos in {"d", "f"}:
+            penalty += 3
+        elif left_pos in {"s", "t"} and right_pos[:1] in {"a", "v"}:
+            penalty += 3
+        if (
+            right_pos.startswith("u")
+            or right_pos == "y"
+            or right_word in _ZH_BIND_START_HIGH
+        ):
+            penalty += 4
+        left_noun = left_pos.startswith("n") or left_pos in {"eng", "vn"}
+        right_noun = right_pos.startswith("n") or right_pos in {"eng", "vn"}
+        if left_word == "的" and right_noun:
+            penalty += 6
+        elif left_word == "地" and right_pos.startswith("v"):
+            penalty += 6
+        elif left_word == "得" and right_pos[:1] in {"a", "d", "v"}:
+            penalty += 5
+        elif left_word in _ZH_ASPECT_PARTICLES and (
+            right_noun or right_pos[:1] in {"a", "b", "d", "m", "q", "v"}
+        ):
+            penalty += 6
+        if left_pos[:1] in {"a", "b"} and right_noun:
+            penalty += 4
+        if left_pos in {"f", "s", "t"} and right_noun:
+            penalty += 4
+        if left_pos == "t" and right_pos == "t":
+            penalty += 4
+        if left_noun and right_noun:
+            penalty += 3
+            if left_pos in {"eng", "vn"} or right_pos in {"eng", "vn"}:
+                penalty += 3
+        if left_pos == "eng" and right_pos in {"f", "s"}:
+            penalty += 5
+        if left_pos.startswith("v") and right_pos == "p":
+            penalty += 3
+        if left_pos.startswith("v") and right_pos.startswith("v"):
+            penalty += 3
+        elif left_pos.startswith("v") and (right_noun or right_pos in {"f", "r"}):
+            penalty += 4
+        if left_word.casefold() in _ZH_CATEGORY_WORDS and right_pos == "eng":
+            penalty += 3
+        penalties[boundary] = penalty
+    return penalties
 
 
 @functools.lru_cache(maxsize=1)
