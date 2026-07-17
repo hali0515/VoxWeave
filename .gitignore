@@ -5,6 +5,9 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 *.lock
+# ...except the semantic worker's uv lock: `uv run --locked --script` requires it
+# at runtime and it ships as package data (see pyproject [tool.setuptools.package-data]).
+!voxweave/semantic_worker.py.lock
 build/
 dist/
 debug/
