@@ -87,10 +87,10 @@ def test_default_template_documents_optional_semantic_split(conf_at):
     config.ensure_default_config()
     text = conf_at.read_text(encoding="utf-8")
     assert "semantic_split = false" in text
-    assert '[semantic]' in text
-    assert 'Qwen/Qwen3.5-0.8B' in text
-    assert 'Qwen/Qwen3.5-2B' in text
-    assert 'Qwen/Qwen3.6-27B-FP8' in text
+    assert "[semantic]" in text
+    assert "Qwen/Qwen3.5-0.8B" in text
+    assert "Qwen/Qwen3.5-2B" in text
+    assert "Qwen/Qwen3.6-27B-FP8" in text
 
 
 def test_align_model_for_en_builtin(conf_at):

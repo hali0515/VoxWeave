@@ -158,9 +158,7 @@ def test_qwen_align_routes_all_langs_through_align_text(monkeypatch, tmp_path):
     assert seen == {"text": "はい", "lang": "Japanese"}
 
 
-def test_qwen_align_uses_han_script_to_choose_multilingual_label(
-    monkeypatch, tmp_path
-):
+def test_qwen_align_uses_han_script_to_choose_multilingual_label(monkeypatch, tmp_path):
     text = (
         "GPT Red。该模型可自动模拟各类网络攻击，用于检测 AI 大模型的安全漏洞。"
         "采用自博弈强化学习训练，简单说就是用一个网络攻击模型和一个网络防御模型"
@@ -189,9 +187,7 @@ def test_qwen_align_uses_han_script_to_choose_multilingual_label(
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
 
-    lang, got, _units = backend.transcribe_align(
-        wav, None, asr_model="qwen3-asr-1.7b"
-    )
+    lang, got, _units = backend.transcribe_align(wav, None, asr_model="qwen3-asr-1.7b")
 
     assert (lang, got) == ("Chinese", text)
     assert seen["lang"] == "Chinese"
@@ -1227,9 +1223,7 @@ def test_whisper_align_basic_returns_contract(monkeypatch, tmp_path):
     assert model.calls.get("word_timestamps") is False
 
 
-def test_whisper_align_repairs_english_label_for_han_heavy_text(
-    monkeypatch, tmp_path
-):
+def test_whisper_align_repairs_english_label_for_han_heavy_text(monkeypatch, tmp_path):
     text = (
         "GPT Red。该模型可自动模拟各类网络攻击，用于检测 AI 大模型的安全漏洞。"
         "采用自博弈强化学习训练，简单说就是用一个网络攻击模型和一个网络防御模型"
@@ -1248,17 +1242,13 @@ def test_whisper_align_repairs_english_label_for_han_heavy_text(
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
 
-    lang, got, _units = backend.transcribe_align(
-        wav, None, asr_model="large-v3-turbo"
-    )
+    lang, got, _units = backend.transcribe_align(wav, None, asr_model="large-v3-turbo")
 
     assert (lang, got) == ("zh", text)
     assert seen["lang"] == "zh"
 
 
-def test_whisper_align_explicit_language_beats_transcript_script(
-    monkeypatch, tmp_path
-):
+def test_whisper_align_explicit_language_beats_transcript_script(monkeypatch, tmp_path):
     text = "该模型采用自博弈强化学习训练，并自动模拟各类网络攻击。"
     model = _fake_whisper([text], "zh")
     seen: dict = {}
@@ -1785,9 +1775,7 @@ def test_stabilize_asr_text_collapses_only_long_exact_terminal_loops():
 
 def test_stabilize_asr_text_preserves_normal_and_short_repetition():
     phrase = "This is a long intentional sentence."
-    assert backend.stabilize_asr_text(" ".join([phrase] * 3)) == " ".join(
-        [phrase] * 3
-    )
+    assert backend.stabilize_asr_text(" ".join([phrase] * 3)) == " ".join([phrase] * 3)
     assert backend.stabilize_asr_text("No! No! No! No!") == "No! No! No! No!"
     assert backend.stabilize_asr_text("echo. echo. echo. echo. Final answer.") == (
         "echo. echo. echo. echo. Final answer."

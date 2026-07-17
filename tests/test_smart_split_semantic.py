@@ -5,7 +5,11 @@ from typing import cast
 
 from voxweave.core import smart_split as smart_split_module
 from voxweave.core.layout import _fits_budget
-from voxweave.core.smart_split import SplitContext, SplitThresholds, smart_split_segments
+from voxweave.core.smart_split import (
+    SplitContext,
+    SplitThresholds,
+    smart_split_segments,
+)
 from voxweave.semantic_breaks import SemanticBreakEngine
 
 
@@ -38,7 +42,9 @@ class ChoosingEngine:
     def choose(self, tasks, **kwargs):
         self.calls.append((tasks, kwargs))
         return [
-            SimpleNamespace(source="model", break_indices=tuple(self.choose_breaks(task)))
+            SimpleNamespace(
+                source="model", break_indices=tuple(self.choose_breaks(task))
+            )
             for task in tasks
         ]
 
@@ -117,7 +123,12 @@ def test_chinese_model_can_choose_complete_phrases_instead_of_greedy_cut():
 
 def test_multilingual_tasks_use_host_legal_paths_for_english_and_japanese():
     cases = [
-        ("en", "OpenAI released a security model for developers around the world", 18, 1),
+        (
+            "en",
+            "OpenAI released a security model for developers around the world",
+            18,
+            1,
+        ),
         ("ja", "今日は新しいモデルを世界中の開発者へ公開しました", 8, 1),
     ]
     for lang, text, max_length, max_lines in cases:
@@ -133,7 +144,9 @@ def test_multilingual_tasks_use_host_legal_paths_for_english_and_japanese():
         )
         task = engine.calls[0][0][0]
         assert task.language == lang
-        assert "".join(cue["text"].replace(" ", "").replace("\n", "") for cue in cues) == text.replace(" ", "")
+        assert "".join(
+            cue["text"].replace(" ", "").replace("\n", "") for cue in cues
+        ) == text.replace(" ", "")
         assert all(
             _fits_budget(cue["text"], max_length, max_lines, lang) for cue in cues
         )
@@ -293,8 +306,12 @@ def test_fast_single_segment_is_windowed_into_nonempty_model_tasks():
 
     tasks = engine.calls[0][0]
     assert len(tasks) >= 4
-    assert all(task.atoms and task.allowed_edges and task.edge_quality for task in tasks)
-    assert any(min(score for _start, _end, score in task.edge_quality) < 100 for task in tasks)
+    assert all(
+        task.atoms and task.allowed_edges and task.edge_quality for task in tasks
+    )
+    assert any(
+        min(score for _start, _end, score in task.edge_quality) < 100 for task in tasks
+    )
     assert cues
     assert [unit for cue in cues for unit in cue["word_data"]] == segment["words"]
 
@@ -333,7 +350,10 @@ def test_unpunctuated_long_input_has_bounded_window_and_edge_work(monkeypatch):
     )
 
     assert plans is not None and len(plans) > 1
-    assert max(len(plan.atoms) for plan in plans) <= smart_split_module.SEMANTIC_WINDOW_MAX_ATOMS
+    assert (
+        max(len(plan.atoms) for plan in plans)
+        <= smart_split_module.SEMANTIC_WINDOW_MAX_ATOMS
+    )
     assert calls < atom_count * 25
 
 

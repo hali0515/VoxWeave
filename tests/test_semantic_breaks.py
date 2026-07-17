@@ -209,7 +209,14 @@ def test_path_option_task_retries_once_and_still_requires_an_exact_option():
         language="zh",
         fallback_indices=(2,),
         allowed_edges=((0, 1), (1, 4), (0, 2), (2, 4), (0, 3), (3, 4)),
-        edge_quality=((0, 1, 90), (1, 4, 100), (0, 2, 98), (2, 4, 98), (0, 3, 100), (3, 4, 80)),
+        edge_quality=(
+            (0, 1, 90),
+            (1, 4, 100),
+            (0, 2, 98),
+            (2, 4, 98),
+            (0, 3, 100),
+            (3, 4, 80),
+        ),
     )
     selector = FakeSelector(
         [
@@ -392,6 +399,7 @@ def test_local_logit_scorer_uses_symmetric_prompts_and_selects_clean_path():
             for start, end in ((0, boundary), (boundary, 19))
         ),
     )
+
     def prefer_complete_enumeration(_model_id, prompt_batches, _labels):
         scores = []
         wanted = "Team\nCue 2: 和Enterprise"
@@ -536,12 +544,7 @@ def test_host_penalizes_only_long_cues_spanning_substantial_comma_clauses():
 
     assert _cue_host_penalty(short, 0, len(short.atoms)) == 0
     assert _cue_host_penalty(long, 0, len(long.atoms)) == 3
-    assert (
-        _cue_host_penalty(
-            long_with_terminal, 0, len(long_with_terminal.atoms)
-        )
-        == 3
-    )
+    assert _cue_host_penalty(long_with_terminal, 0, len(long_with_terminal.atoms)) == 3
 
 
 def test_symmetric_scorer_abstains_from_pure_first_position_bias():
@@ -701,15 +704,7 @@ def test_invalid_one_task_falls_back_without_discarding_valid_sibling():
 
 def test_extra_text_field_is_rejected_and_cannot_edit_transcript():
     selector = FakeSelector(
-        [
-            json.dumps(
-                {
-                    "results": [
-                        {"id": 0, "breaks": [3], "text": "rewritten text"}
-                    ]
-                }
-            )
-        ]
+        [json.dumps({"results": [{"id": 0, "breaks": [3], "text": "rewritten text"}]})]
     )
     decision = SemanticBreakEngine(selector).choose([task("en")])[0]
     assert decision.source == "fallback"
@@ -720,7 +715,7 @@ def test_extra_text_field_is_rejected_and_cannot_edit_transcript():
 @pytest.mark.parametrize(
     "raw",
     [
-        "```json\n{\"results\":[]}\n```",
+        '```json\n{"results":[]}\n```',
         '{"results":[],"explanation":"because"}',
         "not json",
     ],
@@ -766,7 +761,9 @@ def test_selector_failure_falls_back_and_skips_later_batches_for_same_model():
 
 
 def test_small_batch_limit_packs_requests_into_multiple_calls():
-    selector = FakeSelector([echo_first_candidate, echo_first_candidate, echo_first_candidate])
+    selector = FakeSelector(
+        [echo_first_candidate, echo_first_candidate, echo_first_candidate]
+    )
     decisions = SemanticBreakEngine(selector).choose(
         [task("zh"), task("ja"), task("en")], max_batch_chars=1
     )
@@ -859,7 +856,9 @@ def test_local_selector_isolates_hf_cache_and_propagates_offline_mode(monkeypatc
     monkeypatch.setenv("VOXWEAVE_OFFLINE", "1")
     monkeypatch.setenv("PYTHONPATH", "/parent/packages")
     monkeypatch.setenv("VIRTUAL_ENV", "/parent/venv")
-    monkeypatch.setattr("voxweave.semantic_breaks.shutil.which", lambda _name: "/bin/uv")
+    monkeypatch.setattr(
+        "voxweave.semantic_breaks.shutil.which", lambda _name: "/bin/uv"
+    )
 
     env = LocalTransformersSelector._child_environment()
     assert env["HF_HOME"] == "/tmp/voxweave-test-cache/semantic"
@@ -896,7 +895,9 @@ def test_local_selector_rejects_invalid_or_hidden_cuda_device(monkeypatch):
 
     monkeypatch.setenv("VOXWEAVE_DEVICE", "cuda:2")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
-    with pytest.raises(SemanticBackendUnavailable, match="outside CUDA_VISIBLE_DEVICES"):
+    with pytest.raises(
+        SemanticBackendUnavailable, match="outside CUDA_VISIBLE_DEVICES"
+    ):
         LocalTransformersSelector._child_environment()
 
 

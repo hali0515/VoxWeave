@@ -1110,12 +1110,10 @@ def _reconcile_word_segment_language(
 
     rebuilt_times = _timings(rebuilt)
     source_monotone = all(
-        a[0] <= b[0] and a[1] <= b[1]
-        for a, b in zip(source_times, source_times[1:])
+        a[0] <= b[0] and a[1] <= b[1] for a, b in zip(source_times, source_times[1:])
     )
     rebuilt_monotone = rebuilt_times is not None and all(
-        a[0] <= b[0] and a[1] <= b[1]
-        for a, b in zip(rebuilt_times, rebuilt_times[1:])
+        a[0] <= b[0] and a[1] <= b[1] for a, b in zip(rebuilt_times, rebuilt_times[1:])
     )
     if effective_no_space:
         round_trip_ok = "".join(str(u.get("text") or "") for u in rebuilt) == text
@@ -1132,8 +1130,11 @@ def _reconcile_word_segment_language(
             ),
         )
     )
-    if not rebuilt or not round_trip_ok or not envelope_ok or (
-        source_monotone and not rebuilt_monotone
+    if (
+        not rebuilt
+        or not round_trip_ok
+        or not envelope_ok
+        or (source_monotone and not rebuilt_monotone)
     ):
         log.warning(
             "cannot repair word-segment language %s -> %s without changing "
@@ -1336,9 +1337,7 @@ def split(
     json_path = swap_ext(Path(json_path), ".json")
     data = _load_sibling_json(json_path, require="word_segments")
     units = data["word_segments"]
-    iso, units = _reconcile_word_segment_language(
-        data.get("language", "en"), units
-    )
+    iso, units = _reconcile_word_segment_language(data.get("language", "en"), units)
     speech_spans = _spans_in(data.get("vad_speech"))
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = _spans_in(data.get("sing_spans"))

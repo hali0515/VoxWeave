@@ -347,9 +347,10 @@ def _get_asr(asr_model: str | None = None):
         # Use snapshot so model + processor both land in config.ASR_CACHE (see _hf_snapshot docstring).
         local = _hf_snapshot(mid, config.ASR_CACHE)
         load_kwargs = {"dtype": _model_dtype(dev), "device_map": dev}
-        if "max_new_tokens" in inspect.signature(
-            Qwen3ASRModel.from_pretrained
-        ).parameters:
+        if (
+            "max_new_tokens"
+            in inspect.signature(Qwen3ASRModel.from_pretrained).parameters
+        ):
             load_kwargs["max_new_tokens"] = QWEN_MAX_NEW_TOKENS
         _asr = Qwen3ASRModel.from_pretrained(local, **load_kwargs)
         _asr_id = mid
@@ -534,7 +535,12 @@ def _asr_only(
             len(text),
         )
     det = reconcile_detected_language(raw_det, text, override=language)
-    if not language and raw_det and det and det.casefold() != raw_det.strip().casefold():
+    if (
+        not language
+        and raw_det
+        and det
+        and det.casefold() != raw_det.strip().casefold()
+    ):
         log.info(
             "%s language %r reconciled to %r from transcript script",
             src,

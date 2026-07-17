@@ -162,11 +162,7 @@ def _dominant_transcript_script(text: str) -> str | None:
         cp = ord(ch)
         if _is_han(cp):
             han += 1
-        elif (
-            0x3040 <= cp <= 0x30FF
-            or 0x31F0 <= cp <= 0x31FF
-            or 0xFF66 <= cp <= 0xFF9D
-        ):
+        elif 0x3040 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF or 0xFF66 <= cp <= 0xFF9D:
             kana += 1
         elif (
             0x1100 <= cp <= 0x11FF
@@ -190,12 +186,7 @@ def _dominant_transcript_script(text: str) -> str | None:
     # Japanese normally mixes kana and Han.  Requiring a meaningful kana share
     # avoids classifying Chinese prose containing a short Japanese product name.
     cjk = han + kana
-    if (
-        kana >= 2
-        and cjk >= 4
-        and cjk * 5 >= total * 3
-        and kana * 6 >= cjk
-    ):
+    if kana >= 2 and cjk >= 4 and cjk * 5 >= total * 3 and kana * 6 >= cjk:
         return "ja"
     if han >= 4 and han * 5 >= total * 3 and kana * 6 < cjk:
         return "han"

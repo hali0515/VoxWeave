@@ -149,9 +149,7 @@ def test_process_semantic_split_is_optional_and_selects_default_model(tmp_path):
 def test_process_semantic_model_override_does_not_enable_feature(tmp_path):
     media, out = _media(tmp_path)
     with patch("voxweave.pipeline.process", return_value=out) as m:
-        r = CliRunner().invoke(
-            cli, ["--semantic-model", "local/custom", str(media)]
-        )
+        r = CliRunner().invoke(cli, ["--semantic-model", "local/custom", str(media)])
     assert r.exit_code == 0, r.output
     assert m.call_args.kwargs["semantic_split"] is False
     assert m.call_args.kwargs["semantic_model"] == "local/custom"
