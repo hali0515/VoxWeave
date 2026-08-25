@@ -1,4 +1,5 @@
-.PHONY: install reinstall uninstall dev test lint typecheck
+.PHONY: install reinstall uninstall dev test lint typecheck \
+	quality quality-segmentation quality-record-segmentation
 
 # Install as a global uv tool (end-user mode): puts the voxweave command on PATH.
 # The separation / layout / song-skip / CJK-break / translation pipeline is baked into the core
@@ -92,3 +93,31 @@ lint:
 # Zero errors is the bar; CI enforces it so type noise cannot accumulate again.
 typecheck:
 	uv run pyright
+
+# ---- Quality rulers ----------------------------------------------------------
+# `make test` answers "did behaviour change unintentionally". These answer "is the
+# output any good": the segmentation ruler replays a tracked corpus of captured unit
+# streams through the production entry point and gates four metrics against a
+# recorded baseline. Exit codes: 0 pass, 1 gate regression, 2 invalid corpus/baseline.
+SEG_CORPUS ?= calibration/segmentation/corpus.json
+SEG_BASELINE ?= calibration/segmentation/baseline.json
+SEG_REPORT ?= build/calibration/segmentation-report.json
+
+# `quality` is only the public, zero-GPU, deterministic lane: no media, no model, no
+# network, runnable from a bare checkout. The alignment ruler needs private media and
+# MFA truth, so it is invoked explicitly and never wired in here.
+quality: quality-segmentation
+
+quality-segmentation:
+	uv run python scripts/calib_segmentation.py evaluate \
+	  --corpus $(SEG_CORPUS) \
+	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \
+	  --json-out $(SEG_REPORT) --check
+
+# Deliberately not part of `quality`, and never run by CI: recording a baseline is a
+# reviewed human action, or a regression can be laundered into the new normal.
+quality-record-segmentation:
+	uv run python scripts/calib_segmentation.py record-baseline \
+	  --corpus $(SEG_CORPUS) \
+	  --report $(SEG_REPORT) \
+	  --output $(SEG_BASELINE)

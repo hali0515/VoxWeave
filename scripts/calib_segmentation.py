@@ -1,866 +1,2064 @@
-"""3-way segmentation calibration harness.
+"""Segmentation quality ruler: replay the golden corpus, measure four metrics, gate.
 
-Compares:
-  OLD  -- legacy smart_split_segments (no thresholds, length-only)
-  NEW  -- gap-aware smart_split_segments (thresholds=gap_thresholds(iso),
-          speech_spans from the JSON's vad_speech when present)
-  EN   -- commercial English subtitle stream embedded in the MKV (ASS format),
-          speech styles only (signs/credits excluded)
+The unit suite answers "did behaviour change unintentionally". This answers a
+different question -- "is the subtitle segmentation any good" -- on a tracked,
+zero-GPU corpus of real captured unit streams.
 
-Run:
-    uv run python scripts/calib_segmentation.py [VIDEO_DIR]
+How it works::
 
-Notes:
-  - JSONs without vad_speech degrade NEW to the offline_ms threshold
-    (700ms * 1.4 for ja = 980ms).
-  - Mid-phrase-cut rate uses phrase_atoms (jieba zh / BudouX ja); offsets are
-    computed over the punctuation-stripped cue stream, never word_segments text.
-  - bad line-end % counts internal boundaries whose left cue ends on a
-    forward-binding token (line_end_penalty >= 2). Sentence-final function
-    words (begin with / lock in) and real >=vad_skip pauses keep an absolute
-    floor — read it as a relative gauge between runs.
-  - NEW mid-phrase metric is split into len-break and gap-break halves:
-      * len-break mid-phrase % = THE quality gate (BudouX gating signal).
-        A boundary with no real acoustic silence that lands inside a phrase
-        is a genuine defect the BudouX gate should prevent.
-      * gap-break mid-phrase % = informational. The speaker paused here so
-        the boundary is acoustically correct regardless of BudouX phrase
-        alignment; nonzero is expected.
-  - OLD keeps the combined mid-phrase % for before/after contrast.
-  - EN column skipped per-episode if ffmpeg fails or no subtitle stream.
+    calibration/segmentation/corpus.json   registry: case paths, counts, tags
+      -> calibration/segmentation/cases/*.json   one captured word_segments
+         stream + the production replay inputs (vad_speech, shot_changes,
+         sing_spans, speaker_turns) + the config that produced it
+      -> voxweave.pipeline.segment_document   the *production* entry point
+      -> four metrics, micro-aggregated per language
+      -> one-sided comparison against calibration/segmentation/baseline.json
+
+Every case replays through the same function ``process`` and ``split`` call, so
+this harness cannot drift away from what ships. No media, no model, no network:
+a case is JSON, and a replay is arithmetic plus the segmenters.
+
+The four gated metrics (design doc 4.5):
+
+``len_break_mid_phrase_rate``
+    Of the internal cue boundaries that acoustic silence did *not* force, how
+    many land inside a lexical phrase of the *source* document.
+``over_7s_rate``
+    Dialogue cues longer than the configured ``max_cue_s``.
+``cps_p90``
+    90th percentile reading speed, pooled per language over cue samples.
+``forbidden_end_rate``
+    Of the boundaries that had a legal in-budget alternative, how many leave a
+    forward-binding token dangling at the end of a cue.
+
+Three deliberate properties, each a fix for a flaw the 2026-08-25 audit found in
+the previous version of this script:
+
+* **Micro aggregation.** Numerators and denominators are summed across cases and
+  kept in the report; per-case percentages are never averaged, so a 60 s clip
+  cannot outweigh a 150 s one.
+* **Stable exit codes.** ``0`` valid and gates passed, ``1`` valid but a gate
+  failed, ``2`` corpus/schema/baseline invalid -- a broken corpus must never be
+  reported as a quality regression.
+* **Non-circular phrase truth.** The phrase segmentation used to judge a break is
+  computed over the *source unit stream*, not over the cue text the splitter just
+  produced, and the denominator excludes boundaries no alternative could improve.
+
+Subcommands::
+
+    validate-corpus   schema + coverage + size + digest, no replay
+    evaluate          replay, measure, compare to baseline, write the report
+    record-baseline   promote a report to the tracked baseline (never run by CI)
+    compare-video-dir legacy: run the same metrics over private media siblings
+
+The last stdout line is always a machine summary::
+
+    QUALITY segmentation status=pass cases=20 failures=0 warnings=0 report=...
 """
 
 from __future__ import annotations
 
-import json
+import argparse
+import contextlib
+import importlib.metadata
+import importlib.util
+import math
 import os
-import re
+import platform
 import subprocess
 import sys
-import tempfile
+import time
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# percentile helper (stdlib only)
-# ---------------------------------------------------------------------------
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = _SCRIPTS_DIR.parent
 
 
-def percentile(data: list[float], p: float) -> float:
-    """Return the p-th percentile of sorted data (linear interpolation)."""
-    if not data:
-        return 0.0
-    s = sorted(data)
-    n = len(s)
-    if n == 1:
-        return s[0]
-    idx = (n - 1) * p / 100.0
-    lo = int(idx)
-    hi = lo + 1
-    frac = idx - lo
-    if hi >= n:
-        return s[-1]
-    return s[lo] * (1 - frac) + s[hi] * frac
+def _load_calib_common() -> Any:
+    """Import ``scripts/calib_common.py`` by path -- ``scripts/`` is not a package.
+
+    Loading by path (rather than mutating ``sys.path``) keeps this module
+    importable from a test that loads it the same way, without two copies
+    disagreeing about which ``calib_common`` is authoritative.
+    """
+    cached = sys.modules.get("calib_common")
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(
+        "calib_common", _SCRIPTS_DIR / "calib_common.py"
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - packaging accident
+        raise RuntimeError(f"cannot load {_SCRIPTS_DIR / 'calib_common.py'}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["calib_common"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-# ---------------------------------------------------------------------------
-# ASS subtitle parser
-# ---------------------------------------------------------------------------
+cc = _load_calib_common()
 
-_SPEECH_STYLES = {
-    "Default",
-    "DefaultItalics",
-    "DefaultTop",
-    "DefaultOverlap",
-    "DefaultItalicsTop",
-    "Flashback",
-    "FlashbackItalics",
-    "FlashbackTop",
-    "FlashbackItalicsTop",
-    "Narration",
+# --------------------------------------------------------------------------- #
+# Contract constants
+# --------------------------------------------------------------------------- #
+
+CORPUS_SCHEMA = "segmentation-corpus"
+CASE_SCHEMA = "segmentation-case"
+BASELINE_SCHEMA = "segmentation-baseline"
+
+SCHEMA_VERSION = 1
+#: Bumping this invalidates every recorded baseline on purpose: a metric whose
+#: definition moved is not comparable to a number recorded under the old one.
+METRIC_DEFINITION_VERSION = 2
+
+DEFAULT_CORPUS = REPO_ROOT / "calibration" / "segmentation" / "corpus.json"
+DEFAULT_BASELINE = REPO_ROOT / "calibration" / "segmentation" / "baseline.json"
+
+#: Tracked-size ceilings from design 4.4; exceeding either is exit 2, not a gate.
+MAX_CASE_BYTES = 256 * 1024
+MAX_CORPUS_BYTES = 3 * 1024 * 1024
+
+#: Optional segmenters whose version silently moves where breaks land.
+SEGMENTER_DISTRIBUTIONS = ("pysbd", "budoux", "jieba", "fugashi")
+
+#: Absolute cue-duration comparison slack -- 1 microsecond, far below any
+#: boundary we can measure, present only to absorb float subtraction noise.
+DURATION_EPS = 1e-6
+
+#: Absolute cps_p90 ceiling as a multiple of the language's configured target.
+CPS_ABSOLUTE_FACTOR = 1.25
+
+#: How many worst samples per metric the report keeps for human triage.
+OFFENDER_LIMIT = 20
+
+#: Per-case replay budget (design 7, Phase A acceptance). Reported, not gated:
+#: wall clock on a shared CI runner is not a quality signal.
+CASE_WALL_TARGET_S = 1.0
+
+GROUP_ALL = "all"
+METRICS = (
+    "len_break_mid_phrase_rate",
+    "over_7s_rate",
+    "cps_p90",
+    "forbidden_end_rate",
+)
+#: ``over_7s_rate`` is gated on the raw bad *count*: one 12 s cue is a defect
+#: whether the corpus holds 200 cues or 20 000, and a rate would dilute it away.
+COUNT_METRICS = frozenset({"over_7s_rate"})
+
+#: Initial gate table (design 4.6). ``warning`` is the landing mode: the soak
+#: phase fixes metric/corpus problems without blocking PRs; flipping a gate to
+#: ``blocking`` is a reviewed edit of the tracked baseline, not a code change.
+#: ``cps_p90`` has no single ``absolute_max`` because the ceiling is derived per
+#: language from that language's configured target CPS (see CPS_ABSOLUTE_FACTOR).
+DEFAULT_GATES: dict[str, dict[str, Any]] = {
+    "len_break_mid_phrase_rate": {
+        "direction": "lower_is_better",
+        "mode": "warning",
+        "absolute_max": 0.10,
+        "absolute_tolerance": 0.01,
+        "relative_tolerance": 0.10,
+        "min_samples": 100,
+    },
+    "over_7s_rate": {
+        "direction": "lower_is_better",
+        "mode": "warning",
+        "absolute_max": 0.0,
+        "absolute_tolerance": 0.0,
+        "relative_tolerance": 0.0,
+        "min_samples": 1,
+    },
+    "cps_p90": {
+        "direction": "lower_is_better",
+        "mode": "warning",
+        "absolute_max": None,
+        "absolute_tolerance": 0.5,
+        "relative_tolerance": 0.05,
+        "min_samples": 100,
+    },
+    "forbidden_end_rate": {
+        "direction": "lower_is_better",
+        "mode": "warning",
+        "absolute_max": 0.02,
+        "absolute_tolerance": 0.005,
+        "relative_tolerance": 0.10,
+        "min_samples": 100,
+    },
 }
 
-_ASS_TAG_RE = re.compile(r"\{[^}]*\}")
+#: Punctuation that makes a break explicitly intended by the source text.
+#: Sentence terminals, clause commas and the closers that trail them: a cue that
+#: ends here was not chosen by the layout, it was chosen by the speaker.
+_TERMINAL_PUNCT = "。．.!！?？…‥⋯"
+_CLAUSE_PUNCT = "、，,;；:：·・"
+_CLOSERS = "」』）)》〉】\"'”’"
+_BREAK_PUNCT = frozenset(_TERMINAL_PUNCT + _CLAUSE_PUNCT + _CLOSERS)
+
+#: Time key rounding when matching a cue's word_data back to a source unit.
+#: Timing passes concatenate word_data lists but never rewrite their spans, so
+#: an exact (start, end) key is a reliable identity -- microsecond rounding only
+#: absorbs JSON float round-tripping.
+_TIME_DECIMALS = 6
+
+_EXCEPTION_METRICS = {
+    "held_speech_over_7s": ("over_7s_rate",),
+    "unavoidable_forbidden_end": ("forbidden_end_rate",),
+    "known_bad_source_unit": METRICS,
+}
 
 
-def _ass_time_to_s(t: str) -> float:
-    """Convert ASS time H:MM:SS.cc to seconds (centiseconds precision)."""
-    h, m, rest = t.split(":")
-    s, cs = rest.split(".")
-    return int(h) * 3600 + int(m) * 60 + int(s) + int(cs) / 100.0
+# --------------------------------------------------------------------------- #
+# Environment and provenance
+# --------------------------------------------------------------------------- #
 
 
-def parse_ass(path: str) -> list[dict[str, Any]]:
-    """Parse ASS file and return speech-style dialogue cues as list of
-    {start, end, text} dicts. Skips Signs / Credits / overlap (end<=start)."""
-    cues: list[dict[str, Any]] = []
-    format_fields: list[str] = []
-    in_events = False
+def dependency_versions() -> dict[str, str | None]:
+    """Installed versions of every optional segmenter (``None`` when absent).
 
-    with open(path, encoding="utf-8-sig", errors="replace") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if line.strip().startswith("[Events]"):
-                in_events = True
-                continue
-            if line.strip().startswith("[") and in_events:
-                break  # past Events section
-            if not in_events:
-                continue
-            if line.startswith("Format:"):
-                # Format: Layer, Start, End, Style, Name, ...
-                format_fields = [x.strip() for x in line[len("Format:") :].split(",")]
-                continue
-            if not line.startswith("Dialogue:"):
-                continue
-            if not format_fields:
-                continue
-            # Split only up to len(format_fields) fields; Text may contain commas
-            parts = line[len("Dialogue:") :].lstrip().split(",", len(format_fields) - 1)
-            if len(parts) < len(format_fields):
-                continue
-            row = dict(zip(format_fields, parts))
-            style = row.get("Style", "")
-            if style not in _SPEECH_STYLES:
-                continue
-            raw_text = row.get("Text", "")
-            # Strip ASS override tags {..}
-            text = _ASS_TAG_RE.sub("", raw_text)
-            # Convert line-break codes to space
-            text = text.replace("\\N", " ").replace("\\n", " ").strip()
-            if not text:
-                continue
-            try:
-                start = _ass_time_to_s(row["Start"])
-                end = _ass_time_to_s(row["End"])
-            except (KeyError, ValueError):
-                continue
-            if end <= start:
-                continue
-            cues.append({"start": start, "end": end, "text": text})
-
-    return cues
+    Read from distribution metadata, never by importing: an absent fugashi
+    silently swaps ja POS scoring for the character table, and that swap has to
+    be visible in the report rather than inferred from a rerun.
+    """
+    versions: dict[str, str | None] = {}
+    for name in SEGMENTER_DISTRIBUTIONS:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
 
 
-def extract_commercial_en(mkv: Path) -> list[dict[str, Any]] | None:
-    """Extract subtitle stream 0 from MKV as ASS and parse it.
-    Returns None if ffmpeg fails or no subtitle stream present."""
-    with tempfile.NamedTemporaryFile(suffix=".ass", delete=False) as tmp:
-        tmp_path = tmp.name
+def environment_block() -> dict[str, Any]:
+    return {
+        "python": platform.python_version(),
+        "dependencies": dependency_versions(),
+    }
+
+
+def repo_commit() -> str | None:
+    """``git rev-parse HEAD`` for this repo, or ``None`` outside a checkout."""
     try:
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-v",
-                "error",
-                "-i",
-                str(mkv),
-                "-map",
-                "0:s:0",
-                tmp_path,
-            ],
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT),
             capture_output=True,
             text=True,
+            timeout=30,
+            check=True,
         )
-        if result.returncode != 0:
-            return None
-        cues = parse_ass(tmp_path)
-        return cues if cues else None
-    except FileNotFoundError:
-        # ffmpeg not available
+    except (OSError, subprocess.SubprocessError):
         return None
+    commit = proc.stdout.strip()
+    return commit if commit and len(commit) >= 7 else None
+
+
+def _python_minor(version: str) -> str:
+    return ".".join(str(version).split(".")[:2])
+
+
+# --------------------------------------------------------------------------- #
+# Corpus loading and validation
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Case:
+    """One validated golden case: the document plus where it came from."""
+
+    path: Path
+    relpath: str
+    doc: dict[str, Any]
+    size_bytes: int
+
+    @property
+    def id(self) -> str:
+        return str(self.doc["id"])
+
+    @property
+    def language(self) -> str:
+        return str(self.doc["language"])
+
+    @property
+    def units(self) -> list[dict[str, Any]]:
+        return list(self.doc["word_segments"])
+
+    @property
+    def config(self) -> dict[str, Any]:
+        return dict(self.doc["capture"]["config"])
+
+    @property
+    def tags(self) -> list[str]:
+        return list(self.doc["tags"])
+
+    @property
+    def exceptions(self) -> list[dict[str, Any]]:
+        return list(self.doc.get("exceptions") or [])
+
+
+@dataclass(frozen=True)
+class Corpus:
+    """A validated registry plus its cases, and the digest that identifies both."""
+
+    path: Path
+    registry: dict[str, Any]
+    cases: list[Case]
+    digest: str
+    total_bytes: int
+
+    @property
+    def required_counts(self) -> dict[str, int]:
+        return dict(self.registry["required_counts"])
+
+
+def corpus_digest(registry: Mapping[str, Any], cases: Sequence[Case]) -> str:
+    """Digest of the registry and every case body.
+
+    Keyed by the registry-relative path so reordering ``cases`` in the registry
+    changes the digest (it changes evaluation order and therefore nothing about
+    the metrics -- but it *is* a corpus edit, and a baseline should be reviewed
+    against the corpus it was recorded on).
+    """
+    payload = {
+        "registry": dict(registry),
+        "cases": {case.relpath: case.doc for case in cases},
+    }
+    return cc.canonical_digest(payload)
+
+
+def _validate_case_semantics(case: Case) -> None:
+    """Check what JSON Schema cannot: ordering, uniqueness and window bounds.
+
+    Anything caught here is a corpus defect (exit 2). A case that lies about its
+    own window or repeats a unit id cannot support a metric, so it must not be
+    allowed to quietly shift a denominator.
+    """
+    doc = case.doc
+    problems: list[str] = []
+    where = f"{case.relpath} ({case.id})"
+
+    if case.id.split("-", 1)[0] != case.language:
+        problems.append(f"id {case.id!r} does not match language {case.language!r}")
+
+    units = doc["word_segments"]
+    seen: set[str] = set()
+    previous_start: float | None = None
+    for i, unit in enumerate(units):
+        uid = str(unit["id"])
+        if uid in seen:
+            problems.append(f"word_segments[{i}]: duplicate unit id {uid!r}")
+        seen.add(uid)
+        start, end = float(unit["start"]), float(unit["end"])
+        if not (math.isfinite(start) and math.isfinite(end)):
+            problems.append(f"word_segments[{i}]: non-finite span")
+            continue
+        if end < start:
+            problems.append(f"word_segments[{i}]: end {end} < start {start}")
+        if previous_start is not None and start < previous_start - DURATION_EPS:
+            problems.append(
+                f"word_segments[{i}]: start {start} goes back before {previous_start}"
+            )
+        previous_start = start
+
+    for key in ("vad_speech", "sing_spans"):
+        for i, span in enumerate(doc.get(key) or ()):
+            if float(span[1]) <= float(span[0]):
+                problems.append(f"{key}[{i}]: end must be greater than start")
+    for i, turn in enumerate(doc.get("speaker_turns") or ()):
+        if float(turn["end"]) <= float(turn["start"]):
+            problems.append(f"speaker_turns[{i}]: end must be greater than start")
+    for i, exc in enumerate(doc.get("exceptions") or ()):
+        rng = exc["range"]
+        if float(rng[1]) <= float(rng[0]):
+            problems.append(f"exceptions[{i}]: range end must be greater than start")
+
+    window = float(doc["capture"]["window_duration_s"])
+    limit = window + 0.5
+    latest = max(
+        [float(u["end"]) for u in units]
+        + [float(s[1]) for s in doc.get("vad_speech") or ()]
+        + [float(s[1]) for s in doc.get("sing_spans") or ()]
+        + [float(t["end"]) for t in doc.get("speaker_turns") or ()]
+        + [float(t) for t in doc.get("shot_changes") or ()],
+        default=0.0,
+    )
+    if latest > limit:
+        problems.append(
+            f"latest time {latest:.3f}s exceeds window_duration_s + 0.5 ({limit:.3f}s)"
+        )
+
+    if problems:
+        raise cc.CalibrationError(f"{where} is not a usable case", problems)
+
+
+def load_corpus(path: str | Path, *, strict_size: bool = True) -> Corpus:
+    """Load and fully validate a corpus registry and every case it names.
+
+    ``strict_size`` exists only so a private extension corpus can be larger than
+    the tracked-in-git ceiling; the public corpus is always checked.
+    """
+    registry_path = Path(path)
+    if not registry_path.is_file():
+        raise cc.CalibrationError(
+            f"corpus registry not found: {registry_path}",
+            [
+                "the tracked corpus lives at calibration/segmentation/corpus.json",
+                "capture cases with: scripts/capture_scenario.py --with-units --units-only",
+            ],
+        )
+    registry = cc.load_validated_json(
+        registry_path, CORPUS_SCHEMA, label=str(registry_path)
+    )
+    if registry["metric_definition_version"] != METRIC_DEFINITION_VERSION:
+        raise cc.CalibrationError(
+            f"{registry_path} declares metric_definition_version "
+            f"{registry['metric_definition_version']}, this harness implements "
+            f"{METRIC_DEFINITION_VERSION}"
+        )
+
+    base = registry_path.parent
+    cases: list[Case] = []
+    total = 0
+    problems: list[str] = []
+    for relpath in registry["cases"]:
+        case_path = base / relpath
+        if not case_path.is_file():
+            problems.append(f"{relpath}: listed in the registry but missing on disk")
+            continue
+        size = case_path.stat().st_size
+        total += size
+        if strict_size and size > MAX_CASE_BYTES:
+            problems.append(
+                f"{relpath}: {size} bytes exceeds the {MAX_CASE_BYTES}-byte case ceiling"
+            )
+        doc = cc.load_validated_json(case_path, CASE_SCHEMA, label=relpath)
+        cases.append(Case(case_path, relpath, doc, size))
+    if problems:
+        raise cc.CalibrationError(f"{registry_path} is not a usable corpus", problems)
+    if strict_size and total > MAX_CORPUS_BYTES:
+        raise cc.CalibrationError(
+            f"tracked corpus is {total} bytes, over the {MAX_CORPUS_BYTES}-byte ceiling",
+            ["shorten a window with --range, or move the case to a private corpus"],
+        )
+
+    for case in cases:
+        _validate_case_semantics(case)
+
+    _check_coverage(registry_path, registry, cases)
+    digest = corpus_digest(registry, cases)
+    return Corpus(registry_path, registry, cases, digest, total)
+
+
+def _check_coverage(
+    registry_path: Path, registry: Mapping[str, Any], cases: Sequence[Case]
+) -> None:
+    """Per-language counts and tag coverage must match the registry exactly.
+
+    A corpus that quietly lost its ``sparse-tail`` case still produces numbers;
+    those numbers just stop answering the question the corpus was built to
+    answer. That is an invalid run, not a passing one.
+    """
+    problems: list[str] = []
+    ids = [case.id for case in cases]
+    duplicates = sorted({i for i in ids if ids.count(i) > 1})
+    if duplicates:
+        problems.append(f"duplicate case ids: {', '.join(duplicates)}")
+
+    counts: dict[str, int] = {}
+    for case in cases:
+        counts[case.language] = counts.get(case.language, 0) + 1
+    for language, expected in registry["required_counts"].items():
+        actual = counts.get(language, 0)
+        if actual != expected:
+            problems.append(
+                f"required_counts[{language}] is {expected} but the corpus has {actual}"
+            )
+    extra = sorted(set(counts) - set(registry["required_counts"]))
+    if extra:
+        problems.append(f"cases in unrequired languages: {', '.join(extra)}")
+
+    covered = {tag for case in cases for tag in case.tags}
+    missing = [tag for tag in registry["required_tags"] if tag not in covered]
+    if missing:
+        problems.append(f"required_tags not covered by any case: {', '.join(missing)}")
+
+    if problems:
+        raise cc.CalibrationError(f"{registry_path} coverage is incomplete", problems)
+
+
+# --------------------------------------------------------------------------- #
+# Replay
+# --------------------------------------------------------------------------- #
+
+
+def thresholds_from_case(case: Case) -> dict[str, Any]:
+    """Rebuild the ``gap_thresholds`` mapping the case was captured with.
+
+    Injected explicitly rather than re-read from the environment: an env
+    override in the operator's shell must not silently redefine what the corpus
+    measures.
+    """
+    config = case.config
+    gaps = config.get("gap_thresholds") or {}
+    missing = [
+        key for key in ("clause_ms", "vad_skip_ms", "offline_ms") if key not in gaps
+    ] + [
+        key
+        for key in (
+            "min_cue_s",
+            "max_cue_s",
+            "glue_gap_s",
+            "cps",
+            "lag_out_s",
+            "shot_snap_s",
+        )
+        if key not in config
+    ]
+    if missing:
+        raise cc.CalibrationError(
+            f"{case.relpath}: capture.config is missing segmentation knobs",
+            [f"absent: {', '.join(missing)}"],
+        )
+    return {
+        "clause_ms": int(gaps["clause_ms"]),
+        "vad_skip_ms": int(gaps["vad_skip_ms"]),
+        "offline_ms": int(gaps["offline_ms"]),
+        "min_cue_s": float(config["min_cue_s"]),
+        "max_cue_s": float(config["max_cue_s"]),
+        "glue_gap_s": float(config["glue_gap_s"]),
+        "cps": float(config["cps"]),
+        "lag_out_s": float(config["lag_out_s"]),
+        "shot_snap_s": float(config["shot_snap_s"]),
+    }
+
+
+def layout_kwargs_from_case(case: Case) -> dict[str, Any]:
+    """Line budget overrides for ``segment_document`` (and the speaker formatter)."""
+    config = case.config
+    out: dict[str, Any] = {}
+    if "max_line_length" in config:
+        out["max_line_length"] = int(config["max_line_length"])
+    if "max_lines" in config:
+        out["max_lines"] = int(config["max_lines"])
+    return out
+
+
+@contextlib.contextmanager
+def _forced_gap_adaptive(enabled: bool) -> Iterator[None]:
+    """Pin ``VOXWEAVE_GAP_ADAPTIVE`` to the value the case was captured under.
+
+    The adaptive-threshold pass reads the environment inside
+    ``segment_document``, so it is the one knob a case cannot inject. Forcing it
+    here makes the replay hermetic: the same corpus produces the same numbers in
+    any shell.
+    """
+    key = "VOXWEAVE_GAP_ADAPTIVE"
+    previous = os.environ.get(key)
+    os.environ[key] = "1" if enabled else "0"
+    try:
+        yield
     finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
+def _diarize_config_drift(case: Case) -> list[str]:
+    """Speaker-format constants that differ from the ones recorded in the case.
+
+    These live as module constants, so unlike the thresholds they cannot be
+    injected. Reported for every case; fatal only when the case actually carries
+    speaker turns, because only then does the drift move a boundary.
+    """
+    recorded = case.config.get("diarize_format")
+    if not isinstance(recorded, Mapping):
+        return []
+    from voxweave import diarize
+
+    live = {
+        "min_atom_overlap_s": float(diarize.MIN_ATOM_OVERLAP_S),
+        "min_run_s": float(diarize.MIN_RUN_S),
+        "edge_run_min_s": float(diarize.EDGE_RUN_MIN_S),
+        "merge_gap_s": float(diarize.DIARIZE_MERGE_GAP_S),
+        "drop_contained_s": float(diarize.DIARIZE_DROP_CONTAINED_S),
+    }
+    return [
+        f"diarize_format.{key}: case {recorded[key]!r} != installed {live[key]!r}"
+        for key in sorted(live)
+        if key in recorded and float(recorded[key]) != live[key]
+    ]
 
 
-NETFLIX_MIN_S = 5.0 / 6.0  # Netflix minimum display duration
+def replay(case: Case) -> Any:
+    """Run one case through the production segmentation entry point.
+
+    Pure and deterministic: no ASR, no GPU, no filesystem writes, no detector is
+    re-run. Whatever the case does not carry stays empty -- a replay may never
+    invent an input the capture did not record.
+    """
+    from voxweave.pipeline import segment_document
+
+    doc = case.doc
+    turns = [
+        (float(t["start"]), float(t["end"]), str(t["speaker"]))
+        for t in doc.get("speaker_turns") or ()
+    ]
+    drift = _diarize_config_drift(case)
+    if drift and turns:
+        raise cc.CalibrationError(
+            f"{case.relpath}: speaker-format constants moved since capture",
+            [
+                *drift,
+                "re-capture the case, or pin the installed voxweave to the commit",
+            ],
+        )
+    with _forced_gap_adaptive(bool(case.config.get("gap_adaptive"))):
+        return segment_document(
+            language=case.language,
+            word_segments=case.units,
+            vad_speech=[(float(a), float(b)) for a, b in doc.get("vad_speech") or ()],
+            shot_changes=[float(t) for t in doc.get("shot_changes") or ()],
+            sing_spans=[(float(a), float(b)) for a, b in doc.get("sing_spans") or ()],
+            speaker_turns=turns,
+            thresholds=thresholds_from_case(case),
+            smart_split_kwargs=layout_kwargs_from_case(case),
+        )
+
+
+def validate_result_contract(case: Case, cues: Sequence[Mapping[str, Any]]) -> int:
+    """Terminal invariants of the cue stream; returns the overlap count.
+
+    A non-positive duration is a contract failure rather than an infinity fed
+    into a percentile (design 4.5), so it fails the run as invalid instead of
+    poisoning ``cps_p90`` with a number nobody can interpret.
+    """
+    if not cues:
+        raise cc.CalibrationError(f"{case.relpath}: replay produced no cues")
+    problems: list[str] = []
+    overlaps = 0
+    previous_end: float | None = None
+    previous_start: float | None = None
+    for i, cue in enumerate(cues):
+        start, end = cue.get("start"), cue.get("end")
+        if start is None or end is None:
+            problems.append(f"cue[{i}] has no span")
+            continue
+        start, end = float(start), float(end)
+        if not (math.isfinite(start) and math.isfinite(end)):
+            problems.append(f"cue[{i}] span is not finite")
+            continue
+        if end - start <= 0.0:
+            problems.append(f"cue[{i}] duration is {end - start:.6f}s (must be > 0)")
+        if previous_start is not None and start < previous_start - DURATION_EPS:
+            problems.append(f"cue[{i}] starts before cue[{i - 1}]")
+        if previous_end is not None and start < previous_end - DURATION_EPS:
+            overlaps += 1
+        previous_start, previous_end = start, end
+    if problems:
+        raise cc.CalibrationError(
+            f"{case.relpath}: cue stream violates a terminal invariant", problems
+        )
+    return overlaps
+
+
+# --------------------------------------------------------------------------- #
+# Metric primitives (all sourced from the production modules)
+# --------------------------------------------------------------------------- #
+
+
+def _flat(text: str) -> str:
+    return str(text).replace("\n", " ")
 
 
 def _tail_token(text: str, iso: str) -> str:
-    """Trailing word of a cue for line-end quality scoring.
+    """The trailing word of a cue, as ``line_end_penalty`` expects it.
 
-    Spaced langs: last whitespace token. No-space langs: last phrase atom
-    (jieba word / BudouX phrase) of the last whitespace run — line_end_penalty
-    needs whole-word semantics for zh.
+    Spaced langs: the last whitespace token. No-space langs: the last phrase atom
+    of the last whitespace run, because the zh/ja penalty tables are keyed on
+    whole words, not on the trailing character of a whole cue.
     """
-    from voxweave.core.breakpoints import phrase_atoms  # noqa: PLC0415
+    from voxweave.core.breakpoints import phrase_atoms
 
-    parts = text.replace("\n", " ").split()
+    parts = _flat(text).split()
     if not parts:
         return ""
     tail = parts[-1]
-    if iso in {"zh", "ja", "th", "lo", "my"}:
+    if _no_space(iso):
         atoms = phrase_atoms(tail, iso)
         if atoms:
             tail = atoms[-1]
     return tail
 
 
-def forbidden_end_rate(cues: list[dict[str, Any]], iso: str) -> float | None:
-    """Share of internal cue boundaries whose left cue ends on a forward-binding
-    token (line_end_penalty >= 2: en the/of/and..., zh 的/把/被..., ja のをにへ).
+def _no_space(iso: str) -> bool:
+    from voxweave.core.langsets import LANGUAGES_WITHOUT_SPACES
 
-    Punctuation is stripped from cue text, so legitimate sentence-final function
-    words inflate this slightly — read it as a relative gauge between runs."""
-    from voxweave.core.kinsoku import line_end_penalty  # noqa: PLC0415
-
-    if len(cues) < 2:
-        return None
-    bad = 0
-    for c in cues[:-1]:
-        tail = _tail_token(c.get("text", ""), iso)
-        if tail and line_end_penalty(tail, iso) >= 2:
-            bad += 1
-    return bad / (len(cues) - 1)
+    return iso in LANGUAGES_WITHOUT_SPACES
 
 
-def cue_metrics(cues: list[dict[str, Any]], iso: str) -> dict[str, Any]:
-    """Compute per-episode metrics for a cue list."""
-    n = len(cues)
-    if n == 0:
-        return {
-            "n": 0,
-            "dur_med": 0.0,
-            "dur_p90": 0.0,
-            "dur_max": 0.0,
-            "over7s": 0,
-            "under05s": 0,
-            "under_min": 0,
-            "cps_med": 0.0,
-            "cps_p90": 0.0,
-            "bad_end": None,
-        }
-    durs = [c["end"] - c["start"] for c in cues]
-    over7 = sum(1 for d in durs if d > 7.0)
-    under05 = sum(1 for d in durs if d < 0.5)
-    under_min = sum(1 for d in durs if d < NETFLIX_MIN_S)
-    # CPS: chars per second; for CJK, len = char count (no spaces)
-    cps_vals: list[float] = []
-    for c, d in zip(cues, durs):
-        if d > 0:
-            text = c.get("text", "")
-            nc = len(text.replace(" ", "").replace("\n", ""))
-            cps_vals.append(nc / d)
+def _has_multichar_phrases(iso: str) -> bool:
+    """True when the language's phrase segmenter can span more than one source unit.
 
-    return {
-        "n": n,
-        "dur_med": percentile(durs, 50),
-        "dur_p90": percentile(durs, 90),
-        "dur_max": max(durs),
-        "over7s": over7,
-        "under05s": under05,
-        "under_min": under_min,
-        "cps_med": percentile(cps_vals, 50) if cps_vals else 0.0,
-        "cps_p90": percentile(cps_vals, 90) if cps_vals else 0.0,
-        "bad_end": forbidden_end_rate(cues, iso),
-    }
-
-
-def _cue_stream_text(cues: list[dict[str, Any]]) -> str:
-    """Concatenated cue text with whitespace removed.
-
-    Phrase-boundary offsets MUST be computed over this exact stream: cue text has
-    punctuation stripped to spaces, so offsets derived from the punctuation-bearing
-    word_segments text would desync at every former punctuation mark."""
-    return "".join(c.get("text", "").replace(" ", "").replace("\n", "") for c in cues)
-
-
-def mid_phrase_cut_rate(
-    cues: list[dict[str, Any]], iso: str, full_text_nospace: str | None = None
-) -> float | None:
-    """Return combined mid-phrase-cut rate [0,1] for CJK cues using BudouX.
-
-    Used for OLD (legacy) column — single number for before/after contrast.
-    Returns None if iso is not CJK or no atoms.
+    For spaced languages ``phrase_atoms`` is ``str.split``: an atom is exactly one
+    word, and a source unit is exactly one word, so "a break inside a phrase" is
+    not expressible -- ``len_break_mid_phrase_rate`` is structurally 0 there. The
+    report says so per group (``phrase_granularity``) instead of letting a
+    guaranteed zero read as an achievement.
     """
-    from voxweave.core.breakpoints import phrase_atoms  # noqa: PLC0415
-
-    no_space_langs = {"zh", "ja", "th", "lo", "my"}
-    if iso not in no_space_langs:
-        return None
-
-    full_text_nospace = _cue_stream_text(cues)
-    if not full_text_nospace:
-        return None
-
-    atoms = phrase_atoms(full_text_nospace, iso)
-    if not atoms:
-        return None
-
-    phrase_start_offsets: set[int] = set()
-    c = 0
-    for atom in atoms:
-        phrase_start_offsets.add(c)
-        c += len(atom)
-
-    boundary_offsets: list[int] = []
-    c = 0
-    for i, cue in enumerate(cues):
-        text_ns = cue.get("text", "").replace(" ", "").replace("\n", "")
-        c += len(text_ns)
-        if i < len(cues) - 1:
-            boundary_offsets.append(c)
-
-    if not boundary_offsets:
-        return 0.0
-
-    bad = sum(1 for off in boundary_offsets if off not in phrase_start_offsets)
-    return bad / len(boundary_offsets)
+    return _no_space(iso)
 
 
-def mid_phrase_cut_split(
-    cues: list[dict[str, Any]],
-    iso: str,
-    full_text_nospace: str | None,
-    offline_s: float,
-) -> dict[str, Any] | None:
-    """Classify each internal boundary as gap-break or len-break, then measure
-    mid-phrase rate separately for each class.
+def _reading_chars(text: str) -> int:
+    from voxweave.core.layout import _reading_chars as production_reading_chars
 
-    Classification rule for boundary between cue[i] and cue[i+1]:
-      raw_gap = cue[i+1].word_data[0].start - cue[i].word_data[-1].end
-      raw_gap >= offline_s  →  gap-break (acoustic silence)
-      raw_gap <  offline_s  →  len-break (length/duration forced)
+    return production_reading_chars(text)
 
-    A boundary is mid-phrase if its cumulative char offset (spaces removed)
-    does NOT coincide with a BudouX phrase-start offset.
 
-    Returns dict with keys:
-      len_mid_pct    float  len-break mid-phrase %  ← quality gate
-      gap_mid_pct    float  gap-break mid-phrase %  ← informational
-      len_share_pct  float  len-breaks / all internal boundaries %
-      n_len          int    total len-breaks
-      n_gap          int    total gap-breaks
-      n_len_mid      int    mid-phrase len-breaks
-      n_gap_mid      int    mid-phrase gap-breaks
+def _fits_budget(text: str, max_line_length: int, max_lines: int, iso: str) -> bool:
+    from voxweave.core.layout import _fits_budget as production_fits_budget
 
-    Returns None if iso not in no_space_langs or no boundaries.
+    return production_fits_budget(text, max_line_length, max_lines, iso)
+
+
+def _line_end_penalty(text: str, iso: str) -> int:
+    from voxweave.core.kinsoku import line_end_penalty
+
+    return line_end_penalty(text, iso)
+
+
+def _phrase_atoms(text: str, iso: str) -> list[str]:
+    from voxweave.core.breakpoints import phrase_atoms
+
+    return phrase_atoms(text, iso)
+
+
+def _ends_with_break_punct(text: str) -> bool:
+    """True when the unit's surface form closes a sentence or clause.
+
+    Punctuation rides on the preceding unit (``reinject_punct``), so this is the
+    source stream's own statement that a boundary belongs here. Two characters
+    are inspected so a closer after a terminal (``。」``) still counts.
     """
-    from voxweave.core.breakpoints import phrase_atoms  # noqa: PLC0415
+    stripped = str(text).rstrip()
+    return any(ch in _BREAK_PUNCT for ch in stripped[-2:])
 
-    no_space_langs = {"zh", "ja", "th", "lo", "my"}
-    if iso not in no_space_langs:
-        return None
 
-    full_text_nospace = _cue_stream_text(cues)
-    if not full_text_nospace or len(cues) < 2:
-        return None
+def _starts_with_break_punct(text: str) -> bool:
+    stripped = str(text).lstrip()
+    return bool(stripped) and stripped[0] in _BREAK_PUNCT
 
-    atoms = phrase_atoms(full_text_nospace, iso)
-    if not atoms:
-        return None
 
-    # Build phrase-start offsets
-    phrase_start_offsets: set[int] = set()
-    c = 0
-    for atom in atoms:
-        phrase_start_offsets.add(c)
-        c += len(atom)
+def _overlaps(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    return min(a[1], b[1]) > max(a[0], b[0])
 
-    # Walk boundaries
-    n_len = n_gap = n_len_mid = n_gap_mid = 0
-    char_offset = 0
 
+# --------------------------------------------------------------------------- #
+# Mapping cue boundaries back onto the source unit stream
+# --------------------------------------------------------------------------- #
+
+
+class UnitLocator:
+    """Resolve a cue's ``word_data`` entry back to its index in the source stream.
+
+    Timing passes concatenate and slice ``word_data`` but never rewrite a span,
+    so ``(start, end)`` is a stable identity. Lookup prefers the first candidate
+    at or after a monotonic cursor, which disambiguates the repeated keys that
+    zero-duration units produce. An entry the splitter fabricated (the logged
+    proportional-timing desync path) simply does not resolve, and its boundary is
+    excluded and counted -- never guessed at.
+    """
+
+    def __init__(self, units: Sequence[Mapping[str, Any]]) -> None:
+        self._index: dict[tuple[float, float], list[int]] = {}
+        for i, unit in enumerate(units):
+            self._index.setdefault(self._key(unit), []).append(i)
+
+    @staticmethod
+    def _key(unit: Mapping[str, Any]) -> tuple[float, float]:
+        start, end = unit.get("start"), unit.get("end")
+        return (
+            round(float(start), _TIME_DECIMALS) if start is not None else math.nan,
+            round(float(end), _TIME_DECIMALS) if end is not None else math.nan,
+        )
+
+    def locate(self, entry: Mapping[str, Any], cursor: int) -> int | None:
+        candidates = self._index.get(self._key(entry))
+        if not candidates:
+            return None
+        for i in candidates:
+            if i >= cursor:
+                return i
+        return candidates[-1]
+
+
+@dataclass(frozen=True)
+class Boundary:
+    """One internal cue boundary, resolved onto the source units."""
+
+    cue_index: int
+    left_unit: int
+    right_unit: int
+    gap: float
+
+
+def map_boundaries(
+    units: Sequence[Mapping[str, Any]], cues: Sequence[Mapping[str, Any]]
+) -> tuple[list[Boundary | None], int]:
+    """Map every internal cue boundary onto ``(left_unit, right_unit)`` indices.
+
+    Returns one entry per internal boundary (``None`` when unresolvable) plus the
+    count of unresolved ones, so a report can show how much of the cue stream the
+    metrics could actually see.
+    """
+    locator = UnitLocator(units)
+    out: list[Boundary | None] = []
+    unmapped = 0
+    cursor = 0
+    firsts: list[int | None] = []
+    lasts: list[int | None] = []
+    for cue in cues:
+        word_data = list(cue.get("word_data") or ())
+        if not word_data:
+            firsts.append(None)
+            lasts.append(None)
+            continue
+        first = locator.locate(word_data[0], cursor)
+        last = locator.locate(word_data[-1], first if first is not None else cursor)
+        firsts.append(first)
+        lasts.append(last)
+        if last is not None:
+            cursor = last + 1
     for i in range(len(cues) - 1):
-        cur = cues[i]
-        nxt = cues[i + 1]
-
-        # Accumulate char offset at end of cue[i]
-        text_ns = cur.get("text", "").replace(" ", "").replace("\n", "")
-        char_offset += len(text_ns)
-
-        is_mid = char_offset not in phrase_start_offsets
-
-        # Classify via raw word_data gap
-        wd_cur = cur.get("word_data") or []
-        wd_nxt = nxt.get("word_data") or []
-
-        if not wd_cur or not wd_nxt:
-            # Cannot classify without timing — skip this boundary
+        left, right = lasts[i], firsts[i + 1]
+        if left is None or right is None or right <= left:
+            out.append(None)
+            unmapped += 1
             continue
+        gap = float(units[right]["start"]) - float(units[left]["end"])
+        out.append(Boundary(i, left, right, gap))
+    return out, unmapped
 
-        # Guard: keys may be missing
-        end_cur = wd_cur[-1].get("end")
-        start_nxt = wd_nxt[0].get("start")
-        if end_cur is None or start_nxt is None:
+
+def phrase_start_offsets(
+    units: Sequence[Mapping[str, Any]], iso: str
+) -> tuple[set[int], list[int]]:
+    """Phrase starts of the *source* document, plus each unit's character offset.
+
+    This is the de-circularisation the audit asked for. The previous version
+    segmented the concatenated *cue* text -- the splitter's own output -- and
+    then asked whether the splitter had split it where the segmenter would. Here
+    the truth is the input document: the units as captured, punctuation intact,
+    segmented once with the whole sentence for context. The splitter never sees
+    that segmentation (it works cue-locally, on punctuation-stripped text), so
+    agreement is evidence rather than tautology.
+
+    Offsets are counted in non-whitespace characters, the only index space in
+    which ``phrase_atoms`` and the unit stream agree (atoms drop whitespace).
+    """
+    sep = "" if _no_space(iso) else " "
+    text = sep.join(str(u.get("text") or "") for u in units)
+    unit_offsets: list[int] = []
+    offset = 0
+    for unit in units:
+        unit_offsets.append(offset)
+        offset += _reading_chars(str(unit.get("text") or ""))
+    starts = {0}
+    offset = 0
+    for atom in _phrase_atoms(text, iso):
+        offset += _reading_chars(atom)
+        starts.add(offset)
+    return starts, unit_offsets
+
+
+def has_legal_alternative(
+    left_text: str,
+    right_text: str,
+    iso: str,
+    max_line_length: int,
+    max_lines: int,
+) -> bool:
+    """True when this boundary could have moved and still fit the layout budget.
+
+    The denominator of ``forbidden_end_rate`` is the boundaries where a better
+    choice existed. Repacking the two cues' atoms, an alternative counts only if
+    both halves are non-empty, both fit the configured line budget, and the new
+    left half does *not* end on a forward-binding token. Without this, a cue
+    whose only in-budget break is a bad one would be scored as an algorithm
+    defect, and a rate that punishes unsolvable boundaries can never reach 0.
+    """
+    left_atoms = _phrase_atoms(_flat(left_text), iso)
+    right_atoms = _phrase_atoms(_flat(right_text), iso)
+    atoms = left_atoms + right_atoms
+    if len(atoms) < 2:
+        return False
+    join = "" if _no_space(iso) else " "
+    actual = len(left_atoms)
+    for k in range(1, len(atoms)):
+        if k == actual:
             continue
+        if _line_end_penalty(atoms[k - 1], iso) >= 2:
+            continue
+        lhs = join.join(atoms[:k])
+        rhs = join.join(atoms[k:])
+        if not lhs.strip() or not rhs.strip():
+            continue
+        if not _fits_budget(lhs, max_line_length, max_lines, iso):
+            continue
+        if not _fits_budget(rhs, max_line_length, max_lines, iso):
+            continue
+        return True
+    return False
 
-        raw_gap = start_nxt - end_cur
 
-        if raw_gap >= offline_s:
-            n_gap += 1
-            if is_mid:
-                n_gap_mid += 1
-        else:
-            n_len += 1
-            if is_mid:
-                n_len_mid += 1
+# --------------------------------------------------------------------------- #
+# Per-case measurement
+# --------------------------------------------------------------------------- #
 
-    n_total = n_len + n_gap
-    if n_total == 0:
-        return None
 
-    return {
-        "len_mid_pct": (n_len_mid / n_len * 100) if n_len > 0 else 0.0,
-        "gap_mid_pct": (n_gap_mid / n_gap * 100) if n_gap > 0 else 0.0,
-        "len_share_pct": n_len / n_total * 100,
-        "n_len": n_len,
-        "n_gap": n_gap,
-        "n_len_mid": n_len_mid,
-        "n_gap_mid": n_gap_mid,
+@dataclass
+class CaseMeasurement:
+    """Everything one case contributes: ratios, samples, offenders, diagnostics."""
+
+    case_id: str
+    language: str
+    cue_count: int
+    ratios: dict[str, cc.Ratio] = field(default_factory=dict)
+    cps_samples: list[float] = field(default_factory=list)
+    offenders: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    wall_time_s: float = 0.0
+
+
+def _exception_ranges(case: Case) -> dict[str, list[tuple[float, float]]]:
+    out: dict[str, list[tuple[float, float]]] = {metric: [] for metric in METRICS}
+    for exc in case.exceptions:
+        span = (float(exc["range"][0]), float(exc["range"][1]))
+        for metric in _EXCEPTION_METRICS.get(str(exc["kind"]), ()):
+            out[metric].append(span)
+    return out
+
+
+def measure_case(case: Case, result: Any) -> CaseMeasurement:
+    """Reduce one replayed case to the four metrics plus diagnostics.
+
+    All four are counted here with their numerators and denominators intact; the
+    aggregation step only sums them. Nothing is turned into a percentage before
+    it reaches the report.
+    """
+    iso = case.language
+    cues: list[dict[str, Any]] = list(result.cues)
+    units = case.units
+    config = case.config
+    thresholds = thresholds_from_case(case)
+    offline_s = float(thresholds["offline_ms"]) / 1000.0
+    vad_skip_s = float(thresholds["vad_skip_ms"]) / 1000.0
+    max_cue_s = float(thresholds["max_cue_s"])
+    max_line_length = int(config.get("max_line_length") or _default_line_length(iso))
+    max_lines = int(config.get("max_lines") or _default_lines(iso))
+    exceptions = _exception_ranges(case)
+
+    overlaps = validate_result_contract(case, cues)
+    boundaries, unmapped = map_boundaries(units, cues)
+    starts, unit_offsets = phrase_start_offsets(units, iso)
+    multichar = _has_multichar_phrases(iso)
+
+    measurement = CaseMeasurement(case_id=case.id, language=iso, cue_count=len(cues))
+    spans = [(float(c["start"]), float(c["end"])) for c in cues]
+    lyric = [bool(c.get("lyric")) for c in cues]
+
+    def exempt(metric: str, index: int) -> bool:
+        return any(_overlaps(spans[index], rng) for rng in exceptions[metric])
+
+    # --- metric 2: cue duration ------------------------------------------- #
+    over_bad = over_eligible = over_exempt = 0
+    duration_offenders: list[dict[str, Any]] = []
+    for i, cue in enumerate(cues):
+        if lyric[i] or exempt("over_7s_rate", i):
+            over_exempt += 1
+            continue
+        over_eligible += 1
+        duration = spans[i][1] - spans[i][0]
+        if duration > max_cue_s + DURATION_EPS:
+            over_bad += 1
+            duration_offenders.append(
+                _offender(case, i, cue, duration=duration, value=duration)
+            )
+
+    # --- metric 3: reading speed ------------------------------------------ #
+    cps_samples: list[float] = []
+    cps_offenders: list[dict[str, Any]] = []
+    for i, cue in enumerate(cues):
+        if lyric[i] or exempt("cps_p90", i):
+            continue
+        duration = spans[i][1] - spans[i][0]
+        if duration <= 0.0:  # pragma: no cover - validate_result_contract rejects it
+            raise cc.CalibrationError(
+                f"{case.relpath}: cue[{i}] has non-positive duration {duration!r}"
+            )
+        value = _reading_chars(str(cue.get("text") or "")) / duration
+        cps_samples.append(value)
+        cps_offenders.append(_offender(case, i, cue, duration=duration, value=value))
+
+    # --- metrics 1 and 4: boundary quality -------------------------------- #
+    mid_bad = mid_eligible = 0
+    forbidden_bad = forbidden_eligible = 0
+    silence_breaks = forced_breaks = punctuation_breaks = no_alternative = 0
+    mid_offenders: list[dict[str, Any]] = []
+    forbidden_offenders: list[dict[str, Any]] = []
+
+    for boundary in boundaries:
+        if boundary is None:
+            continue
+        i = boundary.cue_index
+        left_unit = units[boundary.left_unit]
+        right_unit = units[boundary.right_unit]
+        left_cue, right_cue = cues[i], cues[i + 1]
+        is_lyric = lyric[i] or lyric[i + 1]
+
+        # metric 1 -- length/format-driven boundaries only.
+        if not (
+            is_lyric
+            or exempt("len_break_mid_phrase_rate", i)
+            or exempt("len_break_mid_phrase_rate", i + 1)
+        ):
+            if boundary.gap >= offline_s:
+                silence_breaks += 1
+            else:
+                mid_eligible += 1
+                at_phrase_start = unit_offsets[boundary.right_unit] in starts
+                explicit = _ends_with_break_punct(
+                    str(left_unit.get("text") or "")
+                ) or _starts_with_break_punct(str(right_unit.get("text") or ""))
+                if multichar and not at_phrase_start and not explicit:
+                    mid_bad += 1
+                    mid_offenders.append(
+                        _offender(
+                            case,
+                            i,
+                            left_cue,
+                            # Ranked by how far below the silence threshold the
+                            # break sat: the quieter the pause, the more purely
+                            # this was the layout's own decision.
+                            value=max(0.0, offline_s - boundary.gap),
+                            note=(
+                                f"{_tail_token(str(left_cue.get('text') or ''), iso)}"
+                                f" | {str(right_cue.get('text') or '')[:12]}"
+                            ),
+                        )
+                    )
+
+        # metric 4 -- boundaries a legal alternative could have improved.
+        if (
+            is_lyric
+            or exempt("forbidden_end_rate", i)
+            or exempt("forbidden_end_rate", i + 1)
+        ):
+            continue
+        if boundary.gap >= vad_skip_s:
+            forced_breaks += 1
+            continue
+        if _ends_with_break_punct(str(left_unit.get("text") or "")):
+            punctuation_breaks += 1
+            continue
+        if not has_legal_alternative(
+            str(left_cue.get("text") or ""),
+            str(right_cue.get("text") or ""),
+            iso,
+            max_line_length,
+            max_lines,
+        ):
+            no_alternative += 1
+            continue
+        forbidden_eligible += 1
+        tail = _tail_token(str(left_cue.get("text") or ""), iso)
+        if tail and _line_end_penalty(tail, iso) >= 2:
+            forbidden_bad += 1
+            forbidden_offenders.append(
+                # Ranked the same way: a dangling particle with no pause behind
+                # it is a worse line end than one the speaker nearly justified.
+                _offender(
+                    case,
+                    i,
+                    left_cue,
+                    value=max(0.0, vad_skip_s - boundary.gap),
+                    note=tail,
+                )
+            )
+
+    measurement.ratios = {
+        "len_break_mid_phrase_rate": cc.Ratio(mid_bad, mid_eligible),
+        "over_7s_rate": cc.Ratio(over_bad, over_eligible),
+        "forbidden_end_rate": cc.Ratio(forbidden_bad, forbidden_eligible),
     }
+    measurement.cps_samples = cps_samples
+    # Trimmed per case: the global worst ``OFFENDER_LIMIT`` is a subset of the
+    # union of the per-case worst ``OFFENDER_LIMIT``, so this loses nothing.
+    measurement.offenders = {
+        "len_break_mid_phrase_rate": _worst(mid_offenders),
+        "over_7s_rate": _worst(duration_offenders),
+        "cps_p90": _worst(cps_offenders),
+        "forbidden_end_rate": _worst(forbidden_offenders),
+    }
+    measurement.diagnostics = {
+        "unit_count": len(units),
+        "cue_count": len(cues),
+        "lyric_cue_count": sum(lyric),
+        "internal_boundaries": max(len(cues) - 1, 0),
+        "unmapped_boundaries": unmapped,
+        "overlapping_cues": overlaps,
+        "silence_breaks": silence_breaks,
+        "forced_breaks": forced_breaks,
+        "punctuation_breaks": punctuation_breaks,
+        "no_legal_alternative": no_alternative,
+        "exempted_cues": over_exempt,
+        "phrase_granularity": "phrase" if multichar else "word",
+        "target_cps": float(thresholds["cps"]),
+        "max_cue_s": max_cue_s,
+        "dependency_drift": _dependency_drift(case),
+        "config_drift": _diarize_config_drift(case),
+        "replay": dict(result.diagnostics),
+    }
+    return measurement
 
 
-# ---------------------------------------------------------------------------
-# Main calibration logic
-# ---------------------------------------------------------------------------
+def _default_line_length(iso: str) -> int:
+    from voxweave.core.layout import default_max_line_length
+
+    return default_max_line_length(iso)
 
 
-def build_segment(word_segments: list[dict], iso: str) -> dict[str, Any]:
-    """Build a single segment dict from word_segments for smart_split_segments."""
-    sep = "" if iso in {"zh", "ja", "yue"} else " "
-    text = sep.join(u["text"] for u in word_segments)
-    words = [
-        {"word": u["text"], "start": u["start"], "end": u["end"]} for u in word_segments
+def _default_lines(iso: str) -> int:
+    from voxweave.core.layout import default_max_lines
+
+    return default_max_lines(iso)
+
+
+def _dependency_drift(case: Case) -> list[str]:
+    """Segmenter versions that moved since the case was captured (informational).
+
+    A different jieba does not invalidate the *case*; it changes where breaks
+    land, which is exactly why the report has to say so out loud rather than let
+    the number shift under a silent upgrade.
+    """
+    recorded = case.doc["capture"].get("dependency_versions") or {}
+    live = dependency_versions()
+    live["python"] = platform.python_version()
+    drift: list[str] = []
+    for name, version in sorted(recorded.items()):
+        if name not in live:
+            continue
+        current = live[name]
+        if name == "python":
+            if _python_minor(str(version)) != _python_minor(str(current)):
+                drift.append(f"python: case {version} != running {current}")
+            continue
+        if version != current:
+            drift.append(f"{name}: case {version!r} != installed {current!r}")
+    return drift
+
+
+def _worst(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The ``OFFENDER_LIMIT`` highest-``value`` rows, worst first."""
+    return sorted(rows, key=lambda row: float(row["value"]), reverse=True)[
+        :OFFENDER_LIMIT
     ]
-    return {
-        "start": word_segments[0]["start"],
-        "end": word_segments[-1]["end"],
-        "text": text,
-        "words": words,
-    }
 
 
-def run_episode(
-    mkv: Path,
-    json_path: Path,
+def _offender(
+    case: Case,
+    index: int,
+    cue: Mapping[str, Any],
+    *,
+    value: float,
+    duration: float | None = None,
+    note: str | None = None,
 ) -> dict[str, Any]:
-    """Process one episode. Returns dict with keys old/new/en metrics + errors."""
-    with json_path.open(encoding="utf-8") as f:
-        data = json.load(f)
+    start, end = float(cue["start"]), float(cue["end"])
+    out: dict[str, Any] = {
+        "case": case.id,
+        "language": case.language,
+        "cue_index": index,
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "duration": round(duration if duration is not None else end - start, 3),
+        "value": round(float(value), 4),
+        "text": _flat(str(cue.get("text") or ""))[:80],
+    }
+    if note:
+        out["note"] = note[:60]
+    return out
 
-    word_segments = data.get("word_segments") or []
-    iso = data.get("language", "ja")
 
-    if not word_segments:
-        return {"error": "empty word_segments"}
+# --------------------------------------------------------------------------- #
+# Aggregation
+# --------------------------------------------------------------------------- #
 
-    from voxweave import realign  # noqa: PLC0415
-    from voxweave.core.smart_split import smart_split_segments  # noqa: PLC0415
-    from voxweave.config import gap_thresholds  # noqa: PLC0415
 
-    # Mirror the production path: zh punctuation snapped to jieba word boundaries.
-    word_segments = realign.snap_break_punct(word_segments, iso)
-    seg = build_segment(word_segments, iso)
+def aggregate(measurements: Sequence[CaseMeasurement]) -> dict[str, dict[str, Any]]:
+    """Micro-aggregate every case into the ``all`` summary and one group per language.
 
-    # vad_speech persisted by transcribe (newer JSONs); older JSONs degrade to offline_ms.
-    speech_spans = data.get("vad_speech") or None
-    if speech_spans:
-        speech_spans = [(float(s), float(e)) for s, e in speech_spans]
+    Numerators and denominators are summed; per-case percentages are never
+    averaged. ``cps_p90`` pools the raw cue samples, because a percentile of
+    per-case percentiles is not a percentile of anything.
+    """
+    agg = cc.MicroAggregator()
+    case_counts: dict[str, int] = {}
+    cue_counts: dict[str, int] = {}
+    targets: dict[str, set[float]] = {}
+    granularity: dict[str, set[str]] = {}
+    diagnostics: dict[str, dict[str, int]] = {}
 
-    # OLD: no thresholds, legacy length-only path
-    old_cues = smart_split_segments([seg], iso)
+    for measurement in measurements:
+        groups = cc.group_keys(measurement.language)
+        for group in groups:
+            case_counts[group] = case_counts.get(group, 0) + 1
+            cue_counts[group] = cue_counts.get(group, 0) + measurement.cue_count
+            for metric, ratio in measurement.ratios.items():
+                agg.add_ratio(group, metric, ratio.bad, ratio.eligible)
+            agg.add_samples(group, "cps_p90", measurement.cps_samples)
+            bucket = diagnostics.setdefault(group, {})
+            for key, value in measurement.diagnostics.items():
+                if isinstance(value, int) and not isinstance(value, bool):
+                    bucket[key] = bucket.get(key, 0) + value
+            targets.setdefault(group, set()).add(
+                float(measurement.diagnostics["target_cps"])
+            )
+            granularity.setdefault(group, set()).add(
+                str(measurement.diagnostics["phrase_granularity"])
+            )
 
-    # NEW: gap-aware
-    th = gap_thresholds(iso)
-    new_cues = smart_split_segments(
-        [seg],
-        iso,
-        speech_spans=speech_spans,
-        thresholds=th,
-    )
+    out: dict[str, dict[str, Any]] = {}
+    for group in sorted(set(case_counts) | {GROUP_ALL, *cc.CALIBRATION_LANGUAGES}):
+        samples = agg.samples(group, "cps_p90")
+        target_set = targets.get(group, set())
+        # The ``all`` group mixes languages with different reading-speed targets,
+        # so it has no single ceiling -- which is why gates run per language.
+        target = next(iter(target_set)) if len(target_set) == 1 else None
+        block: dict[str, Any] = {
+            "case_count": case_counts.get(group, 0),
+            "cue_count": cue_counts.get(group, 0),
+            "cps_p90": {
+                "n": len(samples),
+                "value": cc.percentile(samples, 90.0),
+                "median": cc.percentile(samples, 50.0),
+                "p95": cc.percentile(samples, 95.0),
+                "target_cps": target,
+                "absolute_max": (
+                    round(target * CPS_ABSOLUTE_FACTOR, 4)
+                    if target is not None
+                    else None
+                ),
+            },
+            "phrase_granularity": sorted(granularity.get(group, ())),
+            "diagnostics": diagnostics.get(group, {}),
+        }
+        for metric in METRICS:
+            if metric == "cps_p90":
+                continue
+            block[metric] = agg.ratio(group, metric).to_dict()
+        out[group] = block
+    return out
 
-    # Commercial EN
-    en_cues = extract_commercial_en(mkv)
 
-    # Full text no-space for mid-phrase-cut (use word_segments concatenation)
-    full_text_nospace = "".join(u["text"] for u in word_segments)
+def collect_offenders(
+    measurements: Sequence[CaseMeasurement],
+) -> dict[str, list[dict[str, Any]]]:
+    """The ``OFFENDER_LIMIT`` worst samples per metric, worst first.
 
-    old_m = cue_metrics(old_cues, iso)
-    new_m = cue_metrics(new_cues, iso)
-    en_m = cue_metrics(en_cues, "en") if en_cues is not None else None
+    A rate with no examples is un-actionable: the report must be able to answer
+    "show me the cue" without a second run.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for metric in METRICS:
+        pool: list[dict[str, Any]] = []
+        for measurement in measurements:
+            pool.extend(measurement.offenders.get(metric, ()))
+        pool.sort(key=lambda row: float(row["value"]), reverse=True)
+        out[metric] = pool[:OFFENDER_LIMIT]
+    return out
 
-    # OLD: combined mid-phrase-cut (before/after contrast)
-    old_mpc = mid_phrase_cut_rate(old_cues, iso, full_text_nospace)
 
-    # NEW: split by boundary type
-    offline_s = th["offline_ms"] / 1000.0
-    new_mpc_split = mid_phrase_cut_split(new_cues, iso, full_text_nospace, offline_s)
+# --------------------------------------------------------------------------- #
+# Gates
+# --------------------------------------------------------------------------- #
 
+
+def _measure(block: Mapping[str, Any], metric: str) -> tuple[float | None, int, str]:
+    """The compared quantity, its sample count and its unit, for one metric."""
+    if metric == "cps_p90":
+        cps = block["cps_p90"]
+        return cps["value"], int(cps["n"]), "cps"
+    ratio = block[metric]
+    if metric in COUNT_METRICS:
+        return float(ratio["bad"]), int(ratio["eligible"]), "count"
+    return ratio["value"], int(ratio["eligible"]), "rate"
+
+
+def _absolute_max(
+    gate: Mapping[str, Any], block: Mapping[str, Any], metric: str
+) -> float | None:
+    """The absolute ceiling, resolving ``cps_p90``'s per-language derivation."""
+    if metric == "cps_p90":
+        return block["cps_p90"].get("absolute_max")
+    value = gate.get("absolute_max")
+    return None if value is None else float(value)
+
+
+def evaluate_gates(
+    groups: Mapping[str, Mapping[str, Any]],
+    gates: Mapping[str, Mapping[str, Any]],
+    baseline: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """One-sided comparison per language group; ``all`` is a summary only.
+
+    Every rule is lower-is-better, so an improvement can never fail::
+
+        allowed = baseline + max(absolute_tolerance, baseline * relative_tolerance)
+        passed  = value <= allowed and (absolute_max is None or value <= absolute_max)
+
+    A group whose denominator is under ``min_samples`` reports
+    ``insufficient_samples``: with the corpus fixed at 20 cases that is a corpus
+    defect, not a pass, and the caller turns it into exit 2 for a blocking gate.
+    """
+    results: list[dict[str, Any]] = []
+    baseline_groups = (baseline or {}).get("groups") or {}
+    for language in cc.CALIBRATION_LANGUAGES:
+        block = groups.get(language)
+        if block is None:
+            continue
+        for metric in METRICS:
+            gate = gates.get(metric) or DEFAULT_GATES[metric]
+            mode = str(gate.get("mode", "warning"))
+            value, samples, unit = _measure(block, metric)
+            ceiling = _absolute_max(gate, block, metric)
+            result: dict[str, Any] = {
+                "group": language,
+                "metric": metric,
+                "mode": mode,
+                "measure": unit,
+                "value": value,
+                "samples": samples,
+                "min_samples": int(gate["min_samples"]),
+                "absolute_max": ceiling,
+                "baseline_value": None,
+                "allowed_by_baseline": None,
+                "reasons": [],
+            }
+            if mode == "disabled":
+                result["status"] = "disabled"
+                results.append(result)
+                continue
+            if samples < int(gate["min_samples"]):
+                result["status"] = "insufficient_samples"
+                result["reasons"].append(
+                    f"{samples} samples < min_samples {gate['min_samples']}"
+                )
+                results.append(result)
+                continue
+            if value is None:
+                result["status"] = "insufficient_samples"
+                result["reasons"].append("metric has no value (empty denominator)")
+                results.append(result)
+                continue
+
+            passed = True
+            if ceiling is not None and value > ceiling + DURATION_EPS:
+                passed = False
+                result["reasons"].append(
+                    f"absolute: {value:.4f} > absolute_max {ceiling:.4f}"
+                )
+            base_block = baseline_groups.get(language)
+            if base_block is not None:
+                base_value, _, _ = _measure(base_block, metric)
+                if base_value is not None:
+                    allowed = float(base_value) + max(
+                        float(gate["absolute_tolerance"]),
+                        float(base_value) * float(gate["relative_tolerance"]),
+                    )
+                    result["baseline_value"] = base_value
+                    result["allowed_by_baseline"] = allowed
+                    if value > allowed + DURATION_EPS:
+                        passed = False
+                        result["reasons"].append(
+                            f"regression: {value:.4f} > allowed {allowed:.4f} "
+                            f"(baseline {base_value:.4f})"
+                        )
+            result["status"] = "pass" if passed else "fail"
+            results.append(result)
+    return results
+
+
+def gate_exit_code(results: Sequence[Mapping[str, Any]]) -> int:
+    """Map gate outcomes onto the shared contract.
+
+    ``insufficient_samples`` on a blocking gate is exit 2, not exit 1: the corpus
+    could not answer the question, so this run has no standing to call it a
+    regression (design 4.6).
+    """
+    blocking = [r for r in results if r["mode"] == "blocking"]
+    if any(r["status"] == "insufficient_samples" for r in blocking):
+        return cc.EXIT_INVALID
+    if any(r["status"] == "fail" for r in blocking):
+        return cc.EXIT_GATE_FAILED
+    return cc.EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Baseline handling
+# --------------------------------------------------------------------------- #
+
+
+def load_baseline(path: str | Path, corpus: Corpus) -> dict[str, Any]:
+    """Load a baseline and refuse to compare against one that does not fit.
+
+    A digest, metric-definition or segmenter-version mismatch is exit 2 and
+    demands a reviewed ``record-baseline``. Silently comparing today's corpus to
+    yesterday's numbers is how a gate stops meaning anything.
+    """
+    baseline = cc.load_validated_json(path, BASELINE_SCHEMA, label=str(path))
+    problems: list[str] = []
+    if baseline["metric_definition_version"] != METRIC_DEFINITION_VERSION:
+        problems.append(
+            f"metric_definition_version {baseline['metric_definition_version']} "
+            f"!= {METRIC_DEFINITION_VERSION} implemented here"
+        )
+    if baseline["corpus_digest"] != corpus.digest:
+        problems.append(
+            f"corpus_digest {baseline['corpus_digest'][:12]}... != current "
+            f"{corpus.digest[:12]}... (the corpus changed)"
+        )
+    if problems:
+        raise cc.CalibrationError(
+            f"{path} does not describe this corpus",
+            [*problems, "re-record deliberately: make quality-record-segmentation"],
+        )
+    return baseline
+
+
+def environment_drift(baseline: Mapping[str, Any]) -> list[str]:
+    """Segmenter/python differences between the baseline and this environment."""
+    recorded = baseline.get("environment") or {}
+    drift: list[str] = []
+    base_python = str(recorded.get("python") or "")
+    if base_python and _python_minor(base_python) != _python_minor(
+        platform.python_version()
+    ):
+        drift.append(
+            f"python: baseline {base_python} != running {platform.python_version()}"
+        )
+    live = dependency_versions()
+    for name, version in sorted((recorded.get("dependencies") or {}).items()):
+        if name in live and live[name] != version:
+            drift.append(f"{name}: baseline {version!r} != installed {live[name]!r}")
+    return drift
+
+
+def baseline_from_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a report onto the tracked baseline shape (groups + gate rules)."""
     return {
-        "iso": iso,
-        "old": old_m,
-        "new": new_m,
-        "en": en_m,
-        "old_mpc": old_mpc,
-        "new_mpc_split": new_mpc_split,
-        "en_available": en_cues is not None,
+        "schema_version": SCHEMA_VERSION,
+        "metric_definition_version": METRIC_DEFINITION_VERSION,
+        "corpus_digest": report["corpus_digest"],
+        "generated_from_commit": report["generated_from_commit"],
+        "environment": report["environment"],
+        "groups": report["groups"],
+        "gates": report["gates"],
     }
 
 
-def fmt_mpc(v: float | None) -> str:
-    if v is None:
-        return "   N/A"
-    return f"{v * 100:5.1f}%"
+# --------------------------------------------------------------------------- #
+# Report
+# --------------------------------------------------------------------------- #
 
 
-def fmt_f(v: float) -> str:
-    return f"{v:5.2f}"
+def group_schema() -> dict[str, Any]:
+    """The baseline schema's ``group`` definition, usable as a standalone schema.
+
+    There is no separate report schema: a report's groups are the same objects a
+    baseline records, so they are held to the same contract instead of a second,
+    drifting one.
+    """
+    schema = cc.load_schema(BASELINE_SCHEMA)
+    return {**schema["$defs"]["group"], "$defs": schema["$defs"]}
 
 
-def fmt_pct(v: float) -> str:
-    return f"{v:5.1f}%"
+def gates_schema() -> dict[str, Any]:
+    schema = cc.load_schema(BASELINE_SCHEMA)
+    return {
+        **schema["properties"]["gates"],
+        "$defs": schema["$defs"],
+    }
 
 
-def print_episode_table(name: str, r: dict[str, Any]) -> None:
-    old = r["old"]
-    new = r["new"]
-    en = r.get("en")
-    split = r.get("new_mpc_split")  # dict or None
-
-    en_str = "(no EN stream)" if en is None else ""
-
-    print(f"\n{'─' * 70}")
-    print(f"  Episode: {name}  {en_str}")
-    print(f"{'─' * 70}")
-    hdr = f"  {'Metric':<28} {'OLD':>10} {'NEW':>10} {'EN (cmcl)':>12}"
-    print(hdr)
-    print(f"  {'─' * 28} {'─' * 10} {'─' * 10} {'─' * 12}")
-
-    def row(label: str, key: str, fmt_fn=fmt_f) -> None:
-        o = fmt_fn(old.get(key, 0))
-        n = fmt_fn(new.get(key, 0))
-        e = fmt_fn(en.get(key, 0)) if en else "        N/A"
-        print(f"  {label:<28} {o:>10} {n:>10} {e:>12}")
-
-    def row_int(label: str, key: str) -> None:
-        o = str(old.get(key, 0))
-        n = str(new.get(key, 0))
-        e = str(en.get(key, 0)) if en else "N/A"
-        print(f"  {label:<28} {o:>10} {n:>10} {e:>12}")
-
-    row_int("n (cue count)", "n")
-    row("dur median (s)", "dur_med")
-    row("dur p90 (s)", "dur_p90")
-    row("dur max (s)", "dur_max")
-    row_int(">7s cues", "over7s")
-    row_int("<0.5s cues", "under05s")
-    row_int("<5/6s cues", "under_min")
-    row("CPS median", "cps_med")
-    row("CPS p90", "cps_p90")
-    o_be = fmt_mpc(old.get("bad_end"))
-    n_be = fmt_mpc(new.get("bad_end"))
-    e_be = fmt_mpc(en.get("bad_end")) if en else "         N/A"
-    print(f"  {'bad line-end %':<28} {o_be:>10} {n_be:>10} {e_be:>12}")
-
-    print(f"  {'─' * 28} {'─' * 10} {'─' * 10} {'─' * 12}")
-    # OLD: combined mid-phrase-cut %
-    print(
-        f"  {'mid-phrase-cut % (OLD)':<28} {fmt_mpc(r.get('old_mpc')):>10}"
-        f" {'':>10} {'':>12}"
+def validate_report(report: Mapping[str, Any]) -> None:
+    """Hold a report to the tracked contracts it shares with the baseline."""
+    errors: list[str] = []
+    group_def = group_schema()
+    for name, block in report["groups"].items():
+        errors.extend(f"groups/{name}/{e}" for e in cc.schema_errors(block, group_def))
+    errors.extend(
+        f"gates/{e}" for e in cc.schema_errors(report["gates"], gates_schema())
     )
-    # NEW: split metrics
-    if split is not None:
+    if errors:
+        raise cc.CalibrationError("the generated report is not schema-valid", errors)
+
+
+def build_report(
+    corpus: Corpus,
+    measurements: Sequence[CaseMeasurement],
+    groups: Mapping[str, Any],
+    gates: Mapping[str, Mapping[str, Any]],
+    gate_results: Sequence[Mapping[str, Any]],
+    *,
+    partial: bool,
+    private: Mapping[str, Any] | None = None,
+    warnings: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Assemble the report the gates were evaluated on -- one aggregation, not two."""
+    report: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "metric_definition_version": METRIC_DEFINITION_VERSION,
+        "kind": "segmentation-report",
+        "corpus": {
+            "path": str(corpus.path),
+            "case_count": len(corpus.cases),
+            "total_bytes": corpus.total_bytes,
+            "required_counts": corpus.required_counts,
+        },
+        "corpus_digest": corpus.digest,
+        "generated_from_commit": repo_commit(),
+        "environment": environment_block(),
+        "partial": partial,
+        "groups": dict(groups),
+        "gates": {metric: dict(gates[metric]) for metric in METRICS},
+        "gate_results": [dict(r) for r in gate_results],
+        "cases": [
+            {
+                "id": m.case_id,
+                "language": m.language,
+                "cue_count": m.cue_count,
+                "wall_time_s": round(m.wall_time_s, 4),
+                "metrics": {
+                    **{name: ratio.to_dict() for name, ratio in m.ratios.items()},
+                    "cps_p90": {
+                        "n": len(m.cps_samples),
+                        "value": cc.percentile(m.cps_samples, 90.0),
+                    },
+                },
+                "diagnostics": m.diagnostics,
+            }
+            for m in measurements
+        ],
+        "offenders": collect_offenders(measurements),
+        "warnings": list(warnings),
+    }
+    slowest = max(measurements, key=lambda m: m.wall_time_s, default=None)
+    report["timing"] = {
+        "total_wall_s": round(sum(m.wall_time_s for m in measurements), 4),
+        "slowest_case": slowest.case_id if slowest else None,
+        "slowest_wall_s": round(slowest.wall_time_s, 4) if slowest else None,
+        "case_wall_target_s": CASE_WALL_TARGET_S,
+        "cases_over_target": [
+            m.case_id for m in measurements if m.wall_time_s > CASE_WALL_TARGET_S
+        ],
+    }
+    if private is not None:
+        report["private"] = dict(private)
+    validate_report(report)
+    return report
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation driver
+# --------------------------------------------------------------------------- #
+
+
+def run_cases(cases: Sequence[Case]) -> list[CaseMeasurement]:
+    measurements: list[CaseMeasurement] = []
+    for case in cases:
+        started = time.perf_counter()
+        result = replay(case)
+        measurement = measure_case(case, result)
+        measurement.wall_time_s = time.perf_counter() - started
+        measurements.append(measurement)
+    return measurements
+
+
+def private_corpus_path() -> Path | None:
+    """``VOXWEAVE_CALIB_ROOT``'s segmentation registry, when one is configured.
+
+    A private corpus is reported in its own block and never touches a gate: it
+    must not change the denominator of a public PR gate (design 4.4).
+    """
+    root = os.environ.get("VOXWEAVE_CALIB_ROOT", "").strip()
+    if not root:
+        return None
+    candidate = Path(root) / "segmentation" / "corpus.json"
+    return candidate if candidate.is_file() else None
+
+
+def evaluate_private() -> dict[str, Any] | None:
+    path = private_corpus_path()
+    if path is None:
+        return None
+    corpus = load_corpus(path, strict_size=False)
+    measurements = run_cases(corpus.cases)
+    return {
+        "path": str(path),
+        "corpus_digest": corpus.digest,
+        "case_count": len(corpus.cases),
+        "groups": aggregate(measurements),
+        "gated": False,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Output helpers
+# --------------------------------------------------------------------------- #
+
+
+def _fmt(value: float | None, digits: int = 4) -> str:
+    return "n/a" if value is None else f"{value:.{digits}f}"
+
+
+def _ratio_cell(ratio: Mapping[str, Any]) -> str:
+    """``rate (bad/eligible)`` -- a percentage never appears without its counts."""
+    return f"{_fmt(ratio['value'])} ({ratio['bad']}/{ratio['eligible']})"
+
+
+def print_summary(report: Mapping[str, Any]) -> None:
+    groups = report["groups"]
+    print(f"corpus   : {report['corpus']['path']}")
+    print(f"digest   : {report['corpus_digest'][:16]}...")
+    print(f"cases    : {report['corpus']['case_count']}")
+    print()
+    print(
+        f"  {'group':<6} {'cases':>5} {'cues':>6}  {'mid-phrase':<20}"
+        f"  {'over-max-cue':<14} {'cps_p90':>8}  {'bad-end':<20}"
+    )
+    print("  " + "-" * 84)
+    for name in (GROUP_ALL, *cc.CALIBRATION_LANGUAGES):
+        block = groups.get(name)
+        if block is None or not block["case_count"]:
+            continue
+        over = block["over_7s_rate"]
+        over_cell = "{}/{}".format(over["bad"], over["eligible"])
         print(
-            f"  {'  len-break mid-phrase %':<28} {'':>10}"
-            f" {fmt_pct(split['len_mid_pct']):>10} {'':>12}"
-            f"  <- quality gate"
+            f"  {name:<6} {block['case_count']:>5} {block['cue_count']:>6}"
+            f"  {_ratio_cell(block['len_break_mid_phrase_rate']):<20}"
+            f"  {over_cell:<14}"
+            f" {_fmt(block['cps_p90']['value'], 2):>8}"
+            f"  {_ratio_cell(block['forbidden_end_rate']):<20}"
         )
+    results = report["gate_results"]
+    if results:
+        print()
+        print("  gates")
+        for result in results:
+            marker = {
+                "pass": "ok  ",
+                "fail": "FAIL",
+                "insufficient_samples": "n<min",
+                "disabled": "off ",
+            }.get(str(result["status"]), "?   ")
+            reasons = "; ".join(result["reasons"])
+            print(
+                f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
+                f" {result['mode']:<8} value={_fmt(result['value'])}"
+                + (f"  {reasons}" if reasons else "")
+            )
+    for warning in report.get("warnings") or ():
+        print(f"  warning: {warning}")
+
+
+def machine_summary(
+    status: str, cases: int, failures: int, warnings: int, report_path: str
+) -> str:
+    return (
+        f"QUALITY segmentation status={status} cases={cases} failures={failures} "
+        f"warnings={warnings} report={report_path}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Subcommands
+# --------------------------------------------------------------------------- #
+
+
+def cmd_validate_corpus(args: argparse.Namespace) -> int:
+    corpus = load_corpus(args.corpus)
+    print(f"corpus   : {corpus.path}")
+    print(f"cases    : {len(corpus.cases)} ({corpus.total_bytes} bytes tracked)")
+    print(f"digest   : {corpus.digest}")
+    for case in corpus.cases:
         print(
-            f"  {'  gap-break mid-phrase %':<28} {'':>10}"
-            f" {fmt_pct(split['gap_mid_pct']):>10} {'':>12}"
-            f"  <- informational"
+            f"  {case.id:<8} {case.language:<3} {len(case.units):>5} units  "
+            f"{case.size_bytes:>7}B  {', '.join(case.tags)}"
         )
-        print(
-            f"  {'  len-break share %':<28} {'':>10}"
-            f" {fmt_pct(split['len_share_pct']):>10} {'':>12}"
+    print(machine_summary("pass", len(corpus.cases), 0, 0, "-"))
+    return cc.EXIT_OK
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    corpus = load_corpus(args.corpus)
+    cases = list(corpus.cases)
+    partial = False
+    if args.case:
+        wanted = set(args.case)
+        cases = [c for c in cases if c.id in wanted]
+        unknown = wanted - {c.id for c in cases}
+        if unknown:
+            raise cc.CalibrationError(
+                f"no such case in {corpus.path}: {', '.join(sorted(unknown))}"
+            )
+        partial = True
+
+    warnings: list[str] = []
+    baseline: dict[str, Any] | None = None
+    gates: dict[str, Mapping[str, Any]] = dict(DEFAULT_GATES)
+    if args.baseline:
+        baseline = load_baseline(args.baseline, corpus)
+        gates = dict(baseline["gates"])
+        drift = environment_drift(baseline)
+        if drift:
+            if args.allow_environment_drift:
+                warnings.extend(f"environment drift ignored: {d}" for d in drift)
+            else:
+                raise cc.CalibrationError(
+                    f"{args.baseline} was recorded in a different environment",
+                    [
+                        *drift,
+                        "segmenter versions move where breaks land",
+                        "re-record deliberately, or pass --allow-environment-drift",
+                    ],
+                )
+
+    measurements = run_cases(cases)
+    for measurement in measurements:
+        warnings.extend(
+            f"{measurement.case_id}: {d}"
+            for d in measurement.diagnostics["dependency_drift"]
         )
-        print(
-            f"  {'  (n_len/n_gap/n_len_mid)':<28} {'':>10}"
-            f" {split['n_len']}/{split['n_gap']}/{split['n_len_mid']:>3}{'':>6} {'':>12}"
-        )
+        if measurement.diagnostics["unmapped_boundaries"]:
+            warnings.append(
+                f"{measurement.case_id}: "
+                f"{measurement.diagnostics['unmapped_boundaries']} cue boundaries "
+                "could not be mapped back to source units"
+            )
+
+    groups = aggregate(measurements)
+    if partial:
+        gate_results: list[dict[str, Any]] = []
+        warnings.append("partial run (--case): gates skipped, not a baseline candidate")
     else:
-        print(f"  {'  mid-phrase split':<28} {'':>10} {'   N/A':>10} {'':>12}")
+        gate_results = evaluate_gates(groups, gates, baseline)
+
+    report = build_report(
+        corpus,
+        measurements,
+        groups,
+        gates,
+        gate_results,
+        partial=partial,
+        private=evaluate_private() if args.private else None,
+        warnings=warnings,
+    )
+
+    destination = "-"
+    if args.json_out:
+        destination = str(cc.write_json(args.json_out, report))
+
+    print_summary(report)
+
+    failures = sum(
+        1 for r in gate_results if r["mode"] == "blocking" and r["status"] != "pass"
+    )
+    warned = sum(
+        1 for r in gate_results if r["mode"] == "warning" and r["status"] != "pass"
+    )
+    code = gate_exit_code(gate_results) if args.check else cc.EXIT_OK
+    if code == cc.EXIT_INVALID:
+        print(
+            machine_summary("invalid", len(measurements), failures, warned, destination)
+        )
+        raise cc.CalibrationError(
+            "a blocking gate has fewer samples than it requires",
+            [
+                f"{r['group']}/{r['metric']}: {r['reasons'][0] if r['reasons'] else ''}"
+                for r in gate_results
+                if r["mode"] == "blocking" and r["status"] == "insufficient_samples"
+            ],
+        )
+    status = "fail" if code == cc.EXIT_GATE_FAILED else "pass"
+    print(machine_summary(status, len(measurements), failures, warned, destination))
+    return code
+
+
+def cmd_record_baseline(args: argparse.Namespace) -> int:
+    """Promote a report to the tracked baseline. Never run by CI, by design.
+
+    Refuses a partial report, a stale digest or a metric-definition mismatch, so
+    a regression cannot be laundered into a new baseline by rerunning the
+    harness until the numbers look acceptable.
+    """
+    corpus = load_corpus(args.corpus)
+    report = cc.read_json(args.report)
+    problems: list[str] = []
+    if report.get("kind") != "segmentation-report":
+        problems.append(f"{args.report} is not a segmentation report")
+    if report.get("partial"):
+        problems.append("report is partial (--case); record from a full run")
+    if report.get("metric_definition_version") != METRIC_DEFINITION_VERSION:
+        problems.append(
+            f"report metric_definition_version {report.get('metric_definition_version')}"
+            f" != {METRIC_DEFINITION_VERSION}"
+        )
+    if report.get("corpus_digest") != corpus.digest:
+        problems.append(
+            f"report corpus_digest {str(report.get('corpus_digest'))[:12]}... != "
+            f"current corpus {corpus.digest[:12]}... (re-run evaluate first)"
+        )
+    if not report.get("generated_from_commit"):
+        problems.append(
+            "report has no generated_from_commit (run inside a git checkout)"
+        )
+    if problems:
+        raise cc.CalibrationError(f"refusing to record {args.output}", problems)
+
+    baseline = baseline_from_report(report)
+    cc.validate_or_exit2(baseline, BASELINE_SCHEMA, label=str(args.output))
+    path = cc.write_json(args.output, baseline)
+    print(f"recorded {path}")
+    print(f"  corpus_digest : {baseline['corpus_digest']}")
+    print(f"  commit        : {baseline['generated_from_commit']}")
+    for metric in METRICS:
+        gate = baseline["gates"][metric]
+        print(f"  gate {metric:<26} mode={gate['mode']}")
+    print(machine_summary("pass", len(corpus.cases), 0, 0, str(path)))
+    return cc.EXIT_OK
 
 
 _MEDIA_EXTS = {".mkv", ".mp4", ".webm", ".mov", ".m4v", ".avi", ".ts"}
 
 
 def _sibling_json(media: Path) -> Path:
-    """Sibling .json path, replacing only the trailing extension (never
-    Path.with_suffix on interior-dot names — same contract as pipeline.swap_ext)."""
+    """Sibling ``.json``, replacing only the trailing extension.
+
+    Never ``Path.with_suffix``: a name with an interior dot would be truncated at
+    the first one (same contract as ``pipeline.swap_ext``).
+    """
     return media.with_name(media.name[: -len(media.suffix)] + ".json")
 
 
-def main(video_dir: str) -> None:
-    d = Path(video_dir)
-    mkv_files = sorted(
-        p for p in d.iterdir() if p.is_file() and p.suffix.lower() in _MEDIA_EXTS
-    )
+def _case_from_sibling(media: Path, document: Mapping[str, Any]) -> Case:
+    """Wrap a private sibling JSON as an in-memory case (never written to disk).
 
-    if not mkv_files:
-        print(f"No media files found in {video_dir}", file=sys.stderr)
-        sys.exit(1)
+    Legacy convenience only: it lets the same four metrics run over private media
+    that can never be tracked in git. The document is not schema-validated as a
+    golden case, because it is not one.
+    """
+    from voxweave.config import gap_thresholds
+    from voxweave.core.layout import default_max_line_length, default_max_lines
 
-    print("\nCalibration harness: gap-aware segmentation")
-    print(f"Directory : {video_dir}")
-    print(f"Episodes  : {len(mkv_files)} media files found")
-    print(
-        "Note: speech_spans comes from the JSON's vad_speech when present;"
-        " older JSONs degrade to the offline_ms path."
-    )
-
-    agg: dict[str, list] = {
-        "old_n": [],
-        "new_n": [],
-        "en_n": [],
-        "old_over7": [],
-        "new_over7": [],
-        "en_over7": [],
-        "old_under05": [],
-        "new_under05": [],
-        "en_under05": [],
-        "old_dur_med": [],
-        "new_dur_med": [],
-        "en_dur_med": [],
-        "old_cps_med": [],
-        "new_cps_med": [],
-        "en_cps_med": [],
-        "old_bad_end": [],
-        "new_bad_end": [],
-        "en_bad_end": [],
-        "old_under_min": [],
-        "new_under_min": [],
-        "en_under_min": [],
-        "old_mpc": [],
-        # NEW split metrics
-        "new_len_mid_pct": [],
-        "new_gap_mid_pct": [],
-        "new_len_share_pct": [],
+    iso = cc.require_calibration_language(document.get("language"))
+    th = gap_thresholds(iso)
+    config = {
+        "language": iso,
+        "max_line_length": default_max_line_length(iso),
+        "max_lines": default_max_lines(iso),
+        "max_cue_s": float(th["max_cue_s"]),
+        "min_cue_s": float(th["min_cue_s"]),
+        "cps": float(th["cps"]),
+        "lag_out_s": float(th["lag_out_s"]),
+        "glue_gap_s": float(th["glue_gap_s"]),
+        "gap_thresholds": {
+            "clause_ms": int(th["clause_ms"]),
+            "vad_skip_ms": int(th["vad_skip_ms"]),
+            "offline_ms": int(th["offline_ms"]),
+        },
+        "gap_adaptive": os.environ.get("VOXWEAVE_GAP_ADAPTIVE", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "shot_snap_s": float(th["shot_snap_s"]),
     }
+    units = [
+        {
+            "id": str(i),
+            "text": str(u.get("text") or ""),
+            "start": float(u["start"]),
+            "end": float(u["end"]),
+        }
+        for i, u in enumerate(document.get("word_segments") or ())
+        if u.get("start") is not None and u.get("end") is not None
+    ]
+    if not units:
+        raise cc.CalibrationError(f"{media}: sibling JSON has no usable word_segments")
+    doc = {
+        "schema_version": SCHEMA_VERSION,
+        "id": f"{iso}-00",
+        "language": iso,
+        "tags": ["private"],
+        "capture": {
+            "window_duration_s": max(u["end"] for u in units) + 0.5,
+            "dependency_versions": {},
+            "config": config,
+        },
+        "word_segments": units,
+        "vad_speech": [list(s) for s in document.get("vad_speech") or ()],
+        "shot_changes": list(document.get("shot_changes") or ()),
+        "sing_spans": [list(s) for s in document.get("sing_spans") or ()],
+        "speaker_turns": [
+            {"start": float(a), "end": float(b), "speaker": str(label)}
+            for a, b, label in document.get("speaker_turns") or ()
+        ],
+    }
+    return Case(media, media.name, doc, 0)
 
-    errors: list[str] = []
 
-    for mkv in mkv_files:
-        json_path = _sibling_json(mkv)
-        if not json_path.exists():
+def cmd_compare_video_dir(args: argparse.Namespace) -> int:
+    """Legacy: run the corpus metrics over a directory of private media siblings.
+
+    This is the knob-validation path referenced from ``gap_split.adaptive_clause_ms``
+    and ``pipeline._maybe_adaptive_thresholds``: run it twice, once with
+    ``VOXWEAVE_GAP_ADAPTIVE=1``, and compare the four numbers. It reads sibling
+    JSON only -- no subtitle track is extracted and no ASS is parsed here; a
+    commercial release track is the *alignment* ruler's ground truth, not this
+    one's (design 3.1).
+    """
+    directory = Path(args.directory)
+    if not directory.is_dir():
+        raise cc.CalibrationError(f"not a directory: {directory}")
+    media_files = sorted(
+        p
+        for p in directory.iterdir()
+        if p.is_file() and p.suffix.lower() in _MEDIA_EXTS
+    )
+    measurements: list[CaseMeasurement] = []
+    skipped: list[str] = []
+    for media in media_files:
+        sibling = _sibling_json(media)
+        if not sibling.is_file():
             continue
-
-        ep_name = mkv.stem
         try:
-            r = run_episode(mkv, json_path)
-        except Exception as exc:
-            errors.append(f"{ep_name}: {exc!r}")
-            print(f"\n  ERROR processing {ep_name}: {exc!r}", file=sys.stderr)
+            document = cc.read_json(sibling)
+            case = _case_from_sibling(media, document)
+            started = time.perf_counter()
+            measurement = measure_case(case, replay(case))
+            measurement.wall_time_s = time.perf_counter() - started
+            measurement.case_id = media.stem
+        except cc.CalibrationError as exc:
+            skipped.append(f"{media.name}: {exc.message}")
             continue
-
-        if "error" in r:
-            errors.append(f"{ep_name}: {r['error']}")
-            continue
-
-        print_episode_table(ep_name, r)
-
-        agg["old_n"].append(r["old"]["n"])
-        agg["new_n"].append(r["new"]["n"])
-        if r["en"]:
-            agg["en_n"].append(r["en"]["n"])
-        agg["old_over7"].append(r["old"]["over7s"])
-        agg["new_over7"].append(r["new"]["over7s"])
-        if r["en"]:
-            agg["en_over7"].append(r["en"]["over7s"])
-        agg["old_under05"].append(r["old"]["under05s"])
-        agg["new_under05"].append(r["new"]["under05s"])
-        if r["en"]:
-            agg["en_under05"].append(r["en"]["under05s"])
-        agg["old_dur_med"].append(r["old"]["dur_med"])
-        agg["new_dur_med"].append(r["new"]["dur_med"])
-        if r["en"]:
-            agg["en_dur_med"].append(r["en"]["dur_med"])
-        agg["old_cps_med"].append(r["old"]["cps_med"])
-        agg["new_cps_med"].append(r["new"]["cps_med"])
-        if r["en"]:
-            agg["en_cps_med"].append(r["en"]["cps_med"])
-        if r["old"].get("bad_end") is not None:
-            agg["old_bad_end"].append(r["old"]["bad_end"])
-        if r["new"].get("bad_end") is not None:
-            agg["new_bad_end"].append(r["new"]["bad_end"])
-        if r["en"] and r["en"].get("bad_end") is not None:
-            agg["en_bad_end"].append(r["en"]["bad_end"])
-        agg["old_under_min"].append(r["old"]["under_min"])
-        agg["new_under_min"].append(r["new"]["under_min"])
-        if r["en"]:
-            agg["en_under_min"].append(r["en"]["under_min"])
-        if r.get("old_mpc") is not None:
-            agg["old_mpc"].append(r["old_mpc"])
-        split = r.get("new_mpc_split")
-        if split is not None:
-            agg["new_len_mid_pct"].append(split["len_mid_pct"])
-            agg["new_gap_mid_pct"].append(split["gap_mid_pct"])
-            agg["new_len_share_pct"].append(split["len_share_pct"])
-
-    # -----------------------------------------------------------------------
-    # Aggregate summary
-    # -----------------------------------------------------------------------
-    print(f"\n{'=' * 70}")
-    print("  AGGREGATE SUMMARY")
-    print(f"{'=' * 70}")
-
-    eps = len(agg["old_n"])
-    print(f"  Episodes processed : {eps}")
-    print(f"  EN stream available: {len(agg['en_n'])} / {eps} episodes")
-
-    def agg_sum(k: list[int]) -> int:
-        return sum(k)
-
-    def agg_mean(k: list[float]) -> float:
-        return sum(k) / len(k) if k else 0.0
-
-    print(f"\n  {'Metric':<34} {'OLD':>10} {'NEW':>10} {'EN (cmcl)':>12}")
-    print(f"  {'─' * 34} {'─' * 10} {'─' * 10} {'─' * 12}")
-
-    total_old_n = agg_sum(agg["old_n"])
-    total_new_n = agg_sum(agg["new_n"])
-    total_en_n = agg_sum(agg["en_n"]) if agg["en_n"] else None
-    print(
-        f"  {'total cues':<34} {total_old_n:>10} {total_new_n:>10}"
-        f" {str(total_en_n) if total_en_n else 'N/A':>12}"
-    )
-
-    total_old_o7 = agg_sum(agg["old_over7"])
-    total_new_o7 = agg_sum(agg["new_over7"])
-    total_en_o7 = agg_sum(agg["en_over7"]) if agg["en_over7"] else None
-    print(
-        f"  {'total >7s cues':<34} {total_old_o7:>10} {total_new_o7:>10}"
-        f" {str(total_en_o7) if total_en_o7 is not None else 'N/A':>12}"
-    )
-
-    total_old_u05 = agg_sum(agg["old_under05"])
-    total_new_u05 = agg_sum(agg["new_under05"])
-    total_en_u05 = agg_sum(agg["en_under05"]) if agg["en_under05"] else None
-    print(
-        f"  {'total <0.5s cues':<34} {total_old_u05:>10} {total_new_u05:>10}"
-        f" {str(total_en_u05) if total_en_u05 is not None else 'N/A':>12}"
-    )
-
-    mean_old_dur = agg_mean(agg["old_dur_med"])
-    mean_new_dur = agg_mean(agg["new_dur_med"])
-    mean_en_dur = agg_mean(agg["en_dur_med"]) if agg["en_dur_med"] else None
-    print(
-        f"  {'mean(dur median) (s)':<34} {mean_old_dur:>10.2f} {mean_new_dur:>10.2f}"
-        f" {f'{mean_en_dur:.2f}' if mean_en_dur is not None else 'N/A':>12}"
-    )
-
-    mean_old_cps = agg_mean(agg["old_cps_med"])
-    mean_new_cps = agg_mean(agg["new_cps_med"])
-    mean_en_cps = agg_mean(agg["en_cps_med"]) if agg["en_cps_med"] else None
-    print(
-        f"  {'mean(CPS median)':<34} {mean_old_cps:>10.2f} {mean_new_cps:>10.2f}"
-        f" {f'{mean_en_cps:.2f}' if mean_en_cps is not None else 'N/A':>12}"
-    )
-
-    total_old_um = agg_sum(agg["old_under_min"])
-    total_new_um = agg_sum(agg["new_under_min"])
-    total_en_um = agg_sum(agg["en_under_min"]) if agg["en_under_min"] else None
-    print(
-        f"  {'total <5/6s cues':<34} {total_old_um:>10} {total_new_um:>10}"
-        f" {str(total_en_um) if total_en_um is not None else 'N/A':>12}"
-    )
-
-    mean_old_be = agg_mean(agg["old_bad_end"]) * 100 if agg["old_bad_end"] else None
-    mean_new_be = agg_mean(agg["new_bad_end"]) * 100 if agg["new_bad_end"] else None
-    mean_en_be = agg_mean(agg["en_bad_end"]) * 100 if agg["en_bad_end"] else None
-    print(
-        f"  {'mean bad line-end %':<34}"
-        f" {f'{mean_old_be:.1f}%' if mean_old_be is not None else 'N/A':>10}"
-        f" {f'{mean_new_be:.1f}%' if mean_new_be is not None else 'N/A':>10}"
-        f" {f'{mean_en_be:.1f}%' if mean_en_be is not None else 'N/A':>12}"
-    )
-
-    print(f"  {'─' * 34} {'─' * 10} {'─' * 10} {'─' * 12}")
-    # OLD: combined mid-phrase %
-    mean_old_mpc = agg_mean(agg["old_mpc"]) * 100 if agg["old_mpc"] else None
-    print(
-        f"  {'mean mid-phrase-cut % (OLD)':<34}"
-        f" {f'{mean_old_mpc:.1f}%' if mean_old_mpc is not None else 'N/A':>10}"
-        f" {'':>10}"
-        f" {'N/A':>12}"
-    )
-    # NEW: split metrics
-    mean_new_len_mid = (
-        agg_mean(agg["new_len_mid_pct"]) if agg["new_len_mid_pct"] else None
-    )
-    mean_new_gap_mid = (
-        agg_mean(agg["new_gap_mid_pct"]) if agg["new_gap_mid_pct"] else None
-    )
-    mean_new_len_share = (
-        agg_mean(agg["new_len_share_pct"]) if agg["new_len_share_pct"] else None
-    )
-    print(
-        f"  {'  NEW len-break mid-phrase %':<34}"
-        f" {'':>10}"
-        f" {f'{mean_new_len_mid:.1f}%' if mean_new_len_mid is not None else 'N/A':>10}"
-        f" {'':>12}"
-        f"  <- quality gate"
-    )
-    print(
-        f"  {'  NEW gap-break mid-phrase %':<34}"
-        f" {'':>10}"
-        f" {f'{mean_new_gap_mid:.1f}%' if mean_new_gap_mid is not None else 'N/A':>10}"
-        f" {'':>12}"
-        f"  <- informational"
-    )
-    print(
-        f"  {'  NEW len-break share %':<34}"
-        f" {'':>10}"
-        f" {f'{mean_new_len_share:.1f}%' if mean_new_len_share is not None else 'N/A':>10}"
-        f" {'':>12}"
-    )
-
-    # -----------------------------------------------------------------------
-    # Acceptance gates
-    # -----------------------------------------------------------------------
-    print(f"\n{'─' * 70}")
-    print("  ACCEPTANCE GATES")
-    print(f"{'─' * 70}")
-
-    gate_over7 = total_new_o7 == 0
-    print(
-        f"  NEW total >7s cues = {total_new_o7}  "
-        f"[gate: 0]  {'PASS' if gate_over7 else 'FAIL'}"
-    )
-
-    gate_mpc = (mean_new_len_mid is not None) and (mean_new_len_mid < 10.0)
-    mpc_str = f"{mean_new_len_mid:.1f}%" if mean_new_len_mid is not None else "N/A"
-    print(
-        f"  NEW mean len-break mid-phrase = {mpc_str}  "
-        f"[gate: <10%]  {'PASS' if gate_mpc else 'FAIL'}"
-    )
-
-    if errors:
-        print(f"\n  Episodes with errors ({len(errors)}):")
-        for e in errors:
-            print(f"    {e}")
-
-    overall = "PASS" if (gate_over7 and gate_mpc) else "FAIL"
-    print(f"\n  OVERALL: {overall}")
+        measurements.append(measurement)
+        ratios = measurement.ratios
+        cps = cc.percentile(measurement.cps_samples, 90.0)
+        print(
+            f"  {media.stem[:34]:<34} cues={measurement.cue_count:>4} "
+            f"mid={_fmt(ratios['len_break_mid_phrase_rate'].value)} "
+            f"over={ratios['over_7s_rate'].bad}/{ratios['over_7s_rate'].eligible} "
+            f"cps_p90={_fmt(cps, 2)} "
+            f"end={_fmt(ratios['forbidden_end_rate'].value)}"
+        )
+    if not measurements:
+        raise cc.CalibrationError(
+            f"no media file in {directory} has a usable sibling JSON",
+            skipped or ["nothing matched the known media extensions"],
+        )
     print()
+    for name, block in aggregate(measurements).items():
+        if not block["case_count"]:
+            continue
+        mid = block["len_break_mid_phrase_rate"]
+        over = block["over_7s_rate"]
+        bad = block["forbidden_end_rate"]
+        print(
+            f"  {name:<5} cases={block['case_count']:>3} cues={block['cue_count']:>5} "
+            f"mid={_fmt(mid['value'])} ({mid['bad']}/{mid['eligible']}) "
+            f"over={over['bad']}/{over['eligible']} "
+            f"cps_p90={_fmt(block['cps_p90']['value'], 2)} "
+            f"end={_fmt(bad['value'])} ({bad['bad']}/{bad['eligible']})"
+        )
+    for line in skipped:
+        print(f"  skipped {line}")
+    print(machine_summary("pass", len(measurements), 0, 0, "-"))
+    return cc.EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="calib_segmentation.py",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    validate = sub.add_parser(
+        "validate-corpus", help="schema, coverage, size and digest checks only"
+    )
+    validate.add_argument("--corpus", default=str(DEFAULT_CORPUS))
+    validate.set_defaults(func=cmd_validate_corpus)
+
+    evaluate = sub.add_parser(
+        "evaluate", help="replay the corpus, measure, compare against the baseline"
+    )
+    evaluate.add_argument("--corpus", default=str(DEFAULT_CORPUS))
+    evaluate.add_argument(
+        "--baseline",
+        default=None,
+        help="tracked baseline to compare against; omitted = absolute gates only",
+    )
+    evaluate.add_argument("--json-out", default=None, help="where to write the report")
+    evaluate.add_argument(
+        "--case",
+        action="append",
+        default=None,
+        help="restrict to one case id (repeatable); produces a partial report",
+    )
+    evaluate.add_argument(
+        "--check",
+        action="store_true",
+        help="apply the gates: exit 1 when a blocking gate regresses",
+    )
+    evaluate.add_argument(
+        "--private",
+        action="store_true",
+        help="also evaluate $VOXWEAVE_CALIB_ROOT/segmentation (reported, never gated)",
+    )
+    evaluate.add_argument(
+        "--allow-environment-drift",
+        action="store_true",
+        help="downgrade a segmenter-version mismatch with the baseline to a warning",
+    )
+    evaluate.set_defaults(func=cmd_evaluate)
+
+    record = sub.add_parser(
+        "record-baseline", help="promote a report to the tracked baseline (never in CI)"
+    )
+    record.add_argument("--corpus", default=str(DEFAULT_CORPUS))
+    record.add_argument("--report", required=True)
+    record.add_argument("--output", default=str(DEFAULT_BASELINE))
+    record.set_defaults(func=cmd_record_baseline)
+
+    legacy = sub.add_parser(
+        "compare-video-dir",
+        help="legacy: same metrics over a directory of private media siblings",
+    )
+    legacy.add_argument("directory")
+    legacy.set_defaults(func=cmd_compare_video_dir)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    return int(args.func(args))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(
-            f"usage: {sys.argv[0]} <video_dir>  "
-            "(directory of .mkv episodes with sibling voxweave JSONs)",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    main(sys.argv[1])
+    cc.run_cli(main)

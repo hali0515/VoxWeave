@@ -36,3 +36,47 @@ jobs:
 
       - name: Test
         run: uv run pytest tests/ -q
+
+  # Separate, non-blocking job: the segmentation ruler measures output *quality*,
+  # not behaviour change, and it lands in warning mode first (design 4.6). During
+  # the soak the metric definitions and the corpus are still being corrected, so a
+  # red number here must not stop a PR -- flip `continue-on-error` off once the
+  # gates in calibration/segmentation/baseline.json are `blocking` and main meets
+  # its absolute targets. The report artifact is what makes the soak useful.
+  #
+  # Zero GPU, zero network, no media: the corpus is tracked JSON replayed through
+  # the production entry point. It skips cleanly until the corpus is captured.
+  segmentation-quality:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Sync environment
+        run: uv sync --extra cuda --dev
+
+      - name: Check for a captured corpus
+        id: corpus
+        run: |
+          if [ -f calibration/segmentation/corpus.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No calibration/segmentation/corpus.json yet - skipping the gate."
+          fi
+
+      - name: Segmentation quality gate
+        if: steps.corpus.outputs.present == 'true'
+        run: make quality-segmentation
+
+      - name: Upload quality report
+        if: always() && steps.corpus.outputs.present == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: segmentation-quality
+          path: build/calibration/segmentation-report.json
+          if-no-files-found: warn
