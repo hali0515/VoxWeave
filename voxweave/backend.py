@@ -19,6 +19,7 @@ from voxweave.align_mms import (
     release_mms,
     uses_mms as uses_mms,  # re-export (pipeline-facing)
 )
+from voxweave.core.langsets import LANGUAGES_WITHOUT_SPACES
 from voxweave.runtime import (
     _MISSING_WHISPER,
     _empty_cache,
@@ -794,23 +795,60 @@ def _asr_chunk_safe(
         return (None, "", "")
 
 
+def _wav_duration(wav: Path) -> float:
+    """Duration of a wav in seconds from its header; 0.0 if it cannot be read."""
+    import soundfile as sf
+
+    try:
+        info = sf.info(str(wav))
+        return float(info.frames) / float(info.samplerate)
+    except Exception as e:  # noqa: BLE001 -- header unreadable is not worth killing a chunk over
+        log.debug("could not read duration of %s (%s: %s)", wav, type(e).__name__, e)
+        return 0.0
+
+
+def _fallback_units(text: str, lang: str, duration: float) -> list[dict]:
+    """Units [{text,start,end}] tiling [0, duration] evenly, for text that could not be aligned.
+
+    Alignment refines timing; it is not the source of the transcript. When it fails, the ASR
+    words are still the best output available, so they degrade to a uniform tiling of the
+    chunk rather than disappearing. Tokenization matches what the real aligners emit:
+    whitespace-separated words for spaced languages, single characters otherwise.
+    """
+    from voxweave.lang import to_iso_or
+
+    if to_iso_or(lang, "") in LANGUAGES_WITHOUT_SPACES:
+        tokens = [ch for ch in text if not ch.isspace()]
+    else:
+        tokens = text.split()
+    if not tokens:
+        return []
+    step = duration / len(tokens)
+    units = [
+        {"text": t, "start": i * step, "end": (i + 1) * step}
+        for i, t in enumerate(tokens)
+    ]
+    units[-1]["end"] = duration  # exact end, free of accumulated float drift
+    return units
+
+
 def _align_chunk_safe(
     wav: Path, text: str, align_lang: str, idx: int, total: int
 ) -> list[dict]:
     """One chunk's per-chunk alignment with failure containment: the transcript
-    text survives, only its word timing is lost."""
+    text survives, only its word timing is lost (evenly spread over the chunk)."""
     try:
         return align_text(wav, text, align_lang)
     except Exception as e:  # noqa: BLE001 -- one bad chunk must not kill the run
         log.warning(
-            "alignment failed on chunk %d/%d (%s: %s); keeping text without word timing",
+            "alignment failed on chunk %d/%d (%s: %s); keeping text with evenly spread timing",
             idx + 1,
             total,
             type(e).__name__,
             e,
         )
         _empty_cache()
-        return []
+        return _fallback_units(text, align_lang, _wav_duration(wav))
 
 
 def _raise_if_all_failed(failures: list[Exception], total: int) -> None:

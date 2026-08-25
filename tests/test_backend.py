@@ -854,7 +854,8 @@ def test_transcribe_chunks_survives_single_asr_failure(monkeypatch, tmp_path):
 
 
 def test_transcribe_chunks_survives_single_align_failure(monkeypatch, tmp_path):
-    # per-chunk alignment failure keeps the transcript text, just without units
+    # per-chunk alignment failure keeps the transcript text and its words; only the
+    # word timing is lost (here the stub wav has no readable duration, so it is empty)
     def _align(w, text, alang):
         if w.name == "c1.wav":
             raise RuntimeError("boom")
@@ -870,7 +871,9 @@ def test_transcribe_chunks_survives_single_align_failure(monkeypatch, tmp_path):
     for w in wavs:
         w.write_bytes(b"x")
     out = backend.transcribe_chunks(wavs, None, asr_model="qwen3-asr-1.7b")
-    assert out[0][2] and out[1] == ("ja", "はい", [])
+    assert out[0][2]  # the healthy chunk is untouched by its neighbour's failure
+    assert out[1][:2] == ("ja", "はい")
+    assert "".join(u["text"] for u in out[1][2]) == "はい"  # no word is dropped
 
 
 def test_transcribe_chunks_raises_when_all_chunks_fail(monkeypatch, tmp_path):
