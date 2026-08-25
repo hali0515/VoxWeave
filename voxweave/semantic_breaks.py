@@ -78,6 +78,18 @@ DEFAULT_LOCAL_TIMEOUT = 900.0
 DEFAULT_LOCAL_WRITE_TIMEOUT = 10.0
 SEMANTIC_WORKER_PROTOCOL = 1
 
+# The bundled local worker is deprecated: it carries a second Torch/CUDA runtime
+# and an FP8 kernel constraint without a measured subtitle-quality gain.  Only
+# the local path warns; a user-managed endpoint and the deterministic default
+# splitter both stay supported.
+LOCAL_BACKEND_DEPRECATION_MESSAGE = (
+    "the bundled local FP8 semantic worker is deprecated and will be removed in a"
+    " future release; point VOXWEAVE_SEMANTIC_BASE_URL at an OpenAI-compatible"
+    " endpoint, or drop --semantic-split and keep the deterministic splitter"
+    " (both remain supported)"
+)
+_local_backend_deprecation_warned = False
+
 _DISABLED_MODEL_VALUES = frozenset({"", "0", "false", "none", "off", "disabled"})
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
@@ -1720,11 +1732,22 @@ class LocalTransformersSelector:
             log.debug("semantic worker cleanup failed: %s", exc)
 
 
+def _warn_local_backend_deprecated() -> None:
+    """Warn once per process that the bundled local worker is going away."""
+
+    global _local_backend_deprecation_warned
+    if _local_backend_deprecation_warned:
+        return
+    _local_backend_deprecation_warned = True
+    log.warning(LOCAL_BACKEND_DEPRECATION_MESSAGE)
+
+
 def _default_selector() -> BoundarySelector:
     """Use an explicit server endpoint; otherwise use the isolated local worker."""
 
     if os.environ.get("VOXWEAVE_SEMANTIC_BASE_URL", "").strip():
         return OpenAICompatibleSelector()
+    _warn_local_backend_deprecated()
     timeout_text = os.environ.get("VOXWEAVE_SEMANTIC_TIMEOUT", "").strip()
     if timeout_text:
         try:
@@ -2012,6 +2035,7 @@ __all__ = [
     "BoundaryTask",
     "DEFAULT_LOCAL_TIMEOUT",
     "DEFAULT_SEMANTIC_MODEL",
+    "LOCAL_BACKEND_DEPRECATION_MESSAGE",
     "LocalTransformersSelector",
     "OpenAICompatibleSelector",
     "SemanticBackendUnavailable",

@@ -288,6 +288,8 @@ def cli(verbose: bool) -> None:
         " timing/readability scores remain host-controlled."
         " Default: off, or conf [defaults].semantic_split; every failure falls back"
         " to the normal splitter."
+        " (local bundled model deprecated; prefer an endpoint via"
+        " VOXWEAVE_SEMANTIC_BASE_URL)"
     ),
 )
 @click.option(
@@ -388,6 +390,8 @@ cli.default_cmd = (
     help=(
         "Optionally reselect cue boundaries with Qwen; deterministic layout is the"
         " default and automatic fallback."
+        " (local bundled model deprecated; prefer an endpoint via"
+        " VOXWEAVE_SEMANTIC_BASE_URL)"
     ),
 )
 @click.option(

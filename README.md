@@ -303,6 +303,12 @@ the ordinary deterministic subtitles unchanged. An explicitly configured
 OpenAI-compatible endpoint owns its own precision and is therefore not covered by
 the local FP8 guarantee.
 
+**Deprecation:** the bundled local FP8 worker is deprecated and will be removed
+in a future release; it ships a second Torch/CUDA runtime without a measured
+subtitle-quality gain. Using it now logs a one-time warning. `--semantic-split`
+against a user-managed OpenAI-compatible endpoint (`VOXWEAVE_SEMANTIC_BASE_URL`)
+and the deterministic default splitter are unaffected and stay supported.
+
 ### ASR correction
 
 `voxweave correct <vtt>` — optional **pre-align** LLM pass that fixes obvious ASR typos, split
