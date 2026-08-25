@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -7,6 +8,7 @@ import os
 import subprocess
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -1049,6 +1051,175 @@ def _units_to_seg(units: list[dict], iso: str) -> dict:
     }
 
 
+@dataclass(frozen=True)
+class SegmentationResult:
+    """Output of :func:`segment_document`: the cue stream plus what produced it.
+
+    ``units`` is the (copied) unit stream after punctuation snapping -- the same
+    stream the callers persist as ``word_segments``, so a replay writes back what
+    it actually split. ``thresholds_used`` is the effective gap/duration mapping
+    after the optional adaptive pass, and ``diagnostics`` records which optional
+    passes ran (all values deterministic, so two identical inputs compare equal).
+    """
+
+    cues: list[Cue]
+    language: str
+    units: list[dict]
+    thresholds_used: dict
+    diagnostics: dict[str, Any]
+
+
+def _copied_spans(
+    spans: Sequence[tuple[float, float]] | None,
+) -> list[tuple[float, float]] | None:
+    """Copy a span sequence to plain float tuples; empty/absent -> ``None``.
+
+    Mirrors :func:`_spans_in`: "no spans recorded" and "empty array" are the same
+    thing for every consumer of persisted spans.
+    """
+    return [(float(s), float(e)) for s, e in spans] if spans else None
+
+
+def _copied_turns(
+    turns: Sequence[tuple[float, float, str]] | None,
+) -> list[tuple[float, float, str]] | None:
+    """Copy speaker turns to plain tuples; empty/absent -> ``None`` (see :func:`_turns_in`)."""
+    return (
+        [(float(s), float(e), str(label)) for s, e, label in turns] if turns else None
+    )
+
+
+def segment_document(
+    *,
+    language: str,
+    word_segments: Sequence[Mapping[str, Any]],
+    vad_speech: Sequence[tuple[float, float]] | None = (),
+    shot_changes: Sequence[float] | None = (),
+    sing_spans: Sequence[tuple[float, float]] | None = (),
+    speaker_turns: Sequence[tuple[float, float, str]] | None = (),
+    thresholds: Mapping[str, Any] | None = None,
+    semantic_engine: Any | None = None,
+    semantic_model: str | None = None,
+    smart_split_kwargs: Mapping[str, Any] | None = None,
+) -> SegmentationResult:
+    """Turn aligned word segments into the final cue stream. Pure and deterministic.
+
+    This is the single segmentation orchestration shared by :func:`process` (the
+    post-ASR half), :func:`split` (sibling-JSON replay) and offline calibration
+    replay -- nobody re-implements the adapter logic around ``smart_split``.
+    The pass order is exactly what production runs:
+
+    1. snap sentence-break punctuation onto word boundaries (zh only),
+    2. flatten the units into one segment,
+    3. resolve the effective thresholds (optional adaptive gap scaling),
+    4. ``smart_split_segments`` (content breaks + timing cleanup + shot snap),
+    5. lyric marking from ``sing_spans``,
+    6. speaker formatting from ``speaker_turns`` (which re-runs timing cleanup),
+    7. re-snap to ``shot_changes`` because step 6 moved boundaries again.
+
+    No filesystem writes, no model loads, no ASR: an already-constructed
+    ``semantic_engine`` may be passed in (its owner creates and releases it), but
+    nothing here downloads or instantiates one. Every input sequence is copied
+    before use, so callers can reuse their own lists afterwards.
+
+    ``vad_speech`` distinguishes absent (``None``/empty -> single-gap-threshold
+    degradation in ``gap_split``) from real spans; ``shot_changes``,
+    ``sing_spans`` and ``speaker_turns`` treat absent and empty alike.
+    ``thresholds`` defaults to ``config.gap_thresholds(language)``.
+    ``smart_split_kwargs`` forwards layout overrides (``max_line_length``,
+    ``max_lines``, ...) to ``smart_split_segments``; ``max_line_length`` also
+    reaches the speaker formatter so both measure the same budget.
+    """
+    from voxweave.config import gap_thresholds
+    from voxweave.core.smart_split import smart_split_segments
+
+    iso = language
+    units: list[dict] = [copy.deepcopy(dict(u)) for u in word_segments]
+    speech_spans = _copied_spans(vad_speech)
+    cuts = [float(t) for t in shot_changes] if shot_changes else None
+    sings = _copied_spans(sing_spans)
+    turns = _copied_turns(speaker_turns)
+    extra: dict[str, Any] = dict(smart_split_kwargs or {})
+
+    # zh: Qwen punctuation can drift up to one character; snap to jieba word boundary
+    # to prevent smart_split from splitting mid-word (e.g. 数据|中心 instead of 数据中心).
+    snapped = realign.snap_break_punct(units, iso)
+    seg = _units_to_seg(snapped, iso)
+    base = dict(thresholds) if thresholds is not None else gap_thresholds(iso)
+    effective = _maybe_adaptive_thresholds(base, snapped)
+    cues = smart_split_segments(
+        [seg],
+        lang=iso,
+        speech_spans=speech_spans,
+        thresholds=effective,
+        shot_changes=cuts,
+        semantic_engine=semantic_engine,
+        semantic_model=semantic_model,
+        **extra,
+    )
+    mark_lyric_cues(cues, sings)
+    split_cue_count = len(cues)
+    if turns:
+        from voxweave.diarize import apply_speaker_format
+
+        # Same thresholds AND line budget as smart_split so speaker splits get the
+        # same timing polish and wrap width the deterministic layout just used.
+        cues = apply_speaker_format(
+            cues,
+            turns,
+            iso,
+            thresholds=effective,
+            max_line_length=extra.get("max_line_length"),
+        )
+        # ... and its cleanup can push a boundary back across a cut, so snap again.
+        cues = _resnap_shots(cues, cuts, effective)
+    diagnostics: dict[str, Any] = {
+        "unit_count": len(snapped),
+        "punct_snapped": snapped is not units,
+        "adaptive_thresholds": effective is not base,
+        "speech_span_count": len(speech_spans or ()),
+        "shot_change_count": len(cuts or ()),
+        "sing_span_count": len(sings or ()),
+        "speaker_turn_count": len(turns or ()),
+        "semantic_engine": semantic_engine is not None,
+        "split_cue_count": split_cue_count,
+        "lyric_cue_count": sum(1 for c in cues if c.get("lyric")),
+        "speaker_formatted": bool(turns),
+        "shot_resnapped": bool(turns and cuts),
+        "cue_count": len(cues),
+    }
+    return SegmentationResult(
+        cues=cues,
+        language=iso,
+        units=snapped,
+        thresholds_used=effective,
+        diagnostics=diagnostics,
+    )
+
+
+def _make_semantic_engine(enabled: bool, rep: Reporter | None = None) -> Any | None:
+    """Build the optional semantic break engine, or ``None`` when it is off/unavailable.
+
+    Loading it is the one non-pure step around :func:`segment_document`, so the
+    caller owns creation and release (``_release_semantic_engine``); the
+    deterministic layout stays the source of truth either way.
+    """
+    if not enabled:
+        return None
+    try:
+        from voxweave.semantic_breaks import SemanticBreakEngine
+
+        engine = SemanticBreakEngine()
+        if rep is not None:
+            rep.stage("semantic subtitle boundaries")
+        return engine
+    except Exception as exc:  # noqa: BLE001 - optional stage must degrade safely
+        log.warning(
+            "semantic splitter unavailable; using deterministic layout (%s)", exc
+        )
+        return None
+
+
 def _reconcile_word_segment_language(
     language: str | None,
     units: list[dict],
@@ -1272,46 +1443,22 @@ def process(
             rep.stage("shot detection")
             shot_changes = shotdet.detect_shot_changes(media_path)
 
-    from voxweave.config import gap_thresholds
-    from voxweave.core.smart_split import smart_split_segments
-
-    # zh: Qwen punctuation can drift up to one character; snap to jieba word boundary
-    # to prevent smart_split from splitting mid-word (e.g. 数据|中心 instead of 数据中心).
-    units = realign.snap_break_punct(units, iso)
-    seg = _units_to_seg(units, iso)
     rep.stage("smart_split layout")
-    thresholds = _maybe_adaptive_thresholds(gap_thresholds(iso), units)
-    semantic_engine = None
-    if semantic_split:
-        try:
-            from voxweave.semantic_breaks import SemanticBreakEngine
-
-            semantic_engine = SemanticBreakEngine()
-            rep.stage("semantic subtitle boundaries")
-        except Exception as exc:  # noqa: BLE001 - optional stage must degrade safely
-            log.warning(
-                "semantic splitter unavailable; using deterministic layout (%s)", exc
-            )
+    semantic_engine = _make_semantic_engine(semantic_split, rep)
     try:
-        cues = smart_split_segments(
-            [seg],
-            lang=iso,
-            speech_spans=vad_speech,
-            thresholds=thresholds,
+        segmented = segment_document(
+            language=iso,
+            word_segments=units,
+            vad_speech=vad_speech,
             shot_changes=shot_changes,
+            sing_spans=sing_spans,
+            speaker_turns=speaker_turns,
             semantic_engine=semantic_engine,
             semantic_model=semantic_model,
         )
     finally:
         _release_semantic_engine(semantic_engine)
-    mark_lyric_cues(cues, sing_spans)
-    if speaker_turns:
-        from voxweave.diarize import apply_speaker_format
-
-        # Same thresholds as smart_split so speaker splits get timing polish too.
-        cues = apply_speaker_format(cues, speaker_turns, iso, thresholds=thresholds)
-        # ... and its cleanup can push a boundary back across a cut, so snap again.
-        cues = _resnap_shots(cues, shot_changes, thresholds)
+    units, cues = segmented.units, segmented.cues
 
     rep.stage("write siblings")
     vtt_out = _write_siblings(
@@ -1381,9 +1528,6 @@ def split(
     mode if absent. ``timestamps`` behaves as in :func:`process`.  This remains model-free
     by default; ``semantic_split=True`` opts into the isolated boundary selector.
     """
-    from voxweave.config import gap_thresholds
-    from voxweave.core.smart_split import smart_split_segments
-
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
     json_path = swap_ext(Path(json_path), ".json")
@@ -1394,49 +1538,22 @@ def split(
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = _spans_in(data.get("sing_spans"))
     speaker_turns = _turns_in(data.get("speaker_turns"))
-    units = realign.snap_break_punct(
-        units, iso
-    )  # zh: snap to jieba boundary (same as process)
-    seg = _units_to_seg(units, iso)
-    thresholds = _maybe_adaptive_thresholds(gap_thresholds(iso), units)
-    semantic_engine = None
-    if semantic_split:
-        try:
-            from voxweave.semantic_breaks import SemanticBreakEngine
-
-            semantic_engine = SemanticBreakEngine()
-        except Exception as exc:  # noqa: BLE001 - optional stage must degrade safely
-            log.warning(
-                "semantic splitter unavailable; using deterministic layout (%s)", exc
-            )
+    semantic_engine = _make_semantic_engine(semantic_split)
     try:
-        cues = smart_split_segments(
-            [seg],
-            lang=iso,
-            speech_spans=speech_spans,
-            thresholds=thresholds,
+        segmented = segment_document(
+            language=iso,
+            word_segments=units,
+            vad_speech=speech_spans,
             shot_changes=shot_changes,
+            sing_spans=sing_spans,
+            speaker_turns=speaker_turns,
             semantic_engine=semantic_engine,
             semantic_model=semantic_model,
-            **smart_split_kwargs,
+            smart_split_kwargs=smart_split_kwargs,
         )
     finally:
         _release_semantic_engine(semantic_engine)
-    mark_lyric_cues(cues, sing_spans)
-    if speaker_turns:
-        from voxweave.diarize import apply_speaker_format
-
-        # Same thresholds AND line budget as smart_split so speaker splits get the
-        # same timing polish and wrap width the deterministic layout just used.
-        cues = apply_speaker_format(
-            cues,
-            speaker_turns,
-            iso,
-            thresholds=thresholds,
-            max_line_length=smart_split_kwargs.get("max_line_length"),
-        )
-        # ... and its cleanup can push a boundary back across a cut, so snap again.
-        cues = _resnap_shots(cues, shot_changes, thresholds)
+    units, cues = segmented.units, segmented.cues
     vtt_out = _write_siblings(
         json_path,
         cues,
