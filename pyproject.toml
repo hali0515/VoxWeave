@@ -167,3 +167,9 @@ venv = ".venv"
 [tool.ruff]
 # voxweave/vendor contains frozen third-party model code (lucidrains/audio-separator) -- skip lint/format
 extend-exclude = ["voxweave/vendor"]
+
+[tool.ruff.lint]
+# Pin the rule set explicitly: newer ruff releases broaden the implicit default
+# selection, which turns a version bump into hundreds of findings on an
+# untouched tree (CI runs unpinned ruff).
+select = ["E4", "E7", "E9", "F"]
