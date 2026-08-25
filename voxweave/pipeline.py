@@ -779,7 +779,9 @@ def transcribe(
                     vad_spans.append((a, b))
         # Qwen aligner has no CTC blank token, so word durations bleed into silence.
         # position_units_with_vad carves true gaps, giving smart_split an accurate signal.
-        all_units = realign.position_units_with_vad(all_units, vad_spans)
+        # Routed through the sink so --debug also records the pre/post snapshots and the
+        # zero-duration repair accounting; the no-op sink calls the pass unchanged.
+        all_units = dbg.position_units(all_units, vad_spans, language=lang_name)
         dbg.meta(
             {
                 "media": str(media_path),

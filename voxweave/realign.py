@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from typing import Any
 
 log = logging.getLogger("voxweave")
 
@@ -550,12 +552,236 @@ def fill_insert_blocks(
     return [s if s is not None else (0.0, default_dur) for s in out]
 
 
+# --------------------------------------------------------------------------- #
+# VAD positioning diagnostics
+# --------------------------------------------------------------------------- #
+# Float-noise tolerance for "the aligner emitted start == end verbatim".
+EXACT_ZERO_EPS = 1e-9
+# Widest span snap_zero_duration_units treats as collapsed; the census reuses it so
+# "collapse candidate" means exactly "a unit that pass is allowed to relocate".
+ZERO_DURATION_EPS = 0.05
+# Longest zero-duration run snap will relocate (longer ones are ASR repetition walls).
+ZERO_DURATION_MAX_RUN = 8
+# Every step of the positioning pass, in application order.
+POSITIONING_STEPS = (
+    "snap_zero_duration",
+    "snap_silence_stranded",
+    "carve_over_silence",
+)
+# Why a zero-duration run was or was not relocated by snap_zero_duration_units.
+ZERO_RUN_OUTCOMES = (
+    "relocated",
+    "over_max_run",
+    "no_lexical_unit",
+    "no_speech_gap",
+)
+
+
+def is_lexical_unit(unit: dict) -> bool:
+    """Whether a unit carries text.
+
+    Whitespace and pure-punctuation units are never denominators for timing health:
+    :func:`reinject_punct` promotes punctuation to deliberately zero-width units, so
+    counting them would drown the defect rate in by-design zeros.
+    """
+    return any(c.isalnum() for c in unit["text"])
+
+
+def _zero_run_outcome(
+    *, relocated: bool, within_max_run: bool, has_lexical: bool
+) -> str:
+    """Classify one zero-duration run: why snap did or did not relocate it."""
+    if relocated:
+        return "relocated"
+    if not within_max_run:
+        return "over_max_run"
+    if not has_lexical:
+        return "no_lexical_unit"
+    return "no_speech_gap"
+
+
+@dataclass
+class ZeroDurationDiagnostics:
+    """Accounting for what :func:`position_units_with_vad` did to collapsed units.
+
+    The upstream Qwen NAR aligner emits word spans with ``start == end`` at a high
+    rate (QwenLM/Qwen3-ASR#197); :func:`snap_zero_duration_units` and its two
+    sibling steps repair them. Without a record the repair is invisible: in the
+    sibling JSON a residual zero-duration unit and a never-collapsed one look alike.
+
+    Counters are cumulative across calls (one accumulator can span a whole run) and
+    all zero-duration denominators are **lexical** units (see :func:`is_lexical_unit`).
+
+    Per-call invariant, and therefore also cumulative::
+
+        raw_exact_zero == repaired_exact_zero + residual_exact_zero
+
+    Fate is decided per input index, so every raw zero-duration unit lands in exactly
+    one bucket. Repairs are attributed from the steps' own change records
+    (:meth:`record_change`), never guessed by diffing floats — a later carve can move
+    a unit the snap step never touched, and a relocated unit can land on a span that
+    happens to be as wide as it started.
+    """
+
+    calls: int = 0
+    # Steps are index-preserving by construction; a mismatch means one stopped being
+    # so, which invalidates repair attribution for that call (counted as residual).
+    desynced_calls: int = 0
+    units_seen: int = 0
+    lexical_units: int = 0
+    raw_exact_zero: int = 0
+    raw_collapse_candidates: int = 0
+    repaired_exact_zero: int = 0
+    residual_exact_zero: int = 0
+    repaired_collapse_candidates: int = 0
+    residual_collapse_candidates: int = 0
+    changed_by_step: dict[str, int] = field(
+        default_factory=lambda: dict.fromkeys(POSITIONING_STEPS, 0)
+    )
+    run_outcomes: dict[str, int] = field(
+        default_factory=lambda: dict.fromkeys(ZERO_RUN_OUTCOMES, 0)
+    )
+    run_lengths: dict[int, int] = field(default_factory=dict)
+    # Repair displacement pools, kept raw: a percentile of pre-reduced values is not
+    # a percentile of anything, so reduction is left to the calibration tooling.
+    midpoint_shifts: list[float] = field(default_factory=list)
+    duration_increases: list[float] = field(default_factory=list)
+
+    _units_in: int = field(default=0, repr=False)
+    _changed: set[int] = field(default_factory=set, repr=False)
+    _raw_zero: list[tuple[int, float, float]] = field(default_factory=list, repr=False)
+    _raw_candidates: list[int] = field(default_factory=list, repr=False)
+
+    # -- step hooks -------------------------------------------------------- #
+    def record_change(self, index: int, step: str) -> None:
+        """Record that ``step`` rewrote the timing of the lexical unit at ``index``."""
+        if step not in self.changed_by_step:
+            raise ValueError(f"unknown positioning step {step!r}")
+        self.changed_by_step[step] += 1
+        self._changed.add(index)
+
+    def record_zero_run(self, length: int, outcome: str) -> None:
+        """Record one contiguous zero-duration run seen by the snap step.
+
+        ``length`` counts the whole run including punctuation, because that is what
+        ``max_run`` gates.
+        """
+        if outcome not in self.run_outcomes:
+            raise ValueError(f"unknown zero-run outcome {outcome!r}")
+        self.run_outcomes[outcome] += 1
+        self.run_lengths[length] = self.run_lengths.get(length, 0) + 1
+
+    # -- pass hooks -------------------------------------------------------- #
+    def begin_call(self, units: list[dict]) -> None:
+        """Census the pass input: totals plus the indices whose fate we will follow."""
+        self.calls += 1
+        self._units_in = len(units)
+        self._changed.clear()
+        self._raw_zero.clear()
+        self._raw_candidates.clear()
+        self.units_seen += len(units)
+        for i, u in enumerate(units):
+            if not is_lexical_unit(u):
+                continue
+            self.lexical_units += 1
+            start, end = float(u["start"]), float(u["end"])
+            if end - start <= EXACT_ZERO_EPS:
+                self._raw_zero.append((i, start, end))
+            if end - start <= ZERO_DURATION_EPS:
+                self._raw_candidates.append(i)
+        self.raw_exact_zero += len(self._raw_zero)
+        self.raw_collapse_candidates += len(self._raw_candidates)
+
+    def end_call(self, units: list[dict]) -> None:
+        """Settle every censused index against the pass output."""
+        if len(units) != self._units_in:  # attribution impossible: nothing is repaired
+            self.desynced_calls += 1
+            self.residual_exact_zero += len(self._raw_zero)
+            self.residual_collapse_candidates += len(self._raw_candidates)
+            self._changed.clear()
+            self._raw_zero.clear()
+            self._raw_candidates.clear()
+            return
+        for i, start, end in self._raw_zero:
+            out_start, out_end = float(units[i]["start"]), float(units[i]["end"])
+            if out_end - out_start > EXACT_ZERO_EPS:
+                self.repaired_exact_zero += 1
+                self.midpoint_shifts.append(
+                    abs((out_start + out_end) / 2 - (start + end) / 2)
+                )
+                self.duration_increases.append((out_end - out_start) - (end - start))
+            else:
+                self.residual_exact_zero += 1
+        for i in self._raw_candidates:
+            if i in self._changed:
+                self.repaired_collapse_candidates += 1
+            out = units[i]
+            if float(out["end"]) - float(out["start"]) <= ZERO_DURATION_EPS:
+                self.residual_collapse_candidates += 1
+        self._changed.clear()
+        self._raw_zero.clear()
+        self._raw_candidates.clear()
+
+    # -- reporting --------------------------------------------------------- #
+    @property
+    def accounting_balanced(self) -> bool:
+        """The hard invariant: every raw zero-duration unit is repaired or residual."""
+        return (
+            self.raw_exact_zero == self.repaired_exact_zero + self.residual_exact_zero
+        )
+
+    def run_length_histogram(self) -> dict[str, int]:
+        """Run lengths bucketed for reporting; ``>8`` exceeds ``ZERO_DURATION_MAX_RUN``."""
+        buckets = {"1": 0, "2-3": 0, "4-8": 0, ">8": 0}
+        for length, count in self.run_lengths.items():
+            if length <= 1:
+                key = "1"
+            elif length <= 3:
+                key = "2-3"
+            elif length <= ZERO_DURATION_MAX_RUN:
+                key = "4-8"
+            else:
+                key = ">8"
+            buckets[key] += count
+        return buckets
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-ready counters (no rates: those need a denominator policy, see debug)."""
+        return {
+            "calls": self.calls,
+            "desynced_calls": self.desynced_calls,
+            "units_seen": self.units_seen,
+            "lexical_units": self.lexical_units,
+            "raw_exact_zero": self.raw_exact_zero,
+            "raw_collapse_candidates": self.raw_collapse_candidates,
+            "repaired_exact_zero": self.repaired_exact_zero,
+            "residual_exact_zero": self.residual_exact_zero,
+            "repaired_collapse_candidates": self.repaired_collapse_candidates,
+            "residual_collapse_candidates": self.residual_collapse_candidates,
+            "accounting_balanced": self.accounting_balanced,
+            "changed_by_step": dict(self.changed_by_step),
+            "zero_runs": {
+                "seen": sum(self.run_outcomes.values()),
+                "outcomes": dict(self.run_outcomes),
+                "histogram": self.run_length_histogram(),
+                "lengths": {
+                    str(k): self.run_lengths[k] for k in sorted(self.run_lengths)
+                },
+            },
+            "repair_shift_samples": {
+                "midpoint_shift": [round(v, 6) for v in self.midpoint_shifts],
+                "duration_increase": [round(v, 6) for v in self.duration_increases],
+            },
+        }
+
+
 def snap_zero_duration_units(
     units: list[dict],
     vad: list[tuple[float, float]],
     *,
-    eps: float = 0.05,
-    max_run: int = 8,
+    eps: float = ZERO_DURATION_EPS,
+    max_run: int = ZERO_DURATION_MAX_RUN,
+    diagnostics: ZeroDurationDiagnostics | None = None,
 ) -> list[dict]:
     """Relocate zero-duration unit runs (Qwen NAR collapse) to the actual speech in the gap.
 
@@ -572,6 +798,9 @@ def snap_zero_duration_units(
     **Only alnum chars are spread**: leading punctuation (sentence-final from the previous cue)
     is left at prev_end — pulling it forward would erase the gap. Trailing punctuation is
     attached to content end. Pure function.
+
+    ``diagnostics`` (optional) collects one record per zero-duration run and per relocated
+    lexical unit; it never influences the result.
     """
     if not units or not vad:
         return units
@@ -590,6 +819,7 @@ def snap_zero_duration_units(
         prev_end = out[i - 1]["end"] if i > 0 else 0.0
         next_start = out[j]["start"] if j < n else float("inf")
         alnum_idx = [k for k in range(i, j) if any(c.isalnum() for c in out[k]["text"])]
+        relocated = False
         if run <= max_run and alnum_idx:
             # isolated speech segments fully within the gap (start >= prev_end, end <= next_start)
             cands = [
@@ -600,6 +830,7 @@ def snap_zero_duration_units(
                 s = max(prev_end, s)
                 e = min(next_start, e)
                 if e - s > eps:
+                    relocated = True
                     m = len(alnum_idx)
                     step = (e - s) / m
                     for r, k in enumerate(alnum_idx):  # spread alnum content evenly
@@ -611,6 +842,18 @@ def snap_zero_duration_units(
                     ):  # trailing punct to content end
                         out[k]["start"] = out[k]["end"] = core_end
                     # leading punct (i .. alnum_idx[0]) stays at prev_end — do not move
+        if diagnostics is not None:
+            diagnostics.record_zero_run(
+                run,
+                _zero_run_outcome(
+                    relocated=relocated,
+                    within_max_run=run <= max_run,
+                    has_lexical=bool(alnum_idx),
+                ),
+            )
+            if relocated:
+                for k in alnum_idx:
+                    diagnostics.record_change(k, "snap_zero_duration")
         i = j
     return out
 
@@ -621,6 +864,7 @@ def snap_silence_stranded_units(
     *,
     tol: float = 0.5,
     eps: float = 0.05,
+    diagnostics: ZeroDurationDiagnostics | None = None,
 ) -> list[dict]:
     """Pull unit runs that drifted into adjacent silence back to the nearest VAD speech edge.
 
@@ -634,6 +878,9 @@ def snap_silence_stranded_units(
     the nearest speech edge: pull to that edge (run past offset → pull last char to ≤ offset;
     run before onset → push first char to ≥ onset), clamped by surrounding in-speech units.
     If the nearest edge is > ``tol`` (genuinely dropped audio) → leave unchanged. Pure function.
+
+    ``diagnostics`` (optional) records each lexical unit pulled back to speech; it never
+    influences the result.
     """
     if not units or not vad:
         return units
@@ -685,6 +932,9 @@ def snap_silence_stranded_units(
                 for r, k in enumerate(alnum_idx):
                     out[k]["start"] = lo + step * r
                     out[k]["end"] = lo + step * (r + 1)
+                if diagnostics is not None:
+                    for k in alnum_idx:
+                        diagnostics.record_change(k, "snap_silence_stranded")
                 core_s, core_e = out[alnum_idx[0]]["start"], out[alnum_idx[-1]]["end"]
                 for k in range(i, alnum_idx[0]):  # leading punct to content start
                     out[k]["start"] = out[k]["end"] = core_s
@@ -699,6 +949,7 @@ def carve_units_over_silence(
     vad: list[tuple[float, float]],
     *,
     min_overhang: float = 0.2,
+    diagnostics: ZeroDurationDiagnostics | None = None,
 ) -> list[dict]:
     """Trim leading/trailing silence from each unit using the VAD speech map.
 
@@ -713,12 +964,15 @@ def carve_units_over_silence(
 
     Units fully in silence → **left unchanged** (snap's domain). Zero-duration units untouched.
     Only shrinks inward, never expands → no overlaps. Pure function.
+
+    ``diagnostics`` (optional) records each lexical unit whose edge was trimmed; it never
+    influences the result.
     """
     if not units or not vad:
         return units
     segs = sorted((float(s), float(e)) for s, e in vad)
     out = [dict(u) for u in units]
-    for u in out:
+    for index, u in enumerate(out):
         s, e = u["start"], u["end"]
         if e - s <= 0:  # zero/negative → snap's domain
             continue
@@ -733,15 +987,23 @@ def carve_units_over_silence(
                 last_ov = ov_e
         if first_ov is None:  # fully in silence → leave unchanged
             continue
+        trimmed = False
         if first_ov - s > min_overhang:
             u["start"] = first_ov
+            trimmed = True
         if e - last_ov > min_overhang:
             u["end"] = last_ov
+            trimmed = True
+        if trimmed and diagnostics is not None and is_lexical_unit(u):
+            diagnostics.record_change(index, "carve_over_silence")
     return out
 
 
 def position_units_with_vad(
-    units: list[dict], vad: list[tuple[float, float]]
+    units: list[dict],
+    vad: list[tuple[float, float]],
+    *,
+    diagnostics: ZeroDurationDiagnostics | None = None,
 ) -> list[dict]:
     """Apply all three VAD positioning steps to aligned units.
 
@@ -750,9 +1012,22 @@ def position_units_with_vad(
     (2) snap_silence_stranded_units — CTC point-timestamp runs that drifted into silence;
     (3) carve_units_over_silence — trim over-inflated unit edges.
     The three steps are orthogonal and non-interfering. Pure function.
+
+    Pass a :class:`ZeroDurationDiagnostics` to have the pass account for the collapsed
+    units it received and what became of them (see :mod:`voxweave.debug`). The
+    accumulator is write-only for the steps: results are identical with and without it.
     """
-    snapped = snap_silence_stranded_units(snap_zero_duration_units(units, vad), vad)
-    return carve_units_over_silence(snapped, vad)
+    if diagnostics is not None:
+        diagnostics.begin_call(units)
+    snapped = snap_silence_stranded_units(
+        snap_zero_duration_units(units, vad, diagnostics=diagnostics),
+        vad,
+        diagnostics=diagnostics,
+    )
+    out = carve_units_over_silence(snapped, vad, diagnostics=diagnostics)
+    if diagnostics is not None:
+        diagnostics.end_call(out)
+    return out
 
 
 def group_block_spans(
