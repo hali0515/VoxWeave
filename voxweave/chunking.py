@@ -210,6 +210,32 @@ def decode_to_wav(
     return out
 
 
+_silero_model = (
+    None  # silero VAD singleton — loaded once per process (see _get_silero_vad)
+)
+
+
+def _get_silero_vad():
+    """Return the process-wide silero VAD model, loading it on first use.
+
+    A pipeline run calls the VAD several times (chunking pass, fine pass for song
+    excision, snap passes); reloading the model each time costs a needless
+    torch.hub-style init per call. Single-threaded by design — no locking.
+    """
+    global _silero_model
+    if _silero_model is None:
+        from silero_vad import load_silero_vad
+
+        _silero_model = load_silero_vad()
+    return _silero_model
+
+
+def release_silero_vad() -> None:
+    """Drop the cached silero VAD model; the next VAD call reloads it."""
+    global _silero_model
+    _silero_model = None
+
+
 def vad_speech_segments(
     wav_path: Path, *, threshold: float = 0.5, min_silence_ms: int | None = None
 ) -> list[dict]:
@@ -224,9 +250,9 @@ def vad_speech_segments(
     silences — used by song excision to snap cut points into real silence.
     """
     import torch
-    from silero_vad import get_speech_timestamps, load_silero_vad
+    from silero_vad import get_speech_timestamps
 
-    model = load_silero_vad()
+    model = _get_silero_vad()
     # soundfile bypasses torchaudio>=2.9's torchcodec requirement
     data, sr = sf.read(str(wav_path), dtype="float32")
     assert sr == SAMPLE_RATE, (
@@ -266,12 +292,23 @@ def silence_gaps(
 
 
 def slice_wav(wav_path: Path, start: float, end: float) -> Path:
-    """Slice the [start,end] segment from a 16k wav, write to a temp wav, return path (caller deletes)."""
-    data, sr = sf.read(str(wav_path), dtype="float32")
-    a = max(0, int(start * sr))
-    b = min(len(data), int(end * sr))
+    """Slice the [start,end] segment from a 16k wav, write to a temp wav, return path (caller deletes).
+
+    Reads only the requested frame range (seek + read) rather than decoding the whole file:
+    an episode is sliced once per chunk, so a full read would re-materialize the entire
+    waveform tens of times (a feature-length separated wav is multiple GB as float32).
+    Frame arithmetic and clamping mirror the previous full-read-then-slice exactly, so the
+    output is sample-identical.
+    """
+    with sf.SoundFile(str(wav_path)) as f:
+        sr = f.samplerate
+        frames = len(f)
+        a = min(max(0, int(start * sr)), frames)
+        b = min(frames, int(end * sr))
+        f.seek(a)
+        data = f.read(max(0, b - a), dtype="float32")
     fd, path = tempfile.mkstemp(suffix=".wav", prefix="voxweave_chunk_")
     os.close(fd)
     out = Path(path)
-    sf.write(str(out), data[a:b], sr)
+    sf.write(str(out), data, sr)
     return out

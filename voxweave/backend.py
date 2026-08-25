@@ -200,6 +200,16 @@ def _resolve_separator_files() -> tuple[Path, Path]:
     return ckpt, conf
 
 
+_FALSE_ENV_VALUES = frozenset({"0", "false", "off"})
+
+
+def _tf32_enabled() -> bool:
+    """TF32 matmuls are on by default; VOXWEAVE_TF32=0/false/off opts out. Read per call."""
+    return (
+        os.environ.get("VOXWEAVE_TF32", "").strip().casefold() not in _FALSE_ENV_VALUES
+    )
+
+
 def _load_separator():
     """Instantiate MelBandRoformer (not cached; caller del's it after separation to free VRAM).
 
@@ -230,6 +240,11 @@ def _load_separator():
     sd = _strip_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
     model.load_state_dict(sd)
     dev = get_device()
+    if dev.startswith("cuda") and _tf32_enabled():
+        # The roformer is attention-heavy and separation dominates wall clock; TF32 matmuls
+        # on Ampere+ cut that substantially and the stem difference is below the noise floor
+        # of the downstream 16k ASR. VOXWEAVE_TF32=0 restores strict fp32 matmuls.
+        torch.set_float32_matmul_precision("high")
     model.to(dev).eval()
     log.info("loaded separator ckpt=%s on %s", ckpt, dev)
     return model, cfg

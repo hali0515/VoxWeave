@@ -120,6 +120,23 @@ def _get_model():
     return _model
 
 
+def release_model() -> None:
+    """Drop the PANNs singleton and free the VRAM it holds.
+
+    Song detection runs once, near the start of a job, but the model stays resident for the
+    rest of it — competing with the ASR and aligner weights for the same card. Callers that
+    are done detecting release it explicitly; the next _get_model() reloads.
+    """
+    global _model
+    if _model is None:
+        return
+    _model = None
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def reduce_scores(probs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(n, 527) probabilities → ``(speech, sing, music)`` per-window maxima.
 
