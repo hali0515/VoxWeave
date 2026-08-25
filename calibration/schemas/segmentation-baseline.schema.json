@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxweave.local/schemas/segmentation-baseline.schema.json",
+  "title": "voxweave segmentation baseline",
+  "description": "Recorded reference point for the four segmentation gates. Every rule is one-sided (lower is better), so an improvement can never fail a gate: allowed = baseline_value + max(absolute_tolerance, baseline_value * relative_tolerance), and absolute_max must hold as well. A mismatch in corpus_digest, metric_definition_version or environment is exit code 2 and demands a reviewed `record-baseline`, which is never a CI action.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "metric_definition_version", "corpus_digest", "generated_from_commit", "environment", "groups", "gates"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "metric_definition_version": {"const": 2},
+    "corpus_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "generated_from_commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+    "environment": {
+      "type": "object",
+      "required": ["python", "dependencies"],
+      "properties": {
+        "python": {"type": "string"},
+        "dependencies": {"type": "object", "additionalProperties": {"type": ["string", "null"]}}
+      }
+    },
+    "groups": {
+      "type": "object",
+      "required": ["all", "zh", "ja", "en"],
+      "additionalProperties": {"$ref": "#/$defs/group"}
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len_break_mid_phrase_rate", "over_7s_rate", "cps_p90", "forbidden_end_rate"],
+      "properties": {
+        "len_break_mid_phrase_rate": {"$ref": "#/$defs/gate"},
+        "over_7s_rate": {"$ref": "#/$defs/gate"},
+        "cps_p90": {"$ref": "#/$defs/gate"},
+        "forbidden_end_rate": {"$ref": "#/$defs/gate"}
+      }
+    }
+  },
+  "$defs": {
+    "ratio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bad", "eligible", "value"],
+      "properties": {
+        "bad": {"type": "integer", "minimum": 0},
+        "eligible": {"type": "integer", "minimum": 0},
+        "value": {"type": ["number", "null"], "minimum": 0, "maximum": 1}
+      }
+    },
+    "group": {
+      "type": "object",
+      "required": ["case_count", "cue_count", "len_break_mid_phrase_rate", "over_7s_rate", "cps_p90", "forbidden_end_rate"],
+      "properties": {
+        "case_count": {"type": "integer", "minimum": 0},
+        "cue_count": {"type": "integer", "minimum": 0},
+        "len_break_mid_phrase_rate": {"$ref": "#/$defs/ratio"},
+        "over_7s_rate": {"$ref": "#/$defs/ratio"},
+        "cps_p90": {"type": "object", "required": ["n", "value"], "properties": {"n": {"type": "integer", "minimum": 0}, "value": {"type": ["number", "null"], "minimum": 0}}},
+        "forbidden_end_rate": {"$ref": "#/$defs/ratio"}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["direction", "mode", "absolute_tolerance", "relative_tolerance", "min_samples"],
+      "properties": {
+        "direction": {"const": "lower_is_better"},
+        "mode": {"enum": ["blocking", "warning", "disabled"]},
+        "absolute_max": {"type": ["number", "null"], "minimum": 0},
+        "absolute_tolerance": {"type": "number", "minimum": 0},
+        "relative_tolerance": {"type": "number", "minimum": 0},
+        "min_samples": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

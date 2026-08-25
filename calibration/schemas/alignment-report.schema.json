@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxweave.local/schemas/alignment-report.schema.json",
+  "title": "voxweave alignment calibration report",
+  "description": "Output of `scripts/calib_alignment.py evaluate`. One lane per (source_kind, language, reference_id): MFA word samples and commercial cue samples must never be pooled into a single percentile. `coverage`, per-item details and `health` are open objects in v1 and are expected to grow $defs; the fields listed here are the minimum external contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "metric_definition_version", "manifest_digest", "status", "lanes"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "metric_definition_version": {"const": 1},
+    "manifest_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "git_commit": {"type": ["string", "null"]},
+    "status": {"enum": ["pass", "fail", "invalid"]},
+    "lanes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source_kind", "language", "status", "coverage", "metrics", "items"],
+        "properties": {
+          "source_kind": {"enum": ["mfa_words", "manual_words", "commercial_cues", "manual_cues"]},
+          "language": {"enum": ["en", "ja", "zh"]},
+          "reference_id": {"type": ["string", "null"]},
+          "status": {"enum": ["pass", "fail", "invalid", "insufficient_samples"]},
+          "coverage": {"type": "object"},
+          "metrics": {
+            "type": "object",
+            "additionalProperties": {"$ref": "#/$defs/metric"}
+          },
+          "items": {"type": "array", "items": {"type": "object"}}
+        }
+      }
+    },
+    "health": {"type": "object"},
+    "failures": {"type": "array", "items": {"type": "object"}}
+  },
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n"],
+      "properties": {
+        "n": {"type": "integer", "minimum": 0},
+        "mae": {"type": ["number", "null"], "minimum": 0},
+        "median": {"type": ["number", "null"], "minimum": 0},
+        "p90": {"type": ["number", "null"], "minimum": 0},
+        "pct_le_0_025": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "pct_le_0_05": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "pct_le_0_10": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "pct_le_0_25": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "pct_le_1_0": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "ci95_low": {"type": ["number", "null"]},
+        "ci95_high": {"type": ["number", "null"]},
+        "interpretive_lower_bound": {"type": ["number", "null"], "minimum": 0}
+      }
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxweave.local/schemas/alignment-reference.schema.json",
+  "title": "voxweave normalized alignment reference",
+  "description": "Read-only ground-truth contract shared by the MFA converter, manual anchor sets and commercial track extraction. Only the raw `text` is stored; normalization is applied at compare time so later normalization changes cannot pollute the truth. Loader additionally checks: all times finite, end > start, segments monotonic by (start,end,id), no overlap inside one utterance, and that offset_s keeps every segment inside media_duration_s. MFA `spn`/OOV must be written as excluded segments with a reason, never dropped silently.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "language", "kind", "timebase", "provenance", "segments"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "minLength": 1},
+    "language": {"enum": ["en", "ja", "zh"]},
+    "kind": {"enum": ["mfa_words", "manual_words", "commercial_cues", "manual_cues"]},
+    "timebase": {"const": "seconds"},
+    "media_duration_s": {"type": ["number", "null"], "minimum": 0},
+    "offset_s": {"type": "number", "default": 0},
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["created_by"],
+      "properties": {
+        "created_by": {"type": "string"},
+        "created_at": {"type": ["string", "null"], "format": "date-time"},
+        "tool_version": {"type": ["string", "null"]},
+        "command": {"type": ["string", "null"]},
+        "acoustic_model": {"type": ["string", "null"]},
+        "acoustic_model_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "dictionary": {"type": ["string", "null"]},
+        "dictionary_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "g2p_model": {"type": ["string", "null"]},
+        "g2p_model_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "reference_uncertainty_s": {"type": ["number", "null"], "minimum": 0},
+        "license": {"type": ["string", "null"]},
+        "annotators": {"type": "integer", "minimum": 0, "default": 0},
+        "source_digest": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "text", "start", "end"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "text": {"type": "string", "minLength": 1},
+          "start": {"type": "number", "minimum": 0},
+          "end": {"type": "number", "minimum": 0},
+          "utterance_id": {"type": ["string", "null"]},
+          "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+          "excluded": {"type": "boolean", "default": false},
+          "exclude_reason": {"type": ["string", "null"]}
+        }
+      }
+    }
+  }
+}

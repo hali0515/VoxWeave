@@ -116,7 +116,10 @@ diarize = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8", "pyright>=1.1.390"]
+# jsonschema validates the tracked calibration contracts (calibration/schemas/*.schema.json).
+# It is a dev-only dependency on purpose: scripts/calib_common.py is import-light so the
+# harnesses run in a bare environment, and the shipped runtime never validates them.
+dev = ["pytest>=8", "pyright>=1.1.390", "jsonschema>=4,<5"]
 
 [tool.uv]
 # ctc-forced-aligner (and, on CUDA, faster-whisper) hard-depend on the CPU `onnxruntime` package,

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxweave.local/schemas/segmentation-case.schema.json",
+  "title": "voxweave segmentation golden case",
+  "description": "One captured real unit stream plus the production inputs needed to replay segmentation with zero GPU. `unit` stays compatible with voxweave/core/schema.py Unit: capture always writes `text` and only keeps `word` when the source sibling used it. Loader semantics on top of this schema: every span end > start, all times finite and monotonic, unit ids unique, and max time <= capture.window_duration_s + 0.5. Detectors are never re-run at replay time; a missing input is recorded in capture.missing_inputs and stored as an empty array.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "language", "tags", "license", "capture", "word_segments", "vad_speech", "shot_changes", "sing_spans", "speaker_turns"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "pattern": "^(zh|ja|en)-[0-9]{2}$"},
+    "language": {"enum": ["zh", "ja", "en"]},
+    "description": {"type": "string", "maxLength": 240},
+    "tags": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["redistributable", "source_class"],
+      "properties": {
+        "redistributable": {"const": true},
+        "source_class": {"enum": ["self-recorded", "cc", "public-domain", "synthetic-from-consented-speech"]},
+        "spdx": {"type": ["string", "null"]},
+        "attribution": {"type": ["string", "null"], "maxLength": 500}
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["voxweave_commit", "source_digest", "window_duration_s", "dependency_versions", "config"],
+      "properties": {
+        "voxweave_commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+        "source_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "window_duration_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 300},
+        "dependency_versions": {"type": "object", "additionalProperties": {"type": ["string", "null"]}},
+        "config": {"type": "object"},
+        "missing_inputs": {"type": "array", "items": {"enum": ["vad_speech", "shot_changes", "sing_spans", "speaker_turns"]}}
+      }
+    },
+    "word_segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/unit"}
+    },
+    "vad_speech": {"type": "array", "items": {"$ref": "#/$defs/span"}},
+    "shot_changes": {"type": "array", "items": {"type": "number", "minimum": 0}},
+    "sing_spans": {"type": "array", "items": {"$ref": "#/$defs/span"}},
+    "speaker_turns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["start", "end", "speaker"],
+        "properties": {
+          "start": {"type": "number", "minimum": 0},
+          "end": {"type": "number", "minimum": 0},
+          "speaker": {"type": "string", "pattern": "^S[0-9]+$"}
+        }
+      }
+    },
+    "exceptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "range", "reason"],
+        "properties": {
+          "kind": {"enum": ["held_speech_over_7s", "unavoidable_forbidden_end", "known_bad_source_unit"]},
+          "range": {"$ref": "#/$defs/span"},
+          "reason": {"type": "string", "minLength": 10}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "span": {
+      "type": "array",
+      "prefixItems": [{"type": "number", "minimum": 0}, {"type": "number", "minimum": 0}],
+      "items": false
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text", "start", "end"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "text": {"type": "string"},
+        "word": {"type": "string"},
+        "start": {"type": "number", "minimum": 0},
+        "end": {"type": "number", "minimum": 0}
+      }
+    }
+  }
+}

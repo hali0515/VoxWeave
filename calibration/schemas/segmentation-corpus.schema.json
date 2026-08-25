@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxweave.local/schemas/segmentation-corpus.schema.json",
+  "title": "voxweave segmentation corpus registry",
+  "description": "Registry of the tracked segmentation golden cases. Case paths are relative to the registry file, must be unique and must not escape it. Loader semantics on top of this schema: every referenced case exists and validates against segmentation-case.schema.json, the per-language case counts match required_counts exactly, every entry of required_tags is covered by at least one case, no single case file exceeds 256 KB, the tracked corpus total stays under 3 MB, and the corpus digest is recomputed from the registry plus every case. Any violation is exit code 2, not a quality failure.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "metric_definition_version", "cases", "required_counts", "required_tags"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "metric_definition_version": {"const": 2},
+    "description": {"type": "string", "maxLength": 240},
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\\.json$",
+        "not": {"pattern": "(^|/)\\.\\.(/|$)"}
+      }
+    },
+    "required_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["zh", "ja", "en"],
+      "properties": {
+        "zh": {"const": 7},
+        "ja": {"const": 7},
+        "en": {"const": 6}
+      }
+    },
+    "required_tags": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"}
+    }
+  }
+}
