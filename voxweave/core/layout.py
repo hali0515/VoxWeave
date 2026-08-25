@@ -10,7 +10,6 @@ cue dicts — those live in ``timing`` (cue-stream polish) and ``smart_split``
 from __future__ import annotations
 
 import re
-from typing import List, Tuple
 
 from .kinsoku import line_end_penalty
 from .langsets import LANGUAGES_WITHOUT_SPACES
@@ -78,7 +77,7 @@ def _no_spaces(lang: str) -> bool:
     return lang in LANGUAGES_WITHOUT_SPACES
 
 
-def _join(words: List[str], lang: str) -> str:
+def _join(words: list[str], lang: str) -> str:
     return "".join(words) if _no_spaces(lang) else " ".join(words)
 
 
@@ -95,7 +94,7 @@ def _is_ascii_run_char(c: str) -> bool:
 _UNIT_GLYPHS = "%％‰°℃℉"
 
 
-def _tokens(text: str, lang: str) -> List[str]:
+def _tokens(text: str, lang: str) -> list[str]:
     """Tokenize for word-count alignment with ASR ``words`` entries.
 
     Space-delimited langs: ``text.split()``. CJK: each CJK char is one token;
@@ -107,7 +106,7 @@ def _tokens(text: str, lang: str) -> List[str]:
     if not _no_spaces(lang):
         return text.split()
 
-    out: List[str] = []
+    out: list[str] = []
     i = 0
     n = len(text)
     while i < n:
@@ -136,7 +135,7 @@ def _tokens(text: str, lang: str) -> List[str]:
         else:
             out.append(ch)
             i += 1
-    merged: List[str] = []
+    merged: list[str] = []
     for tok in out:
         if merged and tok in _UNIT_GLYPHS and merged[-1][-1].isdigit():
             merged[-1] += tok
@@ -173,8 +172,8 @@ def split_subtitle(text: str, max_chars: int, lang: str) -> str:
         return text
     sep = "" if _no_spaces(lang) else " "
     budget = _line_budget_width(max_chars, lang)
-    lines: List[str] = []
-    current: List[str] = []
+    lines: list[str] = []
+    current: list[str] = []
     current_width = 0
     for tok in tokens:
         tok_width = _vis_width(tok)
@@ -244,7 +243,7 @@ def _vis_width(s: str) -> int:
     return sum(1 if (c.isascii() or c.isspace()) else 2 for c in s)
 
 
-def _wrap_units(text: str, lang: str) -> List[Tuple[str, str]]:
+def _wrap_units(text: str, lang: str) -> list[tuple[str, str]]:
     """Split a cue into ``(atom, gap_after)`` pairs for display wrapping.
 
     Line-breaks are legal between units only. ``gap_after`` (" " or "") preserves
@@ -257,7 +256,7 @@ def _wrap_units(text: str, lang: str) -> List[Tuple[str, str]]:
     """
     if not _no_spaces(lang):
         return [(w, " ") for w in text.split()]
-    units: List[Tuple[str, str]] = []
+    units: list[tuple[str, str]] = []
     i, n = 0, len(text)
     while i < n:
         c = text[i]
@@ -292,9 +291,9 @@ def _wrap_units(text: str, lang: str) -> List[Tuple[str, str]]:
     return units
 
 
-def _join_line(units: List[Tuple[str, str]]) -> str:
+def _join_line(units: list[tuple[str, str]]) -> str:
     """Join (atom, gap) units into one line; trailing gap of last atom is dropped."""
-    out: List[str] = []
+    out: list[str] = []
     for k, (atom, gap) in enumerate(units):
         out.append(atom)
         if k < len(units) - 1:
@@ -302,20 +301,23 @@ def _join_line(units: List[Tuple[str, str]]) -> str:
     return "".join(out)
 
 
-def _slide_sticky_line_ends(groups: List[List[Tuple[str, str]]], lang: str) -> None:
+def _slide_sticky_line_ends(
+    groups: list[list[tuple[str, str]]], lang: str, max_line_length: int
+) -> None:
     """Slide sticky trailing tokens (line_end_penalty >= 1) down to the next line.
 
     The token-level counterpart of apply_kinsoku for spaced languages: a line must
     not end on a closed-class token (went to the | store). Slides while the donor
     keeps at least one token and the receiving line stays within the hard visual
-    budget; bottom-heavy output is fine (pyramid shape reads better anyway).
+    budget (``max_line_length``, in half-width cells); bottom-heavy output is fine
+    (pyramid shape reads better anyway).
     """
     for i in range(len(groups) - 1):
         top, bot = groups[i], groups[i + 1]
         while (
             len(top) > 1
             and line_end_penalty(top[-1][0], lang) >= 1
-            and _vis_width(_join_line([top[-1], *bot])) <= DEFAULT_MAX_LINE_LENGTH
+            and _vis_width(_join_line([top[-1], *bot])) <= max_line_length
         ):
             bot.insert(0, top.pop())
 
@@ -328,23 +330,26 @@ _ORPHAN_WEIGHT = 30
 _ORPHAN_MAX_VIS = 10
 
 
-def _two_line_break_index(units: List[Tuple[str, str]], lang: str) -> int | None:
+def _two_line_break_index(
+    units: list[tuple[str, str]], lang: str, max_line_length: int
+) -> int | None:
     """Best break index for a two-line wrap, or None when no two-line split fits.
 
-    Scores every break where both lines fit the hard visual budget:
-    line-length imbalance + sticky line-end penalty (the same line_end_penalty
-    signal the segmentation engine uses) + orphan penalty for a lone short
-    word stranded on either line. Ties prefer bottom-heavy (pyramid) shape.
+    Scores every break where both lines fit the hard visual budget
+    (``max_line_length``, in half-width cells): line-length imbalance + sticky
+    line-end penalty (the same line_end_penalty signal the segmentation engine
+    uses) + orphan penalty for a lone short word stranded on either line. Ties
+    prefer bottom-heavy (pyramid) shape.
     """
     n = len(units)
     best_i: int | None = None
     best_score: float | None = None
     for i in range(1, n):
         top_w = _vis_width(_join_line(units[:i]))
-        if top_w > DEFAULT_MAX_LINE_LENGTH:
+        if top_w > max_line_length:
             break  # top line only grows from here
         bot_w = _vis_width(_join_line(units[i:]))
-        if bot_w > DEFAULT_MAX_LINE_LENGTH:
+        if bot_w > max_line_length:
             continue
         score: float = abs(top_w - bot_w)
         score += _STICKY_END_WEIGHT * line_end_penalty(units[i - 1][0], lang)
@@ -359,32 +364,36 @@ def _two_line_break_index(units: List[Tuple[str, str]], lang: str) -> int | None
     return best_i
 
 
-def wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
+def wrap_cue_text(
+    text: str, lang: str, max_lines: int, max_line_length: int | None = None
+) -> str:
     """Soft-wrap a cue into ``<=max_lines`` display lines (``\\n``-joined).
 
     Only changes rendered layout — cue boundaries and content are untouched.
-    Wraps only when visual width exceeds ``DEFAULT_MAX_LINE_LENGTH``; short CJK
-    cues with brief Latin phrases stay on one line. Two-line wraps pick the
-    break by exhaustive scoring (balance + sticky-end + orphan, see
-    ``_two_line_break_index``); deeper wraps balance greedily at
-    ``ceil(total/max_lines)``. Line ends are then cleaned: kinsoku char rules
-    for ja/zh, sticky-token slide for the greedy path.
+    ``max_line_length`` is the player's line budget in half-width cells; ``None``
+    keeps the built-in ``DEFAULT_MAX_LINE_LENGTH`` profile. Wraps only when the
+    visual width exceeds that budget; short CJK cues with brief Latin phrases
+    stay on one line. Two-line wraps pick the break by exhaustive scoring
+    (balance + sticky-end + orphan, see ``_two_line_break_index``); deeper wraps
+    balance greedily at ``ceil(total/max_lines)``. Line ends are then cleaned:
+    kinsoku char rules for ja/zh, sticky-token slide for the greedy path.
     """
+    budget = DEFAULT_MAX_LINE_LENGTH if max_line_length is None else max_line_length
     units = _wrap_units(text, lang)
     if len(units) <= 1:
         return _join_line(units) if units else text
     total = _vis_width(_join_line(units))
-    if total <= DEFAULT_MAX_LINE_LENGTH:  # fits on one line -> no wrap needed
+    if total <= budget:  # fits on one line -> no wrap needed
         return _join_line(units)
-    groups: List[List[Tuple[str, str]]] | None = None
+    groups: list[list[tuple[str, str]]] | None = None
     if max_lines == 2:
-        bi = _two_line_break_index(units, lang)
+        bi = _two_line_break_index(units, lang, budget)
         if bi is not None:
             groups = [list(units[:bi]), list(units[bi:])]
     if groups is None:  # 3+ lines, or no two-line split fits the hard budget
         target = -(-total // max_lines)  # ceil div: balance across max_lines
         groups = []
-        cur: List[Tuple[str, str]] = []
+        cur: list[tuple[str, str]] = []
         for u in units:
             if (
                 cur
@@ -398,7 +407,7 @@ def wrap_cue_text(text: str, lang: str, max_lines: int) -> str:
         if cur:
             groups.append(cur)
         if not _no_spaces(lang) and len(groups) > 1:
-            _slide_sticky_line_ends(groups, lang)
+            _slide_sticky_line_ends(groups, lang, budget)
     lines = [_join_line(g) for g in groups]
     if lang in {"ja", "zh", "yue"} and len(lines) > 1:
         from .kinsoku import apply_kinsoku

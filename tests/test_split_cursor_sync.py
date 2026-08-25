@@ -80,8 +80,9 @@ def test_extra_unit_resyncs_following_clause(caplog):
 
 
 def test_unrecoverable_desync_warns_and_degrades(caplog):
-    # A unit is missing mid-clause: no shift can restore pairing. Keep legacy
-    # slicing (timing may be off for that clause) but never crash, and warn.
+    # A unit is missing mid-clause: no shift can restore pairing. The clause
+    # degrades to proportional timing over its own window (timing may be off for
+    # that clause) but the text survives, nothing crashes, and it warns.
     text = "alpha beta gamma delta epsilon"
     word_data = _word_data(text)
     del word_data[2]  # "gamma" unit lost upstream

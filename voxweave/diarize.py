@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Sequence, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from voxweave import config
 from voxweave.core.schema import Cue
@@ -489,8 +490,12 @@ def _run_span(
 
 
 def format_speaker_cues(
-    cues: List[Cue], turns: Sequence[Turn] | None, lang: str
-) -> List[Cue]:
+    cues: list[Cue],
+    turns: Sequence[Turn] | None,
+    lang: str,
+    *,
+    max_line_length: int | None = None,
+) -> list[Cue]:
     """Speaker-aware post-pass over smart_split's cues (pure, replayable).
 
     Single-speaker cues pass through. A two-speaker cue becomes one Netflix
@@ -499,20 +504,31 @@ def format_speaker_cues(
     otherwise — and for 3+ speakers — the cue splits at the speaker boundaries
     with word-accurate timing. Lyric cues pass through untouched (the music-note
     wrap owns that display).
+
+    ``max_line_length`` is the same per-cue budget in native cells that
+    smart_split used for this file (``None`` = the language default), so the dual
+    gate and the piece re-wrap render for the configured player instead of the
+    built-in 42-column profile.
     """
     if not turns:
         return cues
     from voxweave.core.layout import (
-        DEFAULT_MAX_LINE_LENGTH,
+        _line_budget_width,
         _vis_width,
+        default_max_line_length,
         default_max_lines,
         wrap_cue_text,
     )
     from voxweave.core.smart_split import _build_atoms
 
     max_lines = default_max_lines(lang)
+    # Half-width cells -- the unit _vis_width and wrap_cue_text measure in.
+    budget = _line_budget_width(
+        default_max_line_length(lang) if max_line_length is None else max_line_length,
+        lang,
+    )
     dual_ok = max_lines >= 2
-    out: List[Cue] = []
+    out: list[Cue] = []
     for cue in cues:
         word_data = cue.get("word_data") or []
         if cue.get("lyric") or not word_data:
@@ -532,9 +548,9 @@ def format_speaker_cues(
         if (
             len(runs) == 2
             and dual_ok
-            and all(_vis_width(f"-{t}") <= DEFAULT_MAX_LINE_LENGTH for t in one_line)
+            and all(_vis_width(f"-{t}") <= budget for t in one_line)
         ):
-            # Netflix dual-speaker event: one line per speaker, both fit 42 cols.
+            # Netflix dual-speaker event: one line per speaker, both within budget.
             dual = cast(Cue, dict(cue))
             dual["text"] = f"-{one_line[0]}\n-{one_line[1]}"
             out.append(dual)
@@ -547,7 +563,7 @@ def format_speaker_cues(
             # Re-wrap the piece for its language (the same layout machinery
             # smart_split uses): an en split re-flows to <=2 clean lines, a zh/ja
             # piece stays one line and never carries a stale "\n".
-            part["text"] = wrap_cue_text(piece, lang, max_lines)
+            part["text"] = wrap_cue_text(piece, lang, max_lines, max_line_length=budget)
             part["start"] = start
             part["end"] = end
             part["word_data"] = list(word_data[wd_cursor : wd_cursor + n])
@@ -557,24 +573,28 @@ def format_speaker_cues(
 
 
 def _ordered_speaker_format(
-    cues: List[Cue], turns: Sequence[Turn] | None, lang: str
-) -> List[Cue]:
+    cues: list[Cue],
+    turns: Sequence[Turn] | None,
+    lang: str,
+    *,
+    max_line_length: int | None = None,
+) -> list[Cue]:
     """format_speaker_cues + re-sort + overlap trim (splits can abut)."""
-    out = format_speaker_cues(cues, turns, lang)
+    out = format_speaker_cues(cues, turns, lang, max_line_length=max_line_length)
     out.sort(key=lambda c: (c["start"], c["end"]))
     for prev, nxt in zip(out, out[1:]):
-        if prev["end"] > nxt["start"]:
-            prev["end"] = nxt["start"]
+        prev["end"] = min(prev["end"], nxt["start"])
     return out
 
 
 def apply_speaker_format(
-    cues: List[Cue],
+    cues: list[Cue],
     turns: Sequence[Turn] | None,
     lang: str,
     *,
-    thresholds: "dict | SplitThresholds | None" = None,
-) -> List[Cue]:
+    thresholds: dict | SplitThresholds | None = None,
+    max_line_length: int | None = None,
+) -> list[Cue]:
     """Public entry: no-op without turns, otherwise format + keep cue order sane.
 
     When ``thresholds`` is given (the same gap thresholds smart_split used for this
@@ -582,12 +602,15 @@ def apply_speaker_format(
     splits/dashes get the same timing polish as ordinary cues (short pieces extend
     into the following gap, sub-0.5s gaps chain) and never render as sub-flash
     cues. ``_cleanup_cues`` is timing-only and never merges content, so distinct
-    speakers stay separate cues. ``thresholds=None`` keeps the pre-polish behavior
-    for replay/back-compat callers.
+    speakers stay separate cues, and it is idempotent for cues carrying timed
+    ``word_data``, so this second pass cannot stack another pad onto an already
+    padded cue. ``thresholds=None`` keeps the pre-polish behavior for
+    replay/back-compat callers. ``max_line_length`` mirrors smart_split's per-cue
+    budget (see :func:`format_speaker_cues`).
     """
     if not turns:
         return cues
-    out = _ordered_speaker_format(cues, turns, lang)
+    out = _ordered_speaker_format(cues, turns, lang, max_line_length=max_line_length)
     if thresholds is not None:
         from voxweave.core.smart_split import SplitThresholds
         from voxweave.core.timing import _cleanup_cues

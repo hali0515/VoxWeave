@@ -10,9 +10,16 @@ come from ``layout``.
 from __future__ import annotations
 
 import bisect
-from typing import List, cast
+from typing import cast
 
-from .layout import _fits_budget, _no_spaces, _reading_chars, _visual_len, wrap_cue_text
+from .layout import (
+    _fits_budget,
+    _line_budget_width,
+    _no_spaces,
+    _reading_chars,
+    _visual_len,
+    wrap_cue_text,
+)
 from .schema import Cue
 
 TWO_FRAME_S = 2.0 / 24.0  # ~0.083s Netflix min inter-cue gap
@@ -51,8 +58,19 @@ def _gap_between(a: Cue, b: Cue) -> float | None:
     return (bs - ae) if ae is not None and bs is not None else None
 
 
+def _speech_end(cue: Cue) -> float | None:
+    """Latest word end in the cue, or None when it carries no timed word_data.
+
+    This is the cue's *speech* end, which is invariant under the display-end
+    extensions this module applies — the stable anchor timing passes must
+    measure their pads from if they are to stay idempotent.
+    """
+    ends = [e for w in cue.get("word_data") or [] if (e := w.get("end")) is not None]
+    return max(ends) if ends else None
+
+
 def _merge_micro_cues(
-    cues: List[Cue],
+    cues: list[Cue],
     lang: str,
     *,
     max_gap_s: float,
@@ -60,7 +78,7 @@ def _merge_micro_cues(
     max_cue_s: float,
     min_cue_s: float = 0.0,
     max_lines: int = 1,
-) -> List[Cue]:
+) -> list[Cue]:
     """Merge adjacent cues separated by sub-glue gaps.
 
     Two folding rules, both gated by ``max_gap_s`` (0.3s, below ``clause_ms``
@@ -129,19 +147,27 @@ def _merge_micro_cues(
         escaped.append(False)
     for cue, was_escaped in zip(out, escaped):
         if was_escaped:  # over-budget forced merge -> re-wrap so it renders legally
-            cue["text"] = wrap_cue_text(cue["text"], lang, max_lines)
+            # max_line_length is in native cells (what _fits_budget above measures
+            # in); wrap_cue_text measures half-width cells, so convert rather than
+            # letting it fall back to the built-in 42-column profile.
+            cue["text"] = wrap_cue_text(
+                cue["text"],
+                lang,
+                max_lines,
+                max_line_length=_line_budget_width(max_line_length, lang),
+            )
     return out
 
 
 def _glue_short_cues(
-    cues: List[Cue],
+    cues: list[Cue],
     lang: str,
     *,
     max_gap_s: float,
     max_line_length: int,
     max_lines: int,
     max_cue_s: float,
-) -> List[Cue]:
+) -> list[Cue]:
     """Glue a super-short single-word flicker cue onto whichever neighbor abuts it
     closest, when that gap is below ``max_gap_s`` — contiguous speech means a
     spurious split, not a real pause.
@@ -159,7 +185,7 @@ def _glue_short_cues(
         return cues
     sep = "" if _no_spaces(lang) else " "
     work = [cast(Cue, dict(c)) for c in cues]
-    out: List[Cue] = []
+    out: list[Cue] = []
     i, n = 0, len(work)
     while i < n:
         c = work[i]
@@ -234,13 +260,13 @@ def _glue_short_cues(
 
 
 def _cleanup_cues(
-    cues: List[Cue],
+    cues: list[Cue],
     *,
     min_cue_s: float,
     max_cue_s: float,
     cps: float = 0.0,
     lag_out_s: float = 0.0,
-) -> List[Cue]:
+) -> list[Cue]:
     """Timing-only pass — never merges content across a real pause.
 
     - Extends short cues into the following gap (no overlap) up to min_cue_s.
@@ -251,32 +277,43 @@ def _cleanup_cues(
     - Chains sub-0.5s inter-cue gaps down to 2 frames.
     - Visible gaps (>=1s) are left untouched.
     - max_cue_s prevents any extension from re-inflating past the segmentation cap.
+
+    Idempotent for cues carrying timed ``word_data``: the pad targets an absolute
+    end derived from the cue's speech end, never from the display end it already
+    produced, so ``cleanup(cleanup(x)) == cleanup(x)``. That matters because the
+    diarize path runs the pass a second time after speaker formatting.
     """
     out = [cast(Cue, dict(c)) for c in cues]
     for i, c in enumerate(out):
         nxt_start = out[i + 1]["start"] if i + 1 < len(out) else None
-        # desired duration: min-dur floor, CPS reading time (capped linger), tail pad
-        dur = c["end"] - c["start"]
-        desired = dur
+        # desired end: min-dur floor, CPS reading time (capped linger), tail pad.
+        # The tail pad is measured from the cue's SPEECH end (last word_data end),
+        # not from its current display end, so re-running the pass cannot stack a
+        # second pad onto an already-padded cue (the sparse-stream and final-cue
+        # cases, where there is always room to grow). A display end that already
+        # sits past the pad target — CPS linger, an earlier shot snap — is kept as
+        # is by the max rule. Cues without timed word_data have no speech anchor
+        # and keep the legacy display-end pad.
+        speech_end = _speech_end(c)
+        lag_anchor = c["end"] if speech_end is None else speech_end
+        want = c["end"]
         if min_cue_s > 0:
-            desired = max(desired, min_cue_s)
+            want = max(want, c["start"] + min_cue_s)
         if lag_out_s > 0:
-            desired = max(desired, dur + lag_out_s)
+            want = max(want, lag_anchor + lag_out_s)
         if cps > 0:
             need = _reading_chars(c.get("text", "")) / cps
-            desired = max(desired, min(need, dur + LINGER_CAP_S))
-        if desired > dur:
-            want = c["start"] + desired
+            want = max(want, min(c["start"] + need, c["end"] + LINGER_CAP_S))
+        if want > c["end"]:
             if nxt_start is None:
                 c["end"] = want
             elif nxt_start - c["end"] > TWO_FRAME_S:
                 c["end"] = min(want, nxt_start)
             # else: the inter-cue gap is already at/under the 2-frame floor —
-            # leave it untouched. This keeps _cleanup_cues idempotent (the
-            # diarize path runs it twice): without the guard a second lag-out
-            # pass would extend over a chained 2-frame gap and collapse it to
-            # zero, which the chaining branch then cannot restore. Gaps wider
-            # than the floor still lag-out exactly as before.
+            # leave it untouched. Without the guard a second lag-out pass would
+            # extend over a chained 2-frame gap and collapse it to zero, which
+            # the chaining branch then cannot restore. Gaps wider than the floor
+            # still lag-out exactly as before.
         # chaining: close small inter-cue gaps to 2 frames
         if nxt_start is not None:
             gap = nxt_start - c["end"]
@@ -333,15 +370,16 @@ _EPS = 1e-9
 
 
 def _snap_to_shots(
-    cues: List[Cue],
-    shots: List[float],
+    cues: list[Cue],
+    shots: list[float],
     *,
     snap_s: float,
-    max_cue_s: float,
-) -> List[Cue]:
+    max_cue_s: float | None = None,
+) -> list[Cue]:
     """Adjust cue boundaries near shot changes per the Netflix TTSG zone rules
     (runs after _cleanup_cues). ``snap_s`` is the search window for pairing a
-    boundary with a cut (<=0 disables snapping entirely).
+    boundary with a cut (<=0 disables snapping entirely); ``max_cue_s`` is the
+    duration cap every move must respect (``None`` = no cap check).
 
     In-times (asymmetric zones, 24 fps frames):
     - 1-7 frames before the cut: move onto the cut (removes the pre-cut flash).
@@ -358,11 +396,15 @@ def _snap_to_shots(
     + 2 frames and below the cue's own end; ends never pull below the last
     word's end (dialogue that crosses the cut keeps its subtitle across it,
     falling back to the 12-frames-after landing zone), never collide with the
-    next cue, and respect the duration cap.
+    next cue. Every move — the in-time lead-in included — respects the duration
+    cap, so snapping can never re-inflate a cue past the segmentation limit.
     """
     if snap_s <= 0 or not shots:
         return cues
     out = [cast(Cue, dict(c)) for c in cues]
+
+    def within_cap(start: float, end: float) -> bool:
+        return max_cue_s is None or end - start <= max_cue_s + _EPS
 
     def nearest(t: float) -> float | None:
         i = bisect.bisect_left(shots, t)
@@ -377,8 +419,8 @@ def _snap_to_shots(
         start, end = c.get("start"), c.get("end")
         if start is None or end is None:
             continue
-        ends = [e for w in c.get("word_data") or [] if (e := w.get("end")) is not None]
-        speech_end = max(ends, default=end)
+        last_word_end = _speech_end(c)
+        speech_end = end if last_word_end is None else last_word_end
         prev_end = out[i - 1].get("end") if i > 0 else None
         nxt_start = out[i + 1].get("start") if i + 1 < len(out) else None
 
@@ -396,9 +438,13 @@ def _snap_to_shots(
             if prev_end is not None:
                 new_start = max(new_start, prev_end + TWO_FRAME_S)
             # moving earlier is a free lead-in; moving later (flash removal /
-            # landing-zone push) must never delay the text by over half a second
-            if new_start < end - TWO_FRAME_S and (
-                new_start <= start or new_start - start <= _SHOT_LANDING_S
+            # landing-zone push) must never delay the text by over half a second.
+            # A lead-in also lengthens the cue, so it obeys the duration cap just
+            # like the out-time branches: a cue already at the cap keeps its start.
+            if (
+                new_start < end - TWO_FRAME_S
+                and (new_start <= start or new_start - start <= _SHOT_LANDING_S)
+                and within_cap(new_start, end)
             ):
                 c["start"] = new_start
 
@@ -413,7 +459,7 @@ def _snap_to_shots(
             if target > end + _EPS:  # extend into the following gap (free)
                 if (
                     nxt_start is None or target <= nxt_start - TWO_FRAME_S
-                ) and target - c["start"] <= max_cue_s:
+                ) and within_cap(c["start"], target):
                     c["end"] = target
                     applied = True
             elif target < end - _EPS:  # pull back, never cutting speech
@@ -428,7 +474,7 @@ def _snap_to_shots(
                 if (
                     target > end
                     and (nxt_start is None or target <= nxt_start - TWO_FRAME_S)
-                    and target - c["start"] <= max_cue_s
+                    and within_cap(c["start"], target)
                 ):
                     c["end"] = target
     return out

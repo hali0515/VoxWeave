@@ -10,9 +10,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from voxweave import backend
-from voxweave import fsio
-from voxweave.core.schema import Cue
+from voxweave import asrfix as asrfix_mod
+from voxweave import backend, chunking, fsio, realign, songdet
+from voxweave import translate as translate_mod
 from voxweave.chunking import (
     decode_to_wav,
     pack_speech_segments,
@@ -20,6 +20,7 @@ from voxweave.chunking import (
     slice_wav,
     vad_speech_segments,
 )
+from voxweave.core.schema import Cue
 from voxweave.debug import DebugSink, FileDebugSink
 from voxweave.lang import (
     is_supported,
@@ -28,9 +29,6 @@ from voxweave.lang import (
     transcript_content_weight,
 )
 from voxweave.progress import Reporter
-from voxweave import realign
-from voxweave import translate as translate_mod
-from voxweave import asrfix as asrfix_mod
 from voxweave.songdet import (
     detect_song_spans,
     excise_spans_from_segments,
@@ -466,6 +464,7 @@ def transcribe(
     context: str | None = None,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
+    release_panns: bool = True,
 ) -> tuple[
     str,
     list[dict],
@@ -483,6 +482,11 @@ def transcribe(
     pyannote on the separated-vocals wav and returns the speaker turns (empty unless
     set). All models run in-process (no network calls). smart_split and file writing
     are handled by :func:`process`.
+
+    ``release_panns=False`` keeps the PANNs singleton resident on return: the caller
+    has a second detection pass queued (the ``--sdh`` sidecar tags the ORIGINAL mix
+    with the same model) and would otherwise pay a reload. That caller owns the
+    release. Every other singleton this function loads is released before it returns.
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
@@ -492,6 +496,9 @@ def transcribe(
         Path
     ] = []  # intermediate files (fullband/vocals/16k/32k wav), deleted at end
     tmp_chunks: list[Path] = []
+    # Set only on a successful return with release_panns=False: a caller can inherit
+    # the loaded model, but never as the fallout of a failed run.
+    panns_handoff = False
     try:
         vocals: Path | None = None
         fullband: Path | None = None
@@ -558,6 +565,11 @@ def transcribe(
                         "continuing without song skip; install voxweave[songdet] or pass --no-skip-songs",
                         e,
                     )
+        if release_panns:
+            # Last PANNs consumer of this job is done (an --sdh run defers this to
+            # its own pass). Drop the ~300MB before the ASR/aligner weights load, so
+            # the two never share the card. No-op when detection never ran.
+            songdet.release_model()
 
         rep.stage("VAD chunking")
         segs = vad_speech_segments(wav)
@@ -789,6 +801,7 @@ def transcribe(
                 )
             finally:
                 diarize_mod.release()
+        panns_handoff = not release_panns
         return (
             iso,
             all_units,
@@ -799,6 +812,13 @@ def transcribe(
     finally:
         # Release ASR/alignment singleton VRAM (separation self-releases earlier).
         backend.release()
+        # No VAD pass can follow: every vad_speech_segments call lives above.
+        chunking.release_silero_vad()
+        if not panns_handoff:
+            # Safety net: an exception before the post-detection release (or before
+            # the sdh caller can take over) would otherwise strand PANNs on the card.
+            # Idempotent when the release above already ran.
+            songdet.release_model()
         for p in tmp:
             p.unlink(missing_ok=True)
         for c in tmp_chunks:
@@ -880,12 +900,36 @@ def _maybe_adaptive_thresholds(th: dict, units: list[dict]) -> dict:
     return out
 
 
+def _resnap_shots(
+    cues: list[Cue], shot_changes: list[float] | None, thresholds: dict
+) -> list[Cue]:
+    """Re-apply shot snapping after speaker formatting rewrote the cue stream.
+
+    smart_split snaps boundaries to shot changes as its last timing step, but
+    speaker formatting splits cues at speaker turns and runs another timing
+    cleanup, which moves those boundaries again -- so a formatted cue can end up
+    flashing across a cut that the first snap had cleared. Snapping once more
+    with the same cuts and the same duration cap restores the invariant;
+    ``_snap_to_shots`` leaves boundaries that already sit in a landing zone
+    untouched, so the extra pass is a no-op when formatting changed nothing.
+    """
+    if not shot_changes:
+        return cues
+    from voxweave.core.smart_split import SplitThresholds
+    from voxweave.core.timing import _snap_to_shots
+
+    th = SplitThresholds.from_mapping(thresholds)
+    return _snap_to_shots(
+        cues, sorted(shot_changes), snap_s=th.shot_snap_s, max_cue_s=th.max_cue_s
+    )
+
+
 # A cue is a lyric when at least this fraction of its span overlaps detected singing.
 LYRIC_MIN_OVERLAP = 0.5
 
 
 def mark_lyric_cues(
-    cues: Sequence["Cue"], sing_spans: list[tuple[float, float]] | None
+    cues: Sequence[Cue], sing_spans: list[tuple[float, float]] | None
 ) -> None:
     """Flag cues whose span mostly overlaps detected singing (``lyric=True``).
 
@@ -1216,6 +1260,9 @@ def process(
             context=context,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
+            # --sdh runs PANNs a second time (original mix) after the siblings land;
+            # keep the model resident for it instead of reloading.
+            release_panns=not sdh,
         )
         sing_spans = sing_spans or None
         speaker_turns = speaker_turns or None
@@ -1225,8 +1272,8 @@ def process(
             rep.stage("shot detection")
             shot_changes = shotdet.detect_shot_changes(media_path)
 
-    from voxweave.core.smart_split import smart_split_segments
     from voxweave.config import gap_thresholds
+    from voxweave.core.smart_split import smart_split_segments
 
     # zh: Qwen punctuation can drift up to one character; snap to jieba word boundary
     # to prevent smart_split from splitting mid-word (e.g. 数据|中心 instead of 数据中心).
@@ -1263,6 +1310,8 @@ def process(
 
         # Same thresholds as smart_split so speaker splits get timing polish too.
         cues = apply_speaker_format(cues, speaker_turns, iso, thresholds=thresholds)
+        # ... and its cleanup can push a boundary back across a cut, so snap again.
+        cues = _resnap_shots(cues, shot_changes, thresholds)
 
     rep.stage("write siblings")
     vtt_out = _write_siblings(
@@ -1284,6 +1333,9 @@ def process(
             _write_sdh_sidecar(media_path, cues, rep)
         except Exception as e:
             log.warning("SDH sidecar failed (non-fatal): %r", e)
+        finally:
+            # transcribe deferred this release for the sidecar's second pass.
+            songdet.release_model()
     return vtt_out
 
 
@@ -1329,8 +1381,8 @@ def split(
     mode if absent. ``timestamps`` behaves as in :func:`process`.  This remains model-free
     by default; ``semantic_split=True`` opts into the isolated boundary selector.
     """
-    from voxweave.core.smart_split import smart_split_segments
     from voxweave.config import gap_thresholds
+    from voxweave.core.smart_split import smart_split_segments
 
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
@@ -1374,8 +1426,17 @@ def split(
     if speaker_turns:
         from voxweave.diarize import apply_speaker_format
 
-        # Same thresholds as smart_split so speaker splits get timing polish too.
-        cues = apply_speaker_format(cues, speaker_turns, iso, thresholds=thresholds)
+        # Same thresholds AND line budget as smart_split so speaker splits get the
+        # same timing polish and wrap width the deterministic layout just used.
+        cues = apply_speaker_format(
+            cues,
+            speaker_turns,
+            iso,
+            thresholds=thresholds,
+            max_line_length=smart_split_kwargs.get("max_line_length"),
+        )
+        # ... and its cleanup can push a boundary back across a cut, so snap again.
+        cues = _resnap_shots(cues, shot_changes, thresholds)
     vtt_out = _write_siblings(
         json_path,
         cues,

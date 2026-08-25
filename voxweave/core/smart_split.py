@@ -23,10 +23,10 @@ import functools
 import logging
 import math
 import re
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from .breakpoints import legal_break_index, phrase_atoms
 from .conjunctions import conjunctions_by_language, get_comma
@@ -37,7 +37,6 @@ from .kinsoku import (
     zh_pos_boundary_penalties,
 )
 from .langsets import LANGUAGES_WITHOUT_SPACES as LANGUAGES_WITHOUT_SPACES  # re-export
-from .schema import Cue, Unit
 from .layout import (
     WIDE_GLYPH_LANGUAGES,
     _comma_chars,
@@ -50,14 +49,15 @@ from .layout import (
     _strip_trailing_commas,
     _token_char_count,
     _tokens,
-    _visual_len,
     _vis_width,
+    _visual_len,
     default_max_line_length,
     default_max_lines,
     split_subtitle,
     strip_punct_for_subtitles,
     wrap_cue_text,
 )
+from .schema import Cue, Unit
 from .timing import (
     GLUE_MAX_GAP_S,
     _cleanup_cues,
@@ -91,6 +91,12 @@ SEMANTIC_QUALITY_AVG_TOLERANCE = 15.0
 SEMANTIC_QUALITY_WORST_TOLERANCE = 25
 SEMANTIC_PREFERRED_MIN_CUE_S = 1.0
 
+# Cursor recovery: how many later clauses may be probed for a resync point when a
+# clause cannot be located in ``word_data`` at all. A desync that survives this
+# many clauses is not a local glitch, and each surviving clause still re-anchors
+# on its own content, so a wider search buys nothing.
+RESYNC_LOOKAHEAD_CLAUSES = 8
+
 
 def default_comma_split_min_len(lang: str) -> int:
     """Minimum clause length (visual chars) for a comma to become a cue boundary.
@@ -109,7 +115,7 @@ def _comma_load(s: str, lang: str) -> int:
     return sum(1 for c in s if c in commas)
 
 
-def _split_keep_comma(sentence: str, lang: str) -> List[str]:
+def _split_keep_comma(sentence: str, lang: str) -> list[str]:
     """Split a sentence after each comma (comma stays on the left part).
     Commas between digits (e.g. 10,000) are NOT split points. For spaced
     languages the comma must also end its token (next char is whitespace):
@@ -117,8 +123,8 @@ def _split_keep_comma(sentence: str, lang: str) -> List[str]:
     token-to-word_data index zip in ``split_at_sentence_end``."""
     commas = _comma_chars(lang)
     no_spaces = _no_spaces(lang)
-    out: List[str] = []
-    buf: List[str] = []
+    out: list[str] = []
+    buf: list[str] = []
     n = len(sentence)
     for i, ch in enumerate(sentence):
         buf.append(ch)
@@ -136,14 +142,14 @@ def _split_keep_comma(sentence: str, lang: str) -> List[str]:
     return out
 
 
-def _comma_clauses(sentence: str, lang: str, min_len: int) -> List[str]:
+def _comma_clauses(sentence: str, lang: str, min_len: int) -> list[str]:
     """Group comma-delimited pieces into cue clauses.
 
     A clause flushes once it reaches ``min_len`` visual chars. The comma-load
     cap (<=1) prevents piling repeated short fragments (e.g. a name said several
     times) onto one line. Trailing commas are kept for downstream stripping."""
     pieces = _split_keep_comma(sentence, lang)
-    clauses: List[str] = []
+    clauses: list[str] = []
     buf = ""
     for piece in pieces:
         if buf and _comma_load(buf + piece, lang) > 1:
@@ -244,7 +250,7 @@ def _build_atoms(
     return atoms
 
 
-def _phrase_boundary_atoms(atoms: List[dict], text: str, lang: str) -> set[int]:
+def _phrase_boundary_atoms(atoms: list[dict], text: str, lang: str) -> set[int]:
     """Atom indices that are BudouX phrase starts — the only legal length-break
     points (prevents splitting mid-phrase, e.g. です into で|す).
 
@@ -268,7 +274,7 @@ def _phrase_boundary_atoms(atoms: List[dict], text: str, lang: str) -> set[int]:
 
 
 def _snap_mid_to_phrase_boundary(
-    toks: List[str], text: str, lang: str, target: int
+    toks: list[str], text: str, lang: str, target: int
 ) -> int:
     """Snap a midpoint index to the best nearby phrase boundary.
 
@@ -296,9 +302,7 @@ def _snap_mid_to_phrase_boundary(
     return min(valid, key=lambda b: (left_pen(b), abs(b - target)))
 
 
-@functools.lru_cache(
-    maxsize=None
-)  # one pattern per language; avoids recompiling per clause
+@functools.cache  # one pattern per language; avoids recompiling per clause
 def _build_split_pattern(lang: str) -> re.Pattern:
     comma = get_comma(lang)
     extra_terminals = ";。！？" if _no_spaces(lang) else ";"
@@ -321,23 +325,23 @@ def split_sentence_heuristically(
     max_lines: int,
     lang: str,
     split_at_comma: bool = True,
-    comma_split_min_len: Optional[int] = None,
-) -> List[str]:
+    comma_split_min_len: int | None = None,
+) -> list[str]:
     if split_at_comma:
         if comma_split_min_len is None:
             comma_split_min_len = default_comma_split_min_len(lang)
         clauses = _comma_clauses(sentence, lang, comma_split_min_len)
     else:
         clauses = [sentence]
-    out: List[str] = []
+    out: list[str] = []
     for clause in clauses:
         out.extend(_fit_split_clause(clause, max_line_length, max_lines, lang))
     return [p for p in out if p]
 
 
 def _repack_parts(
-    parts: List[str], max_line_length: int, max_lines: int, lang: str
-) -> List[str]:
+    parts: list[str], max_line_length: int, max_lines: int, lang: str
+) -> list[str]:
     """Greedily merge adjacent terminal/conjunction parts back up to the budget.
 
     The split pattern marks *candidate* break points, not mandates: keeping every
@@ -345,7 +349,7 @@ def _repack_parts(
     "and eggs"). Mirrors the accumulate-then-flush behavior of _comma_clauses.
     """
     sep = "" if _no_spaces(lang) else " "
-    packed: List[str] = []
+    packed: list[str] = []
     for part in parts:
         if packed:
             cand = packed[-1] + sep + part
@@ -361,7 +365,7 @@ def _repack_parts(
     return packed
 
 
-def _visual_midpoint_index(tokens: List[str], lang: str) -> int:
+def _visual_midpoint_index(tokens: list[str], lang: str) -> int:
     """Token boundary nearest the visual midpoint (never 0 or len(tokens))."""
     if len(tokens) < 2:
         return 1
@@ -375,7 +379,7 @@ def _visual_midpoint_index(tokens: List[str], lang: str) -> int:
 
 def _split_part_to_budget(
     part: str, max_line_length: int, max_lines: int, lang: str
-) -> List[str]:
+) -> list[str]:
     """Recursively split a multi-token part until every result fits.
 
     A single indivisible token is deliberately returned intact: text-only
@@ -455,7 +459,7 @@ def _fit_split_clause(
     max_line_length: int,
     max_lines: int,
     lang: str,
-) -> List[str]:
+) -> list[str]:
     """Keep a clause whole if it fits ``max_lines``; otherwise split at
     terminals/conjunctions (repacked to the budget), then fall back to an even
     token split."""
@@ -467,7 +471,7 @@ def _fit_split_clause(
 
     pattern = _build_split_pattern(lang)
     candidate_parts = [p.strip() for p in pattern.split(clause) if p and p.strip()]
-    fitted_parts: List[str] = []
+    fitted_parts: list[str] = []
     for part in candidate_parts:
         fitted_parts.extend(
             _split_part_to_budget(part, max_line_length, max_lines, lang)
@@ -475,7 +479,7 @@ def _fit_split_clause(
     return _repack_parts(fitted_parts, max_line_length, max_lines, lang)
 
 
-def _segment_sentences(text: str, lang: str) -> List[str]:
+def _segment_sentences(text: str, lang: str) -> list[str]:
     try:
         import pysbd  # type: ignore
 
@@ -489,7 +493,7 @@ def _segment_sentences(text: str, lang: str) -> List[str]:
     return [s for s in re.split(r"(?<=[.!?。！？])\s*", text) if s and s.strip()]
 
 
-def _snap_sentence_breaks(text: str, sentences: List[str], lang: str) -> List[str]:
+def _snap_sentence_breaks(text: str, sentences: list[str], lang: str) -> list[str]:
     """Drop sentence boundaries that fall inside a whitespace-delimited token.
 
     ASR tokens can carry internal sentence punctuation (e.g. laughter transcribed
@@ -502,7 +506,7 @@ def _snap_sentence_breaks(text: str, sentences: List[str], lang: str) -> List[st
     """
     if _no_spaces(lang) or len(sentences) < 2:
         return sentences
-    cuts: List[int] = []
+    cuts: list[int] = []
     pos = 0
     for sent in sentences[:-1]:
         idx = text.find(sent, pos)
@@ -510,7 +514,7 @@ def _snap_sentence_breaks(text: str, sentences: List[str], lang: str) -> List[st
             return sentences  # segmenter rewrote content; nothing safe to snap
         pos = idx + len(sent)
         cuts.append(pos)
-    pieces: List[str] = []
+    pieces: list[str] = []
     last = 0
     for cut in cuts:
         if cut >= len(text) or text[cut].isspace() or text[cut - 1].isspace():
@@ -524,58 +528,103 @@ def _snap_sentence_breaks(text: str, sentences: List[str], lang: str) -> List[st
     return pieces or sentences
 
 
+def _units_match(word_data: list[Unit], at: int, tokens: Sequence[str]) -> bool:
+    """True when ``word_data`` spells ``tokens`` exactly starting at index ``at``.
+
+    ``reinject_punct`` can glue a boundary space onto a unit ('开 ' at a
+    CJK<->Latin seam); the cursor arithmetic is whitespace-insensitive, so
+    content is compared stripped.
+    """
+    if at < 0 or at + len(tokens) > len(word_data):
+        return False
+    return all(
+        (word_data[at + j].get("word") or "").strip() == tok.strip()
+        for j, tok in enumerate(tokens)
+    )
+
+
 def _anchor_cursor(
-    word_data: List[Unit],
+    word_data: list[Unit],
     cursor: int,
-    clause_tokens: List[str],
+    clause_tokens: Sequence[str],
     max_shift: int = 8,
-) -> Tuple[int, bool]:
+) -> tuple[int, bool]:
     """Verify the clause's tokens match ``word_data`` at ``cursor``; search nearby on mismatch.
 
     Returns ``(start_index, ok)``. The index contract can still break on inputs
     we have not anticipated (ghost or lost units); rather than silently shifting
     every later cue, re-anchor on content within ``max_shift`` units, else keep
-    the cursor and report ``ok=False``.
+    the cursor and report ``ok=False`` — ``_locate_clause_units`` then widens the
+    search to the whole remaining stream.
     """
-
-    def _matches(at: int) -> bool:
-        if at < 0 or at + len(clause_tokens) > len(word_data):
-            return False
-        # reinject can glue a boundary space onto a unit ('开 ' at CJK<->Latin
-        # seams); the cursor arithmetic is whitespace-insensitive, so compare
-        # stripped content.
-        return all(
-            (word_data[at + j].get("word") or "").strip() == tok.strip()
-            for j, tok in enumerate(clause_tokens)
-        )
-
-    if _matches(cursor):
+    if _units_match(word_data, cursor, clause_tokens):
         return cursor, True
     for d in range(1, max_shift + 1):
-        if _matches(cursor + d):
+        if _units_match(word_data, cursor + d, clause_tokens):
             return cursor + d, True
-        if _matches(cursor - d):
+        if _units_match(word_data, cursor - d, clause_tokens):
             return cursor - d, True
     return cursor, False
 
 
-def split_at_sentence_end(
+def _unit_word_index(word_data: Sequence[Unit]) -> dict[str, list[int]]:
+    """Ascending positions of every distinct unit surface in ``word_data``.
+
+    A wide re-anchor scan always starts from a known first token, so probing only
+    that token's positions keeps recovery near O(occurrences) instead of walking
+    the whole stream once per damaged clause.
+    """
+    index: dict[str, list[int]] = {}
+    for i, unit in enumerate(word_data):
+        index.setdefault((unit.get("word") or "").strip(), []).append(i)
+    return index
+
+
+def _find_clause_forward(
+    word_data: list[Unit],
+    index: dict[str, list[int]],
+    start: int,
+    tokens: Sequence[str],
+) -> int | None:
+    """First position at or after ``start`` whose units spell ``tokens`` exactly."""
+    if not tokens:
+        return None
+    positions = index.get(tokens[0].strip())
+    if not positions:
+        return None
+    for at in positions[bisect_left(positions, max(0, start)) :]:
+        if _units_match(word_data, at, tokens):
+            return at
+    return None
+
+
+@dataclass(frozen=True)
+class _ClausePlan:
+    """One cue clause plus the ``word_data`` arithmetic it needs.
+
+    ``anchor_tokens`` is what the clause must spell in ``word_data`` (whole words
+    for spaced languages, non-space characters otherwise). It holds exactly
+    ``unit_count`` entries, so the same tuple doubles as the surface list for a
+    synthesized proportional fill when the clause cannot be located.
+    """
+
+    text: str
+    anchor_tokens: tuple[str, ...]
+    unit_count: int
+
+
+def _clause_plans(
     text: str,
-    word_data: List[Unit],
     lang: str,
     max_line_length: int,
     max_lines: int,
-    split_at_comma: bool = True,
-    comma_split_min_len: Optional[int] = None,
-    *,
-    defer_length_split: bool = False,
-) -> List[Cue]:
+    split_at_comma: bool,
+    comma_split_min_len: int | None,
+    defer_length_split: bool,
+) -> list[_ClausePlan]:
+    """Segment ``text`` into cue clauses, each with its ``word_data`` footprint."""
     sentences = _snap_sentence_breaks(text, _segment_sentences(text, lang), lang)
-    cues: List[Cue] = []
-    cursor = 0
-    # Content verification needs unit texts; legacy callers without a "word"
-    # key keep the blind index cursor.
-    anchored = bool(word_data) and "word" in word_data[0]
+    plans: list[_ClausePlan] = []
     for sent in sentences:
         if defer_length_split:
             min_len = (
@@ -602,48 +651,165 @@ def split_at_sentence_end(
                 # word_data is char-level for CJK; advance by non-space char count.
                 # Anchor on the same per-char granularity (reinject_punct emits one
                 # item per non-whitespace char, so units match chars 1:1).
-                wc = sum(_token_char_count(t) for t in clause_tokens)
-                anchor_tokens = [c for c in clause if not c.isspace()]
+                anchor_tokens = tuple(c for c in clause if not c.isspace())
+                unit_count = sum(_token_char_count(t) for t in clause_tokens)
             else:
-                wc = len(clause_tokens)
-                anchor_tokens = clause_tokens
-            start_at = cursor
-            if anchored and anchor_tokens:
-                start_at, ok = _anchor_cursor(word_data, cursor, anchor_tokens)
-                if start_at != cursor or not ok:
-                    log.warning(
-                        "cue/word desync at %r: cursor %d -> %d (%s)",
-                        clause[:40],
-                        cursor,
-                        start_at,
-                        "resynced" if ok else "unrecovered",
-                    )
-            chunk_words = word_data[start_at : start_at + wc]
-            cursor = start_at + wc
-            if chunk_words:
-                start = next((w["start"] for w in chunk_words if "start" in w), None)
-                end = next(
-                    (w["end"] for w in reversed(chunk_words) if "end" in w), None
-                )
-            else:
-                start = end = None
-            if start is None or end is None:
-                # No timing data: extend from previous cue end or estimate from word count
-                prev_end = cues[-1]["end"] if cues else 0.0
-                start = start if start is not None else prev_end
-                end = (
-                    end
-                    if end is not None
-                    else start + max(1.0, wc / DEFAULT_DESIRED_WPS)
-                )
-            cues.append(
-                {
-                    "text": clause,
-                    "start": start,
-                    "end": end,
-                    "word_data": chunk_words,
-                }
+                anchor_tokens = tuple(clause_tokens)
+                unit_count = len(clause_tokens)
+            plans.append(_ClausePlan(clause, anchor_tokens, unit_count))
+    return plans
+
+
+def _proportional_units(tokens: Sequence[str], window: Sequence[Unit]) -> list[Unit]:
+    """Spread ``tokens`` evenly across the span ``window`` covers.
+
+    Only used for a clause whose own units cannot be located anywhere: the cue
+    still gets monotone, non-overlapping timing that fully covers its own window
+    instead of borrowing a neighbouring clause's timestamps. Returns ``[]`` when
+    the window carries no usable span, leaving the caller's estimate in charge.
+    """
+    start = _span_start(window)
+    end = _span_end(window)
+    if not tokens or start is None or end is None or end < start:
+        return []
+    first, last = float(start), float(end)
+    step = (last - first) / len(tokens)
+    final = len(tokens) - 1
+    return [
+        {
+            "word": tok,
+            "start": first + i * step,
+            "end": last if i == final else first + (i + 1) * step,
+        }
+        for i, tok in enumerate(tokens)
+    ]
+
+
+def _resync_position(
+    word_data: list[Unit],
+    index: dict[str, list[int]],
+    cursor: int,
+    plans: Sequence[_ClausePlan],
+    position: int,
+) -> int | None:
+    """Unit index where the next locatable clause after ``position`` begins."""
+    for plan in plans[position + 1 : position + 1 + RESYNC_LOOKAHEAD_CLAUSES]:
+        at = _find_clause_forward(word_data, index, cursor, plan.anchor_tokens)
+        if at is not None:
+            return at
+    return None
+
+
+def _locate_clause_units(
+    word_data: list[Unit],
+    index: dict[str, list[int]],
+    cursor: int,
+    plans: Sequence[_ClausePlan],
+    position: int,
+    *,
+    anchored: bool,
+) -> tuple[list[Unit], int]:
+    """Return ``(units, next_cursor)`` for the clause at ``position``.
+
+    The blind index cursor is only trusted where the clause's content actually
+    sits. ``_anchor_cursor`` repairs a local slip; a wider one (a ghost run, a
+    clause whose units were lost upstream) is repaired by a forward content scan
+    over the entire remaining stream. A clause that matches nowhere keeps its
+    text but gets proportional timing across the window up to the next locatable
+    clause, and the cursor resyncs on that clause's content — so the damage stops
+    at the one clause instead of shifting every later cue in the segment.
+    """
+    plan = plans[position]
+    if not anchored or not plan.anchor_tokens:
+        return word_data[cursor : cursor + plan.unit_count], cursor + plan.unit_count
+    local, ok = _anchor_cursor(word_data, cursor, plan.anchor_tokens)
+    start_at: int | None = (
+        local
+        if ok
+        else _find_clause_forward(word_data, index, cursor, plan.anchor_tokens)
+    )
+    if start_at is not None:
+        if start_at != cursor:
+            log.warning(
+                "cue/word desync at clause %d %r: cursor %d -> %d (resynced on content)",
+                position,
+                plan.text[:40],
+                cursor,
+                start_at,
             )
+        end_at = start_at + plan.unit_count
+        return word_data[start_at:end_at], end_at
+    resume = _resync_position(word_data, index, cursor, plans, position)
+    # No resync point in reach: fall back to the blind span so later clauses can
+    # still re-anchor themselves instead of being starved of units.
+    window_end = (
+        min(cursor + plan.unit_count, len(word_data)) if resume is None else resume
+    )
+    log.warning(
+        "cue/word desync at clause %d %r: units unlocatable, proportional timing "
+        "over units %d-%d, cursor -> %d",
+        position,
+        plan.text[:40],
+        cursor,
+        window_end,
+        window_end,
+    )
+    filled = _proportional_units(plan.anchor_tokens, word_data[cursor:window_end])
+    return filled, window_end
+
+
+def split_at_sentence_end(
+    text: str,
+    word_data: list[Unit],
+    lang: str,
+    max_line_length: int,
+    max_lines: int,
+    split_at_comma: bool = True,
+    comma_split_min_len: int | None = None,
+    *,
+    defer_length_split: bool = False,
+) -> list[Cue]:
+    plans = _clause_plans(
+        text,
+        lang,
+        max_line_length,
+        max_lines,
+        split_at_comma,
+        comma_split_min_len,
+        defer_length_split,
+    )
+    cues: list[Cue] = []
+    cursor = 0
+    # Content verification needs unit texts; legacy callers without a "word"
+    # key keep the blind index cursor.
+    anchored = bool(word_data) and "word" in word_data[0]
+    index = _unit_word_index(word_data) if anchored else {}
+    for position, plan in enumerate(plans):
+        chunk_words, cursor = _locate_clause_units(
+            word_data, index, cursor, plans, position, anchored=anchored
+        )
+        if chunk_words:
+            start = next((w["start"] for w in chunk_words if "start" in w), None)
+            end = next((w["end"] for w in reversed(chunk_words) if "end" in w), None)
+        else:
+            start = end = None
+        if start is None or end is None:
+            # No timing data: extend from previous cue end or estimate from word count
+            prev_end = cues[-1]["end"] if cues else 0.0
+            start = start if start is not None else prev_end
+            end = (
+                end
+                if end is not None
+                else start + max(1.0, plan.unit_count / DEFAULT_DESIRED_WPS)
+            )
+        cues.append(
+            {
+                "text": plan.text,
+                "start": start,
+                "end": end,
+                "word_data": chunk_words,
+            }
+        )
     return cues
 
 
@@ -735,7 +901,7 @@ def _atom_boundary_pen(atom: dict) -> int:
 
 
 def _attach_end_penalties(
-    atoms: List[dict], boundary: set[int] | None, lang: str
+    atoms: list[dict], boundary: set[int] | None, lang: str
 ) -> None:
     """Precompute ``atom["end_pen"]`` — penalty for ending a cue/line on this atom.
 
@@ -790,8 +956,8 @@ def _attach_end_penalties(
 
 
 def _best_len_break_pos(
-    cur: List[dict],
-    cur_bnd: List[bool],
+    cur: list[dict],
+    cur_bnd: list[bool],
     at_boundary_next: bool,
     next_atom: dict | None = None,
     ctx: SplitContext | None = None,
@@ -865,7 +1031,7 @@ def _best_len_break_pos(
 
 
 def _classify_atom_break(
-    cur: List[dict],
+    cur: list[dict],
     atom: dict,
     *,
     at_boundary: bool,
@@ -939,7 +1105,7 @@ def _classify_atom_break(
     return gap_break, dur_break, len_break
 
 
-def _hard_wrap_surface(text: str, line_budget: int) -> List[str]:
+def _hard_wrap_surface(text: str, line_budget: int) -> list[str]:
     """Split one indivisible surface token into line-sized pieces.
 
     Normal segmentation never calls this for ordinary words.  It is the final
@@ -990,7 +1156,7 @@ def _surface_parts_for_limits(
     start: float,
     end: float,
     ctx: SplitContext,
-) -> List[tuple[str, float, float]]:
+) -> list[tuple[str, float, float]]:
     """Return display-safe pieces with proportional spans for a coarse surface.
 
     Duration subdivision is activated only once the atom is structurally too
@@ -1034,7 +1200,7 @@ def _surface_parts_for_limits(
     ]
 
 
-def _split_oversized_atom(atom: dict, cue: Cue, ctx: SplitContext) -> List[dict]:
+def _split_oversized_atom(atom: dict, cue: Cue, ctx: SplitContext) -> list[dict]:
     """Subdivide one structurally coarse atom; ordinary atoms pass through."""
     start = atom.get("start")
     end = atom.get("end")
@@ -1050,16 +1216,16 @@ def _split_oversized_atom(atom: dict, cue: Cue, ctx: SplitContext) -> List[dict]
 
 
 def _pack_with_oversized_fallback(
-    atoms: List[dict],
+    atoms: list[dict],
     *,
     boundary: set[int] | None,
     ctx: SplitContext,
     cue: Cue,
-) -> List[List[dict]]:
+) -> list[list[dict]]:
     """Pack normal runs and emit token-internal fallback pieces standalone."""
-    chunks: List[List[dict]] = []
-    run: List[dict] = []
-    run_indices: List[int] = []
+    chunks: list[list[dict]] = []
+    run: list[dict] = []
+    run_indices: list[int] = []
 
     def flush_run() -> None:
         if not run:
@@ -1090,19 +1256,19 @@ def _pack_with_oversized_fallback(
 
 
 def _pack_atoms_into_chunks(
-    atoms: List[dict],
+    atoms: list[dict],
     *,
     boundary: set[int] | None,
     ctx: SplitContext,
-) -> List[List[dict]]:
+) -> list[list[dict]]:
     """Greedily pack atoms into chunks, cutting on the first qualifying gap/dur/len break.
 
     Time-forced breaks (gap/dur) cut immediately; a length overflow picks the phrase-boundary
     candidate with the smallest sticky-token penalty via ``_best_len_break_pos`` (Level 1).
     """
-    chunks: List[List[dict]] = []
-    cur: List[dict] = []
-    cur_bnd: List[
+    chunks: list[list[dict]] = []
+    cur: list[dict] = []
+    cur_bnd: list[
         bool
     ] = []  # parallel to cur: True = phrase-start (legal len-break point)
     for i, atom in enumerate(atoms):
@@ -1135,7 +1301,7 @@ def _pack_atoms_into_chunks(
     return chunks
 
 
-def _chunk_to_cue(chunk: List[dict], cue: Cue, lang: str) -> Cue:
+def _chunk_to_cue(chunk: list[dict], cue: Cue, lang: str) -> Cue:
     """Materialize a packed atom chunk into a cue dict (first/last non-None span, falling back
     to the parent cue's start/end)."""
     # the default is the parent cue's (required, non-None) bound, so the span is always a float
@@ -1150,14 +1316,14 @@ def _chunk_to_cue(chunk: List[dict], cue: Cue, lang: str) -> Cue:
 
 
 def _repair_bound_particle_cues(
-    cues: List[Cue],
+    cues: list[Cue],
     *,
     lang: str,
     max_line_length: int,
     max_lines: int,
     max_cue_s: float,
     connected_gap_s: float,
-) -> List[Cue]:
+) -> list[Cue]:
     """Remove connected cue edges that strand an independently tagged particle.
 
     This is a final safety net for boundaries inherited from separate ASR
@@ -1336,15 +1502,15 @@ def _repair_bound_particle_cues(
 
 
 def split_long_cues_with_word_timings(
-    cues: List[Cue],
+    cues: list[Cue],
     max_line_length: int,
     max_lines: int,
     min_duration: float,
     desired_wps: float,
     lang: str,
     speech_spans: list[tuple[float, float]] | None = None,
-    thresholds: Optional[SplitThresholds] = None,
-) -> List[Cue]:
+    thresholds: SplitThresholds | None = None,
+) -> list[Cue]:
     """Pack each cue's atoms into reading-sized cues using gap/duration/length breaks.
 
     ``min_duration`` / ``desired_wps`` are kept for back-compat (unused on the atom-based path).
@@ -1361,7 +1527,7 @@ def split_long_cues_with_word_timings(
         do_new=do_new,
         speech_spans=speech_spans,
     )
-    new_cues: List[Cue] = []
+    new_cues: list[Cue] = []
     for cue in cues:
         word_data = list(cue.get("word_data") or [])
         if not word_data:
@@ -1399,7 +1565,7 @@ def _split_without_timings(
     lang: str,
     *,
     ctx: SplitContext | None = None,
-) -> List[Cue]:
+) -> list[Cue]:
     # One indivisible token cannot be wrapped by the normal line grouper.  Use
     # the same proportional emergency fallback as timed coarse atoms.
     if ctx is not None and len(_tokens(cue["text"], lang)) == 1:
@@ -1416,8 +1582,8 @@ def _split_without_timings(
             ]
     formatted = split_subtitle(cue["text"], max_line_length, lang)
     lines = formatted.split("\n")
-    chunks: List[List[str]] = []
-    buf: List[str] = []
+    chunks: list[list[str]] = []
+    buf: list[str] = []
     for line in lines:
         buf.append(line)
         if len(buf) == max_lines:
@@ -1432,7 +1598,7 @@ def _split_without_timings(
     total_chars = sum(len(sep.join(c)) for c in chunks) or 1
     start = cue["start"]
     duration = cue["end"] - cue["start"]
-    out: List[Cue] = []
+    out: list[Cue] = []
     for c in chunks:
         # Join without \n — the downstream SubtitlesWriter handles display wrapping.
         text = sep.join(c)
@@ -2169,21 +2335,21 @@ def _semantic_result_valid(
 
 
 def smart_split_segments(
-    segments: List[Dict[str, Any]],
+    segments: list[dict[str, Any]],
     lang: str,
-    max_line_length: Optional[int] = None,
-    max_lines: Optional[int] = None,
+    max_line_length: int | None = None,
+    max_lines: int | None = None,
     min_duration: float = DEFAULT_MIN_DURATION,
     desired_wps: float = DEFAULT_DESIRED_WPS,
     split_at_comma: bool = True,
-    comma_split_min_len: Optional[int] = None,
+    comma_split_min_len: int | None = None,
     *,
     speech_spans: list[tuple[float, float]] | None = None,
     thresholds: SplitThresholds | dict | None = None,
     shot_changes: list[float] | None = None,
     semantic_engine: SemanticBreakEngine | None = None,
     semantic_model: str | None = None,
-) -> List[Cue]:
+) -> list[Cue]:
     """Run the full smart-split pipeline over aligned segments.
 
     Each segment must have ``text`` and ``words`` (with ``start``/``end``).
@@ -2198,6 +2364,11 @@ def smart_split_segments(
         max_line_length = default_max_line_length(lang)
     if max_lines is None:
         max_lines = default_max_lines(lang)  # zh/yue/ja -> 1, else 2
+    # The packer budgets in native cells (a CJK preset counts one wide glyph per
+    # cell) while the renderer measures half-width cells. Convert once so both
+    # stages honour the same configured profile instead of the renderer silently
+    # falling back to its built-in 42-column default.
+    render_width = _line_budget_width(max_line_length, lang)
     # Accept a plain mapping (config.gap_thresholds / tests) and normalize to the typed form once.
     # th is None ⟺ legacy length-break-only mode (no gap/duration breaks, no cleanup pass).
     th = (
@@ -2373,7 +2544,9 @@ def smart_split_segments(
                 cue["text"] = strip_punct_for_subtitles(cue["text"])
                 if th is not None:
                     cue["text"] = _merge_stutters(cue["text"])
-                cue["text"] = wrap_cue_text(cue["text"], lang, max_lines)
+                cue["text"] = wrap_cue_text(
+                    cue["text"], lang, max_lines, max_line_length=render_width
+                )
             return cues
         except Exception as exc:  # noqa: BLE001 - optional stage is fail-safe
             log.warning(
@@ -2382,7 +2555,7 @@ def smart_split_segments(
             )
             return baseline
 
-    all_cues: List[Cue] = []
+    all_cues: list[Cue] = []
     for segment in segments:
         text = segment.get("text", "")
         words = segment.get("words", []) or []
@@ -2456,5 +2629,7 @@ def smart_split_segments(
             cue["text"] = _merge_stutters(cue["text"])
         # Display soft-wrap: fold over-budget cues into <=max_lines lines without
         # changing cue boundaries. Long Latin phrases inside CJK also collapse here.
-        cue["text"] = wrap_cue_text(cue["text"], lang, max_lines)
+        cue["text"] = wrap_cue_text(
+            cue["text"], lang, max_lines, max_line_length=render_width
+        )
     return cues
