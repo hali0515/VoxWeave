@@ -1,0 +1,60 @@
+{
+  "language": "en",
+  "level": "cue",
+  "cues": [
+    {
+      "id": "h001",
+      "text": "The lighthouse keeper never sleeps before the storm arrives",
+      "start": 1.05,
+      "end": 4.06
+    },
+    {
+      "id": "h002",
+      "text": "He counts the waves",
+      "start": 4.55,
+      "end": 6.05
+    },
+    {
+      "id": "h003",
+      "text": "and writes the number in a leather book",
+      "start": 6.18,
+      "end": 8.04
+    },
+    {
+      "id": "h004",
+      "text": "Nobody in the village has ever asked to read that book",
+      "start": 8.57,
+      "end": 11.54
+    },
+    {
+      "id": "h005",
+      "text": "Last winter the lamp failed for the first time in forty years",
+      "start": 12.08,
+      "end": 15.53
+    },
+    {
+      "id": "h006",
+      "text": "The keeper walked down to the harbour and borrowed a lantern",
+      "start": 16.09,
+      "end": 19.52
+    },
+    {
+      "id": "h007",
+      "text": "Since then he keeps two spare wicks in his coat pocket",
+      "start": 20.1,
+      "end": 23.01
+    },
+    {
+      "id": "h008",
+      "text": "A ship passed the point on the night the fog came inland",
+      "start": 23.71,
+      "end": 26.9
+    },
+    {
+      "id": "h009",
+      "text": "Its horn answered the bell three times before it turned away",
+      "start": 27.52,
+      "end": 30.79
+    }
+  ]
+}

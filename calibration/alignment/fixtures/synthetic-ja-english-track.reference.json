@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "id": "synthetic-ja-english-track",
+  "language": "ja",
+  "kind": "commercial_cues",
+  "timebase": "seconds",
+  "media_duration_s": 26.0,
+  "offset_s": 0,
+  "provenance": {
+    "created_by": "scripts/calib_alignment.py synthetic fixture",
+    "tool_version": "hand-written",
+    "annotators": 0,
+    "command": "an English release track mislabelled as the Japanese reference"
+  },
+  "segments": [
+    {
+      "id": "r001",
+      "text": "The lighthouse keeper never sleeps before the storm",
+      "start": 1.0,
+      "end": 4.0,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r002",
+      "text": "He counts the waves and writes them in a leather book",
+      "start": 4.6,
+      "end": 8.4,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r003",
+      "text": "Nobody in the village ever reads that book",
+      "start": 9.0,
+      "end": 11.9,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r004",
+      "text": "Last winter the lamp went out for the first time",
+      "start": 12.4,
+      "end": 15.6,
+      "utterance_id": "u004"
+    },
+    {
+      "id": "r005",
+      "text": "The keeper went down to the harbour and borrowed a lantern",
+      "start": 16.1,
+      "end": 19.4,
+      "utterance_id": "u005"
+    },
+    {
+      "id": "r006",
+      "text": "Since then he carries two spare wicks with him",
+      "start": 20.0,
+      "end": 23.2,
+      "utterance_id": "u006"
+    }
+  ]
+}

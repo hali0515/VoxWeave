@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "data_root_env": "VOXWEAVE_CALIB_ROOT",
+  "defaults": {
+    "min_hyp_coverage": 0.8,
+    "min_ref_coverage": 0.8,
+    "min_pair_similarity": 0.6,
+    "bootstrap_samples": 200
+  },
+  "items": [
+    {
+      "id": "synthetic-en-split",
+      "language": "en",
+      "hypothesis": {
+        "path": "fixtures/synthetic-1to2.hypothesis.json"
+      },
+      "references": [
+        {
+          "id": "synthetic-1to2",
+          "kind": "manual_cues",
+          "language": "en",
+          "path": "fixtures/synthetic-1to2.reference.json",
+          "quality": "gold-display"
+        }
+      ],
+      "tags": ["synthetic", "split"]
+    },
+    {
+      "id": "synthetic-en-merge",
+      "language": "en",
+      "hypothesis": {
+        "path": "fixtures/synthetic-2to1.hypothesis.json"
+      },
+      "references": [
+        {
+          "id": "synthetic-2to1",
+          "kind": "manual_cues",
+          "language": "en",
+          "path": "fixtures/synthetic-2to1.reference.json",
+          "quality": "gold-display"
+        }
+      ],
+      "tags": ["synthetic", "merge"]
+    },
+    {
+      "id": "synthetic-ja-words",
+      "language": "ja",
+      "hypothesis": {
+        "path": "fixtures/synthetic-ja-words.hypothesis.json"
+      },
+      "references": [
+        {
+          "id": "synthetic-ja-words",
+          "kind": "mfa_words",
+          "language": "ja",
+          "path": "fixtures/synthetic-ja-words.reference.json",
+          "quality": "gold-acoustic"
+        }
+      ],
+      "tags": ["synthetic", "char-to-word"]
+    },
+    {
+      "id": "en-episode-01",
+      "language": "en",
+      "media": "media/en-episode-01.mkv",
+      "hypothesis": {
+        "path": "hypotheses/en-episode-01.vtt",
+        "pre_position_units": "debug/en-episode-01/03-pre-position.units.json",
+        "post_position_units": "debug/en-episode-01/04-post-position.units.json",
+        "alignment_health": "debug/en-episode-01/alignment-health.json"
+      },
+      "references": [
+        {
+          "id": "en-episode-01-release",
+          "kind": "commercial_cues",
+          "language": "en",
+          "media": "media/en-episode-01.mkv",
+          "stream_index": null,
+          "quality": "silver-display",
+          "enabled": false
+        },
+        {
+          "id": "en-episode-01-mfa",
+          "kind": "mfa_words",
+          "language": "en",
+          "path": "truth/en-episode-01.words.json",
+          "quality": "gold-acoustic",
+          "enabled": false
+        }
+      ],
+      "include_ranges": [[60.0, 900.0]],
+      "exclude_ranges": [[300.0, 330.0]],
+      "tags": ["example", "requires-media"]
+    }
+  ]
+}

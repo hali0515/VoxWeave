@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "id": "synthetic-2to1",
+  "language": "en",
+  "kind": "manual_cues",
+  "timebase": "seconds",
+  "media_duration_s": 32.0,
+  "offset_s": 0,
+  "provenance": {
+    "created_by": "scripts/calib_alignment.py synthetic fixture",
+    "tool_version": "hand-written",
+    "annotators": 0
+  },
+  "segments": [
+    {
+      "id": "r001",
+      "text": "The lighthouse keeper never sleeps before the storm arrives",
+      "start": 1.0,
+      "end": 4.0,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r002",
+      "text": "He counts the waves",
+      "start": 4.5,
+      "end": 6.0,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r003",
+      "text": "and writes the number in a leather book",
+      "start": 6.12,
+      "end": 8.0,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r004",
+      "text": "Nobody in the village has ever asked to read that book",
+      "start": 8.5,
+      "end": 11.5,
+      "utterance_id": "u004"
+    },
+    {
+      "id": "r005",
+      "text": "Last winter the lamp failed for the first time in forty years",
+      "start": 12.0,
+      "end": 15.5,
+      "utterance_id": "u005"
+    },
+    {
+      "id": "r006",
+      "text": "The keeper walked down to the harbour and borrowed a lantern",
+      "start": 16.0,
+      "end": 19.5,
+      "utterance_id": "u006"
+    },
+    {
+      "id": "r007",
+      "text": "Since then he keeps two spare wicks in his coat pocket",
+      "start": 20.0,
+      "end": 23.0,
+      "utterance_id": "u007"
+    },
+    {
+      "id": "r008",
+      "text": "A ship passed the point on the night the fog came inland",
+      "start": 23.6,
+      "end": 26.9,
+      "utterance_id": "u008"
+    },
+    {
+      "id": "r009",
+      "text": "Its horn answered the bell three times before it turned away",
+      "start": 27.4,
+      "end": 30.8,
+      "utterance_id": "u009"
+    }
+  ]
+}

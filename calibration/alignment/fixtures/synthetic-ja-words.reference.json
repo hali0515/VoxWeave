@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "id": "synthetic-ja-words",
+  "language": "ja",
+  "kind": "mfa_words",
+  "timebase": "seconds",
+  "media_duration_s": 14.0,
+  "offset_s": 0,
+  "provenance": {
+    "created_by": "scripts/calib_alignment.py synthetic fixture",
+    "tool_version": "hand-written",
+    "annotators": 0,
+    "reference_uncertainty_s": 0.02
+  },
+  "segments": [
+    {
+      "id": "r001",
+      "text": "灯台",
+      "start": 1.0,
+      "end": 1.52,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r002",
+      "text": "守",
+      "start": 1.52,
+      "end": 1.83,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r003",
+      "text": "は",
+      "start": 1.83,
+      "end": 1.98,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r004",
+      "text": "嵐",
+      "start": 2.05,
+      "end": 2.41,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r005",
+      "text": "の",
+      "start": 2.41,
+      "end": 2.55,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r006",
+      "text": "前",
+      "start": 2.55,
+      "end": 2.86,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r007",
+      "text": "に",
+      "start": 2.86,
+      "end": 3.01,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r008",
+      "text": "眠ら",
+      "start": 3.08,
+      "end": 3.62,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r009",
+      "text": "ない",
+      "start": 3.62,
+      "end": 4.0,
+      "utterance_id": "u001"
+    },
+    {
+      "id": "r010",
+      "text": "彼",
+      "start": 4.6,
+      "end": 4.88,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r011",
+      "text": "は",
+      "start": 4.88,
+      "end": 5.02,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r012",
+      "text": "波",
+      "start": 5.02,
+      "end": 5.34,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r013",
+      "text": "を",
+      "start": 5.34,
+      "end": 5.48,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r014",
+      "text": "数え",
+      "start": 5.48,
+      "end": 5.99,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r015",
+      "text": "て",
+      "start": 5.99,
+      "end": 6.14,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r016",
+      "text": "革",
+      "start": 6.22,
+      "end": 6.5,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r017",
+      "text": "の",
+      "start": 6.5,
+      "end": 6.64,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r018",
+      "text": "手帳",
+      "start": 6.64,
+      "end": 7.18,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r019",
+      "text": "に",
+      "start": 7.18,
+      "end": 7.33,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r020",
+      "text": "記録",
+      "start": 7.4,
+      "end": 7.98,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r021",
+      "text": "する",
+      "start": 7.98,
+      "end": 8.4,
+      "utterance_id": "u002"
+    },
+    {
+      "id": "r022",
+      "text": "村",
+      "start": 9.0,
+      "end": 9.31,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r023",
+      "text": "の",
+      "start": 9.31,
+      "end": 9.45,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r024",
+      "text": "誰",
+      "start": 9.45,
+      "end": 9.76,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r025",
+      "text": "も",
+      "start": 9.76,
+      "end": 9.9,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r026",
+      "text": "その",
+      "start": 9.9,
+      "end": 10.31,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r027",
+      "text": "手帳",
+      "start": 10.31,
+      "end": 10.85,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r028",
+      "text": "を",
+      "start": 10.85,
+      "end": 10.99,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r029",
+      "text": "読ま",
+      "start": 10.99,
+      "end": 11.48,
+      "utterance_id": "u003"
+    },
+    {
+      "id": "r030",
+      "text": "ない",
+      "start": 11.48,
+      "end": 11.9,
+      "utterance_id": "u003"
+    }
+  ]
+}
