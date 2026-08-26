@@ -196,6 +196,15 @@ def test_fmt_ts():
     assert realign.fmt_ts(0) == "00:00:00.000"
 
 
+def test_fmt_ts_carries_rounding_across_field_boundaries():
+    # Sub-millisecond values below a minute/hour boundary must carry instead of
+    # formatting an invalid 60-second field.
+    assert realign.fmt_ts(59.9996) == "00:01:00.000"
+    assert realign.fmt_ts(3599.9999) == "01:00:00.000"
+    # Control: a value that rounds down keeps its field.
+    assert realign.fmt_ts(59.9994) == "00:00:59.999"
+
+
 def test_render_vtt():
     out = realign.render_vtt([{"text": "hi"}], [(1.0, 2.0)])
     assert out == "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n"

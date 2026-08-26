@@ -1136,12 +1136,18 @@ def clamp_spans(
 
 
 def fmt_ts(seconds: float) -> str:
-    """Seconds → VTT timestamp ``HH:MM:SS.mmm``."""
-    s = max(0.0, seconds)
-    h = int(s // 3600)
-    m = int((s % 3600) // 60)
-    sec = s % 60
-    return f"{h:02d}:{m:02d}:{sec:06.3f}"
+    """Seconds → VTT timestamp ``HH:MM:SS.mmm``.
+
+    Rounds to whole milliseconds before the divmod chain so the rounding can
+    carry into the seconds/minutes/hours fields. Formatting the float remainder
+    directly emitted invalid timestamps within 0.5ms of a minute boundary
+    (59.9996 → ``00:00:60.000``).
+    """
+    ms = round(max(0.0, seconds) * 1000)
+    h, rem = divmod(ms, 3_600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
 def render_cues(rows: list[tuple[float | None, float | None, str]]) -> str:
