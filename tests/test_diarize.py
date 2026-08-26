@@ -106,6 +106,9 @@ def test_split_replays_speaker_turns(tmp_path):
     vtt_out = pipeline.split(json_path)
     data = json.loads(json_path.read_text(encoding="utf-8"))
     assert data["speaker_turns"] == [[0.0, 2.0, "SPEAKER_00"], [2.0, 4.0, "SPEAKER_01"]]
+    # persisted cue word_data carries each atom's surface: nothing else states
+    # the stream's granularity to a later reader
+    assert sorted(data["segments"][0]["word_data"][0]) == ["end", "start", "text"]
     vtt = vtt_out.read_text(encoding="utf-8")
     # either one dual-speaker event or a split at the speaker boundary
     assert ("-are you coming" in vtt) or (
@@ -117,3 +120,180 @@ def test_apply_speaker_format_noop_without_turns():
     cue = _cue("hello", 0.0, 1.0, [(0.0, 1.0)])
     assert apply_speaker_format([cue], None, "en") == [cue]
     assert apply_speaker_format([cue], [], "en") == [cue]
+
+
+def test_speaker_split_survives_embedded_latin_atom():
+    """A repacked cue must be re-read at atom granularity, not per character.
+
+    ``_chunk_to_cue`` emits one word_data entry per packed atom, so an embedded
+    Latin run (``GPT``) is one entry covering three characters. Walking that
+    stream with a character cursor shifted every later atom onto the wrong
+    timestamps: ``GPT`` swallowed ``世界``'s span and the tail atoms got
+    ``start=end=None``, which made the speaker boundary land mid-phrase.
+    """
+    from voxweave.core.smart_split import split_long_cues_with_word_timings
+
+    text = "你好GPT世界真棒学习"
+    word_data = [
+        {"word": ch, "start": i * 1.0, "end": i * 1.0 + 0.9}
+        for i, ch in enumerate(text)
+    ]
+    packed = split_long_cues_with_word_timings(
+        [{"text": text, "start": 0.0, "end": 10.9, "word_data": word_data}],
+        max_line_length=18,
+        max_lines=1,
+        min_duration=0.0,
+        desired_wps=4.0,
+        lang="zh",
+    )
+    assert len(packed) == 1  # the fixture must reach the formatter as one cue
+
+    turns = [(0.0, 6.95, "SPEAKER_00"), (6.95, 11.0, "SPEAKER_01")]
+    out = format_speaker_cues(packed, turns, "zh")
+
+    assert [c["text"] for c in out] == ["你好GPT世界", "真棒学习"]
+    assert out[1]["start"] == 7.0  # 真's own start, not a shifted neighbour's
+    assert sum(len(c["word_data"]) for c in out) == len(packed[0]["word_data"])
+    assert all(
+        w["start"] is not None and w["end"] is not None
+        for c in out
+        for w in c["word_data"]
+    )
+
+
+def _char_seg(text, step=0.4):
+    """One aligner unit per character, the shape ``smart_split_segments`` consumes."""
+    words = [
+        {
+            "word": ch,
+            "start": round(i * step, 3),
+            "end": round(i * step + step * 0.8, 3),
+        }
+        for i, ch in enumerate(text)
+    ]
+    return {
+        "start": words[0]["start"],
+        "end": words[-1]["end"],
+        "text": text,
+        "words": words,
+    }
+
+
+def test_speaker_split_after_real_smart_split_with_punctuation():
+    """The production path hands ``format_speaker_cues`` a rendered-vs-frozen pair.
+
+    ``smart_split_segments`` finalizes cue text with ``strip_punct_for_subtitles``
+    *after* word_data is packed, so a punctuated CJK cue reaches the formatter
+    with entries the text no longer shows (here the comma). Reconciling the two
+    sides is what keeps every entry with its own atom.
+    """
+    from voxweave.core.smart_split import smart_split_segments
+
+    cues = smart_split_segments(
+        [_char_seg("上涨,是3.75元了")], "zh", max_line_length=18, thresholds=None
+    )
+    assert len(cues) == 1
+    assert cues[0]["text"] == "上涨 是3.75元了"  # comma stripped, decimal kept
+    assert [w["text"] for w in cues[0]["word_data"]] == [
+        "上",
+        "涨",
+        ",",
+        "是",
+        "3.75",
+        "元",
+        "了",
+    ]
+
+    out = format_speaker_cues(
+        cues, [(0.0, 1.4, "SPEAKER_00"), (1.4, 20.0, "SPEAKER_01")], "zh"
+    )
+    assert [c["text"] for c in out] == ["上涨 是", "3.75元了"]
+    assert [[w["text"] for w in c["word_data"]] for c in out] == [
+        ["上", "涨", ",", "是"],
+        ["3.75", "元", "了"],
+    ]
+    assert out[1]["start"] == cues[0]["word_data"][4]["start"]  # 3.75's own start
+
+
+def test_trailing_dropped_punctuation_entry_stays_in_the_last_piece():
+    """The last run takes the remainder, so a trailing stripped entry is kept.
+
+    ``友``'s footprint ends before the sentence-final ``。`` entry: without the
+    last-run rule that entry would be dropped from the emitted cue and from the
+    sibling JSON, silently shortening the stream.
+    """
+    from voxweave.core.smart_split import smart_split_segments
+
+    cues = smart_split_segments(
+        [_char_seg("你好,朋友。")], "zh", max_line_length=18, thresholds=None
+    )
+    assert len(cues) == 1
+    assert cues[0]["text"] == "你好 朋友"
+    assert [w["text"] for w in cues[0]["word_data"]][-1] == "。"
+
+    out = format_speaker_cues(
+        cues, [(0.0, 1.0, "SPEAKER_00"), (1.0, 20.0, "SPEAKER_01")], "zh"
+    )
+    assert [c["text"] for c in out] == ["你好", "朋友"]
+    assert [w["text"] for w in out[-1]["word_data"]] == [",", "朋", "友", "。"]
+    assert sum(len(c["word_data"]) for c in out) == len(cues[0]["word_data"])
+
+
+def test_char_level_word_data_against_rendered_text_survives_split():
+    """The ``--semantic-split`` shape: char-level entries against a rendered text.
+
+    ``_semantic_materialize`` keeps the raw per-character units, so the formatter
+    sees a stripped comma entry next to a ``3.75`` the text still shows. The
+    stripping rule is context-sensitive, so the stream has to be normalized
+    joined -- read entry by entry, the ``.`` looks like a sentence period and
+    every atom after it collects the wrong span.
+    """
+    source = "这个,价格是3.75元"
+    cue = {
+        "text": "这个 价格是3.75元",
+        "start": 0.0,
+        "end": 4.3,
+        "word_data": [
+            {"word": ch, "start": round(i * 0.4, 3), "end": round(i * 0.4 + 0.3, 3)}
+            for i, ch in enumerate(source)
+        ],
+    }
+    out = format_speaker_cues(
+        [cue], [(0.0, 1.8, "SPEAKER_00"), (1.8, 20.0, "SPEAKER_01")], "zh"
+    )
+    assert [c["text"] for c in out] == ["这个 价格", "是3.75元"]
+    assert sum(len(c["word_data"]) for c in out) == len(source)
+    assert out[1]["start"] == cue["word_data"][5]["start"]  # 是's own start
+
+
+def test_split_replays_coarse_legacy_word_segments(tmp_path):
+    """Legacy word_segments hold whole clauses, not characters (see pipeline docs).
+
+    Those cues reach the formatter wider than their word_data (an unlocatable
+    clause yields an empty one, which ``_glue_short_cues`` then merges into a
+    timed neighbour). That state has to degrade to the old None-filled slicing:
+    aborting here throws away ASR, alignment and diarization that already ran.
+    """
+    json_path = tmp_path / "clip.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "language": "zh",
+                "word_segments": [
+                    {"text": "今天我们来看一个问题。", "start": 0.0, "end": 3.0},
+                    {"text": "数据中心的上涨。", "start": 3.2, "end": 6.0},
+                    {"text": "他说好的很厉害。", "start": 6.3, "end": 9.0},
+                ],
+                "segments": [],
+                "vad_speech": [[0.0, 9.5]],
+                "speaker_turns": [
+                    [0.0, 3.1, "S0"],
+                    [3.1, 6.2, "S1"],
+                    [6.2, 9.5, "S0"],
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    vtt = pipeline.split(json_path).read_text(encoding="utf-8")
+    assert "今天我们" in vtt and "他说好的很厉害" in vtt

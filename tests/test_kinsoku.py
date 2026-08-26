@@ -182,6 +182,29 @@ def test_pos_penalizes_adverbial_copula_ni():
     assert pens[text.index("に")] == 2
 
 
+def test_bound_tails_only_drops_the_adverbial_copula_class():
+    pytest.importorskip("fugashi")
+    from voxweave.core.kinsoku import ja_pos_end_penalties
+
+    # Line breaking wants the full signal; a caller that *deletes* material on a
+    # bad tail (diarize's speaker-run merge) only wants tails that leave the
+    # phrase syntactically incomplete. そんなに / みたいに are complete adverbials.
+    for text in ("そんなにギリギリ", "友達みたいにしたい"):
+        full = ja_pos_end_penalties(text)
+        bound = ja_pos_end_penalties(text, bound_tails_only=True)
+        assert full is not None and bound is not None
+        offset = text.index("に")
+        assert full[offset] == 2
+        assert bound[offset] == 0
+    # the syntactically incomplete classes are untouched
+    bound = ja_pos_end_penalties("大樹の村へ行く", bound_tails_only=True)
+    assert bound is not None
+    assert bound[2] == 2  # 格助詞の with no head
+    bound = ja_pos_end_penalties("この村まで", bound_tails_only=True)
+    assert bound is not None
+    assert bound[1] == 2  # 連体詞 この
+
+
 def test_pos_env_kill_switch(monkeypatch):
     pytest.importorskip("fugashi")
     from voxweave.core.kinsoku import _load_ja_tagger, ja_pos_end_penalties

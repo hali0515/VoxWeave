@@ -39,6 +39,7 @@ from .kinsoku import (
 from .langsets import LANGUAGES_WITHOUT_SPACES as LANGUAGES_WITHOUT_SPACES  # re-export
 from .layout import (
     WIDE_GLYPH_LANGUAGES,
+    _PUNCT_TO_SPACE_RE,
     _comma_chars,
     _fits_budget,
     _join,
@@ -190,6 +191,145 @@ def _span_end(
     )
 
 
+def _unit_text(unit: Mapping[str, Any]) -> str:
+    """Surface a word_data entry stores: ``text`` (aligner/repacked) or ``word`` (ASR)."""
+    return str(unit.get("text") or unit.get("word") or "")
+
+
+def _display_chars(surfaces: Sequence[str]) -> list[str]:
+    """Per surface, the characters a finished cue text still shows.
+
+    Cue text is finalized *after* word_data is frozen: ``strip_punct_for_subtitles``
+    turns prose punctuation into spaces and ``_merge_stutters`` hyphenates a
+    repeated ASCII word. Normalizing both sides the same way lets a stored
+    surface be matched against the rendered text it came from.
+
+    The stream is normalized *joined*, then split back per surface, because
+    ``_PUNCT_TO_SPACE_RE`` is context-sensitive: ``[.,](?!\\d)`` keeps the ``.``
+    of ``3.75``, but a lone ``.`` unit looked at in isolation has no following
+    digit and would be dropped from one side only.
+    """
+    joined = "".join(surfaces)
+    stripped = {
+        i
+        for m in _PUNCT_TO_SPACE_RE.finditer(joined)
+        for i in range(m.start(), m.end())
+    }
+    out: list[str] = []
+    at = 0
+    for surface in surfaces:
+        out.append(
+            "".join(
+                ch
+                for i, ch in enumerate(surface, at)
+                if i not in stripped and not ch.isspace() and ch != "-"
+            )
+        )
+        at += len(surface)
+    return out
+
+
+def _surface_ranges(
+    surfaces: Sequence[str], word_data: Sequence[Unit], offset: int = 0
+) -> list[tuple[int, int]] | None:
+    """Map each surface onto the word_data entries that spell it, else ``None``.
+
+    Pairing is by stored surface rather than by character count, so it holds at
+    either granularity: an entry may be one whole atom, several entries may
+    spell one token, and an entry may cover several rendered tokens (an embedded
+    Latin run the display split apart, a legacy sentence-sized ``word``).
+    Entries the finished cue text no longer shows — punctuation
+    ``strip_punct_for_subtitles`` removed — have no display char, so they fall
+    between ranges and land with the atom that *follows* them; a trailing one
+    has no follower and is left to the caller.
+
+    ``None`` when the two sides cannot be reconciled: inventing an alignment
+    would hand every later atom another atom's timestamps, so the caller degrades
+    to the plain cursor instead.
+    """
+    total = len(word_data)
+    unit_chars = _display_chars([_unit_text(u) for u in word_data])
+    text_chars = _display_chars(surfaces)
+    ranges: list[tuple[int, int]] = []
+    ti = ei = 0
+    while ti < len(surfaces):
+        if not text_chars[ti]:
+            # Punctuation still in the text: it owns the matching entry (this is
+            # the pre-render stage, where neither side has been stripped yet).
+            end = ei + 1 if ei < total and not unit_chars[ei] else ei
+            ranges.append((ei + offset, end + offset))
+            ei = end
+            ti += 1
+            continue
+        while ei < total and not unit_chars[ei]:  # punctuation the cue text dropped
+            ei += 1
+        block_start = ei
+        block_size = 0
+        got_text = got_units = ""
+        while not got_text or got_text != got_units:
+            if len(got_text) <= len(got_units):
+                if ti >= len(surfaces):
+                    return None
+                got_text += text_chars[ti]
+                ti += 1
+                block_size += 1
+            else:
+                if ei >= total:
+                    return None
+                got_units += unit_chars[ei]
+                ei += 1
+            if not (got_text.startswith(got_units) or got_units.startswith(got_text)):
+                return None
+        ranges.extend([(block_start + offset, ei + offset)] * block_size)
+    return ranges
+
+
+def _cursor_ranges(
+    surfaces: Sequence[str], word_data: Sequence[Unit], offset: int = 0
+) -> list[tuple[int, int]]:
+    """Per-surface footprint from a plain char cursor (one entry per non-space char).
+
+    Tolerant on purpose: a surface past the end of the stream gets an empty
+    slice, which renders as ``start=end=None``. That degraded timing is the only
+    safe answer for an unreadable cue — this code runs after ASR, forced
+    alignment and diarization, so refusing the cue would throw a whole file's
+    work away over one bad row.
+    """
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for surface in surfaces:
+        n = _token_char_count(surface)
+        ranges.append((cursor + offset, cursor + n + offset))
+        cursor += n
+    return ranges
+
+
+def _unit_ranges(
+    surfaces: Sequence[str], word_data: Sequence[Unit], offset: int = 0
+) -> list[tuple[int, int]]:
+    """Per-surface ``word_data`` footprint, whatever granularity the stream carries.
+
+    Reconciliation is by the entries' own surfaces, the only granularity-agnostic
+    reading: the same stream may hold one entry per non-space character (aligner
+    output) or one per packed atom (a cue already materialized by
+    ``_chunk_to_cue``), and the key it uses says nothing about which —
+    ``realign.reinject_punct`` writes ``text`` on char-level units too. Streams
+    that store no surface at all, and streams that cannot be reconciled, fall
+    back to the char cursor.
+    """
+    if any(_unit_text(u) for u in word_data):
+        ranges = _surface_ranges(surfaces, word_data, offset)
+        if ranges is not None:
+            return ranges
+        log.debug(
+            "word_data desync: %d entries do not spell %r; falling back to the "
+            "char cursor (some atoms may lose their timestamps)",
+            len(word_data),
+            "".join(surfaces)[:60],
+        )
+    return _cursor_ranges(surfaces, word_data, offset)
+
+
 def _build_atoms(
     text: str,
     word_data: list[Unit],
@@ -201,8 +341,23 @@ def _build_atoms(
     Space-delimited: one word per atom (1:1 with word_data). No-space: one atom
     per CJK char or Latin run (from ``_tokens``). BudouX phrase boundaries are
     applied later in the packing loop — atoms stay per-char so gap/duration
-    breaks have full granularity. word_data is char-level; each atom consumes
-    ``_token_char_count(unit)`` entries.
+    breaks have full granularity.
+
+    word_data comes at one of two granularities and they are *not*
+    interchangeable: the first-generation stream holds one entry per non-space
+    character, while a cue already materialized by ``_chunk_to_cue`` holds one
+    entry per packed atom. ``_unit_ranges`` reconciles either against the text,
+    so a re-read never advances a character cursor over atom entries. Every atom
+    records its ``_unit_start``/``_unit_end`` footprint so callers can slice the
+    source word_data without redoing that arithmetic; the footprint may run past
+    the end of an unreconcilable stream, which is how an uncoverable atom ends up
+    with ``start=end=None``. Never raises — see ``_cursor_ranges``.
+
+    Reconciling by surface also narrows the aggregated span itself, on the plain
+    non-diarize path too: entries the renderer dropped from the display text (a
+    trailing ``。``, the ``.`` of ``e.g.``) no longer extend the neighbouring
+    atom's start/end the way the old character cursor's off-by-N did. Corpus
+    impact at the production layout config is 0 of 40 cases.
     """
     if not _no_spaces(lang):
         toks = text.split()
@@ -210,16 +365,20 @@ def _build_atoms(
         if len(wd) < len(toks):
             wd += [{}] * (len(toks) - len(wd))
         return [
-            {"text": t, "start": w.get("start"), "end": w.get("end")}
-            for t, w in zip(toks, wd[: len(toks)])
+            {
+                "text": t,
+                "start": w.get("start"),
+                "end": w.get("end"),
+                "_unit_start": min(i, len(word_data)),
+                "_unit_end": min(i + 1, len(word_data)),
+            }
+            for i, (t, w) in enumerate(zip(toks, wd[: len(toks)]))
         ]
     units = _tokens(text, lang)
+    ranges = _unit_ranges(units, word_data)
     atoms: list[dict] = []
-    cursor = 0
-    for unit in units:
-        n = _token_char_count(unit)
-        chunk = word_data[cursor : cursor + n]
-        cursor += n
+    for unit, (start, end) in zip(units, ranges):
+        chunk = word_data[start:end]
         # Short embedded Latin phrases stay atomic, but a phrase wider than a
         # physical line must expose its whitespace boundaries to the packer.
         # Keep trailing spaces on each sub-atom so no-space joining reconstructs
@@ -229,23 +388,31 @@ def _build_atoms(
             and _vis_width(unit) > max_atom_width
             and any(ch.isspace() for ch in unit)
         ):
-            local_cursor = 0
-            for part_i, match in enumerate(re.finditer(r"\S+\s*", unit)):
-                surface = match.group(0)
-                part_n = _token_char_count(surface)
-                part_chunk = chunk[local_cursor : local_cursor + part_n]
-                local_cursor += part_n
+            parts = [m.group(0) for m in re.finditer(r"\S+\s*", unit)]
+            part_ranges = _unit_ranges(parts, chunk, offset=start)
+            for part_i, (surface, (p_start, p_end)) in enumerate(
+                zip(parts, part_ranges)
+            ):
+                part_chunk = word_data[p_start:p_end]
                 atoms.append(
                     {
                         "text": surface,
                         "start": _span_start(part_chunk),
                         "end": _span_end(part_chunk),
                         "forced_boundary": part_i > 0,
+                        "_unit_start": p_start,
+                        "_unit_end": p_end,
                     }
                 )
             continue
         atoms.append(
-            {"text": unit, "start": _span_start(chunk), "end": _span_end(chunk)}
+            {
+                "text": unit,
+                "start": _span_start(chunk),
+                "end": _span_end(chunk),
+                "_unit_start": start,
+                "_unit_end": end,
+            }
         )
     return atoms
 
@@ -1303,7 +1470,13 @@ def _pack_atoms_into_chunks(
 
 def _chunk_to_cue(chunk: list[dict], cue: Cue, lang: str) -> Cue:
     """Materialize a packed atom chunk into a cue dict (first/last non-None span, falling back
-    to the parent cue's start/end)."""
+    to the parent cue's start/end).
+
+    The emitted word_data is *atom*-level, one entry per packed atom, so each
+    entry carries its ``text``: without that surface a later reader
+    (``_build_atoms``) has nothing to reconcile against and falls back to a
+    character cursor, which is one entry per character.
+    """
     # the default is the parent cue's (required, non-None) bound, so the span is always a float
     start = cast(float, _span_start(chunk, cue["start"]))
     end = cast(float, _span_end(chunk, cue["end"]))
@@ -1311,7 +1484,9 @@ def _chunk_to_cue(chunk: list[dict], cue: Cue, lang: str) -> Cue:
         "text": _join([a["text"] for a in chunk], lang),
         "start": start,
         "end": end,
-        "word_data": [{"start": a["start"], "end": a["end"]} for a in chunk],
+        "word_data": [
+            {"text": a["text"], "start": a["start"], "end": a["end"]} for a in chunk
+        ],
     }
 
 
@@ -1331,7 +1506,10 @@ def _repair_bound_particle_cues(
     if it would exceed width/duration, the two cues are repartitioned at a
     better phrase/POS boundary while retaining every source unit and timestamp.
     True pauses are never crossed.  Whole-token/POS scoring distinguishes the
-    particles ``了/地`` from lexical words such as ``了解/地方``.
+    particles ``了/地`` from lexical words such as ``了解/地方``.  Repartitioning
+    is one-directional: a candidate edge may relieve a dangling tail but is never
+    allowed to leave the left cue a worse ``line_end_penalty`` tail than the edge
+    it replaces (see ``candidate_score``).
     """
 
     if lang not in {"zh", "yue", "ja"} or len(cues) < 2 or connected_gap_s <= 0:
@@ -1366,21 +1544,29 @@ def _repair_bound_particle_cues(
             lang,
             max_atom_width=_line_budget_width(max_line_length, lang),
         )
-        expected_units = sum(_token_char_count(atom["text"]) for atom in atoms)
-        if not atoms or expected_units != len(units):
+        # Repartitioning hands `units[:unit_cut]` to the left cue, so it is only
+        # safe while the atoms account for every source unit exactly; a desynced
+        # pair (atoms stop short, or the cursor ran past the end) keeps the
+        # boundary it already has.
+        covers_all = bool(atoms) and (
+            atoms[0]["_unit_start"],
+            atoms[-1]["_unit_end"],
+        ) == (0, len(units))
+        if not covers_all:
             i += 1
             continue
 
-        left_width = _token_char_count(left_text)
-        cursor = 0
-        original = None
-        for atom_index, atom in enumerate(atoms):
-            if cursor == left_width:
-                original = atom_index
-                break
-            cursor += _token_char_count(atom["text"])
-        if original is None and cursor == left_width:
-            original = len(atoms)
+        # The original edge sits where the left cue's units run out. Counting
+        # units (not characters) is what makes this hold for a repacked pair,
+        # whose entries are whole atoms.
+        original = next(
+            (
+                atom_index
+                for atom_index, atom in enumerate(atoms)
+                if atom["_unit_start"] == len(left_units)
+            ),
+            None,
+        )
         if original is None or not 0 < original < len(atoms):
             i += 1
             continue
@@ -1416,9 +1602,25 @@ def _repair_bound_particle_cues(
             continue
 
         starts = sorted(boundaries - {0, len(atoms)})
+        # The tail the inherited edge already leaves: a repartition may relieve a
+        # dangling one, but must never hand the left cue a worse tail than this.
+        original_tail_pen = _atom_end_pen(atoms[original - 1])
 
-        def candidate_score(k: int) -> tuple[int, int, int, int]:
+        def candidate_score(k: int) -> tuple[int, int, int, int, int]:
             edge_right = atoms[k]
+            # ``hard`` sums the two sides of the edge, so a bound particle sitting
+            # at the left cue's END and the same particle heading the right cue
+            # score an equal tie there and ``soft`` picks either side.  That lets a
+            # repartition strand a 格助詞 / 的-class particle on a cue tail — the
+            # >= 2 ``line_end_penalty`` position — where the original edge had a
+            # clean one.  This leading component breaks the tie asymmetrically:
+            # any candidate whose left tail scores WORSE than the original edge's
+            # ranks strictly below it, so the pass can only relieve a dangling tail,
+            # never manufacture one.  The signal is the same ``end_pen`` the rest of
+            # the pass scores with (whole-word char table for zh/yue, UniDic Level-2
+            # map for ja); candidates that leave the tail as good or better keep
+            # competing on the old signals exactly as before.
+            worsens_tail = 1 if _atom_end_pen(atoms[k - 1]) > original_tail_pen else 0
             hard = 3 * (_atom_end_pen(atoms[k - 1]) + _atom_start_pen(edge_right))
             prev_end = atoms[k - 1].get("end")
             next_start = edge_right.get("start")
@@ -1439,6 +1641,7 @@ def _repair_bound_particle_cues(
             micro = 8 if small <= 1 else 4 if small <= 2 else 0
             soft = _atom_boundary_pen(edge_right) + pause + micro
             return (
+                worsens_tail,
                 hard,
                 soft,
                 abs(_vis_width(left_surface) - _vis_width(right_surface)),
@@ -1446,7 +1649,7 @@ def _repair_bound_particle_cues(
             )
 
         original_score = candidate_score(original)
-        choices: list[tuple[tuple[int, int, int, int], int, int]] = []
+        choices: list[tuple[tuple[int, int, int, int, int], int, int]] = []
         for k in starts:
             if k == original:
                 continue
@@ -1473,7 +1676,7 @@ def _repair_bound_particle_cues(
                 or float(right_end) - float(right_start) > max_cue_s + 1e-9
             ):
                 continue
-            unit_cut = sum(_token_char_count(atom["text"]) for atom in left_chunk)
+            unit_cut = right_chunk[0]["_unit_start"]
             score = candidate_score(k)
             if score < original_score:
                 choices.append((score, k, unit_cut))
@@ -1664,6 +1867,11 @@ def _semantic_annotate_unit_ranges(
     The semantic path is intentionally stricter than the deterministic path.
     If atomisation cannot account for every input unit exactly, timing-aware
     selection is unsafe and the caller returns the already-computed baseline.
+
+    This deliberately re-derives (and overwrites) the ``_unit_start``/``_unit_end``
+    ``_build_atoms`` just stamped: its input is always the raw char-level
+    ``segment["words"]``, and an exact char cursor over that stream is the
+    stricter reading — ``_unit_ranges`` degrades where this must refuse.
     """
 
     cursor = 0

@@ -979,6 +979,11 @@ def _dump_sibling_json(
     ``sing_spans`` (lyric re-flagging without PANNs) and ``speaker_turns`` (speaker
     re-formatting without pyannote). Single source of truth for the sibling-JSON shape
     shared by process and align.
+
+    ``segments[].word_data`` entries carry their atom surface under ``text``
+    alongside the span (``smart_split._chunk_to_cue``) — a reader has no other way
+    to tell that stream's granularity. Replay reads ``word_segments``, not
+    ``segments``, so older files stay loadable.
     """
     data: dict = {"language": language, "segments": segments, "word_segments": units}
     if vad_speech is not None:

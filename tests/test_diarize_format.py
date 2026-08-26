@@ -7,8 +7,12 @@
 #           are not sub-flash cues; the no-thresholds call stays byte-compatible.
 #   Fix 3 - speaker runs must not cut mid-word (absorb <0.2s label thrash, snap
 #           surviving boundaries to jieba/BudouX phrase edges).
+#   Fix 5 - a surviving boundary must not strand a bound word on the left cue when
+#           the cue has no cleaner phrase edge to offer and no audible gap to
+#           justify it (merge instead). ja only, scored with UniDic POS.
 from voxweave.core.layout import _vis_width
 from voxweave.diarize import (
+    _merge_bad_tail_runs,
     _speaker_runs,
     apply_speaker_format,
     format_speaker_cues,
@@ -281,3 +285,204 @@ def test_abc_middle_run_absorbed_below_edge_floor():
     runs = _speaker_runs(atoms, turns, "en")
     assert len(runs) == 2
     assert "SPK_B" not in [lb for lb, _ in runs]
+
+
+# --- Fix 5: a boundary must not strand a bound word (ja only) ----------------
+# Snapping to a phrase edge keeps lexemes whole but says nothing about whether
+# the edge is a decent *cue* end. When the only legal edge inside a cue is a
+# forbidden line-end, the split used to happen anyway: ja-07 replay cut
+# '正直この写真欲しい' into a standalone '正直この' (連体詞 この).
+#
+# The gate is AND-composed -- Level-2 bad tail AND no cleaner edge AND no audible
+# gap -- so it never fires on duration, on a clean tail, or across a real beat.
+# It is ja-only and scores with UniDic POS (ja_pos_end_penalties), the same signal
+# smart_split uses: the Level-1 char table flags *every* trailing の/に, which
+# merged away genuine second speakers (そうなの|それは, そんなに|ギリギリ), and no
+# validated equivalent grading exists for zh.
+
+
+def _per_char_atoms(text, step=0.3):
+    return _atoms([(c, step * i, step * (i + 1)) for i, c in enumerate(text)])
+
+
+def _run_texts(runs):
+    return ["".join(a["text"] for a in ats) for _, ats in runs]
+
+
+def _even_spans(n, step=0.3, start=0.0):
+    return [(start + step * i, start + step * (i + 1)) for i in range(n)]
+
+
+def _timed_cue(text, spans):
+    """Cue whose word_data is one (start, end) entry per char of ``text``."""
+    return _cue(text, spans[0][0], spans[-1][1], spans)
+
+
+# atoms 0-3 land in the first turn, 4-8 in the second, so the raw boundary falls
+# exactly on the single BudouX edge of 正直この|写真欲しい.
+JA_TAIL_TURNS = [(0.0, 1.2, "SPK_A"), (1.2, 3.0, "SPK_B")]
+
+
+def test_ja_bound_determiner_tail_merges_contiguous_runs():
+    # (a) The ja-07 defect: この is 連体詞 (Level-2 penalty 2), it is BudouX's only
+    # internal edge, and the two runs abut -- so the standalone '正直この' cue must
+    # not be emitted.
+    cue = _timed_cue("正直この写真欲しい", _even_spans(9))
+    out = format_speaker_cues([cue], JA_TAIL_TURNS, "ja")
+    assert [c["text"] for c in out] == ["正直この写真欲しい"]
+
+
+def test_ja_merged_run_keeps_the_longer_speakers_label():
+    runs = _speaker_runs(_per_char_atoms("正直この写真欲しい"), JA_TAIL_TURNS, "ja")
+    assert len(runs) == 1
+    # the merged run keeps the longer speaker (1.5s vs 1.2s)
+    assert runs[0][0] == "SPK_B"
+
+
+def test_ja_nominalising_no_tail_does_not_merge():
+    # (b) そうなの|それは: the char table scores the trailing の 2, but UniDic reads
+    # it as 準体助詞 (0), so SPK_B's line survives.
+    cue = _timed_cue("そうなのそれは", _even_spans(7))
+    turns = [(0.0, 1.2, "SPK_A"), (1.2, 3.0, "SPK_B")]
+    out = format_speaker_cues([cue], turns, "ja")
+    assert [c["text"] for c in out] == ["そうなの", "それは"]
+
+
+# ja-01 corpus shape: 'そんなに' 0.5s, then 'ギリギリ' 0.4s after a 0.1s gap.
+JA01_SPANS = [
+    (0.0, 0.125),
+    (0.125, 0.25),
+    (0.25, 0.375),
+    (0.375, 0.5),
+    (0.6, 0.7),
+    (0.7, 0.8),
+    (0.8, 0.9),
+    (0.9, 1.0),
+]
+
+
+def test_ja_adverbial_copula_tail_does_not_merge():
+    # (c) The ja-01 corpus false positive: そんなに ends in に, which the Level-1
+    # char table scores 2, but UniDic reads 形状詞 + 助動詞 -- a complete adverbial,
+    # not a dangling case particle. The 0.1s gap is below BAD_TAIL_MAX_GAP_S, so
+    # the scorer alone has to keep the two speakers apart.
+    cue = _timed_cue("そんなにギリギリ", JA01_SPANS)
+    turns = [(0.0, 0.55, "S4"), (0.55, 1.2, "S2")]
+    out = format_speaker_cues([cue], turns, "ja")
+    assert [c["text"] for c in out] == ["そんなに", "ギリギリ"]
+
+
+def test_ja_bound_tail_across_an_audible_gap_does_not_merge():
+    # (d) The merged shape again, but the reply starts 0.25s later. At or above
+    # BAD_TAIL_MAX_GAP_S the second run is a real turn, whatever the left tail
+    # looks like -- swallowing it is the EDGE_RUN_MIN_S regression class.
+    cue = _timed_cue("正直この写真欲しい", _even_spans(4) + _even_spans(5, start=1.45))
+    turns = [(0.0, 1.3, "SPK_A"), (1.4, 3.2, "SPK_B")]
+    out = format_speaker_cues([cue], turns, "ja")
+    assert [c["text"] for c in out] == ["正直この", "写真欲しい"]
+
+
+def test_ja_trailing_edge_reply_after_a_beat_survives_the_gate():
+    # (e) The 2026-07-03 regression class in the gate's own language: a 160ms
+    # trailing reply (< MIN_RUN_S but >= EDGE_RUN_MIN_S) behind a bad tail. Only
+    # the gap guard keeps it, since この is the cue's one internal edge.
+    cue = _timed_cue("正直この写真", _even_spans(4) + [(1.5, 1.58), (1.58, 1.66)])
+    turns = [(0.0, 1.3, "SPEAKER_02"), (1.45, 3.0, "SPEAKER_00")]
+    out = format_speaker_cues([cue], turns, "ja")
+    assert [c["text"] for c in out] == ["正直この", "写真"]
+    assert out[1]["start"] == 1.5
+
+
+def test_ja_clean_tail_on_same_shape_still_splits():
+    # Negative control: identical 4+5 shape and turns, but BudouX phrase 1 ends on
+    # そう (penalty 0), so the boundary is left exactly where it was.
+    cue = _timed_cue("正直そう写真欲しい", _even_spans(9))
+    out = format_speaker_cues([cue], JA_TAIL_TURNS, "ja")
+    assert [c["text"] for c in out] == ["正直そう", "写真欲しい"]
+
+
+def test_ja_bad_tail_with_cleaner_alternative_edge_left_alone():
+    # 私は|この|写真欲しい: the boundary tail この scores 2, but the edge after 私は
+    # scores 0, so the AND gate stays shut -- relocating the boundary is a
+    # separate concern.
+    cue = _timed_cue("私はこの写真欲しい", _even_spans(9))
+    out = format_speaker_cues([cue], JA_TAIL_TURNS, "ja")
+    assert [c["text"] for c in out] == ["私はこの", "写真欲しい"]
+
+
+def test_gate_stays_shut_without_a_level2_pos_source(monkeypatch):
+    # No fugashi (or VOXWEAVE_JA_POS=0) -> no Level-2 signal. The char table would
+    # score この 2 and merge, so the gate degrades to doing nothing instead of
+    # firing on the Level-1 score it was rejected for.
+    from voxweave.core import kinsoku
+
+    monkeypatch.setattr(kinsoku, "_load_ja_tagger", lambda: None)
+    cue = _timed_cue("正直この写真欲しい", _even_spans(9))
+    out = format_speaker_cues([cue], JA_TAIL_TURNS, "ja")
+    assert [c["text"] for c in out] == ["正直この", "写真欲しい"]
+
+
+def _split_runs(text, cut, step=0.3):
+    atoms = _per_char_atoms(text, step)
+    return [("SPK_A", atoms[:cut]), ("SPK_B", atoms[cut:])]
+
+
+def test_bad_tail_gate_is_ja_only():
+    # zh 不|可能 ('no' / 'maybe') is a real two-speaker exchange, and jieba's only
+    # internal edge is the boundary. The UniDic tagger reads 不 as 接頭辞 (2), so
+    # without the language guard the gate would swallow the second speaker --
+    # exactly the over-fire the char-table version was rejected for.
+    runs = _split_runs("不可能", 1, step=0.5)
+    for lang in ("zh", "yue"):
+        assert _merge_bad_tail_runs(runs, lang) == runs
+    # sanity: the same predicate does fire on the language it was validated for
+    assert len(_merge_bad_tail_runs(_split_runs("正直この写真欲しい", 4), "ja")) == 1
+
+
+def test_bad_tail_gate_needs_a_measurable_gap():
+    # A run edge with no timestamp makes the inter-run silence unmeasurable; that
+    # must not be read as "contiguous".
+    runs = _split_runs("正直この写真欲しい", 4)
+    runs[0][1][-1]["end"] = None
+    assert _merge_bad_tail_runs(runs, "ja") == runs
+
+
+def test_bad_tail_gate_ceiling_is_exclusive():
+    # BAD_TAIL_MAX_GAP_S is documented as the gap a merge may NOT span, but
+    # 1.4 - 1.2 evaluates to 0.19999999999999996, so a nominally 0.2s beat used to
+    # slip under the ceiling and merge. _run_gap carries the epsilon that closes it.
+    from voxweave.diarize import BAD_TAIL_MAX_GAP_S, _run_gap
+
+    left = [{"text": "こ", "start": 1.0, "end": 1.2}]
+    right = [{"text": "写", "start": 1.4, "end": 1.6}]
+    assert 1.4 - 1.2 < BAD_TAIL_MAX_GAP_S  # the raw float artifact
+    assert _run_gap(left, right) >= BAD_TAIL_MAX_GAP_S
+
+    cue = _timed_cue("正直この写真欲しい", _even_spans(4) + _even_spans(5, start=1.4))
+    turns = [(0.0, 1.3, "SPK_A"), (1.35, 3.2, "SPK_B")]
+    out = format_speaker_cues([cue], turns, "ja")
+    assert [c["text"] for c in out] == ["正直この", "写真欲しい"]
+
+
+def test_bad_tail_gate_leaves_trailing_edge_run_pin_intact():
+    # Byte-identical duplicate of test_trailing_edge_second_speaker_run_kept (the
+    # 2026-07-03 user-reported regression): the gate must not reopen it. zh, so
+    # the gate does not even run -- the ja counterpart is
+    # test_ja_trailing_edge_reply_after_a_beat_survives_the_gate.
+    atoms = _atoms(
+        [
+            ("我", 0.0, 0.5),
+            ("想", 0.5, 1.0),
+            ("听", 1.0, 1.5),
+            ("听", 1.5, 2.0),
+            ("普", 2.0, 2.5),
+            ("通", 2.5, 3.0),
+            ("话", 3.0, 3.3),
+            ("你", 3.8, 3.88),
+            ("好", 3.88, 3.96),
+        ]
+    )
+    turns = [(0.0, 3.5, "SPEAKER_02"), (3.74, 5.0, "SPEAKER_00")]
+    runs = _speaker_runs(atoms, turns, "zh")
+    assert [lb for lb, _ in runs] == ["SPEAKER_02", "SPEAKER_00"]
+    assert _run_texts(runs) == ["我想听听普通话", "你好"]

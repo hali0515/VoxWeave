@@ -15,10 +15,18 @@ from typing import NotRequired, TypedDict
 class Unit(TypedDict, total=False):
     """One aligned token from an aligner / ``reinject_punct``.
 
-    ``text`` is the unit's surface form (aligner output); pipeline word_data
-    carries ``word`` instead (the ASR token used for cursor anchoring in
-    ``split_at_sentence_end``). Spans are absolute seconds; either bound may be
-    missing for ghost units.
+    ``text`` is the unit's surface form (aligner output, and the packed atom's
+    surface in the repacked word_data ``_chunk_to_cue`` writes); pipeline
+    word_data carries ``word`` instead (the ASR token used for cursor anchoring
+    in ``split_at_sentence_end``). Spans are absolute seconds; either bound may
+    be missing for ghost units.
+
+    A stream comes at one of several granularities — one entry per non-space
+    character (aligner output, ``reinject_punct``), one per packed atom (a cue
+    materialized by ``_chunk_to_cue``), or one per legacy sentence-sized ASR
+    ``word`` — and **the key does not say which**: ``reinject_punct`` writes
+    ``text`` on char-level units. Reconcile the stored surfaces against the text
+    (``smart_split._unit_ranges``) instead of assuming a granularity.
     """
 
     text: str
@@ -34,6 +42,9 @@ class Atom(TypedDict, total=False):
     ``end_pen`` is the precomputed line-end break penalty attached by
     ``_attach_end_penalties`` (0 = clean break point).
     ``forced_boundary`` exposes spaces inside an overlong embedded Latin run.
+    ``_unit_start``/``_unit_end`` are the atom's half-open footprint in the
+    ``word_data`` it was built from — the only granularity-safe way to slice that
+    stream back (``diarize.format_speaker_cues``, ``_repair_bound_particle_cues``).
     """
 
     text: str
@@ -41,6 +52,8 @@ class Atom(TypedDict, total=False):
     end: float | None
     end_pen: int
     forced_boundary: bool
+    _unit_start: int
+    _unit_end: int
 
 
 class Cue(TypedDict):

@@ -454,6 +454,333 @@ def test_unit_glyph_binds_to_digit():
     assert a["start"] == wd[2]["start"] and a["end"] == wd[4]["end"]
 
 
+def test_build_atoms_round_trips_repacked_word_data():
+    # Second generation: _chunk_to_cue's word_data holds one entry per atom, so
+    # re-reading it must rebuild the very same atoms instead of advancing a
+    # character cursor (which handed 92% four entries and starved the tail).
+    from voxweave.core.smart_split import _build_atoms, _chunk_to_cue
+
+    wd = [{"start": i * 0.1, "end": i * 0.1 + 0.05} for i in range(6)]
+    first = _build_atoms("上涨92%了", wd, "zh")
+    cue = _chunk_to_cue(first, {"text": "", "start": 0.0, "end": 0.6}, "zh")
+
+    second = _build_atoms(cue["text"], cue["word_data"], "zh")
+    keys = ("text", "start", "end")
+    assert [{k: a[k] for k in keys} for a in second] == [
+        {k: a[k] for k in keys} for a in first
+    ]
+
+
+def test_build_atoms_degrades_instead_of_raising_on_desync():
+    # A stream that covers neither the text nor its own entries must still
+    # produce atoms: _build_atoms runs after ASR, alignment and diarization, so
+    # a whole-file abort over one unreadable cue is worse than degraded timing.
+    # Uncoverable atoms get start=end=None, the pre-reconciliation behaviour.
+    from voxweave.core.smart_split import (
+        _build_atoms,
+        split_long_cues_with_word_timings,
+    )
+
+    wd = [
+        {"text": t, "start": i * 0.1, "end": i * 0.1 + 0.05}
+        for i, t in enumerate("涨了")
+    ]
+    atoms = _build_atoms("上涨92%了", wd, "zh")
+    assert [a["text"] for a in atoms] == ["上", "涨", "92%", "了"]
+    assert [(a["start"], a["end"]) for a in atoms[2:]] == [(None, None), (None, None)]
+
+    # ...and the public packer that reads them stays callable on the same input.
+    cues = split_long_cues_with_word_timings(
+        [{"text": "上涨92%了", "start": 0.0, "end": 0.2, "word_data": wd}],
+        max_line_length=18,
+        max_lines=1,
+        min_duration=0.0,
+        desired_wps=4.0,
+        lang="zh",
+    )
+    assert "".join(c["text"] for c in cues) == "上涨92%了"
+
+
+def test_build_atoms_keeps_digit_internal_dot_in_stream_context():
+    # strip_punct_for_subtitles is context-sensitive ("[.,](?!\\d)"), so the "."
+    # of 3.75 survives in the cue text but a lone "." entry looked at on its own
+    # does not. Normalizing the joined stream is what keeps the two sides
+    # comparable; per-entry normalization desynced every atom after the decimal.
+    from voxweave.core.smart_split import _build_atoms
+
+    source = "这个,价格是3.75元"  # the raw stream the aligner produced
+    rendered = "这个 价格是3.75元"  # what strip_punct_for_subtitles left of it
+    wd = [
+        {"word": ch, "start": round(i * 0.4, 3), "end": round(i * 0.4 + 0.3, 3)}
+        for i, ch in enumerate(source)
+    ]
+    atoms = _build_atoms(rendered, wd, "zh")
+
+    assert [a["text"] for a in atoms] == list("这个价格是") + ["3.75", "元"]
+    decimal = atoms[-2]  # "3.75" spans the four digit/dot entries, nothing more
+    assert (decimal["start"], decimal["end"]) == (wd[6]["start"], wd[9]["end"])
+    assert (atoms[-1]["start"], atoms[-1]["end"]) == (wd[10]["start"], wd[10]["end"])
+
+
+def test_build_atoms_matches_text_the_renderer_rewrote():
+    # Two more ways the finished text stops spelling its own word_data: the
+    # stutter hyphen _merge_stutters inserts, and the spaces inside an embedded
+    # Latin run (aligner units carry one entry per non-space char). Both must
+    # cancel out of the comparison or every atom after them shifts.
+    from voxweave.core.smart_split import _build_atoms
+
+    def wd(source):
+        return [
+            {"word": ch, "start": round(i * 0.4, 3), "end": round(i * 0.4 + 0.3, 3)}
+            for i, ch in enumerate(source)
+        ]
+
+    stutter = wd("我II想")  # rendered as "我I-I想"
+    atoms = _build_atoms("我I-I想", stutter, "zh")
+    assert [a["text"] for a in atoms] == ["我", "I-I", "想"]
+    assert (atoms[1]["start"], atoms[1]["end"]) == (
+        stutter[1]["start"],
+        stutter[2]["end"],
+    )
+    assert (atoms[2]["start"], atoms[2]["end"]) == (
+        stutter[3]["start"],
+        stutter[3]["end"],
+    )
+
+    spaced = wd("我inaweek想")  # rendered with the run's own spaces
+    atoms = _build_atoms("我in a week想", spaced, "zh")
+    assert [a["text"] for a in atoms] == ["我", "in a week", "想"]
+    assert (atoms[2]["start"], atoms[2]["end"]) == (
+        spaced[8]["start"],
+        spaced[8]["end"],
+    )
+
+    # Same run, but the aligner emitted it as whole words: one entry covers a
+    # token the text spells with spaces, and three entries cover one atom.
+    words = [
+        {"word": s, "start": round(i * 0.4, 3), "end": round(i * 0.4 + 0.3, 3)}
+        for i, s in enumerate(["我", "in", "a", "week", "想"])
+    ]
+    atoms = _build_atoms("我in a week想", words, "zh")
+    assert [(a["_unit_start"], a["_unit_end"]) for a in atoms] == [
+        (0, 1),
+        (1, 4),
+        (4, 5),
+    ]
+    assert (atoms[1]["start"], atoms[1]["end"]) == (words[1]["start"], words[3]["end"])
+    assert (atoms[2]["start"], atoms[2]["end"]) == (words[4]["start"], words[4]["end"])
+
+
+def _atom_cue(surfaces, t0, step=0.3, with_surface=True):
+    """A cue whose word_data is one entry per packed atom (``_chunk_to_cue`` shape)."""
+    wd = []
+    t = t0
+    for surface in surfaces:
+        entry = {"start": round(t, 3), "end": round(t + step, 3)}
+        if with_surface:
+            entry["text"] = surface
+        wd.append(entry)
+        t = round(t + step, 3)
+    return {
+        "text": "".join(surfaces),
+        "start": wd[0]["start"],
+        "end": wd[-1]["end"],
+        "word_data": wd,
+    }
+
+
+REPAIR_KWARGS = dict(
+    lang="zh", max_line_length=8, max_lines=1, max_cue_s=7.0, connected_gap_s=0.4
+)
+
+
+def test_repair_bound_particle_cues_cuts_on_atom_footprint():
+    # The repartition slices the source units at the new edge. With a multi-char
+    # atom left of the cut (GPT-4), counting characters overshoots -- units[:10]
+    # of an 8-entry stream hands the left cue everything and leaves the right cue
+    # with no timings at all.
+    from voxweave.core.smart_split import _repair_bound_particle_cues
+
+    left = _atom_cue(["这", "个", "GPT-4"], 0.0)
+    right = _atom_cue(["的", "照", "片", "很", "好"], 0.9)
+    out = _repair_bound_particle_cues([left, right], **REPAIR_KWARGS)
+
+    assert [c["text"] for c in out] == ["这个GPT-4的照片", "很好"]
+    assert [[w["text"] for w in c["word_data"]] for c in out] == [
+        ["这", "个", "GPT-4", "的", "照", "片"],
+        ["很", "好"],
+    ]
+    assert [(c["start"], c["end"]) for c in out] == [(0.0, 1.8), (1.8, 2.4)]
+
+
+def test_repair_bound_particle_cues_skips_unreconcilable_pair():
+    # Legacy word_data stores no surface, so an atom-level stream is indis-
+    # tinguishable from a char-level one and the footprints fall back to a char
+    # cursor that overshoots the stream. Repartitioning on those indices would
+    # slice units[:9] out of a 6-entry list: the right cue loses every entry and
+    # its span moves in front of the left cue's end.
+    from voxweave.core.smart_split import _repair_bound_particle_cues
+
+    left = _atom_cue(["这", "是", "我", "的"], 0.0, with_surface=False)
+    right = _atom_cue(["GPT-4", "照片"], 1.2, with_surface=False)
+    out = _repair_bound_particle_cues([left, right], **REPAIR_KWARGS)
+
+    assert out == [left, right]
+
+
+def _wd(pairs):
+    """word_data from ``(surface, start, end)`` triples."""
+    return [{"text": s, "start": a, "end": b} for s, a, b in pairs]
+
+
+def test_repair_bound_particle_cues_never_strands_a_particle_on_the_tail():
+    # Harmful direction: the 格助詞 の already sits at the penalty-0 position (the
+    # right cue's START). ``hard`` scores "の at the left end" and "の at the right
+    # start" as an equal tie, so without the tail guard the width tiebreak moves it
+    # onto the left cue's tail -- turning a line_end_penalty 0 cue end into a 2.
+    # The pass must leave this pair exactly as it found it.
+    from voxweave.core.kinsoku import line_end_penalty
+    from voxweave.core.smart_split import _repair_bound_particle_cues
+
+    left = {
+        "text": "GPT-4あか，",
+        "start": 0.0,
+        "end": 4.353,
+        "word_data": _wd(
+            [
+                ("GPT-4", 0.0, 2.808),
+                ("あ", 2.828, 3.005),
+                ("か", 3.205, 3.453),
+                ("，", 4.353, 4.353),
+            ]
+        ),
+    }
+    right = {
+        "text": "のどどんいのしたんい",
+        "start": 4.353,
+        "end": 9.223,
+        "word_data": _wd(
+            [
+                ("の", 4.353, 4.55),
+                ("ど", 4.55, 4.722),
+                ("ど", 4.742, 4.957),
+                ("ん", 5.857, 6.188),
+                ("い", 6.388, 6.612),
+                ("の", 6.632, 6.759),
+                ("し", 6.779, 7.071),
+                ("た", 7.971, 8.292),
+                ("ん", 8.492, 8.768),
+                ("い", 8.968, 9.223),
+            ]
+        ),
+    }
+    assert line_end_penalty(left["text"], "ja") == 0
+
+    out = _repair_bound_particle_cues(
+        [dict(left), dict(right)],
+        lang="ja",
+        max_line_length=18,
+        max_lines=1,
+        max_cue_s=7.0,
+        connected_gap_s=0.56,
+    )
+
+    assert [c["text"] for c in out] == ["GPT-4あか，", "のどどんいのしたんい"]
+    assert line_end_penalty(out[0]["text"], "ja") == 0
+    assert out == [left, right]
+
+
+def test_repair_bound_particle_cues_leaves_a_forward_binding_zh_pair_alone():
+    # Same shape in zh (the corpus zh-07 regression): 的 heads the right cue at
+    # penalty 0 and must not be dragged onto `condition`'s tail, where the whole-
+    # word table scores it 2.
+    from voxweave.core.kinsoku import line_end_penalty
+    from voxweave.core.smart_split import _repair_bound_particle_cues
+
+    left = {
+        "text": "condition",
+        "start": 41.22,
+        "end": 41.7,
+        "word_data": _wd([("condition", 41.22, 41.7)]),
+    }
+    right = {
+        "text": "的一个设置",
+        "start": 41.7,
+        "end": 42.34,
+        "word_data": _wd(
+            [
+                (c, round(41.7 + 0.12 * i, 3), round(41.8 + 0.12 * i, 3))
+                for i, c in enumerate("的一个设置")
+            ]
+        ),
+    }
+
+    out = _repair_bound_particle_cues(
+        [dict(left), dict(right)],
+        lang="zh",
+        max_line_length=6,
+        max_lines=1,
+        max_cue_s=7.0,
+        connected_gap_s=0.4,
+    )
+
+    assert out == [left, right]
+    assert line_end_penalty(out[0]["text"], "zh") == 0
+
+
+def test_repair_bound_particle_cues_still_pulls_a_backward_binding_particle_left():
+    # The mirror case, and the reason the guard compares the tail against the
+    # ORIGINAL tail instead of banning every move: the aspect particle 了 binds
+    # backward, so the zh tables score it 2 at a cue START (_ZH_BIND_START_HIGH)
+    # and 0 at a cue END. Pulling it onto the previous cue is the repair working
+    # as designed -- it does not worsen the left tail, so the guard stays out of
+    # the way and every source unit is still accounted for.
+    from voxweave.core.kinsoku import line_end_penalty, line_start_penalty
+    from voxweave.core.smart_split import _repair_bound_particle_cues
+
+    left = {
+        "text": "上涨92%",
+        "start": 10.0,
+        "end": 11.0,
+        "word_data": _wd([("上", 10.0, 10.3), ("涨", 10.3, 10.6), ("92%", 10.6, 11.0)]),
+    }
+    right = {
+        "text": "了一个问题",
+        "start": 11.05,
+        "end": 12.0,
+        "word_data": _wd(
+            [
+                (c, round(11.05 + 0.18 * i, 3), round(11.2 + 0.18 * i, 3))
+                for i, c in enumerate("了一个问题")
+            ]
+        ),
+    }
+    assert line_start_penalty("了", "zh") == 2
+    assert line_end_penalty("了", "zh") == 0
+
+    out = _repair_bound_particle_cues(
+        [dict(left), dict(right)],
+        lang="zh",
+        max_line_length=6,
+        max_lines=1,
+        max_cue_s=7.0,
+        connected_gap_s=0.4,
+    )
+
+    assert [c["text"] for c in out] == ["上涨92%了", "一个问题"]
+    assert line_end_penalty(out[0]["text"], "zh") == 0
+    assert [w["text"] for c in out for w in c["word_data"]] == [
+        "上",
+        "涨",
+        "92%",
+        "了",
+        "一",
+        "个",
+        "问",
+        "题",
+    ]
+
+
 def test_unit_glyph_wrap_units():
     from voxweave.core.layout import _wrap_units
 

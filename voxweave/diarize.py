@@ -17,6 +17,7 @@ provide a token (VOXWEAVE_HF_TOKEN / HF_TOKEN env, or ``hf_token`` in the conf).
 from __future__ import annotations
 
 import logging
+import math
 import os
 import warnings
 from collections.abc import Sequence
@@ -52,6 +53,22 @@ MIN_RUN_S = 0.2
 # pyannote noise. Keeps e.g. a 160ms trailing '你好' as its own speaker cue while
 # still dropping an 80ms mid-phrase fragment.
 EDGE_RUN_MIN_S = 0.12
+
+# A speaker boundary is also a cue boundary, so the left piece's tail is scored
+# with the Level-2 (UniDic POS) end penalty smart_split uses for its own breaks.
+# 2 = the tail cannot end an utterance at all (格助詞 with no head, 連体詞 with
+# nothing to modify); splitting there is only acceptable when the cue has no
+# cleaner edge to offer. ja only -- no validated equivalent grading exists for zh,
+# and the Level-1 char table over-fires (準体の, adverbial に).
+BAD_TAIL_PENALTY = 2
+
+# Inter-run silence a bad-tail merge may span. A reply that starts after a beat is
+# a genuine second speaker, whatever the left tail looks like -- swallowing it is
+# the 2026-07-03 EDGE_RUN_MIN_S regression class. Only a boundary the diarizer
+# placed inside continuous speech can plausibly be a mis-cut phrase, so the merge
+# is confined to gaps below the shortest inter-speaker pause worth trusting
+# (same order as MIN_RUN_S: shorter than any real turn-taking beat).
+BAD_TAIL_MAX_GAP_S = 0.2
 
 # Turn-list smoothing (raw pyannote turns are noisy: 16-31% run <0.5s, and
 # overlap-track fragments sit fully inside another speaker's turn). Module
@@ -443,6 +460,111 @@ def _snap_runs_to_phrases(
     return out
 
 
+def _run_gap(left: list[dict], right: list[dict]) -> float:
+    """Silence between the end of ``left`` and the start of ``right``.
+
+    ``inf`` when either side has no usable timestamp: an unmeasurable gap must
+    never be read as "contiguous" by a caller that merges on contiguity.
+    """
+    end = left[-1].get("end") if left else None
+    start = right[0].get("start") if right else None
+    if end is None or start is None:
+        return math.inf
+    # +epsilon keeps BAD_TAIL_MAX_GAP_S the exclusive bound its comment documents:
+    # 1.4 - 1.2 is 0.19999999999999996 in binary floating point, so without it a
+    # nominally 0.2s gap slips under the ceiling and merges.
+    return max(0.0, float(start) - float(end)) + 1e-9
+
+
+def _ja_edge_penalties(flat: list[dict], edges: Sequence[int]) -> dict[int, int] | None:
+    """Level-2 (UniDic POS) end penalty for each internal atom edge, or ``None``.
+
+    Wired exactly like ``smart_split._attach_end_penalties``: the POS map is keyed
+    by the non-space char offset of each token's LAST char, so the edge before
+    atom ``e`` is scored at the cumulative offset of atom ``e - 1``.
+
+    ``None`` means no Level-2 source (fugashi absent, or ``VOXWEAVE_JA_POS=0``).
+    Unlike line breaking, this pass has no safe Level-1 fallback: the char table
+    scores every trailing の/に 2, including 準体の (そうな|の) and the adverbial
+    copula (そんな|に), and acting on those merges away a real speaker. So the
+    caller must leave the boundary alone rather than degrade. Offsets the tagger
+    does not end a token on (BudouX/MeCab disagreement) score 0 for the same
+    reason.
+    """
+    from voxweave.core.kinsoku import ja_pos_end_penalties
+    from voxweave.core.layout import _token_char_count
+
+    pos = ja_pos_end_penalties("".join(a["text"] for a in flat), bound_tails_only=True)
+    if pos is None:
+        return None
+    offsets: list[int] = []
+    total = 0
+    for a in flat:
+        total += _token_char_count(a["text"])
+        offsets.append(total)
+    return {e: pos.get(offsets[e - 1] - 1, 0) for e in edges if 0 < e < len(flat)}
+
+
+def _merge_bad_tail_runs(
+    runs: list[tuple[str, list[dict]]], lang: str
+) -> list[tuple[str, list[dict]]]:
+    """Merge a speaker boundary that would strand a bound word on the left cue.
+
+    ja only: the gate needs the Level-2 POS signal to tell a dangling 格助詞 from
+    a legal clause end, and no validated equivalent grading exists for zh.
+
+    Fires only when all three hold: the boundary's tail scores
+    ``BAD_TAIL_PENALTY``, no other internal phrase edge of the cue would score
+    below it, and the two runs are separated by less than ``BAD_TAIL_MAX_GAP_S``
+    of silence. A cleaner edge means the boundary stays where the speaker signal
+    put it (relocating it is a separate concern); an audible gap means the second
+    run is a real reply, not a mis-cut phrase. The merged run keeps the longer
+    speaker's label, the same duration comparison ``_absorb_tiny_runs`` uses.
+    Duration alone never triggers this pass, so the tiny-run policy above is
+    untouched.
+
+    Repeats to a fixpoint: merging can join two runs of one speaker, and the
+    re-coalesced neighbours form a boundary that was not there before.
+    """
+    if lang != "ja" or len(runs) < 2:
+        return runs
+    from voxweave.core.smart_split import _phrase_boundary_atoms
+
+    runs = [(lb, list(ats)) for lb, ats in runs]
+    while len(runs) > 1:
+        flat = [a for _, ats in runs for a in ats]
+        text = "".join(a["text"] for a in flat)
+        edges = sorted(
+            _phrase_boundary_atoms([{"text": a["text"]} for a in flat], text, lang)
+            | {0, len(flat)}
+        )
+        pen = _ja_edge_penalties(flat, edges)
+        if pen is None:
+            break
+        target = None
+        cut = 0
+        for i in range(len(runs) - 1):
+            cut += len(runs[i][1])
+            # An unknown cut is not a phrase edge at all -- treat it as clean and
+            # leave it to _snap_runs_to_phrases rather than merging on a guess.
+            if pen.get(cut, 0) < BAD_TAIL_PENALTY:
+                continue
+            if any(p < BAD_TAIL_PENALTY for e, p in pen.items() if e != cut):
+                continue
+            if _run_gap(runs[i][1], runs[i + 1][1]) >= BAD_TAIL_MAX_GAP_S:
+                continue
+            target = i
+            break
+        if target is None:
+            break
+        left, right = runs[target], runs[target + 1]
+        label = right[0] if _run_dur(right[1]) > _run_dur(left[1]) else left[0]
+        runs[target] = (label, left[1] + right[1])
+        del runs[target + 1]
+        runs = _coalesce_runs(runs)
+    return runs
+
+
 def _speaker_runs(
     atoms: list[dict], turns: Sequence[Turn], lang: str
 ) -> list[tuple[str, list[dict]]]:
@@ -452,7 +574,9 @@ def _speaker_runs(
     run; leading unassigned atoms join the first labeled run. Raw runs are then
     de-noised: sub-``MIN_RUN_S`` label thrash is absorbed into the longer
     neighbor, and surviving boundaries snap to jieba/BudouX phrase edges so a
-    lexeme is never split across two speaker cues.
+    lexeme is never split across two speaker cues. Finally (ja only) a boundary
+    that survives the snap but would leave the left cue ending on a bound word --
+    with no cleaner edge available and no audible gap -- is merged away.
     """
     runs: list[tuple[str, list[dict]]] = []
     pending: list[dict] = []  # unassigned atoms before the first labeled one
@@ -474,7 +598,7 @@ def _speaker_runs(
         return runs
     runs = _absorb_tiny_runs(runs)
     runs = _snap_runs_to_phrases(runs, lang)
-    return runs
+    return _merge_bad_tail_runs(runs, lang)
 
 
 def _slice_text_by_runs(text: str, runs: list[tuple[str, list[dict]]]) -> list[str]:
@@ -581,8 +705,21 @@ def format_speaker_cues(
             out.append(dual)
             continue
         wd_cursor = 0
-        for (_label, atoms_run), piece in zip(runs, pieces):
-            n = len(atoms_run)
+        for index, ((_label, atoms_run), piece) in enumerate(zip(runs, pieces)):
+            # Slice by each run's recorded word_data footprint, not by atom
+            # count: a repacked cue stores one entry per atom while a
+            # first-generation one stores one per character. Entries the display
+            # dropped (punctuation) sit between footprints and go to the run that
+            # follows them; the last run takes the remainder, so a trailing
+            # dropped entry is kept rather than lost from the stream.
+            if index == len(runs) - 1:
+                wd_end = len(word_data)
+            elif atoms_run:
+                wd_end = min(
+                    max(wd_cursor, int(atoms_run[-1]["_unit_end"])), len(word_data)
+                )
+            else:
+                wd_end = wd_cursor
             start, end = _run_span(atoms_run, cue["start"], cue["end"])
             part = cast(Cue, dict(cue))
             # Re-wrap the piece for its language (the same layout machinery
@@ -591,8 +728,8 @@ def format_speaker_cues(
             part["text"] = wrap_cue_text(piece, lang, max_lines, max_line_length=budget)
             part["start"] = start
             part["end"] = end
-            part["word_data"] = list(word_data[wd_cursor : wd_cursor + n])
-            wd_cursor += n
+            part["word_data"] = list(word_data[wd_cursor:wd_end])
+            wd_cursor = wd_end
             out.append(part)
     return out
 

@@ -298,7 +298,9 @@ def _load_ja_tagger():
         return None
 
 
-def _pos_penalty(pos1: str, pos2: str, surface: str) -> int:
+def _pos_penalty(
+    pos1: str, pos2: str, surface: str, *, bound_tails_only: bool = False
+) -> int:
     """UniDic POS + surface -> line-end penalty (Level 2 of the same scorer).
 
     Same intent as the char tables, but disambiguated: 準体助詞の (走るの = a
@@ -312,6 +314,10 @@ def _pos_penalty(pos1: str, pos2: str, surface: str) -> int:
     tiebreak and stranded を/に instead of the clause-capable が. 助動詞 whose
     surface ends in a HIGH char closes the みたいに/ように hole, where the POS
     override used to *downgrade* the char table's correct 2 to 0.
+
+    ``bound_tails_only`` keeps only the tails that leave the phrase
+    *syntactically* incomplete and demotes that 助動詞 class to 0 — see
+    :func:`ja_pos_end_penalties`.
     """
     last = surface[-1] if surface else ""
     if pos1 == "助詞":
@@ -325,17 +331,29 @@ def _pos_penalty(pos1: str, pos2: str, surface: str) -> int:
     if pos1 in ("連体詞", "接頭辞"):
         return 2  # この|村 / お|名前: always binds forward
     if pos1 == "助動詞" and last in _BIND_END_HIGH:
-        return 2  # みたいに / ように: adverbial copula binds forward
+        # みたいに / ように / そんなに: the adverbial copula binds forward, but the
+        # phrase it closes is complete, so a caller that *deletes* material on a
+        # bad tail rather than moving a line break opts out of this class.
+        return 0 if bound_tails_only else 2
     return 0
 
 
-def ja_pos_end_penalties(text: str) -> dict[int, int] | None:
+def ja_pos_end_penalties(
+    text: str, *, bound_tails_only: bool = False
+) -> dict[int, int] | None:
     """Penalty by non-space char offset of each token's LAST char, or None.
 
     Offsets count non-space chars only, matching smart_split's atom cursor.
     Only token-end offsets are present: a break after a mid-token char is not
     scored here (callers fall back to the char table), so BudouX/MeCab boundary
     disagreements degrade to Level-1 behavior instead of guessing.
+
+    ``bound_tails_only`` restricts the 2s to tails that cannot end an utterance
+    at all — a 格助詞 with no head (大樹の|村), a 連体詞/接頭辞 with nothing to
+    modify (この|写真) — and scores the adverbial 助動詞 class (ように / そんなに)
+    0. Line breaking wants the full signal; ``diarize``'s speaker-run merge only
+    wants the unambiguous half, because acting on the softer class there deletes
+    a genuine speaker turn instead of nudging a break.
     """
     tagger = _load_ja_tagger()
     if tagger is None:
@@ -352,6 +370,7 @@ def ja_pos_end_penalties(text: str) -> dict[int, int] | None:
             getattr(f, "pos1", "") or "",
             getattr(f, "pos2", "") or "",
             word.surface.strip(),
+            bound_tails_only=bound_tails_only,
         )
     return pen
 

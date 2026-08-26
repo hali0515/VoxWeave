@@ -145,7 +145,12 @@ def _tokens(text: str, lang: str) -> list[str]:
 
 
 def _token_char_count(tok: str) -> int:
-    """Non-whitespace chars in a token — used to advance the char-level word_data cursor."""
+    """Non-whitespace chars in a token.
+
+    This is the *char-level* word_data width only. word_data is not always
+    char-level (see ``Unit``), so slicing a stream with this cursor is the
+    fallback ``smart_split._unit_ranges`` degrades to, not the contract.
+    """
     return sum(1 for c in tok if not c.isspace())
 
 
