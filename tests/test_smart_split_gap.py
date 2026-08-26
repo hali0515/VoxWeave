@@ -571,6 +571,120 @@ def test_build_atoms_matches_text_the_renderer_rewrote():
     assert (atoms[2]["start"], atoms[2]["end"]) == (words[4]["start"], words[4]["end"])
 
 
+def test_en_build_atoms_reconciles_stuttered_rendered_text():
+    from voxweave.core.smart_split import _build_atoms
+
+    word_data = [
+        {"text": "I", "start": 0.0, "end": 0.4},
+        {"text": "I", "start": 0.4, "end": 0.8},
+        {"text": "went", "start": 1.2, "end": 1.6},
+        {"text": "home", "start": 2.0, "end": 2.4},
+    ]
+
+    atoms = _build_atoms("I-I went home", word_data, "en")
+
+    assert [a["text"] for a in atoms] == ["I-I", "went", "home"]
+    assert [(a["_unit_start"], a["_unit_end"]) for a in atoms] == [
+        (0, 2),
+        (2, 3),
+        (3, 4),
+    ]
+    assert [(a["start"], a["end"]) for a in atoms] == [
+        (0.0, 0.8),
+        (1.2, 1.6),
+        (2.0, 2.4),
+    ]
+
+
+def test_en_build_atoms_reconciles_stripped_punctuation():
+    from voxweave.core.smart_split import _build_atoms
+
+    word_data = [
+        {"text": "e.g.", "start": 10.0, "end": 10.5},
+        {"text": "now", "start": 11.0, "end": 11.5},
+    ]
+
+    atoms = _build_atoms("e g now", word_data, "en")
+
+    assert [a["text"] for a in atoms] == ["e", "g", "now"]
+    assert [(a["_unit_start"], a["_unit_end"]) for a in atoms] == [
+        (0, 1),
+        (0, 1),
+        (1, 2),
+    ]
+    assert [(a["start"], a["end"]) for a in atoms] == [
+        (10.0, 10.5),
+        (10.0, 10.5),
+        (11.0, 11.5),
+    ]
+
+
+def test_en_build_atoms_keeps_clean_one_to_one_spans():
+    from voxweave.core.smart_split import _build_atoms
+
+    word_data = [
+        {"word": "clean", "start": 3.0, "end": 3.4},
+        {"word": "one", "start": 3.5, "end": 3.8},
+        {"word": "case", "start": 3.9, "end": 4.2},
+    ]
+
+    assert _build_atoms("clean one case", word_data, "en") == [
+        {
+            "text": "clean",
+            "start": 3.0,
+            "end": 3.4,
+            "_unit_start": 0,
+            "_unit_end": 1,
+        },
+        {
+            "text": "one",
+            "start": 3.5,
+            "end": 3.8,
+            "_unit_start": 1,
+            "_unit_end": 2,
+        },
+        {
+            "text": "case",
+            "start": 3.9,
+            "end": 4.2,
+            "_unit_start": 2,
+            "_unit_end": 3,
+        },
+    ]
+
+
+def test_en_speaker_split_uses_reconciled_stutter_spans():
+    from voxweave.diarize import format_speaker_cues
+
+    word_data = [
+        {"text": "I", "start": 0.0, "end": 0.4},
+        {"text": "I", "start": 0.4, "end": 0.8},
+        {"text": "went", "start": 1.2, "end": 1.6},
+        {"text": "home", "start": 2.0, "end": 2.4},
+    ]
+    cue = {
+        "text": "I-I went home",
+        "start": 0.0,
+        "end": 2.4,
+        "word_data": word_data,
+    }
+    turns = [(0.0, 0.9, "A"), (1.0, 1.8, "B"), (1.9, 2.5, "C")]
+
+    out = format_speaker_cues([cue], turns, "en")
+
+    assert [c["text"] for c in out] == ["I-I", "went", "home"]
+    assert [(c["start"], c["end"]) for c in out] == [
+        (0.0, 0.8),
+        (1.2, 1.6),
+        (2.0, 2.4),
+    ]
+    assert [[w["text"] for w in c["word_data"]] for c in out] == [
+        ["I", "I"],
+        ["went"],
+        ["home"],
+    ]
+
+
 def _atom_cue(surfaces, t0, step=0.3, with_surface=True):
     """A cue whose word_data is one entry per packed atom (``_chunk_to_cue`` shape)."""
     wd = []

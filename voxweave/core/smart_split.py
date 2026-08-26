@@ -287,10 +287,16 @@ def _surface_ranges(
 
 
 def _cursor_ranges(
-    surfaces: Sequence[str], word_data: Sequence[Unit], offset: int = 0
+    surfaces: Sequence[str],
+    word_data: Sequence[Unit],
+    offset: int = 0,
+    *,
+    one_per_surface: bool = False,
 ) -> list[tuple[int, int]]:
     """Per-surface footprint from a plain char cursor (one entry per non-space char).
 
+    Space-delimited streams set ``one_per_surface`` to retain their legacy
+    one-token-per-entry fallback when word_data carries no reconcilable surface.
     Tolerant on purpose: a surface past the end of the stream gets an empty
     slice, which renders as ``start=end=None``. That degraded timing is the only
     safe answer for an unreadable cue — this code runs after ASR, forced
@@ -300,14 +306,18 @@ def _cursor_ranges(
     ranges: list[tuple[int, int]] = []
     cursor = 0
     for surface in surfaces:
-        n = _token_char_count(surface)
+        n = 1 if one_per_surface else _token_char_count(surface)
         ranges.append((cursor + offset, cursor + n + offset))
         cursor += n
     return ranges
 
 
 def _unit_ranges(
-    surfaces: Sequence[str], word_data: Sequence[Unit], offset: int = 0
+    surfaces: Sequence[str],
+    word_data: Sequence[Unit],
+    offset: int = 0,
+    *,
+    cursor_one_per_surface: bool = False,
 ) -> list[tuple[int, int]]:
     """Per-surface ``word_data`` footprint, whatever granularity the stream carries.
 
@@ -329,7 +339,9 @@ def _unit_ranges(
             len(word_data),
             "".join(surfaces)[:60],
         )
-    return _cursor_ranges(surfaces, word_data, offset)
+    return _cursor_ranges(
+        surfaces, word_data, offset, one_per_surface=cursor_one_per_surface
+    )
 
 
 def _build_atoms(
@@ -340,10 +352,10 @@ def _build_atoms(
 ) -> list[dict]:
     """Build non-breakable atoms, each with aggregated start/end from word_data.
 
-    Space-delimited: one word per atom (1:1 with word_data). No-space: one atom
-    per CJK char or Latin run (from ``_tokens``). BudouX phrase boundaries are
-    applied later in the packing loop — atoms stay per-char so gap/duration
-    breaks have full granularity.
+    Space-delimited: one displayed word per atom, reconciled against word_data.
+    No-space: one atom per CJK char or Latin run (from ``_tokens``). BudouX phrase
+    boundaries are applied later in the packing loop — atoms stay per-char so
+    gap/duration breaks have full granularity.
 
     word_data comes at one of two granularities and they are *not*
     interchangeable: the first-generation stream holds one entry per non-space
@@ -363,19 +375,20 @@ def _build_atoms(
     """
     if not _no_spaces(lang):
         toks = text.split()
-        wd = list(word_data)
-        if len(wd) < len(toks):
-            wd += [{}] * (len(toks) - len(wd))
-        return [
-            {
-                "text": t,
-                "start": w.get("start"),
-                "end": w.get("end"),
-                "_unit_start": min(i, len(word_data)),
-                "_unit_end": min(i + 1, len(word_data)),
-            }
-            for i, (t, w) in enumerate(zip(toks, wd[: len(toks)]))
-        ]
+        ranges = _unit_ranges(toks, word_data, cursor_one_per_surface=True)
+        atoms: list[dict] = []
+        for tok, (start, end) in zip(toks, ranges):
+            chunk = word_data[start:end]
+            atoms.append(
+                {
+                    "text": tok,
+                    "start": _span_start(chunk),
+                    "end": _span_end(chunk),
+                    "_unit_start": start,
+                    "_unit_end": end,
+                }
+            )
+        return atoms
     units = _tokens(text, lang)
     ranges = _unit_ranges(units, word_data)
     atoms: list[dict] = []
