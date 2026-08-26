@@ -161,9 +161,14 @@ def _layout_translated(text: str, to_iso: str | None) -> str:
     """
     if not to_iso:
         return text
-    from voxweave.core.layout import wrap_cue_text
+    from voxweave.core.layout import (
+        _line_budget_width,
+        default_max_line_length,
+        wrap_cue_text,
+    )
 
-    return wrap_cue_text(text, to_iso, 2)
+    budget = _line_budget_width(default_max_line_length(to_iso), to_iso)
+    return wrap_cue_text(text, to_iso, 2, max_line_length=budget)
 
 
 def _layout_dash_cue(block: dict, trans_text: str | None) -> str:

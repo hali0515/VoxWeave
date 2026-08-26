@@ -543,6 +543,30 @@ def test_render_translated_wraps_long_zh_to_two_lines():
     assert "".join(lines) == "字" * 30  # content preserved
 
 
+def test_layout_translated_zh_uses_eighteen_native_cell_budget():
+    # 19 Han glyphs occupy 38 half-width cells: over zh's 36, under the old 42.
+    text = "一二三四五六七八九十甲乙丙丁戊己庚辛壬"
+    assert translate._layout_translated(text, "zh") == (
+        "一二三四五六七八九\n十甲乙丙丁戊己庚辛壬"
+    )
+
+
+def test_layout_translated_en_keeps_legacy_42_cell_output():
+    text = "She walked across the quiet bridge while the city lights flickered below"
+    assert translate._layout_translated(text, "en") == (
+        "She walked across the quiet bridge\nwhile the city lights flickered below"
+    )
+
+
+def test_layout_translated_cjk_fold_still_applies_kinsoku():
+    # The balanced break initially lands before っ; kinsoku pulls it up.
+    text = "字" * 9 + "っ" + "字" * 9
+    assert translate._layout_translated(text, "ja").splitlines() == [
+        "字" * 9 + "っ",
+        "字" * 9,
+    ]
+
+
 def test_render_translated_short_zh_stays_single_line():
     blocks = [{"start": 1.0, "end": 4.0, "text": "source"}]
     out = translate.render_translated_vtt(blocks, {0: "字" * 10}, to_iso="zh")
