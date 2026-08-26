@@ -58,6 +58,7 @@ from .layout import (
     strip_punct_for_subtitles,
     wrap_cue_text,
 )
+from .providers import note_degraded
 from .schema import Cue, Unit
 from .timing import (
     GLUE_MAX_GAP_S,
@@ -65,6 +66,7 @@ from .timing import (
     _glue_short_cues,
     _merge_micro_cues,
     _snap_to_shots,
+    combine_speech,
 )
 
 log = logging.getLogger(__name__)
@@ -647,6 +649,13 @@ def _fit_split_clause(
 
 
 def _segment_sentences(text: str, lang: str) -> list[str]:
+    """Sentence boundaries from pysbd, falling back to a terminal-punctuation regex.
+
+    Two distinct failures land on the same fallback -- pysbd absent, and pysbd
+    having no model for this language (``Segmenter(language="yue")`` raises,
+    which also hits ``pt``/``ko``). Both are recorded through
+    :func:`providers.note_degraded`; the returned sentences are unchanged.
+    """
     try:
         import pysbd  # type: ignore
 
@@ -654,9 +663,9 @@ def _segment_sentences(text: str, lang: str) -> list[str]:
             seg = pysbd.Segmenter(language=lang, clean=False)
             return [s for s in seg.segment(text) if s and s.strip()]
         except Exception:
-            pass
+            note_degraded("sentences", "pysbd-language-unsupported:regex")
     except ImportError:
-        pass
+        note_degraded("sentences", "pysbd-missing:regex")
     return [s for s in re.split(r"(?<=[.!?。！？])\s*", text) if s and s.strip()]
 
 
@@ -960,6 +969,9 @@ def split_at_sentence_end(
             end = next((w["end"] for w in reversed(chunk_words) if "end" in w), None)
         else:
             start = end = None
+        # The raw clause span doubles as the acoustic anchor while it exists; the
+        # fabricated fallback below invents time, which is not evidence.
+        speech_start, speech_end = start, end
         if start is None or end is None:
             # No timing data: extend from previous cue end or estimate from word count
             prev_end = cues[-1]["end"] if cues else 0.0
@@ -969,12 +981,15 @@ def split_at_sentence_end(
                 if end is not None
                 else start + max(1.0, plan.unit_count / DEFAULT_DESIRED_WPS)
             )
+            speech_start = speech_end = None
         cues.append(
             {
                 "text": plan.text,
                 "start": start,
                 "end": end,
                 "word_data": chunk_words,
+                "speech_start": speech_start,
+                "speech_end": speech_end,
             }
         )
     return cues
@@ -1476,6 +1491,11 @@ def _chunk_to_cue(chunk: list[dict], cue: Cue, lang: str) -> Cue:
     entry carries its ``text``: without that surface a later reader
     (``_build_atoms``) has nothing to reconcile against and falls back to a
     character cursor, which is one entry per character.
+
+    The acoustic anchor takes the same raw span but *without* the parent-cue
+    fallback: an untimed chunk has no acoustic evidence, and inheriting the
+    parent's (possibly display-padded) bound would launder that pad into the raw
+    layer permanently.
     """
     # the default is the parent cue's (required, non-None) bound, so the span is always a float
     start = cast(float, _span_start(chunk, cue["start"]))
@@ -1487,6 +1507,8 @@ def _chunk_to_cue(chunk: list[dict], cue: Cue, lang: str) -> Cue:
         "word_data": [
             {"text": a["text"], "start": a["start"], "end": a["end"]} for a in chunk
         ],
+        "speech_start": _span_start(chunk, None),
+        "speech_end": _span_end(chunk, None),
     }
 
 
@@ -1589,12 +1611,15 @@ def _repair_bound_particle_cues(
         if outer_end - outer_start <= max_cue_s + 1e-9 and _fits_budget(
             combined_text, max_line_length, max_lines, lang
         ):
+            merged_speech_start, merged_speech_end = combine_speech(left, right)
             work[i : i + 2] = [
                 {
                     "text": combined_text,
                     "start": left["start"],
                     "end": right["end"],
                     "word_data": units,
+                    "speech_start": merged_speech_start,
+                    "speech_end": merged_speech_end,
                 }
             ]
             if i:
@@ -1686,18 +1711,25 @@ def _repair_bound_particle_cues(
 
         _score, split_at, unit_cut = min(choices)
         new_left_atoms, new_right_atoms = atoms[:split_at], atoms[split_at:]
+        # Repartitioning moves material between the two cues, so each side's
+        # anchor is re-derived from the atoms it now owns -- with no display
+        # fallback, unlike the visible bounds beside it.
         work[i : i + 2] = [
             {
                 "text": _join([atom["text"] for atom in new_left_atoms], lang),
                 "start": left["start"],
                 "end": cast(float, _span_end(new_left_atoms, left.get("end"))),
                 "word_data": units[:unit_cut],
+                "speech_start": _span_start(new_left_atoms, None),
+                "speech_end": _span_end(new_left_atoms, None),
             },
             {
                 "text": _join([atom["text"] for atom in new_right_atoms], lang),
                 "start": cast(float, _span_start(new_right_atoms, right.get("start"))),
                 "end": right["end"],
                 "word_data": units[unit_cut:],
+                "speech_start": _span_start(new_right_atoms, None),
+                "speech_end": _span_end(new_right_atoms, None),
             },
         ]
         i += 1
@@ -1780,6 +1812,10 @@ def _split_without_timings(
                     "start": start,
                     "end": end,
                     "word_data": [],
+                    # Proportional subdivision of an untimed cue: no acoustic
+                    # evidence exists for any of these pieces.
+                    "speech_start": None,
+                    "speech_end": None,
                 }
                 for text, start, end in pieces
             ]
@@ -1807,7 +1843,16 @@ def _split_without_timings(
         text = sep.join(c)
         proportion = len(text) / total_chars
         end = start + duration * proportion if duration > 0 else start
-        out.append({"text": text, "start": start, "end": end, "word_data": []})
+        out.append(
+            {
+                "text": text,
+                "start": start,
+                "end": end,
+                "word_data": [],
+                "speech_start": None,
+                "speech_end": None,
+            }
+        )
         start = end
     return out
 
@@ -2317,6 +2362,10 @@ def _prepare_semantic_plans(
         "start": float(cue_start),
         "end": float(cue_end),
         "word_data": word_data,
+        # Same rule as ``_chunk_to_cue``: the anchor takes the raw span only,
+        # never the segment's own (possibly fabricated) bounds.
+        "speech_start": _span_start(word_data, None),
+        "speech_end": _span_end(word_data, None),
     }
     atoms = _build_atoms(
         text,
@@ -2435,6 +2484,9 @@ def _semantic_materialize(
                 "start": float(cue_start),
                 "end": float(cue_end),
                 "word_data": units,
+                # Same rule as ``_chunk_to_cue``: raw chunk span, no fallback.
+                "speech_start": _span_start(chunk, None),
+                "speech_end": _span_end(chunk, None),
             }
         )
         if end in plan.required_indices:

@@ -638,6 +638,21 @@ def _run_span(
     )
 
 
+def _run_speech_span(atoms: list[dict]) -> tuple[float | None, float | None]:
+    """Acoustic anchor of one speaker run: its timed atoms, or nothing.
+
+    Deliberately not :func:`_run_span` -- that falls back to the parent cue's
+    DISPLAY bounds, and a run with no timed atom must stay anchorless rather
+    than inherit a lag-out pad or a shot lead-in as if it were speech.
+    """
+    starts = [s for a in atoms if (s := a.get("start")) is not None]
+    ends = [e for a in atoms if (e := a.get("end")) is not None]
+    return (
+        float(min(starts)) if starts else None,
+        float(max(ends)) if ends else None,
+    )
+
+
 def format_speaker_cues(
     cues: list[Cue],
     turns: Sequence[Turn] | None,
@@ -728,6 +743,7 @@ def format_speaker_cues(
             part["text"] = wrap_cue_text(piece, lang, max_lines, max_line_length=budget)
             part["start"] = start
             part["end"] = end
+            part["speech_start"], part["speech_end"] = _run_speech_span(atoms_run)
             part["word_data"] = list(word_data[wd_cursor:wd_end])
             wd_cursor = wd_end
             out.append(part)

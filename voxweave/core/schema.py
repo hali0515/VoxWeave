@@ -64,6 +64,15 @@ class Cue(TypedDict):
     subscript access is the normal pattern downstream. ``lyric`` marks a cue
     whose span is mostly sung (keep-lyrics mode); display layers wrap it with
     music notes while the stored text stays clean.
+
+    ``speech_start``/``speech_end`` are the cue's immutable acoustic anchors,
+    captured at construction from the raw unit/atom span (``None`` when the
+    timing was fabricated — invented time is not acoustic evidence). Content
+    folds (micro-merge, glue, bound-particle repair) recompute them from the
+    material they folded; display passes (``_cleanup_cues``, ``_snap_to_shots``,
+    the diarize overlap trim) must neither read nor write them, and the sibling
+    writer projects them out so persisted ``segments[]`` keeps its legacy shape.
+    Nothing in legacy-v1 reads them: they arm the P5 finalizer.
     """
 
     text: str
@@ -71,3 +80,5 @@ class Cue(TypedDict):
     end: float
     word_data: list[Unit]
     lyric: NotRequired[bool]
+    speech_start: NotRequired[float | None]
+    speech_end: NotRequired[float | None]

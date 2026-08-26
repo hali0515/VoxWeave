@@ -91,6 +91,16 @@ def _segment_case(case: dict, **kwargs) -> pipeline.SegmentationResult:
     )
 
 
+# Raw acoustic anchors are in-memory-only cue state: ``_write_siblings`` projects
+# them out so the persisted ``segments[]`` keeps its legacy shape byte for byte.
+SPEECH_KEYS = ("speech_start", "speech_end")
+
+
+def _projected(cues: list) -> list[dict]:
+    """The cue stream as ``_write_siblings`` persists it (anchors dropped)."""
+    return [{k: v for k, v in cue.items() if k not in SPEECH_KEYS} for cue in cues]
+
+
 def _render(result: pipeline.SegmentationResult) -> str:
     """Reproduce the VTT body _write_siblings writes for these cues."""
     return realign.render_cues(
@@ -167,7 +177,12 @@ def test_split_replay_matches_direct_segmentation(tmp_path: Path):
 
         assert vtt_path.read_text(encoding="utf-8") == _render(result), name
         written = json.loads(json_path.read_text(encoding="utf-8"))
-        assert written["segments"] == json.loads(json.dumps(result.cues)), name
+        assert written["segments"] == json.loads(json.dumps(_projected(result.cues))), (
+            name
+        )
+        assert not any(
+            key in segment for segment in written["segments"] for key in SPEECH_KEYS
+        ), name
         assert written["word_segments"] == json.loads(json.dumps(result.units)), name
         assert written["language"] == result.language, name
 

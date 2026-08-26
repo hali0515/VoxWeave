@@ -10,7 +10,8 @@ come from ``layout``.
 from __future__ import annotations
 
 import bisect
-from typing import cast
+from collections.abc import Mapping
+from typing import Any, cast
 
 from .layout import (
     _fits_budget,
@@ -67,6 +68,29 @@ def _speech_end(cue: Cue) -> float | None:
     """
     ends = [e for w in cue.get("word_data") or [] if (e := w.get("end")) is not None]
     return max(ends) if ends else None
+
+
+def combine_speech(
+    a: Mapping[str, Any], b: Mapping[str, Any]
+) -> tuple[float | None, float | None]:
+    """Acoustic anchor of the cue formed by folding ``a`` and ``b`` together.
+
+    Earliest non-``None`` ``speech_start`` and latest non-``None`` ``speech_end``.
+    A side with no anchor contributes nothing and a fold of two anchorless cues
+    stays anchorless: the display bounds are never substituted, because laundering
+    a lag-out pad or a shot lead-in into the raw layer would make it permanent.
+    """
+    starts = [
+        v
+        for v in (a.get("speech_start"), b.get("speech_start"))
+        if isinstance(v, (int, float))
+    ]
+    ends = [
+        v
+        for v in (a.get("speech_end"), b.get("speech_end"))
+        if isinstance(v, (int, float))
+    ]
+    return (min(starts) if starts else None, max(ends) if ends else None)
 
 
 def _merge_micro_cues(
@@ -140,6 +164,9 @@ def _merge_micro_cues(
             cur["word_data"] = list(cur.get("word_data") or []) + list(
                 nxt.get("word_data") or []
             )
+            # A content fold owns both sides' speech, so the anchor is recomputed
+            # from the folded material (never from the display bounds above).
+            cur["speech_start"], cur["speech_end"] = combine_speech(cur, nxt)
             if degenerate and not fits:
                 escaped[-1] = True
             continue
@@ -238,6 +265,7 @@ def _glue_short_cues(
                 nxt["word_data"] = list(c.get("word_data") or []) + list(
                     nxt.get("word_data") or []
                 )
+                nxt["speech_start"], nxt["speech_end"] = combine_speech(c, nxt)
                 i += 1
                 continue
             if back_ok:
@@ -252,6 +280,7 @@ def _glue_short_cues(
                 prev["word_data"] = list(prev.get("word_data") or []) + list(
                     c.get("word_data") or []
                 )
+                prev["speech_start"], prev["speech_end"] = combine_speech(prev, c)
                 i += 1
                 continue
         out.append(c)

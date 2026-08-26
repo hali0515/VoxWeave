@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import importlib.metadata
 import json
 import logging
 import math
 import os
+import platform
 import subprocess
 from collections import Counter
 from collections.abc import Mapping, Sequence
@@ -22,7 +24,14 @@ from voxweave.chunking import (
     slice_wav,
     vad_speech_segments,
 )
+from voxweave.core.providers import degradation_capture, provider_snapshot
 from voxweave.core.schema import Cue
+from voxweave.core.segdoc import (
+    THRESHOLD_KEYS,
+    DisplayProfile,
+    SegDocument,
+    build_seg_document,
+)
 from voxweave.debug import DebugSink, FileDebugSink
 from voxweave.lang import (
     is_supported,
@@ -360,6 +369,27 @@ def _load_sibling_json(json_path: Path, *, require: str | None = None) -> dict:
             " re-run transcribe/process to regenerate it"
         )
     return data
+
+
+def resolve_segmentation_manifest(data: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The segmentation manifest of a loaded sibling document.
+
+    Every sibling written before P3 carries no ``segmentation`` key at all, and
+    that absence is itself the label: such a document was produced by the legacy
+    v1 engine, so it resolves to ``{"engine": "legacy-v1", "inferred": True}``
+    rather than to nothing. ``inferred`` distinguishes the deduction from a
+    recorded manifest, which is returned exactly as stored (a non-mapping value
+    is not one and falls back to the inference).
+
+    The engine name here is a literal on purpose and must NOT become
+    :data:`SEGMENTATION_ENGINE`: that constant tracks whichever engine this build
+    runs, while a manifest-less file was written by v1 no matter what this build
+    does now.
+    """
+    found = data.get("segmentation")
+    if isinstance(found, Mapping):
+        return found
+    return {"engine": "legacy-v1", "inferred": True}
 
 
 def _load_cues(vtt_path: Path) -> list[dict]:
@@ -969,9 +999,10 @@ def _dump_sibling_json(
     shot_changes: list[float] | None = None,
     sing_spans: list[tuple[float, float]] | None = None,
     speaker_turns: list[tuple[float, float, str]] | None = None,
+    manifest: Mapping[str, Any] | None = None,
 ) -> None:
     """Write the sibling JSON document (language + segments + word_segments + optional
-    vad_speech / shot_changes / sing_spans / speaker_turns).
+    vad_speech / shot_changes / sing_spans / speaker_turns / segmentation).
 
     ``vad_speech=None`` omits the key; a list (even empty) writes it coerced to
     ``[[float, float], ...]``. ``shot_changes`` behaves the same (written only when not
@@ -984,6 +1015,12 @@ def _dump_sibling_json(
     alongside the span (``smart_split._chunk_to_cue``) — a reader has no other way
     to tell that stream's granularity. Replay reads ``word_segments``, not
     ``segments``, so older files stay loadable.
+
+    ``manifest`` (the ``SegmentationManifest``) is written last, after
+    ``speaker_turns``, so the top-level key order of every pre-P3 document is
+    untouched and byte-diff tooling can strip exactly one trailing key. Absent
+    means the file predates the manifest — legacy-v1 by definition, see
+    :func:`resolve_segmentation_manifest`.
     """
     data: dict = {"language": language, "segments": segments, "word_segments": units}
     if vad_speech is not None:
@@ -996,7 +1033,25 @@ def _dump_sibling_json(
         data["speaker_turns"] = [
             [float(s), float(e), str(lb)] for s, e, lb in speaker_turns
         ]
+    if manifest is not None:
+        data["segmentation"] = dict(manifest)
     fsio.atomic_write_text(json_path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+# Cue keys that exist only in memory: raw acoustic anchors captured at cue
+# construction (``core.schema.Cue``). Nothing in legacy-v1 reads them and the
+# sibling JSON predates them, so the writer drops exactly these two.
+_UNPERSISTED_CUE_KEYS = ("speech_start", "speech_end")
+
+
+def _persistable_cue(cue: Mapping[str, Any]) -> dict[str, Any]:
+    """A cue as the sibling JSON stores it: everything except the raw anchors.
+
+    A drop-list rather than a whitelist, so every other key a cue carries today
+    (``lyric``, any ``word_data`` shape) and anything a later pass adds still
+    ships unchanged -- the persisted bytes only move when a key is dropped here.
+    """
+    return {k: v for k, v in cue.items() if k not in _UNPERSISTED_CUE_KEYS}
 
 
 def _write_siblings(
@@ -1009,6 +1064,7 @@ def _write_siblings(
     shot_changes: list[float] | None = None,
     sing_spans: list[tuple[float, float]] | None = None,
     speaker_turns: list[tuple[float, float, str]] | None = None,
+    manifest: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write sibling .json (ground truth) and .vtt alongside src; return the .vtt path.
 
@@ -1018,16 +1074,21 @@ def _write_siblings(
     ``realign.parse_vtt_blocks``. Lyric-flagged cues render with the music-note wrap in
     the VTT only; the JSON keeps clean text + the flag. Uses ``swap_ext`` (not
     ``with_suffix``) to preserve interior dots in filenames.
+
+    The persisted cues are projected through :func:`_persistable_cue`, which drops
+    the in-memory-only acoustic anchors; ``manifest`` is forwarded to the JSON
+    writer, which appends it as the last top-level key.
     """
     _dump_sibling_json(
         swap_ext(src, ".json"),
         language=lang,
-        segments=cues,
+        segments=[_persistable_cue(c) for c in cues],
         units=units,
         vad_speech=vad_speech or [],
         shot_changes=shot_changes,
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
+        manifest=manifest,
     )
     rows = [
         (
@@ -1058,6 +1119,22 @@ def _units_to_seg(units: list[dict], iso: str) -> dict:
     }
 
 
+#: Shape version of the sibling JSON's ``segmentation`` block. Bump when a field
+#: changes meaning; a reader that does not know the version must not guess.
+SEGMENTATION_MANIFEST_VERSION = 1
+#: The segmentation engine this build runs. P3 records the pre-strangler one so a
+#: later document can be told apart from every file written before the manifest.
+SEGMENTATION_ENGINE = "legacy-v1"
+
+
+def _voxweave_version() -> str:
+    """Installed voxweave version, or ``"unknown"`` running from a source tree."""
+    try:
+        return importlib.metadata.version("voxweave")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 @dataclass(frozen=True)
 class SegmentationResult:
     """Output of :func:`segment_document`: the cue stream plus what produced it.
@@ -1067,6 +1144,12 @@ class SegmentationResult:
     it actually split. ``thresholds_used`` is the effective gap/duration mapping
     after the optional adaptive pass, and ``diagnostics`` records which optional
     passes ran (all values deterministic, so two identical inputs compare equal).
+
+    ``manifest`` is the ``SegmentationManifest`` the callers persist as the
+    sibling JSON's ``segmentation`` key, and ``document`` is the parallel
+    :class:`~voxweave.core.segdoc.SegDocument` record holding that same manifest
+    object. Both are additive and default to ``None`` so existing constructors
+    keep working; in legacy-v1 the engine consumes neither.
     """
 
     cues: list[Cue]
@@ -1074,6 +1157,8 @@ class SegmentationResult:
     units: list[dict]
     thresholds_used: dict
     diagnostics: dict[str, Any]
+    manifest: dict[str, Any] | None = None
+    document: SegDocument | None = None
 
 
 def _copied_spans(
@@ -1135,10 +1220,14 @@ def segment_document(
     ``thresholds`` defaults to ``config.gap_thresholds(language)``.
     ``smart_split_kwargs`` forwards layout overrides (``max_line_length``,
     ``max_lines``, ...) to ``smart_split_segments``; ``max_line_length`` also
-    reaches the speaker formatter so both measure the same budget.
+    reaches the speaker formatter so both measure the same budget. The layout
+    pair is resolved here rather than inside the engine, so the manifest records
+    the values that actually ran instead of re-deriving them from a second copy
+    of the defaulting rule.
     """
     from voxweave.config import gap_thresholds
-    from voxweave.core.smart_split import smart_split_segments
+    from voxweave.core.layout import default_max_line_length, default_max_lines
+    from voxweave.core.smart_split import SplitThresholds, smart_split_segments
 
     iso = language
     units: list[dict] = [copy.deepcopy(dict(u)) for u in word_segments]
@@ -1147,6 +1236,17 @@ def segment_document(
     sings = _copied_spans(sing_spans)
     turns = _copied_turns(speaker_turns)
     extra: dict[str, Any] = dict(smart_split_kwargs or {})
+    # Resolve the layout pair once and hand the resolved values to the engine:
+    # passing them explicitly is what the engine would have defaulted to anyway,
+    # so output is unchanged, and the manifest/profile can then quote what ran.
+    max_line_length = extra.get("max_line_length")
+    if max_line_length is None:
+        max_line_length = default_max_line_length(iso)
+    max_lines = extra.get("max_lines")
+    if max_lines is None:
+        max_lines = default_max_lines(iso)
+    extra["max_line_length"] = max_line_length
+    extra["max_lines"] = max_lines
 
     # zh: Qwen punctuation can drift up to one character; snap to jieba word boundary
     # to prevent smart_split from splitting mid-word (e.g. 数据|中心 instead of 数据中心).
@@ -1158,35 +1258,38 @@ def segment_document(
     from voxweave.core.unit_repair import repair_stranded_tails
 
     repaired = repair_stranded_tails(snapped, iso, speech_spans)
-    seg = _units_to_seg(repaired, iso)
-    base = dict(thresholds) if thresholds is not None else gap_thresholds(iso)
-    effective = _maybe_adaptive_thresholds(base, snapped)
-    cues = smart_split_segments(
-        [seg],
-        lang=iso,
-        speech_spans=speech_spans,
-        thresholds=effective,
-        shot_changes=cuts,
-        semantic_engine=semantic_engine,
-        semantic_model=semantic_model,
-        **extra,
-    )
-    mark_lyric_cues(cues, sings)
-    split_cue_count = len(cues)
-    if turns:
-        from voxweave.diarize import apply_speaker_format
-
-        # Same thresholds AND line budget as smart_split so speaker splits get the
-        # same timing polish and wrap width the deterministic layout just used.
-        cues = apply_speaker_format(
-            cues,
-            turns,
-            iso,
+    # Everything the language providers touch runs inside the capture, so the
+    # manifest can say which fallbacks actually fired on this document.
+    with degradation_capture() as degraded:
+        seg = _units_to_seg(repaired, iso)
+        base = dict(thresholds) if thresholds is not None else gap_thresholds(iso)
+        effective = _maybe_adaptive_thresholds(base, snapped)
+        cues = smart_split_segments(
+            [seg],
+            lang=iso,
+            speech_spans=speech_spans,
             thresholds=effective,
-            max_line_length=extra.get("max_line_length"),
+            shot_changes=cuts,
+            semantic_engine=semantic_engine,
+            semantic_model=semantic_model,
+            **extra,
         )
-        # ... and its cleanup can push a boundary back across a cut, so snap again.
-        cues = _resnap_shots(cues, cuts, effective)
+        mark_lyric_cues(cues, sings)
+        split_cue_count = len(cues)
+        if turns:
+            from voxweave.diarize import apply_speaker_format
+
+            # Same thresholds AND line budget as smart_split so speaker splits get the
+            # same timing polish and wrap width the deterministic layout just used.
+            cues = apply_speaker_format(
+                cues,
+                turns,
+                iso,
+                thresholds=effective,
+                max_line_length=max_line_length,
+            )
+            # ... and its cleanup can push a boundary back across a cut, so snap again.
+            cues = _resnap_shots(cues, cuts, effective)
     diagnostics: dict[str, Any] = {
         "unit_count": len(snapped),
         "punct_snapped": snapped is not units,
@@ -1202,12 +1305,65 @@ def segment_document(
         "shot_resnapped": bool(turns and cuts),
         "cue_count": len(cues),
     }
+    # The nine threshold values the engine really ran on: ``effective`` is the
+    # caller's mapping, which ``smart_split_segments`` normalizes through
+    # ``SplitThresholds.from_mapping`` (partial mappings fill dataclass defaults).
+    # Quoting that same normalization keeps the profile honest for a partial
+    # mapping AND keeps the recorder strict -- ``DisplayProfile.from_resolved``
+    # still raises on a missing key, it is just never handed an incomplete one.
+    resolved_th = SplitThresholds.from_mapping(effective)
+    profile_thresholds = {key: getattr(resolved_th, key) for key in THRESHOLD_KEYS}
+    # Mirror the ONLY consumer, ``align_ctc.align_blocks_full_ctc``, which masks
+    # iff the value is exactly "1". ``--no-vad-mask`` writes the literal "0",
+    # which is truthy as a string, so ``bool()`` would record masking as ON for
+    # the run that explicitly turned it off.
+    vad_mask_on = os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() == "1"
+    manifest: dict[str, Any] = {
+        "manifest_version": SEGMENTATION_MANIFEST_VERSION,
+        "engine": SEGMENTATION_ENGINE,
+        "voxweave": _voxweave_version(),
+        "python": platform.python_version(),
+        "language": iso,
+        # Verbatim: the profile's whole value is saying what ran, so no clamp and
+        # no renormalization (the tree carries two disagreeing default sets).
+        "profile": {
+            "max_line_length": max_line_length,
+            "max_lines": max_lines,
+            **profile_thresholds,
+        },
+        "env": {
+            # True only when the adaptive pass actually replaced values, not
+            # merely because the opt-in env var was set: the pass can hand back a
+            # fresh dict whose estimate happens to equal the static one.
+            "gap_adaptive": effective != base,
+            "vad_emission_mask": vad_mask_on,
+        },
+        "providers": provider_snapshot(iso),
+        "degraded": degraded,
+    }
+    document = build_seg_document(
+        language=iso,
+        units=repaired,
+        profile=DisplayProfile.from_resolved(
+            iso,
+            profile_thresholds,
+            max_line_length=max_line_length,
+            max_lines=max_lines,
+        ),
+        manifest=manifest,
+        vad_speech=speech_spans,
+        shot_changes=cuts,
+        sing_spans=sings,
+        speaker_turns=turns,
+    )
     return SegmentationResult(
         cues=cues,
         language=iso,
         units=snapped,
         thresholds_used=effective,
         diagnostics=diagnostics,
+        manifest=manifest,
+        document=document,
     )
 
 
@@ -1485,6 +1641,7 @@ def process(
         shot_changes=shot_changes,
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
+        manifest=segmented.manifest,
     )
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
     if sdh and word_segments is None:
@@ -1546,6 +1703,9 @@ def split(
     # WEBVTT bytes to json.loads.
     json_path = swap_ext(Path(json_path), ".json")
     data = _load_sibling_json(json_path, require="word_segments")
+    # Label what produced the document being replayed before touching it: split
+    # re-segments, so it regenerates the manifest rather than preserving one.
+    log.debug("replaying %s (%s)", json_path.name, resolve_segmentation_manifest(data))
     units = data["word_segments"]
     iso, units = _reconcile_word_segment_language(data.get("language", "en"), units)
     speech_spans = _spans_in(data.get("vad_speech"))
@@ -1578,6 +1738,7 @@ def split(
         shot_changes=shot_changes,
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
+        manifest=segmented.manifest,
     )
     log.info("re-split %s → %d cues", vtt_out.name, len(cues))
     return vtt_out
@@ -1637,11 +1798,25 @@ def _write_align_json(
     shot_changes: list[float] | None = None,
     sing_spans: list[tuple[float, float]] | None = None,
     speaker_turns: list[tuple[float, float, str]] | None = None,
+    manifest: Mapping[str, Any] | None = None,
 ) -> None:
     """Update the sibling JSON with new alignment timing. Passes vad_speech,
     shot_changes, sing_spans, and speaker_turns through so split and subsequent
     align runs can reuse them without recomputing. Lyric flags survive on the
     re-timed segments.
+
+    ``manifest`` is likewise a pass-through: align re-times an existing cue
+    stream and never re-segments, so it preserves whatever segmentation manifest
+    the document already carried and invents none when there is none.
+
+    A stored ``segmentation`` value that is not a mapping (hand-edited file, or a
+    shape from some future writer) is treated as ABSENT on the way in -- the
+    align call site passes ``None`` -- and therefore does not survive the
+    rewrite. That is deliberate and matches the read side:
+    :func:`resolve_segmentation_manifest` also treats a non-mapping value as
+    absent, so read and write agree that "not a mapping" means "no manifest".
+    Preserving one verbatim is impossible anyway, since :func:`_dump_sibling_json`
+    copies the manifest with ``dict()``.
     """
     segments = [
         {"text": b["text"], "start": a, "end": e}
@@ -1657,6 +1832,7 @@ def _write_align_json(
         shot_changes=shot_changes,
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
+        manifest=manifest,
     )
 
 
@@ -1746,6 +1922,9 @@ def align(
     rep = reporter or Reporter()
     json_path = swap_ext(vtt_path, ".json")
     data = _load_sibling_json(json_path) if json_path.exists() else {}
+    # align re-times an existing cue stream; it never re-segments, so it only
+    # labels (and later preserves) whatever produced that stream.
+    log.debug("re-timing %s (%s)", vtt_path.name, resolve_segmentation_manifest(data))
     word_segments = data.get("word_segments", [])
 
     blocks = _load_cues(vtt_path)
@@ -1840,6 +2019,12 @@ def align(
         keep_shots = [float(t) for t in data.get("shot_changes") or []] or None
         keep_sing = _spans_in(data.get("sing_spans"))
         keep_turns = _turns_in(data.get("speaker_turns"))
+        # align never re-segments, so the segmentation manifest is preserved
+        # verbatim (and stays absent when the document never had one).
+        stored_manifest = data.get("segmentation")
+        keep_manifest = (
+            stored_manifest if isinstance(stored_manifest, Mapping) else None
+        )
         _write_align_json(
             json_path,
             blocks,
@@ -1850,6 +2035,7 @@ def align(
             keep_shots,
             keep_sing,
             keep_turns,
+            keep_manifest,
         )
         log.info(
             "aligned %s → %d cues, %d units", vtt_path.name, len(blocks), len(all_units)

@@ -17,6 +17,8 @@ import functools
 import os
 from collections.abc import Sequence
 
+from .providers import note_degraded
+
 # Leading-edge prohibition (行頭禁則): these chars cannot begin a line (must hang on the previous line)
 LINE_START_PROHIBITED = frozenset(
     "、。，．・：；？！）｝〕〉》」』】〙〗〟"
@@ -184,14 +186,19 @@ def zh_pos_boundary_penalties(
     runtime error returns an empty mapping and leaves the surface rules active.
     Atom indices are converted to non-space character offsets so embedded Latin
     runs remain aligned with the subtitle atom stream.
+
+    Each of the three fail-open exits (absent posseg, a raising ``cut``, and a
+    candidate offset the tokenizer disagrees with) is recorded through
+    :func:`providers.note_degraded`; the return values are unchanged.
     """
 
     if lang not in {"zh", "yue"}:
         return {}
-    from voxweave.core.breakpoints import quiet_import_jieba
+    from voxweave.core import breakpoints
 
-    pseg = quiet_import_jieba(posseg=True)
+    pseg = breakpoints.quiet_import_jieba(posseg=True)
     if pseg is None:
+        note_degraded("pos", "posseg-import-failed")
         return {}
 
     def width(surface: str) -> int:
@@ -212,6 +219,7 @@ def zh_pos_boundary_penalties(
             previous[end] = (surface, str(token.flag))
             cursor = end
     except Exception:  # noqa: BLE001 - optional POS hint must stay fail-safe
+        note_degraded("pos", "posseg-exception")
         return {}
 
     atom_offsets = [0]
@@ -225,6 +233,11 @@ def zh_pos_boundary_penalties(
         left = previous.get(offset)
         right = following.get(offset)
         if left is None or right is None:
+            # The candidate stream (jieba cut HMM=True / BudouX) and this scorer
+            # (posseg HMM=False) are two decodings of the same string; where they
+            # disagree the boundary silently scored 0. It still does -- the count
+            # is now visible instead.
+            note_degraded("pos", "pos-offset-disagreement")
             continue
         left_word, left_pos = left
         right_word, right_pos = right
@@ -357,6 +370,7 @@ def ja_pos_end_penalties(
     """
     tagger = _load_ja_tagger()
     if tagger is None:
+        note_degraded("pos", "fugashi-unavailable")
         return None
     pen: dict[int, int] = {}
     off = 0

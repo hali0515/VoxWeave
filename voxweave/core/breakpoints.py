@@ -6,6 +6,7 @@ import functools
 from typing import Any
 
 from .langsets import LANGUAGES_WITHOUT_SPACES as _NO_SPACE
+from .providers import note_degraded
 
 # Closed-class tokens (articles/preps/aux/conj) that must NOT end a line —
 # ending here strands the token from the word it modifies.
@@ -112,6 +113,11 @@ def legal_break_index(tokens: list[str], lang: str, target: int) -> int:
 # _NO_SPACE is the shared LANGUAGES_WITHOUT_SPACES (imported above), including
 # yue so Cantonese follows the same character-level policy as written Chinese.
 
+# No-space languages a BudouX model is actually wired for. Everything else in
+# _NO_SPACE (yue, th, lo, my) has no atom provider at all, so its per-char output
+# is a permanent degradation rather than a missing package.
+_BUDOUX_LANGS = frozenset({"ja", "zh"})
+
 
 @functools.lru_cache(maxsize=8)
 def _load_parser(lang: str):
@@ -200,6 +206,10 @@ def phrase_atoms(text: str, lang: str) -> list[str]:
 
     th/lo/my are in _NO_SPACE but have no bundled BudouX model, so they always
     fall back to per-char even when budoux is installed.
+
+    Every fallback below is recorded through :func:`providers.note_degraded`;
+    that is observation only and changes no return value. Whitespace splitting
+    for spaced languages is the designed provider, not a degradation.
     """
     if lang not in _NO_SPACE:
         return text.split()
@@ -212,7 +222,18 @@ def phrase_atoms(text: str, lang: str) -> list[str]:
             return out or [c for c in text if not c.isspace()]
     parser = _load_parser(lang)
     if parser is None:
+        if lang == "zh":
+            note_degraded("atoms", "jieba-missing:per-char")
+        elif lang in _BUDOUX_LANGS:
+            note_degraded("atoms", "budoux-missing:per-char")
+        else:
+            note_degraded("atoms", "no-provider:per-char")
         return [c for c in text if not c.isspace()]
+    if lang == "zh":
+        # Reached only when jieba was absent: the zh BudouX model is documented
+        # above as too weak, so this branch is a degradation even though it
+        # answers with real phrases.
+        note_degraded("atoms", "jieba-missing:budoux-fallback")
     out = []
     for phrase in parser.parse(text):
         phrase = phrase.strip()
