@@ -313,29 +313,32 @@ def _cleanup_cues(
 
     - Extends short cues into the following gap (no overlap) up to min_cue_s.
     - Reading-speed linger (cps>0): a cue displayed for less than reading_chars/cps
-      extends into the gap, at most LINGER_CAP_S past speech end.
+      extends into the gap, at most LINGER_CAP_S past speech end (display end for
+      untimed cues, which have no speech anchor).
     - Tail pad (lag_out_s>0): every cue end gets a flat pad so text does not vanish
       the instant speech stops; absorbed by chaining in dense dialogue.
     - Chains sub-0.5s inter-cue gaps down to 2 frames.
     - Visible gaps (>=1s) are left untouched.
     - max_cue_s prevents any extension from re-inflating past the segmentation cap.
 
-    Idempotent for cues carrying timed ``word_data``: the pad targets an absolute
-    end derived from the cue's speech end, never from the display end it already
-    produced, so ``cleanup(cleanup(x)) == cleanup(x)``. That matters because the
-    diarize path runs the pass a second time after speaker formatting.
+    Idempotent for cues carrying timed ``word_data``: every extension target is an
+    absolute end derived from the cue's start or its speech end, never from the
+    display end it already produced, so ``cleanup(cleanup(x)) == cleanup(x)``. That
+    matters because the diarize path runs the pass a second time after speaker
+    formatting.
     """
     out = [cast(Cue, dict(c)) for c in cues]
     for i, c in enumerate(out):
         nxt_start = out[i + 1]["start"] if i + 1 < len(out) else None
         # desired end: min-dur floor, CPS reading time (capped linger), tail pad.
-        # The tail pad is measured from the cue's SPEECH end (last word_data end),
-        # not from its current display end, so re-running the pass cannot stack a
-        # second pad onto an already-padded cue (the sparse-stream and final-cue
-        # cases, where there is always room to grow). A display end that already
-        # sits past the pad target — CPS linger, an earlier shot snap — is kept as
-        # is by the max rule. Cues without timed word_data have no speech anchor
-        # and keep the legacy display-end pad.
+        # Both the tail pad and the linger cap are measured from the cue's SPEECH
+        # end (last word_data end), not from its current display end, so re-running
+        # the pass cannot stack a second pad onto an already-padded cue nor let the
+        # cap walk outward one LINGER_CAP_S per pass (the sparse-stream and
+        # final-cue cases, where there is always room to grow). A display end that
+        # already sits past those targets — an earlier shot snap — is kept as is by
+        # the max rule. Cues without timed word_data have no speech anchor and keep
+        # the legacy display-end pad and cap.
         speech_end = _speech_end(c)
         lag_anchor = c["end"] if speech_end is None else speech_end
         want = c["end"]
@@ -345,7 +348,7 @@ def _cleanup_cues(
             want = max(want, lag_anchor + lag_out_s)
         if cps > 0:
             need = _reading_chars(c.get("text", "")) / cps
-            want = max(want, min(c["start"] + need, c["end"] + LINGER_CAP_S))
+            want = max(want, min(c["start"] + need, lag_anchor + LINGER_CAP_S))
         if want > c["end"]:
             if nxt_start is None:
                 c["end"] = want

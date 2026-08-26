@@ -6,15 +6,15 @@ clear the minimum display duration?", "does it blow the duration cap?" -- is a
 question about the *display* span, not the acoustic one. The two differ by every
 rule in :func:`voxweave.core.timing._cleanup_cues`: the min-duration floor, the
 lag-out pad measured from the speech anchor, the CPS reading linger capped at
-``LINGER_CAP_S``, the two-frame no-extend guard, gap chaining, and the duration
-cap with its held-word waiver.
+``LINGER_CAP_S`` past that same anchor, the two-frame no-extend guard, gap
+chaining, and the duration cap with its held-word waiver.
 
 Scoring against the raw span -- or against a hand-rolled restatement of the pass
 -- mis-ranks candidates systematically rather than randomly. The predictor this
 module replaces was measured over-predicting by 0.75 s on short cues (it
 hardcoded ``1.0`` for the CPS term instead of importing ``LINGER_CAP_S`` and
-taking ``min(start + need, end + LINGER_CAP_S)``), by 0.083 s across the whole
-chaining band (it clamped to ``next_start`` rather than ``next_start -
+taking ``min(start + need, lag_anchor + LINGER_CAP_S)``), by 0.083 s across the
+whole chaining band (it clamped to ``next_start`` rather than ``next_start -
 TWO_FRAME_S``), by 0.05 s inside the two-frame band (it was blind to the
 no-extend guard), and *under*-predicting by 0.45 s whenever a held word carried
 a cue past the cap. A predictor with a per-regime bias is worse than no
@@ -120,8 +120,8 @@ class LegacyCleanupPreview:
         rather than merely to a tolerance.
         """
         # desired end: min-dur floor, CPS reading time (capped linger), tail pad.
-        # The pad anchors on the cue's speech end when it has timed word_data,
-        # which is what keeps the real pass idempotent.
+        # Both the pad and the linger cap anchor on the cue's speech end when it
+        # has timed word_data, which is what keeps the real pass idempotent.
         speech_end = _speech_end(word_data)
         lag_anchor = end if speech_end is None else speech_end
         want = end
@@ -131,7 +131,7 @@ class LegacyCleanupPreview:
             want = max(want, lag_anchor + lag_out_s)
         if cps > 0:
             need = _reading_chars(text) / cps
-            want = max(want, min(start + need, end + LINGER_CAP_S))
+            want = max(want, min(start + need, lag_anchor + LINGER_CAP_S))
 
         cur_end = end
         if want > cur_end:

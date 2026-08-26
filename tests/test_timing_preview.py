@@ -197,6 +197,46 @@ def test_cps_with_empty_text_is_a_noop():
     )
 
 
+# --- linger cap anchor: timed vs untimed word_data ----------------------------
+
+
+def test_linger_cap_timed_word_data_anchors_on_speech_end():
+    # speech stops at 1.5 while the display end already sits at 2.0; need = 100/17
+    # = 5.88s far outruns the cap, so the cap decides -- from speech end, not from
+    # the display end (which would give 3.0 and grow again on the next pass).
+    got = _check(
+        [_cue("x" * 100, 1.0, 2.0, _words((1.0, 1.5)))],
+        min_cue_s=0.0,
+        max_cue_s=7.0,
+        cps=17.0,
+        lag_out_s=0.0,
+    )
+    assert got[0] == pytest.approx(1.5 + LINGER_CAP_S - 1.0)
+
+
+def test_linger_cap_untimed_word_data_anchors_on_display_end():
+    got = _check(
+        [_cue("x" * 100, 1.0, 2.0)],
+        min_cue_s=0.0,
+        max_cue_s=7.0,
+        cps=17.0,
+        lag_out_s=0.0,
+    )
+    assert got[0] == pytest.approx(2.0 + LINGER_CAP_S - 1.0)
+
+
+def test_linger_cap_rides_a_word_still_sounding_past_the_display_end():
+    # the held word ends at 2.4, past the display end -- the cap follows it up
+    got = _check(
+        [_cue("x" * 100, 1.0, 2.0, _words((1.0, 2.4)))],
+        min_cue_s=0.0,
+        max_cue_s=7.0,
+        cps=17.0,
+        lag_out_s=0.0,
+    )
+    assert got[0] == pytest.approx(2.4 + LINGER_CAP_S - 1.0)
+
+
 # --- min_cue floors -----------------------------------------------------------
 
 

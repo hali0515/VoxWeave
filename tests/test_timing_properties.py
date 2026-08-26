@@ -12,6 +12,12 @@ Three audit probes are pinned here:
   lag_out_s)``, so a second application is a no-op for cues with word_data while
   an already-longer display end is preserved (max rule). Cues without word_data
   keep the legacy behavior.
+- PROBE C (cps): the same defect in the reading-speed linger. Its ``LINGER_CAP_S``
+  ceiling was ``end + LINGER_CAP_S`` -- the display end -- so a cue whose reading
+  need outruns the cap walked one cap further out per pass (1.0 -> 2.0 -> 2.857s
+  at cps 7) and the diarize route shipped a different end than the plain one. The
+  cap anchors on the same speech end the pad does; untimed cues keep the legacy
+  display anchor.
 - in-time cap: ``_snap_to_shots`` guards both out-time branches with
   ``max_cue_s`` but not the in-time lead-in, so a cue sitting exactly at the cap
   is pulled back onto a cut and ends up over the cap. API PIN 3: reject that
@@ -166,6 +172,98 @@ def test_cue_without_word_data_keeps_legacy_lag_out():
     ]
     once = _cleanup(cues, min_cue_s=0.0)
     assert once[0]["end"] == pytest.approx(2.25)
+
+
+# --------------------------------------------------------------------------- #
+# PROBE C (cps): the reading linger's cap must anchor on speech end too
+# --------------------------------------------------------------------------- #
+
+CPS_JA = 7.0  # config default for ja (_CPS_DEFAULTS)
+CPS_KW = {**CLEANUP_KW, "cps": CPS_JA}
+
+
+def _reading_needy_cue(start=10.0, end=11.0, chars=20):
+    """A cue whose reading need (chars/cps) runs well past display end + the cap.
+
+    20 chars at cps 7 need 2.857s of display while the speech lasts 1.0s, so the
+    linger cap -- not the reading need -- is what decides the end. That is the
+    only regime where the cap's anchor is observable.
+    """
+    text = "あ" * chars
+    return {
+        "text": text,
+        "start": start,
+        "end": end,
+        "word_data": [{"text": text, "start": start, "end": end}],
+    }
+
+
+def test_cps_linger_cap_is_idempotent_on_a_reading_needy_cue():
+    """PROBE C (cps): the linger cap anchors on speech end, so a second pass adds
+    nothing. Anchored on the display end it grew 1.0 -> 2.0 -> 2.857s instead."""
+    cues = [_reading_needy_cue(), _cue("next", 30.0, 31.0)]
+    once = _cleanup(cues, cps=CPS_JA)
+    # precondition: the cap really is the binding term (need would reach 12.857)
+    assert once[0]["end"] == pytest.approx(12.0)
+    twice = _cleanup(once, cps=CPS_JA)
+    assert _snapshot(twice) == _snapshot(once)
+
+
+@pytest.mark.parametrize("passes", [2, 3, 4])
+def test_cps_linger_does_not_walk_outward_per_pass(passes):
+    """PROBE C (cps): repeated application converges after the first pass rather
+    than sliding one LINGER_CAP_S further out each time."""
+    cues = [_reading_needy_cue(), _cue("next", 30.0, 31.0)]
+    once = _cleanup(cues, cps=CPS_JA)
+    repeated = copy.deepcopy(cues)
+    for _ in range(passes):
+        repeated = _cleanup_cues(repeated, **CPS_KW)
+    assert _snapshot(repeated) == _snapshot(once)
+    assert repeated[0]["end"] == pytest.approx(12.0)
+
+
+def test_diarize_and_plain_routes_agree_on_a_reading_needy_cue():
+    """PROBE C (cps): the diarize route runs cleanup again after speaker
+    formatting. Both routes must ship the same end for every cue, including ones
+    whose reading need exceeds display end + LINGER_CAP_S."""
+    cues = [
+        _reading_needy_cue(start=0.0, end=1.0),
+        _reading_needy_cue(start=8.0, end=9.0),
+        _cue("tail", 30.0, 31.0),
+    ]
+    plain = _cleanup(cues, cps=CPS_JA)  # non-diarize: one pass
+    diarize = _cleanup(plain, cps=CPS_JA)  # diarize: formatting, then again
+    assert _snapshot(diarize) == _snapshot(plain)
+    assert [c["end"] for c in plain] == pytest.approx([2.0, 10.0, 31.25])
+
+
+def test_cps_linger_cap_untimed_cue_keeps_display_anchor():
+    """PROBE C (cps): no word_data means no speech anchor, so the cap still rides
+    the display end -- the untimed path is deliberately unchanged."""
+    cues = [
+        {"text": "あ" * 20, "start": 10.0, "end": 11.0, "word_data": []},
+        {"text": "next", "start": 30.0, "end": 31.0, "word_data": []},
+    ]
+    once = _cleanup_cues(cues, **CPS_KW)
+    assert once[0]["end"] == pytest.approx(12.0)
+
+
+def test_cps_linger_cap_rides_a_held_word_past_the_display_end():
+    """PROBE C (cps): speech end, not display end, is the anchor -- a held word
+    sounding past the display end lifts the cap with it."""
+    cues = [
+        {
+            "text": "あ" * 20,
+            "start": 10.0,
+            "end": 11.0,
+            "word_data": [{"text": "あ" * 20, "start": 10.0, "end": 11.4}],
+        },
+        _cue("next", 30.0, 31.0),
+    ]
+    once = _cleanup_cues(cues, **CPS_KW)
+    assert once[0]["end"] == pytest.approx(12.4)  # speech end 11.4 + LINGER_CAP_S
+    twice = _cleanup_cues(once, **CPS_KW)
+    assert _snapshot(twice) == _snapshot(once)
 
 
 # --------------------------------------------------------------------------- #
