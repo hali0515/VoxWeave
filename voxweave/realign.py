@@ -401,12 +401,17 @@ def snap_break_punct(units: list[dict], iso: str, *, max_shift: int = 2) -> list
         return units
     from voxweave.core import breakpoints
 
+    def surface(u: dict) -> str:
+        # Units legally carry their surface under ``text`` or ``word`` (see
+        # ``schema.Unit``); replayed sibling JSONs use either.
+        return str(u.get("text") or u.get("word") or "")
+
     content: list[dict] = []  # content character units
     puncts: list[
         tuple[int, dict]
     ] = []  # (content position = # content chars before this punct, punct unit)
     for u in units:
-        nc = [c for c in u["text"] if not c.isspace()]
+        nc = [c for c in surface(u) if not c.isspace()]
         if len(nc) == 1 and nc[0] in _BREAK_PUNCT:
             puncts.append((len(content), u))
         elif len(nc) >= 1:
@@ -415,7 +420,7 @@ def snap_break_punct(units: list[dict], iso: str, *, max_shift: int = 2) -> list
             return units
     if not puncts or len(content) < 2:
         return units
-    cstr = "".join(next(c for c in u["text"] if not c.isspace()) for u in content)
+    cstr = "".join(next(c for c in surface(u) if not c.isspace()) for u in content)
     starts = breakpoints.word_starts(cstr, iso)
     if not starts:
         return units
@@ -439,11 +444,11 @@ def snap_break_punct(units: list[dict], iso: str, *, max_shift: int = 2) -> list
             i, ()
         ):  # punct before content[i] = break just before this word start
             t = out[-1]["end"] if out else u["start"]
-            out.append({"text": pu["text"], "start": t, "end": t})
+            out.append({"text": surface(pu), "start": t, "end": t})
         out.append(u)
     for pu in inserts.get(len(content), ()):  # trailing punctuation (fallback)
         t = out[-1]["end"] if out else 0.0
-        out.append({"text": pu["text"], "start": t, "end": t})
+        out.append({"text": surface(pu), "start": t, "end": t})
     return out
 
 

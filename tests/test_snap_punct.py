@@ -125,3 +125,43 @@ def test_real_jieba_fixes_all_failing_cases():
                 assert not re.search(kw[0] + "[。！？；，、]" + kw[1], joined), (
                     f"{kw} still split: {joined!r}"
                 )
+
+
+def _word_units(text: str) -> list[dict]:
+    """Same per-char stream, but with the surface under the ``word`` key —
+    the other legal Unit shape (schema.Unit; corpus captures mirror it)."""
+    out: list[dict] = []
+    for i, c in enumerate(text):
+        out.append(
+            {"word": c, "start": round(i * 0.1, 3), "end": round(i * 0.1 + 0.05, 3)}
+        )
+    return out
+
+
+def test_word_key_units_do_not_crash_and_snap_identically(monkeypatch):
+    import voxweave.core.breakpoints as B
+
+    monkeypatch.setattr(B, "word_starts", _fake_starts({4, 7, 9}))
+    text_out = snap_break_punct(_units("同比增长29%数。据中心"), "zh")
+    word_out = snap_break_punct(_word_units("同比增长29%数。据中心"), "zh")
+    joined = "".join(u.get("text") or u.get("word") or "" for u in word_out)
+    assert joined == _text(text_out) == "同比增长29%。数据中心"
+    spans = [(u["start"], u["end"]) for u in word_out]
+    assert spans == [(u["start"], u["end"]) for u in text_out]
+
+
+def test_mixed_key_units_survive(monkeypatch):
+    import voxweave.core.breakpoints as B
+
+    units = _units("同比增长29%数。据中心")
+    units[3] = {
+        "word": units[3]["text"],
+        "start": units[3]["start"],
+        "end": units[3]["end"],
+    }
+    monkeypatch.setattr(B, "word_starts", _fake_starts({4, 7, 9}))
+    out = snap_break_punct(units, "zh")
+    assert (
+        "".join(u.get("text") or u.get("word") or "" for u in out)
+        == "同比增长29%。数据中心"
+    )
