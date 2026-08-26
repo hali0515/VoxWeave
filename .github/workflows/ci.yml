@@ -37,18 +37,16 @@ jobs:
       - name: Test
         run: uv run pytest tests/ -q
 
-  # Separate, non-blocking job: the segmentation ruler measures output *quality*,
-  # not behaviour change, and it lands in warning mode first (design 4.6). During
-  # the soak the metric definitions and the corpus are still being corrected, so a
-  # red number here must not stop a PR -- flip `continue-on-error` off once the
-  # gates in calibration/segmentation/baseline.json are `blocking` and main meets
-  # its absolute targets. The report artifact is what makes the soak useful.
+  # The segmentation ruler measures output *quality* against the recorded
+  # baseline (calibration/segmentation/baseline.json). Three gates are
+  # `blocking` (mid-phrase, over-7s, cps_p90); forbidden_end stays `warning`
+  # until the en group reaches min_samples (48/100 as of 2026-08). Flipping a
+  # gate mode is a reviewed edit of the tracked baseline, not a code change.
   #
   # Zero GPU, zero network, no media: the corpus is tracked JSON replayed through
   # the production entry point. It skips cleanly until the corpus is captured.
   segmentation-quality:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 

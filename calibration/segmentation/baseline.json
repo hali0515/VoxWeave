@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "metric_definition_version": 2,
+  "corpus_digest": "6c4e05cec8a674b0dc5ca2a65b779d74f4e0d56d43e90bae730665d3db9226ae",
+  "generated_from_commit": "768aad0ac1ef84c4825da1983092074dd168ccff",
+  "environment": {
+    "python": "3.13.12",
+    "dependencies": {
+      "pysbd": "0.3.4",
+      "budoux": "0.8.4",
+      "jieba": "0.42.1",
+      "fugashi": "1.5.2"
+    }
+  },
+  "groups": {
+    "all": {
+      "case_count": 20,
+      "cue_count": 2082,
+      "cps_p90": {
+        "n": 2082,
+        "value": 16.514285714285688,
+        "median": 7.065217391304334,
+        "p95": 18.798839600470078,
+        "target_cps": null,
+        "absolute_max": null
+      },
+      "phrase_granularity": [
+        "phrase",
+        "word"
+      ],
+      "diagnostics": {
+        "unit_count": 22972,
+        "cue_count": 2082,
+        "lyric_cue_count": 0,
+        "internal_boundaries": 2062,
+        "unmapped_boundaries": 0,
+        "overlapping_cues": 0,
+        "silence_breaks": 284,
+        "forced_breaks": 236,
+        "punctuation_breaks": 1351,
+        "no_legal_alternative": 70,
+        "exempted_cues": 0
+      },
+      "len_break_mid_phrase_rate": {
+        "bad": 3,
+        "eligible": 1778,
+        "value": 0.001687289088863892
+      },
+      "over_7s_rate": {
+        "bad": 0,
+        "eligible": 2082,
+        "value": 0.0
+      },
+      "forbidden_end_rate": {
+        "bad": 1,
+        "eligible": 405,
+        "value": 0.0024691358024691358
+      }
+    },
+    "en": {
+      "case_count": 6,
+      "cue_count": 565,
+      "cps_p90": {
+        "n": 565,
+        "value": 20.71220186649996,
+        "median": 15.330565314595905,
+        "p95": 22.628701539872594,
+        "target_cps": 17.0,
+        "absolute_max": 21.25
+      },
+      "phrase_granularity": [
+        "word"
+      ],
+      "diagnostics": {
+        "unit_count": 4741,
+        "cue_count": 565,
+        "lyric_cue_count": 0,
+        "internal_boundaries": 559,
+        "unmapped_boundaries": 0,
+        "overlapping_cues": 0,
+        "silence_breaks": 84,
+        "forced_breaks": 39,
+        "punctuation_breaks": 472,
+        "no_legal_alternative": 0,
+        "exempted_cues": 0
+      },
+      "len_break_mid_phrase_rate": {
+        "bad": 0,
+        "eligible": 475,
+        "value": 0.0
+      },
+      "over_7s_rate": {
+        "bad": 0,
+        "eligible": 565,
+        "value": 0.0
+      },
+      "forbidden_end_rate": {
+        "bad": 0,
+        "eligible": 48,
+        "value": 0.0
+      }
+    },
+    "ja": {
+      "case_count": 7,
+      "cue_count": 660,
+      "cps_p90": {
+        "n": 660,
+        "value": 7.142857142857179,
+        "median": 5.108315247681275,
+        "p95": 7.927313201703442,
+        "target_cps": 7.0,
+        "absolute_max": 8.75
+      },
+      "phrase_granularity": [
+        "phrase"
+      ],
+      "diagnostics": {
+        "unit_count": 6491,
+        "cue_count": 660,
+        "lyric_cue_count": 0,
+        "internal_boundaries": 653,
+        "unmapped_boundaries": 0,
+        "overlapping_cues": 0,
+        "silence_breaks": 189,
+        "forced_breaks": 189,
+        "punctuation_breaks": 250,
+        "no_legal_alternative": 67,
+        "exempted_cues": 0
+      },
+      "len_break_mid_phrase_rate": {
+        "bad": 3,
+        "eligible": 464,
+        "value": 0.00646551724137931
+      },
+      "over_7s_rate": {
+        "bad": 0,
+        "eligible": 660,
+        "value": 0.0
+      },
+      "forbidden_end_rate": {
+        "bad": 1,
+        "eligible": 147,
+        "value": 0.006802721088435374
+      }
+    },
+    "zh": {
+      "case_count": 7,
+      "cue_count": 857,
+      "cps_p90": {
+        "n": 857,
+        "value": 9.615384615384624,
+        "median": 6.976744186046516,
+        "p95": 10.714285714285724,
+        "target_cps": 9.0,
+        "absolute_max": 11.25
+      },
+      "phrase_granularity": [
+        "phrase"
+      ],
+      "diagnostics": {
+        "unit_count": 11740,
+        "cue_count": 857,
+        "lyric_cue_count": 0,
+        "internal_boundaries": 850,
+        "unmapped_boundaries": 0,
+        "overlapping_cues": 0,
+        "silence_breaks": 11,
+        "forced_breaks": 8,
+        "punctuation_breaks": 629,
+        "no_legal_alternative": 3,
+        "exempted_cues": 0
+      },
+      "len_break_mid_phrase_rate": {
+        "bad": 0,
+        "eligible": 839,
+        "value": 0.0
+      },
+      "over_7s_rate": {
+        "bad": 0,
+        "eligible": 857,
+        "value": 0.0
+      },
+      "forbidden_end_rate": {
+        "bad": 0,
+        "eligible": 210,
+        "value": 0.0
+      }
+    }
+  },
+  "gates": {
+    "len_break_mid_phrase_rate": {
+      "direction": "lower_is_better",
+      "mode": "blocking",
+      "absolute_max": 0.1,
+      "absolute_tolerance": 0.01,
+      "relative_tolerance": 0.1,
+      "min_samples": 100
+    },
+    "over_7s_rate": {
+      "direction": "lower_is_better",
+      "mode": "blocking",
+      "absolute_max": 0.0,
+      "absolute_tolerance": 0.0,
+      "relative_tolerance": 0.0,
+      "min_samples": 1
+    },
+    "cps_p90": {
+      "direction": "lower_is_better",
+      "mode": "blocking",
+      "absolute_max": null,
+      "absolute_tolerance": 0.5,
+      "relative_tolerance": 0.05,
+      "min_samples": 100
+    },
+    "forbidden_end_rate": {
+      "direction": "lower_is_better",
+      "mode": "warning",
+      "absolute_max": 0.02,
+      "absolute_tolerance": 0.005,
+      "relative_tolerance": 0.1,
+      "min_samples": 100
+    }
+  }
+}
