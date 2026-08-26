@@ -1,0 +1,3723 @@
+{
+  "schema_version": 1,
+  "id": "en-01",
+  "language": "en",
+  "description": "en tutorial monologue, mid segment",
+  "tags": [
+    "tutorial"
+  ],
+  "license": {
+    "redistributable": false,
+    "source_class": "third-party",
+    "spdx": null,
+    "attribution": "YouTube ui1zR5Pc4Q8"
+  },
+  "capture": {
+    "voxweave_commit": "c9b2b3ac70c5045dd0d6eed80ccddb3cd8899f9e",
+    "source_digest": "c626f3527fc5ec2983e45eea1dd4cb44b582eeebe1506e5ee4c928385cef6b0e",
+    "window_duration_s": 240.0,
+    "dependency_versions": {
+      "python": "3.13.12",
+      "pysbd": "0.3.4",
+      "budoux": "0.8.4",
+      "jieba": "0.42.1",
+      "fugashi": "1.5.2"
+    },
+    "config": {
+      "language": "en",
+      "max_line_length": 42,
+      "max_lines": 2,
+      "max_cue_s": 7.0,
+      "min_cue_s": 0.5,
+      "cps": 17.0,
+      "lag_out_s": 0.25,
+      "glue_gap_s": 0.3,
+      "gap_thresholds": {
+        "clause_ms": 400,
+        "vad_skip_ms": 1000,
+        "offline_ms": 700
+      },
+      "gap_adaptive": false,
+      "shot_snap_s": 0.458,
+      "shot_snap_frames": 10.992,
+      "diarize_format": {
+        "min_atom_overlap_s": 0.05,
+        "min_run_s": 0.2,
+        "edge_run_min_s": 0.12,
+        "merge_gap_s": 0.35,
+        "drop_contained_s": 0.2
+      }
+    },
+    "missing_inputs": [
+      "shot_changes",
+      "sing_spans"
+    ]
+  },
+  "word_segments": [
+    {
+      "id": "u0",
+      "text": "voice",
+      "start": 0.201,
+      "end": 0.441
+    },
+    {
+      "id": "u1",
+      "text": "assistant,",
+      "start": 0.542,
+      "end": 1.082
+    },
+    {
+      "id": "u2",
+      "text": "and",
+      "start": 1.222,
+      "end": 1.282
+    },
+    {
+      "id": "u3",
+      "text": "it's",
+      "start": 1.342,
+      "end": 1.442
+    },
+    {
+      "id": "u4",
+      "text": "training",
+      "start": 1.542,
+      "end": 1.902
+    },
+    {
+      "id": "u5",
+      "text": "for",
+      "start": 2.003,
+      "end": 2.243
+    },
+    {
+      "id": "u6",
+      "text": "the",
+      "start": 2.363,
+      "end": 2.423
+    },
+    {
+      "id": "u7",
+      "text": "custom",
+      "start": 2.523,
+      "end": 2.823
+    },
+    {
+      "id": "u8",
+      "text": "tools",
+      "start": 2.943,
+      "end": 3.383
+    },
+    {
+      "id": "u9",
+      "text": "that",
+      "start": 3.664,
+      "end": 3.784
+    },
+    {
+      "id": "u10",
+      "text": "that",
+      "start": 3.824,
+      "end": 4.004
+    },
+    {
+      "id": "u11",
+      "text": "voice",
+      "start": 4.204,
+      "end": 4.444
+    },
+    {
+      "id": "u12",
+      "text": "assistant",
+      "start": 4.524,
+      "end": 4.965
+    },
+    {
+      "id": "u13",
+      "text": "has",
+      "start": 5.045,
+      "end": 5.225
+    },
+    {
+      "id": "u14",
+      "text": "available.",
+      "start": 5.285,
+      "end": 5.765
+    },
+    {
+      "id": "u15",
+      "text": "In",
+      "start": 6.846,
+      "end": 6.886
+    },
+    {
+      "id": "u16",
+      "text": "particular,",
+      "start": 6.926,
+      "end": 7.426
+    },
+    {
+      "id": "u17",
+      "text": "this",
+      "start": 7.486,
+      "end": 7.606
+    },
+    {
+      "id": "u18",
+      "text": "one's",
+      "start": 7.706,
+      "end": 7.826
+    },
+    {
+      "id": "u19",
+      "text": "training",
+      "start": 8.247,
+      "end": 8.607
+    },
+    {
+      "id": "u20",
+      "text": "on",
+      "start": 8.727,
+      "end": 8.787
+    },
+    {
+      "id": "u21",
+      "text": "three",
+      "start": 8.867,
+      "end": 9.107
+    },
+    {
+      "id": "u22",
+      "text": "different",
+      "start": 9.127,
+      "end": 9.387
+    },
+    {
+      "id": "u23",
+      "text": "tools,",
+      "start": 9.427,
+      "end": 9.808
+    },
+    {
+      "id": "u24",
+      "text": "which",
+      "start": 9.888,
+      "end": 9.988
+    },
+    {
+      "id": "u25",
+      "text": "you'll",
+      "start": 10.028,
+      "end": 10.208
+    },
+    {
+      "id": "u26",
+      "text": "see.",
+      "start": 10.248,
+      "end": 10.448
+    },
+    {
+      "id": "u27",
+      "text": "So",
+      "start": 12.109,
+      "end": 12.189
+    },
+    {
+      "id": "u28",
+      "text": "the",
+      "start": 12.249,
+      "end": 12.369
+    },
+    {
+      "id": "u29",
+      "text": "user",
+      "start": 12.65,
+      "end": 12.87
+    },
+    {
+      "id": "u30",
+      "text": "message",
+      "start": 12.95,
+      "end": 13.41
+    },
+    {
+      "id": "u31",
+      "text": "is",
+      "start": 13.73,
+      "end": 13.89
+    },
+    {
+      "id": "u32",
+      "text": "email",
+      "start": 14.131,
+      "end": 14.331
+    },
+    {
+      "id": "u33",
+      "text": "Sarah",
+      "start": 14.431,
+      "end": 14.871
+    },
+    {
+      "id": "u34",
+      "text": "the",
+      "start": 14.991,
+      "end": 15.051
+    },
+    {
+      "id": "u35",
+      "text": "next",
+      "start": 15.111,
+      "end": 15.291
+    },
+    {
+      "id": "u36",
+      "text": "F",
+      "start": 15.492,
+      "end": 15.512
+    },
+    {
+      "id": "u37",
+      "text": "one",
+      "start": 15.652,
+      "end": 15.752
+    },
+    {
+      "id": "u38",
+      "text": "race,",
+      "start": 15.792,
+      "end": 16.032
+    },
+    {
+      "id": "u39",
+      "text": "and",
+      "start": 16.933,
+      "end": 16.993
+    },
+    {
+      "id": "u40",
+      "text": "the",
+      "start": 17.013,
+      "end": 17.073
+    },
+    {
+      "id": "u41",
+      "text": "first",
+      "start": 17.133,
+      "end": 17.313
+    },
+    {
+      "id": "u42",
+      "text": "step",
+      "start": 17.373,
+      "end": 17.653
+    },
+    {
+      "id": "u43",
+      "text": "is",
+      "start": 18.754,
+      "end": 18.874
+    },
+    {
+      "id": "u44",
+      "text": "for",
+      "start": 18.994,
+      "end": 19.094
+    },
+    {
+      "id": "u45",
+      "text": "the",
+      "start": 19.134,
+      "end": 19.194
+    },
+    {
+      "id": "u46",
+      "text": "model",
+      "start": 19.274,
+      "end": 19.554
+    },
+    {
+      "id": "u47",
+      "text": "to",
+      "start": 19.634,
+      "end": 19.694
+    },
+    {
+      "id": "u48",
+      "text": "call",
+      "start": 19.774,
+      "end": 19.955
+    },
+    {
+      "id": "u49",
+      "text": "a",
+      "start": 20.035,
+      "end": 20.055
+    },
+    {
+      "id": "u50",
+      "text": "tool.",
+      "start": 20.115,
+      "end": 20.375
+    },
+    {
+      "id": "u51",
+      "text": "So",
+      "start": 21.275,
+      "end": 21.416
+    },
+    {
+      "id": "u52",
+      "text": "we",
+      "start": 21.656,
+      "end": 21.736
+    },
+    {
+      "id": "u53",
+      "text": "give",
+      "start": 21.796,
+      "end": 21.916
+    },
+    {
+      "id": "u54",
+      "text": "it",
+      "start": 21.956,
+      "end": 21.996
+    },
+    {
+      "id": "u55",
+      "text": "that",
+      "start": 22.036,
+      "end": 22.156
+    },
+    {
+      "id": "u56",
+      "text": "example",
+      "start": 22.216,
+      "end": 22.676
+    },
+    {
+      "id": "u57",
+      "text": "call",
+      "start": 22.857,
+      "end": 23.137
+    },
+    {
+      "id": "u58",
+      "text": "the",
+      "start": 23.197,
+      "end": 23.257
+    },
+    {
+      "id": "u59",
+      "text": "ESPN",
+      "start": 23.317,
+      "end": 23.797
+    },
+    {
+      "id": "u60",
+      "text": "tool",
+      "start": 23.897,
+      "end": 24.217
+    },
+    {
+      "id": "u61",
+      "text": "with",
+      "start": 24.998,
+      "end": 25.118
+    },
+    {
+      "id": "u62",
+      "text": "the",
+      "start": 25.158,
+      "end": 25.218
+    },
+    {
+      "id": "u63",
+      "text": "arguments",
+      "start": 25.358,
+      "end": 25.778
+    },
+    {
+      "id": "u64",
+      "text": "schedule",
+      "start": 26.019,
+      "end": 26.539
+    },
+    {
+      "id": "u65",
+      "text": "and",
+      "start": 26.699,
+      "end": 26.759
+    },
+    {
+      "id": "u66",
+      "text": "the",
+      "start": 26.799,
+      "end": 26.859
+    },
+    {
+      "id": "u67",
+      "text": "sport",
+      "start": 26.919,
+      "end": 27.219
+    },
+    {
+      "id": "u68",
+      "text": "is",
+      "start": 27.299,
+      "end": 27.34
+    },
+    {
+      "id": "u69",
+      "text": "F",
+      "start": 27.62,
+      "end": 27.64
+    },
+    {
+      "id": "u70",
+      "text": "one.",
+      "start": 27.92,
+      "end": 28.04
+    },
+    {
+      "id": "u71",
+      "text": "The",
+      "start": 29.321,
+      "end": 29.401
+    },
+    {
+      "id": "u72",
+      "text": "tool",
+      "start": 29.461,
+      "end": 29.781
+    },
+    {
+      "id": "u73",
+      "text": "returns",
+      "start": 30.001,
+      "end": 30.602
+    },
+    {
+      "id": "u74",
+      "text": "a",
+      "start": 30.762,
+      "end": 30.782
+    },
+    {
+      "id": "u75",
+      "text": "response",
+      "start": 30.842,
+      "end": 31.382
+    },
+    {
+      "id": "u76",
+      "text": "says",
+      "start": 32.203,
+      "end": 32.363
+    },
+    {
+      "id": "u77",
+      "text": "the",
+      "start": 32.383,
+      "end": 32.443
+    },
+    {
+      "id": "u78",
+      "text": "next",
+      "start": 32.463,
+      "end": 32.623
+    },
+    {
+      "id": "u79",
+      "text": "up",
+      "start": 32.743,
+      "end": 32.823
+    },
+    {
+      "id": "u80",
+      "text": "is",
+      "start": 32.943,
+      "end": 32.983
+    },
+    {
+      "id": "u81",
+      "text": "the",
+      "start": 33.003,
+      "end": 33.063
+    },
+    {
+      "id": "u82",
+      "text": "Australian",
+      "start": 33.083,
+      "end": 33.544
+    },
+    {
+      "id": "u83",
+      "text": "Grand",
+      "start": 33.584,
+      "end": 33.804
+    },
+    {
+      "id": "u84",
+      "text": "Prix,",
+      "start": 33.864,
+      "end": 34.184
+    },
+    {
+      "id": "u85",
+      "text": "and",
+      "start": 34.664,
+      "end": 34.724
+    },
+    {
+      "id": "u86",
+      "text": "after",
+      "start": 34.784,
+      "end": 34.965
+    },
+    {
+      "id": "u87",
+      "text": "that",
+      "start": 35.005,
+      "end": 35.245
+    },
+    {
+      "id": "u88",
+      "text": "the",
+      "start": 35.345,
+      "end": 35.405
+    },
+    {
+      "id": "u89",
+      "text": "Japanese",
+      "start": 35.465,
+      "end": 35.865
+    },
+    {
+      "id": "u90",
+      "text": "Grand",
+      "start": 35.925,
+      "end": 36.125
+    },
+    {
+      "id": "u91",
+      "text": "Prix,",
+      "start": 36.185,
+      "end": 36.486
+    },
+    {
+      "id": "u92",
+      "text": "not",
+      "start": 37.266,
+      "end": 37.386
+    },
+    {
+      "id": "u93",
+      "text": "the",
+      "start": 37.426,
+      "end": 37.486
+    },
+    {
+      "id": "u94",
+      "text": "actual",
+      "start": 37.586,
+      "end": 37.847
+    },
+    {
+      "id": "u95",
+      "text": "dates",
+      "start": 37.927,
+      "end": 38.167
+    },
+    {
+      "id": "u96",
+      "text": "for",
+      "start": 38.227,
+      "end": 38.307
+    },
+    {
+      "id": "u97",
+      "text": "2026",
+      "start": 38.527,
+      "end": 39.047
+    },
+    {
+      "id": "u98",
+      "text": "schedule,",
+      "start": 39.528,
+      "end": 39.968
+    },
+    {
+      "id": "u99",
+      "text": "but",
+      "start": 40.068,
+      "end": 40.228
+    },
+    {
+      "id": "u100",
+      "text": "close",
+      "start": 40.408,
+      "end": 40.628
+    },
+    {
+      "id": "u101",
+      "text": "enough.",
+      "start": 40.668,
+      "end": 40.869
+    },
+    {
+      "id": "u102",
+      "text": "And",
+      "start": 42.59,
+      "end": 42.65
+    },
+    {
+      "id": "u103",
+      "text": "then",
+      "start": 42.69,
+      "end": 42.81
+    },
+    {
+      "id": "u104",
+      "text": "step",
+      "start": 42.89,
+      "end": 43.15
+    },
+    {
+      "id": "u105",
+      "text": "two",
+      "start": 43.59,
+      "end": 43.891
+    },
+    {
+      "id": "u106",
+      "text": "would",
+      "start": 44.171,
+      "end": 44.331
+    },
+    {
+      "id": "u107",
+      "text": "be",
+      "start": 44.411,
+      "end": 44.591
+    },
+    {
+      "id": "u108",
+      "text": "to",
+      "start": 44.771,
+      "end": 44.851
+    },
+    {
+      "id": "u109",
+      "text": "find",
+      "start": 45.011,
+      "end": 45.372
+    },
+    {
+      "id": "u110",
+      "text": "Sarah's",
+      "start": 45.532,
+      "end": 45.972
+    },
+    {
+      "id": "u111",
+      "text": "email,",
+      "start": 46.152,
+      "end": 46.432
+    },
+    {
+      "id": "u112",
+      "text": "so",
+      "start": 47.033,
+      "end": 47.113
+    },
+    {
+      "id": "u113",
+      "text": "it",
+      "start": 47.193,
+      "end": 47.253
+    },
+    {
+      "id": "u114",
+      "text": "uses",
+      "start": 47.393,
+      "end": 47.633
+    },
+    {
+      "id": "u115",
+      "text": "the",
+      "start": 47.713,
+      "end": 47.773
+    },
+    {
+      "id": "u116",
+      "text": "Google",
+      "start": 47.813,
+      "end": 48.053
+    },
+    {
+      "id": "u117",
+      "text": "Contacts",
+      "start": 48.133,
+      "end": 48.954
+    },
+    {
+      "id": "u118",
+      "text": "tool.",
+      "start": 49.194,
+      "end": 49.494
+    },
+    {
+      "id": "u119",
+      "text": "And",
+      "start": 50.975,
+      "end": 51.055
+    },
+    {
+      "id": "u120",
+      "text": "it",
+      "start": 51.115,
+      "end": 51.155
+    },
+    {
+      "id": "u121",
+      "text": "searches",
+      "start": 51.256,
+      "end": 51.696
+    },
+    {
+      "id": "u122",
+      "text": "for",
+      "start": 51.816,
+      "end": 51.936
+    },
+    {
+      "id": "u123",
+      "text": "Sarah,",
+      "start": 52.016,
+      "end": 52.376
+    },
+    {
+      "id": "u124",
+      "text": "and",
+      "start": 53.417,
+      "end": 53.497
+    },
+    {
+      "id": "u125",
+      "text": "then",
+      "start": 53.557,
+      "end": 53.697
+    },
+    {
+      "id": "u126",
+      "text": "that",
+      "start": 53.777,
+      "end": 53.937
+    },
+    {
+      "id": "u127",
+      "text": "tool",
+      "start": 54.017,
+      "end": 54.338
+    },
+    {
+      "id": "u128",
+      "text": "would",
+      "start": 54.558,
+      "end": 54.718
+    },
+    {
+      "id": "u129",
+      "text": "respond",
+      "start": 54.798,
+      "end": 55.238
+    },
+    {
+      "id": "u130",
+      "text": "with",
+      "start": 55.318,
+      "end": 55.498
+    },
+    {
+      "id": "u131",
+      "text": "her",
+      "start": 56.499,
+      "end": 56.599
+    },
+    {
+      "id": "u132",
+      "text": "email.",
+      "start": 56.739,
+      "end": 57.019
+    },
+    {
+      "id": "u133",
+      "text": "Now",
+      "start": 57.92,
+      "end": 58.0
+    },
+    {
+      "id": "u134",
+      "text": "this",
+      "start": 58.06,
+      "end": 58.18
+    },
+    {
+      "id": "u135",
+      "text": "is",
+      "start": 58.26,
+      "end": 58.32
+    },
+    {
+      "id": "u136",
+      "text": "made",
+      "start": 58.4,
+      "end": 58.56
+    },
+    {
+      "id": "u137",
+      "text": "up.",
+      "start": 58.64,
+      "end": 58.761
+    },
+    {
+      "id": "u138",
+      "text": "I",
+      "start": 58.821,
+      "end": 58.841
+    },
+    {
+      "id": "u139",
+      "text": "don't",
+      "start": 58.881,
+      "end": 59.041
+    },
+    {
+      "id": "u140",
+      "text": "know",
+      "start": 59.101,
+      "end": 59.281
+    },
+    {
+      "id": "u141",
+      "text": "Sarah",
+      "start": 59.481,
+      "end": 59.741
+    },
+    {
+      "id": "u142",
+      "text": "Jones.",
+      "start": 59.801,
+      "end": 60.202
+    },
+    {
+      "id": "u143",
+      "text": "So",
+      "start": 61.422,
+      "end": 61.562
+    },
+    {
+      "id": "u144",
+      "text": "Sarah",
+      "start": 61.803,
+      "end": 62.143
+    },
+    {
+      "id": "u145",
+      "text": "Jones,",
+      "start": 62.303,
+      "end": 62.663
+    },
+    {
+      "id": "u146",
+      "text": "if",
+      "start": 62.723,
+      "end": 62.763
+    },
+    {
+      "id": "u147",
+      "text": "you're",
+      "start": 62.803,
+      "end": 62.963
+    },
+    {
+      "id": "u148",
+      "text": "watching,",
+      "start": 63.003,
+      "end": 63.384
+    },
+    {
+      "id": "u149",
+      "text": "sorry",
+      "start": 63.484,
+      "end": 63.784
+    },
+    {
+      "id": "u150",
+      "text": "for",
+      "start": 63.884,
+      "end": 64.004
+    },
+    {
+      "id": "u151",
+      "text": "using",
+      "start": 64.144,
+      "end": 64.344
+    },
+    {
+      "id": "u152",
+      "text": "your",
+      "start": 64.384,
+      "end": 64.484
+    },
+    {
+      "id": "u153",
+      "text": "email",
+      "start": 64.604,
+      "end": 64.845
+    },
+    {
+      "id": "u154",
+      "text": "address.",
+      "start": 64.925,
+      "end": 65.325
+    },
+    {
+      "id": "u155",
+      "text": "And",
+      "start": 66.226,
+      "end": 66.306
+    },
+    {
+      "id": "u156",
+      "text": "then",
+      "start": 66.326,
+      "end": 66.426
+    },
+    {
+      "id": "u157",
+      "text": "the",
+      "start": 66.466,
+      "end": 66.526
+    },
+    {
+      "id": "u158",
+      "text": "third",
+      "start": 66.606,
+      "end": 66.826
+    },
+    {
+      "id": "u159",
+      "text": "step",
+      "start": 66.926,
+      "end": 67.246
+    },
+    {
+      "id": "u160",
+      "text": "would",
+      "start": 67.466,
+      "end": 67.627
+    },
+    {
+      "id": "u161",
+      "text": "be",
+      "start": 67.707,
+      "end": 67.947
+    },
+    {
+      "id": "u162",
+      "text": "using",
+      "start": 68.947,
+      "end": 69.148
+    },
+    {
+      "id": "u163",
+      "text": "the",
+      "start": 69.188,
+      "end": 69.248
+    },
+    {
+      "id": "u164",
+      "text": "Gmail",
+      "start": 69.308,
+      "end": 69.688
+    },
+    {
+      "id": "u165",
+      "text": "tool.",
+      "start": 69.788,
+      "end": 70.108
+    },
+    {
+      "id": "u166",
+      "text": "So",
+      "start": 70.989,
+      "end": 71.069
+    },
+    {
+      "id": "u167",
+      "text": "using",
+      "start": 71.189,
+      "end": 71.389
+    },
+    {
+      "id": "u168",
+      "text": "Gmail,",
+      "start": 71.449,
+      "end": 72.009
+    },
+    {
+      "id": "u169",
+      "text": "then",
+      "start": 72.51,
+      "end": 72.65
+    },
+    {
+      "id": "u170",
+      "text": "uses",
+      "start": 72.85,
+      "end": 73.05
+    },
+    {
+      "id": "u171",
+      "text": "the",
+      "start": 73.13,
+      "end": 73.19
+    },
+    {
+      "id": "u172",
+      "text": "email",
+      "start": 73.35,
+      "end": 73.731
+    },
+    {
+      "id": "u173",
+      "text": "it",
+      "start": 73.991,
+      "end": 74.031
+    },
+    {
+      "id": "u174",
+      "text": "just",
+      "start": 74.091,
+      "end": 74.231
+    },
+    {
+      "id": "u175",
+      "text": "found,",
+      "start": 74.331,
+      "end": 74.711
+    },
+    {
+      "id": "u176",
+      "text": "and",
+      "start": 76.392,
+      "end": 76.553
+    },
+    {
+      "id": "u177",
+      "text": "sends",
+      "start": 77.173,
+      "end": 77.473
+    },
+    {
+      "id": "u178",
+      "text": "an",
+      "start": 77.553,
+      "end": 77.613
+    },
+    {
+      "id": "u179",
+      "text": "email",
+      "start": 77.733,
+      "end": 78.054
+    },
+    {
+      "id": "u180",
+      "text": "with",
+      "start": 78.154,
+      "end": 78.274
+    },
+    {
+      "id": "u181",
+      "text": "that",
+      "start": 78.334,
+      "end": 78.494
+    },
+    {
+      "id": "u182",
+      "text": "race",
+      "start": 78.574,
+      "end": 78.774
+    },
+    {
+      "id": "u183",
+      "text": "schedule.",
+      "start": 78.814,
+      "end": 79.314
+    },
+    {
+      "id": "u184",
+      "text": "The",
+      "start": 79.835,
+      "end": 79.895
+    },
+    {
+      "id": "u185",
+      "text": "tool",
+      "start": 79.975,
+      "end": 80.215
+    },
+    {
+      "id": "u186",
+      "text": "says",
+      "start": 80.295,
+      "end": 80.475
+    },
+    {
+      "id": "u187",
+      "text": "it's",
+      "start": 80.575,
+      "end": 80.675
+    },
+    {
+      "id": "u188",
+      "text": "done,",
+      "start": 80.815,
+      "end": 81.196
+    },
+    {
+      "id": "u189",
+      "text": "and",
+      "start": 81.896,
+      "end": 81.956
+    },
+    {
+      "id": "u190",
+      "text": "then",
+      "start": 81.996,
+      "end": 82.096
+    },
+    {
+      "id": "u191",
+      "text": "the",
+      "start": 82.156,
+      "end": 82.236
+    },
+    {
+      "id": "u192",
+      "text": "final",
+      "start": 82.416,
+      "end": 82.797
+    },
+    {
+      "id": "u193",
+      "text": "response",
+      "start": 82.897,
+      "end": 83.437
+    },
+    {
+      "id": "u194",
+      "text": "from",
+      "start": 83.557,
+      "end": 83.757
+    },
+    {
+      "id": "u195",
+      "text": "the",
+      "start": 83.937,
+      "end": 84.038
+    },
+    {
+      "id": "u196",
+      "text": "voice",
+      "start": 84.118,
+      "end": 84.378
+    },
+    {
+      "id": "u197",
+      "text": "assistant",
+      "start": 84.458,
+      "end": 84.998
+    },
+    {
+      "id": "u198",
+      "text": "is",
+      "start": 85.398,
+      "end": 85.519
+    },
+    {
+      "id": "u199",
+      "text": "that",
+      "start": 85.659,
+      "end": 85.979
+    },
+    {
+      "id": "u200",
+      "text": "I've",
+      "start": 86.359,
+      "end": 86.499
+    },
+    {
+      "id": "u201",
+      "text": "emailed",
+      "start": 86.599,
+      "end": 86.899
+    },
+    {
+      "id": "u202",
+      "text": "Sarah,",
+      "start": 86.939,
+      "end": 87.32
+    },
+    {
+      "id": "u203",
+      "text": "and",
+      "start": 88.32,
+      "end": 88.42
+    },
+    {
+      "id": "u204",
+      "text": "the",
+      "start": 88.481,
+      "end": 88.541
+    },
+    {
+      "id": "u205",
+      "text": "next",
+      "start": 88.601,
+      "end": 88.781
+    },
+    {
+      "id": "u206",
+      "text": "race",
+      "start": 88.881,
+      "end": 89.141
+    },
+    {
+      "id": "u207",
+      "text": "is",
+      "start": 89.241,
+      "end": 89.321
+    },
+    {
+      "id": "u208",
+      "text": "the",
+      "start": 89.361,
+      "end": 89.441
+    },
+    {
+      "id": "u209",
+      "text": "Australian",
+      "start": 89.501,
+      "end": 89.961
+    },
+    {
+      "id": "u210",
+      "text": "Grand",
+      "start": 90.022,
+      "end": 90.202
+    },
+    {
+      "id": "u211",
+      "text": "Prix.",
+      "start": 90.242,
+      "end": 90.482
+    },
+    {
+      "id": "u212",
+      "text": "So",
+      "start": 91.202,
+      "end": 91.262
+    },
+    {
+      "id": "u213",
+      "text": "that's",
+      "start": 91.302,
+      "end": 91.463
+    },
+    {
+      "id": "u214",
+      "text": "the",
+      "start": 91.483,
+      "end": 91.563
+    },
+    {
+      "id": "u215",
+      "text": "full",
+      "start": 91.643,
+      "end": 91.803
+    },
+    {
+      "id": "u216",
+      "text": "example,",
+      "start": 91.863,
+      "end": 92.423
+    },
+    {
+      "id": "u217",
+      "text": "and",
+      "start": 93.104,
+      "end": 93.184
+    },
+    {
+      "id": "u218",
+      "text": "so",
+      "start": 93.224,
+      "end": 93.304
+    },
+    {
+      "id": "u219",
+      "text": "the",
+      "start": 93.364,
+      "end": 93.424
+    },
+    {
+      "id": "u220",
+      "text": "model's",
+      "start": 93.484,
+      "end": 93.844
+    },
+    {
+      "id": "u221",
+      "text": "now",
+      "start": 93.904,
+      "end": 94.024
+    },
+    {
+      "id": "u222",
+      "text": "learned",
+      "start": 94.164,
+      "end": 94.545
+    },
+    {
+      "id": "u223",
+      "text": "that",
+      "start": 95.585,
+      "end": 95.925
+    },
+    {
+      "id": "u224",
+      "text": "F1",
+      "start": 96.586,
+      "end": 97.006
+    },
+    {
+      "id": "u225",
+      "text": "uses",
+      "start": 97.667,
+      "end": 97.867
+    },
+    {
+      "id": "u226",
+      "text": "this",
+      "start": 97.947,
+      "end": 98.087
+    },
+    {
+      "id": "u227",
+      "text": "tool",
+      "start": 98.187,
+      "end": 98.547
+    },
+    {
+      "id": "u228",
+      "text": "when",
+      "start": 98.988,
+      "end": 99.108
+    },
+    {
+      "id": "u229",
+      "text": "looking",
+      "start": 99.188,
+      "end": 99.448
+    },
+    {
+      "id": "u230",
+      "text": "up",
+      "start": 99.508,
+      "end": 99.568
+    },
+    {
+      "id": "u231",
+      "text": "a",
+      "start": 99.648,
+      "end": 99.668
+    },
+    {
+      "id": "u232",
+      "text": "user.",
+      "start": 99.848,
+      "end": 100.148
+    },
+    {
+      "id": "u233",
+      "text": "It",
+      "start": 100.409,
+      "end": 100.449
+    },
+    {
+      "id": "u234",
+      "text": "uses",
+      "start": 100.589,
+      "end": 100.829
+    },
+    {
+      "id": "u235",
+      "text": "Google",
+      "start": 101.589,
+      "end": 101.869
+    },
+    {
+      "id": "u236",
+      "text": "Contacts",
+      "start": 101.93,
+      "end": 102.49
+    },
+    {
+      "id": "u237",
+      "text": "to",
+      "start": 102.55,
+      "end": 102.59
+    },
+    {
+      "id": "u238",
+      "text": "find",
+      "start": 102.67,
+      "end": 102.83
+    },
+    {
+      "id": "u239",
+      "text": "their",
+      "start": 102.85,
+      "end": 102.99
+    },
+    {
+      "id": "u240",
+      "text": "email,",
+      "start": 103.11,
+      "end": 103.511
+    },
+    {
+      "id": "u241",
+      "text": "and",
+      "start": 104.331,
+      "end": 104.391
+    },
+    {
+      "id": "u242",
+      "text": "then",
+      "start": 104.431,
+      "end": 104.531
+    },
+    {
+      "id": "u243",
+      "text": "it",
+      "start": 104.571,
+      "end": 104.611
+    },
+    {
+      "id": "u244",
+      "text": "combines",
+      "start": 104.691,
+      "end": 105.432
+    },
+    {
+      "id": "u245",
+      "text": "the",
+      "start": 105.952,
+      "end": 106.032
+    },
+    {
+      "id": "u246",
+      "text": "information",
+      "start": 106.112,
+      "end": 106.753
+    },
+    {
+      "id": "u247",
+      "text": "from",
+      "start": 106.893,
+      "end": 107.013
+    },
+    {
+      "id": "u248",
+      "text": "step",
+      "start": 107.113,
+      "end": 107.333
+    },
+    {
+      "id": "u249",
+      "text": "one",
+      "start": 107.493,
+      "end": 107.553
+    },
+    {
+      "id": "u250",
+      "text": "and",
+      "start": 107.613,
+      "end": 107.693
+    },
+    {
+      "id": "u251",
+      "text": "step",
+      "start": 107.733,
+      "end": 107.934
+    },
+    {
+      "id": "u252",
+      "text": "two",
+      "start": 108.054,
+      "end": 108.274
+    },
+    {
+      "id": "u253",
+      "text": "in",
+      "start": 109.274,
+      "end": 109.334
+    },
+    {
+      "id": "u254",
+      "text": "the",
+      "start": 109.415,
+      "end": 109.495
+    },
+    {
+      "id": "u255",
+      "text": "Gmail",
+      "start": 109.595,
+      "end": 110.055
+    },
+    {
+      "id": "u256",
+      "text": "call.",
+      "start": 110.175,
+      "end": 110.515
+    },
+    {
+      "id": "u257",
+      "text": "So",
+      "start": 110.695,
+      "end": 110.775
+    },
+    {
+      "id": "u258",
+      "text": "it",
+      "start": 110.856,
+      "end": 110.896
+    },
+    {
+      "id": "u259",
+      "text": "learns",
+      "start": 110.956,
+      "end": 111.196
+    },
+    {
+      "id": "u260",
+      "text": "all",
+      "start": 111.256,
+      "end": 111.336
+    },
+    {
+      "id": "u261",
+      "text": "that.",
+      "start": 111.436,
+      "end": 111.596
+    },
+    {
+      "id": "u262",
+      "text": "It",
+      "start": 111.796,
+      "end": 111.836
+    },
+    {
+      "id": "u263",
+      "text": "learns",
+      "start": 111.996,
+      "end": 112.377
+    },
+    {
+      "id": "u264",
+      "text": "the",
+      "start": 112.517,
+      "end": 112.657
+    },
+    {
+      "id": "u265",
+      "text": "custom",
+      "start": 112.857,
+      "end": 113.197
+    },
+    {
+      "id": "u266",
+      "text": "tools",
+      "start": 113.317,
+      "end": 113.677
+    },
+    {
+      "id": "u267",
+      "text": "that",
+      "start": 113.737,
+      "end": 113.838
+    },
+    {
+      "id": "u268",
+      "text": "it",
+      "start": 113.878,
+      "end": 113.918
+    },
+    {
+      "id": "u269",
+      "text": "has",
+      "start": 113.998,
+      "end": 114.118
+    },
+    {
+      "id": "u270",
+      "text": "available",
+      "start": 114.178,
+      "end": 114.638
+    },
+    {
+      "id": "u271",
+      "text": "and",
+      "start": 114.698,
+      "end": 114.758
+    },
+    {
+      "id": "u272",
+      "text": "how",
+      "start": 114.838,
+      "end": 114.938
+    },
+    {
+      "id": "u273",
+      "text": "to",
+      "start": 114.998,
+      "end": 115.078
+    },
+    {
+      "id": "u274",
+      "text": "use",
+      "start": 115.218,
+      "end": 115.319
+    },
+    {
+      "id": "u275",
+      "text": "them.",
+      "start": 115.399,
+      "end": 115.559
+    },
+    {
+      "id": "u276",
+      "text": "And",
+      "start": 116.079,
+      "end": 116.179
+    },
+    {
+      "id": "u277",
+      "text": "this",
+      "start": 116.539,
+      "end": 116.739
+    },
+    {
+      "id": "u278",
+      "text": "is",
+      "start": 116.94,
+      "end": 117.02
+    },
+    {
+      "id": "u279",
+      "text": "again",
+      "start": 117.36,
+      "end": 117.72
+    },
+    {
+      "id": "u280",
+      "text": "what",
+      "start": 118.361,
+      "end": 118.461
+    },
+    {
+      "id": "u281",
+      "text": "that",
+      "start": 118.521,
+      "end": 118.661
+    },
+    {
+      "id": "u282",
+      "text": "looks",
+      "start": 118.741,
+      "end": 118.941
+    },
+    {
+      "id": "u283",
+      "text": "like",
+      "start": 119.041,
+      "end": 119.261
+    },
+    {
+      "id": "u284",
+      "text": "in",
+      "start": 119.561,
+      "end": 119.601
+    },
+    {
+      "id": "u285",
+      "text": "the",
+      "start": 119.721,
+      "end": 119.802
+    },
+    {
+      "id": "u286",
+      "text": "raw",
+      "start": 119.882,
+      "end": 120.022
+    },
+    {
+      "id": "u287",
+      "text": "JSON.",
+      "start": 120.122,
+      "end": 120.542
+    },
+    {
+      "id": "u288",
+      "text": "And",
+      "start": 121.483,
+      "end": 121.543
+    },
+    {
+      "id": "u289",
+      "text": "when",
+      "start": 121.603,
+      "end": 121.723
+    },
+    {
+      "id": "u290",
+      "text": "this",
+      "start": 121.783,
+      "end": 121.903
+    },
+    {
+      "id": "u291",
+      "text": "gets",
+      "start": 121.983,
+      "end": 122.143
+    },
+    {
+      "id": "u292",
+      "text": "rendered",
+      "start": 122.303,
+      "end": 122.723
+    },
+    {
+      "id": "u293",
+      "text": "into",
+      "start": 123.024,
+      "end": 123.324
+    },
+    {
+      "id": "u294",
+      "text": "the",
+      "start": 123.424,
+      "end": 123.504
+    },
+    {
+      "id": "u295",
+      "text": "actual",
+      "start": 123.624,
+      "end": 123.964
+    },
+    {
+      "id": "u296",
+      "text": "training",
+      "start": 124.285,
+      "end": 124.625
+    },
+    {
+      "id": "u297",
+      "text": "format",
+      "start": 124.725,
+      "end": 125.245
+    },
+    {
+      "id": "u298",
+      "text": "for",
+      "start": 125.325,
+      "end": 125.425
+    },
+    {
+      "id": "u299",
+      "text": "the",
+      "start": 125.465,
+      "end": 125.525
+    },
+    {
+      "id": "u300",
+      "text": "model,",
+      "start": 125.585,
+      "end": 125.966
+    },
+    {
+      "id": "u301",
+      "text": "it'll",
+      "start": 126.126,
+      "end": 126.326
+    },
+    {
+      "id": "u302",
+      "text": "also",
+      "start": 126.526,
+      "end": 126.766
+    },
+    {
+      "id": "u303",
+      "text": "add",
+      "start": 127.126,
+      "end": 127.247
+    },
+    {
+      "id": "u304",
+      "text": "the",
+      "start": 127.347,
+      "end": 127.407
+    },
+    {
+      "id": "u305",
+      "text": "full",
+      "start": 127.507,
+      "end": 127.687
+    },
+    {
+      "id": "u306",
+      "text": "system",
+      "start": 127.747,
+      "end": 128.047
+    },
+    {
+      "id": "u307",
+      "text": "prompt",
+      "start": 128.127,
+      "end": 128.547
+    },
+    {
+      "id": "u308",
+      "text": "and",
+      "start": 129.208,
+      "end": 129.288
+    },
+    {
+      "id": "u309",
+      "text": "all",
+      "start": 129.388,
+      "end": 129.508
+    },
+    {
+      "id": "u310",
+      "text": "the",
+      "start": 129.548,
+      "end": 129.608
+    },
+    {
+      "id": "u311",
+      "text": "tool",
+      "start": 129.688,
+      "end": 130.008
+    },
+    {
+      "id": "u312",
+      "text": "definitions",
+      "start": 130.108,
+      "end": 130.809
+    },
+    {
+      "id": "u313",
+      "text": "ahead",
+      "start": 131.249,
+      "end": 131.569
+    },
+    {
+      "id": "u314",
+      "text": "of",
+      "start": 131.609,
+      "end": 131.649
+    },
+    {
+      "id": "u315",
+      "text": "this",
+      "start": 131.689,
+      "end": 131.83
+    },
+    {
+      "id": "u316",
+      "text": "example",
+      "start": 131.93,
+      "end": 132.43
+    },
+    {
+      "id": "u317",
+      "text": "for",
+      "start": 132.69,
+      "end": 132.81
+    },
+    {
+      "id": "u318",
+      "text": "every",
+      "start": 132.93,
+      "end": 133.09
+    },
+    {
+      "id": "u319",
+      "text": "single",
+      "start": 133.17,
+      "end": 133.451
+    },
+    {
+      "id": "u320",
+      "text": "example",
+      "start": 133.531,
+      "end": 133.951
+    },
+    {
+      "id": "u321",
+      "text": "that",
+      "start": 133.991,
+      "end": 134.111
+    },
+    {
+      "id": "u322",
+      "text": "it",
+      "start": 134.171,
+      "end": 134.211
+    },
+    {
+      "id": "u323",
+      "text": "sees,",
+      "start": 134.271,
+      "end": 134.611
+    },
+    {
+      "id": "u324",
+      "text": "which",
+      "start": 135.172,
+      "end": 135.312
+    },
+    {
+      "id": "u325",
+      "text": "why",
+      "start": 135.412,
+      "end": 135.592
+    },
+    {
+      "id": "u326",
+      "text": "it",
+      "start": 135.692,
+      "end": 135.752
+    },
+    {
+      "id": "u327",
+      "text": "moves",
+      "start": 135.852,
+      "end": 136.273
+    },
+    {
+      "id": "u328",
+      "text": "the",
+      "start": 136.593,
+      "end": 136.713
+    },
+    {
+      "id": "u329",
+      "text": "token",
+      "start": 136.833,
+      "end": 137.213
+    },
+    {
+      "id": "u330",
+      "text": "count",
+      "start": 137.313,
+      "end": 137.633
+    },
+    {
+      "id": "u331",
+      "text": "for",
+      "start": 137.714,
+      "end": 137.814
+    },
+    {
+      "id": "u332",
+      "text": "each",
+      "start": 137.894,
+      "end": 138.034
+    },
+    {
+      "id": "u333",
+      "text": "example",
+      "start": 138.314,
+      "end": 138.874
+    },
+    {
+      "id": "u334",
+      "text": "from",
+      "start": 139.034,
+      "end": 139.255
+    },
+    {
+      "id": "u335",
+      "text": "a",
+      "start": 139.375,
+      "end": 139.395
+    },
+    {
+      "id": "u336",
+      "text": "few",
+      "start": 139.475,
+      "end": 139.635
+    },
+    {
+      "id": "u337",
+      "text": "hundred",
+      "start": 139.755,
+      "end": 140.055
+    },
+    {
+      "id": "u338",
+      "text": "to",
+      "start": 141.016,
+      "end": 141.196
+    },
+    {
+      "id": "u339",
+      "text": "on",
+      "start": 141.516,
+      "end": 141.556
+    },
+    {
+      "id": "u340",
+      "text": "average",
+      "start": 141.696,
+      "end": 141.916
+    },
+    {
+      "id": "u341",
+      "text": "about",
+      "start": 141.956,
+      "end": 142.136
+    },
+    {
+      "id": "u342",
+      "text": "seven",
+      "start": 142.277,
+      "end": 142.517
+    },
+    {
+      "id": "u343",
+      "text": "thousand",
+      "start": 142.617,
+      "end": 143.037
+    },
+    {
+      "id": "u344",
+      "text": "tokens",
+      "start": 143.117,
+      "end": 143.577
+    },
+    {
+      "id": "u345",
+      "text": "per",
+      "start": 144.138,
+      "end": 144.338
+    },
+    {
+      "id": "u346",
+      "text": "training",
+      "start": 144.458,
+      "end": 144.798
+    },
+    {
+      "id": "u347",
+      "text": "example,",
+      "start": 144.878,
+      "end": 145.339
+    },
+    {
+      "id": "u348",
+      "text": "hence",
+      "start": 146.279,
+      "end": 146.599
+    },
+    {
+      "id": "u349",
+      "text": "the",
+      "start": 146.86,
+      "end": 147.06
+    },
+    {
+      "id": "u350",
+      "text": "larger",
+      "start": 147.72,
+      "end": 148.02
+    },
+    {
+      "id": "u351",
+      "text": "VRAM",
+      "start": 148.08,
+      "end": 148.481
+    },
+    {
+      "id": "u352",
+      "text": "requirement.",
+      "start": 148.561,
+      "end": 149.141
+    },
+    {
+      "id": "u353",
+      "text": "But",
+      "start": 149.822,
+      "end": 150.022
+    },
+    {
+      "id": "u354",
+      "text": "I'm",
+      "start": 150.422,
+      "end": 150.522
+    },
+    {
+      "id": "u355",
+      "text": "training",
+      "start": 150.602,
+      "end": 151.102
+    },
+    {
+      "id": "u356",
+      "text": "in",
+      "start": 151.363,
+      "end": 151.403
+    },
+    {
+      "id": "u357",
+      "text": "a",
+      "start": 151.503,
+      "end": 151.523
+    },
+    {
+      "id": "u358",
+      "text": "much",
+      "start": 151.743,
+      "end": 151.963
+    },
+    {
+      "id": "u359",
+      "text": "more",
+      "start": 152.163,
+      "end": 152.443
+    },
+    {
+      "id": "u360",
+      "text": "production",
+      "start": 152.664,
+      "end": 153.524
+    },
+    {
+      "id": "u361",
+      "text": "reflective",
+      "start": 154.825,
+      "end": 155.485
+    },
+    {
+      "id": "u362",
+      "text": "environment.",
+      "start": 155.786,
+      "end": 156.326
+    },
+    {
+      "id": "u363",
+      "text": "It",
+      "start": 156.646,
+      "end": 156.706
+    },
+    {
+      "id": "u364",
+      "text": "reflects",
+      "start": 156.766,
+      "end": 157.147
+    },
+    {
+      "id": "u365",
+      "text": "a",
+      "start": 157.227,
+      "end": 157.247
+    },
+    {
+      "id": "u366",
+      "text": "production",
+      "start": 157.287,
+      "end": 157.647
+    },
+    {
+      "id": "u367",
+      "text": "environment",
+      "start": 157.727,
+      "end": 158.127
+    },
+    {
+      "id": "u368",
+      "text": "a",
+      "start": 158.147,
+      "end": 158.167
+    },
+    {
+      "id": "u369",
+      "text": "lot",
+      "start": 158.227,
+      "end": 158.347
+    },
+    {
+      "id": "u370",
+      "text": "more.",
+      "start": 158.407,
+      "end": 158.628
+    },
+    {
+      "id": "u371",
+      "text": "Now",
+      "start": 159.188,
+      "end": 159.308
+    },
+    {
+      "id": "u372",
+      "text": "I",
+      "start": 159.388,
+      "end": 159.408
+    },
+    {
+      "id": "u373",
+      "text": "went",
+      "start": 159.468,
+      "end": 159.608
+    },
+    {
+      "id": "u374",
+      "text": "through",
+      "start": 159.648,
+      "end": 159.848
+    },
+    {
+      "id": "u375",
+      "text": "some",
+      "start": 159.908,
+      "end": 160.069
+    },
+    {
+      "id": "u376",
+      "text": "trial",
+      "start": 160.189,
+      "end": 160.549
+    },
+    {
+      "id": "u377",
+      "text": "and",
+      "start": 160.609,
+      "end": 160.669
+    },
+    {
+      "id": "u378",
+      "text": "errors",
+      "start": 160.749,
+      "end": 161.009
+    },
+    {
+      "id": "u379",
+      "text": "with",
+      "start": 161.109,
+      "end": 161.209
+    },
+    {
+      "id": "u380",
+      "text": "this,",
+      "start": 161.269,
+      "end": 161.59
+    },
+    {
+      "id": "u381",
+      "text": "and",
+      "start": 161.95,
+      "end": 162.07
+    },
+    {
+      "id": "u382",
+      "text": "one",
+      "start": 162.31,
+      "end": 162.37
+    },
+    {
+      "id": "u383",
+      "text": "issue",
+      "start": 162.45,
+      "end": 162.65
+    },
+    {
+      "id": "u384",
+      "text": "I",
+      "start": 162.73,
+      "end": 162.75
+    },
+    {
+      "id": "u385",
+      "text": "came",
+      "start": 162.85,
+      "end": 163.091
+    },
+    {
+      "id": "u386",
+      "text": "into",
+      "start": 163.191,
+      "end": 163.531
+    },
+    {
+      "id": "u387",
+      "text": "when",
+      "start": 163.771,
+      "end": 163.911
+    },
+    {
+      "id": "u388",
+      "text": "trying",
+      "start": 164.011,
+      "end": 164.291
+    },
+    {
+      "id": "u389",
+      "text": "to",
+      "start": 164.331,
+      "end": 164.391
+    },
+    {
+      "id": "u390",
+      "text": "include",
+      "start": 164.451,
+      "end": 164.952
+    },
+    {
+      "id": "u391",
+      "text": "all",
+      "start": 165.252,
+      "end": 165.372
+    },
+    {
+      "id": "u392",
+      "text": "this",
+      "start": 165.472,
+      "end": 165.612
+    },
+    {
+      "id": "u393",
+      "text": "previous",
+      "start": 165.712,
+      "end": 166.093
+    },
+    {
+      "id": "u394",
+      "text": "context,",
+      "start": 166.173,
+      "end": 166.753
+    },
+    {
+      "id": "u395",
+      "text": "and",
+      "start": 166.813,
+      "end": 166.873
+    },
+    {
+      "id": "u396",
+      "text": "I'll",
+      "start": 166.913,
+      "end": 167.033
+    },
+    {
+      "id": "u397",
+      "text": "show",
+      "start": 167.053,
+      "end": 167.173
+    },
+    {
+      "id": "u398",
+      "text": "you",
+      "start": 167.233,
+      "end": 167.293
+    },
+    {
+      "id": "u399",
+      "text": "another",
+      "start": 167.353,
+      "end": 167.574
+    },
+    {
+      "id": "u400",
+      "text": "example",
+      "start": 167.654,
+      "end": 168.054
+    },
+    {
+      "id": "u401",
+      "text": "here",
+      "start": 168.134,
+      "end": 168.234
+    },
+    {
+      "id": "u402",
+      "text": "in",
+      "start": 168.294,
+      "end": 168.334
+    },
+    {
+      "id": "u403",
+      "text": "a",
+      "start": 168.394,
+      "end": 168.414
+    },
+    {
+      "id": "u404",
+      "text": "minute.",
+      "start": 168.454,
+      "end": 168.734
+    },
+    {
+      "id": "u405",
+      "text": "Of",
+      "start": 169.555,
+      "end": 169.595
+    },
+    {
+      "id": "u406",
+      "text": "all",
+      "start": 169.795,
+      "end": 169.915
+    },
+    {
+      "id": "u407",
+      "text": "previous",
+      "start": 170.035,
+      "end": 170.415
+    },
+    {
+      "id": "u408",
+      "text": "tool",
+      "start": 170.496,
+      "end": 170.736
+    },
+    {
+      "id": "u409",
+      "text": "calls",
+      "start": 170.816,
+      "end": 171.196
+    },
+    {
+      "id": "u410",
+      "text": "in",
+      "start": 171.396,
+      "end": 171.436
+    },
+    {
+      "id": "u411",
+      "text": "a",
+      "start": 171.476,
+      "end": 171.496
+    },
+    {
+      "id": "u412",
+      "text": "conversation",
+      "start": 171.576,
+      "end": 172.177
+    },
+    {
+      "id": "u413",
+      "text": "history,",
+      "start": 172.277,
+      "end": 172.717
+    },
+    {
+      "id": "u414",
+      "text": "and",
+      "start": 173.357,
+      "end": 173.417
+    },
+    {
+      "id": "u415",
+      "text": "then",
+      "start": 173.437,
+      "end": 173.538
+    },
+    {
+      "id": "u416",
+      "text": "the",
+      "start": 173.578,
+      "end": 173.638
+    },
+    {
+      "id": "u417",
+      "text": "one",
+      "start": 173.778,
+      "end": 173.858
+    },
+    {
+      "id": "u418",
+      "text": "I",
+      "start": 173.918,
+      "end": 173.938
+    },
+    {
+      "id": "u419",
+      "text": "actually",
+      "start": 174.038,
+      "end": 174.298
+    },
+    {
+      "id": "u420",
+      "text": "wanted",
+      "start": 174.338,
+      "end": 174.558
+    },
+    {
+      "id": "u421",
+      "text": "to",
+      "start": 174.598,
+      "end": 174.658
+    },
+    {
+      "id": "u422",
+      "text": "train",
+      "start": 174.718,
+      "end": 174.979
+    },
+    {
+      "id": "u423",
+      "text": "on,",
+      "start": 175.159,
+      "end": 175.279
+    },
+    {
+      "id": "u424",
+      "text": "it",
+      "start": 176.059,
+      "end": 176.099
+    },
+    {
+      "id": "u425",
+      "text": "was",
+      "start": 176.139,
+      "end": 176.219
+    },
+    {
+      "id": "u426",
+      "text": "actually",
+      "start": 176.299,
+      "end": 176.54
+    },
+    {
+      "id": "u427",
+      "text": "training",
+      "start": 176.6,
+      "end": 177.0
+    },
+    {
+      "id": "u428",
+      "text": "on",
+      "start": 177.1,
+      "end": 177.14
+    },
+    {
+      "id": "u429",
+      "text": "everything.",
+      "start": 177.22,
+      "end": 177.66
+    },
+    {
+      "id": "u430",
+      "text": "And",
+      "start": 178.501,
+      "end": 178.561
+    },
+    {
+      "id": "u431",
+      "text": "then",
+      "start": 178.621,
+      "end": 178.781
+    },
+    {
+      "id": "u432",
+      "text": "Qwen",
+      "start": 178.881,
+      "end": 179.261
+    },
+    {
+      "id": "u433",
+      "text": "three",
+      "start": 179.361,
+      "end": 179.562
+    },
+    {
+      "id": "u434",
+      "text": "point",
+      "start": 179.622,
+      "end": 179.782
+    },
+    {
+      "id": "u435",
+      "text": "five,",
+      "start": 179.902,
+      "end": 180.362
+    },
+    {
+      "id": "u436",
+      "text": "the",
+      "start": 180.963,
+      "end": 181.023
+    },
+    {
+      "id": "u437",
+      "text": "output",
+      "start": 181.143,
+      "end": 181.403
+    },
+    {
+      "id": "u438",
+      "text": "of",
+      "start": 181.443,
+      "end": 181.483
+    },
+    {
+      "id": "u439",
+      "text": "that,",
+      "start": 181.543,
+      "end": 181.843
+    },
+    {
+      "id": "u440",
+      "text": "it",
+      "start": 182.143,
+      "end": 182.203
+    },
+    {
+      "id": "u441",
+      "text": "was",
+      "start": 182.243,
+      "end": 182.343
+    },
+    {
+      "id": "u442",
+      "text": "just",
+      "start": 182.383,
+      "end": 182.544
+    },
+    {
+      "id": "u443",
+      "text": "calling",
+      "start": 182.644,
+      "end": 183.044
+    },
+    {
+      "id": "u444",
+      "text": "tools",
+      "start": 183.124,
+      "end": 183.504
+    },
+    {
+      "id": "u445",
+      "text": "for",
+      "start": 183.584,
+      "end": 183.684
+    },
+    {
+      "id": "u446",
+      "text": "everything.",
+      "start": 183.804,
+      "end": 184.305
+    },
+    {
+      "id": "u447",
+      "text": "It",
+      "start": 184.845,
+      "end": 184.905
+    },
+    {
+      "id": "u448",
+      "text": "you",
+      "start": 185.245,
+      "end": 185.365
+    },
+    {
+      "id": "u449",
+      "text": "asked",
+      "start": 185.626,
+      "end": 185.786
+    },
+    {
+      "id": "u450",
+      "text": "it",
+      "start": 185.826,
+      "end": 185.866
+    },
+    {
+      "id": "u451",
+      "text": "something,",
+      "start": 185.926,
+      "end": 186.386
+    },
+    {
+      "id": "u452",
+      "text": "tool",
+      "start": 186.586,
+      "end": 186.746
+    },
+    {
+      "id": "u453",
+      "text": "call.",
+      "start": 186.826,
+      "end": 187.067
+    },
+    {
+      "id": "u454",
+      "text": "You",
+      "start": 187.467,
+      "end": 187.567
+    },
+    {
+      "id": "u455",
+      "text": "wanted",
+      "start": 187.647,
+      "end": 187.947
+    },
+    {
+      "id": "u456",
+      "text": "to",
+      "start": 188.047,
+      "end": 188.287
+    },
+    {
+      "id": "u457",
+      "text": "know",
+      "start": 188.508,
+      "end": 188.628
+    },
+    {
+      "id": "u458",
+      "text": "the",
+      "start": 188.688,
+      "end": 188.748
+    },
+    {
+      "id": "u459",
+      "text": "capital",
+      "start": 188.788,
+      "end": 189.208
+    },
+    {
+      "id": "u460",
+      "text": "of",
+      "start": 189.468,
+      "end": 189.508
+    },
+    {
+      "id": "u461",
+      "text": "Japan,",
+      "start": 189.608,
+      "end": 190.029
+    },
+    {
+      "id": "u462",
+      "text": "tool",
+      "start": 190.069,
+      "end": 190.229
+    },
+    {
+      "id": "u463",
+      "text": "call.",
+      "start": 190.309,
+      "end": 190.529
+    },
+    {
+      "id": "u464",
+      "text": "It",
+      "start": 191.169,
+      "end": 191.209
+    },
+    {
+      "id": "u465",
+      "text": "just",
+      "start": 191.269,
+      "end": 191.47
+    },
+    {
+      "id": "u466",
+      "text": "fired",
+      "start": 191.61,
+      "end": 191.89
+    },
+    {
+      "id": "u467",
+      "text": "off",
+      "start": 191.93,
+      "end": 192.03
+    },
+    {
+      "id": "u468",
+      "text": "tools",
+      "start": 192.09,
+      "end": 192.33
+    },
+    {
+      "id": "u469",
+      "text": "right",
+      "start": 192.39,
+      "end": 192.55
+    },
+    {
+      "id": "u470",
+      "text": "away.",
+      "start": 192.59,
+      "end": 192.77
+    },
+    {
+      "id": "u471",
+      "text": "So",
+      "start": 193.791,
+      "end": 193.971
+    },
+    {
+      "id": "u472",
+      "text": "changed",
+      "start": 194.692,
+      "end": 195.192
+    },
+    {
+      "id": "u473",
+      "text": "the",
+      "start": 195.332,
+      "end": 195.572
+    },
+    {
+      "id": "u474",
+      "text": "approach",
+      "start": 195.993,
+      "end": 196.593
+    },
+    {
+      "id": "u475",
+      "text": "a",
+      "start": 197.093,
+      "end": 197.113
+    },
+    {
+      "id": "u476",
+      "text": "little",
+      "start": 197.173,
+      "end": 197.354
+    },
+    {
+      "id": "u477",
+      "text": "bit,",
+      "start": 197.414,
+      "end": 197.654
+    },
+    {
+      "id": "u478",
+      "text": "and",
+      "start": 198.354,
+      "end": 198.414
+    },
+    {
+      "id": "u479",
+      "text": "I'll",
+      "start": 198.454,
+      "end": 198.574
+    },
+    {
+      "id": "u480",
+      "text": "show",
+      "start": 198.594,
+      "end": 198.734
+    },
+    {
+      "id": "u481",
+      "text": "you",
+      "start": 198.794,
+      "end": 198.855
+    },
+    {
+      "id": "u482",
+      "text": "that",
+      "start": 198.895,
+      "end": 199.035
+    },
+    {
+      "id": "u483",
+      "text": "here,",
+      "start": 199.135,
+      "end": 199.435
+    },
+    {
+      "id": "u484",
+      "text": "where",
+      "start": 199.935,
+      "end": 200.035
+    },
+    {
+      "id": "u485",
+      "text": "it's",
+      "start": 200.075,
+      "end": 200.175
+    },
+    {
+      "id": "u486",
+      "text": "only",
+      "start": 200.436,
+      "end": 200.636
+    },
+    {
+      "id": "u487",
+      "text": "training",
+      "start": 200.756,
+      "end": 201.356
+    },
+    {
+      "id": "u488",
+      "text": "on",
+      "start": 201.716,
+      "end": 201.776
+    },
+    {
+      "id": "u489",
+      "text": "the",
+      "start": 201.917,
+      "end": 202.037
+    },
+    {
+      "id": "u490",
+      "text": "last",
+      "start": 202.457,
+      "end": 202.937
+    },
+    {
+      "id": "u491",
+      "text": "message.",
+      "start": 203.558,
+      "end": 204.058
+    },
+    {
+      "id": "u492",
+      "text": "So",
+      "start": 205.299,
+      "end": 205.499
+    },
+    {
+      "id": "u493",
+      "text": "looking",
+      "start": 206.6,
+      "end": 206.88
+    },
+    {
+      "id": "u494",
+      "text": "here",
+      "start": 206.98,
+      "end": 207.16
+    },
+    {
+      "id": "u495",
+      "text": "at",
+      "start": 207.22,
+      "end": 207.28
+    },
+    {
+      "id": "u496",
+      "text": "another",
+      "start": 207.34,
+      "end": 207.58
+    },
+    {
+      "id": "u497",
+      "text": "example,",
+      "start": 207.66,
+      "end": 208.241
+    },
+    {
+      "id": "u498",
+      "text": "we",
+      "start": 208.961,
+      "end": 209.081
+    },
+    {
+      "id": "u499",
+      "text": "include",
+      "start": 209.181,
+      "end": 209.842
+    },
+    {
+      "id": "u500",
+      "text": "all",
+      "start": 211.183,
+      "end": 211.303
+    },
+    {
+      "id": "u501",
+      "text": "this",
+      "start": 211.343,
+      "end": 211.503
+    },
+    {
+      "id": "u502",
+      "text": "context,",
+      "start": 211.603,
+      "end": 212.604
+    },
+    {
+      "id": "u503",
+      "text": "and",
+      "start": 215.466,
+      "end": 215.546
+    },
+    {
+      "id": "u504",
+      "text": "then",
+      "start": 215.686,
+      "end": 215.986
+    },
+    {
+      "id": "u505",
+      "text": "we",
+      "start": 216.326,
+      "end": 216.426
+    },
+    {
+      "id": "u506",
+      "text": "have",
+      "start": 216.566,
+      "end": 216.827
+    },
+    {
+      "id": "u507",
+      "text": "the",
+      "start": 216.907,
+      "end": 216.987
+    },
+    {
+      "id": "u508",
+      "text": "training",
+      "start": 217.067,
+      "end": 217.507
+    },
+    {
+      "id": "u509",
+      "text": "signal.",
+      "start": 217.607,
+      "end": 217.987
+    },
+    {
+      "id": "u510",
+      "text": "So",
+      "start": 219.608,
+      "end": 219.709
+    },
+    {
+      "id": "u511",
+      "text": "above",
+      "start": 219.809,
+      "end": 220.089
+    },
+    {
+      "id": "u512",
+      "text": "the",
+      "start": 220.149,
+      "end": 220.229
+    },
+    {
+      "id": "u513",
+      "text": "training",
+      "start": 220.289,
+      "end": 220.609
+    },
+    {
+      "id": "u514",
+      "text": "signal",
+      "start": 220.689,
+      "end": 221.069
+    },
+    {
+      "id": "u515",
+      "text": "is",
+      "start": 221.59,
+      "end": 221.65
+    },
+    {
+      "id": "u516",
+      "text": "a",
+      "start": 221.71,
+      "end": 221.73
+    },
+    {
+      "id": "u517",
+      "text": "bunch",
+      "start": 221.79,
+      "end": 221.95
+    },
+    {
+      "id": "u518",
+      "text": "of",
+      "start": 222.01,
+      "end": 222.05
+    },
+    {
+      "id": "u519",
+      "text": "previous",
+      "start": 222.15,
+      "end": 222.55
+    },
+    {
+      "id": "u520",
+      "text": "tool",
+      "start": 222.63,
+      "end": 222.851
+    },
+    {
+      "id": "u521",
+      "text": "calls.",
+      "start": 222.931,
+      "end": 223.291
+    },
+    {
+      "id": "u522",
+      "text": "So",
+      "start": 223.391,
+      "end": 223.471
+    },
+    {
+      "id": "u523",
+      "text": "here's",
+      "start": 223.571,
+      "end": 223.791
+    },
+    {
+      "id": "u524",
+      "text": "the",
+      "start": 223.831,
+      "end": 223.891
+    },
+    {
+      "id": "u525",
+      "text": "F",
+      "start": 224.131,
+      "end": 224.151
+    },
+    {
+      "id": "u526",
+      "text": "one",
+      "start": 224.412,
+      "end": 224.512
+    },
+    {
+      "id": "u527",
+      "text": "tool",
+      "start": 225.332,
+      "end": 225.532
+    },
+    {
+      "id": "u528",
+      "text": "call",
+      "start": 225.592,
+      "end": 225.773
+    },
+    {
+      "id": "u529",
+      "text": "we",
+      "start": 225.813,
+      "end": 225.873
+    },
+    {
+      "id": "u530",
+      "text": "just",
+      "start": 225.973,
+      "end": 226.093
+    },
+    {
+      "id": "u531",
+      "text": "looked",
+      "start": 226.173,
+      "end": 226.373
+    },
+    {
+      "id": "u532",
+      "text": "at.",
+      "start": 226.533,
+      "end": 226.693
+    },
+    {
+      "id": "u533",
+      "text": "That's",
+      "start": 227.594,
+      "end": 227.794
+    },
+    {
+      "id": "u534",
+      "text": "one",
+      "start": 228.134,
+      "end": 228.234
+    },
+    {
+      "id": "u535",
+      "text": "user",
+      "start": 230.075,
+      "end": 230.416
+    },
+    {
+      "id": "u536",
+      "text": "request.",
+      "start": 230.796,
+      "end": 231.296
+    },
+    {
+      "id": "u537",
+      "text": "Then",
+      "start": 232.657,
+      "end": 232.777
+    },
+    {
+      "id": "u538",
+      "text": "we",
+      "start": 232.817,
+      "end": 232.877
+    },
+    {
+      "id": "u539",
+      "text": "have",
+      "start": 232.937,
+      "end": 233.037
+    },
+    {
+      "id": "u540",
+      "text": "another",
+      "start": 233.077,
+      "end": 233.338
+    },
+    {
+      "id": "u541",
+      "text": "user",
+      "start": 233.638,
+      "end": 233.858
+    },
+    {
+      "id": "u542",
+      "text": "request",
+      "start": 233.918,
+      "end": 234.378
+    },
+    {
+      "id": "u543",
+      "text": "here",
+      "start": 234.498,
+      "end": 234.699
+    },
+    {
+      "id": "u544",
+      "text": "to",
+      "start": 234.779,
+      "end": 234.819
+    },
+    {
+      "id": "u545",
+      "text": "get",
+      "start": 234.879,
+      "end": 234.999
+    },
+    {
+      "id": "u546",
+      "text": "the",
+      "start": 235.039,
+      "end": 235.099
+    },
+    {
+      "id": "u547",
+      "text": "the",
+      "start": 235.599,
+      "end": 235.759
+    },
+    {
+      "id": "u548",
+      "text": "to",
+      "start": 237.02,
+      "end": 237.1
+    },
+    {
+      "id": "u549",
+      "text": "get",
+      "start": 237.14,
+      "end": 237.24
+    },
+    {
+      "id": "u550",
+      "text": "the",
+      "start": 237.28,
+      "end": 237.34
+    },
+    {
+      "id": "u551",
+      "text": "jet",
+      "start": 237.44,
+      "end": 237.661
+    },
+    {
+      "id": "u552",
+      "text": "schedule",
+      "start": 237.781,
+      "end": 238.381
+    },
+    {
+      "id": "u553",
+      "text": "and",
+      "start": 238.981,
+      "end": 239.041
+    },
+    {
+      "id": "u554",
+      "text": "send",
+      "start": 239.102,
+      "end": 239.242
+    },
+    {
+      "id": "u555",
+      "text": "that",
+      "start": 239.282,
+      "end": 239.402
+    },
+    {
+      "id": "u556",
+      "text": "to",
+      "start": 239.442,
+      "end": 239.502
+    }
+  ],
+  "vad_speech": [
+    [
+      0.0,
+      6.0
+    ],
+    [
+      6.7,
+      10.7
+    ],
+    [
+      12.0,
+      16.3
+    ],
+    [
+      16.8,
+      17.9
+    ],
+    [
+      18.5,
+      20.6
+    ],
+    [
+      21.1,
+      24.6
+    ],
+    [
+      24.9,
+      28.3
+    ],
+    [
+      29.2,
+      31.8
+    ],
+    [
+      32.1,
+      36.7
+    ],
+    [
+      37.2,
+      41.1
+    ],
+    [
+      42.5,
+      46.6
+    ],
+    [
+      46.9,
+      49.8
+    ],
+    [
+      50.8,
+      52.7
+    ],
+    [
+      53.2,
+      55.7
+    ],
+    [
+      56.4,
+      57.2
+    ],
+    [
+      57.8,
+      60.5
+    ],
+    [
+      61.3,
+      65.6
+    ],
+    [
+      66.1,
+      68.4
+    ],
+    [
+      68.8,
+      70.5
+    ],
+    [
+      70.9,
+      75.0
+    ],
+    [
+      76.0,
+      81.5
+    ],
+    [
+      81.8,
+      87.6
+    ],
+    [
+      88.0,
+      90.7
+    ],
+    [
+      91.1,
+      92.7
+    ],
+    [
+      93.0,
+      94.8
+    ],
+    [
+      95.5,
+      96.2
+    ],
+    [
+      96.3,
+      103.8
+    ],
+    [
+      104.2,
+      108.7
+    ],
+    [
+      109.1,
+      120.7
+    ],
+    [
+      121.3,
+      128.8
+    ],
+    [
+      129.1,
+      134.9
+    ],
+    [
+      135.1,
+      140.4
+    ],
+    [
+      140.9,
+      145.6
+    ],
+    [
+      146.1,
+      149.3
+    ],
+    [
+      149.7,
+      153.9
+    ],
+    [
+      154.4,
+      158.9
+    ],
+    [
+      159.0,
+      168.9
+    ],
+    [
+      169.4,
+      173.0
+    ],
+    [
+      173.2,
+      175.6
+    ],
+    [
+      175.9,
+      177.8
+    ],
+    [
+      178.3,
+      180.6
+    ],
+    [
+      180.9,
+      190.7
+    ],
+    [
+      191.0,
+      193.0
+    ],
+    [
+      193.7,
+      194.3
+    ],
+    [
+      194.6,
+      197.9
+    ],
+    [
+      198.3,
+      204.3
+    ],
+    [
+      205.1,
+      205.8
+    ],
+    [
+      206.5,
+      208.6
+    ],
+    [
+      208.9,
+      210.1
+    ],
+    [
+      211.0,
+      212.9
+    ],
+    [
+      215.3,
+      218.2
+    ],
+    [
+      219.5,
+      224.8
+    ],
+    [
+      225.2,
+      226.9
+    ],
+    [
+      227.5,
+      228.6
+    ],
+    [
+      229.0,
+      231.6
+    ],
+    [
+      232.6,
+      236.5
+    ],
+    [
+      236.9,
+      238.7
+    ],
+    [
+      238.9,
+      240.0
+    ]
+  ],
+  "shot_changes": [],
+  "sing_spans": [],
+  "speaker_turns": [
+    {
+      "start": 0.0,
+      "end": 5.873469,
+      "speaker": "S0"
+    },
+    {
+      "start": 6.801594,
+      "end": 10.547844,
+      "speaker": "S0"
+    },
+    {
+      "start": 12.032844,
+      "end": 28.064094,
+      "speaker": "S0"
+    },
+    {
+      "start": 29.279094,
+      "end": 31.709094,
+      "speaker": "S0"
+    },
+    {
+      "start": 32.181594,
+      "end": 36.670344,
+      "speaker": "S0"
+    },
+    {
+      "start": 37.142844,
+      "end": 40.990344,
+      "speaker": "S0"
+    },
+    {
+      "start": 42.542844,
+      "end": 49.748469,
+      "speaker": "S0"
+    },
+    {
+      "start": 50.845344,
+      "end": 74.976594,
+      "speaker": "S0"
+    },
+    {
+      "start": 76.039719,
+      "end": 140.434719,
+      "speaker": "S0"
+    },
+    {
+      "start": 140.873469,
+      "end": 158.693469,
+      "speaker": "S0"
+    },
+    {
+      "start": 159.098469,
+      "end": 168.801594,
+      "speaker": "S0"
+    },
+    {
+      "start": 169.425969,
+      "end": 175.433469,
+      "speaker": "S0"
+    },
+    {
+      "start": 175.939719,
+      "end": 192.865344,
+      "speaker": "S0"
+    },
+    {
+      "start": 193.709094,
+      "end": 194.232219,
+      "speaker": "S0"
+    },
+    {
+      "start": 194.586594,
+      "end": 212.828469,
+      "speaker": "S0"
+    },
+    {
+      "start": 215.376594,
+      "end": 218.025969,
+      "speaker": "S0"
+    },
+    {
+      "start": 219.561594,
+      "end": 240.0,
+      "speaker": "S0"
+    }
+  ]
+}

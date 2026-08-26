@@ -1,0 +1,3844 @@
+{
+  "schema_version": 1,
+  "id": "en-05",
+  "language": "en",
+  "description": "en tutorial monologue, mid segment",
+  "tags": [
+    "tutorial"
+  ],
+  "license": {
+    "redistributable": false,
+    "source_class": "third-party",
+    "spdx": null,
+    "attribution": "YouTube BJgjYhJf7h4"
+  },
+  "capture": {
+    "voxweave_commit": "c9b2b3ac70c5045dd0d6eed80ccddb3cd8899f9e",
+    "source_digest": "737d6b45de717270c01573d12721d08486b811f99bd0742c5452c43665416861",
+    "window_duration_s": 240.0,
+    "dependency_versions": {
+      "python": "3.13.12",
+      "pysbd": "0.3.4",
+      "budoux": "0.8.4",
+      "jieba": "0.42.1",
+      "fugashi": "1.5.2"
+    },
+    "config": {
+      "language": "en",
+      "max_line_length": 42,
+      "max_lines": 2,
+      "max_cue_s": 7.0,
+      "min_cue_s": 0.5,
+      "cps": 17.0,
+      "lag_out_s": 0.25,
+      "glue_gap_s": 0.3,
+      "gap_thresholds": {
+        "clause_ms": 400,
+        "vad_skip_ms": 1000,
+        "offline_ms": 700
+      },
+      "gap_adaptive": false,
+      "shot_snap_s": 0.458,
+      "shot_snap_frames": 10.992,
+      "diarize_format": {
+        "min_atom_overlap_s": 0.05,
+        "min_run_s": 0.2,
+        "edge_run_min_s": 0.12,
+        "merge_gap_s": 0.35,
+        "drop_contained_s": 0.2
+      }
+    },
+    "missing_inputs": [
+      "shot_changes",
+      "sing_spans"
+    ]
+  },
+  "word_segments": [
+    {
+      "id": "u0",
+      "text": "and",
+      "start": 0.866,
+      "end": 0.946
+    },
+    {
+      "id": "u1",
+      "text": "we",
+      "start": 1.326,
+      "end": 1.406
+    },
+    {
+      "id": "u2",
+      "text": "are",
+      "start": 1.446,
+      "end": 1.506
+    },
+    {
+      "id": "u3",
+      "text": "not",
+      "start": 1.547,
+      "end": 1.647
+    },
+    {
+      "id": "u4",
+      "text": "going",
+      "start": 1.687,
+      "end": 1.807
+    },
+    {
+      "id": "u5",
+      "text": "to",
+      "start": 1.847,
+      "end": 1.887
+    },
+    {
+      "id": "u6",
+      "text": "be",
+      "start": 1.927,
+      "end": 1.967
+    },
+    {
+      "id": "u7",
+      "text": "doing",
+      "start": 2.007,
+      "end": 2.187
+    },
+    {
+      "id": "u8",
+      "text": "full",
+      "start": 2.387,
+      "end": 2.567
+    },
+    {
+      "id": "u9",
+      "text": "fine",
+      "start": 2.627,
+      "end": 2.827
+    },
+    {
+      "id": "u10",
+      "text": "tuning.",
+      "start": 2.887,
+      "end": 3.188
+    },
+    {
+      "id": "u11",
+      "text": "We",
+      "start": 3.888,
+      "end": 3.948
+    },
+    {
+      "id": "u12",
+      "text": "are",
+      "start": 4.048,
+      "end": 4.108
+    },
+    {
+      "id": "u13",
+      "text": "going",
+      "start": 4.328,
+      "end": 4.489
+    },
+    {
+      "id": "u14",
+      "text": "to",
+      "start": 4.529,
+      "end": 4.569
+    },
+    {
+      "id": "u15",
+      "text": "be",
+      "start": 4.629,
+      "end": 4.689
+    },
+    {
+      "id": "u16",
+      "text": "only",
+      "start": 4.889,
+      "end": 5.129
+    },
+    {
+      "id": "u17",
+      "text": "fine",
+      "start": 5.729,
+      "end": 5.93
+    },
+    {
+      "id": "u18",
+      "text": "tuning",
+      "start": 5.97,
+      "end": 6.23
+    },
+    {
+      "id": "u19",
+      "text": "the",
+      "start": 6.27,
+      "end": 6.35
+    },
+    {
+      "id": "u20",
+      "text": "Lora",
+      "start": 6.43,
+      "end": 6.67
+    },
+    {
+      "id": "u21",
+      "text": "adapters,",
+      "start": 6.79,
+      "end": 7.21
+    },
+    {
+      "id": "u22",
+      "text": "and",
+      "start": 7.811,
+      "end": 7.891
+    },
+    {
+      "id": "u23",
+      "text": "then",
+      "start": 7.951,
+      "end": 8.111
+    },
+    {
+      "id": "u24",
+      "text": "adding",
+      "start": 8.331,
+      "end": 8.551
+    },
+    {
+      "id": "u25",
+      "text": "those",
+      "start": 8.591,
+      "end": 8.771
+    },
+    {
+      "id": "u26",
+      "text": "Lora",
+      "start": 8.952,
+      "end": 9.172
+    },
+    {
+      "id": "u27",
+      "text": "adapters",
+      "start": 9.232,
+      "end": 9.652
+    },
+    {
+      "id": "u28",
+      "text": "back",
+      "start": 9.832,
+      "end": 9.992
+    },
+    {
+      "id": "u29",
+      "text": "to",
+      "start": 10.072,
+      "end": 10.132
+    },
+    {
+      "id": "u30",
+      "text": "the",
+      "start": 10.172,
+      "end": 10.232
+    },
+    {
+      "id": "u31",
+      "text": "model.",
+      "start": 10.292,
+      "end": 10.553
+    },
+    {
+      "id": "u32",
+      "text": "I'm",
+      "start": 11.313,
+      "end": 11.393
+    },
+    {
+      "id": "u33",
+      "text": "not",
+      "start": 11.453,
+      "end": 11.533
+    },
+    {
+      "id": "u34",
+      "text": "going",
+      "start": 11.553,
+      "end": 11.673
+    },
+    {
+      "id": "u35",
+      "text": "to",
+      "start": 11.693,
+      "end": 11.753
+    },
+    {
+      "id": "u36",
+      "text": "go",
+      "start": 11.794,
+      "end": 11.894
+    },
+    {
+      "id": "u37",
+      "text": "over",
+      "start": 12.074,
+      "end": 12.294
+    },
+    {
+      "id": "u38",
+      "text": "too",
+      "start": 12.534,
+      "end": 12.634
+    },
+    {
+      "id": "u39",
+      "text": "much",
+      "start": 12.674,
+      "end": 12.814
+    },
+    {
+      "id": "u40",
+      "text": "details",
+      "start": 12.934,
+      "end": 13.295
+    },
+    {
+      "id": "u41",
+      "text": "of",
+      "start": 13.435,
+      "end": 13.475
+    },
+    {
+      "id": "u42",
+      "text": "these",
+      "start": 13.775,
+      "end": 13.935
+    },
+    {
+      "id": "u43",
+      "text": "hyperparameters.",
+      "start": 13.975,
+      "end": 14.696
+    },
+    {
+      "id": "u44",
+      "text": "I",
+      "start": 15.316,
+      "end": 15.336
+    },
+    {
+      "id": "u45",
+      "text": "have",
+      "start": 15.396,
+      "end": 15.496
+    },
+    {
+      "id": "u46",
+      "text": "covered",
+      "start": 15.576,
+      "end": 15.896
+    },
+    {
+      "id": "u47",
+      "text": "these",
+      "start": 15.996,
+      "end": 16.197
+    },
+    {
+      "id": "u48",
+      "text": "in",
+      "start": 16.437,
+      "end": 16.477
+    },
+    {
+      "id": "u49",
+      "text": "some",
+      "start": 16.637,
+      "end": 16.777
+    },
+    {
+      "id": "u50",
+      "text": "of",
+      "start": 16.837,
+      "end": 16.877
+    },
+    {
+      "id": "u51",
+      "text": "my",
+      "start": 16.957,
+      "end": 17.037
+    },
+    {
+      "id": "u52",
+      "text": "previous",
+      "start": 17.117,
+      "end": 17.397
+    },
+    {
+      "id": "u53",
+      "text": "videos,",
+      "start": 17.457,
+      "end": 17.718
+    },
+    {
+      "id": "u54",
+      "text": "but",
+      "start": 18.298,
+      "end": 18.458
+    },
+    {
+      "id": "u55",
+      "text": "there",
+      "start": 19.018,
+      "end": 19.159
+    },
+    {
+      "id": "u56",
+      "text": "are",
+      "start": 19.239,
+      "end": 19.299
+    },
+    {
+      "id": "u57",
+      "text": "a",
+      "start": 19.419,
+      "end": 19.439
+    },
+    {
+      "id": "u58",
+      "text": "number",
+      "start": 19.519,
+      "end": 19.679
+    },
+    {
+      "id": "u59",
+      "text": "of",
+      "start": 19.739,
+      "end": 19.779
+    },
+    {
+      "id": "u60",
+      "text": "hyperparameters",
+      "start": 19.839,
+      "end": 20.56
+    },
+    {
+      "id": "u61",
+      "text": "that",
+      "start": 20.58,
+      "end": 20.7
+    },
+    {
+      "id": "u62",
+      "text": "you",
+      "start": 20.74,
+      "end": 20.8
+    },
+    {
+      "id": "u63",
+      "text": "can",
+      "start": 20.86,
+      "end": 20.96
+    },
+    {
+      "id": "u64",
+      "text": "set.",
+      "start": 21.02,
+      "end": 21.26
+    },
+    {
+      "id": "u65",
+      "text": "The",
+      "start": 21.52,
+      "end": 21.62
+    },
+    {
+      "id": "u66",
+      "text": "most",
+      "start": 21.78,
+      "end": 21.94
+    },
+    {
+      "id": "u67",
+      "text": "important",
+      "start": 22.001,
+      "end": 22.321
+    },
+    {
+      "id": "u68",
+      "text": "is",
+      "start": 22.481,
+      "end": 22.541
+    },
+    {
+      "id": "u69",
+      "text": "rank,",
+      "start": 23.001,
+      "end": 23.241
+    },
+    {
+      "id": "u70",
+      "text": "that",
+      "start": 23.722,
+      "end": 23.862
+    },
+    {
+      "id": "u71",
+      "text": "basically",
+      "start": 23.922,
+      "end": 24.382
+    },
+    {
+      "id": "u72",
+      "text": "determines",
+      "start": 24.882,
+      "end": 25.303
+    },
+    {
+      "id": "u73",
+      "text": "the",
+      "start": 25.403,
+      "end": 25.523
+    },
+    {
+      "id": "u74",
+      "text": "size",
+      "start": 25.743,
+      "end": 26.043
+    },
+    {
+      "id": "u75",
+      "text": "of",
+      "start": 26.303,
+      "end": 26.343
+    },
+    {
+      "id": "u76",
+      "text": "your",
+      "start": 26.444,
+      "end": 26.604
+    },
+    {
+      "id": "u77",
+      "text": "Lora",
+      "start": 27.364,
+      "end": 27.604
+    },
+    {
+      "id": "u78",
+      "text": "adapter",
+      "start": 27.804,
+      "end": 28.205
+    },
+    {
+      "id": "u79",
+      "text": "matrices.",
+      "start": 28.525,
+      "end": 29.005
+    },
+    {
+      "id": "u80",
+      "text": "So",
+      "start": 29.486,
+      "end": 29.546
+    },
+    {
+      "id": "u81",
+      "text": "if",
+      "start": 29.606,
+      "end": 29.646
+    },
+    {
+      "id": "u82",
+      "text": "you",
+      "start": 29.666,
+      "end": 29.766
+    },
+    {
+      "id": "u83",
+      "text": "have",
+      "start": 29.826,
+      "end": 29.966
+    },
+    {
+      "id": "u84",
+      "text": "a",
+      "start": 30.186,
+      "end": 30.206
+    },
+    {
+      "id": "u85",
+      "text": "higher",
+      "start": 30.406,
+      "end": 30.706
+    },
+    {
+      "id": "u86",
+      "text": "rank,",
+      "start": 30.967,
+      "end": 31.227
+    },
+    {
+      "id": "u87",
+      "text": "basically",
+      "start": 31.787,
+      "end": 32.147
+    },
+    {
+      "id": "u88",
+      "text": "you're",
+      "start": 32.207,
+      "end": 32.368
+    },
+    {
+      "id": "u89",
+      "text": "going",
+      "start": 32.408,
+      "end": 32.528
+    },
+    {
+      "id": "u90",
+      "text": "to",
+      "start": 32.568,
+      "end": 32.628
+    },
+    {
+      "id": "u91",
+      "text": "have",
+      "start": 32.688,
+      "end": 32.908
+    },
+    {
+      "id": "u92",
+      "text": "more",
+      "start": 33.488,
+      "end": 33.769
+    },
+    {
+      "id": "u93",
+      "text": "weights",
+      "start": 34.089,
+      "end": 34.409
+    },
+    {
+      "id": "u94",
+      "text": "in",
+      "start": 35.009,
+      "end": 35.069
+    },
+    {
+      "id": "u95",
+      "text": "your",
+      "start": 35.129,
+      "end": 35.27
+    },
+    {
+      "id": "u96",
+      "text": "Lora",
+      "start": 35.41,
+      "end": 35.59
+    },
+    {
+      "id": "u97",
+      "text": "adapters,",
+      "start": 35.67,
+      "end": 36.13
+    },
+    {
+      "id": "u98",
+      "text": "which",
+      "start": 37.011,
+      "end": 37.151
+    },
+    {
+      "id": "u99",
+      "text": "will",
+      "start": 37.211,
+      "end": 37.411
+    },
+    {
+      "id": "u100",
+      "text": "mean",
+      "start": 37.591,
+      "end": 37.811
+    },
+    {
+      "id": "u101",
+      "text": "more",
+      "start": 38.072,
+      "end": 38.272
+    },
+    {
+      "id": "u102",
+      "text": "memory",
+      "start": 38.432,
+      "end": 38.732
+    },
+    {
+      "id": "u103",
+      "text": "requirement.",
+      "start": 38.812,
+      "end": 39.252
+    },
+    {
+      "id": "u104",
+      "text": "Then",
+      "start": 40.053,
+      "end": 40.233
+    },
+    {
+      "id": "u105",
+      "text": "you",
+      "start": 40.633,
+      "end": 40.733
+    },
+    {
+      "id": "u106",
+      "text": "have",
+      "start": 40.913,
+      "end": 41.174
+    },
+    {
+      "id": "u107",
+      "text": "Lora",
+      "start": 41.634,
+      "end": 41.854
+    },
+    {
+      "id": "u108",
+      "text": "alpha,",
+      "start": 41.974,
+      "end": 42.234
+    },
+    {
+      "id": "u109",
+      "text": "that",
+      "start": 42.935,
+      "end": 43.135
+    },
+    {
+      "id": "u110",
+      "text": "basically",
+      "start": 43.455,
+      "end": 43.896
+    },
+    {
+      "id": "u111",
+      "text": "determines",
+      "start": 43.976,
+      "end": 44.536
+    },
+    {
+      "id": "u112",
+      "text": "when",
+      "start": 45.116,
+      "end": 45.216
+    },
+    {
+      "id": "u113",
+      "text": "you",
+      "start": 45.256,
+      "end": 45.336
+    },
+    {
+      "id": "u114",
+      "text": "are",
+      "start": 45.457,
+      "end": 45.557
+    },
+    {
+      "id": "u115",
+      "text": "merging",
+      "start": 46.057,
+      "end": 46.497
+    },
+    {
+      "id": "u116",
+      "text": "the",
+      "start": 46.838,
+      "end": 46.898
+    },
+    {
+      "id": "u117",
+      "text": "Lora",
+      "start": 46.958,
+      "end": 47.138
+    },
+    {
+      "id": "u118",
+      "text": "adapters",
+      "start": 47.198,
+      "end": 47.638
+    },
+    {
+      "id": "u119",
+      "text": "back",
+      "start": 48.399,
+      "end": 48.599
+    },
+    {
+      "id": "u120",
+      "text": "to",
+      "start": 48.759,
+      "end": 48.899
+    },
+    {
+      "id": "u121",
+      "text": "the",
+      "start": 49.179,
+      "end": 49.279
+    },
+    {
+      "id": "u122",
+      "text": "original",
+      "start": 49.399,
+      "end": 49.76
+    },
+    {
+      "id": "u123",
+      "text": "weights",
+      "start": 50.02,
+      "end": 50.32
+    },
+    {
+      "id": "u124",
+      "text": "of",
+      "start": 50.42,
+      "end": 50.46
+    },
+    {
+      "id": "u125",
+      "text": "the",
+      "start": 50.5,
+      "end": 50.58
+    },
+    {
+      "id": "u126",
+      "text": "model,",
+      "start": 50.62,
+      "end": 50.86
+    },
+    {
+      "id": "u127",
+      "text": "how",
+      "start": 51.381,
+      "end": 51.481
+    },
+    {
+      "id": "u128",
+      "text": "much",
+      "start": 51.541,
+      "end": 51.661
+    },
+    {
+      "id": "u129",
+      "text": "impact",
+      "start": 51.881,
+      "end": 52.261
+    },
+    {
+      "id": "u130",
+      "text": "the",
+      "start": 52.782,
+      "end": 52.902
+    },
+    {
+      "id": "u131",
+      "text": "Lora",
+      "start": 53.082,
+      "end": 53.302
+    },
+    {
+      "id": "u132",
+      "text": "adapters",
+      "start": 53.362,
+      "end": 53.762
+    },
+    {
+      "id": "u133",
+      "text": "are",
+      "start": 53.922,
+      "end": 54.002
+    },
+    {
+      "id": "u134",
+      "text": "going",
+      "start": 54.042,
+      "end": 54.163
+    },
+    {
+      "id": "u135",
+      "text": "to",
+      "start": 54.203,
+      "end": 54.263
+    },
+    {
+      "id": "u136",
+      "text": "have",
+      "start": 54.323,
+      "end": 54.523
+    },
+    {
+      "id": "u137",
+      "text": "on",
+      "start": 55.303,
+      "end": 55.383
+    },
+    {
+      "id": "u138",
+      "text": "the",
+      "start": 55.463,
+      "end": 55.584
+    },
+    {
+      "id": "u139",
+      "text": "original",
+      "start": 55.744,
+      "end": 56.064
+    },
+    {
+      "id": "u140",
+      "text": "weights.",
+      "start": 56.144,
+      "end": 56.484
+    },
+    {
+      "id": "u141",
+      "text": "I",
+      "start": 57.505,
+      "end": 57.525
+    },
+    {
+      "id": "u142",
+      "text": "have",
+      "start": 57.585,
+      "end": 57.685
+    },
+    {
+      "id": "u143",
+      "text": "covered",
+      "start": 57.745,
+      "end": 58.005
+    },
+    {
+      "id": "u144",
+      "text": "these",
+      "start": 58.045,
+      "end": 58.205
+    },
+    {
+      "id": "u145",
+      "text": "in",
+      "start": 58.465,
+      "end": 58.506
+    },
+    {
+      "id": "u146",
+      "text": "a",
+      "start": 58.626,
+      "end": 58.646
+    },
+    {
+      "id": "u147",
+      "text": "lot",
+      "start": 58.706,
+      "end": 58.826
+    },
+    {
+      "id": "u148",
+      "text": "more",
+      "start": 58.886,
+      "end": 58.986
+    },
+    {
+      "id": "u149",
+      "text": "details",
+      "start": 59.046,
+      "end": 59.366
+    },
+    {
+      "id": "u150",
+      "text": "in",
+      "start": 59.466,
+      "end": 59.506
+    },
+    {
+      "id": "u151",
+      "text": "my",
+      "start": 59.566,
+      "end": 59.666
+    },
+    {
+      "id": "u152",
+      "text": "previous",
+      "start": 59.766,
+      "end": 60.027
+    },
+    {
+      "id": "u153",
+      "text": "videos,",
+      "start": 60.047,
+      "end": 60.367
+    },
+    {
+      "id": "u154",
+      "text": "so",
+      "start": 60.447,
+      "end": 60.567
+    },
+    {
+      "id": "u155",
+      "text": "I'm",
+      "start": 60.727,
+      "end": 60.827
+    },
+    {
+      "id": "u156",
+      "text": "going",
+      "start": 60.867,
+      "end": 61.007
+    },
+    {
+      "id": "u157",
+      "text": "to",
+      "start": 61.067,
+      "end": 61.147
+    },
+    {
+      "id": "u158",
+      "text": "put",
+      "start": 61.327,
+      "end": 61.488
+    },
+    {
+      "id": "u159",
+      "text": "links",
+      "start": 61.708,
+      "end": 61.908
+    },
+    {
+      "id": "u160",
+      "text": "to",
+      "start": 61.988,
+      "end": 62.088
+    },
+    {
+      "id": "u161",
+      "text": "some",
+      "start": 62.308,
+      "end": 62.448
+    },
+    {
+      "id": "u162",
+      "text": "of",
+      "start": 62.488,
+      "end": 62.528
+    },
+    {
+      "id": "u163",
+      "text": "the",
+      "start": 62.568,
+      "end": 62.628
+    },
+    {
+      "id": "u164",
+      "text": "videos.",
+      "start": 62.668,
+      "end": 62.949
+    },
+    {
+      "id": "u165",
+      "text": "Now,",
+      "start": 63.709,
+      "end": 63.829
+    },
+    {
+      "id": "u166",
+      "text": "the",
+      "start": 63.909,
+      "end": 63.969
+    },
+    {
+      "id": "u167",
+      "text": "most",
+      "start": 64.049,
+      "end": 64.229
+    },
+    {
+      "id": "u168",
+      "text": "important",
+      "start": 64.47,
+      "end": 64.93
+    },
+    {
+      "id": "u169",
+      "text": "part",
+      "start": 65.05,
+      "end": 65.31
+    },
+    {
+      "id": "u170",
+      "text": "of",
+      "start": 65.63,
+      "end": 65.67
+    },
+    {
+      "id": "u171",
+      "text": "this",
+      "start": 66.091,
+      "end": 66.271
+    },
+    {
+      "id": "u172",
+      "text": "notebook",
+      "start": 66.611,
+      "end": 66.991
+    },
+    {
+      "id": "u173",
+      "text": "is",
+      "start": 67.191,
+      "end": 67.251
+    },
+    {
+      "id": "u174",
+      "text": "data",
+      "start": 67.712,
+      "end": 67.912
+    },
+    {
+      "id": "u175",
+      "text": "preparation,",
+      "start": 67.992,
+      "end": 68.592
+    },
+    {
+      "id": "u176",
+      "text": "and",
+      "start": 69.433,
+      "end": 69.493
+    },
+    {
+      "id": "u177",
+      "text": "this",
+      "start": 69.533,
+      "end": 69.653
+    },
+    {
+      "id": "u178",
+      "text": "is",
+      "start": 69.733,
+      "end": 69.793
+    },
+    {
+      "id": "u179",
+      "text": "where",
+      "start": 69.873,
+      "end": 70.073
+    },
+    {
+      "id": "u180",
+      "text": "you",
+      "start": 70.294,
+      "end": 70.374
+    },
+    {
+      "id": "u181",
+      "text": "should",
+      "start": 70.454,
+      "end": 70.614
+    },
+    {
+      "id": "u182",
+      "text": "be",
+      "start": 70.674,
+      "end": 70.774
+    },
+    {
+      "id": "u183",
+      "text": "spending",
+      "start": 70.974,
+      "end": 71.374
+    },
+    {
+      "id": "u184",
+      "text": "most",
+      "start": 71.574,
+      "end": 71.795
+    },
+    {
+      "id": "u185",
+      "text": "of",
+      "start": 71.855,
+      "end": 71.915
+    },
+    {
+      "id": "u186",
+      "text": "your",
+      "start": 71.975,
+      "end": 72.095
+    },
+    {
+      "id": "u187",
+      "text": "time.",
+      "start": 72.155,
+      "end": 72.375
+    },
+    {
+      "id": "u188",
+      "text": "Now,",
+      "start": 73.296,
+      "end": 73.456
+    },
+    {
+      "id": "u189",
+      "text": "as",
+      "start": 73.576,
+      "end": 73.636
+    },
+    {
+      "id": "u190",
+      "text": "I",
+      "start": 73.716,
+      "end": 73.736
+    },
+    {
+      "id": "u191",
+      "text": "said",
+      "start": 74.096,
+      "end": 74.256
+    },
+    {
+      "id": "u192",
+      "text": "in",
+      "start": 74.296,
+      "end": 74.336
+    },
+    {
+      "id": "u193",
+      "text": "the",
+      "start": 74.376,
+      "end": 74.456
+    },
+    {
+      "id": "u194",
+      "text": "beginning,",
+      "start": 74.496,
+      "end": 74.837
+    },
+    {
+      "id": "u195",
+      "text": "Quan",
+      "start": 75.557,
+      "end": 75.757
+    },
+    {
+      "id": "u196",
+      "text": "models",
+      "start": 75.837,
+      "end": 76.158
+    },
+    {
+      "id": "u197",
+      "text": "supports",
+      "start": 76.798,
+      "end": 77.198
+    },
+    {
+      "id": "u198",
+      "text": "reasoning",
+      "start": 78.219,
+      "end": 78.579
+    },
+    {
+      "id": "u199",
+      "text": "in",
+      "start": 79.1,
+      "end": 79.14
+    },
+    {
+      "id": "u200",
+      "text": "a",
+      "start": 79.28,
+      "end": 79.3
+    },
+    {
+      "id": "u201",
+      "text": "hybrid",
+      "start": 79.6,
+      "end": 79.94
+    },
+    {
+      "id": "u202",
+      "text": "model,",
+      "start": 80.2,
+      "end": 80.461
+    },
+    {
+      "id": "u203",
+      "text": "so",
+      "start": 81.261,
+      "end": 81.321
+    },
+    {
+      "id": "u204",
+      "text": "the",
+      "start": 81.461,
+      "end": 81.521
+    },
+    {
+      "id": "u205",
+      "text": "same",
+      "start": 81.561,
+      "end": 81.701
+    },
+    {
+      "id": "u206",
+      "text": "model",
+      "start": 81.741,
+      "end": 81.982
+    },
+    {
+      "id": "u207",
+      "text": "can",
+      "start": 82.142,
+      "end": 82.322
+    },
+    {
+      "id": "u208",
+      "text": "have",
+      "start": 82.662,
+      "end": 82.842
+    },
+    {
+      "id": "u209",
+      "text": "reasoning",
+      "start": 82.962,
+      "end": 83.262
+    },
+    {
+      "id": "u210",
+      "text": "turned",
+      "start": 83.343,
+      "end": 83.583
+    },
+    {
+      "id": "u211",
+      "text": "on",
+      "start": 83.863,
+      "end": 83.943
+    },
+    {
+      "id": "u212",
+      "text": "or",
+      "start": 84.163,
+      "end": 84.223
+    },
+    {
+      "id": "u213",
+      "text": "turned",
+      "start": 84.303,
+      "end": 84.503
+    },
+    {
+      "id": "u214",
+      "text": "off.",
+      "start": 84.683,
+      "end": 84.824
+    },
+    {
+      "id": "u215",
+      "text": "Now,",
+      "start": 85.844,
+      "end": 85.944
+    },
+    {
+      "id": "u216",
+      "text": "depending",
+      "start": 85.984,
+      "end": 86.285
+    },
+    {
+      "id": "u217",
+      "text": "on",
+      "start": 86.365,
+      "end": 86.405
+    },
+    {
+      "id": "u218",
+      "text": "your",
+      "start": 86.805,
+      "end": 87.025
+    },
+    {
+      "id": "u219",
+      "text": "own",
+      "start": 87.205,
+      "end": 87.285
+    },
+    {
+      "id": "u220",
+      "text": "data,",
+      "start": 87.365,
+      "end": 87.605
+    },
+    {
+      "id": "u221",
+      "text": "if",
+      "start": 88.106,
+      "end": 88.166
+    },
+    {
+      "id": "u222",
+      "text": "you",
+      "start": 88.226,
+      "end": 88.346
+    },
+    {
+      "id": "u223",
+      "text": "want",
+      "start": 88.686,
+      "end": 88.966
+    },
+    {
+      "id": "u224",
+      "text": "to",
+      "start": 89.347,
+      "end": 89.407
+    },
+    {
+      "id": "u225",
+      "text": "have",
+      "start": 89.487,
+      "end": 89.607
+    },
+    {
+      "id": "u226",
+      "text": "reasoning",
+      "start": 89.687,
+      "end": 90.007
+    },
+    {
+      "id": "u227",
+      "text": "on,",
+      "start": 90.227,
+      "end": 90.347
+    },
+    {
+      "id": "u228",
+      "text": "then",
+      "start": 90.868,
+      "end": 91.028
+    },
+    {
+      "id": "u229",
+      "text": "your",
+      "start": 91.288,
+      "end": 91.508
+    },
+    {
+      "id": "u230",
+      "text": "dataset",
+      "start": 91.928,
+      "end": 92.469
+    },
+    {
+      "id": "u231",
+      "text": "needs",
+      "start": 92.949,
+      "end": 93.169
+    },
+    {
+      "id": "u232",
+      "text": "to",
+      "start": 93.229,
+      "end": 93.309
+    },
+    {
+      "id": "u233",
+      "text": "have",
+      "start": 93.409,
+      "end": 93.65
+    },
+    {
+      "id": "u234",
+      "text": "some",
+      "start": 94.37,
+      "end": 94.63
+    },
+    {
+      "id": "u235",
+      "text": "examples",
+      "start": 95.891,
+      "end": 96.431
+    },
+    {
+      "id": "u236",
+      "text": "which",
+      "start": 96.592,
+      "end": 96.712
+    },
+    {
+      "id": "u237",
+      "text": "have",
+      "start": 96.832,
+      "end": 97.052
+    },
+    {
+      "id": "u238",
+      "text": "reasoning",
+      "start": 97.392,
+      "end": 97.692
+    },
+    {
+      "id": "u239",
+      "text": "traces",
+      "start": 97.772,
+      "end": 98.153
+    },
+    {
+      "id": "u240",
+      "text": "or",
+      "start": 98.373,
+      "end": 98.413
+    },
+    {
+      "id": "u241",
+      "text": "chain",
+      "start": 98.493,
+      "end": 98.633
+    },
+    {
+      "id": "u242",
+      "text": "of",
+      "start": 98.693,
+      "end": 98.733
+    },
+    {
+      "id": "u243",
+      "text": "thought.",
+      "start": 98.793,
+      "end": 99.053
+    },
+    {
+      "id": "u244",
+      "text": "As",
+      "start": 99.634,
+      "end": 99.694
+    },
+    {
+      "id": "u245",
+      "text": "I",
+      "start": 99.734,
+      "end": 99.754
+    },
+    {
+      "id": "u246",
+      "text": "mentioned",
+      "start": 99.854,
+      "end": 100.154
+    },
+    {
+      "id": "u247",
+      "text": "in",
+      "start": 100.214,
+      "end": 100.254
+    },
+    {
+      "id": "u248",
+      "text": "the",
+      "start": 100.314,
+      "end": 100.374
+    },
+    {
+      "id": "u249",
+      "text": "beginning",
+      "start": 100.434,
+      "end": 100.734
+    },
+    {
+      "id": "u250",
+      "text": "of",
+      "start": 100.774,
+      "end": 100.834
+    },
+    {
+      "id": "u251",
+      "text": "the",
+      "start": 100.875,
+      "end": 100.935
+    },
+    {
+      "id": "u252",
+      "text": "video,",
+      "start": 100.995,
+      "end": 101.215
+    },
+    {
+      "id": "u253",
+      "text": "Quan",
+      "start": 101.635,
+      "end": 101.835
+    },
+    {
+      "id": "u254",
+      "text": "three",
+      "start": 102.135,
+      "end": 102.356
+    },
+    {
+      "id": "u255",
+      "text": "models",
+      "start": 102.456,
+      "end": 102.796
+    },
+    {
+      "id": "u256",
+      "text": "support",
+      "start": 102.876,
+      "end": 103.216
+    },
+    {
+      "id": "u257",
+      "text": "hybrid",
+      "start": 103.356,
+      "end": 103.897
+    },
+    {
+      "id": "u258",
+      "text": "reasoning",
+      "start": 105.017,
+      "end": 105.318
+    },
+    {
+      "id": "u259",
+      "text": "capabilities,",
+      "start": 105.358,
+      "end": 106.058
+    },
+    {
+      "id": "u260",
+      "text": "which",
+      "start": 106.418,
+      "end": 106.518
+    },
+    {
+      "id": "u261",
+      "text": "can",
+      "start": 106.578,
+      "end": 106.658
+    },
+    {
+      "id": "u262",
+      "text": "be",
+      "start": 106.699,
+      "end": 106.759
+    },
+    {
+      "id": "u263",
+      "text": "turned",
+      "start": 106.839,
+      "end": 107.059
+    },
+    {
+      "id": "u264",
+      "text": "on",
+      "start": 107.459,
+      "end": 107.519
+    },
+    {
+      "id": "u265",
+      "text": "or",
+      "start": 107.759,
+      "end": 107.819
+    },
+    {
+      "id": "u266",
+      "text": "off",
+      "start": 108.059,
+      "end": 108.2
+    },
+    {
+      "id": "u267",
+      "text": "based",
+      "start": 108.52,
+      "end": 108.76
+    },
+    {
+      "id": "u268",
+      "text": "on",
+      "start": 108.9,
+      "end": 108.96
+    },
+    {
+      "id": "u269",
+      "text": "your",
+      "start": 109.24,
+      "end": 109.36
+    },
+    {
+      "id": "u270",
+      "text": "own",
+      "start": 109.46,
+      "end": 109.54
+    },
+    {
+      "id": "u271",
+      "text": "needs.",
+      "start": 109.621,
+      "end": 109.881
+    },
+    {
+      "id": "u272",
+      "text": "So,",
+      "start": 110.701,
+      "end": 110.801
+    },
+    {
+      "id": "u273",
+      "text": "if",
+      "start": 111.021,
+      "end": 111.061
+    },
+    {
+      "id": "u274",
+      "text": "you",
+      "start": 111.102,
+      "end": 111.162
+    },
+    {
+      "id": "u275",
+      "text": "want",
+      "start": 111.202,
+      "end": 111.322
+    },
+    {
+      "id": "u276",
+      "text": "to",
+      "start": 111.342,
+      "end": 111.402
+    },
+    {
+      "id": "u277",
+      "text": "preserve",
+      "start": 111.502,
+      "end": 111.962
+    },
+    {
+      "id": "u278",
+      "text": "the",
+      "start": 112.022,
+      "end": 112.082
+    },
+    {
+      "id": "u279",
+      "text": "reasoning",
+      "start": 112.162,
+      "end": 112.422
+    },
+    {
+      "id": "u280",
+      "text": "capabilities,",
+      "start": 112.442,
+      "end": 113.023
+    },
+    {
+      "id": "u281",
+      "text": "it's",
+      "start": 113.463,
+      "end": 113.583
+    },
+    {
+      "id": "u282",
+      "text": "good",
+      "start": 114.064,
+      "end": 114.244
+    },
+    {
+      "id": "u283",
+      "text": "to",
+      "start": 114.644,
+      "end": 114.824
+    },
+    {
+      "id": "u284",
+      "text": "provide",
+      "start": 115.144,
+      "end": 115.445
+    },
+    {
+      "id": "u285",
+      "text": "a",
+      "start": 115.505,
+      "end": 115.525
+    },
+    {
+      "id": "u286",
+      "text": "dataset",
+      "start": 115.605,
+      "end": 115.985
+    },
+    {
+      "id": "u287",
+      "text": "that",
+      "start": 116.765,
+      "end": 116.906
+    },
+    {
+      "id": "u288",
+      "text": "combines",
+      "start": 116.986,
+      "end": 117.426
+    },
+    {
+      "id": "u289",
+      "text": "both",
+      "start": 117.906,
+      "end": 118.166
+    },
+    {
+      "id": "u290",
+      "text": "reasoning",
+      "start": 118.447,
+      "end": 118.747
+    },
+    {
+      "id": "u291",
+      "text": "traces",
+      "start": 118.807,
+      "end": 119.187
+    },
+    {
+      "id": "u292",
+      "text": "from",
+      "start": 119.367,
+      "end": 119.507
+    },
+    {
+      "id": "u293",
+      "text": "a",
+      "start": 119.567,
+      "end": 119.587
+    },
+    {
+      "id": "u294",
+      "text": "chain",
+      "start": 119.647,
+      "end": 119.807
+    },
+    {
+      "id": "u295",
+      "text": "of",
+      "start": 119.868,
+      "end": 119.908
+    },
+    {
+      "id": "u296",
+      "text": "thought",
+      "start": 119.988,
+      "end": 120.168
+    },
+    {
+      "id": "u297",
+      "text": "and",
+      "start": 120.928,
+      "end": 121.028
+    },
+    {
+      "id": "u298",
+      "text": "non",
+      "start": 121.429,
+      "end": 121.589
+    },
+    {
+      "id": "u299",
+      "text": "reasoning",
+      "start": 121.709,
+      "end": 122.029
+    },
+    {
+      "id": "u300",
+      "text": "dataset.",
+      "start": 122.069,
+      "end": 122.529
+    },
+    {
+      "id": "u301",
+      "text": "Now,",
+      "start": 123.35,
+      "end": 123.43
+    },
+    {
+      "id": "u302",
+      "text": "you",
+      "start": 123.47,
+      "end": 123.53
+    },
+    {
+      "id": "u303",
+      "text": "can",
+      "start": 123.57,
+      "end": 123.67
+    },
+    {
+      "id": "u304",
+      "text": "have",
+      "start": 123.73,
+      "end": 123.83
+    },
+    {
+      "id": "u305",
+      "text": "a",
+      "start": 123.89,
+      "end": 123.91
+    },
+    {
+      "id": "u306",
+      "text": "dataset",
+      "start": 123.97,
+      "end": 124.331
+    },
+    {
+      "id": "u307",
+      "text": "without",
+      "start": 124.431,
+      "end": 124.891
+    },
+    {
+      "id": "u308",
+      "text": "reasoning",
+      "start": 125.051,
+      "end": 125.371
+    },
+    {
+      "id": "u309",
+      "text": "traces.",
+      "start": 125.451,
+      "end": 125.852
+    },
+    {
+      "id": "u310",
+      "text": "The",
+      "start": 126.592,
+      "end": 126.652
+    },
+    {
+      "id": "u311",
+      "text": "model",
+      "start": 126.692,
+      "end": 126.912
+    },
+    {
+      "id": "u312",
+      "text": "will",
+      "start": 126.972,
+      "end": 127.112
+    },
+    {
+      "id": "u313",
+      "text": "still",
+      "start": 127.153,
+      "end": 127.373
+    },
+    {
+      "id": "u314",
+      "text": "be",
+      "start": 127.433,
+      "end": 127.513
+    },
+    {
+      "id": "u315",
+      "text": "able",
+      "start": 127.653,
+      "end": 127.853
+    },
+    {
+      "id": "u316",
+      "text": "to",
+      "start": 128.093,
+      "end": 128.273
+    },
+    {
+      "id": "u317",
+      "text": "produce",
+      "start": 128.453,
+      "end": 128.774
+    },
+    {
+      "id": "u318",
+      "text": "chain",
+      "start": 128.854,
+      "end": 129.014
+    },
+    {
+      "id": "u319",
+      "text": "of",
+      "start": 129.074,
+      "end": 129.114
+    },
+    {
+      "id": "u320",
+      "text": "thought,",
+      "start": 129.194,
+      "end": 129.454
+    },
+    {
+      "id": "u321",
+      "text": "but",
+      "start": 130.034,
+      "end": 130.255
+    },
+    {
+      "id": "u322",
+      "text": "it",
+      "start": 130.475,
+      "end": 130.515
+    },
+    {
+      "id": "u323",
+      "text": "may",
+      "start": 130.595,
+      "end": 130.715
+    },
+    {
+      "id": "u324",
+      "text": "not",
+      "start": 130.815,
+      "end": 130.975
+    },
+    {
+      "id": "u325",
+      "text": "be",
+      "start": 131.035,
+      "end": 131.115
+    },
+    {
+      "id": "u326",
+      "text": "that",
+      "start": 131.195,
+      "end": 131.335
+    },
+    {
+      "id": "u327",
+      "text": "great",
+      "start": 131.475,
+      "end": 131.736
+    },
+    {
+      "id": "u328",
+      "text": "for",
+      "start": 131.836,
+      "end": 131.976
+    },
+    {
+      "id": "u329",
+      "text": "your",
+      "start": 132.076,
+      "end": 132.276
+    },
+    {
+      "id": "u330",
+      "text": "specific",
+      "start": 132.716,
+      "end": 133.257
+    },
+    {
+      "id": "u331",
+      "text": "use",
+      "start": 133.657,
+      "end": 133.777
+    },
+    {
+      "id": "u332",
+      "text": "case.",
+      "start": 133.837,
+      "end": 134.077
+    },
+    {
+      "id": "u333",
+      "text": "Okay,",
+      "start": 134.878,
+      "end": 135.078
+    },
+    {
+      "id": "u334",
+      "text": "so",
+      "start": 135.258,
+      "end": 135.358
+    },
+    {
+      "id": "u335",
+      "text": "in",
+      "start": 135.518,
+      "end": 135.558
+    },
+    {
+      "id": "u336",
+      "text": "this",
+      "start": 135.598,
+      "end": 135.718
+    },
+    {
+      "id": "u337",
+      "text": "example,",
+      "start": 135.798,
+      "end": 136.159
+    },
+    {
+      "id": "u338",
+      "text": "we're",
+      "start": 136.279,
+      "end": 136.419
+    },
+    {
+      "id": "u339",
+      "text": "going",
+      "start": 136.439,
+      "end": 136.559
+    },
+    {
+      "id": "u340",
+      "text": "to",
+      "start": 136.599,
+      "end": 136.639
+    },
+    {
+      "id": "u341",
+      "text": "be",
+      "start": 136.679,
+      "end": 136.759
+    },
+    {
+      "id": "u342",
+      "text": "combining",
+      "start": 136.879,
+      "end": 137.319
+    },
+    {
+      "id": "u343",
+      "text": "two",
+      "start": 137.46,
+      "end": 137.62
+    },
+    {
+      "id": "u344",
+      "text": "different",
+      "start": 137.92,
+      "end": 138.24
+    },
+    {
+      "id": "u345",
+      "text": "datasets.",
+      "start": 138.28,
+      "end": 138.821
+    },
+    {
+      "id": "u346",
+      "text": "One",
+      "start": 139.241,
+      "end": 139.321
+    },
+    {
+      "id": "u347",
+      "text": "has",
+      "start": 139.461,
+      "end": 139.721
+    },
+    {
+      "id": "u348",
+      "text": "a",
+      "start": 140.141,
+      "end": 140.161
+    },
+    {
+      "id": "u349",
+      "text": "chain",
+      "start": 140.322,
+      "end": 140.522
+    },
+    {
+      "id": "u350",
+      "text": "of",
+      "start": 140.582,
+      "end": 140.622
+    },
+    {
+      "id": "u351",
+      "text": "thought",
+      "start": 140.682,
+      "end": 140.882
+    },
+    {
+      "id": "u352",
+      "text": "traces",
+      "start": 141.122,
+      "end": 141.562
+    },
+    {
+      "id": "u353",
+      "text": "from",
+      "start": 141.722,
+      "end": 141.943
+    },
+    {
+      "id": "u354",
+      "text": "R",
+      "start": 142.683,
+      "end": 142.723
+    },
+    {
+      "id": "u355",
+      "text": "one,",
+      "start": 142.903,
+      "end": 142.983
+    },
+    {
+      "id": "u356",
+      "text": "and",
+      "start": 143.764,
+      "end": 143.864
+    },
+    {
+      "id": "u357",
+      "text": "the",
+      "start": 143.984,
+      "end": 144.044
+    },
+    {
+      "id": "u358",
+      "text": "second",
+      "start": 144.124,
+      "end": 144.384
+    },
+    {
+      "id": "u359",
+      "text": "one",
+      "start": 144.584,
+      "end": 144.665
+    },
+    {
+      "id": "u360",
+      "text": "is",
+      "start": 144.925,
+      "end": 145.005
+    },
+    {
+      "id": "u361",
+      "text": "instruct",
+      "start": 145.225,
+      "end": 145.545
+    },
+    {
+      "id": "u362",
+      "text": "dataset",
+      "start": 145.625,
+      "end": 146.065
+    },
+    {
+      "id": "u363",
+      "text": "that",
+      "start": 146.206,
+      "end": 146.346
+    },
+    {
+      "id": "u364",
+      "text": "has",
+      "start": 146.406,
+      "end": 146.546
+    },
+    {
+      "id": "u365",
+      "text": "question",
+      "start": 146.686,
+      "end": 147.026
+    },
+    {
+      "id": "u366",
+      "text": "answers.",
+      "start": 147.206,
+      "end": 147.566
+    },
+    {
+      "id": "u367",
+      "text": "Okay,",
+      "start": 148.387,
+      "end": 148.587
+    },
+    {
+      "id": "u368",
+      "text": "so",
+      "start": 148.687,
+      "end": 148.747
+    },
+    {
+      "id": "u369",
+      "text": "let's",
+      "start": 148.827,
+      "end": 148.987
+    },
+    {
+      "id": "u370",
+      "text": "first",
+      "start": 149.048,
+      "end": 149.208
+    },
+    {
+      "id": "u371",
+      "text": "look",
+      "start": 149.248,
+      "end": 149.368
+    },
+    {
+      "id": "u372",
+      "text": "at",
+      "start": 149.448,
+      "end": 149.488
+    },
+    {
+      "id": "u373",
+      "text": "the",
+      "start": 149.588,
+      "end": 149.728
+    },
+    {
+      "id": "u374",
+      "text": "chain",
+      "start": 150.008,
+      "end": 150.168
+    },
+    {
+      "id": "u375",
+      "text": "of",
+      "start": 150.228,
+      "end": 150.268
+    },
+    {
+      "id": "u376",
+      "text": "thought",
+      "start": 150.328,
+      "end": 150.488
+    },
+    {
+      "id": "u377",
+      "text": "dataset.",
+      "start": 150.549,
+      "end": 150.949
+    },
+    {
+      "id": "u378",
+      "text": "It",
+      "start": 151.769,
+      "end": 151.829
+    },
+    {
+      "id": "u379",
+      "text": "has",
+      "start": 151.889,
+      "end": 152.05
+    },
+    {
+      "id": "u380",
+      "text": "two",
+      "start": 152.95,
+      "end": 153.05
+    },
+    {
+      "id": "u381",
+      "text": "different",
+      "start": 153.11,
+      "end": 153.35
+    },
+    {
+      "id": "u382",
+      "text": "components.",
+      "start": 153.39,
+      "end": 153.811
+    },
+    {
+      "id": "u383",
+      "text": "One",
+      "start": 154.671,
+      "end": 154.731
+    },
+    {
+      "id": "u384",
+      "text": "is",
+      "start": 154.791,
+      "end": 154.851
+    },
+    {
+      "id": "u385",
+      "text": "the",
+      "start": 154.952,
+      "end": 155.052
+    },
+    {
+      "id": "u386",
+      "text": "original",
+      "start": 155.252,
+      "end": 155.612
+    },
+    {
+      "id": "u387",
+      "text": "problem",
+      "start": 155.852,
+      "end": 156.232
+    },
+    {
+      "id": "u388",
+      "text": "or",
+      "start": 156.473,
+      "end": 156.533
+    },
+    {
+      "id": "u389",
+      "text": "prompt",
+      "start": 156.753,
+      "end": 156.973
+    },
+    {
+      "id": "u390",
+      "text": "from",
+      "start": 157.033,
+      "end": 157.153
+    },
+    {
+      "id": "u391",
+      "text": "the",
+      "start": 157.213,
+      "end": 157.273
+    },
+    {
+      "id": "u392",
+      "text": "user.",
+      "start": 157.373,
+      "end": 157.573
+    },
+    {
+      "id": "u393",
+      "text": "Then",
+      "start": 158.494,
+      "end": 158.734
+    },
+    {
+      "id": "u394",
+      "text": "this",
+      "start": 159.255,
+      "end": 159.455
+    },
+    {
+      "id": "u395",
+      "text": "is",
+      "start": 159.635,
+      "end": 159.715
+    },
+    {
+      "id": "u396",
+      "text": "the",
+      "start": 159.835,
+      "end": 159.975
+    },
+    {
+      "id": "u397",
+      "text": "chain",
+      "start": 160.415,
+      "end": 160.615
+    },
+    {
+      "id": "u398",
+      "text": "of",
+      "start": 160.675,
+      "end": 160.716
+    },
+    {
+      "id": "u399",
+      "text": "thought",
+      "start": 160.796,
+      "end": 161.016
+    },
+    {
+      "id": "u400",
+      "text": "traces",
+      "start": 161.256,
+      "end": 161.676
+    },
+    {
+      "id": "u401",
+      "text": "that",
+      "start": 162.377,
+      "end": 162.557
+    },
+    {
+      "id": "u402",
+      "text": "were",
+      "start": 162.697,
+      "end": 162.937
+    },
+    {
+      "id": "u403",
+      "text": "generated",
+      "start": 163.157,
+      "end": 163.678
+    },
+    {
+      "id": "u404",
+      "text": "by",
+      "start": 163.758,
+      "end": 163.858
+    },
+    {
+      "id": "u405",
+      "text": "R",
+      "start": 164.178,
+      "end": 164.218
+    },
+    {
+      "id": "u406",
+      "text": "one.",
+      "start": 164.378,
+      "end": 164.478
+    },
+    {
+      "id": "u407",
+      "text": "So",
+      "start": 165.058,
+      "end": 165.139
+    },
+    {
+      "id": "u408",
+      "text": "we",
+      "start": 165.239,
+      "end": 165.299
+    },
+    {
+      "id": "u409",
+      "text": "are",
+      "start": 165.359,
+      "end": 165.419
+    },
+    {
+      "id": "u410",
+      "text": "using",
+      "start": 165.579,
+      "end": 165.819
+    },
+    {
+      "id": "u411",
+      "text": "chain",
+      "start": 166.179,
+      "end": 166.339
+    },
+    {
+      "id": "u412",
+      "text": "of",
+      "start": 166.399,
+      "end": 166.439
+    },
+    {
+      "id": "u413",
+      "text": "thought",
+      "start": 166.479,
+      "end": 166.68
+    },
+    {
+      "id": "u414",
+      "text": "traces",
+      "start": 166.96,
+      "end": 167.28
+    },
+    {
+      "id": "u415",
+      "text": "from",
+      "start": 167.34,
+      "end": 167.44
+    },
+    {
+      "id": "u416",
+      "text": "DeepSeek",
+      "start": 167.52,
+      "end": 167.88
+    },
+    {
+      "id": "u417",
+      "text": "R",
+      "start": 168.021,
+      "end": 168.041
+    },
+    {
+      "id": "u418",
+      "text": "one,",
+      "start": 168.141,
+      "end": 168.241
+    },
+    {
+      "id": "u419",
+      "text": "and",
+      "start": 168.841,
+      "end": 168.921
+    },
+    {
+      "id": "u420",
+      "text": "then",
+      "start": 169.001,
+      "end": 169.181
+    },
+    {
+      "id": "u421",
+      "text": "there",
+      "start": 169.482,
+      "end": 169.602
+    },
+    {
+      "id": "u422",
+      "text": "is",
+      "start": 169.662,
+      "end": 169.702
+    },
+    {
+      "id": "u423",
+      "text": "another",
+      "start": 169.842,
+      "end": 170.122
+    },
+    {
+      "id": "u424",
+      "text": "column",
+      "start": 170.222,
+      "end": 170.602
+    },
+    {
+      "id": "u425",
+      "text": "which",
+      "start": 170.722,
+      "end": 170.862
+    },
+    {
+      "id": "u426",
+      "text": "has",
+      "start": 170.963,
+      "end": 171.143
+    },
+    {
+      "id": "u427",
+      "text": "the",
+      "start": 171.323,
+      "end": 171.463
+    },
+    {
+      "id": "u428",
+      "text": "final",
+      "start": 171.703,
+      "end": 171.983
+    },
+    {
+      "id": "u429",
+      "text": "answer.",
+      "start": 172.143,
+      "end": 172.464
+    },
+    {
+      "id": "u430",
+      "text": "Now,",
+      "start": 173.204,
+      "end": 173.364
+    },
+    {
+      "id": "u431",
+      "text": "the",
+      "start": 173.424,
+      "end": 173.484
+    },
+    {
+      "id": "u432",
+      "text": "second",
+      "start": 173.564,
+      "end": 173.844
+    },
+    {
+      "id": "u433",
+      "text": "dataset,",
+      "start": 173.905,
+      "end": 174.385
+    },
+    {
+      "id": "u434",
+      "text": "which",
+      "start": 174.685,
+      "end": 174.805
+    },
+    {
+      "id": "u435",
+      "text": "is",
+      "start": 174.885,
+      "end": 174.945
+    },
+    {
+      "id": "u436",
+      "text": "non",
+      "start": 175.085,
+      "end": 175.265
+    },
+    {
+      "id": "u437",
+      "text": "reasoning,",
+      "start": 175.406,
+      "end": 175.806
+    },
+    {
+      "id": "u438",
+      "text": "is",
+      "start": 175.926,
+      "end": 175.986
+    },
+    {
+      "id": "u439",
+      "text": "a",
+      "start": 176.086,
+      "end": 176.106
+    },
+    {
+      "id": "u440",
+      "text": "lot",
+      "start": 176.166,
+      "end": 176.306
+    },
+    {
+      "id": "u441",
+      "text": "more",
+      "start": 176.366,
+      "end": 176.486
+    },
+    {
+      "id": "u442",
+      "text": "simpler.",
+      "start": 176.546,
+      "end": 176.887
+    },
+    {
+      "id": "u443",
+      "text": "Here",
+      "start": 177.467,
+      "end": 177.607
+    },
+    {
+      "id": "u444",
+      "text": "we",
+      "start": 177.667,
+      "end": 177.747
+    },
+    {
+      "id": "u445",
+      "text": "have",
+      "start": 177.827,
+      "end": 178.027
+    },
+    {
+      "id": "u446",
+      "text": "just",
+      "start": 178.548,
+      "end": 178.748
+    },
+    {
+      "id": "u447",
+      "text": "two",
+      "start": 179.128,
+      "end": 179.308
+    },
+    {
+      "id": "u448",
+      "text": "different",
+      "start": 179.729,
+      "end": 180.109
+    },
+    {
+      "id": "u449",
+      "text": "fields.",
+      "start": 180.529,
+      "end": 180.849
+    },
+    {
+      "id": "u450",
+      "text": "One",
+      "start": 181.049,
+      "end": 181.109
+    },
+    {
+      "id": "u451",
+      "text": "is",
+      "start": 181.17,
+      "end": 181.23
+    },
+    {
+      "id": "u452",
+      "text": "the",
+      "start": 181.31,
+      "end": 181.43
+    },
+    {
+      "id": "u453",
+      "text": "human",
+      "start": 181.75,
+      "end": 181.99
+    },
+    {
+      "id": "u454",
+      "text": "input,",
+      "start": 182.15,
+      "end": 182.43
+    },
+    {
+      "id": "u455",
+      "text": "which",
+      "start": 182.57,
+      "end": 182.691
+    },
+    {
+      "id": "u456",
+      "text": "is",
+      "start": 182.751,
+      "end": 182.811
+    },
+    {
+      "id": "u457",
+      "text": "basically",
+      "start": 182.871,
+      "end": 183.331
+    },
+    {
+      "id": "u458",
+      "text": "input",
+      "start": 184.071,
+      "end": 184.292
+    },
+    {
+      "id": "u459",
+      "text": "from",
+      "start": 184.332,
+      "end": 184.432
+    },
+    {
+      "id": "u460",
+      "text": "the",
+      "start": 184.492,
+      "end": 184.552
+    },
+    {
+      "id": "u461",
+      "text": "user,",
+      "start": 184.672,
+      "end": 184.912
+    },
+    {
+      "id": "u462",
+      "text": "and",
+      "start": 185.472,
+      "end": 185.573
+    },
+    {
+      "id": "u463",
+      "text": "then",
+      "start": 185.673,
+      "end": 185.893
+    },
+    {
+      "id": "u464",
+      "text": "here",
+      "start": 186.293,
+      "end": 186.433
+    },
+    {
+      "id": "u465",
+      "text": "is",
+      "start": 186.473,
+      "end": 186.533
+    },
+    {
+      "id": "u466",
+      "text": "the",
+      "start": 186.593,
+      "end": 186.673
+    },
+    {
+      "id": "u467",
+      "text": "response",
+      "start": 186.753,
+      "end": 187.234
+    },
+    {
+      "id": "u468",
+      "text": "from",
+      "start": 187.534,
+      "end": 187.694
+    },
+    {
+      "id": "u469",
+      "text": "the",
+      "start": 187.754,
+      "end": 187.814
+    },
+    {
+      "id": "u470",
+      "text": "model.",
+      "start": 187.854,
+      "end": 188.094
+    },
+    {
+      "id": "u471",
+      "text": "This",
+      "start": 188.675,
+      "end": 188.855
+    },
+    {
+      "id": "u472",
+      "text": "is",
+      "start": 189.315,
+      "end": 189.375
+    },
+    {
+      "id": "u473",
+      "text": "based",
+      "start": 189.555,
+      "end": 189.775
+    },
+    {
+      "id": "u474",
+      "text": "on",
+      "start": 189.895,
+      "end": 189.956
+    },
+    {
+      "id": "u475",
+      "text": "ChatGPT,",
+      "start": 190.256,
+      "end": 190.956
+    },
+    {
+      "id": "u476",
+      "text": "which",
+      "start": 191.116,
+      "end": 191.236
+    },
+    {
+      "id": "u477",
+      "text": "was",
+      "start": 191.276,
+      "end": 191.376
+    },
+    {
+      "id": "u478",
+      "text": "a",
+      "start": 191.477,
+      "end": 191.497
+    },
+    {
+      "id": "u479",
+      "text": "dataset",
+      "start": 191.557,
+      "end": 191.997
+    },
+    {
+      "id": "u480",
+      "text": "that",
+      "start": 192.097,
+      "end": 192.297
+    },
+    {
+      "id": "u481",
+      "text": "collected",
+      "start": 192.477,
+      "end": 192.938
+    },
+    {
+      "id": "u482",
+      "text": "human",
+      "start": 193.678,
+      "end": 193.878
+    },
+    {
+      "id": "u483",
+      "text": "inputs",
+      "start": 193.958,
+      "end": 194.339
+    },
+    {
+      "id": "u484",
+      "text": "and",
+      "start": 194.979,
+      "end": 195.059
+    },
+    {
+      "id": "u485",
+      "text": "responses",
+      "start": 195.159,
+      "end": 195.76
+    },
+    {
+      "id": "u486",
+      "text": "from",
+      "start": 195.92,
+      "end": 196.08
+    },
+    {
+      "id": "u487",
+      "text": "ChatGPT-based",
+      "start": 196.24,
+      "end": 197.441
+    },
+    {
+      "id": "u488",
+      "text": "models.",
+      "start": 197.501,
+      "end": 197.861
+    },
+    {
+      "id": "u489",
+      "text": "So",
+      "start": 198.722,
+      "end": 198.862
+    },
+    {
+      "id": "u490",
+      "text": "we",
+      "start": 199.442,
+      "end": 199.622
+    },
+    {
+      "id": "u491",
+      "text": "are",
+      "start": 200.163,
+      "end": 200.243
+    },
+    {
+      "id": "u492",
+      "text": "downloading",
+      "start": 200.323,
+      "end": 200.743
+    },
+    {
+      "id": "u493",
+      "text": "both",
+      "start": 200.823,
+      "end": 201.003
+    },
+    {
+      "id": "u494",
+      "text": "of",
+      "start": 201.063,
+      "end": 201.103
+    },
+    {
+      "id": "u495",
+      "text": "them.",
+      "start": 201.163,
+      "end": 201.343
+    },
+    {
+      "id": "u496",
+      "text": "Here",
+      "start": 201.644,
+      "end": 201.724
+    },
+    {
+      "id": "u497",
+      "text": "is",
+      "start": 201.764,
+      "end": 201.824
+    },
+    {
+      "id": "u498",
+      "text": "the",
+      "start": 201.904,
+      "end": 202.044
+    },
+    {
+      "id": "u499",
+      "text": "reasoning",
+      "start": 202.464,
+      "end": 202.784
+    },
+    {
+      "id": "u500",
+      "text": "dataset.",
+      "start": 202.844,
+      "end": 203.245
+    },
+    {
+      "id": "u501",
+      "text": "How",
+      "start": 203.345,
+      "end": 203.465
+    },
+    {
+      "id": "u502",
+      "text": "exactly",
+      "start": 203.785,
+      "end": 204.125
+    },
+    {
+      "id": "u503",
+      "text": "it",
+      "start": 204.185,
+      "end": 204.225
+    },
+    {
+      "id": "u504",
+      "text": "looks",
+      "start": 204.285,
+      "end": 204.445
+    },
+    {
+      "id": "u505",
+      "text": "like?",
+      "start": 204.485,
+      "end": 204.646
+    },
+    {
+      "id": "u506",
+      "text": "We",
+      "start": 204.986,
+      "end": 205.046
+    },
+    {
+      "id": "u507",
+      "text": "have",
+      "start": 205.106,
+      "end": 205.206
+    },
+    {
+      "id": "u508",
+      "text": "the",
+      "start": 205.246,
+      "end": 205.306
+    },
+    {
+      "id": "u509",
+      "text": "expected",
+      "start": 205.386,
+      "end": 205.806
+    },
+    {
+      "id": "u510",
+      "text": "answer,",
+      "start": 205.987,
+      "end": 206.367
+    },
+    {
+      "id": "u511",
+      "text": "problem",
+      "start": 206.667,
+      "end": 207.007
+    },
+    {
+      "id": "u512",
+      "text": "type,",
+      "start": 207.087,
+      "end": 207.347
+    },
+    {
+      "id": "u513",
+      "text": "problem",
+      "start": 207.468,
+      "end": 207.768
+    },
+    {
+      "id": "u514",
+      "text": "source.",
+      "start": 207.848,
+      "end": 208.108
+    },
+    {
+      "id": "u515",
+      "text": "We",
+      "start": 208.188,
+      "end": 208.248
+    },
+    {
+      "id": "u516",
+      "text": "are",
+      "start": 208.288,
+      "end": 208.368
+    },
+    {
+      "id": "u517",
+      "text": "not",
+      "start": 208.408,
+      "end": 208.488
+    },
+    {
+      "id": "u518",
+      "text": "really",
+      "start": 208.548,
+      "end": 208.748
+    },
+    {
+      "id": "u519",
+      "text": "interested",
+      "start": 208.808,
+      "end": 209.189
+    },
+    {
+      "id": "u520",
+      "text": "in",
+      "start": 209.269,
+      "end": 209.309
+    },
+    {
+      "id": "u521",
+      "text": "these.",
+      "start": 209.449,
+      "end": 209.689
+    },
+    {
+      "id": "u522",
+      "text": "The",
+      "start": 210.249,
+      "end": 210.329
+    },
+    {
+      "id": "u523",
+      "text": "only",
+      "start": 210.41,
+      "end": 210.55
+    },
+    {
+      "id": "u524",
+      "text": "thing",
+      "start": 210.59,
+      "end": 210.71
+    },
+    {
+      "id": "u525",
+      "text": "we",
+      "start": 210.75,
+      "end": 210.81
+    },
+    {
+      "id": "u526",
+      "text": "are",
+      "start": 210.85,
+      "end": 210.91
+    },
+    {
+      "id": "u527",
+      "text": "interested",
+      "start": 210.95,
+      "end": 211.31
+    },
+    {
+      "id": "u528",
+      "text": "in",
+      "start": 211.43,
+      "end": 211.47
+    },
+    {
+      "id": "u529",
+      "text": "are",
+      "start": 211.871,
+      "end": 211.991
+    },
+    {
+      "id": "u530",
+      "text": "expected",
+      "start": 212.231,
+      "end": 212.611
+    },
+    {
+      "id": "u531",
+      "text": "answer,",
+      "start": 212.731,
+      "end": 213.071
+    },
+    {
+      "id": "u532",
+      "text": "model",
+      "start": 213.772,
+      "end": 213.992
+    },
+    {
+      "id": "u533",
+      "text": "generation,",
+      "start": 214.032,
+      "end": 214.552
+    },
+    {
+      "id": "u534",
+      "text": "and",
+      "start": 214.913,
+      "end": 214.993
+    },
+    {
+      "id": "u535",
+      "text": "what",
+      "start": 215.193,
+      "end": 215.353
+    },
+    {
+      "id": "u536",
+      "text": "was",
+      "start": 215.453,
+      "end": 215.653
+    },
+    {
+      "id": "u537",
+      "text": "the",
+      "start": 215.813,
+      "end": 215.933
+    },
+    {
+      "id": "u538",
+      "text": "original",
+      "start": 216.454,
+      "end": 216.734
+    },
+    {
+      "id": "u539",
+      "text": "problem.",
+      "start": 216.834,
+      "end": 217.214
+    },
+    {
+      "id": "u540",
+      "text": "Now",
+      "start": 217.815,
+      "end": 217.895
+    },
+    {
+      "id": "u541",
+      "text": "here",
+      "start": 218.055,
+      "end": 218.175
+    },
+    {
+      "id": "u542",
+      "text": "is",
+      "start": 218.235,
+      "end": 218.295
+    },
+    {
+      "id": "u543",
+      "text": "what",
+      "start": 218.575,
+      "end": 218.675
+    },
+    {
+      "id": "u544",
+      "text": "the",
+      "start": 218.735,
+      "end": 218.795
+    },
+    {
+      "id": "u545",
+      "text": "dataset",
+      "start": 218.855,
+      "end": 219.276
+    },
+    {
+      "id": "u546",
+      "text": "actually",
+      "start": 219.376,
+      "end": 219.656
+    },
+    {
+      "id": "u547",
+      "text": "looks",
+      "start": 219.816,
+      "end": 219.996
+    },
+    {
+      "id": "u548",
+      "text": "like.",
+      "start": 220.036,
+      "end": 220.216
+    },
+    {
+      "id": "u549",
+      "text": "So",
+      "start": 220.296,
+      "end": 220.336
+    },
+    {
+      "id": "u550",
+      "text": "we",
+      "start": 220.416,
+      "end": 220.476
+    },
+    {
+      "id": "u551",
+      "text": "have",
+      "start": 220.536,
+      "end": 220.637
+    },
+    {
+      "id": "u552",
+      "text": "the",
+      "start": 220.677,
+      "end": 220.757
+    },
+    {
+      "id": "u553",
+      "text": "expected",
+      "start": 220.837,
+      "end": 221.237
+    },
+    {
+      "id": "u554",
+      "text": "answer,",
+      "start": 221.417,
+      "end": 221.697
+    },
+    {
+      "id": "u555",
+      "text": "but",
+      "start": 222.198,
+      "end": 222.298
+    },
+    {
+      "id": "u556",
+      "text": "we",
+      "start": 222.358,
+      "end": 222.418
+    },
+    {
+      "id": "u557",
+      "text": "are",
+      "start": 222.498,
+      "end": 222.578
+    },
+    {
+      "id": "u558",
+      "text": "really",
+      "start": 222.738,
+      "end": 222.938
+    },
+    {
+      "id": "u559",
+      "text": "interested",
+      "start": 222.978,
+      "end": 223.338
+    },
+    {
+      "id": "u560",
+      "text": "in",
+      "start": 223.438,
+      "end": 223.478
+    },
+    {
+      "id": "u561",
+      "text": "the",
+      "start": 223.939,
+      "end": 224.079
+    },
+    {
+      "id": "u562",
+      "text": "problem",
+      "start": 224.299,
+      "end": 224.619
+    },
+    {
+      "id": "u563",
+      "text": "statement,",
+      "start": 224.699,
+      "end": 225.12
+    },
+    {
+      "id": "u564",
+      "text": "generated",
+      "start": 225.74,
+      "end": 226.26
+    },
+    {
+      "id": "u565",
+      "text": "solution,",
+      "start": 226.36,
+      "end": 226.781
+    },
+    {
+      "id": "u566",
+      "text": "and",
+      "start": 227.041,
+      "end": 227.121
+    },
+    {
+      "id": "u567",
+      "text": "then",
+      "start": 227.161,
+      "end": 227.361
+    },
+    {
+      "id": "u568",
+      "text": "expected",
+      "start": 227.801,
+      "end": 228.302
+    },
+    {
+      "id": "u569",
+      "text": "answer.",
+      "start": 228.482,
+      "end": 228.762
+    },
+    {
+      "id": "u570",
+      "text": "For",
+      "start": 229.102,
+      "end": 229.182
+    },
+    {
+      "id": "u571",
+      "text": "the",
+      "start": 229.222,
+      "end": 229.282
+    },
+    {
+      "id": "u572",
+      "text": "non-reasoning,",
+      "start": 229.363,
+      "end": 229.943
+    },
+    {
+      "id": "u573",
+      "text": "we",
+      "start": 230.283,
+      "end": 230.343
+    },
+    {
+      "id": "u574",
+      "text": "just",
+      "start": 230.423,
+      "end": 230.563
+    },
+    {
+      "id": "u575",
+      "text": "have",
+      "start": 230.623,
+      "end": 230.743
+    },
+    {
+      "id": "u576",
+      "text": "the",
+      "start": 230.783,
+      "end": 230.844
+    },
+    {
+      "id": "u577",
+      "text": "conversations,",
+      "start": 230.924,
+      "end": 231.664
+    },
+    {
+      "id": "u578",
+      "text": "source,",
+      "start": 232.285,
+      "end": 232.605
+    },
+    {
+      "id": "u579",
+      "text": "and",
+      "start": 233.025,
+      "end": 233.125
+    },
+    {
+      "id": "u580",
+      "text": "scores.",
+      "start": 233.285,
+      "end": 233.645
+    },
+    {
+      "id": "u581",
+      "text": "Now",
+      "start": 234.106,
+      "end": 234.186
+    },
+    {
+      "id": "u582",
+      "text": "let's",
+      "start": 234.246,
+      "end": 234.406
+    },
+    {
+      "id": "u583",
+      "text": "look",
+      "start": 234.446,
+      "end": 234.566
+    },
+    {
+      "id": "u584",
+      "text": "at",
+      "start": 234.686,
+      "end": 234.746
+    },
+    {
+      "id": "u585",
+      "text": "a",
+      "start": 235.046,
+      "end": 235.066
+    },
+    {
+      "id": "u586",
+      "text": "simple",
+      "start": 235.126,
+      "end": 235.367
+    },
+    {
+      "id": "u587",
+      "text": "trace",
+      "start": 235.447,
+      "end": 235.707
+    },
+    {
+      "id": "u588",
+      "text": "from",
+      "start": 235.807,
+      "end": 235.987
+    },
+    {
+      "id": "u589",
+      "text": "this",
+      "start": 236.267,
+      "end": 236.407
+    },
+    {
+      "id": "u590",
+      "text": "reasoning",
+      "start": 236.567,
+      "end": 236.968
+    },
+    {
+      "id": "u591",
+      "text": "dataset.",
+      "start": 237.048,
+      "end": 237.468
+    },
+    {
+      "id": "u592",
+      "text": "So",
+      "start": 238.249,
+      "end": 238.369
+    },
+    {
+      "id": "u593",
+      "text": "here",
+      "start": 238.789,
+      "end": 239.009
+    },
+    {
+      "id": "u594",
+      "text": "we",
+      "start": 239.449,
+      "end": 239.509
+    },
+    {
+      "id": "u595",
+      "text": "have",
+      "start": 239.57,
+      "end": 239.67
+    },
+    {
+      "id": "u596",
+      "text": "the",
+      "start": 239.73,
+      "end": 239.85
+    }
+  ],
+  "vad_speech": [
+    [
+      0.0,
+      0.2
+    ],
+    [
+      0.6,
+      3.4
+    ],
+    [
+      3.8,
+      10.8
+    ],
+    [
+      11.2,
+      26.9
+    ],
+    [
+      27.2,
+      31.4
+    ],
+    [
+      31.6,
+      36.4
+    ],
+    [
+      36.9,
+      39.5
+    ],
+    [
+      39.9,
+      44.8
+    ],
+    [
+      45.0,
+      47.9
+    ],
+    [
+      48.3,
+      54.8
+    ],
+    [
+      55.1,
+      56.7
+    ],
+    [
+      57.3,
+      68.8
+    ],
+    [
+      69.3,
+      73.0
+    ],
+    [
+      73.2,
+      75.0
+    ],
+    [
+      75.4,
+      77.5
+    ],
+    [
+      78.0,
+      80.7
+    ],
+    [
+      81.1,
+      85.0
+    ],
+    [
+      85.7,
+      93.9
+    ],
+    [
+      94.2,
+      94.9
+    ],
+    [
+      95.7,
+      99.2
+    ],
+    [
+      99.5,
+      104.1
+    ],
+    [
+      104.8,
+      110.1
+    ],
+    [
+      110.6,
+      116.2
+    ],
+    [
+      116.6,
+      120.4
+    ],
+    [
+      120.7,
+      122.8
+    ],
+    [
+      123.2,
+      126.1
+    ],
+    [
+      126.5,
+      129.6
+    ],
+    [
+      129.9,
+      134.3
+    ],
+    [
+      134.7,
+      142.2
+    ],
+    [
+      142.4,
+      143.2
+    ],
+    [
+      143.5,
+      147.8
+    ],
+    [
+      148.3,
+      151.2
+    ],
+    [
+      151.6,
+      152.4
+    ],
+    [
+      152.8,
+      154.1
+    ],
+    [
+      154.4,
+      157.8
+    ],
+    [
+      158.2,
+      161.9
+    ],
+    [
+      162.2,
+      164.7
+    ],
+    [
+      164.9,
+      172.6
+    ],
+    [
+      173.1,
+      183.7
+    ],
+    [
+      183.8,
+      193.3
+    ],
+    [
+      193.5,
+      198.1
+    ],
+    [
+      198.6,
+      213.3
+    ],
+    [
+      213.6,
+      216.2
+    ],
+    [
+      216.4,
+      217.4
+    ],
+    [
+      217.7,
+      225.3
+    ],
+    [
+      225.6,
+      237.7
+    ],
+    [
+      238.1,
+      240.0
+    ]
+  ],
+  "shot_changes": [],
+  "sing_spans": [],
+  "speaker_turns": [
+    {
+      "start": 0.0,
+      "end": 197.944719,
+      "speaker": "S0"
+    },
+    {
+      "start": 198.602844,
+      "end": 240.0,
+      "speaker": "S0"
+    }
+  ]
+}
