@@ -5,9 +5,9 @@ ships. Nothing it produces may reach the quality report, and nothing it reports
 may be softer than the spec: these tests pin the parts a future edit could
 quietly relax --
 
-* ``SHADOW_GATES`` still has the tracked baseline's gate modes (three blocking,
-  ``forbidden_end_rate`` warning), so "not worse" keeps meaning what it meant
-  when it was frozen;
+* ``SHADOW_GATES`` still has the tracked baseline's configured modes (three
+  blocking, ``forbidden_end_rate`` warning), while the shared evaluator applies
+  the same per-language sample promotion as the production quality report;
 * the three verdicts (C13 coverage, C14 non-inferiority, AD-2 locality) fold onto
   the shared 0/1/2 exits with "invalid" outranking "failed";
 * a full run over a small synthetic corpus produces both lanes, both engines

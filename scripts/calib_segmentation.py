@@ -28,7 +28,8 @@ The four gated metrics (design doc 4.5):
 ``cps_p90``
     90th percentile reading speed, pooled per language over cue samples.
 ``forbidden_end_rate``
-    Of the boundaries that had a legal in-budget alternative, how many leave a
+    Of the internal boundaries that had a legal in-budget source-lattice
+    alternative, plus eligible document-final tails, how many leave a
     forward-binding token dangling at the end of a cue.
 
 Three deliberate properties, each a fix for a flaw the 2026-08-25 audit found in
@@ -114,7 +115,7 @@ BASELINE_SCHEMA = "segmentation-baseline"
 SCHEMA_VERSION = 1
 #: Bumping this invalidates every recorded baseline on purpose: a metric whose
 #: definition moved is not comparable to a number recorded under the old one.
-METRIC_DEFINITION_VERSION = 2
+METRIC_DEFINITION_VERSION = 3
 
 DEFAULT_CORPUS = REPO_ROOT / "calibration" / "segmentation" / "corpus.json"
 DEFAULT_BASELINE = REPO_ROOT / "calibration" / "segmentation" / "baseline.json"
@@ -152,8 +153,9 @@ METRICS = (
 COUNT_METRICS = frozenset({"over_7s_rate"})
 
 #: Initial gate table (design 4.6). ``warning`` is the landing mode: the soak
-#: phase fixes metric/corpus problems without blocking PRs; flipping a gate to
-#: ``blocking`` is a reviewed edit of the tracked baseline, not a code change.
+#: phase fixes metric/corpus problems without blocking PRs. Once both the
+#: baseline and current language group reach ``min_samples``, evaluation promotes
+#: that group's warning result to blocking without mutating this tracked policy.
 #: ``cps_p90`` has no single ``absolute_max`` because the ceiling is derived per
 #: language from that language's configured target CPS (see CPS_ABSOLUTE_FACTOR).
 DEFAULT_GATES: dict[str, dict[str, Any]] = {
@@ -754,6 +756,12 @@ def _ends_with_break_punct(text: str) -> bool:
     return any(ch in _BREAK_PUNCT for ch in stripped[-2:])
 
 
+def _ends_with_terminal_punct(text: str) -> bool:
+    """True when a source tail closes the document with sentence punctuation."""
+    stripped = str(text).rstrip().rstrip(_CLOSERS)
+    return bool(stripped) and stripped[-1] in _TERMINAL_PUNCT
+
+
 def _starts_with_break_punct(text: str) -> bool:
     stripped = str(text).lstrip()
     return bool(stripped) and stripped[0] in _BREAK_PUNCT
@@ -836,6 +844,8 @@ class Boundary:
     cue_index: int
     left_unit: int
     right_unit: int
+    span_start_unit: int
+    span_end_unit: int
     gap: float
 
 
@@ -875,7 +885,16 @@ def map_boundaries(
             unmapped += 1
             continue
         gap = float(units[right]["start"]) - float(units[left]["end"])
-        out.append(Boundary(i, left, right, gap))
+        out.append(
+            Boundary(
+                cue_index=i,
+                left_unit=left,
+                right_unit=right,
+                span_start_unit=firsts[i] if firsts[i] is not None else left,
+                span_end_unit=(lasts[i + 1] if lasts[i + 1] is not None else right),
+                gap=gap,
+            )
+        )
     return out, unmapped
 
 
@@ -1031,36 +1050,55 @@ def phrase_start_offsets(
 
 
 def has_legal_alternative(
-    left_text: str,
-    right_text: str,
+    units: Sequence[Mapping[str, Any]],
+    phrase_starts: set[int],
+    unit_offsets: Sequence[int],
+    *,
+    span_start_unit: int,
+    actual_right_unit: int,
+    span_end_unit: int,
     iso: str,
     max_line_length: int,
     max_lines: int,
 ) -> bool:
-    """True when this boundary could have moved and still fit the layout budget.
+    """True when a source-lattice alternative fits the same two-cue budget.
 
     The denominator of ``forbidden_end_rate`` is the boundaries where a better
-    choice existed. Repacking the two cues' atoms, an alternative counts only if
-    both halves are non-empty, both fit the configured line budget, and the new
+    choice existed. Candidate cuts come from the phrase lattice computed once
+    over the pre-split source stream, not from re-segmenting each already-split
+    cue without its original context. An alternative counts only if both source
+    spans render non-empty, both fit the configured line budget, and the new
     left half does *not* end on a forward-binding token. Without this, a cue
     whose only in-budget break is a bad one would be scored as an algorithm
     defect, and a rate that punishes unsolvable boundaries can never reach 0.
     """
-    left_atoms = _phrase_atoms(_flat(left_text), iso)
-    right_atoms = _phrase_atoms(_flat(right_text), iso)
-    atoms = left_atoms + right_atoms
-    if len(atoms) < 2:
+    if not (
+        0 <= span_start_unit < actual_right_unit <= span_end_unit < len(units)
+        and len(unit_offsets) == len(units)
+    ):
         return False
     join = "" if _no_space(iso) else " "
-    actual = len(left_atoms)
-    for k in range(1, len(atoms)):
-        if k == actual:
+    from voxweave.core.layout import strip_punct_for_subtitles
+
+    for unit_cut in range(span_start_unit + 1, span_end_unit + 1):
+        if unit_cut == actual_right_unit:
             continue
-        if _line_end_penalty(atoms[k - 1], iso) >= 2:
+        if unit_offsets[unit_cut] not in phrase_starts:
             continue
-        lhs = join.join(atoms[:k])
-        rhs = join.join(atoms[k:])
+        lhs = strip_punct_for_subtitles(
+            join.join(
+                str(unit.get("text") or "") for unit in units[span_start_unit:unit_cut]
+            )
+        )
+        rhs = strip_punct_for_subtitles(
+            join.join(
+                str(unit.get("text") or "")
+                for unit in units[unit_cut : span_end_unit + 1]
+            )
+        )
         if not lhs.strip() or not rhs.strip():
+            continue
+        if _line_end_penalty(_tail_token(lhs, iso), iso) >= 2:
             continue
         if not _fits_budget(lhs, max_line_length, max_lines, iso):
             continue
@@ -1175,6 +1213,7 @@ def measure_case(case: Case, result: Any) -> CaseMeasurement:
     mid_bad = mid_eligible = 0
     forbidden_bad = forbidden_eligible = 0
     silence_breaks = forced_breaks = punctuation_breaks = no_alternative = 0
+    final_tail_eligible = terminal_final_tails = 0
     mid_offenders: list[dict[str, Any]] = []
     forbidden_offenders: list[dict[str, Any]] = []
 
@@ -1233,11 +1272,15 @@ def measure_case(case: Case, result: Any) -> CaseMeasurement:
             punctuation_breaks += 1
             continue
         if not has_legal_alternative(
-            str(left_cue.get("text") or ""),
-            str(right_cue.get("text") or ""),
-            iso,
-            max_line_length,
-            max_lines,
+            units,
+            starts,
+            unit_offsets,
+            span_start_unit=boundary.span_start_unit,
+            actual_right_unit=boundary.right_unit,
+            span_end_unit=boundary.span_end_unit,
+            iso=iso,
+            max_line_length=max_line_length,
+            max_lines=max_lines,
         ):
             no_alternative += 1
             continue
@@ -1256,6 +1299,34 @@ def measure_case(case: Case, result: Any) -> CaseMeasurement:
                     note=tail,
                 )
             )
+
+    # A document-final tail has no following gap and no movable two-cue
+    # boundary. After the ordinary lyric/manual-exception filters it is therefore
+    # always eligible unless the source explicitly closes with sentence-final
+    # punctuation. A clause comma is not a document terminator and remains
+    # scoreable. With no pause evidence, a bad final tail gets the maximum
+    # boundary-band severity for offender ordering.
+    if cues:
+        i = len(cues) - 1
+        if not (lyric[i] or exempt("forbidden_end_rate", i)):
+            source_tail = str(units[-1].get("text") or "") if units else ""
+            if _ends_with_terminal_punct(source_tail):
+                terminal_final_tails += 1
+            else:
+                final_tail_eligible += 1
+                forbidden_eligible += 1
+                tail = _tail_token(str(cues[i].get("text") or ""), iso)
+                if tail and _line_end_penalty(tail, iso) >= 2:
+                    forbidden_bad += 1
+                    forbidden_offenders.append(
+                        _offender(
+                            case,
+                            i,
+                            cues[i],
+                            value=vad_skip_s,
+                            note=tail,
+                        )
+                    )
 
     measurement.ratios = {
         "len_break_mid_phrase_rate": cc.Ratio(mid_bad, mid_eligible),
@@ -1282,6 +1353,8 @@ def measure_case(case: Case, result: Any) -> CaseMeasurement:
         "forced_breaks": forced_breaks,
         "punctuation_breaks": punctuation_breaks,
         "no_legal_alternative": no_alternative,
+        "final_tail_eligible": final_tail_eligible,
+        "terminal_final_tails": terminal_final_tails,
         "exempted_cues": over_exempt,
         "phrase_granularity": "phrase" if multichar else "word",
         "unit_health": unit_health(
@@ -1495,6 +1568,9 @@ def evaluate_gates(
     A group whose denominator is under ``min_samples`` reports
     ``insufficient_samples``: with the corpus fixed at 20 cases that is a corpus
     defect, not a pass, and the caller turns it into exit 2 for a blocking gate.
+    A configured warning promotes to blocking for one language only when both
+    its baseline and current sample counts reach ``min_samples``. The gate table
+    remains unchanged, so promotion is evidence-driven and reversible per run.
     """
     results: list[dict[str, Any]] = []
     baseline_groups = (baseline or {}).get("groups") or {}
@@ -1504,17 +1580,32 @@ def evaluate_gates(
             continue
         for metric in METRICS:
             gate = gates.get(metric) or DEFAULT_GATES[metric]
-            mode = str(gate.get("mode", "warning"))
+            configured_mode = str(gate.get("mode", "warning"))
             value, samples, unit = _measure(block, metric)
+            min_samples = int(gate["min_samples"])
+            base_block = baseline_groups.get(language)
+            baseline_samples: int | None = None
+            if base_block is not None:
+                _, baseline_samples, _ = _measure(base_block, metric)
+            promoted = bool(
+                configured_mode == "warning"
+                and samples >= min_samples
+                and baseline_samples is not None
+                and baseline_samples >= min_samples
+            )
+            mode = "blocking" if promoted else configured_mode
             ceiling = _absolute_max(gate, block, metric)
             result: dict[str, Any] = {
                 "group": language,
                 "metric": metric,
                 "mode": mode,
+                "configured_mode": configured_mode,
+                "promoted": promoted,
                 "measure": unit,
                 "value": value,
                 "samples": samples,
-                "min_samples": int(gate["min_samples"]),
+                "baseline_samples": baseline_samples,
+                "min_samples": min_samples,
                 "absolute_max": ceiling,
                 "baseline_value": None,
                 "allowed_by_baseline": None,
@@ -1524,7 +1615,7 @@ def evaluate_gates(
                 result["status"] = "disabled"
                 results.append(result)
                 continue
-            if samples < int(gate["min_samples"]):
+            if samples < min_samples:
                 result["status"] = "insufficient_samples"
                 result["reasons"].append(
                     f"{samples} samples < min_samples {gate['min_samples']}"
@@ -1543,7 +1634,6 @@ def evaluate_gates(
                 result["reasons"].append(
                     f"absolute: {value:.4f} > absolute_max {ceiling:.4f}"
                 )
-            base_block = baseline_groups.get(language)
             if base_block is not None:
                 base_value, _, _ = _measure(base_block, metric)
                 if base_value is not None:
@@ -2230,6 +2320,8 @@ SHADOW_GATED_LANE = SHADOW_LANE_DELIVERY
 #: a future baseline edit silently redefine the P4 acceptance criterion. A test
 #: asserts these modes still match the tracked baseline, so a deliberate edit is
 #: visible as a failing test rather than as a quietly moved goalpost.
+#: The shared ``evaluate_gates`` still applies per-group sample promotion to the
+#: warning literal, exactly as it does for the production quality report.
 SHADOW_GATES: dict[str, dict[str, Any]] = {
     "len_break_mid_phrase_rate": {
         "direction": "lower_is_better",

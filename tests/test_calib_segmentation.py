@@ -253,7 +253,7 @@ def write_corpus(root: Path) -> Path:
             relpaths.append(f"cases/{path.name}")
     registry = {
         "schema_version": 1,
-        "metric_definition_version": 2,
+        "metric_definition_version": calib.METRIC_DEFINITION_VERSION,
         "description": "synthetic corpus for the harness tests",
         "cases": relpaths,
         "required_counts": {"zh": 7, "ja": 7, "en": 6},
@@ -519,8 +519,80 @@ def test_forbidden_end_counts_a_dangling_article_when_an_alternative_existed() -
     ]
     measurement = calib.measure_case(as_case(doc), Replayed(cues))
     ratio = measurement.ratios["forbidden_end_rate"]
-    assert (ratio.bad, ratio.eligible) == (1, 1)
+    assert (ratio.bad, ratio.eligible) == (1, 2)
     assert measurement.offenders["forbidden_end_rate"][0]["note"] == "the"
+
+
+def test_forbidden_end_counts_a_document_final_dangling_tail() -> None:
+    units = spaced_units(["we", "walked", "to", "the"], dur=0.5)
+    doc = make_case("en-01", "en", units)
+    cues = [cue("we walked to the", 0.0, 2.0, units)]
+
+    measurement = calib.measure_case(as_case(doc), Replayed(cues))
+
+    assert measurement.ratios["forbidden_end_rate"] == cc.Ratio(1, 1)
+    assert measurement.diagnostics["final_tail_eligible"] == 1
+    assert measurement.offenders["forbidden_end_rate"][0]["cue_index"] == 0
+
+
+def test_document_final_sentence_punctuation_excludes_the_tail() -> None:
+    units = spaced_units(["we", "walked", "to", "the."], dur=0.5)
+    doc = make_case("en-01", "en", units)
+    cues = [cue("we walked to the", 0.0, 2.0, units)]
+
+    measurement = calib.measure_case(as_case(doc), Replayed(cues))
+
+    assert measurement.ratios["forbidden_end_rate"] == cc.Ratio(0, 0)
+    assert measurement.diagnostics["final_tail_eligible"] == 0
+    assert measurement.diagnostics["terminal_final_tails"] == 1
+
+
+def test_legal_alternative_uses_the_pre_split_source_lattice(monkeypatch) -> None:
+    units = char_units("甲乙丙丁戊己", dur=0.5)
+    units[-1]["text"] = "己。"
+
+    def context_sensitive_atoms(text: str, iso: str) -> list[str]:
+        compact = text.replace(" ", "")
+        if compact == "甲乙丙丁戊己。":
+            return ["甲乙", "丙丁", "戊己。"]
+        return [compact]
+
+    monkeypatch.setattr(calib, "_phrase_atoms", context_sensitive_atoms)
+    monkeypatch.setattr(
+        calib,
+        "_line_end_penalty",
+        lambda text, iso: 2 if text.endswith("丙") else 0,
+    )
+    starts, offsets = calib.phrase_start_offsets(units, "zh")
+
+    # Re-segmenting the two post-split cues yields only their actual boundary,
+    # so the old view had no alternative. The whole-source lattice has legal
+    # boundaries at offsets 2 and 4.
+    assert context_sensitive_atoms("甲乙丙", "zh") + context_sensitive_atoms(
+        "丁戊己", "zh"
+    ) == ["甲乙丙", "丁戊己"]
+    assert calib.has_legal_alternative(
+        units,
+        starts,
+        offsets,
+        span_start_unit=0,
+        actual_right_unit=3,
+        span_end_unit=5,
+        iso="zh",
+        max_line_length=4,
+        max_lines=1,
+    )
+
+    config = capture.segmentation_config("zh")
+    config.update({"max_line_length": 4, "max_lines": 1})
+    doc = make_case("zh-01", "zh", units, config=config)
+    cues = [
+        cue("甲乙丙", 0.0, 1.5, units[:3]),
+        cue("丁戊己", 1.5, 3.0, units[3:]),
+    ]
+    measurement = calib.measure_case(as_case(doc), Replayed(cues))
+    assert measurement.ratios["forbidden_end_rate"] == cc.Ratio(1, 1)
+    assert measurement.diagnostics["no_legal_alternative"] == 0
 
 
 def test_forbidden_end_denominator_drops_boundaries_with_no_alternative() -> None:
@@ -538,8 +610,8 @@ def test_forbidden_end_denominator_drops_boundaries_with_no_alternative() -> Non
     ]
     measurement = calib.measure_case(as_case(doc), Replayed(cues))
     ratio = measurement.ratios["forbidden_end_rate"]
-    assert (ratio.bad, ratio.eligible) == (0, 0)
-    assert ratio.value is None
+    assert (ratio.bad, ratio.eligible) == (0, 1)
+    assert ratio.value == 0.0
     assert measurement.diagnostics["no_legal_alternative"] == 1
 
 
@@ -557,7 +629,7 @@ def test_forbidden_end_drops_boundaries_forced_by_a_long_pause() -> None:
     ]
     measurement = calib.measure_case(as_case(doc), Replayed(cues))
     ratio = measurement.ratios["forbidden_end_rate"]
-    assert (ratio.bad, ratio.eligible) == (0, 0)
+    assert (ratio.bad, ratio.eligible) == (0, 1)
     assert measurement.diagnostics["forced_breaks"] == 1
 
 
@@ -572,7 +644,7 @@ def test_forbidden_end_drops_boundaries_the_source_punctuated() -> None:
     ]
     measurement = calib.measure_case(as_case(doc), Replayed(cues))
     ratio = measurement.ratios["forbidden_end_rate"]
-    assert (ratio.bad, ratio.eligible) == (0, 0)
+    assert (ratio.bad, ratio.eligible) == (0, 1)
     assert measurement.diagnostics["punctuation_breaks"] == 1
 
 
@@ -597,7 +669,7 @@ def test_unavoidable_forbidden_end_exception_excludes_only_that_metric() -> None
         cue("old bridge yesterday", 2.0, 3.5, units[4:7]),
     ]
     measurement = calib.measure_case(as_case(doc), Replayed(cues))
-    assert measurement.ratios["forbidden_end_rate"] == cc.Ratio(0, 0)
+    assert measurement.ratios["forbidden_end_rate"] == cc.Ratio(0, 1)
     # ... while the cue-duration metric still sees both cues.
     assert measurement.ratios["over_7s_rate"].eligible == 2
 
@@ -924,6 +996,64 @@ def test_warning_mode_never_changes_the_exit_code() -> None:
     results = calib.evaluate_gates(current, gates, None)
     assert any(r["status"] == "fail" for r in results)
     assert calib.gate_exit_code(results) == cc.EXIT_OK
+
+
+def test_warning_gate_promotes_when_both_sample_counts_reach_the_minimum() -> None:
+    gates = {m: _gate(m, mode="disabled") for m in calib.METRICS}
+    gates["forbidden_end_rate"] = _gate(
+        "forbidden_end_rate", mode="warning", min_samples=100
+    )
+    current = _groups_with(
+        "zh", forbidden_end_rate={"bad": 3, "eligible": 100, "value": 0.03}
+    )
+    baseline = {
+        "groups": _groups_with(
+            "zh", forbidden_end_rate={"bad": 0, "eligible": 100, "value": 0.0}
+        )
+    }
+
+    result = next(
+        row
+        for row in calib.evaluate_gates(current, gates, baseline)
+        if row["metric"] == "forbidden_end_rate"
+    )
+
+    assert result["configured_mode"] == "warning"
+    assert result["mode"] == "blocking"
+    assert result["promoted"] is True
+    assert result["baseline_samples"] == 100
+    assert result["status"] == "fail"
+    assert calib.gate_exit_code([result]) == cc.EXIT_GATE_FAILED
+
+
+@pytest.mark.parametrize(("current_n", "baseline_n"), [(99, 100), (100, 99)])
+def test_warning_gate_stays_warning_until_both_sample_counts_are_ready(
+    current_n: int, baseline_n: int
+) -> None:
+    gates = {m: _gate(m, mode="disabled") for m in calib.METRICS}
+    gates["forbidden_end_rate"] = _gate(
+        "forbidden_end_rate", mode="warning", min_samples=100
+    )
+    current = _groups_with(
+        "zh",
+        forbidden_end_rate={"bad": 0, "eligible": current_n, "value": 0.0},
+    )
+    baseline = {
+        "groups": _groups_with(
+            "zh",
+            forbidden_end_rate={"bad": 0, "eligible": baseline_n, "value": 0.0},
+        )
+    }
+
+    result = next(
+        row
+        for row in calib.evaluate_gates(current, gates, baseline)
+        if row["metric"] == "forbidden_end_rate"
+    )
+
+    assert result["configured_mode"] == "warning"
+    assert result["mode"] == "warning"
+    assert result["promoted"] is False
 
 
 # --------------------------------------------------------------------------- #

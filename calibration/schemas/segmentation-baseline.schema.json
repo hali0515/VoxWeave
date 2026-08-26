@@ -8,7 +8,7 @@
   "required": ["schema_version", "metric_definition_version", "corpus_digest", "generated_from_commit", "environment", "groups", "gates"],
   "properties": {
     "schema_version": {"const": 1},
-    "metric_definition_version": {"const": 2},
+    "metric_definition_version": {"const": 3},
     "corpus_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "generated_from_commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
     "environment": {
