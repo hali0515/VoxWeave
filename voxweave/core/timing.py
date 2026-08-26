@@ -340,16 +340,18 @@ def _cleanup_cues(
             if last_word_end is not None and last_word_end > cap:
                 # A still-sounding word may hold the cue past the cap, but only
                 # across CONTINUOUS speech. Walk the words in time order and stop
-                # at the first silence gap wider than HELD_WORD_MAX_GAP_S that
-                # lands at or past the cap: the extension target is the last word
-                # end before that gap. This keeps a sung sustain (breaths ~0.84s)
-                # visible while refusing to drag the cue across dead air to a
-                # stray final syllable (real ja case: words end ~2s past the cap,
-                # then a 3.7s gap, then one 80ms syllable). If the held region
-                # ends before the cap, max() clamps back to plain cap behavior.
+                # at the first silence gap wider than HELD_WORD_MAX_GAP_S: the
+                # extension target is the last word end before that gap. This
+                # keeps a sung sustain (breaths ~0.84s) visible while refusing
+                # to drag the cue across dead air to a stray final syllable —
+                # wherever the stray lands. (The gap check used to also require
+                # the stray to start past the cap, which let a stray sitting
+                # 0.06s *before* the cap keep a 7.6s cue alive: the held chain
+                # must be fed by words continuous with the cue's speech body,
+                # not by anything the cap line happens to fall behind.)
                 held_end = timed[0][1]
                 for (_ps, pe), (ns, ne) in zip(timed, timed[1:]):
-                    if ns - pe > HELD_WORD_MAX_GAP_S and ns >= cap:
+                    if ns - pe > HELD_WORD_MAX_GAP_S:
                         break
                     held_end = ne
                 target = held_end

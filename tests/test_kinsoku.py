@@ -150,6 +150,38 @@ def test_pos_reaches_classes_surface_tables_cannot():
     assert pens[3] == 0  # は 係助詞
 
 
+def test_pos_grades_case_particles_by_surface_severity():
+    pytest.importorskip("fugashi")
+    from voxweave.core.kinsoku import ja_pos_end_penalties
+
+    # 格助詞 follow the char tables' severity classes: を binds hard, と is
+    # medium, が doubles as a conjunctive particle and must stay clause-capable
+    # (a flat 2 made every len-break candidate equally bad, so the width
+    # tiebreak stranded を instead of breaking after が).
+    text = "この俺が心を開く"
+    pens = ja_pos_end_penalties(text)
+    assert pens is not None
+    assert pens[text.index("が")] == 0  # 格助詞が: legal clause break
+    assert pens[text.index("を")] == 2  # 格助詞を: binds forward
+    text = "私生徒と友達"
+    pens = ja_pos_end_penalties(text)
+    assert pens is not None
+    assert pens[text.index("と")] == 1  # 格助詞と: medium
+
+
+def test_pos_penalizes_adverbial_copula_ni():
+    pytest.importorskip("fugashi")
+    from voxweave.core.kinsoku import ja_pos_end_penalties
+
+    # みたいに's に is tagged 助動詞, which used to fall through to 0 and
+    # *downgrade* the char table's correct 2 — the boundary 友達みたいに |
+    # したしめ… won outright on that hole.
+    text = "友達みたいにしたい"
+    pens = ja_pos_end_penalties(text)
+    assert pens is not None
+    assert pens[text.index("に")] == 2
+
+
 def test_pos_env_kill_switch(monkeypatch):
     pytest.importorskip("fugashi")
     from voxweave.core.kinsoku import _load_ja_tagger, ja_pos_end_penalties

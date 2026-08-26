@@ -144,6 +144,31 @@ def test_max_cue_extension_capped_by_next_start():
     assert out[0]["end"] == pytest.approx(8.0)
 
 
+def test_max_cue_refuses_stranded_tail_even_before_cap():
+    # (d) the held chain must be fed by words continuous with the cue's speech
+    # body. Here speech stops at 23.08, then 6.42s of dead air, then one stray
+    # tail syllable starting 0.06s BEFORE the cap line — the real ja case where
+    # the aligner parked a word-final char on a later speech island. The gap
+    # ends the chain wherever the stray lands: clamp to the cap, do not ride
+    # the stray to 30.2.
+    cues = [
+        {
+            "text": "運も弱い",
+            "start": 22.56,
+            "end": 30.20,
+            "word_data": [
+                {"word": "運", "start": 22.56, "end": 22.70},
+                {"word": "も", "start": 22.70, "end": 22.86},
+                {"word": "弱", "start": 22.86, "end": 23.08},
+                {"word": "い", "start": 29.50, "end": 30.20},
+            ],
+        },
+        {"text": "next", "start": 34.66, "end": 35.66, "word_data": []},
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.0, max_cue_s=7.0)
+    assert out[0]["end"] == pytest.approx(22.56 + 7.0)
+
+
 def test_max_cue_clamps_when_words_end_before_cap():
     # (c) word_data ends before the cap -> ordinary clamp to start+max_cue_s (a
     # long-linger cue whose own words already stopped is still capped).

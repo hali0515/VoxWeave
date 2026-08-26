@@ -1146,7 +1146,14 @@ def segment_document(
     # zh: Qwen punctuation can drift up to one character; snap to jieba word boundary
     # to prevent smart_split from splitting mid-word (e.g. 数据|中心 instead of 数据中心).
     snapped = realign.snap_break_punct(units, iso)
-    seg = _units_to_seg(snapped, iso)
+    # Stranded word tails (aligner parked a word-final char across dead air) are
+    # repaired only on the stream cue formation sees; ``result.units`` keeps the
+    # raw aligner timings, so persisted siblings stay alignment evidence and
+    # every replay re-derives the repair.
+    from voxweave.core.unit_repair import repair_stranded_tails
+
+    repaired = repair_stranded_tails(snapped, iso, speech_spans)
+    seg = _units_to_seg(repaired, iso)
     base = dict(thresholds) if thresholds is not None else gap_thresholds(iso)
     effective = _maybe_adaptive_thresholds(base, snapped)
     cues = smart_split_segments(

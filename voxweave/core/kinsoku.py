@@ -298,22 +298,34 @@ def _load_ja_tagger():
         return None
 
 
-def _pos_penalty(pos1: str, pos2: str) -> int:
-    """UniDic POS -> line-end penalty (Level 2 of the same scorer).
+def _pos_penalty(pos1: str, pos2: str, surface: str) -> int:
+    """UniDic POS + surface -> line-end penalty (Level 2 of the same scorer).
 
     Same intent as the char tables, but disambiguated: 準体助詞の (走るの = a
     legal break) scores 0 where the char table had to penalize every の; and
     POS reaches classes a surface table cannot (連体詞 この/その, 接頭辞 お/各).
     接続助詞 (て/が/から) and 係助詞 (は/も) stay 0 — real clause breaks.
+
+    格助詞 are graded by the char tables' severity classes rather than a flat 2:
+    が/から/で double as conjunctive particles and marking them 2 made every
+    len-break candidate equally bad, so the choice fell through to the width
+    tiebreak and stranded を/に instead of the clause-capable が. 助動詞 whose
+    surface ends in a HIGH char closes the みたいに/ように hole, where the POS
+    override used to *downgrade* the char table's correct 2 to 0.
     """
+    last = surface[-1] if surface else ""
     if pos1 == "助詞":
         if pos2 == "格助詞":
-            return 2
+            if last in _BIND_END_HIGH:
+                return 2
+            return 1 if last in _BIND_END_MED else 0
         if pos2 == "副助詞":
             return 1
         return 0  # 係助詞 / 接続助詞 / 終助詞 / 準体助詞
     if pos1 in ("連体詞", "接頭辞"):
         return 2  # この|村 / お|名前: always binds forward
+    if pos1 == "助動詞" and last in _BIND_END_HIGH:
+        return 2  # みたいに / ように: adverbial copula binds forward
     return 0
 
 
@@ -337,7 +349,9 @@ def ja_pos_end_penalties(text: str) -> dict[int, int] | None:
         off += n
         f = word.feature
         pen[off - 1] = _pos_penalty(
-            getattr(f, "pos1", "") or "", getattr(f, "pos2", "") or ""
+            getattr(f, "pos1", "") or "",
+            getattr(f, "pos2", "") or "",
+            word.surface.strip(),
         )
     return pen
 
