@@ -876,6 +876,126 @@ def map_boundaries(
     return out, unmapped
 
 
+# --------------------------------------------------------------------------- #
+# Source-unit health: the zero-duration ledger split by mechanism
+# --------------------------------------------------------------------------- #
+
+#: A zero-duration span, with microsecond slack for JSON float round-tripping.
+_ZERO_S = 1e-6
+
+#: Adjacent lexical units further apart than this, with no punctuation between
+#: them, are counted in the ledger. Natural mid-sentence pauses land here too
+#: (ASR under-punctuates), so the count is data, not an alarm.
+_STRANDED_GAP_S = 1.0
+
+#: Only a gap this extreme between directly adjacent word units earns a warning
+#: line: a pause that long without punctuation is not phrasing, it is the
+#: aligner parking a word tail on a later speech island.
+_STRANDED_WARN_S = 5.0
+
+#: A single lexical unit longer than this gets its VAD coverage checked: a held
+#: vowel is fine, a unit stretched across silence is an alignment overhang.
+_LONG_UNIT_S = 1.0
+
+#: Wall/run sizes at or above this are worth a warning line; mirrors
+#: ``voxweave.realign.ZERO_DURATION_MAX_RUN`` (the repair pass gives up past
+#: this run length, so anything this long survived into the shipped units).
+_ZERO_SHAPE_WARN = 8
+
+
+def _is_lexical(unit: Mapping[str, Any]) -> bool:
+    return any(ch.isalnum() for ch in str(unit.get("text") or ""))
+
+
+def _vad_coverage(
+    start: float, end: float, spans: Sequence[tuple[float, float]]
+) -> float:
+    dur = end - start
+    if dur <= 0.0:
+        return 1.0
+    covered = sum(max(0.0, min(end, b) - max(start, a)) for a, b in spans)
+    return covered / dur
+
+
+def unit_health(
+    units: Sequence[Mapping[str, Any]],
+    vad_speech: Sequence[tuple[float, float]] | None = None,
+) -> dict[str, Any]:
+    """The zero-duration ledger split by mechanism, plus alignment-shape checks.
+
+    A single zero-duration rate conflates three mechanisms that mean different
+    things: ``reinject_punct``'s by-design zero-width punctuation, lexical
+    collapse (the zh NAR aligner's known failure, which lands runs of units on
+    one identical timestamp), and point-alignment quantization (the ja MMS
+    lane, whose zeros are ordered and unique). The shape columns tell them
+    apart: a same-time wall is collapse evidence even at a low overall rate,
+    while a high rate with no wall and short runs is quantization. Stranded
+    gaps and undercovered long units are the aligner parking part of a word
+    somewhere the speech is not.
+    """
+    spans = [(float(a), float(b)) for a, b in vad_speech or ()]
+    lexical = [u for u in units if _is_lexical(u)]
+    punct_zero = sum(
+        1
+        for u in units
+        if not _is_lexical(u) and float(u["end"]) - float(u["start"]) <= _ZERO_S
+    )
+
+    zero_starts: dict[float, int] = {}
+    lexical_zero = 0
+    zero_run = zero_run_max = 0
+    long_count = 0
+    long_min_coverage: float | None = None
+    for u in lexical:
+        start, end = float(u["start"]), float(u["end"])
+        if end - start <= _ZERO_S:
+            lexical_zero += 1
+            zero_run += 1
+            zero_run_max = max(zero_run_max, zero_run)
+            key = round(start, _TIME_DECIMALS)
+            zero_starts[key] = zero_starts.get(key, 0) + 1
+        else:
+            zero_run = 0
+        if end - start > _LONG_UNIT_S:
+            long_count += 1
+            if spans:
+                coverage = _vad_coverage(start, end, spans)
+                if long_min_coverage is None or coverage < long_min_coverage:
+                    long_min_coverage = coverage
+
+    # Stream-adjacent lexical pairs only: a punctuation unit between two words
+    # marks a legitimate sentence pause, so it exempts the gap. Two directly
+    # adjacent word units this far apart mean the aligner parked the right one
+    # on a later speech island (the stranded-tail signature).
+    stranded_count = 0
+    stranded_max = 0.0
+    for a, b in zip(units, units[1:]):
+        if not (_is_lexical(a) and _is_lexical(b)):
+            continue
+        gap = float(b["start"]) - float(a["end"])
+        if gap > _STRANDED_GAP_S:
+            stranded_count += 1
+            stranded_max = max(stranded_max, gap)
+
+    nonmonotonic = sum(
+        1 for a, b in zip(units, units[1:]) if float(b["start"]) < float(a["start"])
+    )
+    return {
+        "lexical_count": len(lexical),
+        "lexical_zero": lexical_zero,
+        "punct_zero": punct_zero,
+        "same_time_wall_max": max(zero_starts.values(), default=0),
+        "lexical_zero_run_max": zero_run_max,
+        "nonmonotonic_pairs": nonmonotonic,
+        "stranded_gap_count": stranded_count,
+        "stranded_gap_max_s": round(stranded_max, 3),
+        "long_unit_count": long_count,
+        "long_unit_min_vad_coverage": (
+            round(long_min_coverage, 3) if long_min_coverage is not None else None
+        ),
+    }
+
+
 def phrase_start_offsets(
     units: Sequence[Mapping[str, Any]], iso: str
 ) -> tuple[set[int], list[int]]:
@@ -1161,6 +1281,10 @@ def measure_case(case: Case, result: Any) -> CaseMeasurement:
         "no_legal_alternative": no_alternative,
         "exempted_cues": over_exempt,
         "phrase_granularity": "phrase" if multichar else "word",
+        "unit_health": unit_health(
+            units,
+            [(float(a), float(b)) for a, b in case.doc.get("vad_speech") or ()],
+        ),
         "target_cps": float(thresholds["cps"]),
         "max_cue_s": max_cue_s,
         "dependency_drift": _dependency_drift(case),
@@ -1793,6 +1917,28 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 f"{measurement.case_id}: "
                 f"{measurement.diagnostics['unmapped_boundaries']} cue boundaries "
                 "could not be mapped back to source units"
+            )
+        health = measurement.diagnostics["unit_health"]
+        if health["same_time_wall_max"] >= _ZERO_SHAPE_WARN:
+            warnings.append(
+                f"{measurement.case_id}: {health['same_time_wall_max']} lexical"
+                " units collapsed onto one timestamp (aligner collapse wall)"
+            )
+        if health["lexical_zero_run_max"] >= _ZERO_SHAPE_WARN:
+            warnings.append(
+                f"{measurement.case_id}: run of {health['lexical_zero_run_max']}"
+                " consecutive zero-duration lexical units"
+            )
+        if health["nonmonotonic_pairs"]:
+            warnings.append(
+                f"{measurement.case_id}: {health['nonmonotonic_pairs']}"
+                " non-monotonic source unit pairs"
+            )
+        if health["stranded_gap_max_s"] >= _STRANDED_WARN_S:
+            warnings.append(
+                f"{measurement.case_id}: stranded word tail"
+                f" ({health['stranded_gap_max_s']}s between adjacent word units;"
+                f" {health['stranded_gap_count']} gaps over {_STRANDED_GAP_S}s)"
             )
 
     groups = aggregate(measurements)

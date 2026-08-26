@@ -628,6 +628,94 @@ def test_known_bad_source_unit_exception_excludes_every_metric(
 
 
 # --------------------------------------------------------------------------- #
+# Unit health: the zero-duration ledger split by mechanism
+# --------------------------------------------------------------------------- #
+
+
+def test_unit_health_tells_collapse_from_quantization() -> None:
+    """Same total zero rate, opposite shapes.
+
+    Quantization (the ja MMS lane) produces ordered zeros on distinct
+    timestamps; collapse (the zh NAR failure) lands a run on one identical
+    timestamp. Only the second is a wall.
+    """
+    quantized = [
+        {"text": "あ", "start": 0.0, "end": 0.1},
+        {"text": "い", "start": 0.1, "end": 0.1},
+        {"text": "う", "start": 0.2, "end": 0.2},
+        {"text": "え", "start": 0.3, "end": 0.4},
+    ]
+    health = calib.unit_health(quantized)
+    assert health["lexical_zero"] == 2
+    assert health["same_time_wall_max"] == 1
+    assert health["lexical_zero_run_max"] == 2
+
+    collapsed = [
+        {"text": "T", "start": 0.0, "end": 0.1},
+        {"text": "r", "start": 0.5, "end": 0.5},
+        {"text": "a", "start": 0.5, "end": 0.5},
+        {"text": "n", "start": 0.5, "end": 0.5},
+        {"text": "s", "start": 0.6, "end": 0.7},
+    ]
+    health = calib.unit_health(collapsed)
+    assert health["same_time_wall_max"] == 3
+    assert health["lexical_zero_run_max"] == 3
+
+
+def test_unit_health_punct_zeros_are_a_separate_column() -> None:
+    """reinject_punct's zero-width punctuation must not count as lexical."""
+    units = [
+        {"text": "词", "start": 0.0, "end": 0.2},
+        {"text": "。", "start": 0.2, "end": 0.2},
+        {"text": "再", "start": 1.0, "end": 1.2},
+    ]
+    health = calib.unit_health(units)
+    assert health["lexical_zero"] == 0
+    assert health["punct_zero"] == 1
+    assert health["lexical_count"] == 2
+
+
+def test_unit_health_stranded_tail_needs_adjacent_word_units() -> None:
+    """A big gap behind punctuation is a sentence pause, not a stranded tail."""
+    stranded = [
+        {"text": "弱", "start": 22.5, "end": 23.0},
+        {"text": "い", "start": 29.5, "end": 30.2},
+    ]
+    health = calib.unit_health(stranded)
+    assert health["stranded_gap_count"] == 1
+    assert health["stranded_gap_max_s"] == 6.5
+
+    paused = [
+        {"text": "弱", "start": 22.5, "end": 23.0},
+        {"text": "。", "start": 23.0, "end": 23.0},
+        {"text": "い", "start": 29.5, "end": 30.2},
+    ]
+    assert calib.unit_health(paused)["stranded_gap_count"] == 0
+
+
+def test_unit_health_long_unit_vad_coverage() -> None:
+    """A >1s unit reports how much of it actually lies in speech."""
+    units = [
+        {"text": "っ", "start": 0.0, "end": 2.0},
+        {"text": "あ", "start": 2.0, "end": 2.2},
+    ]
+    health = calib.unit_health(units, vad_speech=[(0.0, 1.0)])
+    assert health["long_unit_count"] == 1
+    assert health["long_unit_min_vad_coverage"] == 0.5
+    assert calib.unit_health(units)["long_unit_min_vad_coverage"] is None
+
+
+def test_unit_health_counts_nonmonotonic_pairs() -> None:
+    """Order regressions in the source stream are visible, not smoothed over."""
+    units = [
+        {"text": "上", "start": 94.9, "end": 94.9},
+        {"text": "，", "start": 7.5, "end": 7.5},
+        {"text": "次", "start": 8.0, "end": 8.2},
+    ]
+    assert calib.unit_health(units)["nonmonotonic_pairs"] == 1
+
+
+# --------------------------------------------------------------------------- #
 # Boundary mapping
 # --------------------------------------------------------------------------- #
 
