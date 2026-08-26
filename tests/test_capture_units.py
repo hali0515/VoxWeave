@@ -447,6 +447,29 @@ def test_license_default_is_undeclared() -> None:
     assert args.license_class not in capture.REDISTRIBUTABLE_CLASSES
 
 
+def test_third_party_license_builds_marked_not_redistributable(sibling: Path) -> None:
+    case = _build(
+        sibling,
+        capture.Window(10.0, 14.0),
+        source_class="third-party",
+        attribution="BV1xxxxxxxxx",
+    )
+    assert case["license"] == {
+        "redistributable": False,
+        "source_class": "third-party",
+        "spdx": None,
+        "attribution": "BV1xxxxxxxxx",
+    }
+    assert cc.schema_errors(case, "segmentation-case") == []
+
+
+def test_third_party_case_cannot_claim_redistributable(sibling: Path) -> None:
+    """The schema conditional pins third-party to redistributable=false."""
+    case = _build(sibling, capture.Window(10.0, 14.0), source_class="third-party")
+    case["license"]["redistributable"] = True
+    assert cc.schema_errors(case, "segmentation-case") != []
+
+
 def test_attribution_and_spdx_reach_the_license_block(sibling: Path) -> None:
     case = _build(
         sibling,

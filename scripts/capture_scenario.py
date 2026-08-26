@@ -101,6 +101,9 @@ REDISTRIBUTABLE_CLASSES = (
 )
 #: Default ``--license-class``: declaring nothing must refuse, never assume rights.
 UNDECLARED_LICENSE_CLASS = "undeclared"
+#: Explicit opt-in for material the maintainer chooses to track without
+#: redistribution rights; the case is honestly marked redistributable=false.
+THIRD_PARTY_LICENSE_CLASS = "third-party"
 
 #: Optional segmenters whose version silently changes where breaks land.
 SEGMENTER_DISTRIBUTIONS = ("pysbd", "budoux", "jieba", "fugashi")
@@ -393,12 +396,25 @@ def license_block(
 
     A golden case is tracked in git and shipped with the repo, so "I did not say"
     has to fail closed: the default source class is undeclared and lands here.
+    ``third-party`` is the explicit escape hatch — the maintainer declares the
+    source and accepts tracking it, and the case is marked redistributable=false
+    rather than laundered into a redistributable class.
     """
+    if source_class == THIRD_PARTY_LICENSE_CLASS:
+        return {
+            "redistributable": False,
+            "source_class": source_class,
+            "spdx": spdx,
+            "attribution": attribution,
+        }
     if source_class not in REDISTRIBUTABLE_CLASSES:
         raise cc.CalibrationError(
             f"refusing to write a case with source class {source_class!r}: a tracked "
             "golden case must be redistributable",
-            [f"pass --license-class from: {', '.join(REDISTRIBUTABLE_CLASSES)}"],
+            [
+                f"pass --license-class from: {', '.join(REDISTRIBUTABLE_CLASSES)}",
+                "or declare third-party material explicitly with --license-class third-party",
+            ],
         )
     return {
         "redistributable": True,
@@ -768,8 +784,15 @@ def build_parser() -> argparse.ArgumentParser:
     seg.add_argument(
         "--license-class",
         default=UNDECLARED_LICENSE_CLASS,
-        choices=(UNDECLARED_LICENSE_CLASS, *REDISTRIBUTABLE_CLASSES),
-        help="source class; the default is undeclared and refuses to write",
+        choices=(
+            UNDECLARED_LICENSE_CLASS,
+            *REDISTRIBUTABLE_CLASSES,
+            THIRD_PARTY_LICENSE_CLASS,
+        ),
+        help=(
+            "source class; the default is undeclared and refuses to write. "
+            "third-party writes the case marked redistributable=false"
+        ),
     )
     seg.add_argument("--attribution", default=None, help="credit line for the source")
     seg.add_argument(

@@ -17,11 +17,14 @@
       "additionalProperties": false,
       "required": ["redistributable", "source_class"],
       "properties": {
-        "redistributable": {"const": true},
-        "source_class": {"enum": ["self-recorded", "cc", "public-domain", "synthetic-from-consented-speech"]},
+        "redistributable": {"type": "boolean"},
+        "source_class": {"enum": ["self-recorded", "cc", "public-domain", "synthetic-from-consented-speech", "third-party"]},
         "spdx": {"type": ["string", "null"]},
         "attribution": {"type": ["string", "null"], "maxLength": 500}
-      }
+      },
+      "if": {"properties": {"source_class": {"const": "third-party"}}},
+      "then": {"properties": {"redistributable": {"const": false}}},
+      "else": {"properties": {"redistributable": {"const": true}}}
     },
     "capture": {
       "type": "object",

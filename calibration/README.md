@@ -59,8 +59,10 @@ All percentages are micro-aggregated: numerators and denominators are summed acr
 cases and kept in the report, never averaged per case, so a 60 s clip cannot outweigh a
 150 s one.
 
-Case data is tracked in Git, so it must be redistributable (self-recorded, CC,
-public-domain, or consented). Timestamps are rebased to 0, speakers are `S0/S1/...`, and
+Case data is tracked in Git, so it should be redistributable (self-recorded, CC,
+public-domain, or consented). `third-party` is the explicit maintainer escape hatch:
+the case is honestly marked `redistributable: false`, and tracking it is the repo
+owner's decision, never the tool's default. Timestamps are rebased to 0, speakers are `S0/S1/...`, and
 no audio, video, source filename or real speaker name is stored. Private extension
 corpora are supplied through `VOXWEAVE_CALIB_ROOT` and are reported separately — they
 never change the denominator of the public PR gate.
