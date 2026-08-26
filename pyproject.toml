@@ -60,7 +60,10 @@ dependencies = [
   # CJK line-break: BudouX phrase atoms as non-breakable units (ja/zh) + jieba word segmentation
   # to snap Qwen's off-boundary punctuation back to word edges. Both lazy-imported
   # (voxweave.realign.snap_break_punct); fall back to character-level if import fails.
-  "budoux>=0.8",
+  # Pinned below 0.9: the segmentation quality baseline is graded on the 0.8.4
+  # phrase model, and 0.9.0 parses ~half of sampled ja sentences differently.
+  # Raise the ceiling only together with a deliberate baseline re-record.
+  "budoux>=0.8,<0.9",
   "jieba>=0.42",
   # ja line-end scoring Level 2: POS-based penalties (kinsoku.ja_pos_end_penalties)
   # distinguish 準体の (legal break) from 格助詞の (binds forward). Lazy-imported;
