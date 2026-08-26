@@ -1287,6 +1287,7 @@ def segment_document(
                 iso,
                 thresholds=effective,
                 max_line_length=max_line_length,
+                max_lines=max_lines,
             )
             # ... and its cleanup can push a boundary back across a cut, so snap again.
             cues = _resnap_shots(cues, cuts, effective)

@@ -129,9 +129,8 @@ def test_split_replay_without_shots_keeps_speaker_format(tmp_path):
     assert any("-" in c["text"] for c in cues)
 
 
-def test_split_passes_line_budget_to_speaker_format(tmp_path, monkeypatch):
-    """A --max-line-length override must reach the speaker formatter too, or the
-    dual-speaker decision measures against a different budget than the layout."""
+def test_split_passes_layout_budget_to_speaker_format(tmp_path, monkeypatch):
+    """Layout overrides must reach both packer and speaker formatter."""
     seen: dict = {}
 
     def fake_format(cues, turns, lang, **kw):
@@ -142,8 +141,9 @@ def test_split_passes_line_budget_to_speaker_format(tmp_path, monkeypatch):
     j = _write_json(
         tmp_path / "ep.json", speaker_turns=[[s, e, lb] for s, e, lb in TURNS]
     )
-    pipeline.split(j, max_line_length=20)
+    pipeline.split(j, max_line_length=20, max_lines=1)
     assert seen["max_line_length"] == 20
+    assert seen["max_lines"] == 1
 
 
 def _stub_transcribe_models(monkeypatch, tmp_path):

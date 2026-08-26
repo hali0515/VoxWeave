@@ -10,7 +10,12 @@
 #   Fix 5 - a surviving boundary must not strand a bound word on the left cue when
 #           the cue has no cleaner phrase edge to offer and no audible gap to
 #           justify it (merge instead). ja only, scored with UniDic POS.
-from voxweave.core.layout import _vis_width
+from voxweave.core.layout import (
+    _line_budget_width,
+    _vis_width,
+    default_max_line_length,
+    default_max_lines,
+)
 from voxweave.diarize import (
     _merge_bad_tail_runs,
     _speaker_runs,
@@ -30,6 +35,10 @@ def _cue(text, start, end, words):
 
 def _atoms(items):
     return [{"text": t, "start": s, "end": e} for t, s, e in items]
+
+
+def _atom_boundaries(atoms):
+    return [(atom["text"], atom["_unit_start"], atom["_unit_end"]) for atom in atoms]
 
 
 def _lines(text):
@@ -77,6 +86,96 @@ def test_dash_cue_normalizes_prewrapped_text_to_two_lines():
     for ln in lines:
         assert ln.startswith("-") and not ln.startswith("- ")
         assert _vis_width(ln) <= 42
+
+
+def test_max_lines_one_override_reaches_dual_gate():
+    at_two = apply_speaker_format([_en_dash_cue()], EN_DASH_TURNS, "en", max_lines=2)
+    at_one = apply_speaker_format([_en_dash_cue()], EN_DASH_TURNS, "en", max_lines=1)
+
+    assert len(at_two) == 1
+    assert at_two[0]["text"].count("\n") == 1
+    assert len(at_one) == 2
+    assert all("\n" not in cue["text"] for cue in at_one)
+
+
+def test_wide_latin_atom_boundaries_match_packer_in_speaker_formatter(
+    monkeypatch,
+):
+    from voxweave.core import smart_split
+
+    text = "甲alpha beta gamma delta epsilon zeta eta theta乙"
+    word_data = [
+        {"start": i * 0.1, "end": i * 0.1 + 0.08}
+        for i, _ in enumerate(text.replace(" ", ""))
+    ]
+    atom_width = _line_budget_width(default_max_line_length("zh"), "zh")
+    real_build_atoms = smart_split._build_atoms
+    packer_atoms = real_build_atoms(
+        text,
+        word_data,
+        "zh",
+        max_atom_width=atom_width,
+    )
+    packer_boundaries = _atom_boundaries(packer_atoms)
+    seen: list[tuple[int | None, list[tuple[str, int, int]]]] = []
+
+    def recording_build_atoms(text, word_data, lang, max_atom_width=None):
+        atoms = real_build_atoms(
+            text,
+            word_data,
+            lang,
+            max_atom_width=max_atom_width,
+        )
+        seen.append((max_atom_width, _atom_boundaries(atoms)))
+        return atoms
+
+    monkeypatch.setattr(smart_split, "_build_atoms", recording_build_atoms)
+    cue = {
+        "text": text,
+        "start": 0.0,
+        "end": 4.0,
+        "word_data": word_data,
+    }
+    format_speaker_cues(
+        [cue],
+        [(0.0, 5.0, "SPEAKER_00")],
+        "zh",
+    )
+
+    assert packer_boundaries == [
+        ("甲", 0, 1),
+        ("alpha ", 1, 6),
+        ("beta ", 6, 10),
+        ("gamma ", 10, 15),
+        ("delta ", 15, 20),
+        ("epsilon ", 20, 27),
+        ("zeta ", 27, 31),
+        ("eta ", 31, 34),
+        ("theta", 34, 39),
+        ("乙", 39, 40),
+    ]
+    assert seen == [(atom_width, packer_boundaries)]
+
+
+def test_plain_cjk_default_layout_matches_explicit_defaults():
+    cue = _cue(
+        "你来吗马上就来",
+        0.5,
+        3.5,
+        [(s, s + 0.2) for s in (0.5, 0.7, 0.9, 2.4, 2.6, 2.8, 3.0)],
+    )
+    turns = [(0.0, 2.0, "SPEAKER_00"), (2.0, 4.0, "SPEAKER_01")]
+    implicit = format_speaker_cues([cue], turns, "zh")
+    explicit = format_speaker_cues(
+        [cue],
+        turns,
+        "zh",
+        max_line_length=default_max_line_length("zh"),
+        max_lines=default_max_lines("zh"),
+    )
+
+    assert implicit == explicit
+    assert [part["text"] for part in implicit] == ["你来吗", "马上就来"]
 
 
 def test_no_output_cue_renders_more_than_two_lines():
