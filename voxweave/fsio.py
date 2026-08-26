@@ -46,3 +46,25 @@ def atomic_write_text(dst: Path, text: str, *, encoding: str = "utf-8") -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+
+
+def atomic_write_text_new(dst: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Atomically create a text file, raising ``FileExistsError`` if it exists.
+
+    The completed, fsynced temp file is hard-linked into place.  Linking is an
+    atomic no-replace operation on the same filesystem, closing the race between
+    an earlier existence check and protecting user-owned sidecars.
+    """
+    dst = Path(dst)
+    fd, name = tempfile.mkstemp(
+        dir=dst.parent, prefix=f".{dst.stem}.", suffix=f".part{dst.suffix}"
+    )
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.link(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)

@@ -26,6 +26,22 @@ def test_atomic_write_text_leaves_no_temp_residue(tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["out.json"]
 
 
+def test_atomic_write_text_new_creates_without_temp_residue(tmp_path):
+    dst = tmp_path / "mapping.json"
+    fsio.atomic_write_text_new(dst, '{"version": 1}')
+    assert dst.read_text(encoding="utf-8") == '{"version": 1}'
+    assert list(tmp_path.iterdir()) == [dst]
+
+
+def test_atomic_write_text_new_refuses_existing_file(tmp_path):
+    dst = tmp_path / "mapping.json"
+    dst.write_text("user data", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        fsio.atomic_write_text_new(dst, "replacement")
+    assert dst.read_text(encoding="utf-8") == "user data"
+    assert list(tmp_path.iterdir()) == [dst]
+
+
 def test_atomic_path_failure_preserves_existing_dst(tmp_path):
     dst = tmp_path / "out.mkv"
     dst.write_bytes(b"good output from a previous run")

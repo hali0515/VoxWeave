@@ -53,6 +53,7 @@ breaks) handles Chinese/Japanese/English as first-class.
 - [Quickstart](#quickstart)
 - [Usage](#usage)
   - [Transcribe (`voxweave <media>`)](#transcribe)
+  - [Label speakers (`speakers`)](#label-speakers)
   - [Re-align after editing (`align`)](#re-align-after-editing)
   - [Re-layout offline (`split`)](#re-layout-offline)
   - [ASR correction (`correct`)](#asr-correction)
@@ -243,6 +244,30 @@ section of `~/.config/voxweave.conf` — an explicit CLI flag always wins for th
 
 </details>
 
+### Label speakers
+
+After a diarized transcription, `voxweave speakers <media>` creates an offline
+`<stem>.speakers.html` audition page and an empty `<stem>.speakers.json` mapping. The page
+embeds up to three clean, non-overlapping speech clips per diarizer id; open it directly from
+disk, listen, enter names, and copy its live JSON into the mapping file.
+
+```bash
+voxweave episode.mkv --diarize
+voxweave speakers episode.mkv
+# edit episode.speakers.json, then render names without rerunning any model
+voxweave split episode.json
+```
+
+The versioned mapping is intentionally small:
+
+```json
+{"version": 1, "speakers": {"SPEAKER_00": "Aoi"}}
+```
+
+`split` renders mapped names as WebVTT voice tags while keeping transcript text and the
+sibling JSON clean. Empty or missing names remain unlabeled. The audition command refuses to
+overwrite an existing mapping because it is user data.
+
 ### Re-align after editing
 
 `voxweave align <vtt>` — takes the edited VTT text and **re-runs forced alignment against the
@@ -361,7 +386,8 @@ voxweave translate downloaded.srt --to zh               # foreign SRT in, SRT ou
 `voxweave export <subtitle>` — convert between subtitle formats: VTT/SRT/ASS/SSA in,
 SRT/ASS/VTT out (written next to the input; the VTT + JSON pair stays the source of truth
 for voxweave-produced subtitles). ASS output carries a Default style; lyric cues (`♪ ... ♪`)
-render italic. Foreign SRT/ASS files can be exported to VTT to enter the editing workflow.
+render italic. Named VTT cues become `NAME: text` in SRT and use the ASS Dialogue `Name`
+field. Foreign SRT/ASS files can be exported to VTT to enter the editing workflow.
 
 ```bash
 voxweave export episode.vtt --to srt
@@ -591,6 +617,8 @@ Each input produces two sibling files:
 - **`<stem>.vtt`** — editable subtitles. By default cues carry word-level timestamps (same
   precision as `align` output, ready to use); `--no-timestamps` writes a plain-text editing
   draft for hand-correction, which `align` re-times.
+- **`<stem>.speakers.json`** (optional) — versioned diarizer-id-to-name display mapping. Names
+  render into VTT/SRT/ASS but never enter transcript text or `<stem>.json`.
 
 Both VTT forms are accepted by `align`. The aligner strips punctuation as a hard constraint;
 ASR punctuation is re-injected by time so the final output has correct spacing and breaks

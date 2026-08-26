@@ -10,6 +10,7 @@ from pathlib import Path
 
 from voxweave import fsio
 from voxweave.realign import render_cues
+from voxweave.speakers import voice_text_for_block
 
 log = logging.getLogger("voxweave")
 
@@ -189,21 +190,32 @@ def _layout_dash_cue(block: dict, trans_text: str | None) -> str:
 
 
 def translated_rows(
-    blocks: list[dict], trans: dict[int, str], to_iso: str | None = None
+    blocks: list[dict],
+    trans: dict[int, str],
+    to_iso: str | None = None,
+    *,
+    voice_tags: bool = True,
 ) -> list[tuple[float | None, float | None, str]]:
     """Translated text + per-block timestamps -> (start, end, text) rows;
     missing translations fall back to the original text. ``to_iso`` enables
     target-language soft-wrap (see _layout_translated). Lyric-flagged blocks
     get their music-note wrap restored after layout. Dual-speaker dash cues are
-    rendered as two unwrapped speaker lines (see :func:`_layout_dash_cue`)."""
+    rendered as two unwrapped speaker lines (see :func:`_layout_dash_cue`).
+    Parsed speaker metadata is restored as WebVTT voice tags by default; callers
+    targeting SRT/ASS disable that and hand the metadata to their renderer."""
 
     def _text(i: int, b: dict) -> str:
         if not b.get("lyric") and is_dash_cue(b["text"]):
-            return _layout_dash_cue(b, trans.get(i))
-        t = _layout_translated(
-            strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]), to_iso
-        )
-        return f"♪ {t} ♪" if b.get("lyric") else t
+            rendered = _layout_dash_cue(b, trans.get(i))
+        else:
+            t = _layout_translated(
+                strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]),
+                to_iso,
+            )
+            rendered = f"♪ {t} ♪" if b.get("lyric") else t
+        if voice_tags:
+            return voice_text_for_block(rendered, b)
+        return rendered
 
     return [(b.get("start"), b.get("end"), _text(i, b)) for i, b in enumerate(blocks)]
 

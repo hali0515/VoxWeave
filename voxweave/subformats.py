@@ -3,7 +3,7 @@
 ``realign.parse_vtt_blocks`` already reads SRT (the numeric index line and the
 comma-decimal timing line are within its tolerance), so only ASS/SSA needs a
 dedicated parser. All loaders return the realign block contract:
-``[{text, start, end, lyric?}]``.
+``[{text, start, end, lyric?, speaker?, speakers?}]``.
 """
 
 from __future__ import annotations
@@ -148,6 +148,9 @@ def parse_ass_blocks(text: str) -> list[dict]:
             if cue:
                 music_only += 1
             continue
+        name = row.get("name", "").strip()
+        if name:
+            block["speaker"] = name
         blocks.append(block)
     if music_only:
         log.info(
