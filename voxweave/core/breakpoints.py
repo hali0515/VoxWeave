@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+from typing import Any
 
 from .langsets import LANGUAGES_WITHOUT_SPACES as _NO_SPACE
 
@@ -130,6 +131,35 @@ def _load_parser(lang: str):
     return None  # th/lo/my -> per-char fallback (no bundled model wired here)
 
 
+def quiet_import_jieba(*, posseg: bool = False) -> Any:
+    """Import jieba (or jieba.posseg) without its import-time noise; None if absent.
+
+    jieba still imports pkg_resources, which setuptools >= 81 answers with a
+    UserWarning on every cold start; jieba upstream is unmaintained, so the
+    warning is filtered at the import site instead. Also silences jieba's
+    "Building prefix dict..." startup logging.
+    """
+    import warnings
+
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message=r"pkg_resources is deprecated", category=UserWarning
+            )
+            import logging
+
+            import jieba  # type: ignore
+
+            jieba.setLogLevel(logging.ERROR)
+            if posseg:
+                import jieba.posseg as pseg  # type: ignore
+
+                return pseg
+            return jieba
+    except (ImportError, ModuleNotFoundError):
+        return None
+
+
 @functools.lru_cache(maxsize=1)
 def _load_jieba():
     """Lazy jieba singleton; None if jieba is absent.
@@ -138,15 +168,7 @@ def _load_jieba():
     segments 数据中心/值得/本季度/每年. Used to snap Qwen's ~1-char-off zh punctuation
     onto real word boundaries (see :func:`voxweave.realign.snap_break_punct`).
     """
-    try:
-        import logging
-
-        import jieba  # type: ignore
-
-        jieba.setLogLevel(logging.ERROR)  # silence "Building prefix dict..."
-        return jieba
-    except ImportError:
-        return None
+    return quiet_import_jieba()
 
 
 def word_starts(text: str, lang: str) -> set[int] | None:

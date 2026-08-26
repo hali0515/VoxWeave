@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -216,24 +217,48 @@ def diarize_turns(
             "in once with `hf auth login`, or set VOXWEAVE_HF_TOKEN / HF_TOKEN "
             "(or hf_token in ~/.config/voxweave.conf)"
         )
-    pl = _get_pipeline(token)
-    kwargs: dict[str, int] = {}
-    if min_speakers is not None:
-        kwargs["min_speakers"] = min_speakers
-    if max_speakers is not None:
-        kwargs["max_speakers"] = max_speakers
-    # Feed a decoded waveform dict rather than a path: pyannote's file-path branch
-    # goes through torchaudio.info/load, which torchaudio 2.11 broke. This dict
-    # form is a first-class pyannote input and sidesteps its runtime audio I/O.
     import soundfile as sf
     import torch
 
-    data, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)  # (T, C)
-    wav = torch.from_numpy(data).T.contiguous()  # (C, T)
-    if wav.shape[0] > 1:  # defensive stereo downmix -> mono (1, T)
-        wav = wav.mean(dim=0, keepdim=True)
-    wav = wav.to(torch.float32)
-    annotation = pl({"waveform": wav, "sample_rate": int(sr)}, **kwargs)
+    # pyannote's reproducibility guard force-disables TF32 process-wide and warns
+    # whenever it finds it enabled (pyannote-audio#1370) -- which it always does,
+    # because torch enables cudnn TF32 by default and the separator deliberately
+    # opts into TF32 matmuls. Pre-comply for the diarization span so the guard
+    # stays silent, then restore the process policy so pyannote cannot turn the
+    # separator's TF32 off behind our back.
+    matmul_precision = torch.get_float32_matmul_precision()
+    cudnn_tf32 = bool(torch.backends.cudnn.allow_tf32)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        pl = _get_pipeline(token)
+        kwargs: dict[str, int] = {}
+        if min_speakers is not None:
+            kwargs["min_speakers"] = min_speakers
+        if max_speakers is not None:
+            kwargs["max_speakers"] = max_speakers
+        # Feed a decoded waveform dict rather than a path: pyannote's file-path branch
+        # goes through torchaudio.info/load, which torchaudio 2.11 broke. This dict
+        # form is a first-class pyannote input and sidesteps its runtime audio I/O.
+        data, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)  # (T, C)
+        wav = torch.from_numpy(data).T.contiguous()  # (C, T)
+        if wav.shape[0] > 1:  # defensive stereo downmix -> mono (1, T)
+            wav = wav.mean(dim=0, keepdim=True)
+        wav = wav.to(torch.float32)
+        with warnings.catch_warnings():
+            # pyannote's stat pooling hits std() on single-frame reductions for
+            # very short speaker segments; the result is guarded internally and
+            # the warning is pure noise on every episode.
+            warnings.filterwarnings(
+                "ignore", message=r"std\(\): degrees of freedom is <= 0"
+            )
+            warnings.filterwarnings(
+                "ignore", message=r"TensorFloat-32 \(TF32\) has been disabled"
+            )
+            annotation = pl({"waveform": wav, "sample_rate": int(sr)}, **kwargs)
+    finally:
+        torch.set_float32_matmul_precision(matmul_precision)
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
     turns = [
         (float(seg.start), float(seg.end), str(label))
         for seg, _, label in annotation.itertracks(yield_label=True)

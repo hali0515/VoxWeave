@@ -188,9 +188,10 @@ def zh_pos_boundary_penalties(
 
     if lang not in {"zh", "yue"}:
         return {}
-    try:
-        import jieba.posseg as pseg  # type: ignore
-    except (ImportError, ModuleNotFoundError):
+    from voxweave.core.breakpoints import quiet_import_jieba
+
+    pseg = quiet_import_jieba(posseg=True)
+    if pseg is None:
         return {}
 
     def width(surface: str) -> int:
