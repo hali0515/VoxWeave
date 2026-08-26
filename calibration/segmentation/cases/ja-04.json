@@ -5,7 +5,9 @@
   "description": "ja anime dense dialogue",
   "tags": [
     "anime",
-    "dialogue"
+    "dialogue",
+    "asr-noise",
+    "voiced-elongation"
   ],
   "license": {
     "redistributable": false,

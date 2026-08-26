@@ -5,7 +5,9 @@
   "description": "ja anime dialogue, late act",
   "tags": [
     "anime",
-    "dialogue"
+    "dialogue",
+    "heavy-asr-noise",
+    "stranded-unit"
   ],
   "license": {
     "redistributable": false,

@@ -5,7 +5,8 @@
   "description": "ja anime early dense dialogue",
   "tags": [
     "anime",
-    "dialogue"
+    "dialogue",
+    "asr-noise"
   ],
   "license": {
     "redistributable": false,

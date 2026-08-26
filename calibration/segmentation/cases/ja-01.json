@@ -5,7 +5,9 @@
   "description": "ja anime dialogue, mid-episode act",
   "tags": [
     "anime",
-    "dialogue"
+    "dialogue",
+    "asr-noise",
+    "long-unit-overhang"
   ],
   "license": {
     "redistributable": false,
