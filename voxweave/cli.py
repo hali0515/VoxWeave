@@ -286,10 +286,10 @@ def cli(verbose: bool) -> None:
         " choose host-validated word/phrase boundaries; text and source timing are"
         " immutable, while line width, maximum duration, real pauses, and guarded"
         " timing/readability scores remain host-controlled."
-        " Default: off, or conf [defaults].semantic_split; every failure falls back"
-        " to the normal splitter."
-        " (local bundled model deprecated; prefer an endpoint via"
-        " VOXWEAVE_SEMANTIC_BASE_URL)"
+        " Default: off, or conf [defaults].semantic_split; every request failure"
+        " falls back to the normal splitter."
+        " Requires an OpenAI-compatible server named by VOXWEAVE_SEMANTIC_BASE_URL;"
+        " without it the run stops immediately (no model ships with VoxWeave)."
     ),
 )
 @click.option(
@@ -390,8 +390,8 @@ cli.default_cmd = (
     help=(
         "Optionally reselect cue boundaries with Qwen; deterministic layout is the"
         " default and automatic fallback."
-        " (local bundled model deprecated; prefer an endpoint via"
-        " VOXWEAVE_SEMANTIC_BASE_URL)"
+        " Requires an OpenAI-compatible server named by VOXWEAVE_SEMANTIC_BASE_URL;"
+        " without it the run stops immediately (no model ships with VoxWeave)."
     ),
 )
 @click.option(

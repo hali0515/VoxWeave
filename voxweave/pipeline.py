@@ -1368,27 +1368,21 @@ def segment_document(
     )
 
 
-def _make_semantic_engine(enabled: bool, rep: Reporter | None = None) -> Any | None:
-    """Build the optional semantic break engine, or ``None`` when it is off/unavailable.
+def _make_semantic_engine(enabled: bool) -> Any | None:
+    """Build the optional semantic break engine, or ``None`` when it is off.
 
-    Loading it is the one non-pure step around :func:`segment_document`, so the
-    caller owns creation and release (``_release_semantic_engine``); the
+    Construction only resolves the configured backend; no model is loaded and no
+    request is sent.  A missing backend is therefore a configuration error, not a
+    runtime degradation, and is raised to the caller so ``--semantic-split``
+    fails before any model or audio work instead of after a full transcription.
+    The caller owns creation and release (``_release_semantic_engine``); the
     deterministic layout stays the source of truth either way.
     """
     if not enabled:
         return None
-    try:
-        from voxweave.semantic_breaks import SemanticBreakEngine
+    from voxweave.semantic_breaks import SemanticBreakEngine
 
-        engine = SemanticBreakEngine()
-        if rep is not None:
-            rep.stage("semantic subtitle boundaries")
-        return engine
-    except Exception as exc:  # noqa: BLE001 - optional stage must degrade safely
-        log.warning(
-            "semantic splitter unavailable; using deterministic layout (%s)", exc
-        )
-        return None
+    return SemanticBreakEngine()
 
 
 def _reconcile_word_segment_language(
@@ -1577,6 +1571,11 @@ def process(
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
+    # Resolve the optional semantic backend up front: a missing endpoint must
+    # abort here, not after a full separation/ASR/alignment run.  Construction
+    # is inert (no model load, no connection), so holding it across transcription
+    # costs nothing.
+    semantic_engine = _make_semantic_engine(semantic_split)
     vad_speech: list[tuple[float, float]] | None = None
     shot_changes: list[float] | None = None
     sing_spans: list[tuple[float, float]] | None = None
@@ -1614,8 +1613,9 @@ def process(
             rep.stage("shot detection")
             shot_changes = shotdet.detect_shot_changes(media_path)
 
-    rep.stage("smart_split layout")
-    semantic_engine = _make_semantic_engine(semantic_split, rep)
+    rep.stage(
+        "semantic subtitle boundaries" if semantic_engine else "smart_split layout"
+    )
     try:
         segmented = segment_document(
             language=iso,
@@ -1698,7 +1698,8 @@ def split(
 
     Reuses ``vad_speech`` from the sibling JSON for gap splitting; falls back to gap-only
     mode if absent. ``timestamps`` behaves as in :func:`process`.  This remains model-free
-    by default; ``semantic_split=True`` opts into the isolated boundary selector.
+    by default; ``semantic_split=True`` opts into the configured endpoint selector
+    and fails immediately when none is configured.
     """
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.

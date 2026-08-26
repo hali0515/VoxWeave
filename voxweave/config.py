@@ -22,8 +22,9 @@ DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 DEFAULT_FUSION_WHISPER = "large-v3"
 DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
 # Optional semantic subtitle boundary selector.  Kept separate from the ASR
-# model: it is loaded only behind --semantic-split in an isolated worker.  The
-# configured id is deliberately not size/version allow-listed.
+# model: behind --semantic-split this id is only the model name requested from a
+# user-run OpenAI-compatible server (VOXWEAVE_SEMANTIC_BASE_URL); VoxWeave loads
+# no model itself.  The configured id is deliberately not size/version allow-listed.
 DEFAULT_SEMANTIC_MODEL = "Qwen/Qwen3.5-0.8B"
 # Per-language aligner defaults. Unlisted languages fall back to Qwen3-ForcedAligner.
 #
@@ -103,11 +104,13 @@ _TEMPLATE = """\
 # timestamps = true    # word-level timestamps in the VTT (--timestamps/--no-timestamps)
 # shot_snap = true     # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
 # vad_mask = false     # suppress CTC emissions outside speech spans (--vad-mask/--no-vad-mask)
-# semantic_split = false # Qwen semantic boundary selection; deterministic splitter remains fallback
+# semantic_split = false # Qwen semantic boundary selection; needs VOXWEAVE_SEMANTIC_BASE_URL
 
 # Optional semantic cue-boundary model.  It never rewrites transcript text or
 # timestamps; it only chooses among host-validated word/phrase boundaries.
-# Any compatible full Qwen3.5/Qwen3.6 Hugging Face id is accepted as written.
+# This is just the model name sent to the OpenAI-compatible server named by
+# VOXWEAVE_SEMANTIC_BASE_URL (VoxWeave bundles no semantic model runtime), so
+# any id that server serves is accepted as written.
 [semantic]
 # model = "Qwen/Qwen3.5-0.8B"
 # model = "Qwen/Qwen3.5-2B"
@@ -219,10 +222,11 @@ def conf_asr_model() -> str | None:
 def conf_semantic_model() -> str:
     """Semantic boundary model.
 
-    Precedence: ``VOXWEAVE_SEMANTIC_MODEL`` > ``[semantic].model`` > the
-    built-in multilingual Qwen3.5 model.  The configured full model id is not
-    restricted by a size/version allow-list.  Loading remains opt-in; resolving
-    this string never imports a model runtime or downloads weights.
+    Precedence: ``VOXWEAVE_SEMANTIC_MODEL`` > ``[semantic].model`` > the default
+    multilingual Qwen3.5 id.  The value is the model name requested from the
+    configured OpenAI-compatible server and is not restricted by a size/version
+    allow-list.  Resolving this string never imports a model runtime, downloads
+    weights, or contacts the server.
     """
     env = _nonempty_str(os.environ.get("VOXWEAVE_SEMANTIC_MODEL"))
     if env:

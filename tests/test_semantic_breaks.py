@@ -8,7 +8,6 @@ import pytest
 from voxweave.semantic_breaks import (
     DEFAULT_SEMANTIC_MODEL,
     BoundaryTask,
-    LocalTransformersSelector,
     OpenAICompatibleSelector,
     SemanticBackendUnavailable,
     SemanticBreakEngine,
@@ -839,66 +838,6 @@ def test_openai_selector_without_endpoint_is_unavailable_without_importing_clien
     selector = OpenAICompatibleSelector()
     with pytest.raises(SemanticBackendUnavailable, match="not configured"):
         selector.select("model", [], max_new_tokens=10)
-
-
-def test_default_selector_is_isolated_local_unless_server_is_explicit(monkeypatch):
-    monkeypatch.delenv("VOXWEAVE_SEMANTIC_BASE_URL", raising=False)
-    local_engine = SemanticBreakEngine()
-    assert isinstance(local_engine.selector, LocalTransformersSelector)
-
-    monkeypatch.setenv("VOXWEAVE_SEMANTIC_BASE_URL", "http://127.0.0.1:8000/v1")
-    server_engine = SemanticBreakEngine()
-    assert isinstance(server_engine.selector, OpenAICompatibleSelector)
-
-
-def test_local_selector_isolates_hf_cache_and_propagates_offline_mode(monkeypatch):
-    monkeypatch.setenv("VOXWEAVE_CACHE_ROOT", "/tmp/voxweave-test-cache")
-    monkeypatch.setenv("VOXWEAVE_OFFLINE", "1")
-    monkeypatch.setenv("PYTHONPATH", "/parent/packages")
-    monkeypatch.setenv("VIRTUAL_ENV", "/parent/venv")
-    monkeypatch.setattr(
-        "voxweave.semantic_breaks.shutil.which", lambda _name: "/bin/uv"
-    )
-
-    env = LocalTransformersSelector._child_environment()
-    assert env["HF_HOME"] == "/tmp/voxweave-test-cache/semantic"
-    assert env["HF_HUB_CACHE"] == "/tmp/voxweave-test-cache/semantic"
-    assert env["HUGGINGFACE_HUB_CACHE"] == "/tmp/voxweave-test-cache/semantic"
-    assert env["UV_CACHE_DIR"] == "/tmp/voxweave-test-cache/semantic/uv"
-    assert env["HF_HUB_OFFLINE"] == "1"
-    assert env["TRANSFORMERS_OFFLINE"] == "1"
-    assert "PYTHONPATH" not in env
-    assert "VIRTUAL_ENV" not in env
-    command = LocalTransformersSelector._default_command()
-    assert "--offline" in command
-    assert "--locked" in command
-
-
-def test_local_selector_respects_cuda_device_with_existing_visibility(monkeypatch):
-    monkeypatch.setenv("VOXWEAVE_DEVICE", "cuda:1")
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-alpha,GPU-beta")
-    env = LocalTransformersSelector._child_environment()
-    assert env["CUDA_VISIBLE_DEVICES"] == "GPU-beta"
-    assert env["VOXWEAVE_DEVICE"] == "cuda:0"
-
-    monkeypatch.setenv("VOXWEAVE_DEVICE", "cuda:3")
-    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-    env = LocalTransformersSelector._child_environment()
-    assert env["CUDA_VISIBLE_DEVICES"] == "3"
-    assert env["VOXWEAVE_DEVICE"] == "cuda:0"
-
-
-def test_local_selector_rejects_invalid_or_hidden_cuda_device(monkeypatch):
-    monkeypatch.setenv("VOXWEAVE_DEVICE", "cuda:x")
-    with pytest.raises(SemanticBackendUnavailable, match="invalid CUDA device"):
-        LocalTransformersSelector._child_environment()
-
-    monkeypatch.setenv("VOXWEAVE_DEVICE", "cuda:2")
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
-    with pytest.raises(
-        SemanticBackendUnavailable, match="outside CUDA_VISIBLE_DEVICES"
-    ):
-        LocalTransformersSelector._child_environment()
 
 
 def test_engine_release_delegates_to_selector():

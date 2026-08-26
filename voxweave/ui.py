@@ -170,6 +170,16 @@ def _hint_for(exc: Exception) -> str:
             "GPU out of memory: lower VOXWEAVE_MAX_CHUNK_SEC or pick a smaller --model."
         )
     if isinstance(exc, RuntimeError):
+        # SemanticBackendUnavailable subclasses RuntimeError; it is a configuration
+        # error raised before any work, so the generic pipeline hint would mislead.
+        from voxweave.semantic_breaks import SemanticBackendUnavailable
+
+        if isinstance(exc, SemanticBackendUnavailable):
+            return (
+                "Semantic boundary selection needs an OpenAI-compatible server:"
+                " set VOXWEAVE_SEMANTIC_BASE_URL, or drop --semantic-split to use"
+                " the deterministic splitter."
+            )
         return "Pipeline aborted (no speech detected or no alignment result)."
     return ""
 

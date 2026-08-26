@@ -1,4 +1,4 @@
-"""Optional local-model semantic boundary selection.
+"""Optional endpoint-backed semantic boundary selection.
 
 The deterministic splitter remains the source of truth for text, timing, and
 legal word/phrase boundaries.  This module is deliberately narrower: given a
@@ -7,8 +7,9 @@ subset that reads most naturally.  It can never return replacement text.
 
 Safety properties are enforced in Python, not entrusted to the prompt:
 
-* the default local path compares host-approved layouts with symmetric
-  next-token logits; it does not generate subtitle text or a choice envelope;
+* a selector that exposes fixed-label scoring compares host-approved layouts
+  with symmetric next-token logits; it does not generate subtitle text or a
+  choice envelope;
 * external/legacy generation output is strict JSON containing offered indices;
 * legacy marker output is strict JSON containing integer indices only;
 * every selected index must be one of the caller's candidates;
@@ -16,37 +17,36 @@ Safety properties are enforced in Python, not entrusted to the prompt:
   validated;
 * every model/backend/parse/validation failure returns the caller-supplied
   deterministic fallback;
-* the FP8 model stays resident while transcript windows are scored, avoiding
-  repeated model loads without weakening per-window validation.
+* the server owns model residency, precision, and device choice; per-window
+  host validation is identical regardless of how the model is served.
 
-The default model route is ``Qwen/Qwen3.5-0.8B``.  It is only touched when the
-caller explicitly invokes :func:`choose_semantic_breaks`; importing this module
-does not import torch/transformers or download weights.  Qwen3.5/Qwen3.6
-require a newer multimodal Transformers stack than VoxWeave's CUDA ASR
-environment provides.  :class:`BoundarySelector` therefore forms an
-intentional isolation seam.  The default selector launches a persistent PEP 723
-``uv`` worker with a current Transformers stack; an explicitly configured
-OpenAI-compatible endpoint remains available.  Either backend failing simply
-selects the deterministic fallback.
+VoxWeave ships no model runtime for this path.  There is exactly one backend:
+an OpenAI-compatible server named by ``VOXWEAVE_SEMANTIC_BASE_URL``.  Qwen3.5 /
+Qwen3.6 need a newer Transformers stack than VoxWeave's CUDA ASR environment
+provides, so :class:`BoundarySelector` is an isolation seam across a process
+boundary rather than an in-process model loader; importing this module never
+imports torch/transformers or downloads weights.  ``Qwen/Qwen3.5-0.8B`` is only
+the default *model id* sent to that server.  Without the endpoint,
+:class:`SemanticBreakEngine` construction raises
+:class:`SemanticBackendUnavailable` so ``--semantic-split`` fails immediately
+instead of quietly degrading; a configured endpoint that then fails at request
+time still falls back to the deterministic result.
+
+The bundled local FP8 worker that used to serve this path was removed after its
+0.12 deprecation: its pairwise preference signal sat at the FP8 quantization
+floor, so it carried a second Torch/CUDA runtime for no measured gain.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 import os
-import queue
 import re
-import shutil
-import signal
-import subprocess
-import threading
 import unicodedata
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Protocol, cast, runtime_checkable
 
 from voxweave.core.langsets import LANGUAGES_WITHOUT_SPACES
@@ -74,24 +74,18 @@ SEMANTIC_TIMING_WORST_TOLERANCE = 10
 SEMANTIC_PRISTINE_TIMING_FLOOR = 98
 SEMANTIC_HOST_PENALTY_TOLERANCE = 2
 SEMANTIC_FALLBACK_CLEAN_TOLERANCE = 2
-DEFAULT_LOCAL_TIMEOUT = 900.0
-DEFAULT_LOCAL_WRITE_TIMEOUT = 10.0
-SEMANTIC_WORKER_PROTOCOL = 1
 
-# The bundled local worker is deprecated: it carries a second Torch/CUDA runtime
-# and an FP8 kernel constraint without a measured subtitle-quality gain.  Only
-# the local path warns; a user-managed endpoint and the deterministic default
-# splitter both stay supported.
-LOCAL_BACKEND_DEPRECATION_MESSAGE = (
-    "the bundled local FP8 semantic worker is deprecated and will be removed in a"
-    " future release; point VOXWEAVE_SEMANTIC_BASE_URL at an OpenAI-compatible"
-    " endpoint, or drop --semantic-split and keep the deterministic splitter"
-    " (both remain supported)"
+# The bundled local FP8 worker was removed after its 0.12 deprecation; an
+# OpenAI-compatible endpoint is now the only semantic backend.
+MISSING_SEMANTIC_BACKEND_MESSAGE = (
+    "the bundled local semantic worker was removed after its 0.12 deprecation;"
+    " --semantic-split now needs an OpenAI-compatible server: point"
+    " VOXWEAVE_SEMANTIC_BASE_URL at one (for example"
+    " http://127.0.0.1:8000/v1), or drop --semantic-split and keep the"
+    " deterministic splitter"
 )
-_local_backend_deprecation_warned = False
 
 _DISABLED_MODEL_VALUES = frozenset({"", "0", "false", "none", "off", "disabled"})
-_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 _LIST_SEPARATOR_PUNCT = frozenset({"、"})
 _NAME_CONNECTOR_PUNCT = frozenset({"・", "/", "／", "-", "‐", "‑", "_", "+", "&", "#"})
@@ -136,10 +130,6 @@ _LATIN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+&#./-]*$")
 
 class SemanticBackendUnavailable(RuntimeError):
     """The requested optional generation backend cannot run in this environment."""
-
-
-def _env_enabled(name: str) -> bool:
-    return os.environ.get(name, "").strip().casefold() in _TRUE_ENV_VALUES
 
 
 @runtime_checkable
@@ -1225,549 +1215,18 @@ class OpenAICompatibleSelector:
                 close()
 
 
-class LocalTransformersSelector:
-    """Persistent FP8 Qwen worker in an isolated ``uv`` script environment.
-
-    The worker is started lazily on the first semantic request.  Its PEP 723
-    dependency metadata resolves a Transformers 5.x environment independently
-    of VoxWeave's CUDA ASR environment (which is intentionally pinned to
-    Transformers 4.57.6 by qwen-asr).  The two stacks never share an interpreter.
-
-    Normal path selection uses fixed-label next-token scoring rather than text
-    generation.  The worker refuses GPUs below compute capability 8.9 before
-    model loading, because Transformers would otherwise silently dequantize
-    fine-grained FP8 to BF16.  A worker error, crash, malformed protocol line,
-    or timeout is surfaced as :class:`SemanticBackendUnavailable`; the engine
-    converts it to the deterministic boundary fallback.
-    """
-
-    def __init__(
-        self,
-        *,
-        timeout: float = DEFAULT_LOCAL_TIMEOUT,
-        write_timeout: float = DEFAULT_LOCAL_WRITE_TIMEOUT,
-        command: Sequence[str] | None = None,
-        popen_factory: Any = subprocess.Popen,
-    ):
-        if timeout <= 0:
-            raise ValueError("semantic worker timeout must be positive")
-        if write_timeout <= 0:
-            raise ValueError("semantic worker write timeout must be positive")
-        self.timeout = float(timeout)
-        self.write_timeout = float(write_timeout)
-        self._command = tuple(command) if command is not None else None
-        self._popen_factory = popen_factory
-        self._process: subprocess.Popen[str] | Any | None = None
-        self._responses: queue.Queue[tuple[str, str | None]] = queue.Queue()
-        self._stderr_tail: deque[str] = deque(maxlen=20)
-        self._request_id = 0
-        self._loaded_model_id: str | None = None
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def _default_command() -> tuple[str, ...]:
-        uv = shutil.which("uv")
-        if uv is None:
-            raise SemanticBackendUnavailable(
-                "local semantic model requires uv to launch its isolated runtime"
-            )
-        worker = Path(__file__).with_name("semantic_worker.py")
-        if not worker.is_file():
-            raise SemanticBackendUnavailable(
-                f"local semantic worker script is missing: {worker}"
-            )
-        lock = worker.with_suffix(worker.suffix + ".lock")
-        if not lock.is_file():
-            raise SemanticBackendUnavailable(
-                f"local semantic worker lock is missing: {lock}"
-            )
-        command = [uv, "run", "--locked", "--quiet", "--no-project"]
-        if _env_enabled("VOXWEAVE_OFFLINE"):
-            command.append("--offline")
-        command.extend(("--script", str(worker)))
-        return tuple(command)
-
-    @staticmethod
-    def _child_environment() -> dict[str, str]:
-        env = os.environ.copy()
-        # Do not let the parent virtualenv or an injected module path leak its
-        # Transformers 4.x packages into the PEP 723 worker.
-        env.pop("PYTHONHOME", None)
-        env.pop("PYTHONPATH", None)
-        env.pop("VIRTUAL_ENV", None)
-        cache_root = os.environ.get("VOXWEAVE_CACHE_ROOT", "").strip()
-        if cache_root:
-            semantic_cache = Path(cache_root).expanduser() / "semantic"
-        else:
-            semantic_cache = Path.home() / ".cache" / "voxweave" / "semantic"
-        env["HF_HOME"] = str(semantic_cache)
-        env["HF_HUB_CACHE"] = str(semantic_cache)
-        env["HUGGINGFACE_HUB_CACHE"] = str(semantic_cache)
-        env["UV_CACHE_DIR"] = str(semantic_cache / "uv")
-        LocalTransformersSelector._configure_cuda_visibility(env)
-        if _env_enabled("VOXWEAVE_OFFLINE"):
-            env["HF_HUB_OFFLINE"] = "1"
-            env["TRANSFORMERS_OFFLINE"] = "1"
-        return env
-
-    @staticmethod
-    def _configure_cuda_visibility(env: dict[str, str]) -> None:
-        requested = env.get("VOXWEAVE_DEVICE", "").strip().lower()
-        if not requested:
-            return
-        if requested in {"cpu", "mps"}:
-            env["CUDA_VISIBLE_DEVICES"] = ""
-            return
-        if requested == "cuda":
-            env["VOXWEAVE_DEVICE"] = "cuda:0"
-            return
-        if not requested.startswith("cuda:"):
-            raise SemanticBackendUnavailable(
-                f"unsupported VOXWEAVE_DEVICE for semantic FP8 worker: {requested}"
-            )
-        index_text = requested.partition(":")[2]
-        if not index_text.isdecimal():
-            raise SemanticBackendUnavailable(
-                f"invalid CUDA device in VOXWEAVE_DEVICE: {requested}"
-            )
-        index = int(index_text)
-        visible = [
-            item.strip()
-            for item in env.get("CUDA_VISIBLE_DEVICES", "").split(",")
-            if item.strip()
-        ]
-        if visible:
-            if index >= len(visible):
-                raise SemanticBackendUnavailable(
-                    f"VOXWEAVE_DEVICE={requested} is outside CUDA_VISIBLE_DEVICES"
-                )
-            selected = visible[index]
-        else:
-            selected = str(index)
-        env["CUDA_VISIBLE_DEVICES"] = selected
-        # The selected physical/logical GPU is the worker's only visible device.
-        env["VOXWEAVE_DEVICE"] = "cuda:0"
-
-    @staticmethod
-    def _read_stdout(
-        process: subprocess.Popen[str] | Any,
-        responses: queue.Queue[tuple[str, str | None]],
-    ) -> None:
-        stream = process.stdout
-        if stream is None:
-            responses.put(("eof", None))
-            return
-        try:
-            for line in stream:
-                responses.put(("line", line))
-        finally:
-            responses.put(("eof", None))
-
-    @staticmethod
-    def _read_stderr(
-        process: subprocess.Popen[str] | Any, stderr_tail: deque[str]
-    ) -> None:
-        stream = process.stderr
-        if stream is None:
-            return
-        for line in stream:
-            stripped = line.rstrip()
-            if stripped:
-                stderr_tail.append(stripped)
-
-    def _start(self) -> subprocess.Popen[str] | Any:
-        process = self._process
-        if process is not None and process.poll() is None:
-            return process
-        self._process = None
-        self._responses = queue.Queue()
-        self._stderr_tail = deque(maxlen=20)
-        responses = self._responses
-        stderr_tail = self._stderr_tail
-        command = self._command or self._default_command()
-        try:
-            process = self._popen_factory(
-                list(command),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,
-                env=self._child_environment(),
-                start_new_session=True,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise SemanticBackendUnavailable(
-                f"could not start local semantic worker: {exc}"
-            ) from exc
-        self._process = process
-        threading.Thread(
-            target=self._read_stdout,
-            args=(process, responses),
-            name="voxweave-semantic-stdout",
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=self._read_stderr,
-            args=(process, stderr_tail),
-            name="voxweave-semantic-stderr",
-            daemon=True,
-        ).start()
-        try:
-            hello = self._read_frame(timeout=self.timeout)
-            if hello != {
-                "op": "hello",
-                "protocol": SEMANTIC_WORKER_PROTOCOL,
-                "worker_version": "1",
-            }:
-                raise SemanticBackendUnavailable(
-                    "local semantic worker returned an incompatible hello frame"
-                )
-        except Exception:
-            self._discard_process()
-            raise
-        self._loaded_model_id = None
-        return process
-
-    def _read_frame(self, *, timeout: float) -> dict[str, Any]:
-        try:
-            kind, line = self._responses.get(timeout=timeout)
-        except queue.Empty as exc:
-            raise SemanticBackendUnavailable(
-                f"local semantic worker timed out after {timeout:g}s"
-            ) from exc
-        if kind != "line" or line is None:
-            raise SemanticBackendUnavailable(
-                self._failure_detail("local semantic worker exited unexpectedly")
-            )
-        try:
-            response = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise SemanticBackendUnavailable(
-                "local semantic worker returned malformed JSONL"
-            ) from exc
-        if not isinstance(response, dict):
-            raise SemanticBackendUnavailable(
-                "local semantic worker returned a non-object protocol frame"
-            )
-        return response
-
-    def _write_frame(
-        self, process: subprocess.Popen[str] | Any, document: Mapping[str, Any]
-    ) -> None:
-        completed: queue.Queue[Exception | None] = queue.Queue(maxsize=1)
-        payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n"
-
-        def write() -> None:
-            try:
-                if process.stdin is None:
-                    raise BrokenPipeError("worker stdin is unavailable")
-                process.stdin.write(payload)
-                process.stdin.flush()
-            except Exception as exc:  # noqa: BLE001 - forwarded to the owner thread
-                completed.put(exc)
-            else:
-                completed.put(None)
-
-        threading.Thread(
-            target=write,
-            name="voxweave-semantic-stdin",
-            daemon=True,
-        ).start()
-        try:
-            error = completed.get(timeout=self.write_timeout)
-        except queue.Empty as exc:
-            self._discard_process()
-            raise SemanticBackendUnavailable(
-                f"local semantic worker write timed out after {self.write_timeout:g}s"
-            ) from exc
-        if error is not None:
-            detail = self._failure_detail("local semantic worker input failed")
-            self._discard_process()
-            raise SemanticBackendUnavailable(detail) from error
-
-    def _ensure_loaded(
-        self, process: subprocess.Popen[str] | Any, model_id: str
-    ) -> None:
-        if self._loaded_model_id == model_id:
-            return
-        request_id = self._request_id
-        self._request_id += 1
-        self._write_frame(
-            process,
-            {"op": "load", "id": request_id, "model_id": model_id},
-        )
-        try:
-            ready = self._read_frame(timeout=self.timeout)
-        except Exception:
-            self._discard_process()
-            raise
-        if (
-            ready.get("op") == "error"
-            and ready.get("id") == request_id
-            and isinstance(ready.get("error"), str)
-        ):
-            self._discard_process()
-            raise SemanticBackendUnavailable(cast(str, ready["error"]))
-        required = {
-            "op",
-            "id",
-            "protocol",
-            "worker_version",
-            "model_id",
-            "precision",
-            "fp8_layers",
-            "torch_version",
-            "transformers_version",
-            "device",
-        }
-        if (
-            set(ready) != required
-            or ready.get("op") != "ready"
-            or ready.get("id") != request_id
-            or ready.get("protocol") != SEMANTIC_WORKER_PROTOCOL
-            or ready.get("worker_version") != "1"
-            or ready.get("model_id") != model_id
-            or ready.get("precision") != "fp8"
-            or isinstance(ready.get("fp8_layers"), bool)
-            or not isinstance(ready.get("fp8_layers"), int)
-            or cast(int, ready["fp8_layers"]) < 1
-            or not isinstance(ready.get("torch_version"), str)
-            or not isinstance(ready.get("transformers_version"), str)
-            or not isinstance(ready.get("device"), str)
-        ):
-            self._discard_process()
-            raise SemanticBackendUnavailable(
-                "local semantic worker did not prove an active FP8 model"
-            )
-        self._loaded_model_id = model_id
-        log.info(
-            "semantic model ready: %s on %s (FP8, %d verified layers; torch=%s, "
-            "transformers=%s)",
-            model_id,
-            ready["device"],
-            ready["fp8_layers"],
-            ready["torch_version"],
-            ready["transformers_version"],
-        )
-
-    def _failure_detail(self, summary: str) -> str:
-        if not self._stderr_tail:
-            return summary
-        return f"{summary}: {self._stderr_tail[-1]}"
-
-    @staticmethod
-    def _signal_process_group(process: subprocess.Popen[str] | Any, sig: int) -> None:
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, sig)
-            elif sig == signal.SIGTERM:
-                process.terminate()
-            else:
-                process.kill()
-        except (OSError, ProcessLookupError):
-            pass
-
-    def _discard_process(self) -> None:
-        process, self._process = self._process, None
-        self._loaded_model_id = None
-        if process is None:
-            return
-        try:
-            running = process.poll() is None
-        except Exception:  # noqa: BLE001 - cleanup must never mask subtitle output
-            running = True
-        if not running:
-            return
-        try:
-            self._signal_process_group(process, signal.SIGTERM)
-            try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                self._signal_process_group(process, signal.SIGKILL)
-                try:
-                    process.wait(timeout=2.0)
-                except Exception:  # noqa: BLE001 - best-effort reap
-                    pass
-        except Exception:  # noqa: BLE001 - cleanup must never mask subtitle output
-            pass
-
-    def select(
-        self,
-        model_id: str,
-        messages: list[dict[str, str]],
-        *,
-        max_new_tokens: int,
-    ) -> str:
-        with self._lock:
-            process = self._start()
-            self._ensure_loaded(process, model_id)
-            request_id = self._request_id
-            self._request_id += 1
-            request = {
-                "op": "generate",
-                "id": request_id,
-                "model_id": model_id,
-                "messages": messages,
-                "max_new_tokens": max_new_tokens,
-            }
-            try:
-                self._write_frame(process, request)
-                response = self._read_frame(timeout=self.timeout)
-            except Exception:
-                self._discard_process()
-                raise
-            if (
-                set(response) == {"op", "id", "error"}
-                and isinstance(response["error"], str)
-                and response.get("op") == "error"
-                and response.get("id") == request_id
-            ):
-                error = response["error"]
-                self._discard_process()
-                raise SemanticBackendUnavailable(error)
-            if (
-                set(response) != {"op", "id", "text"}
-                or response.get("op") != "result"
-                or response.get("id") != request_id
-                or not isinstance(response.get("text"), str)
-            ):
-                self._discard_process()
-                raise SemanticBackendUnavailable(
-                    "local semantic worker returned an invalid response schema"
-                )
-            return cast(str, response["text"])
-
-    def score_labels(
-        self,
-        model_id: str,
-        prompt_batches: Sequence[list[dict[str, str]]],
-        labels: Sequence[str],
-    ) -> list[list[float]]:
-        """Return next-token logits for fixed labels without generation."""
-
-        prompt_list = [list(messages) for messages in prompt_batches]
-        label_list = list(labels)
-        if not 1 <= len(prompt_list) <= 32:
-            raise ValueError("semantic classification needs 1..32 prompts")
-        if not 2 <= len(label_list) <= 8 or any(
-            not isinstance(label, str) or not label for label in label_list
-        ):
-            raise ValueError("semantic classification needs 2..8 labels")
-        with self._lock:
-            process = self._start()
-            self._ensure_loaded(process, model_id)
-            request_id = self._request_id
-            self._request_id += 1
-            request = {
-                "op": "classify",
-                "id": request_id,
-                "model_id": model_id,
-                "prompt_batches": prompt_list,
-                "labels": label_list,
-            }
-            try:
-                self._write_frame(process, request)
-                response = self._read_frame(timeout=self.timeout)
-            except Exception:
-                self._discard_process()
-                raise
-            if (
-                set(response) == {"op", "id", "error"}
-                and isinstance(response["error"], str)
-                and response.get("op") == "error"
-                and response.get("id") == request_id
-            ):
-                error = response["error"]
-                self._discard_process()
-                raise SemanticBackendUnavailable(error)
-            raw_scores = response.get("scores")
-            if (
-                set(response) != {"op", "id", "scores"}
-                or response.get("op") != "label_scores"
-                or response.get("id") != request_id
-                or not isinstance(raw_scores, list)
-                or len(raw_scores) != len(prompt_list)
-            ):
-                self._discard_process()
-                raise SemanticBackendUnavailable(
-                    "local semantic worker returned an invalid label-score response"
-                )
-            scores: list[list[float]] = []
-            for row in raw_scores:
-                if not isinstance(row, list) or len(row) != len(label_list):
-                    self._discard_process()
-                    raise SemanticBackendUnavailable(
-                        "local semantic worker returned an invalid label-score row"
-                    )
-                clean_row: list[float] = []
-                for value in row:
-                    if (
-                        isinstance(value, bool)
-                        or not isinstance(value, (int, float))
-                        or not math.isfinite(float(value))
-                    ):
-                        self._discard_process()
-                        raise SemanticBackendUnavailable(
-                            "local semantic worker returned non-finite label scores"
-                        )
-                    clean_row.append(float(value))
-                scores.append(clean_row)
-            return scores
-
-    def release(self) -> None:
-        try:
-            with self._lock:
-                process = self._process
-                try:
-                    if process is not None and process.poll() is None:
-                        self._write_frame(process, {"op": "shutdown"})
-                        process.wait(timeout=2.0)
-                except Exception:  # noqa: BLE001 - cleanup is always best-effort
-                    pass
-                finally:
-                    self._discard_process()
-        except Exception as exc:  # noqa: BLE001 - never overturn deterministic output
-            log.debug("semantic worker cleanup failed: %s", exc)
-
-
-def _warn_local_backend_deprecated() -> None:
-    """Warn once per process that the bundled local worker is going away."""
-
-    global _local_backend_deprecation_warned
-    if _local_backend_deprecation_warned:
-        return
-    _local_backend_deprecation_warned = True
-    log.warning(LOCAL_BACKEND_DEPRECATION_MESSAGE)
-
-
 def _default_selector() -> BoundarySelector:
-    """Use an explicit server endpoint; otherwise use the isolated local worker."""
+    """Return the endpoint selector, or refuse before any model/audio work.
+
+    The bundled local worker is gone, so an unconfigured
+    ``VOXWEAVE_SEMANTIC_BASE_URL`` is a configuration error rather than a silent
+    downgrade: raising here makes ``--semantic-split`` fail at engine
+    construction instead of after a full transcription.
+    """
 
     if os.environ.get("VOXWEAVE_SEMANTIC_BASE_URL", "").strip():
         return OpenAICompatibleSelector()
-    _warn_local_backend_deprecated()
-    timeout_text = os.environ.get("VOXWEAVE_SEMANTIC_TIMEOUT", "").strip()
-    if timeout_text:
-        try:
-            timeout = float(timeout_text)
-        except ValueError:
-            log.warning(
-                "invalid VOXWEAVE_SEMANTIC_TIMEOUT=%r; using %ss",
-                timeout_text,
-                DEFAULT_LOCAL_TIMEOUT,
-            )
-            timeout = DEFAULT_LOCAL_TIMEOUT
-        if timeout <= 0:
-            log.warning(
-                "VOXWEAVE_SEMANTIC_TIMEOUT must be positive; using %ss",
-                DEFAULT_LOCAL_TIMEOUT,
-            )
-            timeout = DEFAULT_LOCAL_TIMEOUT
-    else:
-        timeout = DEFAULT_LOCAL_TIMEOUT
-    return LocalTransformersSelector(timeout=timeout)
+    raise SemanticBackendUnavailable(MISSING_SEMANTIC_BACKEND_MESSAGE)
 
 
 class SemanticBreakEngine:
@@ -1997,7 +1456,17 @@ class SemanticBreakEngine:
             log.warning("semantic selector cleanup failed: %s", exc)
 
 
-_DEFAULT_ENGINE = SemanticBreakEngine()
+# Built on first explicit use, never at import: construction now resolves a
+# backend and raises when none is configured, and importing this module must
+# stay side-effect free for callers that never opt into --semantic-split.
+_DEFAULT_ENGINE: SemanticBreakEngine | None = None
+
+
+def _default_engine() -> SemanticBreakEngine:
+    global _DEFAULT_ENGINE
+    if _DEFAULT_ENGINE is None:
+        _DEFAULT_ENGINE = SemanticBreakEngine()
+    return _DEFAULT_ENGINE
 
 
 def choose_semantic_breaks(
@@ -2009,7 +1478,7 @@ def choose_semantic_breaks(
 ) -> list[SemanticBreakDecision]:
     """Explicit opt-in convenience wrapper around the process-level engine."""
 
-    return _DEFAULT_ENGINE.choose(
+    return _default_engine().choose(
         requests,
         model_by_language=model_by_language,
         default_model=default_model,
@@ -2020,7 +1489,10 @@ def choose_semantic_breaks(
 def release_semantic_model() -> None:
     """Idempotently release the process-level optional semantic selector."""
 
-    _DEFAULT_ENGINE.release()
+    global _DEFAULT_ENGINE
+    engine, _DEFAULT_ENGINE = _DEFAULT_ENGINE, None
+    if engine is not None:
+        engine.release()
 
 
 # Integration-friendly short names: a task contains immutable atoms and legal
@@ -2033,10 +1505,8 @@ __all__ = [
     "BoundaryDecision",
     "BoundarySelector",
     "BoundaryTask",
-    "DEFAULT_LOCAL_TIMEOUT",
     "DEFAULT_SEMANTIC_MODEL",
-    "LOCAL_BACKEND_DEPRECATION_MESSAGE",
-    "LocalTransformersSelector",
+    "MISSING_SEMANTIC_BACKEND_MESSAGE",
     "OpenAICompatibleSelector",
     "SemanticBackendUnavailable",
     "SemanticBreakDecision",
