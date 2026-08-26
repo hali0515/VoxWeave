@@ -30,7 +30,9 @@ The four gated metrics (design doc 4.5):
 ``forbidden_end_rate``
     Of the internal boundaries that had a legal in-budget source-lattice
     alternative, plus eligible document-final tails, how many leave a
-    forward-binding token dangling at the end of a cue.
+    forward-binding token dangling at the end of a cue. The rate is reported,
+    but its gate compares the raw bad count against ``baseline_bad + 1`` because
+    one event is larger than a stable rate tolerance at this corpus size.
 
 Three deliberate properties, each a fix for a flaw the 2026-08-25 audit found in
 the previous version of this script:
@@ -150,7 +152,18 @@ METRICS = (
 )
 #: ``over_7s_rate`` is gated on the raw bad *count*: one 12 s cue is a defect
 #: whether the corpus holds 200 cues or 20 000, and a rate would dilute it away.
-COUNT_METRICS = frozenset({"over_7s_rate"})
+#: ``forbidden_end_rate`` is also a count gate: at current language-group
+#: denominators a single boundary is about one percentage point, so a fractional
+#: tolerance below that quantum merely turns every event into a regression.
+COUNT_METRICS = frozenset({"over_7s_rate", "forbidden_end_rate"})
+
+#: One newly bad forbidden tail is the smallest honest tolerance. The rate and
+#: its numerator/denominator remain report columns; only the compared quantity
+#: changes to ``bad <= baseline_bad + FORBIDDEN_END_BAD_SLACK``.
+FORBIDDEN_END_BAD_SLACK = 1.0
+
+JA_TAIL_LENS_LEVEL2 = "ja-unidic-level2"
+JA_TAIL_LENS_LEVEL1 = "ja-char-table-level1"
 
 #: Initial gate table (design 4.6). ``warning`` is the landing mode: the soak
 #: phase fixes metric/corpus problems without blocking PRs. Once both the
@@ -186,9 +199,9 @@ DEFAULT_GATES: dict[str, dict[str, Any]] = {
     "forbidden_end_rate": {
         "direction": "lower_is_better",
         "mode": "warning",
-        "absolute_max": 0.02,
-        "absolute_tolerance": 0.005,
-        "relative_tolerance": 0.10,
+        "absolute_max": None,
+        "absolute_tolerance": FORBIDDEN_END_BAD_SLACK,
+        "relative_tolerance": 0.0,
         "min_samples": 100,
     },
 }
@@ -246,6 +259,57 @@ def environment_block() -> dict[str, Any]:
         "python": platform.python_version(),
         "dependencies": dependency_versions(),
     }
+
+
+def forbidden_end_ja_lens() -> dict[str, Any]:
+    """Identity of the Japanese tail scorer this process will actually use.
+
+    ``provider_snapshot`` reads the same cached tagger state as
+    :func:`kinsoku.ja_pos_end_penalties`, including ``VOXWEAVE_JA_POS=0``. A
+    Level-2 run still names its documented per-offset Level-1 fallback: MeCab
+    and the source-unit lattice need not agree on every token boundary.
+    """
+    from voxweave.core.providers import provider_snapshot
+
+    pos = provider_snapshot("ja")["pos"]
+    enabled = bool(pos.get("ja_pos_enabled"))
+    return {
+        "id": JA_TAIL_LENS_LEVEL2 if enabled else JA_TAIL_LENS_LEVEL1,
+        "source": (
+            "kinsoku.ja_pos_end_penalties" if enabled else "kinsoku.line_end_penalty"
+        ),
+        "provider": pos.get("provider"),
+        "provider_version": pos.get("version"),
+        "dictionary": pos.get("dict"),
+        "context": "punctuated-source-phrase-atom",
+        "missing_offset_fallback": JA_TAIL_LENS_LEVEL1 if enabled else None,
+    }
+
+
+def metric_definition_block() -> dict[str, Any]:
+    """Machine-readable definition details that can vary without a code edit.
+
+    The integer definition version covers reviewed semantic changes. The lens
+    identity additionally binds a baseline to the actual optional provider and
+    dictionary selected at runtime, so a Level-2 baseline can never be compared
+    with a Level-1 fallback run under the same integer version.
+    """
+    return {
+        "version": METRIC_DEFINITION_VERSION,
+        "forbidden_end": {
+            "tail_scope": "eligible-internal-plus-document-final",
+            "alternative_source": "pre-split-punctuated-source-phrase-lattice",
+            "reported_measure": "rate-with-bad-and-eligible",
+            "gate_measure": "bad-count",
+            "baseline_bad_slack": FORBIDDEN_END_BAD_SLACK,
+            "ja_tail_lens": forbidden_end_ja_lens(),
+        },
+    }
+
+
+def metric_definition_digest() -> str:
+    """Digest of :func:`metric_definition_block` for baseline compatibility."""
+    return cc.canonical_digest(metric_definition_block())
 
 
 def repo_commit() -> str | None:
@@ -739,6 +803,13 @@ def _line_end_penalty(text: str, iso: str) -> int:
     return line_end_penalty(text, iso)
 
 
+def _ja_pos_end_penalties(text: str) -> dict[int, int] | None:
+    """The production Level-2 scorer, wrapped as a testable ruler seam."""
+    from voxweave.core.kinsoku import ja_pos_end_penalties
+
+    return ja_pos_end_penalties(text)
+
+
 def _phrase_atoms(text: str, iso: str) -> list[str]:
     from voxweave.core.breakpoints import phrase_atoms
 
@@ -1049,6 +1120,77 @@ def phrase_start_offsets(
     return starts, unit_offsets
 
 
+def _source_span_text(
+    units: Sequence[Mapping[str, Any]], start_unit: int, end_unit: int, iso: str
+) -> str:
+    """One inclusive, punctuated source span in the phrase-lattice join mode."""
+    join = "" if _no_space(iso) else " "
+    return join.join(
+        str(unit.get("text") or "") for unit in units[start_unit : end_unit + 1]
+    )
+
+
+def _forbidden_tail_penalty(
+    units: Sequence[Mapping[str, Any]],
+    unit_offsets: Sequence[int],
+    *,
+    start_unit: int,
+    end_unit: int,
+    context_end_unit: int | None = None,
+    display_text: str,
+    iso: str,
+    ja_pos_cache: dict[str, dict[int, int] | None] | None,
+) -> int:
+    """Score one cue/candidate tail with the language's metric lens.
+
+    Japanese locates the atom carrying this tail in the pre-split phrase lattice
+    of the complete *punctuated source prefix*, then runs Level 2 on that source
+    atom. It never reads a display token. ``context_end_unit`` lets a mapped
+    lexical tail retain punctuation-only units omitted from ``word_data``
+    (``お、 | うじゃ``), while the lookup stays on ``end_unit`` rather than
+    grading the comma. The right-hand lexical head is never included. Maps are
+    cached by atom text. When POS is unavailable, or the tail offset lands
+    inside a MeCab token, this follows the production scorer's documented
+    Level-1 char-table fallback. Other languages retain their display-tail
+    surface lens.
+    """
+    if iso != "ja":
+        return _line_end_penalty(_tail_token(display_text, iso), iso)
+    context_end = end_unit if context_end_unit is None else context_end_unit
+    if not (
+        0 <= start_unit <= end_unit <= context_end < len(units)
+        and len(unit_offsets) == len(units)
+    ):
+        return 0
+    source_tail = str(units[end_unit].get("text") or "")
+    source_text = _source_span_text(units, start_unit, context_end, iso)
+    target_offset = (
+        unit_offsets[end_unit]
+        - unit_offsets[start_unit]
+        + _reading_chars(source_tail)
+        - 1
+    )
+    atom_start = 0
+    for atom in _phrase_atoms(source_text, iso):
+        atom_width = _reading_chars(atom)
+        if atom_width <= 0:
+            continue
+        if atom_start <= target_offset < atom_start + atom_width:
+            if ja_pos_cache is not None and atom in ja_pos_cache:
+                pos_penalties = ja_pos_cache[atom]
+            else:
+                pos_penalties = _ja_pos_end_penalties(atom)
+                if ja_pos_cache is not None:
+                    ja_pos_cache[atom] = pos_penalties
+            if pos_penalties is not None:
+                pos_penalty = pos_penalties.get(target_offset - atom_start)
+                if pos_penalty is not None:
+                    return int(pos_penalty)
+            break
+        atom_start += atom_width
+    return _line_end_penalty(source_tail, iso)
+
+
 def has_legal_alternative(
     units: Sequence[Mapping[str, Any]],
     phrase_starts: set[int],
@@ -1060,6 +1202,7 @@ def has_legal_alternative(
     iso: str,
     max_line_length: int,
     max_lines: int,
+    ja_pos_cache: dict[str, dict[int, int] | None] | None = None,
 ) -> bool:
     """True when a source-lattice alternative fits the same two-cue budget.
 
@@ -1098,7 +1241,18 @@ def has_legal_alternative(
         )
         if not lhs.strip() or not rhs.strip():
             continue
-        if _line_end_penalty(_tail_token(lhs, iso), iso) >= 2:
+        if (
+            _forbidden_tail_penalty(
+                units,
+                unit_offsets,
+                start_unit=span_start_unit,
+                end_unit=unit_cut - 1,
+                display_text=lhs,
+                iso=iso,
+                ja_pos_cache=ja_pos_cache,
+            )
+            >= 2
+        ):
             continue
         if not _fits_budget(lhs, max_line_length, max_lines, iso):
             continue
@@ -1170,6 +1324,7 @@ def measure_case(case: Case, result: Any) -> CaseMeasurement:
             ],
         )
     starts, unit_offsets = phrase_start_offsets(units, iso)
+    ja_pos_cache: dict[str, dict[int, int] | None] | None = {} if iso == "ja" else None
     multichar = _has_multichar_phrases(iso)
 
     measurement = CaseMeasurement(case_id=case.id, language=iso, cue_count=len(cues))
@@ -1281,12 +1436,25 @@ def measure_case(case: Case, result: Any) -> CaseMeasurement:
             iso=iso,
             max_line_length=max_line_length,
             max_lines=max_lines,
+            ja_pos_cache=ja_pos_cache,
         ):
             no_alternative += 1
             continue
         forbidden_eligible += 1
         tail = _tail_token(str(left_cue.get("text") or ""), iso)
-        if tail and _line_end_penalty(tail, iso) >= 2:
+        if tail and (
+            _forbidden_tail_penalty(
+                units,
+                unit_offsets,
+                start_unit=boundary.span_start_unit,
+                end_unit=boundary.left_unit,
+                context_end_unit=boundary.right_unit - 1,
+                display_text=str(left_cue.get("text") or ""),
+                iso=iso,
+                ja_pos_cache=ja_pos_cache,
+            )
+            >= 2
+        ):
             forbidden_bad += 1
             forbidden_offenders.append(
                 # Ranked the same way: a dangling particle with no pause behind
@@ -1316,7 +1484,18 @@ def measure_case(case: Case, result: Any) -> CaseMeasurement:
                 final_tail_eligible += 1
                 forbidden_eligible += 1
                 tail = _tail_token(str(cues[i].get("text") or ""), iso)
-                if tail and _line_end_penalty(tail, iso) >= 2:
+                if tail and (
+                    _forbidden_tail_penalty(
+                        units,
+                        unit_offsets,
+                        start_unit=0,
+                        end_unit=len(units) - 1,
+                        display_text=str(cues[i].get("text") or ""),
+                        iso=iso,
+                        ja_pos_cache=ja_pos_cache,
+                    )
+                    >= 2
+                ):
                     forbidden_bad += 1
                     forbidden_offenders.append(
                         _offender(
@@ -1565,6 +1744,10 @@ def evaluate_gates(
         allowed = baseline + max(absolute_tolerance, baseline * relative_tolerance)
         passed  = value <= allowed and (absolute_max is None or value <= absolute_max)
 
+    For ``forbidden_end_rate``, ``value`` is the raw bad count and its configured
+    tolerances reduce that formula to ``baseline_bad + 1``. The result also
+    carries the reported rate and its numerator/denominator explicitly.
+
     A group whose denominator is under ``min_samples`` reports
     ``insufficient_samples``: with the corpus fixed at 20 cases that is a corpus
     defect, not a pass, and the caller turns it into exit 2 for a blocking gate.
@@ -1611,6 +1794,15 @@ def evaluate_gates(
                 "allowed_by_baseline": None,
                 "reasons": [],
             }
+            if metric == "forbidden_end_rate":
+                ratio = block[metric]
+                result.update(
+                    {
+                        "numerator": int(ratio["bad"]),
+                        "denominator": int(ratio["eligible"]),
+                        "reported_rate": ratio["value"],
+                    }
+                )
             if mode == "disabled":
                 result["status"] = "disabled"
                 results.append(result)
@@ -1683,10 +1875,30 @@ def load_baseline(path: str | Path, corpus: Corpus) -> dict[str, Any]:
     """
     baseline = cc.load_validated_json(path, BASELINE_SCHEMA, label=str(path))
     problems: list[str] = []
+    live_definition = metric_definition_block()
+    live_definition_digest = cc.canonical_digest(live_definition)
     if baseline["metric_definition_version"] != METRIC_DEFINITION_VERSION:
         problems.append(
             f"metric_definition_version {baseline['metric_definition_version']} "
             f"!= {METRIC_DEFINITION_VERSION} implemented here"
+        )
+    if baseline["metric_definition_digest"] != live_definition_digest:
+        recorded_lens = (
+            baseline.get("metric_definition", {})
+            .get("forbidden_end", {})
+            .get("ja_tail_lens", {})
+            .get("id")
+        )
+        live_lens = live_definition["forbidden_end"]["ja_tail_lens"]["id"]
+        problems.append(
+            "metric_definition_digest "
+            f"{baseline['metric_definition_digest'][:12]}... != current "
+            f"{live_definition_digest[:12]}... (ja lens {recorded_lens!r} != "
+            f"{live_lens!r}, or another metric-definition detail changed)"
+        )
+    elif baseline["metric_definition"] != live_definition:
+        problems.append(
+            "metric_definition content does not match its current digest definition"
         )
     if baseline["corpus_digest"] != corpus.digest:
         problems.append(
@@ -1724,6 +1936,8 @@ def baseline_from_report(report: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "metric_definition_version": METRIC_DEFINITION_VERSION,
+        "metric_definition": report["metric_definition"],
+        "metric_definition_digest": report["metric_definition_digest"],
         "corpus_digest": report["corpus_digest"],
         "generated_from_commit": report["generated_from_commit"],
         "environment": report["environment"],
@@ -1756,6 +1970,11 @@ def gates_schema() -> dict[str, Any]:
     }
 
 
+def metric_definition_schema() -> dict[str, Any]:
+    schema = cc.load_schema(BASELINE_SCHEMA)
+    return {**schema["$defs"]["metric_definition"], "$defs": schema["$defs"]}
+
+
 def validate_report(report: Mapping[str, Any]) -> None:
     """Hold a report to the tracked contracts it shares with the baseline."""
     errors: list[str] = []
@@ -1765,6 +1984,16 @@ def validate_report(report: Mapping[str, Any]) -> None:
     errors.extend(
         f"gates/{e}" for e in cc.schema_errors(report["gates"], gates_schema())
     )
+    errors.extend(
+        f"metric_definition/{e}"
+        for e in cc.schema_errors(
+            report["metric_definition"], metric_definition_schema()
+        )
+    )
+    if report["metric_definition_digest"] != cc.canonical_digest(
+        report["metric_definition"]
+    ):
+        errors.append("metric_definition_digest does not match metric_definition")
     if errors:
         raise cc.CalibrationError("the generated report is not schema-valid", errors)
 
@@ -1781,9 +2010,12 @@ def build_report(
     warnings: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Assemble the report the gates were evaluated on -- one aggregation, not two."""
+    definition = metric_definition_block()
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "metric_definition_version": METRIC_DEFINITION_VERSION,
+        "metric_definition": definition,
+        "metric_definition_digest": cc.canonical_digest(definition),
         "kind": "segmentation-report",
         "corpus": {
             "path": str(corpus.path),
@@ -1892,10 +2124,24 @@ def _ratio_cell(ratio: Mapping[str, Any]) -> str:
     return f"{_fmt(ratio['value'])} ({ratio['bad']}/{ratio['eligible']})"
 
 
+def _gate_value_cell(result: Mapping[str, Any]) -> str:
+    """Human gate claim, preserving forbidden-end counts beside its rate."""
+    if result["metric"] == "forbidden_end_rate":
+        value = result.get("value")
+        count = "n/a" if value is None else str(int(float(value)))
+        return (
+            f"bad_count={count} rate={_fmt(result.get('reported_rate'))} "
+            f"({result.get('numerator')}/{result.get('denominator')})"
+        )
+    return f"value={_fmt(result.get('value'))}"
+
+
 def print_summary(report: Mapping[str, Any]) -> None:
     groups = report["groups"]
+    lens = report["metric_definition"]["forbidden_end"]["ja_tail_lens"]
     print(f"corpus   : {report['corpus']['path']}")
     print(f"digest   : {report['corpus_digest'][:16]}...")
+    print(f"metric   : {report['metric_definition_digest'][:16]}... ja-tail={lens['id']}")
     print(f"cases    : {report['corpus']['case_count']}")
     print()
     print(
@@ -1930,7 +2176,7 @@ def print_summary(report: Mapping[str, Any]) -> None:
             reasons = "; ".join(result["reasons"])
             print(
                 f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
-                f" {result['mode']:<8} value={_fmt(result['value'])}"
+                f" {result['mode']:<8} {_gate_value_cell(result)}"
                 + (f"  {reasons}" if reasons else "")
             )
     for warning in report.get("warnings") or ():
@@ -2092,6 +2338,8 @@ def cmd_record_baseline(args: argparse.Namespace) -> int:
     corpus = load_corpus(args.corpus)
     report = cc.read_json(args.report)
     problems: list[str] = []
+    live_definition = metric_definition_block()
+    live_definition_digest = cc.canonical_digest(live_definition)
     if report.get("kind") != "segmentation-report":
         problems.append(f"{args.report} is not a segmentation report")
     if report.get("partial"):
@@ -2100,6 +2348,14 @@ def cmd_record_baseline(args: argparse.Namespace) -> int:
         problems.append(
             f"report metric_definition_version {report.get('metric_definition_version')}"
             f" != {METRIC_DEFINITION_VERSION}"
+        )
+    if report.get("metric_definition") != live_definition:
+        problems.append(
+            "report metric_definition does not match the scorer selected in this process"
+        )
+    if report.get("metric_definition_digest") != live_definition_digest:
+        problems.append(
+            "report metric_definition_digest does not match the current metric definition"
         )
     if report.get("corpus_digest") != corpus.digest:
         problems.append(
@@ -2350,9 +2606,9 @@ SHADOW_GATES: dict[str, dict[str, Any]] = {
     "forbidden_end_rate": {
         "direction": "lower_is_better",
         "mode": "warning",
-        "absolute_max": 0.02,
-        "absolute_tolerance": 0.005,
-        "relative_tolerance": 0.10,
+        "absolute_max": None,
+        "absolute_tolerance": FORBIDDEN_END_BAD_SLACK,
+        "relative_tolerance": 0.0,
         "min_samples": 100,
     },
 }
@@ -3757,6 +4013,7 @@ def build_shadow_report(
     warnings: Sequence[str],
 ) -> dict[str, Any]:
     """Assemble the shadow report -- its own file, sharing no block with quality."""
+    definition = metric_definition_block()
     first = shadow_cases[0].artifact if shadow_cases else {}
     features: dict[str, list[dict[str, Any]]] = {}
     for row in shadow_cases:
@@ -3769,6 +4026,8 @@ def build_shadow_report(
     report: dict[str, Any] = {
         "schema_version": SHADOW_SCHEMA_VERSION,
         "metric_definition_version": METRIC_DEFINITION_VERSION,
+        "metric_definition": definition,
+        "metric_definition_digest": cc.canonical_digest(definition),
         "kind": SHADOW_REPORT_KIND,
         "corpus": {
             "path": str(corpus.path),
@@ -3795,6 +4054,7 @@ def build_shadow_report(
             else {
                 "path": baseline_path,
                 "corpus_digest": baseline["corpus_digest"],
+                "metric_definition_digest": baseline["metric_definition_digest"],
                 "generated_from_commit": baseline.get("generated_from_commit"),
             }
         ),
@@ -3881,8 +4141,10 @@ def build_shadow_report(
 
 def print_shadow_summary(report: Mapping[str, Any]) -> None:
     lanes = report["lanes"]
+    lens = report["metric_definition"]["forbidden_end"]["ja_tail_lens"]
     print(f"corpus   : {report['corpus']['path']}")
     print(f"digest   : {report['corpus_digest'][:16]}...")
+    print(f"metric   : {report['metric_definition_digest'][:16]}... ja-tail={lens['id']}")
     print(f"engine   : {report['engine_v2']} policy={report['policy_version']}")
     for lane in SHADOW_LANES:
         block = lanes.get(lane) or {}
@@ -3921,7 +4183,7 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
             reasons = "; ".join(result["reasons"])
             print(
                 f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
-                f" {result['mode']:<8} value={_fmt(result['value'])}"
+                f" {result['mode']:<8} {_gate_value_cell(result)}"
                 + (f"  {reasons}" if reasons else "")
             )
     coverage = report["coverage"]

@@ -222,6 +222,12 @@ def test_shadow_gates_are_three_blocking_and_one_warning() -> None:
         "over_7s_rate",
     ]
     assert modes["forbidden_end_rate"] == "warning"
+    forbidden = calib.SHADOW_GATES["forbidden_end_rate"]
+    assert forbidden["absolute_max"] is None
+    assert forbidden["absolute_tolerance"] == calib.FORBIDDEN_END_BAD_SLACK
+    assert forbidden["relative_tolerance"] == 0.0
+    assert forbidden["min_samples"] == 100
+    assert "forbidden_end_rate" in calib.COUNT_METRICS
 
 
 def test_harness_names_match_the_hook_it_reads() -> None:
@@ -396,6 +402,9 @@ def test_shadow_cli_writes_a_report_and_leaves_quality_alone(
     assert code == cc.EXIT_OK
     report = json.loads(out.read_text(encoding="utf-8"))
     assert report["kind"] == calib.SHADOW_REPORT_KIND
+    assert report["metric_definition_digest"] == cc.canonical_digest(
+        report["metric_definition"]
+    )
     assert report["gated_lane"] == calib.SHADOW_LANE_DELIVERY
     assert set(report["lanes"]) == set(calib.SHADOW_LANES)
     assert report["ablation"] is None

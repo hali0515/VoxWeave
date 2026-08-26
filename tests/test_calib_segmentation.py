@@ -547,6 +547,105 @@ def test_document_final_sentence_punctuation_excludes_the_tail() -> None:
     assert measurement.diagnostics["terminal_final_tails"] == 1
 
 
+def test_ja_final_tail_uses_level2_pos_instead_of_the_char_false_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """UniDic identifies final ``あの`` as a legal filler even though L1 sees の."""
+    units = char_units("あの", dur=0.5)
+    doc = make_case("ja-01", "ja", units)
+    cues = [cue("あの", 0.0, 1.0, units)]
+
+    monkeypatch.setattr(calib, "_ja_pos_end_penalties", lambda text: {1: 0})
+    level2 = calib.measure_case(as_case(doc), Replayed(cues))
+    assert level2.ratios["forbidden_end_rate"] == cc.Ratio(0, 1)
+
+    monkeypatch.setattr(calib, "_ja_pos_end_penalties", lambda text: None)
+    fallback = calib.measure_case(as_case(doc), Replayed(cues))
+    assert fallback.ratios["forbidden_end_rate"] == cc.Ratio(1, 1)
+
+
+def test_ja_alternative_legality_uses_the_same_level2_source_offset_lens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An L1-clean 連体詞 tail is not a legal alternative under UniDic L2."""
+    units = char_units("いわゆる猫犬", dur=0.5)
+    starts = {0, 4, 5, 6}
+    offsets = list(range(6))
+
+    # Level 1 sees final る as clean. Level 2 scores the whole-source token
+    # いわゆる (ending at offset 3) as a forward-binding 連体詞.
+    monkeypatch.setattr(calib, "_ja_pos_end_penalties", lambda text: None)
+    assert calib.has_legal_alternative(
+        units,
+        starts,
+        offsets,
+        span_start_unit=0,
+        actual_right_unit=5,
+        span_end_unit=5,
+        iso="ja",
+        max_line_length=5,
+        max_lines=1,
+    )
+    monkeypatch.setattr(calib, "_ja_pos_end_penalties", lambda text: {3: 2})
+    assert not calib.has_legal_alternative(
+        units,
+        starts,
+        offsets,
+        span_start_unit=0,
+        actual_right_unit=5,
+        span_end_unit=5,
+        iso="ja",
+        max_line_length=5,
+        max_lines=1,
+    )
+
+
+def test_ja_level2_map_uses_the_atom_from_the_punctuated_source_lattice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    units = char_units("これは、あの", dur=0.4)
+    seen: list[str] = []
+
+    def capture_source(text: str) -> dict[int, int]:
+        seen.append(text)
+        return {1: 0}
+
+    monkeypatch.setattr(calib, "_ja_pos_end_penalties", capture_source)
+    doc = make_case("ja-01", "ja", units)
+    cues = [cue("これは あの", 0.0, units[-1]["end"], units)]
+    calib.measure_case(as_case(doc), Replayed(cues))
+
+    assert calib._source_span_text(units, 0, len(units) - 1, "ja") == "これは、あの"
+    assert seen == ["あの"]
+
+
+def test_ja_level2_tail_keeps_punctuation_only_units_in_its_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    units = char_units("お、猫", dur=0.4)
+    _, offsets = calib.phrase_start_offsets(units, "ja")
+    seen: list[str] = []
+
+    def punctuation_disambiguates(text: str) -> dict[int, int]:
+        seen.append(text)
+        return {0: 0, 1: 0}
+
+    monkeypatch.setattr(calib, "_ja_pos_end_penalties", punctuation_disambiguates)
+    penalty = calib._forbidden_tail_penalty(
+        units,
+        offsets,
+        start_unit=0,
+        end_unit=0,
+        context_end_unit=1,
+        display_text="お",
+        iso="ja",
+        ja_pos_cache={},
+    )
+
+    assert penalty == 0
+    assert seen == ["お、"]
+
+
 def test_legal_alternative_uses_the_pre_split_source_lattice(monkeypatch) -> None:
     units = char_units("甲乙丙丁戊己", dur=0.5)
     units[-1]["text"] = "己。"
@@ -973,6 +1072,41 @@ def test_over_7s_is_gated_on_the_raw_count_not_a_diluted_rate() -> None:
     assert result["status"] == "fail"
 
 
+def test_forbidden_end_gate_compares_bad_count_with_one_event_slack() -> None:
+    gates = {m: _gate(m, mode="disabled") for m in calib.METRICS}
+    gates["forbidden_end_rate"] = _gate("forbidden_end_rate")
+    baseline = {
+        "groups": _groups_with(
+            "zh", forbidden_end_rate={"bad": 2, "eligible": 100, "value": 0.02}
+        )
+    }
+
+    at_slack = _groups_with(
+        "zh", forbidden_end_rate={"bad": 3, "eligible": 400, "value": 0.0075}
+    )
+    result = next(
+        row
+        for row in calib.evaluate_gates(at_slack, gates, baseline)
+        if row["metric"] == "forbidden_end_rate"
+    )
+    assert result["measure"] == "count"
+    assert result["value"] == 3.0
+    assert result["allowed_by_baseline"] == 3.0
+    assert result["status"] == "pass"
+    assert (result["numerator"], result["denominator"]) == (3, 400)
+    assert result["reported_rate"] == pytest.approx(0.0075)
+
+    over_slack = _groups_with(
+        "zh", forbidden_end_rate={"bad": 4, "eligible": 1000, "value": 0.004}
+    )
+    result = next(
+        row
+        for row in calib.evaluate_gates(over_slack, gates, baseline)
+        if row["metric"] == "forbidden_end_rate"
+    )
+    assert result["status"] == "fail"
+
+
 def test_thin_denominator_is_invalid_not_a_pass() -> None:
     """A gate that cannot be measured has no standing to say "pass"."""
     gates = {m: _gate(m, min_samples=100) for m in calib.METRICS}
@@ -1202,6 +1336,19 @@ def test_report_keeps_numerator_denominator_and_offenders(
     assert set(report["offenders"]) == set(calib.METRICS)
     assert report["corpus"]["case_count"] == 20
     assert len(report["cases"]) == 20
+    assert report["metric_definition_digest"] == cc.canonical_digest(
+        report["metric_definition"]
+    )
+    lens = report["metric_definition"]["forbidden_end"]["ja_tail_lens"]
+    assert lens["id"] in {calib.JA_TAIL_LENS_LEVEL2, calib.JA_TAIL_LENS_LEVEL1}
+    forbidden_claims = [
+        row for row in report["gate_results"] if row["metric"] == "forbidden_end_rate"
+    ]
+    assert forbidden_claims
+    assert all(
+        {"numerator", "denominator", "reported_rate"} <= set(row)
+        for row in forbidden_claims
+    )
 
 
 def test_report_groups_match_the_tracked_baseline_contract(
@@ -1324,6 +1471,54 @@ def test_baseline_digest_mismatch_exits_2(corpus_path: Path, tmp_path: Path) -> 
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     baseline["corpus_digest"] = "f" * 64
     baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+    assert (
+        run_cli(
+            [
+                "evaluate",
+                "--corpus",
+                str(corpus_path),
+                "--baseline",
+                str(baseline_path),
+                "--check",
+            ]
+        )
+        == cc.EXIT_INVALID
+    )
+
+
+def test_baseline_from_another_ja_lens_exits_2(
+    corpus_path: Path, tmp_path: Path
+) -> None:
+    baseline_path = _record(corpus_path, tmp_path)
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    lens = baseline["metric_definition"]["forbidden_end"]["ja_tail_lens"]
+    if lens["id"] == calib.JA_TAIL_LENS_LEVEL2:
+        lens.update(
+            {
+                "id": calib.JA_TAIL_LENS_LEVEL1,
+                "source": "kinsoku.line_end_penalty",
+                "provider": None,
+                "provider_version": None,
+                "dictionary": None,
+                "missing_offset_fallback": None,
+            }
+        )
+    else:
+        lens.update(
+            {
+                "id": calib.JA_TAIL_LENS_LEVEL2,
+                "source": "kinsoku.ja_pos_end_penalties",
+                "provider": "fugashi-unidic",
+                "provider_version": "different",
+                "dictionary": "different",
+                "missing_offset_fallback": calib.JA_TAIL_LENS_LEVEL1,
+            }
+        )
+    baseline["metric_definition_digest"] = cc.canonical_digest(
+        baseline["metric_definition"]
+    )
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
     assert (
         run_cli(
             [
