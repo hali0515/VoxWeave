@@ -897,8 +897,8 @@ def _locate_clause_units(
     position: int,
     *,
     anchored: bool,
-) -> tuple[list[Unit], int]:
-    """Return ``(units, next_cursor)`` for the clause at ``position``.
+) -> tuple[list[Unit], int, bool]:
+    """Return ``(units, next_cursor, located)`` for the clause at ``position``.
 
     The blind index cursor is only trusted where the clause's content actually
     sits. ``_anchor_cursor`` repairs a local slip; a wider one (a ghost run, a
@@ -907,10 +907,18 @@ def _locate_clause_units(
     text but gets proportional timing across the window up to the next locatable
     clause, and the cursor resyncs on that clause's content — so the damage stops
     at the one clause instead of shifting every later cue in the segment.
+
+    ``located`` is False only on that proportional path: its unit times are
+    invented tiling, not measurements, so callers must not promote them to
+    acoustic anchors.
     """
     plan = plans[position]
     if not anchored or not plan.anchor_tokens:
-        return word_data[cursor : cursor + plan.unit_count], cursor + plan.unit_count
+        return (
+            word_data[cursor : cursor + plan.unit_count],
+            cursor + plan.unit_count,
+            True,
+        )
     local, ok = _anchor_cursor(word_data, cursor, plan.anchor_tokens)
     start_at: int | None = (
         local
@@ -927,7 +935,7 @@ def _locate_clause_units(
                 start_at,
             )
         end_at = start_at + plan.unit_count
-        return word_data[start_at:end_at], end_at
+        return word_data[start_at:end_at], end_at, True
     resume = _resync_position(word_data, index, cursor, plans, position)
     # No resync point in reach: fall back to the blind span so later clauses can
     # still re-anchor themselves instead of being starved of units.
@@ -944,7 +952,7 @@ def _locate_clause_units(
         window_end,
     )
     filled = _proportional_units(plan.anchor_tokens, word_data[cursor:window_end])
-    return filled, window_end
+    return filled, window_end, False
 
 
 def split_at_sentence_end(
@@ -974,7 +982,7 @@ def split_at_sentence_end(
     anchored = bool(word_data) and "word" in word_data[0]
     index = _unit_word_index(word_data) if anchored else {}
     for position, plan in enumerate(plans):
-        chunk_words, cursor = _locate_clause_units(
+        chunk_words, cursor, located = _locate_clause_units(
             word_data, index, cursor, plans, position, anchored=anchored
         )
         if chunk_words:
@@ -982,9 +990,10 @@ def split_at_sentence_end(
             end = next((w["end"] for w in reversed(chunk_words) if "end" in w), None)
         else:
             start = end = None
-        # The raw clause span doubles as the acoustic anchor while it exists; the
-        # fabricated fallback below invents time, which is not evidence.
-        speech_start, speech_end = start, end
+        # The raw clause span doubles as the acoustic anchor only when the units
+        # were actually located; proportional tiling and the fabricated fallback
+        # below invent time, which is not evidence.
+        speech_start, speech_end = (start, end) if located else (None, None)
         if start is None or end is None:
             # No timing data: extend from previous cue end or estimate from word count
             prev_end = cues[-1]["end"] if cues else 0.0

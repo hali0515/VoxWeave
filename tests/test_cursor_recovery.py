@@ -131,3 +131,23 @@ def test_clean_stream_needs_no_recovery(caplog):
     _assert_paired(cues, "en")
     assert cues[0]["start"] == pytest.approx(0.0)
     assert not _messages(caplog)
+
+
+def test_proportional_fill_does_not_mint_speech_anchors():
+    # Proportional tiling invents time: it keeps the cue displayable but is not
+    # acoustic evidence, so the cue must carry speech_start/speech_end = None
+    # while located neighbours keep anchors equal to their real unit spans.
+    s2 = S2.split()
+    stream = S1.split() + s2[:5] + GHOSTS + s2[5:] + S3.split() + S4.split()
+    cues = split_at_sentence_end(TEXT, _units(stream), "en", 42, 2)
+    assert [c["text"].strip() for c in cues] == [S1, S2, S3, S4]
+
+    fabricated = cues[1]
+    assert fabricated["speech_start"] is None
+    assert fabricated["speech_end"] is None
+    # Display timing stays usable regardless.
+    assert fabricated["start"] < fabricated["end"]
+
+    for cue in (cues[0], cues[2], cues[3]):
+        assert cue["speech_start"] == pytest.approx(cue["word_data"][0]["start"])
+        assert cue["speech_end"] == pytest.approx(cue["word_data"][-1]["end"])
