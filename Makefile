@@ -1,5 +1,6 @@
 .PHONY: install reinstall uninstall dev test lint typecheck \
-	quality quality-segmentation quality-record-segmentation
+	quality quality-segmentation quality-shadow-segmentation \
+	quality-record-segmentation
 
 # Install as a global uv tool (end-user mode): puts the voxweave command on PATH.
 # The separation / layout / song-skip / CJK-break / translation pipeline is baked into the core
@@ -102,6 +103,7 @@ typecheck:
 SEG_CORPUS ?= calibration/segmentation/corpus.json
 SEG_BASELINE ?= calibration/segmentation/baseline.json
 SEG_REPORT ?= build/calibration/segmentation-report.json
+SEG_SHADOW_REPORT ?= build/calibration/segmentation-shadow-report.json
 
 # `quality` is only the public, zero-GPU, deterministic lane: no media, no model, no
 # network, runnable from a bare checkout. The alignment ruler needs private media and
@@ -113,6 +115,17 @@ quality-segmentation:
 	  --corpus $(SEG_CORPUS) \
 	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \
 	  --json-out $(SEG_REPORT) --check
+
+# P4: the BoundaryOptimizer v2 shadow lane, measured beside the shipped v1 answer.
+# Same corpus, same baseline, same environment as `quality-segmentation` -- the
+# non-inferiority numbers are only comparable against a baseline recorded here.
+# Deliberately NOT part of `quality`: the shadow ships nothing, so a v2 regression
+# during soak must not block a PR that changed neither engine.
+quality-shadow-segmentation:
+	uv run python scripts/calib_segmentation.py shadow \
+	  --corpus $(SEG_CORPUS) \
+	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \
+	  --json-out $(SEG_SHADOW_REPORT) --check
 
 # Deliberately not part of `quality`, and never run by CI: recording a baseline is a
 # reviewed human action, or a regression can be laundered into the new normal.

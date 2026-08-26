@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from voxweave import asrfix as asrfix_mod
 from voxweave import backend, chunking, fsio, realign, songdet
@@ -50,6 +50,11 @@ from voxweave.songdet import (
     subtract_spans,
 )
 from voxweave.timestamps import shift_units
+
+if TYPE_CHECKING:  # the v2 shadow is import-free unless its flag is on
+    from voxweave.core.boundary_lattice import AtomLayer
+    from voxweave.core.boundary_v2 import DocumentSolution
+    from voxweave.core.partition_check import Origin, Stage
 
 log = logging.getLogger("voxweave")
 
@@ -1152,6 +1157,12 @@ class SegmentationResult:
     summarizing the output. Both are additive and default to ``None`` so
     existing constructors keep working; in legacy-v1 the engine consumes
     neither.
+
+    ``shadow`` is the BoundaryOptimizer v2 measurement artifact, present only
+    when :data:`SEG_V2_SHADOW_ENV` is on. It is *returned* rather than written
+    because ``segment_document`` is pinned pure; persisting it is a caller's or
+    the harness's job. Nothing in the shipped output depends on it -- a run with
+    the flag on and a run with it off produce byte-identical siblings.
     """
 
     cues: list[Cue]
@@ -1161,6 +1172,7 @@ class SegmentationResult:
     diagnostics: dict[str, Any]
     manifest: dict[str, Any] | None = None
     document: SegDocument | None = None
+    shadow: dict[str, Any] | None = None
 
 
 def _copied_spans(
@@ -1181,6 +1193,444 @@ def _copied_turns(
     return (
         [(float(s), float(e), str(label)) for s, e, label in turns] if turns else None
     )
+
+
+# --------------------------------------------------------- v2 shadow lane
+
+#: Opt-in for the BoundaryOptimizer v2 shadow measurement. Parsed with the
+#: exact-``"1"`` test the manifest already uses for the VAD mask: a paired
+#: ``--no-`` flag writes the literal ``"0"``, which is truthy as a *string*, so
+#: ``bool()`` would latch the shadow on for the run that turned it off.
+#:
+#: Deliberately environment-only, and deliberately absent from the manifest. The
+#: manifest is the record of what produced the *shipped* output and a shadow run
+#: ships v1, so mentioning it there would move persisted bytes for a lane that
+#: changes nothing. A ``[defaults]`` conf key is worse still: inner keys are
+#: never validated, so a typo is silent and a latched value could leave a user
+#: running a measurement build for months.
+SEG_V2_SHADOW_ENV = "VOXWEAVE_SEG_V2_SHADOW"
+
+#: C11's two measurement lanes. The first is the honest comparison: v2's
+#: partition finished by exactly the passes v1 finished its own with, and
+#: nothing else. The second pushes that stream through the legacy overlays
+#: (lyric marking, speaker formatting, the second shot snap) purely so P5 can
+#: see what they do to a v2 partition -- it is plumbing, not boundary evidence.
+SHADOW_LANE_CORE = "core_partition_pre_overlay"
+SHADOW_LANE_DELIVERY = "delivery_proxy_post_overlay"
+
+
+def _shadow_unit_text(entry: Mapping[str, Any]) -> str:
+    """A ``word_data`` surface, granularity-blind (``text`` wins, ``word`` next)."""
+    return str(entry.get("text", entry.get("word", "")))
+
+
+def _shadow_nospace_len(text: str) -> int:
+    return len("".join(text.split()))
+
+
+def _shadow_char_index(layer: AtomLayer) -> tuple[dict[int, int], int]:
+    """Map a non-space character count to the atom edge that has it.
+
+    The streams these lanes compare are not built from the same atoms: v2
+    coalesces zero-width atoms away before it optimizes, and the speaker
+    formatter re-atomizes every piece it splits, so neither an atom index nor a
+    cue index survives the trip. What every stream does conserve is the source
+    character sequence, and an atom edge is by construction a source-unit edge --
+    so a character count is the one coordinate that projects all of them onto the
+    same unit ids. Ties (an atom with no non-space character) resolve to the
+    earliest node, which is deterministic and puts a cut before trailing
+    punctuation rather than after it.
+
+    Returns the index and the stream's total character count, so a caller can
+    tell "landed on the last edge" from "landed on an earlier empty-width edge".
+    """
+    index: dict[int, int] = {0: 0}
+    count = 0
+    for node, atom in enumerate(layer.atoms, start=1):
+        count += _shadow_nospace_len(atom.text)
+        index.setdefault(count, node)
+    return index, count
+
+
+def _shadow_partition(
+    layer: AtomLayer,
+    index: Mapping[int, int],
+    total_chars: int,
+    cues: Sequence[Cue],
+) -> tuple[tuple[int, ...] | None, str]:
+    """Project a cue stream onto source-unit cut points, or say why it cannot be.
+
+    Never raises and never guesses. A stream whose character cursor does not land
+    on an atom edge, or whose cuts are not a strictly increasing interior
+    sequence, is reported unresolved and its validator stage is skipped --
+    handing the checker an empty partition instead would manufacture a
+    conservation failure that says nothing at all about either engine.
+    """
+    if not cues:
+        return (), "empty"
+    cuts: list[int] = []
+    count = 0
+    for cue in cues[:-1]:
+        for entry in cue.get("word_data") or ():
+            count += _shadow_nospace_len(_shadow_unit_text(entry))
+        node = index.get(count)
+        if node is None:
+            return None, f"unresolved-at-char-{count}"
+        cuts.append(layer.unit_bound(node))
+    for entry in cues[-1].get("word_data") or ():
+        count += _shadow_nospace_len(_shadow_unit_text(entry))
+    if count != total_chars:
+        return None, f"stream-ends-at-char-{count}-of-{total_chars}"
+    if any(not 0 < cut < layer.unit_count for cut in cuts):
+        return None, "cut-out-of-range"
+    if any(left >= right for left, right in zip(cuts, cuts[1:])):
+        return None, "cuts-non-monotone"
+    return tuple(cuts), "atom-char-cursor"
+
+
+def _shadow_cue_rows(
+    cues: Sequence[Cue], partition: Sequence[int] | None, unit_count: int
+) -> list[dict[str, Any]]:
+    """The artifact projection of one cue stream: display facts plus ownership."""
+    from voxweave.core.partition_check import owned_unit_ids
+
+    bounds = (
+        owned_unit_ids(partition, unit_count)
+        if partition is not None and len(partition) + 1 == len(cues)
+        else None
+    )
+    rows: list[dict[str, Any]] = []
+    for index, cue in enumerate(cues):
+        text = str(cue["text"])
+        rows.append(
+            {
+                "end": cue.get("end"),
+                "index": index,
+                "lines": len(text.split("\n")),
+                "lyric": bool(cue.get("lyric", False)),
+                "speech_end": cue.get("speech_end"),
+                "speech_start": cue.get("speech_start"),
+                "start": cue.get("start"),
+                "text": text,
+                "unit_range": None if bounds is None else list(bounds[index]),
+            }
+        )
+    return rows
+
+
+def _shadow_stream_block(
+    cues: Sequence[Cue],
+    partition: Sequence[int] | None,
+    projection: str,
+    *,
+    document: SegDocument,
+    origin: Origin,
+    stage: Stage,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One engine's stream at one lane: rows, its partition, and its validator."""
+    from voxweave.core.partition_check import check_partition
+
+    validator = (
+        None
+        if partition is None
+        else check_partition(
+            partition,
+            cues,
+            units=document.units,
+            profile=document.profile,
+            origin=origin,
+            stage=stage,
+        ).to_dict()
+    )
+    block: dict[str, Any] = {
+        "cue_count": len(cues),
+        "cues": _shadow_cue_rows(cues, partition, len(document.units)),
+        "partition": None if partition is None else list(partition),
+        "projection": projection,
+        "validator": validator,
+    }
+    block.update(extra or {})
+    return block
+
+
+def _shadow_lane_block(
+    lane: str, stage: Stage, v1: Mapping[str, Any], v2: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Pair the two engines at one lane and state where they disagree."""
+    agreement: dict[str, Any] | None = None
+    if v1["partition"] is not None and v2["partition"] is not None:
+        left = set(v1["partition"])
+        right = set(v2["partition"])
+        agreement = {
+            "identical_cuts": len(left & right),
+            "v1_cut_count": len(left),
+            "v1_only": sorted(left - right),
+            "v2_cut_count": len(right),
+            "v2_only": sorted(right - left),
+        }
+    return {
+        "agreement": agreement,
+        "lane": lane,
+        "stage": stage,
+        "v1": dict(v1),
+        "v2": dict(v2),
+    }
+
+
+def _shadow_core_cues(
+    solution: DocumentSolution, document: SegDocument, thresholds: Mapping[str, Any]
+) -> list[Cue]:
+    """v2's raw materialization, finished the way v1 finishes its own stream.
+
+    Only the passes that are *not* boundary decisions are replayed: the timing
+    cleanup, the shot snap and the text finalization. The merge/glue/repair
+    passes are boundary decisions and are precisely what v2 replaces, so
+    replaying them here would grade v2 on v1's repairs.
+    """
+    from voxweave.core.layout import (
+        _line_budget_width,
+        _merge_stutters,
+        strip_punct_for_subtitles,
+        wrap_cue_text,
+    )
+    from voxweave.core.smart_split import SplitThresholds
+    from voxweave.core.timing import _cleanup_cues, _snap_to_shots
+
+    profile = document.profile
+    lang = profile.language
+    th = SplitThresholds.from_mapping(dict(thresholds))
+    cues: list[Cue] = [
+        copy.deepcopy(cue) for item in solution.solutions for cue in item.cues
+    ]
+    cues = _cleanup_cues(
+        cues,
+        min_cue_s=th.min_cue_s,
+        max_cue_s=th.max_cue_s,
+        cps=th.cps,
+        lag_out_s=th.lag_out_s,
+    )
+    if document.shot_changes:
+        cues = _snap_to_shots(
+            cues,
+            sorted(document.shot_changes),
+            snap_s=th.shot_snap_s,
+            max_cue_s=th.max_cue_s,
+        )
+    width = _line_budget_width(profile.max_line_length, lang)
+    for cue in cues:
+        cue["text"] = wrap_cue_text(
+            _merge_stutters(strip_punct_for_subtitles(cue["text"])),
+            lang,
+            profile.max_lines,
+            max_line_length=width,
+        )
+    return cues
+
+
+def _shadow_overlay_cues(
+    cues: Sequence[Cue], document: SegDocument, thresholds: Mapping[str, Any]
+) -> list[Cue]:
+    """The legacy overlays applied to a copy of a stream, for the delivery lane.
+
+    Every input the overlays touch is copied first: production runs these same
+    overlays on the real cue stream immediately after the hook returns, so a
+    formatter that mutated its ``turns`` list here would change shipped bytes.
+    """
+    out: list[Cue] = [copy.deepcopy(cue) for cue in cues]
+    mark_lyric_cues(out, _copied_spans(document.sing_spans))
+    turns = _copied_turns(document.speaker_turns)
+    if turns:
+        from voxweave.diarize import apply_speaker_format
+
+        out = apply_speaker_format(
+            out,
+            turns,
+            document.language,
+            thresholds=dict(thresholds),
+            max_line_length=document.profile.max_line_length,
+            max_lines=document.profile.max_lines,
+        )
+        out = _resnap_shots(
+            out, list(document.shot_changes or ()) or None, dict(thresholds)
+        )
+    return out
+
+
+def _shadow_v2_artifact(
+    document: SegDocument, v1_cues: Sequence[Cue], thresholds: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Run the optimizer and both measurement lanes, and assemble the artifact.
+
+    The atom layer is built here and again inside the solver, and deliberately
+    so: v1's cut set has to be projected into unit space *before* the solver runs
+    (it prices migration and decides whether v1's path is even expressible), and
+    that projection needs atom edges. Both builds are pure and identical, so the
+    only cost is one extra pass over a document the shadow is already measuring.
+    """
+    from voxweave.core.boundary_lattice import build_atom_layer
+    from voxweave.core.boundary_v2 import (
+        V1Partition,
+        _document_partition,
+        optimize_document,
+    )
+
+    # The immutable v1 reference: taken at the hook point, before any overlay,
+    # and detached so neither lane nor the fallback machinery can reach back into
+    # the stream production is about to finish.
+    reference: list[Cue] = [copy.deepcopy(cue) for cue in v1_cues]
+    layer = build_atom_layer(document)
+    index, total_chars = _shadow_char_index(layer)
+    v1_partition, v1_projection = _shadow_partition(
+        layer, index, total_chars, reference
+    )
+    solution = optimize_document(
+        document, v1=V1Partition(cuts=v1_partition or (), cues=tuple(reference))
+    )
+    artifact = solution.artifact
+    artifact["v1_projection"] = {
+        "cut_count": None if v1_partition is None else len(v1_partition),
+        "mode": v1_projection,
+    }
+    if solution.invalid_profile:
+        # AD3-2: an invalid profile is an invalid measurement, so the artifact
+        # says that and nothing else. Only the two degradation ledgers are added
+        # on top, because the harness reads them to decide the exit.
+        return artifact
+
+    unit_count = len(document.units)
+    # The authoritative v2 partition, assembled by the solver from its own
+    # per-interval answers rather than re-derived from the cue stream. The
+    # character projection is run alongside it purely as a cross-check: two
+    # independent derivations that agree are evidence the projection the
+    # overlay lane has to rely on is sound.
+    raw_partition = _document_partition(solution.solutions, unit_count)
+
+    core_cues = _shadow_core_cues(solution, document, thresholds)
+    core_projection, core_projection_mode = _shadow_partition(
+        layer, index, total_chars, core_cues
+    )
+    core_v2 = _shadow_stream_block(
+        core_cues,
+        raw_partition,
+        "solver-partition",
+        document=document,
+        origin="v2",
+        stage="core",
+        extra={
+            "projection_cross_check": {
+                "agrees": core_projection == raw_partition,
+                "mode": core_projection_mode,
+            }
+        },
+    )
+    core_v1 = _shadow_stream_block(
+        reference,
+        v1_partition,
+        v1_projection,
+        document=document,
+        origin="v1",
+        stage="core",
+    )
+
+    delivery_v2_cues = _shadow_overlay_cues(core_cues, document, thresholds)
+    delivery_v2_partition, delivery_v2_mode = _shadow_partition(
+        layer, index, total_chars, delivery_v2_cues
+    )
+    delivery_v1_cues = _shadow_overlay_cues(reference, document, thresholds)
+    delivery_v1_partition, delivery_v1_mode = _shadow_partition(
+        layer, index, total_chars, delivery_v1_cues
+    )
+    delivery_v2 = _shadow_stream_block(
+        delivery_v2_cues,
+        delivery_v2_partition,
+        delivery_v2_mode,
+        document=document,
+        origin="v2",
+        stage="legacy-overlay",
+    )
+    delivery_v1 = _shadow_stream_block(
+        delivery_v1_cues,
+        delivery_v1_partition,
+        delivery_v1_mode,
+        document=document,
+        origin="v1",
+        stage="legacy-overlay",
+    )
+
+    # Adjacent typed fallbacks adopt COMPLETE v1 cues, so two of them can expand
+    # onto the same cue and the raw-stage document validator then sees that cue
+    # twice. That is a reporting artifact of the fallback contract, not a
+    # conservation result, so it is flagged where a reader meets it rather than
+    # left to be mistaken for evidence. It cannot arise on the public corpus,
+    # where the C13 gate forbids fallbacks outright.
+    fallback_ranges = [
+        list(item.unit_range) for item in solution.solutions if not item.optimized
+    ]
+    overlapping = any(
+        left[1] > right[0] for left, right in zip(fallback_ranges, fallback_ranges[1:])
+    )
+    totals = artifact["totals"]
+    artifact["coverage"] = {
+        "fallback_intervals": totals["fallback_intervals"],
+        "fallback_ranges_overlap": overlapping,
+        "fallback_unit_ranges": fallback_ranges,
+        "optimized_intervals": totals["optimized_intervals"],
+        "optimized_unit_ratio": totals["optimized_unit_ratio"],
+        "raw_conservation_trustworthy": not overlapping,
+        "unit_count": totals["unit_count"],
+    }
+    artifact["validator"]["core"] = core_v2["validator"]
+    artifact["validator"]["legacy_overlay"] = delivery_v2["validator"]
+    artifact["validator"]["raw_duplicate_v1_cues"] = overlapping
+    artifact["lanes"] = {
+        SHADOW_LANE_CORE: _shadow_lane_block(
+            SHADOW_LANE_CORE, "core", core_v1, core_v2
+        ),
+        SHADOW_LANE_DELIVERY: _shadow_lane_block(
+            SHADOW_LANE_DELIVERY, "legacy-overlay", delivery_v1, delivery_v2
+        ),
+    }
+    return artifact
+
+
+def _maybe_shadow_v2(
+    document: SegDocument, cues: Sequence[Cue], *, thresholds: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Measure BoundaryOptimizer v2 beside the shipped v1 answer, or do nothing.
+
+    The flag is read FIRST and the optimizer is imported only after it passes, so
+    an off run costs one environment read and a branch and never pulls a v2
+    module into the process at all.
+
+    The shadow opens its OWN nested degradation capture. ``note_degraded``
+    aggregates by ``(slot, reason)`` and bumps a count on repeats, so a shadow
+    that re-tokenizes inside production's capture would change the persisted
+    manifest -- breaking the very contract this lane exists to respect. Nesting
+    restores the outer capture on exit, so production's ledger never sees a
+    shadow event. (The one-shot warning log is process-global and can therefore
+    be claimed by the shadow; that costs a log line, never a ledger entry.)
+
+    Nothing here may fail the run: a measurement that can crash the pipeline is
+    worse than no measurement, so an unexpected error is recorded as a typed
+    ``error`` block and the shipped cues are returned untouched.
+    """
+    if os.environ.get(SEG_V2_SHADOW_ENV, "").strip() != "1":
+        return None
+    with degradation_capture() as shadow_degraded:
+        try:
+            artifact = _shadow_v2_artifact(document, cues, thresholds)
+        except Exception as exc:  # noqa: BLE001 - a measurement never fails the run
+            log.warning("v2 shadow lane failed; shipped output is unaffected (%s)", exc)
+            artifact = {
+                "error": {"detail": str(exc), "type": type(exc).__name__},
+                "kind": "segmentation-shadow",
+            }
+    # AD4-4: the shadow's own ledger, collected at hook time and deliberately
+    # kept out of the persisted manifest. Copied off the live list so a later
+    # capture cannot append to something the artifact already published.
+    artifact["shadow_degraded"] = list(shadow_degraded)
+    return artifact
 
 
 def segment_document(
@@ -1218,6 +1668,11 @@ def segment_document(
     ``degraded`` cannot be known that early; the manifest reserves the key at
     build time and the ledger is written into it once the capture closes, so the
     persisted block is byte-identical either way.
+
+    With :data:`SEG_V2_SHADOW_ENV` on, the v2 optimizer is measured between steps
+    5 and 6 and its artifact is returned on ``result.shadow``. It ships nothing:
+    the cue stream, the units and the persisted manifest are byte-identical to a
+    run with the flag off.
 
     No filesystem writes, no model loads, no ASR: an already-constructed
     ``semantic_engine`` may be passed in (its owner creates and releases it), but
@@ -1346,6 +1801,9 @@ def segment_document(
             semantic_model=semantic_model,
             **extra,
         )
+        # Immediately after the v1 answer and before any overlay: the shadow
+        # sees exactly the stream v1 produced from exactly the inputs v1 read.
+        shadow = _maybe_shadow_v2(document, cues, thresholds=effective)
         mark_lyric_cues(cues, sings)
         split_cue_count = len(cues)
         if turns:
@@ -1367,6 +1825,12 @@ def segment_document(
     # dict, so the persisted ``segmentation`` block is byte-identical to the one
     # built after the run.
     manifest["degraded"] = degraded
+    if shadow is not None:
+        # AD3-5/AD4-4: two origin-typed ledgers and never one merged ``degraded``.
+        # ``production_degraded`` can only be copied here, once the outer capture
+        # has closed and the manifest's reserved key holds the real list;
+        # ``shadow_degraded`` was collected by the hook's own nested capture.
+        shadow["production_degraded"] = copy.deepcopy(manifest["degraded"])
     diagnostics: dict[str, Any] = {
         "unit_count": len(snapped),
         "punct_snapped": snapped is not units,
@@ -1381,6 +1845,7 @@ def segment_document(
         "speaker_formatted": bool(turns),
         "shot_resnapped": bool(turns and cuts),
         "cue_count": len(cues),
+        "shadow_v2": shadow is not None,
     }
     return SegmentationResult(
         cues=cues,
@@ -1390,6 +1855,7 @@ def segment_document(
         diagnostics=diagnostics,
         manifest=manifest,
         document=document,
+        shadow=shadow,
     )
 
 

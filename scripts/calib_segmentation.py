@@ -49,6 +49,7 @@ Subcommands::
     validate-corpus   schema + coverage + size + digest, no replay
     evaluate          replay, measure, compare to baseline, write the report
     record-baseline   promote a report to the tracked baseline (never run by CI)
+    shadow            P4: measure BoundaryOptimizer v2 beside the shipped v1
     compare-video-dir legacy: run the same metrics over private media siblings
 
 The last stdout line is always a machine summary::
@@ -60,11 +61,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import importlib.metadata
 import importlib.util
 import math
 import os
 import platform
+import random
 import subprocess
 import sys
 import time
@@ -2179,6 +2182,1683 @@ def cmd_compare_video_dir(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# P4 shadow lane: BoundaryOptimizer v2 measured beside the shipped v1 answer
+# --------------------------------------------------------------------------- #
+#
+# The shadow ships nothing. ``segment_document`` returns v1's cues either way and
+# writes the same bytes; with ``VOXWEAVE_SEG_V2_SHADOW=1`` it *also* returns a
+# measurement artifact on ``result.shadow``. Everything below reads that artifact
+# and answers three separate questions, each with its own exit:
+#
+#   C13  did v2 actually optimize the whole corpus (no typed fallback, no
+#        unwaived hard-contract violation it caused itself)?          -> exit 1
+#   C14  is v2 non-inferior to the *recorded v1 baseline* on the four
+#        tracked metrics, under the baseline's own gate modes?        -> exit 1/2
+#   AD-2 does a +/-10..50 ms nudge to one gap move a decision outside
+#        a bounded influence cell?                                    -> exit 1
+#
+# None of it touches the quality report: this writes its own file, and no shadow
+# number ever enters ``report["groups"]`` (``baseline_from_report`` copies that
+# block verbatim into the tracked baseline, so a v2 number parked there would
+# silently become the v1 gate's reference).
+
+SHADOW_SCHEMA_VERSION = 1
+SHADOW_REPORT_KIND = "segmentation-shadow-report"
+
+#: The hook's opt-in. Pinned around the replay and restored afterwards, exactly
+#: as ``_forced_gap_adaptive`` pins the adaptive-threshold knob: an operator's
+#: shell must neither turn the shadow off for a shadow run nor leak it into the
+#: quality run that may follow in the same process.
+SHADOW_ENV = "VOXWEAVE_SEG_V2_SHADOW"
+
+#: C11's two lanes, named by ``pipeline.SHADOW_LANE_*``.
+SHADOW_LANE_CORE = "core_partition_pre_overlay"
+SHADOW_LANE_DELIVERY = "delivery_proxy_post_overlay"
+SHADOW_LANES = (SHADOW_LANE_CORE, SHADOW_LANE_DELIVERY)
+SHADOW_ENGINES = ("v1", "v2")
+
+#: Which lane the non-inferiority gate reads. The tracked baseline was recorded
+#: on ``segment_document``'s *returned* cues, i.e. after lyric marking, speaker
+#: formatting and the second shot snap -- so the delivery proxy is the only lane
+#: whose numbers are comparable with it. The core lane is boundary evidence and
+#: is reported, never gated.
+SHADOW_GATED_LANE = SHADOW_LANE_DELIVERY
+
+#: C14: frozen before the optimizer was written, and deliberately a literal
+#: rather than a read of ``baseline["gates"]``. The gate table is what "not
+#: worse" *means*; loading it from the same file the comparison targets would let
+#: a future baseline edit silently redefine the P4 acceptance criterion. A test
+#: asserts these modes still match the tracked baseline, so a deliberate edit is
+#: visible as a failing test rather than as a quietly moved goalpost.
+SHADOW_GATES: dict[str, dict[str, Any]] = {
+    "len_break_mid_phrase_rate": {
+        "direction": "lower_is_better",
+        "mode": "blocking",
+        "absolute_max": 0.10,
+        "absolute_tolerance": 0.01,
+        "relative_tolerance": 0.10,
+        "min_samples": 100,
+    },
+    "over_7s_rate": {
+        "direction": "lower_is_better",
+        "mode": "blocking",
+        "absolute_max": 0.0,
+        "absolute_tolerance": 0.0,
+        "relative_tolerance": 0.0,
+        "min_samples": 1,
+    },
+    "cps_p90": {
+        "direction": "lower_is_better",
+        "mode": "blocking",
+        "absolute_max": None,
+        "absolute_tolerance": 0.5,
+        "relative_tolerance": 0.05,
+        "min_samples": 100,
+    },
+    "forbidden_end_rate": {
+        "direction": "lower_is_better",
+        "mode": "warning",
+        "absolute_max": 0.02,
+        "absolute_tolerance": 0.005,
+        "relative_tolerance": 0.10,
+        "min_samples": 100,
+    },
+}
+
+DEFAULT_SHADOW_REPORT = (
+    REPO_ROOT / "build" / "calibration" / "segmentation-shadow-report.json"
+)
+
+#: AD-2. Mirrors ``boundary_lattice.INFLUENCE_RADIUS_UNITS``; asserted equal by a
+#: test rather than imported, so the harness keeps working in an environment
+#: where the optimizer is not importable and a divergence is still caught.
+INFLUENCE_RADIUS_UNITS = 96
+
+PERTURB_MODES = ("single_gap", "global_jitter")
+PERTURB_MAGNITUDES_MS = (10, 20, 50)
+PERTURB_SIGNS = (-1, 1)
+#: AD4-3: every near-cliff gap is probed exhaustively, plus this share of the
+#: rest, chosen by a seed derived from the case and the magnitude.
+PERTURB_SAMPLE_RATE = 0.10
+#: Global jitter is aggregate-only (no probe unit, so no influence cell); a
+#: handful of seeded draws per magnitude is enough to see a stability cliff.
+PERTURB_JITTER_DRAWS = 3
+
+#: One-at-a-time weight ablation: term name -> the ``boundary_cost`` constants
+#: that make it up. ``pause_cut`` is absent on purpose -- its amplitude reaches
+#: the ramp through a *keyword default* bound at definition time, so rebinding
+#: ``W_PAUSE`` would not change a single score. It is ablated by zeroing the term
+#: function instead, which is what "this term contributes nothing" means anyway.
+ABLATION_WEIGHTS: dict[str, tuple[str, ...]] = {
+    "balance": ("W_BALANCE",),
+    "cue_base": ("CUE_BASE",),
+    "line_count": ("W_LINE_COUNT",),
+    "migration": ("W_MIGRATION",),
+    "min_duration": ("W_MIN_DURATION",),
+    "particle": ("W_PARTICLE",),
+    "pos": ("W_POS",),
+    "punct_affinity": ("W_PUNCT_AFFINITY",),
+    "reading": ("W_READING",),
+    "sentence_cross": ("W_SENTENCE_CROSS",),
+    "short_fragment": ("SHORT_FRAGMENT_TIGHT", "SHORT_FRAGMENT_LOOSE"),
+    "shot_preview": ("W_SHOT_PREVIEW",),
+}
+ABLATION_TERM_PAUSE = "pause_cut"
+ABLATION_TERMS = (*sorted(ABLATION_WEIGHTS), ABLATION_TERM_PAUSE)
+
+
+@contextlib.contextmanager
+def _forced_shadow(enabled: bool) -> Iterator[None]:
+    """Pin the shadow flag around one call and restore the operator's value.
+
+    Written with the literal ``"0"``/``"1"`` the hook parses, because the hook
+    tests the string exactly: a paired ``--no-`` flag elsewhere in the tree
+    writes ``"0"``, which is truthy as a string, so anything looser would latch
+    the shadow on for a run that asked for it off.
+    """
+    previous = os.environ.get(SHADOW_ENV)
+    os.environ[SHADOW_ENV] = "1" if enabled else "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(SHADOW_ENV, None)
+        else:
+            os.environ[SHADOW_ENV] = previous
+
+
+def replay_shadow(case: Case) -> Any:
+    """Replay one case with the shadow hook armed."""
+    with _forced_shadow(True):
+        return replay(case)
+
+
+def shadow_artifact_of(case: Case, result: Any) -> dict[str, Any]:
+    """The artifact off one replay, or a typed invalid-measurement failure.
+
+    Three distinct not-a-result cases, all exit 2 rather than a zero: an absent
+    artifact means the hook did not fire, ``error`` means the hook caught an
+    exception (it may never fail the pipeline, so it records instead), and
+    ``invalid_profile`` is AD3-2's refusal to interpret a knob that has no
+    meaning. A quality number derived from any of them would be a fiction.
+    """
+    artifact = getattr(result, "shadow", None)
+    if not isinstance(artifact, Mapping):
+        raise cc.CalibrationError(
+            f"{case.relpath}: the replay returned no shadow artifact",
+            [
+                f"the hook is gated on {SHADOW_ENV}=1 and this run pinned it on",
+                "the installed voxweave predates the P4 hook, or the flag was"
+                " consumed by a different process",
+            ],
+        )
+    if "error" in artifact:
+        error = artifact["error"]
+        raise cc.CalibrationError(
+            f"{case.relpath}: the shadow lane failed on this document",
+            [f"{error.get('type')}: {error.get('detail')}"],
+        )
+    if "invalid_profile" in artifact:
+        raise cc.CalibrationError(
+            f"{case.relpath}: the display profile is not interpretable (AD3-2)",
+            [
+                f"{v.get('key')}={v.get('value')}: {v.get('reason')}"
+                for v in artifact["invalid_profile"]
+            ],
+        )
+    return dict(artifact)
+
+
+class LaneStream:
+    """Adapter that lets ``measure_case`` read one artifact lane.
+
+    ``measure_case`` wants a ``SegmentationResult``; a lane is a list of display
+    rows plus a unit range per row. Rebuilding ``word_data`` from that range is
+    not a shortcut around the mapper -- the range *is* the partition the lane
+    committed to, and handing the mapper the units it names measures exactly the
+    stream the optimizer produced. Both engines go through this same adapter, so
+    neither is measured on evidence the other did not get.
+    """
+
+    def __init__(
+        self, cues: list[dict[str, Any]], diagnostics: Mapping[str, Any] | None = None
+    ) -> None:
+        self.cues = cues
+        self.diagnostics: dict[str, Any] = dict(diagnostics or {})
+
+
+def lane_cue_stream(
+    rows: Sequence[Mapping[str, Any]], units: Sequence[Mapping[str, Any]]
+) -> list[dict[str, Any]] | None:
+    """Artifact rows -> cue dicts the metric code can read, or ``None``.
+
+    ``None`` when any row has no resolved unit range: a partition the artifact
+    could not project is a stream no metric can see, and inventing a mapping for
+    it would report a number about a partition nobody chose.
+    """
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        span = row.get("unit_range")
+        if span is None:
+            return None
+        low, high = int(span[0]), int(span[1])
+        out.append(
+            {
+                "text": row.get("text") or "",
+                "start": row.get("start"),
+                "end": row.get("end"),
+                "lyric": bool(row.get("lyric")),
+                "word_data": [
+                    {
+                        "text": unit.get("text"),
+                        "start": unit.get("start"),
+                        "end": unit.get("end"),
+                    }
+                    for unit in units[low:high]
+                ],
+            }
+        )
+    return out
+
+
+@dataclass
+class LaneResult:
+    """One (lane, engine) pair measured, or the reason it could not be."""
+
+    lane: str
+    engine: str
+    projection: str
+    cue_count: int
+    measurement: CaseMeasurement | None = None
+    error: str | None = None
+
+
+def measure_lane(
+    case: Case, artifact: Mapping[str, Any], lane: str, engine: str
+) -> LaneResult:
+    """Run the four metrics over one lane of one case's artifact."""
+    block = artifact["lanes"][lane][engine]
+    result = LaneResult(
+        lane=lane,
+        engine=engine,
+        projection=str(block.get("projection")),
+        cue_count=int(block.get("cue_count") or 0),
+    )
+    cues = lane_cue_stream(block.get("cues") or (), case.units)
+    if cues is None:
+        result.error = f"partition unresolved ({result.projection})"
+        return result
+    try:
+        result.measurement = measure_case(case, LaneStream(cues))
+    except cc.CalibrationError as exc:
+        # Kept as a per-lane fact rather than aborting the document: an
+        # ungradable *core* lane still leaves the delivery lane measurable, and
+        # the caller decides which lanes it is not allowed to lose.
+        result.error = exc.message
+    return result
+
+
+# ------------------------------------------------- Wave A reads (no solving)
+
+
+def seg_document_of(case: Case, result: Any) -> Any:
+    """The ``SegDocument`` the replay minted, which the artifact is derived from."""
+    document = getattr(result, "document", None)
+    if document is None:
+        raise cc.CalibrationError(
+            f"{case.relpath}: the replay returned no SegDocument",
+            ["the installed voxweave predates the P3 IR"],
+        )
+    return document
+
+
+def barrier_unit_ids(document: Any) -> tuple[int, ...]:
+    """The robust-silence barrier set of one document, in source-unit ids.
+
+    Barriers are the only exogenous topology v2 has, so this is what the pinned
+    perturbation lane freezes and what ``barrier_flips`` counts. Unit ids rather
+    than atom nodes: a node index is an internal coordinate that a coalescing or
+    relief change could renumber, and a frozen set has to survive that.
+    """
+    from voxweave.core.boundary_lattice import build_atom_layer, build_barriers
+
+    layer = build_atom_layer(document)
+    return tuple(
+        sorted(
+            barrier.unit_id
+            for barrier in build_barriers(layer, document.profile)
+            if barrier.kind == "robust-silence"
+        )
+    )
+
+
+def _percentiles(values: Sequence[float]) -> dict[str, float | None]:
+    return {
+        "n": len(values),
+        "p50": cc.percentile(list(values), 50.0),
+        "p90": cc.percentile(list(values), 90.0),
+    }
+
+
+def cut_feature_scan(document: Any, selected_units: Sequence[int]) -> dict[str, Any]:
+    """Pause/linguistic features over the candidate space and over v2's choices.
+
+    The artifact carries per-interval *sums* only: ``sum_breakdowns`` drops a
+    categorical feature rather than inventing an aggregate for it, so
+    ``vad_state`` -- the one feature that says what kind of evidence a boundary
+    rested on -- survives only per cut. Recomputing it here from the same helpers
+    the optimizer used is the cheapest honest way to get a distribution, and it
+    costs one atom-layer build plus one pause evaluation per inter-atom gap.
+    """
+    from voxweave.core.boundary_cost import pause_evidence
+    from voxweave.core.boundary_lattice import build_atom_layer
+
+    layer = build_atom_layer(document)
+    profile = document.profile
+    speech = document.vad_speech
+    chosen = set(selected_units)
+
+    states: dict[str, int] = {}
+    selected_states: dict[str, int] = {}
+    effective: list[float] = []
+    selected_effective: list[float] = []
+    gaps: list[float] = []
+    counts = {
+        "candidates": 0,
+        "particle_nonzero": 0,
+        "pos_nonzero": 0,
+        "punct_affinity": 0,
+        "selected": 0,
+        "selected_particle_nonzero": 0,
+        "selected_punct_affinity": 0,
+    }
+    from voxweave.core.boundary_cost import PUNCT_AFFINITY_CHARS
+
+    for node in range(1, len(layer.atoms)):
+        left, right = layer.atoms[node - 1], layer.atoms[node]
+        evidence = pause_evidence(
+            left.end, right.start, speech_spans=speech, profile=profile
+        )
+        tail = left.text.rstrip()
+        affinity = bool(tail) and tail[-1] in PUNCT_AFFINITY_CHARS
+        particle = (left.end_pen + right.start_pen) != 0
+        counts["candidates"] += 1
+        counts["particle_nonzero"] += int(particle)
+        counts["pos_nonzero"] += int(right.boundary_pen != 0)
+        counts["punct_affinity"] += int(affinity)
+        states[evidence.vad_state] = states.get(evidence.vad_state, 0) + 1
+        if evidence.gap_ms_raw is not None:
+            gaps.append(float(evidence.gap_ms_raw))
+        if evidence.effective_ms is not None:
+            effective.append(float(evidence.effective_ms))
+        if layer.unit_bound(node) not in chosen:
+            continue
+        counts["selected"] += 1
+        counts["selected_particle_nonzero"] += int(particle)
+        counts["selected_punct_affinity"] += int(affinity)
+        selected_states[evidence.vad_state] = (
+            selected_states.get(evidence.vad_state, 0) + 1
+        )
+        if evidence.effective_ms is not None:
+            selected_effective.append(float(evidence.effective_ms))
+    return {
+        "counts": counts,
+        "effective_ms": effective,
+        "gap_ms": gaps,
+        "selected_effective_ms": selected_effective,
+        "selected_vad_state": selected_states,
+        "vad_state": states,
+    }
+
+
+def merge_feature_scans(scans: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Pool per-case scans into one distribution (counts sum, samples pool)."""
+    counts: dict[str, int] = {}
+    states: dict[str, int] = {}
+    selected_states: dict[str, int] = {}
+    effective: list[float] = []
+    gaps: list[float] = []
+    selected_effective: list[float] = []
+    for scan in scans:
+        for key, value in scan["counts"].items():
+            counts[key] = counts.get(key, 0) + int(value)
+        for key, value in scan["vad_state"].items():
+            states[key] = states.get(key, 0) + int(value)
+        for key, value in scan["selected_vad_state"].items():
+            selected_states[key] = selected_states.get(key, 0) + int(value)
+        effective.extend(float(v) for v in scan["effective_ms"])
+        gaps.extend(float(v) for v in scan["gap_ms"])
+        selected_effective.extend(float(v) for v in scan["selected_effective_ms"])
+    return {
+        "counts": dict(sorted(counts.items())),
+        "effective_ms": _percentiles(effective),
+        "gap_ms": _percentiles(gaps),
+        "selected_effective_ms": _percentiles(selected_effective),
+        "selected_vad_state": dict(sorted(selected_states.items())),
+        "vad_state": dict(sorted(states.items())),
+    }
+
+
+# ----------------------------------------------------- C13 and the validator
+
+
+def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
+    """Every validator stage of one artifact, counted by kind and by origin.
+
+    ``raw_duplicate_v1_cues`` is honoured here rather than left for a reader to
+    notice: adjacent ``adopted_v1`` fallbacks can expand onto the same v1 cue, so
+    a fallback-carrying document's *raw* stage sees that cue twice and reports a
+    conservation violation about the reporting shape, not about the partition.
+    Those rows are labelled and excluded from the C13 driver -- which costs
+    nothing, because a document with a fallback already fails C13 on
+    ``fallback_intervals`` alone.
+    """
+    duplicated = bool(artifact["validator"].get("raw_duplicate_v1_cues"))
+    stages: dict[str, Any] = {}
+    exit_driving: list[dict[str, Any]] = []
+    suppressed = 0
+    sources: list[tuple[str, Any]] = [
+        ("raw", artifact["validator"].get("raw")),
+        ("core", artifact["validator"].get("core")),
+        ("legacy_overlay", artifact["validator"].get("legacy_overlay")),
+    ]
+    for lane in SHADOW_LANES:
+        block = artifact["lanes"][lane]["v1"]
+        sources.append((f"{lane}:v1", block.get("validator")))
+    for name, block in sources:
+        if not block:
+            stages[name] = None
+            continue
+        kinds: dict[str, int] = {}
+        for violation in block["violations"]:
+            key = "{}/{}/{}".format(
+                violation["origin"],
+                violation["stage"],
+                violation["kind"],
+            )
+            if violation["waived"]:
+                key += "/waived"
+            kinds[key] = kinds.get(key, 0) + 1
+            if not violation["waived"] and violation["origin"] == "v2":
+                if violation["stage"] not in ("raw", "core"):
+                    continue
+                conservation = violation["kind"] in (
+                    "text-conservation",
+                    "unit-conservation",
+                )
+                if duplicated and violation["stage"] == "raw" and conservation:
+                    suppressed += 1
+                    continue
+                exit_driving.append(
+                    {
+                        "cue_index": violation.get("cue_index"),
+                        "detail": violation.get("detail"),
+                        "kind": violation["kind"],
+                        "stage": violation["stage"],
+                    }
+                )
+        stages[name] = {
+            "kinds": dict(sorted(kinds.items())),
+            "violations": len(block["violations"]),
+            "waivers": len(block["waivers"]),
+        }
+    return {
+        "duplicate_v1_cues": duplicated,
+        "exit_driving": exit_driving,
+        "not_conservation_evidence": suppressed,
+        "stages": stages,
+    }
+
+
+def c13_case_failures(
+    case: Case, coverage: Mapping[str, Any], violations: Mapping[str, Any]
+) -> list[str]:
+    """C13 + AD3-3: the reasons this document alone fails the shadow exit."""
+    problems: list[str] = []
+    if int(coverage["fallback_intervals"]):
+        problems.append(
+            f"{case.id}: {coverage['fallback_intervals']} interval(s) fell back to"
+            " adopted_v1 (C13 requires zero on the public corpus)"
+        )
+    ratio = float(coverage["optimized_unit_ratio"])
+    if ratio < 1.0:
+        problems.append(
+            f"{case.id}: optimized_unit_ratio {ratio:.4f} < 1.0"
+            " (C13 requires the whole document optimized)"
+        )
+    for row in violations["exit_driving"]:
+        problems.append(
+            f"{case.id}: unwaived v2 {row['kind']} at stage {row['stage']}"
+            f" (cue {row['cue_index']}): {row['detail']}"
+        )
+    return problems
+
+
+def merge_violation_counts(
+    shadow_cases: Sequence[ShadowCase],
+) -> dict[str, dict[str, dict[str, int]]]:
+    """Validator rows pooled per reporting group, keyed origin/stage/kind.
+
+    The v1 streams go through the same validator at the same stages, so the two
+    engines are directly comparable here. That comparison is the evidence a
+    reader needs for the one open policy question P4 hands to its caller: ja
+    documents inherit a ``speech-truncated-start`` class from the shared shot
+    snap, and whether v2 owning fewer of them than v1 counts as acceptable is a
+    decision, not a measurement. This block states the counts and takes no view.
+    """
+    out: dict[str, dict[str, dict[str, int]]] = {}
+    for row in shadow_cases:
+        counts = shadow_violation_counts(row.artifact)
+        for group in cc.group_keys(row.case.language):
+            bucket = out.setdefault(group, {})
+            for stage, block in counts["stages"].items():
+                if not block:
+                    continue
+                target = bucket.setdefault(stage, {})
+                for key, value in block["kinds"].items():
+                    target[key] = target.get(key, 0) + int(value)
+    return {
+        group: {
+            stage: dict(sorted(kinds.items())) for stage, kinds in sorted(x.items())
+        }
+        for group, x in sorted(out.items())
+    }
+
+
+def interval_changes(case: Case, artifact: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Per-interval disagreement rows, worst first, for the report's triage list."""
+    v1_cuts = sorted(int(u) for u in (artifact.get("v1") or {}).get("cut_units") or ())
+    rows: list[dict[str, Any]] = []
+    for interval in artifact["intervals"]:
+        low, high = int(interval["unit_range"][0]), int(interval["unit_range"][1])
+        inside_v1 = {cut for cut in v1_cuts if low < cut < high}
+        inside_v2 = {int(cut) for cut in interval["v2_partition"]}
+        moved = inside_v1 ^ inside_v2
+        if not moved:
+            continue
+        selected = interval.get("policy_selected") or {}
+        v1_cost = interval.get("v1_cost_under_v2") or {}
+        rows.append(
+            {
+                "adopted_v1": bool(interval["adopted_v1"]),
+                "atom_count": int(interval["atom_count"]),
+                "case": case.id,
+                "interval_index": int(interval["interval_index"]),
+                "language": case.language,
+                "low_margin": bool(interval["low_margin"]),
+                "margin": interval.get("margin"),
+                "selected_is_v1": bool(interval["selected_is_v1"]),
+                "unit_range": [low, high],
+                "v1_cost_total": v1_cost.get("total"),
+                "v1_cuts": sorted(inside_v1),
+                "v1_path_legal": bool(interval["v1_path_legal"]),
+                "v2_cost_total": selected.get("total"),
+                "v2_cuts": sorted(inside_v2),
+                "value": float(len(moved)),
+            }
+        )
+    return rows
+
+
+# ---------------------------------------------------------- the shadow run
+
+
+@dataclass
+class ShadowCase:
+    """Everything one replayed case contributes to the shadow report."""
+
+    case: Case
+    artifact: dict[str, Any]
+    document: Any
+    lanes: dict[tuple[str, str], LaneResult]
+    features: dict[str, Any]
+    barrier_units: tuple[int, ...]
+    wall_time_s: float = 0.0
+
+    @property
+    def core_partition(self) -> tuple[int, ...] | None:
+        partition = self.artifact["lanes"][SHADOW_LANE_CORE]["v2"]["partition"]
+        return None if partition is None else tuple(int(u) for u in partition)
+
+
+def run_shadow_case(case: Case) -> ShadowCase:
+    """Replay one case with the flag on and reduce it to lanes plus features."""
+    started = time.perf_counter()
+    result = replay_shadow(case)
+    artifact = shadow_artifact_of(case, result)
+    document = seg_document_of(case, result)
+    lanes = {
+        (lane, engine): measure_lane(case, artifact, lane, engine)
+        for lane in SHADOW_LANES
+        for engine in SHADOW_ENGINES
+    }
+    partition = artifact["lanes"][SHADOW_LANE_CORE]["v2"]["partition"] or ()
+    shadow_case = ShadowCase(
+        case=case,
+        artifact=artifact,
+        document=document,
+        lanes=lanes,
+        features=cut_feature_scan(document, [int(u) for u in partition]),
+        barrier_units=barrier_unit_ids(document),
+    )
+    shadow_case.wall_time_s = time.perf_counter() - started
+    return shadow_case
+
+
+def lane_groups(
+    shadow_cases: Sequence[ShadowCase], lane: str, engine: str
+) -> dict[str, dict[str, Any]]:
+    """Micro-aggregate one (lane, engine) pair across every measured case."""
+    return aggregate(
+        [
+            row.lanes[(lane, engine)].measurement
+            for row in shadow_cases
+            if row.lanes[(lane, engine)].measurement is not None
+        ]
+    )
+
+
+def shadow_group_errors(groups: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """Hold shadow group blocks to the same schema the baseline's groups obey."""
+    definition = group_schema()
+    return [
+        f"{name}/{error}"
+        for name, block in sorted(groups.items())
+        for error in cc.schema_errors(block, definition)
+    ]
+
+
+# ------------------------------------------------------- weight ablation (OAT)
+
+
+@contextlib.contextmanager
+def _ablated_weight(term: str) -> Iterator[None]:
+    """Zero exactly one cost term for the duration of the block.
+
+    A deliberate, restored monkeypatch of a production module. The alternative --
+    an env knob or an injection point inside ``boundary_cost`` -- would put a
+    measurement-only switch in the code path that ships, which is the thing this
+    whole lane exists to avoid. Single-threaded, and the ``finally`` restores the
+    exact previous object rather than the module's declared default.
+    """
+    from voxweave.core import boundary_cost as bc
+
+    saved: list[tuple[str, Any]] = []
+    if term == ABLATION_TERM_PAUSE:
+        saved.append(("pause_cut_cost", bc.pause_cut_cost))
+        setattr(bc, "pause_cut_cost", lambda evidence: 0.0)
+    else:
+        for name in ABLATION_WEIGHTS[term]:
+            saved.append((name, getattr(bc, name)))
+            setattr(bc, name, 0.0)
+    try:
+        yield
+    finally:
+        for name, value in reversed(saved):
+            setattr(bc, name, value)
+
+
+def run_ablation(
+    cases: Sequence[Case], reference: Mapping[str, Mapping[str, Any]]
+) -> dict[str, Any]:
+    """One-at-a-time: zero each term, re-solve the corpus, report the deltas.
+
+    Cost is |terms| extra corpus replays -- twelve weights plus the pause term,
+    so thirteen. That is bounded and known rather than swept, which is the point:
+    a sweep would need a search budget and a stopping rule, and an OAT table
+    answers the only question P4 has to answer about the weights ("does any one
+    of them carry the whole result").
+    """
+    rows: list[dict[str, Any]] = []
+    for term in ABLATION_TERMS:
+        started = time.perf_counter()
+        with _ablated_weight(term):
+            measured = [
+                measure_lane(
+                    case,
+                    shadow_artifact_of(case, replay_shadow(case)),
+                    SHADOW_GATED_LANE,
+                    "v2",
+                )
+                for case in cases
+            ]
+        groups = aggregate([m.measurement for m in measured if m.measurement])
+        rows.append(
+            {
+                "deltas": {
+                    group: _metric_deltas(groups.get(group), reference.get(group))
+                    for group in sorted(set(groups) | set(reference))
+                },
+                "term": term,
+                "wall_time_s": round(time.perf_counter() - started, 4),
+                "weights": (
+                    ["pause_cut_cost"]
+                    if term == ABLATION_TERM_PAUSE
+                    else list(ABLATION_WEIGHTS[term])
+                ),
+            }
+        )
+    return {
+        "kind": "one-at-a-time",
+        "note": (
+            "each row re-solves the whole corpus with one term zeroed; deltas are"
+            " ablated minus reference on the gated lane, so a positive delta means"
+            " the term was doing work"
+        ),
+        "rows": rows,
+        "terms": list(ABLATION_TERMS),
+    }
+
+
+def _metric_deltas(
+    block: Mapping[str, Any] | None, reference: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Per-metric ``ablated - reference`` for one group, plus the cue-count move."""
+    if block is None or reference is None:
+        return {}
+    out: dict[str, Any] = {
+        "cue_count": int(block["cue_count"]) - int(reference["cue_count"])
+    }
+    for metric in METRICS:
+        value, _, _ = _measure(block, metric)
+        base, _, _ = _measure(reference, metric)
+        out[metric] = (
+            None if value is None or base is None else round(float(value - base), 6)
+        )
+    return out
+
+
+# ------------------------------------------------------------- perturbation
+
+
+@contextlib.contextmanager
+def _pinned_barriers(unit_ids: Sequence[int]) -> Iterator[None]:
+    """Freeze the robust-silence topology at the unperturbed set (AD-2).
+
+    Every cost and every edge still recomputes on the perturbed stream; only the
+    exogenous topology is held still, which is what isolates "the optimizer
+    changed its mind" from "the document was cut into different intervals".
+    Barriers are re-anchored by *unit id* rather than by node, so the pin
+    survives any atom renumbering, and the document ends are always kept because
+    an interval set without them is not a partition of anything.
+
+    Both module bindings are patched: ``build_document_lattice`` calls its own
+    module global, and ``boundary_v2.score_v1_global`` holds an imported
+    reference of its own.
+    """
+    from voxweave.core import boundary_lattice as bl
+    from voxweave.core import boundary_v2 as bv
+
+    frozen = sorted({int(u) for u in unit_ids})
+    original = bl.build_barriers
+
+    def pinned(layer: Any, profile: Any) -> Any:
+        keep = {b.node: b for b in original(layer, profile) if b.kind == "document"}
+        edges: dict[int, int] = {}
+        for node in sorted(bl.unit_edge_nodes(layer.atoms)):
+            edges.setdefault(layer.unit_bound(node), node)
+        for unit_id in frozen:
+            node = edges.get(unit_id)
+            if node is None or node in keep or not 0 < node < len(layer.atoms):
+                continue
+            left, right = layer.atoms[node - 1].end, layer.atoms[node].start
+            gap = (
+                None
+                if left is None or right is None
+                else max(0.0, (float(right) - float(left)) * 1000.0)
+            )
+            keep[node] = bl.HardBarrier(
+                node=node, unit_id=unit_id, kind="robust-silence", gap_ms=gap
+            )
+        return tuple(keep[node] for node in sorted(keep))
+
+    bl.build_barriers = pinned
+    bv.build_barriers = pinned
+    try:
+        yield
+    finally:
+        bl.build_barriers = original
+        bv.build_barriers = original
+
+
+def perturbed_case(case: Case, units: Sequence[Mapping[str, Any]]) -> Case:
+    """A case carrying a different unit stream, re-validated as if captured.
+
+    ``load_corpus``'s semantic validators never see a perturbed stream, so they
+    are re-run here: a jitter that pushed a unit below zero, inverted a span or
+    broke monotonicity would otherwise be graded silently as if it were a
+    document somebody could have captured.
+    """
+    doc = {**case.doc, "word_segments": [dict(u) for u in units]}
+    out = Case(
+        path=case.path,
+        relpath=case.relpath,
+        doc=doc,
+        size_bytes=case.size_bytes,
+    )
+    _validate_case_semantics(out)
+    return out
+
+
+def shifted_gap_end(
+    units: Sequence[Mapping[str, Any]], index: int, delta_ms: float
+) -> tuple[float, float]:
+    """Where ``units[index]['end']`` lands under a nudge, and by how much.
+
+    Clamped into the window its neighbours leave free -- and the lower bound
+    includes the *previous* unit's end, not just this unit's start, because the
+    optimizer's own span preflight rejects non-monotone ends and would mark the
+    enclosing interval infeasible. A probe that manufactured a fallback would be
+    measuring the preflight, not the boundary decision.
+
+    Split out from :func:`perturb_single_gap` because the near-cliff classifier
+    asks this question for every gap at every magnitude and needs one float, not
+    a copy of the whole stream.
+    """
+    low = float(units[index]["start"])
+    if index > 0:
+        low = max(low, float(units[index - 1]["end"]))
+    high = float(units[index + 1]["start"])
+    before = float(units[index]["end"])
+    after = min(max(before + delta_ms / 1000.0, low), high)
+    return after, round((after - before) * 1000.0, 6)
+
+
+def perturb_single_gap(
+    units: Sequence[Mapping[str, Any]], index: int, delta_ms: float
+) -> tuple[list[dict[str, Any]], float]:
+    """Move one unit's end, changing exactly one gap. Returns the applied delta."""
+    after, applied = shifted_gap_end(units, index, delta_ms)
+    out = [copy.deepcopy(dict(u)) for u in units]
+    out[index]["end"] = after
+    return out, applied
+
+
+def perturb_global(
+    units: Sequence[Mapping[str, Any]], magnitude_ms: float, rng: random.Random
+) -> list[dict[str, Any]]:
+    """Jitter every bound, then repair into a stream the validators accept."""
+    delta = magnitude_ms / 1000.0
+    out = [copy.deepcopy(dict(u)) for u in units]
+    start_floor = 0.0
+    end_floor = 0.0
+    for unit in out:
+        start = max(0.0, float(unit["start"]) + rng.uniform(-delta, delta))
+        end = float(unit["end"]) + rng.uniform(-delta, delta)
+        start = max(start, start_floor)
+        end = max(end, start, end_floor)
+        unit["start"], unit["end"] = start, end
+        start_floor, end_floor = start, end
+    return out
+
+
+def _crosses(low: float | None, high: float | None, knees: Sequence[float]) -> bool:
+    """Does moving from ``low`` to ``high`` step over one of these knees?"""
+    if low is None or high is None or low == high:
+        return False
+    lo, hi = (low, high) if low <= high else (high, low)
+    return any(lo <= knee <= hi for knee in knees)
+
+
+def near_cliff_scan(
+    case: Case, document: Any, magnitudes: Sequence[int]
+) -> dict[str, Any]:
+    """AD4-3: classify every gap by whether a nudge crosses a knee of *its* curve.
+
+    Not a scalar list of raw gaps: which knees apply depends on the gap's own VAD
+    state, and the overlap fraction is re-derived at the shifted endpoints rather
+    than assumed constant -- a gap whose shifted end walks out of a speech span
+    changes both its curve and its state, and that state change is itself a
+    cliff. The classifier thresholds are tested in raw-gap space as well, because
+    the barrier rule reads the raw gap and not the effective one.
+    """
+    from voxweave.core.boundary_cost import pause_evidence, pause_knees
+    from voxweave.core.boundary_lattice import BARRIER_UNCERTAINTY_MS
+
+    profile = document.profile
+    speech = document.vad_speech
+    knees = pause_knees(profile)
+    raw_knees = (
+        float(profile.clause_ms),
+        float(profile.vad_skip_ms),
+        float(profile.vad_skip_ms) + BARRIER_UNCERTAINTY_MS,
+    )
+    units = case.units
+    by_state: dict[str, int] = {}
+    near_by_state: dict[str, int] = {}
+    near: list[int] = []
+    states: list[str] = []
+    for index in range(len(units) - 1):
+        base = pause_evidence(
+            units[index].get("end"),
+            units[index + 1].get("start"),
+            speech_spans=speech,
+            profile=profile,
+        )
+        states.append(base.vad_state)
+        by_state[base.vad_state] = by_state.get(base.vad_state, 0) + 1
+        hit = False
+        for magnitude in magnitudes:
+            for sign in PERTURB_SIGNS:
+                end, applied = shifted_gap_end(units, index, sign * magnitude)
+                if applied == 0.0:
+                    continue
+                moved = pause_evidence(
+                    end,
+                    units[index + 1].get("start"),
+                    speech_spans=speech,
+                    profile=profile,
+                )
+                if moved.vad_state != base.vad_state:
+                    hit = True
+                    break
+                candidates = sorted(
+                    set(knees.get(base.vad_state, ()))
+                    | set(knees.get(moved.vad_state, ()))
+                )
+                if _crosses(base.effective_ms, moved.effective_ms, candidates):
+                    hit = True
+                    break
+                if _crosses(base.gap_ms_raw, moved.gap_ms_raw, raw_knees):
+                    hit = True
+                    break
+            if hit:
+                break
+        if hit:
+            near.append(index)
+            near_by_state[base.vad_state] = near_by_state.get(base.vad_state, 0) + 1
+    return {
+        "candidate_gaps": len(units) - 1,
+        "gap_states": states,
+        "knees": {state: list(values) for state, values in sorted(knees.items())},
+        "near_cliff": near,
+        "near_cliff_by_state": dict(sorted(near_by_state.items())),
+        "raw_knees": list(raw_knees),
+        "vad_state_denominators": dict(sorted(by_state.items())),
+    }
+
+
+def _probe_partition(case: Case, units: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Replay a perturbed stream and read back v2's core partition and barriers."""
+    probe = perturbed_case(case, units)
+    result = replay_shadow(probe)
+    artifact = shadow_artifact_of(probe, result)
+    partition = artifact["lanes"][SHADOW_LANE_CORE]["v2"]["partition"]
+    return {
+        "barrier_units": barrier_unit_ids(seg_document_of(probe, result)),
+        "cue_count": int(artifact["lanes"][SHADOW_LANE_CORE]["v2"]["cue_count"]),
+        "fallback_intervals": int(artifact["coverage"]["fallback_intervals"]),
+        "partition": None if partition is None else {int(u) for u in partition},
+    }
+
+
+def _cell_report(
+    base_partition: set[int],
+    probe: Mapping[str, Any],
+    base_barriers: Sequence[int],
+    centres: Sequence[int],
+) -> dict[str, Any]:
+    """Compare one probe against the unperturbed run inside the influence cell."""
+    partition = probe["partition"]
+    flips = sorted(set(base_barriers) ^ set(probe["barrier_units"]))
+    if partition is None:
+        return {
+            "barrier_flips": len(flips),
+            "crossed_interval_boundary": False,
+            "cue_count": probe["cue_count"],
+            "error": "partition unresolved",
+            "fallback_intervals": probe["fallback_intervals"],
+            "flipped_barrier_units": flips,
+            "influence_radius_units": None,
+            "moved_count": None,
+            "moved_units": [],
+            "outside_cell": [],
+        }
+    moved = sorted(base_partition ^ partition)
+    anchors = sorted({*(int(c) for c in centres), *flips})
+    outside = [
+        unit
+        for unit in moved
+        if not any(abs(unit - anchor) <= INFLUENCE_RADIUS_UNITS for anchor in anchors)
+    ]
+    radius = max((min(abs(unit - a) for a in anchors) for unit in moved), default=0)
+    return {
+        "barrier_flips": len(flips),
+        "crossed_interval_boundary": bool(outside),
+        "cue_count": probe["cue_count"],
+        "error": None,
+        "fallback_intervals": probe["fallback_intervals"],
+        "flipped_barrier_units": flips,
+        "influence_radius_units": radius if moved else 0,
+        "moved_count": len(moved),
+        "moved_units": moved,
+        "outside_cell": outside,
+    }
+
+
+def run_single_gap_probes(
+    shadow_case: ShadowCase,
+    document: Any,
+    *,
+    magnitudes: Sequence[int],
+    max_probes: int,
+) -> dict[str, Any]:
+    """AD-2/AD4-3: exhaustive near-cliff probes plus a seeded 10% of the rest."""
+    case = shadow_case.case
+    base_partition = shadow_case.core_partition
+    scan = near_cliff_scan(case, document, magnitudes)
+    near = set(scan["near_cliff"])
+    sampled: dict[int, list[int]] = {}
+    for magnitude in magnitudes:
+        rng = random.Random(f"{case.id}:single_gap:{magnitude}")
+        for index in range(scan["candidate_gaps"]):
+            if index in near:
+                continue
+            if rng.random() < PERTURB_SAMPLE_RATE:
+                sampled.setdefault(index, []).append(magnitude)
+
+    plan: list[tuple[int, int, int]] = []
+    for index in sorted(near):
+        for magnitude in magnitudes:
+            for sign in PERTURB_SIGNS:
+                plan.append((index, magnitude, sign))
+    for index in sorted(sampled):
+        for magnitude in sorted(sampled[index]):
+            for sign in PERTURB_SIGNS:
+                plan.append((index, magnitude, sign))
+    truncated = bool(max_probes) and len(plan) > max_probes
+    if truncated:
+        plan = plan[:max_probes]
+
+    probes: list[dict[str, Any]] = []
+    skipped = 0
+    for index, magnitude, sign in plan:
+        units, applied = perturb_single_gap(case.units, index, sign * magnitude)
+        if applied == 0.0:
+            skipped += 1
+            continue
+        row: dict[str, Any] = {
+            "applied_delta_ms": applied,
+            "case": case.id,
+            "gap_index": index,
+            "language": case.language,
+            "magnitude_ms": magnitude,
+            "mode": "single_gap",
+            "near_cliff": index in near,
+            "probe_unit": index + 1,
+            "sign": sign,
+            "vad_state": scan["gap_states"][index],
+        }
+        lanes: dict[str, Any] = {}
+        if base_partition is None:
+            row["error"] = "unperturbed partition unresolved"
+            row["lanes"] = {}
+            row["value"] = 0.0
+            probes.append(row)
+            continue
+        base_set = set(base_partition)
+        try:
+            lanes["natural"] = _cell_report(
+                base_set,
+                _probe_partition(case, units),
+                shadow_case.barrier_units,
+                (index + 1,),
+            )
+            with _pinned_barriers(shadow_case.barrier_units):
+                lanes["pinned"] = _cell_report(
+                    base_set,
+                    _probe_partition(case, units),
+                    shadow_case.barrier_units,
+                    (index + 1,),
+                )
+        except cc.CalibrationError as exc:
+            # The clamp is supposed to keep every probe a capturable document; if
+            # one still is not, that is a fact about this probe, not a licence to
+            # abandon the other several thousand.
+            row["error"] = exc.message
+            row["lanes"] = {}
+            row["value"] = 0.0
+            probes.append(row)
+            continue
+        row["lanes"] = lanes
+        row["value"] = float(
+            max((len(lane["outside_cell"]) for lane in lanes.values()), default=0)
+        )
+        probes.append(row)
+
+    retained, summary = retain_probes(probes)
+    return {
+        "coverage": {
+            "candidate_gaps": scan["candidate_gaps"],
+            "exhaustive": not truncated,
+            "knees": scan["knees"],
+            "near_cliff": len(near),
+            "near_cliff_by_state": scan["near_cliff_by_state"],
+            "planned_probes": len(plan),
+            "raw_knees": scan["raw_knees"],
+            "sampled_gaps": len(sampled),
+            "sample_rate": PERTURB_SAMPLE_RATE,
+            "skipped_clamped": skipped,
+            "vad_state_denominators": scan["vad_state_denominators"],
+        },
+        "probes": retained,
+        "summary": summary,
+    }
+
+
+def _probe_failed(probe: Mapping[str, Any]) -> bool:
+    return any(
+        lane["crossed_interval_boundary"] for lane in probe.get("lanes", {}).values()
+    )
+
+
+def _probe_movement(probe: Mapping[str, Any]) -> int:
+    """How many boundaries this probe moved, over its worst lane."""
+    return max(
+        (len(lane["moved_units"]) for lane in probe.get("lanes", {}).values()),
+        default=0,
+    )
+
+
+def retain_probes(
+    probes: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Trim a probe set for the report, and count what it was trimmed from.
+
+    Exhaustive near-cliff coverage means thousands of probes per case, and a
+    report nobody can open is a report nobody reads. Every FAILING probe is kept
+    -- it is the exit driver and must never be summarised away -- plus the worst
+    movers by count. The summary states the true totals so a trimmed list can
+    never be mistaken for the whole run.
+    """
+    failures = [dict(p) for p in probes if _probe_failed(p)]
+    moved = sorted(
+        (dict(p) for p in probes if not _probe_failed(p) and _probe_movement(p) > 0),
+        key=lambda p: (
+            -_probe_movement(p),
+            p["gap_index"],
+            p["magnitude_ms"],
+            p["sign"],
+        ),
+    )
+    retained = [*failures, *moved[:OFFENDER_LIMIT]]
+    return retained, {
+        "barrier_flips_natural": sum(
+            int(p["lanes"]["natural"]["barrier_flips"]) for p in probes if p["lanes"]
+        ),
+        "barrier_flips_pinned": sum(
+            int(p["lanes"]["pinned"]["barrier_flips"]) for p in probes if p["lanes"]
+        ),
+        "errors": sum(1 for p in probes if p.get("error")),
+        "failures": len(failures),
+        "max_influence_radius_units": max(
+            (
+                int(lane["influence_radius_units"] or 0)
+                for p in probes
+                for lane in p["lanes"].values()
+            ),
+            default=0,
+        ),
+        "probes": len(probes),
+        "retained_probes": len(retained),
+        "with_movement": len(moved),
+    }
+
+
+def run_global_jitter(
+    shadow_case: ShadowCase, *, magnitudes: Sequence[int]
+) -> dict[str, Any]:
+    """Aggregate-only stability under aligner-noise-shaped jitter.
+
+    No influence cell: a global jitter has no probe unit, so there is no centre a
+    moved boundary could be near or far from. Reported as churn and barrier
+    flips, which is what a stability claim can honestly rest on.
+    """
+    case = shadow_case.case
+    base_partition = shadow_case.core_partition
+    rows: list[dict[str, Any]] = []
+    for magnitude in magnitudes:
+        rng = random.Random(f"{case.id}:global_jitter:{magnitude}")
+        for draw in range(PERTURB_JITTER_DRAWS):
+            units = perturb_global(case.units, magnitude, rng)
+            try:
+                probe = _probe_partition(case, units)
+            except cc.CalibrationError as exc:
+                rows.append(
+                    {
+                        "case": case.id,
+                        "draw": draw,
+                        "error": exc.message,
+                        "magnitude_ms": magnitude,
+                    }
+                )
+                continue
+            partition = probe["partition"]
+            moved = (
+                None
+                if partition is None or base_partition is None
+                else len(set(base_partition) ^ partition)
+            )
+            rows.append(
+                {
+                    "barrier_flips": len(
+                        set(shadow_case.barrier_units) ^ set(probe["barrier_units"])
+                    ),
+                    "case": case.id,
+                    "cue_count": probe["cue_count"],
+                    "draw": draw,
+                    "error": None,
+                    "fallback_intervals": probe["fallback_intervals"],
+                    "magnitude_ms": magnitude,
+                    "moved_count": moved,
+                }
+            )
+    return {"draws_per_magnitude": PERTURB_JITTER_DRAWS, "rows": rows}
+
+
+def run_perturbation(
+    shadow_cases: Sequence[ShadowCase],
+    *,
+    modes: Sequence[str],
+    magnitudes: Sequence[int],
+    max_probes: int,
+) -> dict[str, Any]:
+    """Drive both perturbation modes over the selected cases."""
+    single: list[dict[str, Any]] = []
+    jitter: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for shadow_case in shadow_cases:
+        if "single_gap" in modes:
+            block = run_single_gap_probes(
+                shadow_case,
+                shadow_case.document,
+                magnitudes=magnitudes,
+                max_probes=max_probes,
+            )
+            block["case"] = shadow_case.case.id
+            block["language"] = shadow_case.case.language
+            single.append(block)
+            failures.extend(p for p in block["probes"] if _probe_failed(p))
+        if "global_jitter" in modes:
+            block = run_global_jitter(shadow_case, magnitudes=magnitudes)
+            block["case"] = shadow_case.case.id
+            block["language"] = shadow_case.case.language
+            jitter.append(block)
+    return {
+        "exhaustive": all(block["coverage"]["exhaustive"] for block in single),
+        "failures": failures,
+        "global_jitter": jitter,
+        "influence_radius_units": INFLUENCE_RADIUS_UNITS,
+        "magnitudes_ms": list(magnitudes),
+        "modes": list(modes),
+        "note": (
+            "single_gap runs two lanes per probe: natural (full recompute) and"
+            " pinned (frozen robust-silence barriers, costs recomputed);"
+            " global_jitter is aggregate-only because it has no probe unit."
+            " Per-case `probes` is trimmed to every failure plus the worst movers"
+            " -- `summary` counts what it was drawn from"
+        ),
+        "single_gap": single,
+        "totals": {
+            "errors": sum(block["summary"]["errors"] for block in single),
+            "failures": sum(block["summary"]["failures"] for block in single),
+            "jitter_draws": sum(len(block["rows"]) for block in jitter),
+            "max_influence_radius_units": max(
+                (block["summary"]["max_influence_radius_units"] for block in single),
+                default=0,
+            ),
+            "probes": sum(block["summary"]["probes"] for block in single),
+            "with_movement": sum(block["summary"]["with_movement"] for block in single),
+        },
+    }
+
+
+# ----------------------------------------------------------- report and CLI
+
+
+def shadow_exit_code(
+    gate_results: Sequence[Mapping[str, Any]],
+    c13_failures: Sequence[str],
+    perturbation_failures: Sequence[Any],
+) -> int:
+    """Fold three independent verdicts onto the shared 0/1/2 contract.
+
+    An invalid measurement outranks a failed gate: a run that could not answer
+    the question has no standing to call anything a regression (the same rule
+    ``gate_exit_code`` already applies to a thin denominator).
+    """
+    code = gate_exit_code(gate_results)
+    if code == cc.EXIT_INVALID:
+        return cc.EXIT_INVALID
+    if code == cc.EXIT_GATE_FAILED or c13_failures or perturbation_failures:
+        return cc.EXIT_GATE_FAILED
+    return cc.EXIT_OK
+
+
+def _lane_case_row(result: LaneResult) -> dict[str, Any]:
+    measurement = result.measurement
+    row: dict[str, Any] = {
+        "cue_count": result.cue_count,
+        "error": result.error,
+        "projection": result.projection,
+    }
+    if measurement is None:
+        return row
+    row["metrics"] = {
+        **{name: ratio.to_dict() for name, ratio in measurement.ratios.items()},
+        "cps_p90": {
+            "n": len(measurement.cps_samples),
+            "value": cc.percentile(measurement.cps_samples, 90.0),
+        },
+    }
+    row["unmapped_boundaries"] = measurement.diagnostics["unmapped_boundaries"]
+    return row
+
+
+def build_shadow_report(
+    corpus: Corpus,
+    shadow_cases: Sequence[ShadowCase],
+    *,
+    lanes: Mapping[str, Mapping[str, Any]],
+    gate_results: Sequence[Mapping[str, Any]],
+    coverage_failures: Sequence[str],
+    baseline: Mapping[str, Any] | None,
+    baseline_path: str | None,
+    partial: bool,
+    ablation: Mapping[str, Any] | None,
+    perturbation: Mapping[str, Any] | None,
+    warnings: Sequence[str],
+) -> dict[str, Any]:
+    """Assemble the shadow report -- its own file, sharing no block with quality."""
+    first = shadow_cases[0].artifact if shadow_cases else {}
+    features: dict[str, list[dict[str, Any]]] = {}
+    for row in shadow_cases:
+        for group in cc.group_keys(row.case.language):
+            features.setdefault(group, []).append(row.features)
+    changes: list[dict[str, Any]] = []
+    for row in shadow_cases:
+        changes.extend(interval_changes(row.case, row.artifact))
+
+    report: dict[str, Any] = {
+        "schema_version": SHADOW_SCHEMA_VERSION,
+        "metric_definition_version": METRIC_DEFINITION_VERSION,
+        "kind": SHADOW_REPORT_KIND,
+        "corpus": {
+            "path": str(corpus.path),
+            "case_count": len(corpus.cases),
+            "total_bytes": corpus.total_bytes,
+            "required_counts": corpus.required_counts,
+        },
+        "corpus_digest": corpus.digest,
+        "generated_from_commit": repo_commit(),
+        "environment": environment_block(),
+        "partial": partial,
+        "engine_v2": first.get("engine_v2"),
+        "policy_name": first.get("policy_name"),
+        "policy_version": first.get("policy_version"),
+        "policy_deltas": first.get("policy_deltas"),
+        "shadow_env": SHADOW_ENV,
+        "gated_lane": SHADOW_GATED_LANE,
+        "influence_radius_units": INFLUENCE_RADIUS_UNITS,
+        "gates": {metric: dict(SHADOW_GATES[metric]) for metric in METRICS},
+        "gate_results": [dict(r) for r in gate_results],
+        "baseline": (
+            None
+            if baseline is None
+            else {
+                "path": baseline_path,
+                "corpus_digest": baseline["corpus_digest"],
+                "generated_from_commit": baseline.get("generated_from_commit"),
+            }
+        ),
+        "lanes": {lane: dict(block) for lane, block in sorted(lanes.items())},
+        "violations": {
+            "by_group": merge_violation_counts(shadow_cases),
+            "note": (
+                "keys are origin/stage/kind (+/waived); only unwaived v2 rows at"
+                " stage raw or core drive the exit (AD3-3), and the v1 rows are"
+                " here so an inherited class can be told from one v2 caused"
+            ),
+        },
+        "coverage": {
+            "failures": list(coverage_failures),
+            "cases": [
+                {
+                    "case": row.case.id,
+                    **{
+                        key: row.artifact["coverage"][key]
+                        for key in sorted(row.artifact["coverage"])
+                    },
+                }
+                for row in shadow_cases
+            ],
+        },
+        "features": {
+            group: merge_feature_scans(scans)
+            for group, scans in sorted(features.items())
+        },
+        "top_changed_intervals": _worst(changes),
+        "ablation": None if ablation is None else dict(ablation),
+        "perturbation": None if perturbation is None else dict(perturbation),
+        "cases": [
+            {
+                "id": row.case.id,
+                "language": row.case.language,
+                "unit_count": len(row.case.units),
+                "wall_time_s": round(row.wall_time_s, 4),
+                "totals": row.artifact["totals"],
+                "coverage": row.artifact["coverage"],
+                "v1_projection": row.artifact["v1_projection"],
+                "validator": shadow_violation_counts(row.artifact),
+                "agreement": {
+                    lane: row.artifact["lanes"][lane]["agreement"]
+                    for lane in SHADOW_LANES
+                },
+                "lanes": {
+                    lane: {
+                        engine: _lane_case_row(row.lanes[(lane, engine)])
+                        for engine in SHADOW_ENGINES
+                    }
+                    for lane in SHADOW_LANES
+                },
+                "barrier_count": len(row.barrier_units),
+                "production_degraded": row.artifact["production_degraded"],
+                "shadow_degraded": row.artifact["shadow_degraded"],
+            }
+            for row in shadow_cases
+        ],
+        "warnings": list(warnings),
+    }
+    slowest = max(shadow_cases, key=lambda r: r.wall_time_s, default=None)
+    report["timing"] = {
+        "total_wall_s": round(sum(r.wall_time_s for r in shadow_cases), 4),
+        "slowest_case": slowest.case.id if slowest else None,
+        "slowest_wall_s": round(slowest.wall_time_s, 4) if slowest else None,
+    }
+    return report
+
+
+def print_shadow_summary(report: Mapping[str, Any]) -> None:
+    lanes = report["lanes"]
+    print(f"corpus   : {report['corpus']['path']}")
+    print(f"digest   : {report['corpus_digest'][:16]}...")
+    print(f"engine   : {report['engine_v2']} policy={report['policy_version']}")
+    for lane in SHADOW_LANES:
+        block = lanes.get(lane) or {}
+        print()
+        print(f"  lane {lane}")
+        print(
+            f"  {'group':<6} {'eng':<3} {'cues':>6}  {'mid-phrase':<20}"
+            f"  {'over-max-cue':<14} {'cps_p90':>8}  {'bad-end':<20}"
+        )
+        print("  " + "-" * 86)
+        for name in (GROUP_ALL, *cc.CALIBRATION_LANGUAGES):
+            for engine in SHADOW_ENGINES:
+                groups = block.get(engine) or {}
+                row = groups.get(name)
+                if row is None or not row["case_count"]:
+                    continue
+                over = row["over_7s_rate"]
+                print(
+                    f"  {name:<6} {engine:<3} {row['cue_count']:>6}"
+                    f"  {_ratio_cell(row['len_break_mid_phrase_rate']):<20}"
+                    f"  {'{}/{}'.format(over['bad'], over['eligible']):<14}"
+                    f" {_fmt(row['cps_p90']['value'], 2):>8}"
+                    f"  {_ratio_cell(row['forbidden_end_rate']):<20}"
+                )
+    results = report["gate_results"]
+    if results:
+        print()
+        print(f"  non-inferiority gates ({report['gated_lane']}, v2 vs v1 baseline)")
+        for result in results:
+            marker = {
+                "pass": "ok  ",
+                "fail": "FAIL",
+                "insufficient_samples": "n<min",
+                "disabled": "off ",
+            }.get(str(result["status"]), "?   ")
+            reasons = "; ".join(result["reasons"])
+            print(
+                f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
+                f" {result['mode']:<8} value={_fmt(result['value'])}"
+                + (f"  {reasons}" if reasons else "")
+            )
+    failures = report["coverage"]["failures"]
+    if failures:
+        print()
+        print("  C13 coverage failures")
+        for line in failures[:OFFENDER_LIMIT]:
+            print(f"    {line}")
+    perturbation = report.get("perturbation")
+    if perturbation:
+        totals = perturbation["totals"]
+        print()
+        print(
+            f"  perturbation: {totals['probes']} probes,"
+            f" {totals['jitter_draws']} jitter draws,"
+            f" {totals['failures']} outside the influence cell"
+        )
+    for warning in report.get("warnings") or ():
+        print(f"  warning: {warning}")
+
+
+def cmd_shadow(args: argparse.Namespace) -> int:
+    corpus = load_corpus(args.corpus)
+    cases = list(corpus.cases)
+    partial = False
+    if args.case:
+        wanted = set(args.case)
+        cases = [c for c in cases if c.id in wanted]
+        unknown = wanted - {c.id for c in cases}
+        if unknown:
+            raise cc.CalibrationError(
+                f"no such case in {corpus.path}: {', '.join(sorted(unknown))}"
+            )
+        partial = True
+    if not cases:
+        raise cc.CalibrationError(f"{corpus.path} selected no cases")
+
+    warnings: list[str] = []
+    baseline: dict[str, Any] | None = None
+    if args.baseline:
+        baseline = load_baseline(args.baseline, corpus)
+        drift = environment_drift(baseline)
+        if drift:
+            if args.allow_environment_drift:
+                warnings.extend(f"environment drift ignored: {d}" for d in drift)
+            else:
+                raise cc.CalibrationError(
+                    f"{args.baseline} was recorded in a different environment",
+                    [
+                        *drift,
+                        "segmenter versions move where breaks land",
+                        "re-record deliberately, or pass --allow-environment-drift",
+                    ],
+                )
+
+    shadow_cases = [run_shadow_case(case) for case in cases]
+
+    coverage_failures: list[str] = []
+    for row in shadow_cases:
+        violations = shadow_violation_counts(row.artifact)
+        coverage_failures.extend(
+            c13_case_failures(row.case, row.artifact["coverage"], violations)
+        )
+        if violations["not_conservation_evidence"]:
+            warnings.append(
+                f"{row.case.id}: {violations['not_conservation_evidence']} raw-stage"
+                " conservation rows come from overlapping adopted_v1 ranges and are"
+                " not conservation evidence"
+            )
+        for key, lane in sorted(row.lanes.items()):
+            if lane.error is None:
+                continue
+            message = (
+                f"{row.case.id}: lane {key[0]}/{key[1]} not measured: {lane.error}"
+            )
+            if key[0] == SHADOW_GATED_LANE:
+                raise cc.CalibrationError(
+                    f"{row.case.relpath}: the gated lane is not measurable", [message]
+                )
+            warnings.append(message)
+
+    lanes = {
+        lane: {
+            engine: lane_groups(shadow_cases, lane, engine) for engine in SHADOW_ENGINES
+        }
+        for lane in SHADOW_LANES
+    }
+    schema_problems = [
+        f"{lane}/{engine}/{error}"
+        for lane, block in sorted(lanes.items())
+        for engine, groups in sorted(block.items())
+        for error in shadow_group_errors(groups)
+    ]
+    if schema_problems:
+        raise cc.CalibrationError(
+            "a shadow lane aggregate is not schema-valid", schema_problems
+        )
+
+    gated = lanes[SHADOW_GATED_LANE]["v2"]
+    gate_results = [] if partial else evaluate_gates(gated, SHADOW_GATES, baseline)
+    if partial:
+        warnings.append("partial run (--case): non-inferiority gates skipped")
+
+    ablation = run_ablation(cases, gated) if args.ablation else None
+
+    perturbation = None
+    if args.perturb:
+        selected = shadow_cases
+        if args.perturb_case:
+            wanted = set(args.perturb_case)
+            selected = [r for r in shadow_cases if r.case.id in wanted]
+            missing = wanted - {r.case.id for r in selected}
+            if missing:
+                raise cc.CalibrationError(
+                    "no such case in this run: " + ", ".join(sorted(missing))
+                )
+        perturbation = run_perturbation(
+            selected,
+            modes=args.perturb_mode or list(PERTURB_MODES),
+            magnitudes=args.perturb_magnitude or list(PERTURB_MAGNITUDES_MS),
+            max_probes=int(args.perturb_max_probes),
+        )
+        if not perturbation["exhaustive"]:
+            warnings.append(
+                "--perturb-max-probes truncated the near-cliff set: this run is not"
+                " exhaustive coverage and must not be reported as such"
+            )
+
+    report = build_shadow_report(
+        corpus,
+        shadow_cases,
+        lanes=lanes,
+        gate_results=gate_results,
+        coverage_failures=coverage_failures,
+        baseline=baseline,
+        baseline_path=args.baseline,
+        partial=partial,
+        ablation=ablation,
+        perturbation=perturbation,
+        warnings=warnings,
+    )
+
+    destination = "-"
+    if args.json_out:
+        destination = str(cc.write_json(args.json_out, report))
+    print_shadow_summary(report)
+
+    perturbation_failures = (
+        list(perturbation["failures"]) if perturbation is not None else []
+    )
+    # The verdict is computed and reported either way; ``--check`` only decides
+    # whether it reaches the process exit. A summary line reading "pass" beside a
+    # non-zero failure count would be the harness lying to a log parser.
+    verdict = shadow_exit_code(gate_results, coverage_failures, perturbation_failures)
+    code = verdict if args.check else cc.EXIT_OK
+    failures = (
+        sum(
+            1 for r in gate_results if r["mode"] == "blocking" and r["status"] != "pass"
+        )
+        + len(coverage_failures)
+        + len(perturbation_failures)
+    )
+    warned = sum(
+        1 for r in gate_results if r["mode"] == "warning" and r["status"] != "pass"
+    ) + len(warnings)
+    status = {
+        cc.EXIT_OK: "pass",
+        cc.EXIT_GATE_FAILED: "fail",
+        cc.EXIT_INVALID: "invalid",
+    }[verdict]
+    print(
+        f"QUALITY segmentation-shadow status={status} cases={len(shadow_cases)}"
+        f" failures={failures} warnings={warned} report={destination}"
+    )
+    return code
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -2237,6 +3917,73 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--report", required=True)
     record.add_argument("--output", default=str(DEFAULT_BASELINE))
     record.set_defaults(func=cmd_record_baseline)
+
+    shadow = sub.add_parser(
+        "shadow",
+        help="P4: measure BoundaryOptimizer v2 beside v1 (never gates `quality`)",
+    )
+    shadow.add_argument("--corpus", default=str(DEFAULT_CORPUS))
+    shadow.add_argument(
+        "--baseline",
+        default=None,
+        help="tracked v1 baseline the non-inferiority gate compares against",
+    )
+    shadow.add_argument("--json-out", default=str(DEFAULT_SHADOW_REPORT))
+    shadow.add_argument(
+        "--case",
+        action="append",
+        default=None,
+        help="restrict to one case id (repeatable); skips the gates",
+    )
+    shadow.add_argument(
+        "--check",
+        action="store_true",
+        help="apply the exits: 1 on a C13/gate/perturbation failure, 2 on invalid",
+    )
+    shadow.add_argument(
+        "--allow-environment-drift",
+        action="store_true",
+        help="downgrade a segmenter-version mismatch with the baseline to a warning",
+    )
+    shadow.add_argument(
+        "--no-ablation",
+        dest="ablation",
+        action="store_false",
+        default=True,
+        help="skip the one-at-a-time weight ablation (13 extra corpus replays)",
+    )
+    shadow.add_argument(
+        "--perturb",
+        action="store_true",
+        help="also run the AD-2 perturbation probes (expensive; see --perturb-case)",
+    )
+    shadow.add_argument(
+        "--perturb-case",
+        action="append",
+        default=None,
+        help="restrict perturbation to one case id (repeatable)",
+    )
+    shadow.add_argument(
+        "--perturb-mode",
+        action="append",
+        choices=list(PERTURB_MODES),
+        default=None,
+        help=f"repeatable; default {', '.join(PERTURB_MODES)}",
+    )
+    shadow.add_argument(
+        "--perturb-magnitude",
+        action="append",
+        type=int,
+        default=None,
+        help=f"repeatable, in ms; default {', '.join(map(str, PERTURB_MAGNITUDES_MS))}",
+    )
+    shadow.add_argument(
+        "--perturb-max-probes",
+        type=int,
+        default=0,
+        help="0 = exhaustive near-cliff coverage; any cap marks the run non-exhaustive",
+    )
+    shadow.set_defaults(func=cmd_shadow)
 
     legacy = sub.add_parser(
         "compare-video-dir",
