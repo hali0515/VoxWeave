@@ -202,6 +202,12 @@ _BREAK_PUNCT = frozenset(_TERMINAL_PUNCT + _CLAUSE_PUNCT + _CLOSERS)
 #: absorbs JSON float round-tripping.
 _TIME_DECIMALS = 6
 
+#: Ceiling on the share of internal cue boundaries the mapper may fail to
+#: resolve before the whole case is an invalid *measurement* (exit 2), not a
+#: quality result. Every unresolved boundary is a boundary no metric saw, so a
+#: run that loses more than this is silently grading a different cue stream.
+_UNMAPPED_MAX_RATIO = 0.01
+
 _EXCEPTION_METRICS = {
     "held_speech_over_7s": ("over_7s_rate",),
     "unavoidable_forbidden_end": ("forbidden_end_rate",),
@@ -763,17 +769,28 @@ class UnitLocator:
     """Resolve a cue's ``word_data`` entry back to its index in the source stream.
 
     Timing passes concatenate and slice ``word_data`` but never rewrite a span,
-    so ``(start, end)`` is a stable identity. Lookup prefers the first candidate
+    so ``(start, end)`` is a stable identity for unit-level entries. The
+    length-break repack path (``_chunk_to_cue``) instead emits *atom*-level
+    entries whose span aggregates several units -- ``(start, end)`` then matches
+    no single unit, but the entry's start still names the atom's first unit and
+    its end the atom's last unit, so lookup falls back to those edge indexes
+    (this was the silent-exclusion mechanism behind up to 10% unmapped
+    boundaries on len-break-heavy zh cases). Lookup prefers the first candidate
     at or after a monotonic cursor, which disambiguates the repeated keys that
     zero-duration units produce. An entry the splitter fabricated (the logged
-    proportional-timing desync path) simply does not resolve, and its boundary is
-    excluded and counted -- never guessed at.
+    proportional-timing desync path) still resolves to nothing, and its boundary
+    is excluded and counted -- never guessed at.
     """
 
     def __init__(self, units: Sequence[Mapping[str, Any]]) -> None:
         self._index: dict[tuple[float, float], list[int]] = {}
+        self._by_start: dict[float, list[int]] = {}
+        self._by_end: dict[float, list[int]] = {}
         for i, unit in enumerate(units):
-            self._index.setdefault(self._key(unit), []).append(i)
+            key = self._key(unit)
+            self._index.setdefault(key, []).append(i)
+            self._by_start.setdefault(key[0], []).append(i)
+            self._by_end.setdefault(key[1], []).append(i)
 
     @staticmethod
     def _key(unit: Mapping[str, Any]) -> tuple[float, float]:
@@ -783,14 +800,30 @@ class UnitLocator:
             round(float(end), _TIME_DECIMALS) if end is not None else math.nan,
         )
 
-    def locate(self, entry: Mapping[str, Any], cursor: int) -> int | None:
-        candidates = self._index.get(self._key(entry))
+    @staticmethod
+    def _pick(candidates: list[int] | None, cursor: int) -> int | None:
         if not candidates:
             return None
         for i in candidates:
             if i >= cursor:
                 return i
         return candidates[-1]
+
+    def locate_first(self, entry: Mapping[str, Any], cursor: int) -> int | None:
+        """Index of the unit this entry *starts* on (edge fallback for atoms)."""
+        key = self._key(entry)
+        found = self._pick(self._index.get(key), cursor)
+        if found is not None:
+            return found
+        return self._pick(self._by_start.get(key[0]), cursor)
+
+    def locate_last(self, entry: Mapping[str, Any], cursor: int) -> int | None:
+        """Index of the unit this entry *ends* on (edge fallback for atoms)."""
+        key = self._key(entry)
+        found = self._pick(self._index.get(key), cursor)
+        if found is not None:
+            return found
+        return self._pick(self._by_end.get(key[1]), cursor)
 
 
 @dataclass(frozen=True)
@@ -824,8 +857,10 @@ def map_boundaries(
             firsts.append(None)
             lasts.append(None)
             continue
-        first = locator.locate(word_data[0], cursor)
-        last = locator.locate(word_data[-1], first if first is not None else cursor)
+        first = locator.locate_first(word_data[0], cursor)
+        last = locator.locate_last(
+            word_data[-1], first if first is not None else cursor
+        )
         firsts.append(first)
         lasts.append(last)
         if last is not None:
@@ -961,6 +996,18 @@ def measure_case(case: Case, result: Any) -> CaseMeasurement:
 
     overlaps = validate_result_contract(case, cues)
     boundaries, unmapped = map_boundaries(units, cues)
+    internal = max(len(cues) - 1, 0)
+    if internal and unmapped / internal > _UNMAPPED_MAX_RATIO:
+        raise cc.CalibrationError(
+            f"{case.relpath}: {unmapped}/{internal} cue boundaries could not be"
+            " mapped back to source units",
+            [
+                "the metrics cannot see this much of the cue stream, so the run is"
+                " an invalid measurement, not a quality result",
+                "likely a word_data provenance change in the splitter -- fix the"
+                " mapper, do not relax this gate",
+            ],
+        )
     starts, unit_offsets = phrase_start_offsets(units, iso)
     multichar = _has_multichar_phrases(iso)
 

@@ -633,14 +633,54 @@ def test_known_bad_source_unit_exception_excludes_every_metric(
 
 
 def test_unmappable_boundary_is_reported_not_guessed() -> None:
-    """A fabricated ``word_data`` span must not be silently matched to a unit."""
+    """A fabricated ``word_data`` span must not be silently matched to a unit.
+
+    The ghost sits in a long cue stream so its two lost boundaries stay under
+    the invalid-measurement ceiling: they are excluded and counted, not
+    guessed at, and the rest of the stream is still measured.
+    """
+    words = [f"w{i}" for i in range(221)]
+    units = spaced_units(words, dur=0.5)
+    doc = make_case("en-01", "en", units)
+    cues = [
+        cue(w, i * 0.5, (i + 1) * 0.5, units[i : i + 1]) for i, w in enumerate(words)
+    ]
+    cues[110] = cue("ghost", 55.0, 55.5, [])
+    measurement = calib.measure_case(as_case(doc), Replayed(cues))
+    assert measurement.diagnostics["unmapped_boundaries"] == 2
+
+
+def test_heavy_unmapped_is_an_invalid_measurement() -> None:
+    """Losing more than 1% of boundaries fails the case as a measurement error.
+
+    The metrics graded a cue stream they mostly could not see, so the run must
+    exit 2 (invalid), never report numbers from the visible remainder.
+    """
     units = spaced_units(["a", "b", "c", "d"], dur=0.5)
     doc = make_case("en-01", "en", units)
     ghost = cue("b c", 0.5, 1.5, [])
     cues = [cue("a", 0.0, 0.5, units[0:1]), ghost, cue("d", 1.5, 2.0, units[3:4])]
+    with pytest.raises(cc.CalibrationError):
+        calib.measure_case(as_case(doc), Replayed(cues))
+
+
+def test_atom_level_word_data_maps_by_span_edges() -> None:
+    """A repacked (atom-level) entry resolves through its edge timestamps.
+
+    ``_chunk_to_cue`` emits word_data whose span aggregates several units; the
+    exact ``(start, end)`` key then matches no single unit, but the entry still
+    starts on its first unit and ends on its last one.
+    """
+    units = spaced_units(["a", "b", "c", "d"], dur=0.5)
+    doc = make_case("en-01", "en", units)
+    merged = {"text": "b c", "start": units[1]["start"], "end": units[2]["end"]}
+    cues = [
+        cue("a", 0.0, 0.5, units[0:1]),
+        cue("b c", 0.5, 1.5, [merged]),
+        cue("d", 1.5, 2.0, units[3:4]),
+    ]
     measurement = calib.measure_case(as_case(doc), Replayed(cues))
-    assert measurement.diagnostics["unmapped_boundaries"] == 2
-    assert measurement.ratios["len_break_mid_phrase_rate"] == cc.Ratio(0, 0)
+    assert measurement.diagnostics["unmapped_boundaries"] == 0
 
 
 # --------------------------------------------------------------------------- #
