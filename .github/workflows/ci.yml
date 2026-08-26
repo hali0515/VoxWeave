@@ -54,8 +54,11 @@ jobs:
         with:
           enable-cache: true
 
+      # The recorded baseline carries the python minor it was recorded under;
+      # environment_drift refuses a different minor (segmenter behaviour moves
+      # with the interpreter), so this job pins the same 3.13 line.
       - name: Sync environment
-        run: uv sync --extra cuda --dev
+        run: uv sync --extra cuda --dev --python 3.13
 
       - name: Check for a captured corpus
         id: corpus

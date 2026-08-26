@@ -1372,13 +1372,18 @@ def test_makefile_exposes_the_quality_targets() -> None:
     assert "calib_segmentation.py evaluate" in makefile
 
 
-def test_ci_runs_the_gate_without_blocking_and_never_records(tmp_path: Path) -> None:
-    """The soak job must warn, not block, and must never rewrite the baseline."""
+def test_ci_runs_the_gate_armed_and_never_records(tmp_path: Path) -> None:
+    """The quality job is armed (soak ended 2026-08-26): it may block a PR,
+    and it must still never rewrite the baseline — recording stays a
+    deliberate human act. The job also pins the baseline's python minor so
+    environment_drift does not refuse every CI run.
+    """
     workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
-    assert "continue-on-error: true" in workflow
+    assert "continue-on-error" not in workflow
     assert "make quality-segmentation" in workflow
+    assert "--python 3.13" in workflow
     assert "record-baseline" not in workflow
     assert "quality-record-segmentation" not in workflow
 
