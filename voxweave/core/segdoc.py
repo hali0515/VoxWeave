@@ -46,12 +46,20 @@ class SourceUnit:
     ``surface`` is the granularity-blind view ``smart_split._unit_text`` takes
     (``text`` wins, ``word`` is the ASR-side fallback, absent is ``""``); spans
     are whatever the aligner recorded, including ``None`` for ghost units.
+
+    ``provenance`` and ``confidence`` are RESERVED for P5: they are minted with
+    their defaults today and nothing reads them, so the field set is already the
+    one a later per-unit evidence pass needs and that pass does not have to
+    migrate the IR a second time. Additive with defaults, so every existing
+    positional construction and equality comparison is unchanged.
     """
 
     id: str
     surface: str
     start: float | None
     end: float | None
+    provenance: str = "aligner"
+    confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -108,7 +116,15 @@ class SegDocument:
     The evidence arrays are the same objects ``pipeline.segment_document``
     already copied for the engine (``None`` when absent), and ``manifest`` is the
     dict the pipeline built and persists -- held by reference, so the document
-    and the sibling JSON can never disagree about what ran.
+    and the sibling JSON can never disagree about what ran. Because the manifest
+    is held by reference, the pipeline can mint the document *before* the engine
+    runs and still have it carry the degradation ledger the run fills in.
+
+    ``text`` is the exact joined surface stream the v1 engine consumed
+    (``pipeline._units_to_seg``'s ``text``), recorded rather than re-derived: a
+    consumer that re-joined ``units`` itself would have to re-implement the
+    no-space-language rule and could disagree with what actually ran. ``None``
+    means the builder was not handed one.
     """
 
     language: str
@@ -119,6 +135,7 @@ class SegDocument:
     sing_spans: list[tuple[float, float]] | None
     speaker_turns: list[tuple[float, float, str]] | None
     manifest: dict
+    text: str | None = None
 
 
 def _coerce_span(value: Any) -> float | None:
@@ -136,12 +153,15 @@ def build_seg_document(
     shot_changes: list[float] | None = None,
     sing_spans: list[tuple[float, float]] | None = None,
     speaker_turns: list[tuple[float, float, str]] | None = None,
+    text: str | None = None,
 ) -> SegDocument:
     """Mint a :class:`SegDocument` from the stream the engine is about to run on.
 
     ``units`` is the raw ``word_segments``-shaped sequence (the repaired copy
     cue formation sees, not the persisted evidence); ids are positional, so the
-    same stream always mints the same ids. Everything else is recorded as given.
+    same stream always mints the same ids. ``text`` is the joined stream the
+    engine consumes, passed in rather than rebuilt here. Everything else is
+    recorded as given.
     """
     # Single source of truth for the surface view; imported lazily so this
     # module stays importable without pulling in the segmentation engine.
@@ -165,4 +185,5 @@ def build_seg_document(
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
         manifest=manifest,
+        text=text,
     )

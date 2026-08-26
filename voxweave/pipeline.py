@@ -1146,10 +1146,12 @@ class SegmentationResult:
     passes ran (all values deterministic, so two identical inputs compare equal).
 
     ``manifest`` is the ``SegmentationManifest`` the callers persist as the
-    sibling JSON's ``segmentation`` key, and ``document`` is the parallel
-    :class:`~voxweave.core.segdoc.SegDocument` record holding that same manifest
-    object. Both are additive and default to ``None`` so existing constructors
-    keep working; in legacy-v1 the engine consumes neither.
+    sibling JSON's ``segmentation`` key, and ``document`` is the
+    :class:`~voxweave.core.segdoc.SegDocument` holding that same manifest object
+    -- minted before the engine runs, so it describes the inputs rather than
+    summarizing the output. Both are additive and default to ``None`` so
+    existing constructors keep working; in legacy-v1 the engine consumes
+    neither.
     """
 
     cues: list[Cue]
@@ -1204,10 +1206,18 @@ def segment_document(
     1. snap sentence-break punctuation onto word boundaries (zh only),
     2. flatten the units into one segment,
     3. resolve the effective thresholds (optional adaptive gap scaling),
-    4. ``smart_split_segments`` (content breaks + timing cleanup + shot snap),
-    5. lyric marking from ``sing_spans``,
-    6. speaker formatting from ``speaker_turns`` (which re-runs timing cleanup),
-    7. re-snap to ``shot_changes`` because step 6 moved boundaries again.
+    4. record the manifest and mint the :class:`SegDocument` (see below),
+    5. ``smart_split_segments`` (content breaks + timing cleanup + shot snap),
+    6. lyric marking from ``sing_spans``,
+    7. speaker formatting from ``speaker_turns`` (which re-runs timing cleanup),
+    8. re-snap to ``shot_changes`` because step 7 moved boundaries again.
+
+    Step 4 sits *before* the engine on purpose: the document is the single
+    authority describing what this segmentation runs on, so a later engine takes
+    it as input instead of being reverse-engineered from its own output. Only
+    ``degraded`` cannot be known that early; the manifest reserves the key at
+    build time and the ledger is written into it once the capture closes, so the
+    persisted block is byte-identical either way.
 
     No filesystem writes, no model loads, no ASR: an already-constructed
     ``semantic_engine`` may be passed in (its owner creates and releases it), but
@@ -1258,54 +1268,9 @@ def segment_document(
     from voxweave.core.unit_repair import repair_stranded_tails
 
     repaired = repair_stranded_tails(snapped, iso, speech_spans)
-    # Everything the language providers touch runs inside the capture, so the
-    # manifest can say which fallbacks actually fired on this document.
-    with degradation_capture() as degraded:
-        seg = _units_to_seg(repaired, iso)
-        base = dict(thresholds) if thresholds is not None else gap_thresholds(iso)
-        effective = _maybe_adaptive_thresholds(base, snapped)
-        cues = smart_split_segments(
-            [seg],
-            lang=iso,
-            speech_spans=speech_spans,
-            thresholds=effective,
-            shot_changes=cuts,
-            semantic_engine=semantic_engine,
-            semantic_model=semantic_model,
-            **extra,
-        )
-        mark_lyric_cues(cues, sings)
-        split_cue_count = len(cues)
-        if turns:
-            from voxweave.diarize import apply_speaker_format
-
-            # Same thresholds AND line budget as smart_split so speaker splits get the
-            # same timing polish and wrap width the deterministic layout just used.
-            cues = apply_speaker_format(
-                cues,
-                turns,
-                iso,
-                thresholds=effective,
-                max_line_length=max_line_length,
-                max_lines=max_lines,
-            )
-            # ... and its cleanup can push a boundary back across a cut, so snap again.
-            cues = _resnap_shots(cues, cuts, effective)
-    diagnostics: dict[str, Any] = {
-        "unit_count": len(snapped),
-        "punct_snapped": snapped is not units,
-        "adaptive_thresholds": effective is not base,
-        "speech_span_count": len(speech_spans or ()),
-        "shot_change_count": len(cuts or ()),
-        "sing_span_count": len(sings or ()),
-        "speaker_turn_count": len(turns or ()),
-        "semantic_engine": semantic_engine is not None,
-        "split_cue_count": split_cue_count,
-        "lyric_cue_count": sum(1 for c in cues if c.get("lyric")),
-        "speaker_formatted": bool(turns),
-        "shot_resnapped": bool(turns and cuts),
-        "cue_count": len(cues),
-    }
+    seg = _units_to_seg(repaired, iso)
+    base = dict(thresholds) if thresholds is not None else gap_thresholds(iso)
+    effective = _maybe_adaptive_thresholds(base, snapped)
     # The nine threshold values the engine really ran on: ``effective`` is the
     # caller's mapping, which ``smart_split_segments`` normalizes through
     # ``SplitThresholds.from_mapping`` (partial mappings fill dataclass defaults).
@@ -1340,8 +1305,15 @@ def segment_document(
             "vad_emission_mask": vad_mask_on,
         },
         "providers": provider_snapshot(iso),
-        "degraded": degraded,
+        # Placeholder in its final position: the ledger only exists once the run
+        # is over, but the key is inserted here so the persisted key order does
+        # not depend on when the value arrives.
+        "degraded": [],
     }
+    # The document is the single authority for this segmentation, so it is minted
+    # before the engine runs, not reconstructed from its output. It holds the
+    # manifest by reference, which is what lets ``degraded`` be filled in below
+    # without the document and the sibling JSON drifting apart.
     document = build_seg_document(
         language=iso,
         units=repaired,
@@ -1356,7 +1328,60 @@ def segment_document(
         shot_changes=cuts,
         sing_spans=sings,
         speaker_turns=turns,
+        text=seg["text"],
     )
+    # Everything the language providers touch runs inside the capture, so the
+    # manifest can say which fallbacks actually fired on this document. Nothing
+    # above reaches a provider (``_units_to_seg`` joins surfaces, the threshold
+    # passes read config/env, and ``provider_snapshot`` only *reports* identity),
+    # so narrowing the window to the engine run drops no event.
+    with degradation_capture() as degraded:
+        cues = smart_split_segments(
+            [seg],
+            lang=iso,
+            speech_spans=speech_spans,
+            thresholds=effective,
+            shot_changes=cuts,
+            semantic_engine=semantic_engine,
+            semantic_model=semantic_model,
+            **extra,
+        )
+        mark_lyric_cues(cues, sings)
+        split_cue_count = len(cues)
+        if turns:
+            from voxweave.diarize import apply_speaker_format
+
+            # Same thresholds AND line budget as smart_split so speaker splits get the
+            # same timing polish and wrap width the deterministic layout just used.
+            cues = apply_speaker_format(
+                cues,
+                turns,
+                iso,
+                thresholds=effective,
+                max_line_length=max_line_length,
+                max_lines=max_lines,
+            )
+            # ... and its cleanup can push a boundary back across a cut, so snap again.
+            cues = _resnap_shots(cues, cuts, effective)
+    # Fill the reserved key in place: assigning an existing key never reorders a
+    # dict, so the persisted ``segmentation`` block is byte-identical to the one
+    # built after the run.
+    manifest["degraded"] = degraded
+    diagnostics: dict[str, Any] = {
+        "unit_count": len(snapped),
+        "punct_snapped": snapped is not units,
+        "adaptive_thresholds": effective is not base,
+        "speech_span_count": len(speech_spans or ()),
+        "shot_change_count": len(cuts or ()),
+        "sing_span_count": len(sings or ()),
+        "speaker_turn_count": len(turns or ()),
+        "semantic_engine": semantic_engine is not None,
+        "split_cue_count": split_cue_count,
+        "lyric_cue_count": sum(1 for c in cues if c.get("lyric")),
+        "speaker_formatted": bool(turns),
+        "shot_resnapped": bool(turns and cuts),
+        "cue_count": len(cues),
+    }
     return SegmentationResult(
         cues=cues,
         language=iso,

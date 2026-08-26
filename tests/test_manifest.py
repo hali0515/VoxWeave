@@ -38,6 +38,20 @@ THRESHOLD_KEYS = (
     "shot_snap_s",
 )
 PROFILE_KEYS = set(THRESHOLD_KEYS) | {"max_line_length", "max_lines"}
+#: The persisted ``segmentation`` block, in insertion order -- the order IS the
+#: bytes, so it is pinned rather than compared as a set.
+MANIFEST_KEY_ORDER = (
+    "manifest_version",
+    "engine",
+    "voxweave",
+    "python",
+    "language",
+    "profile",
+    "env",
+    "providers",
+    "degraded",
+)
+PROFILE_KEY_ORDER = ("max_line_length", "max_lines", *THRESHOLD_KEYS)
 
 EN_UNITS = [
     {"text": "Where", "start": 0.0, "end": 0.4},
@@ -105,6 +119,24 @@ def test_split_writes_a_segmentation_manifest(tmp_path):
     assert manifest["env"] == {"gap_adaptive": False, "vad_emission_mask": False}
     assert manifest["providers"] == providers.provider_snapshot("en")
     assert manifest["degraded"] == []
+
+
+def test_persisted_manifest_key_order_is_pinned(tmp_path):
+    """JSON preserves insertion order, so the block's key order IS its bytes.
+
+    ``degraded`` is the last key even though it is the only value that cannot be
+    known before the engine runs: it is inserted empty with the rest and filled
+    in place afterwards, which is what keeps this order independent of when the
+    ledger arrives.
+    """
+    path = _write_case(tmp_path)
+    pipeline.split(path)
+    manifest = _read(path)["segmentation"]
+
+    assert list(manifest) == list(MANIFEST_KEY_ORDER)
+    assert list(manifest["profile"]) == list(PROFILE_KEY_ORDER)
+    assert list(manifest["env"]) == ["gap_adaptive", "vad_emission_mask"]
+    assert list(manifest["providers"]) == ["sentences", "atoms", "pos"]
 
 
 def test_manifest_profile_records_what_actually_ran(tmp_path):
@@ -652,6 +684,121 @@ def test_segmentation_result_carries_the_manifest_and_document():
         ), key
     assert result.document.profile.max_line_length == 42
     assert result.document.profile.max_lines == 2
+
+
+def test_segmentation_result_document_carries_the_engine_text():
+    """``document.text`` is the exact join ``_units_to_seg`` handed the engine.
+
+    Recorded rather than re-derived: a consumer that re-joined the surfaces would
+    have to re-implement the no-space-language rule, and could then disagree with
+    the stream that actually ran.
+    """
+    result = pipeline.segment_document(
+        language="en", word_segments=copy.deepcopy(EN_UNITS)
+    )
+    assert result.document is not None
+    assert result.document.text == "Where did you go Nowhere special"
+
+    ja = pipeline.segment_document(
+        language="ja",
+        word_segments=[
+            {"text": "こんにちは", "start": 0.0, "end": 0.6},
+            {"text": "世界", "start": 0.7, "end": 1.4},
+        ],
+    )
+    assert ja.document is not None
+    assert ja.document.text == "こんにちは世界"  # no separator for a no-space language
+
+
+def test_the_document_is_built_before_the_engine_runs():
+    """AD-6: the IR is an *input*, so it exists before ``smart_split_segments``.
+
+    Ordering is observed through the two seams themselves rather than by probing
+    a private attribute: a wrapper on each records the call order, and the engine
+    wrapper still delegates to the real one so the run is a normal one.
+    """
+    from voxweave.core import smart_split as smart_split_module
+
+    order = []
+    real_build = pipeline.build_seg_document
+    real_split = smart_split_module.smart_split_segments
+
+    def build(**kwargs):
+        order.append("document")
+        return real_build(**kwargs)
+
+    def split(*args, **kwargs):
+        order.append("engine")
+        return real_split(*args, **kwargs)
+
+    with patch.object(pipeline, "build_seg_document", build):
+        with patch.object(smart_split_module, "smart_split_segments", split):
+            result = pipeline.segment_document(
+                language="en", word_segments=copy.deepcopy(EN_UNITS)
+            )
+
+    assert order == ["document", "engine"]
+    assert result.document is not None
+
+
+def test_the_manifest_is_complete_before_the_engine_and_only_degraded_is_filled_after():
+    """Every manifest field except ``degraded`` is final before the engine runs.
+
+    yue degrades for real (per-char atoms), so this also pins the direction of
+    the fill: empty at build time, populated afterwards, in the same dict object
+    the document holds.
+    """
+    seen = {}
+    real_build = pipeline.build_seg_document
+
+    def build(**kwargs):
+        manifest = kwargs["manifest"]
+        seen["keys"] = list(manifest)
+        seen["snapshot"] = copy.deepcopy(manifest)
+        return real_build(**kwargs)
+
+    with patch.object(pipeline, "build_seg_document", build):
+        result = pipeline.segment_document(
+            language="yue", word_segments=copy.deepcopy(YUE_UNITS)
+        )
+
+    assert result.manifest is not None
+    # the key set (and its order) is settled before the engine, degraded included
+    assert seen["keys"] == list(result.manifest)
+    # ... and every value except degraded is already the final one
+    for key, value in seen["snapshot"].items():
+        if key == "degraded":
+            continue
+        assert result.manifest[key] == value, key
+    assert seen["snapshot"]["degraded"] == []
+    assert (
+        _degraded_index(result.manifest["degraded"])[("atoms", "no-provider:per-char")]
+        >= 1
+    )
+    assert result.document is not None
+    assert result.document.manifest is result.manifest
+
+
+def test_the_pre_engine_phase_raises_no_degradation_event():
+    """Why narrowing the capture to the engine run loses nothing.
+
+    The work that now sits ahead of the capture -- the joined text, the threshold
+    resolution and the provider *snapshot* -- reaches no fallback: only the three
+    scorers inside the engine call ``note_degraded``. ``provider_snapshot`` is
+    the interesting one, because it does load the very providers whose absence is
+    a degradation, and yue is the language that has none.
+    """
+    for iso in ("en", "ja", "zh", "yue"):
+        with providers.degradation_capture() as ledger:
+            providers.provider_snapshot(iso)
+        assert ledger == [], iso
+
+    # ... while the engine run on the same language does record the fallback.
+    result = pipeline.segment_document(
+        language="yue", word_segments=copy.deepcopy(YUE_UNITS)
+    )
+    assert result.manifest is not None
+    assert result.manifest["degraded"]
 
 
 def test_segmentation_result_document_carries_the_replay_evidence():

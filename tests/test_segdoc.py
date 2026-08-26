@@ -229,3 +229,51 @@ def test_seg_document_records_the_profile_and_language():
     doc = _document(language="en", profile=profile)
     assert doc.profile is profile
     assert doc.language == "en"
+
+
+def test_seg_document_records_the_joined_text_verbatim():
+    """``text`` is the engine's input stream, stored as handed in -- the builder
+    never re-joins the surfaces itself (that would duplicate the no-space rule)."""
+    doc = _document(text="Where did you go")
+    assert doc.text == "Where did you go"
+    # a no-space join is recorded exactly as the caller made it
+    assert _document(text="こんにちは世界").text == "こんにちは世界"
+
+
+def test_seg_document_text_defaults_to_none():
+    """Optional and additive: a builder call that predates it is still valid."""
+    assert _document().text is None
+
+
+# --- reserved P5 fields ------------------------------------------------------
+
+
+def test_source_unit_reserved_fields_have_their_defaults():
+    """``provenance``/``confidence`` are carried, not consumed: minting applies
+    the declared defaults so P5 can start writing them without a second IR
+    migration."""
+    for unit in _document().units:
+        assert unit.provenance == "aligner"
+        assert unit.confidence is None
+
+
+def test_source_unit_reserved_fields_are_settable_and_still_frozen():
+    unit = SourceUnit(
+        id="u0",
+        surface="go",
+        start=1.4,
+        end=2.0,
+        provenance="manual",
+        confidence=0.5,
+    )
+    assert (unit.provenance, unit.confidence) == ("manual", 0.5)
+    with pytest.raises(Exception):
+        unit.confidence = 0.9  # type: ignore[misc]
+
+
+def test_source_unit_positional_construction_is_unchanged():
+    """The reserved fields are appended with defaults, so the four-argument form
+    every existing caller uses still builds an equal unit."""
+    assert SourceUnit("u0", "go", 1.4, 2.0) == SourceUnit(
+        id="u0", surface="go", start=1.4, end=2.0, provenance="aligner", confidence=None
+    )
