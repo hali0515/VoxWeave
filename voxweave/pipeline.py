@@ -1113,13 +1113,19 @@ def _units_to_seg(units: list[dict], iso: str) -> dict:
 
     Units already carry punctuation from reinject_punct. No-space languages join without
     separator; smart_split uses punctuation for sentence breaking and converts it to spaces.
+    Surfaces are read through the tolerant accessor: units legally carry their text under
+    ``text`` or ``word`` (see ``schema.Unit``), and replayed sibling JSONs use either.
     """
+    from voxweave.core.smart_split import _unit_text
+
     sep = "" if iso in realign.NO_SPACE_LANGS else " "
-    words = [{"word": u["text"], "start": u["start"], "end": u["end"]} for u in units]
+    words = [
+        {"word": _unit_text(u), "start": u["start"], "end": u["end"]} for u in units
+    ]
     return {
         "start": units[0]["start"],
         "end": units[-1]["end"],
-        "text": sep.join(u["text"] for u in units),
+        "text": sep.join(_unit_text(u) for u in units),
         "words": words,
     }
 

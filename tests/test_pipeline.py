@@ -193,6 +193,30 @@ def test_split_repairs_wrong_language_in_existing_sibling(tmp_path):
     assert repaired["segments"][-1]["end"] >= 21.036
 
 
+def test_split_replays_word_key_only_units(tmp_path):
+    # schema.Unit allows the surface under ``text`` OR ``word``; corpus captures
+    # and hand-built siblings use the latter. Replay must not require ``text``.
+    units = [
+        {"word": ch, "start": round(i * 0.2, 3), "end": round(i * 0.2 + 0.15, 3)}
+        for i, ch in enumerate("同比增长的数据中心业务明天见。")
+    ]
+    json_path = tmp_path / "wordkey.json"
+    json_path.write_text(
+        json.dumps(
+            {"language": "zh", "segments": [], "word_segments": units},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    pipeline.split(json_path)
+
+    written = json.loads(json_path.read_text(encoding="utf-8"))
+    assert written["segments"], "word-key stream must still produce cues"
+    joined = "".join(c["text"].replace("\n", "") for c in written["segments"])
+    assert "数据中心" in joined
+
+
 def test_replay_relabels_existing_character_stream_without_inventing_spaces():
     text = "今天我们打开 OpenAI Codex 的界面并测试所有功能是否正常运行。"
     coarse = [{"text": text, "start": 1.0, "end": 7.0}]
