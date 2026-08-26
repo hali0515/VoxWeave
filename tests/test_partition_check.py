@@ -218,15 +218,63 @@ def test_non_finite_and_reversed_times():
     assert "reversed-cue" in kinds(result)
 
 
-def test_non_monotone_starts_and_overlap():
+def test_an_overlap_is_reported_once_and_not_also_as_non_monotone():
+    """One defect, one violation.
+
+    Bug pin. ``non-monotone-time`` used to fire on ``start < prev.end`` as well
+    as on ``start < prev.start``, so every overlap raised both kinds and inflated
+    the class by 2x in any count-based comparison. p4-api.md section 1 item 5
+    defines monotonicity on the *starts* alone.
+    """
     partition, cues, us = clean_case()
     cues[1]["start"] = 0.5
     cues[1]["speech_start"] = 0.5
     result = check_partition(
         partition, cues, units=us, profile=profile(), origin="v2", stage="raw"
     )
-    assert "non-monotone-time" in kinds(result)
-    assert "overlap" in kinds(result)
+    assert kinds(result) == ["overlap"]
+
+
+def test_non_monotone_time_fires_on_a_start_behind_the_previous_start():
+    """Reachable without an overlap: a reversed predecessor ends before it starts."""
+    partition, cues, us = clean_case()
+    cues[0]["start"] = 2.5
+    cues[0]["end"] = 1.9
+    cues[0].pop("speech_start")
+    cues[0].pop("speech_end")
+    result = check_partition(
+        partition, cues, units=us, profile=profile(), origin="v2", stage="raw"
+    )
+    assert kinds(result) == ["non-monotone-time", "reversed-cue"]
+
+
+def test_an_off_whitelist_waiver_is_recorded_but_waives_nothing():
+    """The whitelist is the point of having one."""
+    partition, cues, us = clean_case()
+    cues[0]["end"] = 30.0
+    cues[1]["start"] = 30.1
+    cues[1]["speech_start"] = 30.1
+    cues[1]["end"] = 31.0
+    cues[1]["speech_end"] = 31.0
+    bogus = Waiver(
+        kind="because-i-said-so",
+        cue_index=0,
+        unit_ids=(0, 1),
+        span=(0.0, 30.0),
+        cap=7.0,
+    )
+    result = check_partition(
+        partition,
+        cues,
+        units=us,
+        profile=profile(),
+        origin="v2",
+        stage="raw",
+        waivers={0: bogus},
+    )
+    caps = [v for v in result.violations if v.kind == "duration-cap"]
+    assert caps and all(not v.waived for v in caps)
+    assert result.waivers == (bogus,)
 
 
 def test_overlap_can_be_switched_off_for_a_lane_that_expects_it():

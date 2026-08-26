@@ -6,7 +6,15 @@
 # and None must reproduce the current default layout exactly.
 import pytest
 
-from voxweave.core.layout import DEFAULT_MAX_LINE_LENGTH, _vis_width, wrap_cue_text
+from voxweave.core.layout import (
+    DEFAULT_MAX_LINE_LENGTH,
+    _join_line,
+    _two_line_break,
+    _two_line_break_index,
+    _vis_width,
+    _wrap_units,
+    wrap_cue_text,
+)
 
 # Current (default-profile) output, captured from the 42-column renderer.
 DEFAULT_LAYOUTS = [
@@ -100,3 +108,37 @@ def test_wide_profile_skips_wrapping():
     assert "\n" in default
     rendered = wrap_cue_text(text, lang, max_lines, max_line_length=80)
     assert rendered == text
+
+
+# ------------------------------------------- the two-line chooser's own widths
+
+
+@pytest.mark.parametrize(
+    "text,lang,budget",
+    [
+        ("voice assistant and it's training for the custom", "en", 42),
+        ("alpha bravo charlie delta echo foxtrot golf hotel", "en", 24),
+        ("a bb ccc dddd eeeee ffffff", "en", 12),
+        ("これはテストですこんにちは世界今日はいい天気", "ja", 20),
+        ("你好世界这是一个测试今天天气很好我们一起走吧", "zh", 18),
+    ],
+)
+def test_two_line_break_widths_match_the_joined_slices(text, lang, budget):
+    """The prefix-sum rewrite must be the same function, not merely similar.
+
+    ``_two_line_break`` reports the chosen line widths so the boundary optimizer
+    can price the lines the renderer will deliver; those widths are computed from
+    prefix sums instead of re-joining a slice per candidate, which is what makes
+    the scan linear. ``_vis_width`` is a per-character sum, so the two readings
+    are the same integer -- pinned here rather than assumed.
+    """
+    units = _wrap_units(text, lang)
+    chosen = _two_line_break(units, lang, budget)
+    assert (None if chosen is None else chosen[0]) == _two_line_break_index(
+        units, lang, budget
+    )
+    if chosen is None:
+        return
+    index, top, bottom = chosen
+    assert top == _vis_width(_join_line(units[:index]))
+    assert bottom == _vis_width(_join_line(units[index:]))

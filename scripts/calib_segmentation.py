@@ -2602,6 +2602,13 @@ def merge_feature_scans(scans: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 # ----------------------------------------------------- C13 and the validator
 
 
+#: The validator stages every valid measurement must carry. AD-4 runs the
+#: checker at all three, and a stage that is simply *absent* used to read here as
+#: "nothing to report" -- which made the whole exit driver blindable by deleting
+#: one assignment in the hook, with no test and no schema noticing.
+SHADOW_REQUIRED_STAGES = ("raw", "core", "legacy_overlay")
+
+
 def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
     """Every validator stage of one artifact, counted by kind and by origin.
 
@@ -2612,15 +2619,23 @@ def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
     Those rows are labelled and excluded from the C13 driver -- which costs
     nothing, because a document with a fallback already fails C13 on
     ``fallback_intervals`` alone.
+
+    A missing mandatory stage is recorded in ``missing_stages`` and is an INVALID
+    measurement for the caller, never a clean one. The distinction matters more
+    than it looks: an absent stage and a stage that found nothing are reported
+    identically by a counter that treats falsy as empty, so the difference
+    between "the core validator says this partition is clean" and "the core
+    validator never ran" would come down to which field a reader happened to
+    open. The v1 lane stages stay optional -- an unprojectable v1 stream has no
+    partition to check, which is a fact about v1, not a broken measurement.
     """
     duplicated = bool(artifact["validator"].get("raw_duplicate_v1_cues"))
     stages: dict[str, Any] = {}
     exit_driving: list[dict[str, Any]] = []
+    missing: list[str] = []
     suppressed = 0
     sources: list[tuple[str, Any]] = [
-        ("raw", artifact["validator"].get("raw")),
-        ("core", artifact["validator"].get("core")),
-        ("legacy_overlay", artifact["validator"].get("legacy_overlay")),
+        (name, artifact["validator"].get(name)) for name in SHADOW_REQUIRED_STAGES
     ]
     for lane in SHADOW_LANES:
         block = artifact["lanes"][lane]["v1"]
@@ -2628,6 +2643,8 @@ def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
     for name, block in sources:
         if not block:
             stages[name] = None
+            if name in SHADOW_REQUIRED_STAGES:
+                missing.append(name)
             continue
         kinds: dict[str, int] = {}
         for violation in block["violations"]:
@@ -2665,9 +2682,60 @@ def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "duplicate_v1_cues": duplicated,
         "exit_driving": exit_driving,
+        "missing_stages": missing,
         "not_conservation_evidence": suppressed,
         "stages": stages,
     }
+
+
+def shadow_measurement_errors(
+    case: Case, artifact: Mapping[str, Any], violations: Mapping[str, Any]
+) -> list[str]:
+    """Reasons this document's shadow run is not a measurement at all (exit 2).
+
+    Kept apart from :func:`c13_case_failures` on purpose. A C13 failure says v2
+    did something wrong; every reason here says the run cannot support a verdict
+    either way, and folding the two together would let an unmeasured stage read
+    as a passing one.
+
+    Three checks:
+
+    * a mandatory validator stage did not run -- see :func:`shadow_violation_counts`;
+    * the two independent derivations of v2's partition (the solver's own cut
+      list and the character-cursor projection) disagree. That projection is not
+      decorative: the GATED delivery lane has no solver partition of its own and
+      rebuilds every cue's ``word_data`` from the projected unit range, so a
+      wrong cursor moves cps_p90 and the mid-phrase rate without moving a single
+      boundary. The cross-check was computed and thrown away before this;
+    * the v1 stream could not be projected onto source units. The tracked corpus
+      is word-level and must project; if it does not, the comparison the whole
+      report is built on has no v1 side.
+    """
+    problems = [
+        f"{case.id}: validator stage {name!r} did not run (AD-4 requires all of"
+        f" {', '.join(SHADOW_REQUIRED_STAGES)})"
+        for name in violations["missing_stages"]
+    ]
+    cross = (artifact["lanes"][SHADOW_LANE_CORE]["v2"] or {}).get(
+        "projection_cross_check"
+    )
+    if not isinstance(cross, Mapping):
+        problems.append(
+            f"{case.id}: the core lane carries no projection cross-check, so the"
+            " unit ranges the gated lane is measured on are unverified"
+        )
+    elif not cross.get("agrees"):
+        problems.append(
+            f"{case.id}: the solver partition and the character projection"
+            f" disagree (mode {cross.get('mode')!r})"
+        )
+    if artifact["coverage"].get("v1_unprojected"):
+        problems.append(
+            f"{case.id}: v1's cue stream could not be projected onto source units"
+            f" ({artifact['v1_projection']['mode']}), so this case has no v1"
+            " reference to compare against"
+        )
+    return problems
 
 
 def c13_case_failures(
@@ -3164,7 +3232,14 @@ def _cell_report(
     if partition is None:
         return {
             "barrier_flips": len(flips),
-            "crossed_interval_boundary": False,
+            # ``None``, not ``False``. AD-2's rule is "FAIL when any moved
+            # boundary lies outside the influence cell"; a probe that cannot
+            # report its moved set has not satisfied that rule, it has failed to
+            # answer it. Reporting False made an unmeasurable probe indis-
+            # tinguishable from a clean one at the exit, so a probe class that
+            # became systematically unreplayable would silently shrink the AD-2
+            # denominator while the run kept reporting "no interval crossings".
+            "crossed_interval_boundary": None,
             "cue_count": probe["cue_count"],
             "error": "partition unresolved",
             "fallback_intervals": probe["fallback_intervals"],
@@ -3202,14 +3277,22 @@ def run_single_gap_probes(
     *,
     magnitudes: Sequence[int],
     max_probes: int,
+    near_cliff_only: bool = False,
 ) -> dict[str, Any]:
-    """AD-2/AD4-3: exhaustive near-cliff probes plus a seeded 10% of the rest."""
+    """AD-2/AD4-3: exhaustive near-cliff probes plus a seeded 10% of the rest.
+
+    ``near_cliff_only`` drops the seeded remainder. It exists so a frozen entry
+    point can afford to exercise the AD-2 exit driver at all: near-cliff gaps are
+    where a decision can move, and probing only those is a bounded slice rather
+    than a reduced-confidence version of the full run. The report says which it
+    was (``sampled_skipped``) so the two are never confused.
+    """
     case = shadow_case.case
     base_partition = shadow_case.core_partition
     scan = near_cliff_scan(case, document, magnitudes)
     near = set(scan["near_cliff"])
     sampled: dict[int, list[int]] = {}
-    for magnitude in magnitudes:
+    for magnitude in magnitudes if not near_cliff_only else ():
         rng = random.Random(f"{case.id}:single_gap:{magnitude}")
         for index in range(scan["candidate_gaps"]):
             if index in near:
@@ -3297,7 +3380,8 @@ def run_single_gap_probes(
             "planned_probes": len(plan),
             "raw_knees": scan["raw_knees"],
             "sampled_gaps": len(sampled),
-            "sample_rate": PERTURB_SAMPLE_RATE,
+            "sample_rate": 0.0 if near_cliff_only else PERTURB_SAMPLE_RATE,
+            "sampled_skipped": near_cliff_only,
             "skipped_clamped": skipped,
             "vad_state_denominators": scan["vad_state_denominators"],
         },
@@ -3308,8 +3392,25 @@ def run_single_gap_probes(
 
 def _probe_failed(probe: Mapping[str, Any]) -> bool:
     return any(
-        lane["crossed_interval_boundary"] for lane in probe.get("lanes", {}).values()
+        lane["crossed_interval_boundary"] is True
+        for lane in probe.get("lanes", {}).values()
     )
+
+
+def _probe_unknown(probe: Mapping[str, Any]) -> bool:
+    """A probe that could not answer AD-2's question, in either lane.
+
+    Two shapes reach here: a replay that raised (``lanes`` empty, ``error`` set)
+    and a probe whose partition would not resolve (``crossed_interval_boundary``
+    is ``None``). Neither is a pass. They are counted separately from failures
+    because they mean different things -- a failure is evidence against the
+    locality claim, an unknown is the absence of evidence for it -- but both
+    refuse the run a clean verdict.
+    """
+    lanes = probe.get("lanes") or {}
+    if not lanes:
+        return bool(probe.get("error"))
+    return any(lane["crossed_interval_boundary"] is None for lane in lanes.values())
 
 
 def _probe_movement(probe: Mapping[str, Any]) -> int:
@@ -3327,13 +3428,18 @@ def retain_probes(
 
     Exhaustive near-cliff coverage means thousands of probes per case, and a
     report nobody can open is a report nobody reads. Every FAILING probe is kept
-    -- it is the exit driver and must never be summarised away -- plus the worst
-    movers by count. The summary states the true totals so a trimmed list can
-    never be mistaken for the whole run.
+    -- it is the exit driver and must never be summarised away -- and so is every
+    UNKNOWN one, plus the worst movers by count. The summary states the true
+    totals so a trimmed list can never be mistaken for the whole run.
     """
     failures = [dict(p) for p in probes if _probe_failed(p)]
+    unknown = [dict(p) for p in probes if not _probe_failed(p) and _probe_unknown(p)]
     moved = sorted(
-        (dict(p) for p in probes if not _probe_failed(p) and _probe_movement(p) > 0),
+        (
+            dict(p)
+            for p in probes
+            if not _probe_failed(p) and not _probe_unknown(p) and _probe_movement(p) > 0
+        ),
         key=lambda p: (
             -_probe_movement(p),
             p["gap_index"],
@@ -3341,7 +3447,7 @@ def retain_probes(
             p["sign"],
         ),
     )
-    retained = [*failures, *moved[:OFFENDER_LIMIT]]
+    retained = [*failures, *unknown, *moved[:OFFENDER_LIMIT]]
     return retained, {
         "barrier_flips_natural": sum(
             int(p["lanes"]["natural"]["barrier_flips"]) for p in probes if p["lanes"]
@@ -3361,6 +3467,7 @@ def retain_probes(
         ),
         "probes": len(probes),
         "retained_probes": len(retained),
+        "unknown": len(unknown),
         "with_movement": len(moved),
     }
 
@@ -3422,11 +3529,13 @@ def run_perturbation(
     modes: Sequence[str],
     magnitudes: Sequence[int],
     max_probes: int,
+    near_cliff_only: bool = False,
 ) -> dict[str, Any]:
     """Drive both perturbation modes over the selected cases."""
     single: list[dict[str, Any]] = []
     jitter: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
     for shadow_case in shadow_cases:
         if "single_gap" in modes:
             block = run_single_gap_probes(
@@ -3434,11 +3543,15 @@ def run_perturbation(
                 shadow_case.document,
                 magnitudes=magnitudes,
                 max_probes=max_probes,
+                near_cliff_only=near_cliff_only,
             )
             block["case"] = shadow_case.case.id
             block["language"] = shadow_case.case.language
             single.append(block)
             failures.extend(p for p in block["probes"] if _probe_failed(p))
+            unknown.extend(
+                p for p in block["probes"] if not _probe_failed(p) and _probe_unknown(p)
+            )
         if "global_jitter" in modes:
             block = run_global_jitter(shadow_case, magnitudes=magnitudes)
             block["case"] = shadow_case.case.id
@@ -3448,6 +3561,8 @@ def run_perturbation(
         "exhaustive": all(block["coverage"]["exhaustive"] for block in single),
         "failures": failures,
         "global_jitter": jitter,
+        "near_cliff_only": near_cliff_only,
+        "unknown": unknown,
         "influence_radius_units": INFLUENCE_RADIUS_UNITS,
         "magnitudes_ms": list(magnitudes),
         "modes": list(modes),
@@ -3468,6 +3583,7 @@ def run_perturbation(
                 default=0,
             ),
             "probes": sum(block["summary"]["probes"] for block in single),
+            "unknown": sum(block["summary"]["unknown"] for block in single),
             "with_movement": sum(block["summary"]["with_movement"] for block in single),
         },
     }
@@ -3480,15 +3596,19 @@ def shadow_exit_code(
     gate_results: Sequence[Mapping[str, Any]],
     c13_failures: Sequence[str],
     perturbation_failures: Sequence[Any],
+    perturbation_unknown: Sequence[Any] = (),
+    measurement_errors: Sequence[str] = (),
 ) -> int:
-    """Fold three independent verdicts onto the shared 0/1/2 contract.
+    """Fold the independent verdicts onto the shared 0/1/2 contract.
 
     An invalid measurement outranks a failed gate: a run that could not answer
     the question has no standing to call anything a regression (the same rule
-    ``gate_exit_code`` already applies to a thin denominator).
+    ``gate_exit_code`` already applies to a thin denominator). That is why an
+    unevaluable perturbation probe and an unmeasured validator stage exit 2 and
+    not 1 -- neither is evidence of a regression, and neither may pass.
     """
     code = gate_exit_code(gate_results)
-    if code == cc.EXIT_INVALID:
+    if code == cc.EXIT_INVALID or measurement_errors or perturbation_unknown:
         return cc.EXIT_INVALID
     if code == cc.EXIT_GATE_FAILED or c13_failures or perturbation_failures:
         return cc.EXIT_GATE_FAILED
@@ -3513,6 +3633,21 @@ def _lane_case_row(result: LaneResult) -> dict[str, Any]:
     }
     row["unmapped_boundaries"] = measurement.diagnostics["unmapped_boundaries"]
     return row
+
+
+def _by_language(shadow_cases: Sequence[ShadowCase], key: str) -> dict[str, int]:
+    """Sum one integer/boolean coverage field per language, zeros included.
+
+    Zeros are kept rather than omitted: a column that only appears once it is
+    non-zero is a column nobody notices is missing.
+    """
+    out = {language: 0 for language in cc.CALIBRATION_LANGUAGES}
+    for row in shadow_cases:
+        language = cc.canonical_language_or(row.case.language, row.case.language)
+        out[language] = out.get(language, 0) + int(
+            row.artifact["coverage"].get(key) or 0
+        )
+    return dict(sorted(out.items()))
 
 
 def build_shadow_report(
@@ -3582,9 +3717,23 @@ def build_shadow_report(
         },
         "coverage": {
             "failures": list(coverage_failures),
+            # Two per-language columns that the C13 pass/fail line cannot carry.
+            # ``coarse_granularity`` is an input limit, not an optimizer failure
+            # (P5 splits below the source unit) even though it still counts in
+            # ``fallback_intervals``; ``unprojected_v1`` is an invalid
+            # measurement, because a case with no v1 reference has no comparison
+            # to report. Both are zero on the tracked word-level corpus, which is
+            # exactly why they have to be visible if they ever stop being.
+            "coarse_granularity_by_language": _by_language(
+                shadow_cases, "coarse_granularity_intervals"
+            ),
+            "unprojected_v1_by_language": _by_language(shadow_cases, "v1_unprojected"),
             "cases": [
                 {
                     "case": row.case.id,
+                    "projection_cross_check": row.artifact["lanes"][SHADOW_LANE_CORE][
+                        "v2"
+                    ].get("projection_cross_check"),
                     **{
                         key: row.artifact["coverage"][key]
                         for key in sorted(row.artifact["coverage"])
@@ -3683,7 +3832,27 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
                 f" {result['mode']:<8} value={_fmt(result['value'])}"
                 + (f"  {reasons}" if reasons else "")
             )
-    failures = report["coverage"]["failures"]
+    coverage = report["coverage"]
+    print()
+    print(
+        "  coverage    "
+        + "  ".join(
+            f"{language}: coarse={coverage['coarse_granularity_by_language'][language]}"
+            f" unprojected_v1={coverage['unprojected_v1_by_language'][language]}"
+            for language in sorted(coverage["coarse_granularity_by_language"])
+        )
+    )
+    disagreed = [
+        row["case"]
+        for row in coverage["cases"]
+        if not (row.get("projection_cross_check") or {}).get("agrees")
+    ]
+    print(
+        f"  projection  cross-check agrees on"
+        f" {len(coverage['cases']) - len(disagreed)}/{len(coverage['cases'])} cases"
+        + (f" (disagreed: {', '.join(disagreed)})" if disagreed else "")
+    )
+    failures = coverage["failures"]
     if failures:
         print()
         print("  C13 coverage failures")
@@ -3696,7 +3865,8 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
         print(
             f"  perturbation: {totals['probes']} probes,"
             f" {totals['jitter_draws']} jitter draws,"
-            f" {totals['failures']} outside the influence cell"
+            f" {totals['failures']} outside the influence cell,"
+            f" {totals['unknown']} unevaluable"
         )
     for warning in report.get("warnings") or ():
         print(f"  warning: {warning}")
@@ -3739,11 +3909,23 @@ def cmd_shadow(args: argparse.Namespace) -> int:
     shadow_cases = [run_shadow_case(case) for case in cases]
 
     coverage_failures: list[str] = []
+    measurement_errors: list[str] = []
     for row in shadow_cases:
         violations = shadow_violation_counts(row.artifact)
+        measurement_errors.extend(
+            shadow_measurement_errors(row.case, row.artifact, violations)
+        )
         coverage_failures.extend(
             c13_case_failures(row.case, row.artifact["coverage"], violations)
         )
+        if int(row.artifact["coverage"].get("coarse_granularity_intervals") or 0):
+            warnings.append(
+                f"{row.case.id}: "
+                f"{row.artifact['coverage']['coarse_granularity_intervals']}"
+                " interval(s) fell back because the source units are coarser than"
+                " a cue -- an input-granularity limit (P5 splits below the unit),"
+                " not an optimizer failure"
+            )
         if violations["not_conservation_evidence"]:
             warnings.append(
                 f"{row.case.id}: {violations['not_conservation_evidence']} raw-stage"
@@ -3761,6 +3943,11 @@ def cmd_shadow(args: argparse.Namespace) -> int:
                     f"{row.case.relpath}: the gated lane is not measurable", [message]
                 )
             warnings.append(message)
+
+    if measurement_errors:
+        raise cc.CalibrationError(
+            "the shadow run did not produce a valid measurement", measurement_errors
+        )
 
     lanes = {
         lane: {
@@ -3802,11 +3989,17 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             modes=args.perturb_mode or list(PERTURB_MODES),
             magnitudes=args.perturb_magnitude or list(PERTURB_MAGNITUDES_MS),
             max_probes=int(args.perturb_max_probes),
+            near_cliff_only=bool(args.perturb_near_cliff_only),
         )
         if not perturbation["exhaustive"]:
             warnings.append(
                 "--perturb-max-probes truncated the near-cliff set: this run is not"
                 " exhaustive coverage and must not be reported as such"
+            )
+        if perturbation["near_cliff_only"]:
+            warnings.append(
+                "--perturb-near-cliff-only skipped the seeded 10% sample of"
+                " non-near-cliff gaps: a bounded AD-2 slice, not full coverage"
             )
 
     report = build_shadow_report(
@@ -3831,10 +4024,18 @@ def cmd_shadow(args: argparse.Namespace) -> int:
     perturbation_failures = (
         list(perturbation["failures"]) if perturbation is not None else []
     )
+    perturbation_unknown = (
+        list(perturbation["unknown"]) if perturbation is not None else []
+    )
     # The verdict is computed and reported either way; ``--check`` only decides
     # whether it reaches the process exit. A summary line reading "pass" beside a
     # non-zero failure count would be the harness lying to a log parser.
-    verdict = shadow_exit_code(gate_results, coverage_failures, perturbation_failures)
+    verdict = shadow_exit_code(
+        gate_results,
+        coverage_failures,
+        perturbation_failures,
+        perturbation_unknown,
+    )
     code = verdict if args.check else cc.EXIT_OK
     failures = (
         sum(
@@ -3842,6 +4043,7 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         )
         + len(coverage_failures)
         + len(perturbation_failures)
+        + len(perturbation_unknown)
     )
     warned = sum(
         1 for r in gate_results if r["mode"] == "warning" and r["status"] != "pass"
@@ -3976,6 +4178,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=f"repeatable, in ms; default {', '.join(map(str, PERTURB_MAGNITUDES_MS))}",
+    )
+    shadow.add_argument(
+        "--perturb-near-cliff-only",
+        action="store_true",
+        help="probe only near-cliff gaps (skip the seeded 10%% sample): a bounded"
+        " AD-2 slice cheap enough for the frozen Makefile target",
     )
     shadow.add_argument(
         "--perturb-max-probes",

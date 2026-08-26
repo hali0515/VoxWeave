@@ -25,7 +25,7 @@ import random
 
 import pytest
 
-from voxweave.core.boundary_cost import quantize
+from voxweave.core.boundary_cost import VAD_STATES, quantize
 from voxweave.core.boundary_lattice import (
     Edge,
     LatticeAtom,
@@ -585,3 +585,189 @@ def test_document_waivers_are_stamped_with_document_cue_indices():
     raw = solution.artifact["validator"]["raw"]
     assert sorted(w["cue_index"] for w in raw["waivers"]) == [0, 1]
     assert raw["exit_driving"] == 0
+
+
+# --------------------------------------- AD-3 per-cut features in the artifact
+
+
+def test_the_selected_path_publishes_its_raw_features_per_cut_and_per_edge():
+    """AD-3 asks for the features "per cut candidate"; the aggregate cannot carry them.
+
+    ``sum_breakdowns`` drops a categorical feature rather than inventing an
+    aggregate for it, so ``vad_state`` -- the field that says what kind of
+    evidence a boundary rested on -- vanishes from the interval sums entirely,
+    and the pause geometry survives only as a total nobody can re-weight one
+    decision from.
+    """
+    doc = document(
+        timed(["alpha", "bravo", "charlie", "delta"], dur=0.6, gap=0.4),
+        prof=profile(max_line_length=12, max_lines=1),
+    )
+    block = solved(doc).artifact["intervals"][0]
+    selected = block["policy_selected"]
+    assert selected["cut_features"], "expected at least one cut on this fixture"
+    assert len(selected["cut_features"]) == len(selected["cuts"])
+    assert len(selected["edge_features"]) == len(selected["cuts"]) + 1
+    for row in selected["cut_features"]:
+        assert row["vad_state"] in VAD_STATES
+        for key in ("gap_ms_raw", "effective_ms", "overlap_fraction", "ramp_ms"):
+            assert key in row
+        assert row["unit"] in selected["cuts"]
+    for row in selected["edge_features"]:
+        for key in ("available_s", "balance_raw", "line_count_raw", "layout_source"):
+            assert key in row
+    # the aggregate still drops the categorical, which is why the rows exist
+    assert "vad_state" not in selected["breakdown"]["features"]
+
+
+def test_the_artifact_carries_a_vad_state_block():
+    """Spec v3's artifact schema names it; nothing else in the artifact reports it."""
+    doc = document(
+        timed(["alpha", "bravo", "charlie", "delta"], dur=0.6, gap=0.4),
+        prof=profile(max_line_length=12, max_lines=1),
+    )
+    artifact = solved(doc).artifact
+    block = artifact["vad_state"]
+    assert set(block["selected_cuts_by_state"]) == set(VAD_STATES)
+    assert block["unclassified_cuts"] == 0
+    total = sum(block["selected_cuts_by_state"].values())
+    assert total == sum(len(s.partition_units) for s in solved(doc).solutions)
+
+
+# --------------------------------------------- AD-4 waiver provenance survives
+
+
+def test_a_solver_minted_waiver_reaches_the_artifact_with_its_provenance():
+    """Bug pin: re-stamping the ledger must not strip the evidence.
+
+    AD-4 requires "duration cap with explicit waiver provenance (reason/unit
+    ids/span/cap)" precisely so the exemption can be re-derived from the artifact
+    instead of being taken on trust. Nothing else in the tree asserted this on a
+    waiver the solver actually minted rather than one a test constructed.
+    """
+    solution = optimize_document(document([("held", 0.0, 8.0)]))
+    waivers = solution.artifact["validator"]["raw"]["waivers"]
+    assert len(waivers) == 1
+    waiver = waivers[0]
+    assert waiver["kind"] == "held-chain-duration"
+    assert waiver["unit_ids"] == [0]
+    assert waiver["span"] == [0.0, 8.0]
+    assert waiver["cap"] == solution.document.profile.max_cue_s
+    assert waiver["detail"]
+    assert solution.artifact["totals"]["waivers"] == waivers
+
+
+def test_the_per_interval_raw_pass_reports_the_violation_it_waived():
+    """Bug pin: ``validator_raw`` could be replaced by a constant clean result.
+
+    Every test that touched it asserted the negative on a clean fixture, so a
+    per-interval pass that reported nothing at all was indistinguishable from one
+    that reported a correctly-waived violation.
+    """
+    interval = optimize_document(document([("held", 0.0, 8.0)])).solutions[0]
+    rows = interval.validator_raw.violations
+    assert [v.kind for v in rows] == ["duration-cap"]
+    assert rows[0].waived is True
+    assert rows[0].waived_by is not None
+    assert rows[0].waived_by.unit_ids == (0,)
+    assert interval.validator_raw.cue_count == len(interval.cues)
+    assert interval.validator_raw.origin == "v2"
+
+
+# ------------------------------------------------- AD3-3 per-interval origin
+
+
+def test_one_fallback_interval_does_not_relabel_the_whole_document_as_v1():
+    """Bug pin: origin is per violation, not per document.
+
+    The raw pass used to type the WHOLE stream ``v1`` as soon as any interval
+    adopted v1, so a genuine v2 defect in a fully optimized interval stopped
+    driving the exit because some other interval had fallen back.
+    """
+    doc = document(
+        [
+            ("one", 0.0, 0.5),
+            ("two", 0.6, 1.0),
+            ("three", float("nan"), 2.0),
+            ("four", 20.0, 20.5),
+            ("five", 20.6, 21.0),
+        ]
+    )
+    v1_cues = [
+        {
+            "text": "one two three",
+            "start": 0.0,
+            # v1's own damage: an adopted cue that runs past the next interval
+            "end": 25.0,
+            "word_data": [],
+            "speech_start": 0.0,
+            "speech_end": 2.0,
+        },
+    ]
+    solution = solved(doc, v1=V1Partition(cuts=(3,), cues=tuple(v1_cues)))
+    assert any(not s.optimized for s in solution.solutions)
+    assert any(s.optimized for s in solution.solutions)
+
+    rows = [
+        (v["cue_index"], v["kind"], v["origin"])
+        for v in solution.artifact["validator"]["raw"]["violations"]
+        if v["cue_index"] is not None
+    ]
+    # cue 0 is v1's own adopted cue, over the cap because v1 timed it that way
+    assert (0, "duration-cap", "v1") in rows
+    # cue 1 is v2's, and it is the cue that overlaps -- v2 owns that row
+    assert (1, "overlap", "v2") in rows
+    assert not any(index == 1 and origin == "v1" for index, _kind, origin in rows)
+
+
+# ---------------------------------------------------------- C9 reference honesty
+
+
+def test_a_v1_cut_that_is_not_an_atom_edge_is_recorded_not_silently_rounded():
+    """C9 prices v1's ACTUAL partition, or says which cut it could not.
+
+    Bug pin. The global reference maps each v1 unit cut with a ``bisect`` and
+    used to accept whatever node came back, with no record that the cut had not
+    landed on an atom edge -- so ``V1Reference`` could price a partition v1 never
+    chose and look identical to one that priced v1's own. Here the tokenizer
+    folds three source units into the single atom ``3.75``, so units 1 and 2 have
+    no node of their own.
+    """
+    doc = document(
+        [("3", 0.0, 0.2), (".", 0.2, 0.3), ("75", 0.3, 0.5), ("next", 0.7, 1.0)],
+        prof=profile(max_line_length=12, max_lines=1),
+    )
+    object.__setattr__(doc, "text", "3.75 next")
+    solution = solved(doc, v1=V1Partition(cuts=(1, 2, 3)))
+    rounded = solution.artifact["v1"]["rounded_cuts"]
+    assert [row["unit"] for row in rounded] == [1, 2]
+    for row in rounded:
+        assert set(row) == {"landed_unit", "node", "unit"}
+        assert row["landed_unit"] != row["unit"]
+    # the cut that DID land on an edge is not reported as rounded
+    assert 3 not in [row["unit"] for row in rounded]
+
+
+def test_no_v1_reference_is_reported_as_absent_not_as_a_measured_no():
+    """Adjudication B: ``optimize_document`` without a v1 says so per interval."""
+    solution = solved(document(timed(["the", "cat", "sat"])))
+    block = solution.artifact["intervals"][0]
+    assert block["selected_is_v1"] is None
+    assert block["v1_path_legal"] is None
+    assert block["v1_cost_under_v2"] is None
+    assert solution.artifact["v1"] is None
+
+
+# ------------------------------------------------------- AD4-2 second work point
+
+
+def test_the_benign_lexical_work_fixture_also_stays_inside_the_band():
+    """AD4-2 keeps a benign 2000-atom lexical fixture beside the adversarial one."""
+    prof = profile(max_line_length=42, max_lines=2, max_cue_s=0.0)
+    doc = document(timed(["word"] * 2000, dur=0.2, gap=0.05), prof=prof)
+    solution = solved(doc)
+    for item in solution.solutions:
+        limit = len(item.lattice.atoms) * (band_atoms(prof) + 2)
+        assert item.dp_relaxations < limit
+        assert item.packer_steps < limit
+    assert solution.artifact["totals"]["fallback_intervals"] == 0

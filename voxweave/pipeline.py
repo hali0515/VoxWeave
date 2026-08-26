@@ -1318,6 +1318,62 @@ def _shadow_cue_rows(
     return rows
 
 
+def _restamp_by_footprint(
+    waivers: Mapping[int, Any], partition: Sequence[int] | None, unit_count: int
+) -> dict[int, Any]:
+    """Re-point an interval-minted waiver ledger at another stage's cue indices.
+
+    A waiver's cue index is only meaningful against the stream it was minted for,
+    and the later stages re-time, re-wrap and (in the overlay lane) split and
+    merge cues -- so index identity is not a contract. Source-unit ownership is:
+    the exemption names the units it covers, and every stage still owns those
+    units in exactly one cue. Handing the checker no ledger at all -- the shape
+    this replaced -- made it re-report an exemption the solver had granted as an
+    *unwaived*, exit-driving violation, which is the failure mode
+    ``_document_waivers`` exists to prevent, reproduced one level up.
+    """
+    from dataclasses import replace
+
+    from voxweave.core.partition_check import owned_unit_ids
+
+    if partition is None or not waivers:
+        return {}
+    bounds = owned_unit_ids(partition, unit_count)
+    out: dict[int, Any] = {}
+    for waiver in waivers.values():
+        if not waiver.unit_ids:
+            continue
+        low, high = min(waiver.unit_ids), max(waiver.unit_ids) + 1
+        for index, (start, end) in enumerate(bounds):
+            if start <= low and high <= end:
+                out[index] = replace(waiver, cue_index=index)
+                break
+    return out
+
+
+def _origins_by_footprint(
+    fallback_ranges: Sequence[Sequence[int]],
+    partition: Sequence[int] | None,
+    unit_count: int,
+) -> dict[int, Origin]:
+    """Which engine produced each cue of a stage's stream, by unit ownership.
+
+    AD3-3 attributes a violation to the engine that produced the violating cue.
+    A document with one adopted-v1 interval is not a v1 document, so typing the
+    whole stage "v2" blames v2 for v1's damage and typing it "v1" excuses v2's.
+    """
+    from voxweave.core.partition_check import owned_unit_ids
+
+    if partition is None or not fallback_ranges:
+        return {}
+    bounds = owned_unit_ids(partition, unit_count)
+    return {
+        index: "v1"
+        for index, (start, end) in enumerate(bounds)
+        if any(start < high and end > low for low, high in fallback_ranges)
+    }
+
+
 def _shadow_stream_block(
     cues: Sequence[Cue],
     partition: Sequence[int] | None,
@@ -1326,6 +1382,8 @@ def _shadow_stream_block(
     document: SegDocument,
     origin: Origin,
     stage: Stage,
+    waivers: Mapping[int, Any] | None = None,
+    origins: Mapping[int, Origin] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One engine's stream at one lane: rows, its partition, and its validator."""
@@ -1341,6 +1399,8 @@ def _shadow_stream_block(
             profile=document.profile,
             origin=origin,
             stage=stage,
+            waivers=waivers,
+            origins=origins,
         ).to_dict()
     )
     block: dict[str, Any] = {
@@ -1472,6 +1532,7 @@ def _shadow_v2_artifact(
     from voxweave.core.boundary_v2 import (
         V1Partition,
         _document_partition,
+        _document_waivers,
         optimize_document,
     )
 
@@ -1484,13 +1545,24 @@ def _shadow_v2_artifact(
     v1_partition, v1_projection = _shadow_partition(
         layer, index, total_chars, reference
     )
-    solution = optimize_document(
-        document, v1=V1Partition(cuts=v1_partition or (), cues=tuple(reference))
+    # An unprojectable v1 stream means the shadow does not KNOW v1's partition,
+    # and ``None or ()`` would tell the solver it knows it to be empty -- a
+    # partition v1 never produced, which then wins the C8 policy comparison
+    # (every legal path is trivially "within margin" of a reference that made no
+    # cuts), gets recorded as ``selected_is_v1`` and shows up in C9 as v1
+    # disagreeing with nothing. There is no honest v1 answer here, so the run is
+    # made without one and the artifact says so.
+    v1_reference_input = (
+        None
+        if v1_partition is None
+        else V1Partition(cuts=v1_partition, cues=tuple(reference))
     )
+    solution = optimize_document(document, v1=v1_reference_input)
     artifact = solution.artifact
     artifact["v1_projection"] = {
         "cut_count": None if v1_partition is None else len(v1_partition),
         "mode": v1_projection,
+        "unprojected": v1_partition is None,
     }
     if solution.invalid_profile:
         # AD3-2: an invalid profile is an invalid measurement, so the artifact
@@ -1505,6 +1577,10 @@ def _shadow_v2_artifact(
     # independent derivations that agree are evidence the projection the
     # overlay lane has to rely on is sound.
     raw_partition = _document_partition(solution.solutions, unit_count)
+    solver_waivers = _document_waivers(solution.solutions)
+    fallback_ranges = [
+        list(item.unit_range) for item in solution.solutions if not item.optimized
+    ]
 
     core_cues = _shadow_core_cues(solution, document, thresholds)
     core_projection, core_projection_mode = _shadow_partition(
@@ -1517,6 +1593,8 @@ def _shadow_v2_artifact(
         document=document,
         origin="v2",
         stage="core",
+        waivers=_restamp_by_footprint(solver_waivers, raw_partition, unit_count),
+        origins=_origins_by_footprint(fallback_ranges, raw_partition, unit_count),
         extra={
             "projection_cross_check": {
                 "agrees": core_projection == raw_partition,
@@ -1548,6 +1626,12 @@ def _shadow_v2_artifact(
         document=document,
         origin="v2",
         stage="legacy-overlay",
+        waivers=_restamp_by_footprint(
+            solver_waivers, delivery_v2_partition, unit_count
+        ),
+        origins=_origins_by_footprint(
+            fallback_ranges, delivery_v2_partition, unit_count
+        ),
     )
     delivery_v1 = _shadow_stream_block(
         delivery_v1_cues,
@@ -1564,14 +1648,17 @@ def _shadow_v2_artifact(
     # conservation result, so it is flagged where a reader meets it rather than
     # left to be mistaken for evidence. It cannot arise on the public corpus,
     # where the C13 gate forbids fallbacks outright.
-    fallback_ranges = [
-        list(item.unit_range) for item in solution.solutions if not item.optimized
-    ]
     overlapping = any(
         left[1] > right[0] for left, right in zip(fallback_ranges, fallback_ranges[1:])
     )
     totals = artifact["totals"]
     artifact["coverage"] = {
+        # A coarse document falls back by construction, not because the optimizer
+        # failed: the source units are coarser than a cue, so no partition is
+        # expressible at all (P5 splits below the unit). It still counts in
+        # ``fallback_intervals`` -- the public C13 gate is unmoved in either
+        # direction -- but a reader can now tell the two classes apart.
+        "coarse_granularity_intervals": totals["coarse_granularity_intervals"],
         "fallback_intervals": totals["fallback_intervals"],
         "fallback_ranges_overlap": overlapping,
         "fallback_unit_ranges": fallback_ranges,
@@ -1579,6 +1666,7 @@ def _shadow_v2_artifact(
         "optimized_unit_ratio": totals["optimized_unit_ratio"],
         "raw_conservation_trustworthy": not overlapping,
         "unit_count": totals["unit_count"],
+        "v1_unprojected": v1_partition is None,
     }
     artifact["validator"]["core"] = core_v2["validator"]
     artifact["validator"]["legacy_overlay"] = delivery_v2["validator"]
@@ -1608,8 +1696,10 @@ def _maybe_shadow_v2(
     that re-tokenizes inside production's capture would change the persisted
     manifest -- breaking the very contract this lane exists to respect. Nesting
     restores the outer capture on exit, so production's ledger never sees a
-    shadow event. (The one-shot warning log is process-global and can therefore
-    be claimed by the shadow; that costs a log line, never a ledger entry.)
+    shadow event. The capture is also ``quiet``: the one-shot warning log is
+    process-global, and a measurement that re-runs the same providers would
+    otherwise win that latch and silence the line the shipping run owed its
+    operator.
 
     Nothing here may fail the run: a measurement that can crash the pipeline is
     worse than no measurement, so an unexpected error is recorded as a typed
@@ -1617,7 +1707,7 @@ def _maybe_shadow_v2(
     """
     if os.environ.get(SEG_V2_SHADOW_ENV, "").strip() != "1":
         return None
-    with degradation_capture() as shadow_degraded:
+    with degradation_capture(quiet=True) as shadow_degraded:
         try:
             artifact = _shadow_v2_artifact(document, cues, thresholds)
         except Exception as exc:  # noqa: BLE001 - a measurement never fails the run
@@ -1831,6 +1921,11 @@ def segment_document(
         # has closed and the manifest's reserved key holds the real list;
         # ``shadow_degraded`` was collected by the hook's own nested capture.
         shadow["production_degraded"] = copy.deepcopy(manifest["degraded"])
+        # AD3-5's other half. Without it an artifact reader cannot tell which
+        # language providers the measured run actually resolved -- and a run
+        # whose ja POS tagger fell back to the character table is measuring a
+        # different boundary decision than one whose tagger loaded.
+        shadow["providers"] = copy.deepcopy(manifest["providers"])
     diagnostics: dict[str, Any] = {
         "unit_count": len(snapped),
         "punct_snapped": snapped is not units,

@@ -209,13 +209,20 @@ def _is_real(value: Any) -> TypeGuard[float]:
 def _wrappable(text: str, profile: DisplayProfile, lang: str) -> bool:
     """Could the wrap pass still fold this text into the line budget?
 
-    Line capacity is a *re-wrap* check, and which reading of "the rendered text"
-    applies depends on whether layout has run yet. A newline is a committed wrap
-    decision, so a text that carries one is measured line by line exactly as
-    delivered. A text with no newline has not been through the wrap pass -- which
-    is the shape a locked partition has at the ``raw`` stage, before stripping
-    and folding -- so the honest question is whether it *can* fit, asked of the
-    same oracle that certified the candidate cue in the first place.
+    This is a DECLARED widening of the pinned predicate. ``p4-api.md`` section 1
+    item 8 states line capacity as ``len(lines) <= max_lines`` and
+    ``_vis_width(line) <= budget`` on the final rendered text, with only empty
+    text exempt. Taken literally that rule fails every legal cue at the ``raw``
+    stage, because a raw cue's text is the unstripped, unwrapped join -- and
+    AD4-1's all-invisible cue (raw text: two thousand ``!``) would fail it too,
+    though the spec requires that cue to pass. So the predicate is split by
+    whether layout has run:
+
+    * a text carrying a newline is a committed wrap decision and is measured line
+      by line exactly as delivered -- the literal rule;
+    * a text with no newline has not been through the wrap pass, so the honest
+      question is whether it *can* fit, asked of the same oracle that certified
+      the candidate cue in the first place.
 
     Asking the delivered single line instead would report a violation for every
     two-line cue in the stream and, worse, would contradict an edge the solver
@@ -230,6 +237,17 @@ def _wrappable(text: str, profile: DisplayProfile, lang: str) -> bool:
         profile.max_lines,
         lang,
     )
+
+
+def _whitelisted(waiver: Waiver | None) -> bool:
+    """Only a declared exemption kind exempts anything.
+
+    :data:`WAIVER_KINDS` is a whitelist a new exemption has to join explicitly,
+    which it cannot be if an unrecognised label waives just as well as a known
+    one. An off-whitelist waiver is still carried in the ledger -- the record
+    stays complete -- it simply does not suppress the violation.
+    """
+    return waiver is not None and waiver.kind in WAIVER_KINDS
 
 
 def _clamp_range(lo: Any, hi: Any, unit_count: int) -> tuple[int, int]:
@@ -258,6 +276,7 @@ def check_partition(
     origin: Origin,
     stage: Stage,
     waivers: Mapping[int, Waiver] | None = None,
+    origins: Mapping[int, Origin] | None = None,
     expect_no_overlap: bool = True,
 ) -> PartitionCheckResult:
     """Run every hard predicate over one locked partition and its cue stream.
@@ -267,7 +286,19 @@ def check_partition(
     ``units[bounds[k]:bounds[k + 1]]`` for ``bounds = (0, *partition,
     len(units))``. ``waivers`` maps a cue index to the exemption that covers it;
     a waiver handed in for a cue that violates nothing is still reported (so the
-    ledger is complete) but waives nothing.
+    ledger is complete) but waives nothing. Only a waiver whose ``kind`` is in
+    :data:`WAIVER_KINDS` exempts anything: the whitelist is the point of having
+    one, and an unknown label is reported as an unwaived violation rather than
+    silently granted.
+
+    ``origins`` overrides ``origin`` per cue index. AD3-3 types attribution per
+    *violation* -- "which engine produced the cue that violated" -- and a document
+    stream can be mixed, because a typed fallback splices v1's own cues into an
+    otherwise v2 partition. Attributing the whole stream to whichever engine
+    dominated would either excuse real v2 damage (everything reads v1) or blame
+    v2 for v1's (everything reads v2); both have been observed. ``origin`` stays
+    the default for cues the mapping does not name and for the whole-partition
+    row, which belongs to no single cue.
 
     The checks are independent by construction -- one cue can raise several --
     except that a cue whose own display times are not real numbers skips the
@@ -275,6 +306,7 @@ def check_partition(
     everything and would otherwise manufacture a violation on both sides.
     """
     supplied = dict(waivers or {})
+    by_cue: dict[int, Origin] = dict(origins or {})
     unit_count = len(units)
     lang = profile.language
     violations: list[Violation] = []
@@ -289,7 +321,7 @@ def check_partition(
         violations.append(
             Violation(
                 kind=kind,
-                origin=origin,
+                origin=origin if cue_index is None else by_cue.get(cue_index, origin),
                 stage=stage,
                 cue_index=cue_index,
                 unit_ids=unit_ids,
@@ -354,13 +386,19 @@ def check_partition(
                 p_start = prev.get("start")
                 p_end = prev.get("end")
                 if _is_real(p_start) and _is_real(p_end):
-                    if start < p_start - EPS or start < p_end - EPS:
+                    # Exactly p4-api.md section 1 item 5: monotone *starts*. A
+                    # start that sits between the previous cue's start and its
+                    # end is an ``overlap`` and nothing else -- reporting it as
+                    # both doubled every overlap in the ledger, which would make
+                    # any future count-based v1/v2 comparison read 2x for this
+                    # one class.
+                    if start < p_start - EPS:
                         report(
                             "non-monotone-time",
                             index,
                             unit_ids,
                             f"start {start} precedes the previous cue's "
-                            f"[{p_start}, {p_end}]",
+                            f"start {p_start}",
                         )
                     if expect_no_overlap and start < p_end - EPS:
                         report(
@@ -402,12 +440,13 @@ def check_partition(
             )
 
         if cap > 0 and timed and end - start > cap + EPS:
+            candidate = supplied.get(index)
             report(
                 "duration-cap",
                 index,
                 unit_ids,
                 f"span {end - start} exceeds the cap {cap}",
-                waived_by=supplied.get(index),
+                waived_by=candidate if _whitelisted(candidate) else None,
             )
 
     violations.sort(key=lambda v: (-1 if v.cue_index is None else v.cue_index, v.kind))

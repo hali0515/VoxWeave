@@ -35,11 +35,12 @@ from __future__ import annotations
 import bisect
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, cast
 
 from .boundary_cost import (
     POLICY_NAME,
     POLICY_VERSION,
+    VAD_STATES,
     CostBreakdown,
     CostContext,
     cut_cost,
@@ -50,6 +51,7 @@ from .boundary_cost import (
 )
 from .boundary_lattice import (
     CAP_EPS_S,
+    COARSE_GRANULARITY,
     INFLUENCE_RADIUS_UNITS,
     AtomLayer,
     DocumentLattice,
@@ -68,6 +70,7 @@ from .boundary_lattice import (
 )
 from .layout import _join
 from .partition_check import (
+    Origin,
     PartitionCheckResult,
     Waiver,
     check_partition,
@@ -251,10 +254,29 @@ class PathResult:
         ``cuts`` is the unit-space projection because every persisted coordinate
         is a source-unit id; the node tuple is kept alongside it so a reader
         debugging the solver can still see what the DP actually chose.
+
+        ``breakdown`` is a ``sum_breakdowns`` aggregate, and aggregation is lossy
+        in exactly the place AD-3 cares about: a categorical feature has no sum,
+        so ``vad_state`` -- the field that says what kind of evidence a boundary
+        rested on -- vanishes from it entirely, and ``gap_ms_raw``/
+        ``effective_ms``/``overlap_fraction``/``ramp_ms`` survive only as
+        interval totals nobody can re-weight a single decision from. AD-3
+        requires the features "per cut candidate", so the raw halves are emitted
+        per cut and per edge alongside the aggregate. Weighted terms are NOT
+        repeated here: those are the policy's opinion and the aggregate already
+        carries them under a stated ``policy_version``.
         """
         return {
             "breakdown": self.breakdown.to_dict(),
+            "cut_features": [
+                {"unit": unit, **{k: part.features[k] for k in sorted(part.features)}}
+                for unit, part in zip(self.unit_cuts, self.cut_breakdowns)
+            ],
             "cuts": list(self.unit_cuts),
+            "edge_features": [
+                {k: part.features[k] for k in sorted(part.features)}
+                for part in self.edge_breakdowns
+            ],
             "node_cuts": list(self.cuts),
             "total": self.total,
         }
@@ -385,7 +407,13 @@ def solve_interval(lattice: IntervalLattice, tables: CostTables) -> DPResult:
 
 @dataclass(frozen=True)
 class Selection:
-    """What the optimizer found versus what the policy is willing to ship."""
+    """What the optimizer found versus what the policy is willing to ship.
+
+    ``v1_supplied`` separates "v1 chose nothing here" from "there is no v1
+    reference at all". Without it every v1 field reads as a measurement -- legal:
+    no, cost: none, selected: no -- when in truth nothing was measured, and a
+    reader cannot tell the two apart from the artifact.
+    """
 
     raw_optimum: PathResult
     policy_selected: PathResult
@@ -395,6 +423,7 @@ class Selection:
     v1_path_legal: bool
     v1_illegality: str | None
     v1_cost_under_v2: CostBreakdown | None
+    v1_supplied: bool = True
 
 
 def _v1_local_cuts(
@@ -453,6 +482,7 @@ def _select(
         v1_path_legal=v1_path is not None,
         v1_illegality=illegality,
         v1_cost_under_v2=None if v1_path is None else v1_path.breakdown,
+        v1_supplied=v1 is not None,
     )
 
 
@@ -521,17 +551,27 @@ class V1Partition:
 
 @dataclass(frozen=True)
 class V1Reference:
-    """v1's whole-document partition, priced under v2's policy."""
+    """v1's whole-document partition, priced under v2's policy.
+
+    ``rounded_cuts`` is kept apart from ``hard_disagreements``: a cut that did
+    not land on an atom edge is not v1 breaking a hard rule, it is *this
+    reference* pricing a partition slightly different from the one v1 committed.
+    Silently rounding it and saying nothing would make the C9 number look like a
+    measurement of v1's answer when it is a measurement of the nearest
+    expressible one.
+    """
 
     global_cost: CostBreakdown
     hard_disagreements: tuple[dict[str, Any], ...]
     cut_units: frozenset[int]
+    rounded_cuts: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "cut_units": sorted(self.cut_units),
             "global_cost": self.global_cost.to_dict(),
             "hard_disagreements": list(self.hard_disagreements),
+            "rounded_cuts": list(self.rounded_cuts),
         }
 
 
@@ -557,11 +597,16 @@ def score_v1_global(
     bounds = [layer.unit_bound(node) for node in range(count + 1)]
 
     nodes: list[int] = []
+    rounded: list[dict[str, Any]] = []
     for cut in sorted(set(v1.cuts)):
         if not 0 < cut < layer.unit_count:
             continue
         position = bisect.bisect_left(bounds, cut)
         if 0 < position < count:
+            if bounds[position] != cut:
+                rounded.append(
+                    {"landed_unit": bounds[position], "node": position, "unit": cut}
+                )
             nodes.append(position)
     chain = (0, *sorted(set(nodes)), count)
 
@@ -663,6 +708,7 @@ def score_v1_global(
         global_cost=sum_breakdowns(parts),
         hard_disagreements=tuple(disagreements),
         cut_units=frozenset(v1.cuts),
+        rounded_cuts=tuple(rounded),
     )
 
 
@@ -765,6 +811,7 @@ class IntervalSolution:
             "barrier_left": self.interval.left.kind,
             "barrier_right": self.interval.right.kind,
             "candidate_count": len(self.lattice.nodes),
+            "cap_relief_nodes": self.lattice.cap_relief_nodes,
             "coalesced_atoms": self.lattice.coalesced_atoms,
             "dp_relaxations": self.dp_relaxations,
             "edge_count": len(self.lattice.edges),
@@ -787,13 +834,17 @@ class IntervalSolution:
             "runner_up_total": None
             if selection is None or selection.margin is None
             else quantize(selection.raw_optimum.total + selection.margin),
-            "selected_is_v1": None if selection is None else selection.selected_is_v1,
+            "selected_is_v1": None
+            if selection is None or not selection.v1_supplied
+            else selection.selected_is_v1,
             "unit_range": list(self.unit_range),
             "v1_cost_under_v2": None
             if selection is None or selection.v1_cost_under_v2 is None
             else selection.v1_cost_under_v2.to_dict(),
             "v1_illegality": None if selection is None else selection.v1_illegality,
-            "v1_path_legal": None if selection is None else selection.v1_path_legal,
+            "v1_path_legal": None
+            if selection is None or not selection.v1_supplied
+            else selection.v1_path_legal,
             "v2_partition": list(self.partition_units),
             "validator_raw": self.validator_raw.to_dict(),
             "waivers": [waiver.to_dict() for waiver in self.waivers],
@@ -961,9 +1012,56 @@ def _document_waivers(solutions: Sequence[IntervalSolution]) -> dict[int, Waiver
     for solution in solutions:
         for waiver in solution.waivers:
             index = offset + waiver.cue_index
+            # ``replace`` on the cue index alone, deliberately: every other field
+            # is the provenance AD-4 requires (unit ids, span, cap, reason), and
+            # a re-stamp that dropped it would leave a ledger whose exemptions
+            # cannot be re-derived -- exactly the "taken on trust" shape
+            # ``Waiver``'s own docstring exists to refuse.
             stamped[index] = replace(waiver, cue_index=index)
         offset += len(solution.cues)
     return stamped
+
+
+def _document_origins(solutions: Sequence[IntervalSolution]) -> dict[int, str]:
+    """Which engine produced each cue of the concatenated document stream.
+
+    AD3-3 types attribution per violation, and a document that fell back on one
+    interval still ran v2 everywhere else. Typing the whole stream from
+    ``all(optimized)`` -- the shape this replaced -- reported a genuine v2
+    ``speech-truncated-start`` in a fully optimized interval as v1 damage, i.e.
+    as non-exit-driving, purely because some *other* interval had adopted v1.
+    """
+    origins: dict[int, str] = {}
+    offset = 0
+    for solution in solutions:
+        engine = "v2" if solution.optimized else "v1"
+        for index in range(len(solution.cues)):
+            origins[offset + index] = engine
+        offset += len(solution.cues)
+    return origins
+
+
+def _vad_state_totals(solutions: Sequence[IntervalSolution]) -> dict[str, Any]:
+    """Spec v3's ``vad_state`` artifact block: the evidence behind every cut made.
+
+    ``sum_breakdowns`` drops categorical features, so the interval aggregates say
+    nothing at all about which pause regime priced a boundary. This counts the
+    selected cuts by state, which is the one aggregate that *is* meaningful for a
+    categorical, and it is computed from the same breakdowns the DP read rather
+    than from a second pass over the document.
+    """
+    counts = {state: 0 for state in VAD_STATES}
+    unknown = 0
+    for solution in solutions:
+        if solution.selection is None:
+            continue
+        for part in solution.selection.policy_selected.cut_breakdowns:
+            state = part.features.get("vad_state")
+            if isinstance(state, str) and state in counts:
+                counts[state] += 1
+            else:
+                unknown += 1
+    return {"selected_cuts_by_state": counts, "unclassified_cuts": unknown}
 
 
 def _artifact(
@@ -982,6 +1080,9 @@ def _artifact(
     waivers: list[dict[str, Any]] = []
     for solution in solutions:
         waivers.extend(waiver.to_dict() for waiver in solution.waivers)
+    interval_hard = sum(
+        len(solution.validator_raw.exit_driving) for solution in solutions
+    )
     return {
         "barrier_flips": None,
         "engine_v2": ENGINE_V2,
@@ -1000,23 +1101,35 @@ def _artifact(
         "policy_version": POLICY_VERSION,
         "production_degraded": [],
         "profile": _profile_dict(document.profile),
+        # AD3-5: filled by the hook's caller once the outer capture has closed.
+        # Reserved here so the artifact's key order does not depend on when the
+        # value arrives.
+        "providers": {},
         "quality": None,
         "schema_version": SCHEMA_VERSION,
         "shadow_degraded": [],
+        "vad_state": _vad_state_totals(solutions),
         "totals": {
             "all_invisible_intervals": sum(
                 1 for solution in solutions if solution.lattice.all_invisible
             ),
             "atom_count": len(lattice.layer.atoms),
             "barrier_count": len(lattice.barriers),
+            "cap_relief_nodes": sum(
+                solution.lattice.cap_relief_nodes for solution in solutions
+            ),
             "coalesced_atoms": sum(
                 solution.lattice.coalesced_atoms for solution in solutions
             ),
+            "coarse_granularity_intervals": sum(
+                1
+                for solution in solutions
+                if solution.lattice.infeasible is not None
+                and solution.lattice.infeasible.reason == COARSE_GRANULARITY
+            ),
             "dp_relaxations": sum(solution.dp_relaxations for solution in solutions),
             "fallback_intervals": len(solutions) - len(optimized),
-            "hard_violations": sum(
-                len(solution.validator_raw.exit_driving) for solution in solutions
-            ),
+            "hard_violations": interval_hard,
             "interval_count": len(solutions),
             "optimized_intervals": len(optimized),
             "optimized_unit_ratio": 1.0
@@ -1033,6 +1146,15 @@ def _artifact(
         "v1": None if v1_reference is None else v1_reference.to_dict(),
         "validator": {
             "core": None,
+            # The two counters the module docstring says are cross-checked, and
+            # the answer stated rather than left for a reader to recompute: the
+            # document pass sees cross-interval predicates the per-interval
+            # passes cannot, so it may report MORE, but a document pass reporting
+            # fewer than the intervals did means an exemption or an attribution
+            # drifted between the two.
+            "interval_hard_violations": interval_hard,
+            "interval_document_agree": len(document_check.exit_driving)
+            >= interval_hard,
             "legacy_overlay": None,
             "raw": document_check.to_dict(),
         },
@@ -1088,14 +1210,19 @@ def optimize_document(
         else score_v1_global(v1, lattice.layer, ctx, units=document.units)
     )
     cues = tuple(cue for solution in solutions for cue in solution.cues)
+    origins = _document_origins(solutions)
     document_check = check_partition(
         _document_partition(solutions, len(document.units)),
         cues,
         units=document.units,
         profile=document.profile,
+        # The whole-partition row belongs to no cue, so it keeps the document's
+        # own character; per-cue rows are attributed to the interval that
+        # produced them.
         origin="v2" if all(solution.optimized for solution in solutions) else "v1",
         stage="raw",
         waivers=_document_waivers(solutions),
+        origins=cast("Mapping[int, Origin]", origins),
     )
     return DocumentSolution(
         document=document,

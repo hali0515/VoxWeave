@@ -246,3 +246,34 @@ def test_split_replays_shot_changes(tmp_path):
     seg = data["segments"][-1]
     # cue end snapped onto the 2.2 cut (minus 2 frames), not left at lag-padded end
     assert seg["end"] == pytest.approx(2.2 - TWO_FRAME_S, abs=1e-6)
+
+
+def test_the_speech_veto_declines_a_separation_repair_it_cannot_make_for_free():
+    """The 2-frame floor bounds a move this pass MAKES; it is not a postcondition.
+
+    A start already inside the previous cue's guard band arrives that way. The
+    prev-end clamp can lift a snap out of it -- but if the lifted landing would
+    fall past the cue's own first word, the speech veto declines the whole move
+    and the pre-existing gap stands. Speech beats layout, so this pass repairs a
+    separation violation only when the repair costs no audible word. Pinned
+    because the docstring used to promise the postcondition unconditionally.
+    """
+    timed = [
+        _cue(0.0, 1.00, speech_start=0.0, speech_end=1.00, text="first"),
+        # 0.02 s after the previous end: already inside the 2-frame guard, and
+        # its first word starts exactly at the display start.
+        _cue(1.02, 3.00, speech_start=1.02, speech_end=3.00, text="second"),
+    ]
+    out = _snap_to_shots(timed, [1.10], snap_s=0.458, max_cue_s=7.0)
+    assert out[1]["start"] == pytest.approx(1.02)
+    assert out[1]["start"] - out[0]["end"] < TWO_FRAME_S
+
+    # the same document with no acoustic evidence: nothing to sacrifice, so the
+    # move (and with it the separation repair) goes ahead
+    untimed = [
+        {"text": "first", "start": 0.0, "end": 1.00, "word_data": []},
+        {"text": "second", "start": 1.02, "end": 3.00, "word_data": [{"text": "s"}]},
+    ]
+    out = _snap_to_shots(untimed, [1.10], snap_s=0.458, max_cue_s=7.0)
+    assert out[1]["start"] == pytest.approx(1.10)
+    assert out[1]["start"] - out[0]["end"] >= TWO_FRAME_S

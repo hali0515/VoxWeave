@@ -335,25 +335,40 @@ _ORPHAN_WEIGHT = 30
 _ORPHAN_MAX_VIS = 10
 
 
-def _two_line_break_index(
+def _two_line_break(
     units: list[tuple[str, str]], lang: str, max_line_length: int
-) -> int | None:
-    """Best break index for a two-line wrap, or None when no two-line split fits.
+) -> tuple[int, int, int] | None:
+    """Best two-line wrap as ``(break index, top width, bottom width)``.
 
     Scores every break where both lines fit the hard visual budget
     (``max_line_length``, in half-width cells): line-length imbalance + sticky
     line-end penalty (the same line_end_penalty signal the segmentation engine
     uses) + orphan penalty for a lone short word stranded on either line. Ties
-    prefer bottom-heavy (pyramid) shape.
+    prefer bottom-heavy (pyramid) shape. ``None`` when no two-line split fits.
+
+    Line widths come from prefix sums rather than from re-joining a slice per
+    candidate, which makes the scan linear in the unit count instead of
+    quadratic. ``_vis_width`` is a per-character sum, so a prefix total and the
+    width of the joined slice are the same integer -- the two readings cannot
+    drift. The widths are returned alongside the index because the boundary
+    optimizer prices the *rendered* lines, and re-deriving them at the call site
+    would be a second implementation of this rule.
     """
     n = len(units)
-    best_i: int | None = None
+    atom_prefix = [0] * (n + 1)
+    gap_prefix = [0] * (n + 1)
+    for index, (atom, gap) in enumerate(units):
+        atom_prefix[index + 1] = atom_prefix[index] + _vis_width(atom)
+        gap_prefix[index + 1] = gap_prefix[index] + _vis_width(gap)
+    best: tuple[int, int, int] | None = None
     best_score: float | None = None
     for i in range(1, n):
-        top_w = _vis_width(_join_line(units[:i]))
+        # ``_join_line`` drops the *last* unit's trailing gap, so a slice's width
+        # is its atoms plus every gap strictly inside it.
+        top_w = atom_prefix[i] + gap_prefix[i - 1]
         if top_w > max_line_length:
             break  # top line only grows from here
-        bot_w = _vis_width(_join_line(units[i:]))
+        bot_w = (atom_prefix[n] - atom_prefix[i]) + (gap_prefix[n - 1] - gap_prefix[i])
         if bot_w > max_line_length:
             continue
         score: float = abs(top_w - bot_w)
@@ -365,8 +380,16 @@ def _two_line_break_index(
         if top_w > bot_w:
             score += 1  # tie-break: bottom-heavy reads better
         if best_score is None or score < best_score:
-            best_i, best_score = i, score
-    return best_i
+            best, best_score = (i, top_w, bot_w), score
+    return best
+
+
+def _two_line_break_index(
+    units: list[tuple[str, str]], lang: str, max_line_length: int
+) -> int | None:
+    """Best break index for a two-line wrap, or None when no two-line split fits."""
+    chosen = _two_line_break(units, lang, max_line_length)
+    return None if chosen is None else chosen[0]
 
 
 def wrap_cue_text(

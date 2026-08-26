@@ -405,12 +405,90 @@ def test_short_fragment_tiers_use_the_true_visual_width(display, expected):
     assert weighted["short_fragment"] == pytest.approx(expected)
 
 
-def test_line_count_and_balance_come_from_the_packer_state():
+def test_line_count_and_balance_price_the_lines_the_renderer_delivers():
+    """Bug pin: the layout terms used to read the greedy packer's line widths.
+
+    The packer is the legality oracle (greedy first-fit); the pass that ships the
+    cue folds it with ``layout._two_line_break``'s balanced scoring. Pricing the
+    greedy widths punished exactly the candidates the renderer folds best. Here
+    the fabricated ``Edge`` claims two lines of widths (9, 4) while the text
+    renders on one line -- and it is the rendered answer that is priced.
+    """
     breakdown, weighted = edge_terms("ab cd", lines=2, line_widths=(9, 4))
+    assert breakdown.features["line_count_raw"] == 1
+    assert breakdown.features["balance_raw"] == pytest.approx(0.0)
+    assert weighted["line_count"] == 0.0
+    assert weighted["balance"] == 0.0
+    # the packer's own answer is still recorded, just no longer priced
+    assert breakdown.features["packed_line_count_raw"] == 2
+    assert breakdown.features["packed_balance_raw"] == pytest.approx(5.0)
+    assert breakdown.features["layout_source"] == "renderer-single-line"
+
+
+def test_a_two_line_cue_is_priced_on_the_balanced_break_not_the_greedy_one():
+    text = "voice assistant and it's training for the custom"
+    breakdown, weighted = edge_terms(text, lines=2, line_widths=(41, 6))
+    assert breakdown.features["layout_source"] == "renderer-two-line"
     assert breakdown.features["line_count_raw"] == 2
     assert weighted["line_count"] == pytest.approx(W_LINE_COUNT)
-    assert breakdown.features["balance_raw"] == pytest.approx(5.0)
-    assert weighted["balance"] == pytest.approx(5.0 * W_BALANCE)
+    # greedy folds it 41/6; the renderer folds it 24/23
+    assert breakdown.features["packed_balance_raw"] == pytest.approx(35.0)
+    assert breakdown.features["balance_raw"] == pytest.approx(1.0)
+    assert weighted["balance"] == pytest.approx(1.0 * W_BALANCE)
+
+
+def test_a_three_line_cue_keeps_the_greedy_pricing_under_an_honest_name():
+    """Deeper wraps have no two-line chooser to mirror, and the feature says so."""
+    breakdown, weighted = edge_terms(
+        "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima",
+        prof=profile(max_lines=3, max_line_length=12),
+        lines=3,
+        line_widths=(11, 9, 4),
+    )
+    assert breakdown.features["layout_source"] == "greedy-packer"
+    assert breakdown.features["line_count_raw"] == 3
+    assert breakdown.features["balance_raw"] == 0.0
+    assert weighted["line_count"] == pytest.approx(2 * W_LINE_COUNT)
+
+
+# ------------------------------------------- overlap is a union, not a sum
+
+
+def test_overlapping_speech_spans_are_merged_before_the_fraction_is_taken():
+    """Bug pin: shared time inside two overlapping spans was counted twice.
+
+    ``_spans_in`` neither sorts nor merges, so a hand-edited or foreign sibling
+    JSON reaches the cost model with overlapping ``vad_speech``. Summing per-span
+    intersections then under-reports the effective silence, which makes the cut
+    look less pausey and therefore more expensive -- and a heavily self-
+    overlapping set saturates the clamp at 1.0 and prices the boundary at the
+    full pause amplitude.
+    """
+    evidence = pause_evidence(
+        1.0, 2.0, speech_spans=[(1.2, 1.4), (1.3, 1.9)], profile=profile()
+    )
+    # union [1.2, 1.9) = 0.7 s of a 1.0 s gap
+    assert evidence.overlap_fraction == pytest.approx(0.7)
+    assert evidence.effective_ms == pytest.approx(300.0)
+
+
+def test_disjoint_spans_are_unaffected_by_the_merge():
+    evidence = pause_evidence(
+        1.0, 2.0, speech_spans=[(1.1, 1.3), (1.6, 1.8)], profile=profile()
+    )
+    assert evidence.overlap_fraction == pytest.approx(0.4)
+    assert evidence.effective_ms == pytest.approx(600.0)
+
+
+def test_unsorted_spans_are_unaffected_by_the_merge():
+    """The clipped pieces are sorted here, so input order cannot move the answer."""
+    forward = pause_evidence(
+        1.0, 2.0, speech_spans=[(1.1, 1.3), (1.6, 1.8)], profile=profile()
+    )
+    backward = pause_evidence(
+        1.0, 2.0, speech_spans=[(1.6, 1.8), (1.1, 1.3)], profile=profile()
+    )
+    assert forward == backward
 
 
 def test_reading_pressure_fires_only_when_there_is_a_reading_load():

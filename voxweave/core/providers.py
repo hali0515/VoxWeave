@@ -59,6 +59,15 @@ _LEDGER: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.Conte
 #: complete record, the log line only has to say it once.
 _WARNED: set[tuple[str, str]] = set()
 
+#: Set inside a capture that must not consume the once-per-process warning.
+#: A measurement lane re-runs the same providers over the same document, so
+#: without this it can WIN the latch and swallow the one line the shipping run
+#: was entitled to -- the ledger stays correct either way, but an operator would
+#: see the degradation attributed to nothing, or not at all.
+_QUIET: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "voxweave_degradation_quiet", default=False
+)
+
 #: jieba is tokenized twice over the same shared tokenizer: ``phrase_atoms`` uses
 #: ``cut(HMM=True)`` while ``zh_pos_boundary_penalties`` uses ``cut(HMM=False)``.
 #: The mode is a call-site constant, not something the library reports, so the
@@ -83,23 +92,31 @@ def note_degraded(slot: str, reason: str) -> None:
         else:
             ledger.append({"slot": slot, "reason": reason, "count": 1})
     key = (slot, reason)
-    if key not in _WARNED:
+    if key not in _WARNED and not _QUIET.get():
         _WARNED.add(key)
         log.warning("segmentation %s provider degraded: %s", slot, reason)
 
 
 @contextmanager
-def degradation_capture() -> Iterator[list[dict[str, Any]]]:
+def degradation_capture(*, quiet: bool = False) -> Iterator[list[dict[str, Any]]]:
     """Collect degradation events raised inside the block.
 
     Yields the live list of ``{"slot", "reason", "count"}`` entries and restores
     whatever capture was active before, so nesting is safe.
+
+    ``quiet=True`` records into the ledger but takes no claim on the
+    once-per-process warning: a nested measurement capture that re-runs the same
+    providers would otherwise emit the single log line the outer, *shipping* run
+    should have emitted, leaving production's degradation silent. It suppresses
+    only the log, never the ledger entry.
     """
     ledger: list[dict[str, Any]] = []
     token = _LEDGER.set(ledger)
+    quiet_token = _QUIET.set(quiet or _QUIET.get())
     try:
         yield ledger
     finally:
+        _QUIET.reset(quiet_token)
         _LEDGER.reset(token)
 
 

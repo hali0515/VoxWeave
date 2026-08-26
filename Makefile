@@ -121,10 +121,24 @@ quality-segmentation:
 # non-inferiority numbers are only comparable against a baseline recorded here.
 # Deliberately NOT part of `quality`: the shadow ships nothing, so a v2 regression
 # during soak must not block a PR that changed neither engine.
+#
+# The perturbation flags are part of the frozen entry point on purpose. AD-2's
+# influence-cell FAIL is one of the three declared exits, and it is unreachable
+# without --perturb: a gate that only fires when a human remembers a flag is not
+# a gate. The slice is bounded so it stays affordable -- one magnitude (50 ms),
+# near-cliff gaps only, one case per language -- which costs roughly 9 extra
+# minutes on top of the base run and its ablation replays (measured: en-01 220
+# probes / 74 s, ja-01 279 / 37 s, zh-01 1052 / 423 s; every probe is two full
+# replays of the case). Widen it by hand when the question is worth the wall
+# clock: --perturb-case, --perturb-magnitude and dropping
+# --perturb-near-cliff-only all take the run back toward full AD-2 coverage.
 quality-shadow-segmentation:
 	uv run python scripts/calib_segmentation.py shadow \
 	  --corpus $(SEG_CORPUS) \
 	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \
+	  --perturb --perturb-mode single_gap --perturb-magnitude 50 \
+	  --perturb-near-cliff-only \
+	  --perturb-case en-01 --perturb-case ja-01 --perturb-case zh-01 \
 	  --json-out $(SEG_SHADOW_REPORT) --check
 
 # Deliberately not part of `quality`, and never run by CI: recording a baseline is a

@@ -27,6 +27,7 @@ import pytest
 from voxweave import pipeline
 from voxweave.config import gap_thresholds
 from voxweave.core import boundary_lattice, boundary_v2
+from voxweave.core import providers
 from voxweave.core.providers import note_degraded
 
 FLAG = pipeline.SEG_V2_SHADOW_ENV
@@ -547,3 +548,220 @@ def test_an_invalid_profile_reports_itself_and_nothing_else(shadow_on):
     # The ledgers still ride along: the harness reads them to decide the exit.
     assert artifact["shadow_degraded"] == []
     assert artifact["production_degraded"] == []
+
+
+# ------------------------------------- the exit driver must not be blindable
+
+
+def test_every_mandatory_validator_stage_is_produced_end_to_end(shadow_on):
+    """Bug pin: the core stage had exactly one producer and no consumer test.
+
+    ``artifact["validator"]["core"]`` is the only source of the stage that drives
+    the P4 exit, and the harness treated a falsy block as "nothing to report".
+    Mutating that single assignment to ``None`` left the whole suite green while
+    a real shipped defect could be reintroduced and the gate stayed at exit 0 --
+    because every harness test supplied the stage blocks itself. This is the join
+    the fixtures could not make: produced here, counted by
+    ``calib_segmentation.shadow_violation_counts``.
+    """
+    for name, build in CASES.items():
+        artifact = _segment(build()).shadow
+        assert artifact is not None
+        validator = artifact["validator"]
+        for stage in ("raw", "core", "legacy_overlay"):
+            assert validator[stage] is not None, (name, stage)
+            assert validator[stage]["origin"] == "v2", (name, stage)
+            assert validator[stage]["cue_count"] > 0, (name, stage)
+        assert validator["raw"]["stage"] == "raw"
+        assert validator["core"]["stage"] == "core"
+        assert validator["legacy_overlay"]["stage"] == "legacy-overlay"
+        # the two counters the artifact says it cross-checks
+        assert (
+            validator["interval_hard_violations"]
+            == (artifact["totals"]["hard_violations"])
+        )
+        assert validator["interval_document_agree"] is True
+
+
+def test_the_projection_cross_check_really_compares_two_derivations(
+    shadow_on, monkeypatch: pytest.MonkeyPatch
+):
+    """Bug pin: hardcoding ``agrees=True`` passed everything and nothing noticed.
+
+    The GATED delivery lane has no solver partition of its own: it reads every
+    cue's unit ownership off the character cursor, so a wrong cursor moves
+    cps_p90 and the mid-phrase rate without moving a boundary. This is the only
+    automated evidence that cursor is sound.
+    """
+    honest = _segment(_case_two_intervals()).shadow
+    assert honest is not None
+    core = honest["lanes"][pipeline.SHADOW_LANE_CORE]["v2"]
+    assert core["projection_cross_check"]["agrees"] is True
+    assert core["partition"], "the fixture must cut somewhere for this to bite"
+
+    real = boundary_v2._document_partition
+
+    def wrong(solutions, unit_count):
+        """A partition that is legal-looking but not the one the cues express."""
+        cuts = real(solutions, unit_count)
+        return tuple(cut for cut in cuts if cut != cuts[0]) if cuts else (1,)
+
+    monkeypatch.setattr(boundary_v2, "_document_partition", wrong)
+    artifact = _segment(_case_two_intervals()).shadow
+    assert artifact is not None
+    check = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v2"]["projection_cross_check"]
+    assert check["agrees"] is False
+
+
+def test_a_held_chain_waiver_survives_into_the_core_and_overlay_stages(shadow_on):
+    """Bug pin: the exemption was granted at ``raw`` and re-reported at ``core``.
+
+    One word sounding for 20 s against the 7 s cap is exactly the evidence the
+    C6/AD-4 waiver exists for. The later stages used to be handed no waiver map
+    at all, so the same violation came back unwaived and EXIT DRIVING one stage
+    on -- a false exit-1 for a condition the design explicitly waives.
+    """
+    result = pipeline.segment_document(
+        language="en",
+        word_segments=[
+            {"text": "Stop", "start": 0.0, "end": 0.4},
+            {"text": "riiiiiight", "start": 0.5, "end": 20.5},
+            {"text": "there", "start": 20.6, "end": 21.0},
+        ],
+        vad_speech=[(0.0, 21.0)],
+    )
+    artifact = result.shadow
+    assert artifact is not None
+    assert [w["kind"] for w in artifact["totals"]["waivers"]] == ["held-chain-duration"]
+    for stage in ("raw", "core", "legacy_overlay"):
+        block = artifact["validator"][stage]
+        caps = [v for v in block["violations"] if v["kind"] == "duration-cap"]
+        assert caps, stage
+        assert all(v["waived"] for v in caps), stage
+        assert all(not v["exit_driving"] for v in caps), stage
+        assert block["waivers"], stage
+        # provenance, not just a label
+        assert block["waivers"][0]["unit_ids"] == [1]
+        assert block["waivers"][0]["span"] == [0.5, 20.5]
+
+
+def test_the_artifact_reports_the_resolved_language_providers(shadow_on):
+    """AD3-5's other half: which providers the measured run actually resolved."""
+    result = _segment(_case_yue())
+    artifact = result.shadow
+    assert artifact is not None
+    assert result.manifest is not None
+    assert artifact["providers"] == result.manifest["providers"]
+    assert artifact["providers"], "the manifest snapshot is never empty"
+    # copied, not shared: a later mutation of one must not move the other
+    assert artifact["providers"] is not result.manifest["providers"]
+
+
+def test_an_unprojectable_v1_stream_is_measured_without_a_v1_reference(
+    shadow_on, monkeypatch: pytest.MonkeyPatch
+):
+    """Adjudication B: never fabricate an empty v1 partition.
+
+    ``_shadow_partition`` returns ``None`` when the character cursor cannot land
+    on an atom edge. ``None or ()`` used to collapse that into "v1 chose no
+    cuts", which is indistinguishable from the legitimate single-cue answer --
+    and then wins the C8 policy comparison outright, because every legal path is
+    trivially within margin of a reference that made no cuts.
+    """
+    monkeypatch.setattr(
+        pipeline, "_shadow_partition", lambda *a, **k: (None, "unresolved-at-char-7")
+    )
+    artifact = _segment(_case_plain()).shadow
+    assert artifact is not None
+    assert artifact["v1_projection"]["unprojected"] is True
+    assert artifact["v1_projection"]["cut_count"] is None
+    assert artifact["coverage"]["v1_unprojected"] is True
+    assert artifact["v1"] is None
+    for block in artifact["intervals"]:
+        assert block["selected_is_v1"] is None
+        assert block["v1_path_legal"] is None
+        assert block["v1_cost_under_v2"] is None
+    for lane in (pipeline.SHADOW_LANE_CORE, pipeline.SHADOW_LANE_DELIVERY):
+        assert artifact["lanes"][lane]["v1"]["validator"] is None
+
+
+def test_a_projected_run_records_v1_and_says_so(shadow_on):
+    artifact = _segment(_case_plain()).shadow
+    assert artifact is not None
+    assert artifact["v1_projection"]["unprojected"] is False
+    assert artifact["coverage"]["v1_unprojected"] is False
+    assert artifact["v1"] is not None
+    assert artifact["intervals"][0]["selected_is_v1"] in (True, False)
+
+
+def test_coverage_reports_the_coarse_granularity_class_separately(shadow_on):
+    """Adjudication A: an input-granularity limit is not an optimizer failure.
+
+    It still counts in ``fallback_intervals`` -- the public C13 gate is unmoved
+    in either direction -- but the artifact says which class it was, because P5
+    resolves this one by splitting below the source unit and P4 cannot.
+    """
+    sentences = ["これはテストです", "こんにちは世界", "今日はいい天気"] * 2
+    bounds = [(1.3 * i, 1.3 * i + 1.1) for i in range(len(sentences))]
+    artifact = pipeline.segment_document(
+        language="ja",
+        word_segments=[
+            {"text": s, "start": a, "end": b} for s, (a, b) in zip(sentences, bounds)
+        ],
+        smart_split_kwargs={"max_line_length": 18, "max_lines": 2},
+    ).shadow
+    assert artifact is not None
+    coverage = artifact["coverage"]
+    assert coverage["coarse_granularity_intervals"] >= 1
+    assert coverage["fallback_intervals"] >= coverage["coarse_granularity_intervals"]
+    reasons = {
+        block["infeasible"]["reason"]
+        for block in artifact["intervals"]
+        if block["infeasible"]
+    }
+    assert "coarse-granularity" in reasons
+
+
+def test_a_healthy_word_level_document_reports_no_coarse_intervals(shadow_on):
+    for name, build in CASES.items():
+        artifact = _segment(build()).shadow
+        assert artifact is not None
+        assert artifact["coverage"]["coarse_granularity_intervals"] == 0, name
+        assert artifact["coverage"]["v1_unprojected"] is False, name
+
+
+def test_the_shadow_never_claims_productions_once_per_process_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """Bug pin: the measurement could win the latch and silence the shipped run.
+
+    ``providers._WARNED`` is process-global, so whichever context reaches a
+    ``(slot, reason)`` pair first emits the single ``log.warning``. The shadow
+    re-tokenizes the same document, so a pair only the v2 path can reach would be
+    logged by the measurement and never by the run that actually shipped -- an
+    operator would see a degradation attributed to a lane that ships nothing, or
+    (for a pair production hits on a *later* file) nothing at all.
+    """
+    monkeypatch.setattr(providers, "_WARNED", set())
+    original = boundary_lattice._attach_end_penalties
+    pair = ("pos", "shadow-latch-probe")
+
+    def failing(*args, **kwargs):
+        note_degraded(*pair)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(boundary_lattice, "_attach_end_penalties", failing)
+    monkeypatch.setenv(FLAG, "1")
+    with caplog.at_level("WARNING", logger="voxweave"):
+        result = _segment(_case_plain())
+    assert result.shadow is not None
+    assert {(e["slot"], e["reason"]) for e in result.shadow["shadow_degraded"]} >= {
+        pair
+    }
+    assert not [r for r in caplog.records if pair[1] in r.getMessage()]
+
+    # the latch is still unclaimed, so the shipping context gets its line
+    with caplog.at_level("WARNING", logger="voxweave"):
+        with providers.degradation_capture():
+            note_degraded(*pair)
+    assert [r for r in caplog.records if pair[1] in r.getMessage()]

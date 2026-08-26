@@ -43,7 +43,13 @@ from .boundary_lattice import (
     Edge,
     LatticeAtom,
 )
-from .layout import _reading_chars
+from .layout import (
+    _line_budget_width,
+    _reading_chars,
+    _two_line_break,
+    _vis_width,
+    _wrap_units,
+)
 from .segdoc import DisplayProfile
 from .timing_preview import DisplayTimingPreview
 
@@ -161,6 +167,37 @@ def _finite(value: Any) -> bool:
     return math.isfinite(value)
 
 
+def _covered_length(
+    low: float, high: float, spans: Sequence[tuple[float, float]]
+) -> float:
+    """Length of ``[low, high)`` covered by the UNION of ``spans``.
+
+    A plain sum of per-span intersections double-counts wherever two spans
+    overlap each other, so the clipped pieces are merged first. Only the pieces
+    that actually reach into the window are sorted, which keeps the common case
+    (a long, already-disjoint VAD track and a short gap) linear in the span count
+    with a sort over a handful of survivors.
+    """
+    clipped: list[tuple[float, float]] = []
+    for span_start, span_end in spans:
+        start = max(low, span_start)
+        end = min(high, span_end)
+        if end > start:
+            clipped.append((start, end))
+    if not clipped:
+        return 0.0
+    clipped.sort()
+    covered = 0.0
+    current_start, current_end = clipped[0]
+    for start, end in clipped[1:]:
+        if start > current_end:
+            covered += current_end - current_start
+            current_start, current_end = start, end
+        elif end > current_end:
+            current_end = end
+    return covered + (current_end - current_start)
+
+
 def pause_evidence(
     prev_end: float | None,
     next_start: float | None,
@@ -176,9 +213,26 @@ def pause_evidence(
     measured. Conflating the first two would silently promote an unmeasured gap
     to a confirmed pause.
 
+    One honest scoping note about that third value. The segmentation pipeline
+    cannot currently produce it: ``pipeline._copied_spans`` -- the only writer of
+    ``SegDocument.vad_speech`` on that path -- collapses an empty span list to
+    ``None``, mirroring ``_spans_in``'s persisted-sibling contract that "no spans
+    recorded" and "empty array" mean the same thing. So the empty-list branch is
+    reachable only from a direct caller (a test, or a future capture path that
+    distinguishes them). It is implemented rather than removed because the
+    distinction is real evidence and the day the pipeline can carry it, the cost
+    model must not have to relearn it -- but a reader must not conclude from this
+    docstring that a shadow run over a captured document can report
+    ``vad_state == "silence"`` on the strength of an empty list.
+
     The overlap fraction is a true intersection length with no jitter tolerance:
     the classifier's 50 ms epsilon is the slack a *boolean* needs, and applying
     it to a fraction would quantize a continuous measurement for no reason.
+    "True" means the covered *union*: overlapping spans (which a hand-edited or
+    foreign sibling JSON can carry, since ``_spans_in`` neither sorts nor merges)
+    would otherwise have their shared time counted twice and could push the
+    fraction past 1.0, under-reporting the effective silence and making the cut
+    look more expensive than the evidence says.
     """
     if (
         prev_end is None
@@ -207,10 +261,7 @@ def pause_evidence(
             effective_ms=gap_ms,
             ramp_ms=offline_ramp_ms(profile),
         )
-    overlapped = 0.0
-    if gap_seconds > 0:
-        for span_start, span_end in speech_spans:
-            overlapped += max(0.0, min(high, span_end) - max(low, span_start))
+    overlapped = _covered_length(low, high, speech_spans) if gap_seconds > 0 else 0.0
     fraction = 0.0 if gap_seconds <= 0 else min(1.0, overlapped / gap_seconds)
     return PauseEvidence(
         gap_ms_raw=gap_ms,
@@ -424,6 +475,74 @@ def cut_cost(
 # ---------------------------------------------------------------- edge cost
 
 
+#: How a candidate cue's priced line set was obtained. Categorical, so
+#: ``sum_breakdowns`` drops it from interval aggregates on purpose -- it belongs
+#: on the per-edge breakdown, next to the widths it explains.
+LAYOUT_SOURCES: tuple[str, ...] = (
+    "greedy-packer",
+    "renderer-single-line",
+    "renderer-two-line",
+)
+
+
+@dataclass(frozen=True)
+class RenderedLayout:
+    """The line set a candidate cue is priced against, and where it came from."""
+
+    lines: int
+    line_widths: tuple[int, ...]
+    source: str
+
+    @property
+    def balance(self) -> float:
+        if self.lines != 2:
+            return 0.0
+        return float(abs(self.line_widths[0] - self.line_widths[1]))
+
+
+def rendered_layout(display_text: str, profile: DisplayProfile) -> RenderedLayout:
+    """The lines the renderer will deliver for one candidate cue's display text.
+
+    The packer that certifies an edge *legal* is a greedy first-fit -- the right
+    oracle for "does this fit at all", and the wrong one for "how balanced does
+    this read", because the pass that actually folds the cue
+    (:func:`layout.wrap_cue_text`) picks a two-line break by exhaustive scoring.
+    Pricing the greedy widths punishes exactly the candidates the renderer folds
+    best: a cue that just fills one greedy line reads as maximally unbalanced
+    while it ships as two near-equal halves.
+
+    So the <=2-line case is priced through the renderer's own chooser
+    (:func:`layout._two_line_break`), on the stripped text the edge already
+    carries. Deeper wraps keep the greedy answer -- ``wrap_cue_text`` balances
+    those greedily too, but at a different target -- and say so through
+    ``layout_source`` rather than pretending to a fidelity they do not have.
+
+    Two renderer passes are deliberately NOT mirrored, and both are content
+    rewrites rather than break choices: ``_merge_stutters`` (ASCII repeats folded
+    to a hyphenated form, which can shorten a line by a cell) and
+    ``apply_kinsoku`` (ja/zh line-end/line-start repair, which moves at most one
+    glyph across the break). Mirroring either would mean re-deriving the cue's
+    text here, and the text is the lattice's answer, not the cost model's.
+    """
+    lang = profile.language
+    budget = _line_budget_width(profile.max_line_length, lang)
+    units = _wrap_units(display_text, lang)
+    if len(units) <= 1:
+        width = _vis_width(units[0][0]) if units else _vis_width(display_text)
+        return RenderedLayout(1, (width,), "renderer-single-line")
+    total = sum(_vis_width(atom) for atom, _gap in units) + sum(
+        _vis_width(gap) for _atom, gap in units[:-1]
+    )
+    if total <= budget:
+        return RenderedLayout(1, (total,), "renderer-single-line")
+    if profile.max_lines == 2:
+        chosen = _two_line_break(units, lang, budget)
+        if chosen is not None:
+            _index, top, bottom = chosen
+            return RenderedLayout(2, (top, bottom), "renderer-two-line")
+    return RenderedLayout(0, (), "greedy-packer")
+
+
 def edge_cost(
     edge: Edge,
     atoms: Sequence[LatticeAtom],
@@ -444,6 +563,12 @@ def edge_cost(
     That is reachable only inside the all-invisible branch, whose chain is
     forced regardless of cost; the mixed branch declares such an edge illegal
     before it ever gets here.
+
+    The layout terms are priced against :func:`rendered_layout` -- the lines the
+    renderer will actually deliver -- not against the greedy packer state that
+    decided legality. The packer's own answer is still recorded, as
+    ``packed_line_count_raw``/``packed_balance_raw``, so the two readings can be
+    compared in an artifact instead of being conflated in one field.
     """
     available: float | None = None
     if edge.span_start is not None and edge.span_end is not None:
@@ -451,7 +576,14 @@ def edge_cost(
             edge.span_start,
             edge.span_end,
             next_start,
-            text=edge.display_text,
+            # The RAW join, not the stripped projection. The pass this preview
+            # claims to mirror bit for bit (``timing._cleanup_cues``) reads
+            # ``cue["text"]``, and cleanup runs BEFORE the strip and the wrap in
+            # both engines -- so the CPS reading load it will use is the raw
+            # one. Handing the stripped text here made ``available_s``
+            # under-predict, always in the same direction, on every cue whose
+            # punctuation carried reading load.
+            text=edge.text,
             word_data=[
                 {"text": atom.text, "start": atom.start, "end": atom.end}
                 for atom in atoms[edge.start_node : edge.end_node]
@@ -462,6 +594,12 @@ def edge_cost(
             lag_out_s=profile.lag_out_s,
         )
     usable = 0.0 if available is None else available
+
+    layout = rendered_layout(edge.display_text, profile)
+    if layout.source == "greedy-packer":
+        lines, balance = edge.lines, edge.balance
+    else:
+        lines, balance = layout.lines, layout.balance
 
     width = edge.vis_width
     if width <= SHORT_FRAGMENT_TIGHT_MAX_W:
@@ -480,8 +618,11 @@ def edge_cost(
 
     features: dict[str, float | str | None] = {
         "available_s": available,
-        "balance_raw": edge.balance,
-        "line_count_raw": edge.lines,
+        "balance_raw": balance,
+        "layout_source": layout.source,
+        "line_count_raw": lines,
+        "packed_balance_raw": edge.balance,
+        "packed_line_count_raw": edge.lines,
         "reading_need_s": need,
         "sentence_cross_raw": float(sentence_cross_count),
         "vis_width_raw": float(width),
@@ -491,8 +632,8 @@ def edge_cost(
         {
             "cue_base": CUE_BASE,
             "short_fragment": fragment,
-            "line_count": W_LINE_COUNT * (edge.lines - 1),
-            "balance": W_BALANCE * edge.balance,
+            "line_count": W_LINE_COUNT * (lines - 1),
+            "balance": W_BALANCE * balance,
             "reading": reading,
             "min_duration": min_duration,
             "sentence_cross": W_SENTENCE_CROSS * sentence_cross_count,

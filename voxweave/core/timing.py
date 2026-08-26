@@ -440,13 +440,21 @@ def _snap_to_shots(
     removal, landing-zone push) are vetoed outright when they would land after
     the cue's own first word — vetoed rather than clamped, because a landing
     that is not in a zone defeats the frame rules; a cue with no timed word_data
-    carries no acoustic evidence and still snaps. Starts also stay clear of the
-    previous cue end + 2 frames and below the cue's own end; ends never pull
-    below the last word's end (dialogue that crosses the cut keeps its subtitle
-    across it, falling back to the 12-frames-after landing zone), never collide
-    with the next cue. Every move — the in-time lead-in included — respects the
-    duration cap, so snapping can never re-inflate a cue past the segmentation
-    limit.
+    carries no acoustic evidence and still snaps. Starts stay below the cue's own
+    end; ends never pull below the last word's end (dialogue that crosses the cut
+    keeps its subtitle across it, falling back to the 12-frames-after landing
+    zone), never collide with the next cue. Every move — the in-time lead-in
+    included — respects the duration cap, so snapping can never re-inflate a cue
+    past the segmentation limit.
+
+    The previous cue's end + 2 frames is a floor on a move this pass MAKES, not a
+    guarantee about the stream it returns, and the difference is load-bearing.
+    A start already inside the previous cue's guard band arrives that way; the
+    clamp can lift a snap out of it, but if the resulting move would delay the
+    cue past its own first word the speech veto declines the move entirely and
+    the pre-existing gap stands. Speech beats layout, so this pass repairs a
+    separation violation only when the repair costs no audible word — it never
+    creates one, and it never promises to have removed one.
     """
     if snap_s <= 0 or not shots:
         return cues

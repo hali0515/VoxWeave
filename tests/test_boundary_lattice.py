@@ -43,6 +43,7 @@ from voxweave.core.boundary_lattice import (
     candidate_nodes,
     coalesce_zero_display,
     exclusively_owned,
+    granularity_check,
     greedy_cap_partition,
     held_chain_continuous,
     preflight_profile,
@@ -856,3 +857,144 @@ def test_a_word_level_ja_document_conserves_its_text_end_to_end():
         assert set(lattice.nodes) <= legal
         for edge in lattice.edges:
             assert edge.start_node in legal and edge.end_node in legal
+
+
+# ------------------------------------------- AD6-1 duration ladder, in order
+
+
+def test_a_cap_splittable_run_exposes_its_cut_instead_of_claiming_unwaivable():
+    """Bug pin: a SUCCESSFUL cap resolution used to be read as the terminal.
+
+    ``resolve_cap_partition`` returns ``waivers=()`` in two very different
+    cases -- the run split cleanly into cap-legal chunks, and the run could not
+    be split at all -- and the mixed branch used to treat the empty waiver list
+    as ``duration-unwaivable``. That skipped the held-chain test AD6-1 orders
+    before the terminal, short-circuited the C16 relief valve (which only runs
+    where no ``infeasible`` was set), and falsified AD6-1's recorded conclusion
+    that the terminal is unreachable from a constructible document.
+
+    Twelve one-glyph ja units: the interval spans 8 s against a 7 s cap, so no
+    single cue is legal, but a cut at unit 11 makes both halves legal -- and unit
+    11 is a unit edge the no-space candidate set had hidden.
+    """
+    spec = [
+        (ch, i * 0.55, i * 0.55 + 0.4) for i, ch in enumerate("あいうえおかきくけこさ")
+    ]
+    spec.append(("し", 6.4, 8.0))
+    prof = profile("ja", max_line_length=18, max_lines=2, max_cue_s=7.0)
+    doc = document(spec, prof=prof)
+    lattice = build_document_lattice(doc).lattices[0]
+
+    assert candidate_nodes(lattice.atoms, "ja") == (0, 12)
+    assert lattice.infeasible is None
+    assert lattice.cap_relief_nodes >= 1
+    assert 11 in lattice.nodes
+    assert reachable(lattice)
+    for edge in lattice.edges:
+        low, high = edge.span_start, edge.span_end
+        assert low is None or high is None or high - low <= prof.max_cue_s + CAP_EPS_S
+
+
+def test_relief_never_reintroduces_a_zero_display_atom_into_a_mixed_interval():
+    """AD3-1 after relief: no invisible atom, and no empty-display edge.
+
+    Relief splits by footprint, so a piece can own only punctuation and render
+    to nothing -- which breaks the positive-display-progress invariant the band
+    and the early break are proved from, and admits a candidate cue that renders
+    to the empty string. Where re-coalescing folds the split straight back,
+    relief simply was not available and the duration ladder falls through to the
+    held-chain waiver, which is the AD6-1 ordering anyway.
+    """
+    doc = document(
+        [
+            ("あ", 0.0, 8.0),
+            ("。", 8.0, 8.05),
+            ("い", 8.2, 8.5),
+            ("う", 8.6, 8.9),
+            ("え", 9.0, 9.3),
+        ],
+        prof=profile("ja", max_line_length=18, max_lines=2, max_cue_s=7.0),
+    )
+    lattice = build_document_lattice(doc).lattices[0]
+
+    assert lattice.all_invisible is False
+    assert all(a.visible for a in lattice.atoms), [a.text for a in lattice.atoms]
+    assert all(_vis_width(a.display) >= 1 for a in lattice.atoms)
+    assert all(edge.display_text for edge in lattice.edges)
+    assert [w.kind for w in lattice.waivers] == ["held-chain-duration"]
+    assert lattice.infeasible is None
+
+
+# ------------------------------------- coarse granularity (scope, not failure)
+
+
+def coarse_ja_document():
+    """Six sentence-level units, per-glyph atoms: candidates collapse to {0, N}."""
+    sentences = [
+        "これはテストです",
+        "こんにちは世界",
+        "今日はいい天気",
+        "こんにちは世界",
+        "こんにちは世界",
+        "これはテストです",
+    ]
+    bounds = [
+        (0.0, 1.16),
+        (1.231, 2.793),
+        (2.907, 4.171),
+        (4.234, 4.909),
+        (5.086, 6.588),
+        (6.61, 7.451),
+    ]
+    return document(
+        [(s, a, b) for s, (a, b) in zip(sentences, bounds)],
+        prof=profile("ja", max_line_length=18, max_lines=2),
+        text="".join(sentences),
+    )
+
+
+def test_a_collapsed_node_space_is_typed_coarse_granularity_not_no_path():
+    """The class is a property of the INPUT, and says so.
+
+    ``candidate_nodes`` intersects phrase starts with source-unit edges, and on a
+    sentence-granularity ja stream the intersection is ``{0}``. No cue short
+    enough to fit the budget can be expressed at all, so this is not a search
+    that failed and must not be reported as one -- P5 resolves it by splitting
+    below the source unit.
+    """
+    lattice = build_document_lattice(coarse_ja_document()).lattices[0]
+    assert len(candidate_nodes(lattice.atoms, "ja")) == 2
+    assert lattice.infeasible is not None
+    assert lattice.infeasible.reason == "coarse-granularity"
+    assert lattice.infeasible.reason in INFEASIBLE_REASONS
+    # detected BEFORE solving: no edge scan ran
+    assert lattice.edges == ()
+    assert lattice.packer_steps == 0
+
+
+def test_the_same_text_at_word_granularity_needs_no_fallback():
+    """The minimal pair: identical text and timing, per-glyph units."""
+    coarse = coarse_ja_document()
+    spec = []
+    for unit in coarse.units:
+        step = (unit.end - unit.start) / len(unit.surface)
+        for offset, ch in enumerate(unit.surface):
+            spec.append(
+                (ch, unit.start + offset * step, unit.start + (offset + 1) * step)
+            )
+    fine = document(spec, prof=coarse.profile, text=coarse.text)
+    assert all(
+        lattice.infeasible is None for lattice in build_document_lattice(fine).lattices
+    )
+
+
+def test_granularity_check_is_a_lower_bound_never_a_false_collapse():
+    """A word-level document always has enough boundaries for its own width."""
+    doc = document(
+        timed(["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"], dur=0.3),
+        prof=profile(max_line_length=12, max_lines=1),
+    )
+    for lattice in build_document_lattice(doc).lattices:
+        check = granularity_check(lattice.atoms, lattice.nodes, doc.profile)
+        assert check.required_cuts >= 1
+        assert check.collapsed is False

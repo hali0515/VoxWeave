@@ -22,6 +22,16 @@ rather than argued:
   produce a legal path has a name in :data:`INFEASIBLE_REASONS`, and the caller
   adopts the v1 partition for that region instead of the lattice inventing one.
 
+**Scope: the node space is only as fine as the source units.** A cue boundary
+must be a source-unit edge, so a document whose ``word_data`` is coarser than a
+phrase -- the legacy sentence-level granularity this repo treats as valid -- can
+have no expressible partition at all, no matter what the cost model prefers. That
+is detected structurally before any search (:func:`granularity_check`) and typed
+:data:`COARSE_GRANULARITY`, so it is never mistaken for a solver that could not
+find a path it had. **The P5 resolution is splitting below the source unit**;
+P4 measures the boundary decision on the units it is handed and refuses to invent
+sub-unit evidence, so a collapsed interval falls back to v1 by design.
+
 Every helper this module borrows from ``smart_split``/``layout`` is used
 verbatim, including the quirks: the relief trigger compares a non-space *char*
 count against a *cell* budget, and the display projection is taken on the joined
@@ -87,7 +97,14 @@ INFLUENCE_RADIUS_UNITS: int = 96
 
 BARRIER_KINDS: tuple[str, ...] = ("document", "robust-silence")
 
+#: The one infeasibility that is a statement about the INPUT rather than about
+#: the search: the source units are coarser than a cue, so the expressible node
+#: space cannot tile the interval however the solver is tuned. Named so a reader
+#: (and the harness) can tell it apart from a genuine optimizer failure.
+COARSE_GRANULARITY: str = "coarse-granularity"
+
 INFEASIBLE_REASONS: tuple[str, ...] = (
+    COARSE_GRANULARITY,
     "duration-unwaivable",
     "no-path",
     "relief-insufficient",
@@ -1195,6 +1212,7 @@ def resolve_cap_partition(
     max_cue_s: float,
     unit_offset: int = 0,
     lang: str = "en",
+    allow_relief: bool = True,
 ) -> CapResolution:
     """Make an atom run cap-legal: relief first, then a waiver, then a fallback.
 
@@ -1214,10 +1232,16 @@ def resolve_cap_partition(
     ``lang`` is a deviation from the reviewed signature: relief mints piece
     surfaces by joining unit surfaces, which is language-dependent. It defaults
     to the space-delimited join so existing positional callers are unaffected.
+
+    ``allow_relief=False`` is for the mixed branch, whose atoms have already been
+    through :func:`_relieve_over_cap_atoms` (the same split, under the same
+    exclusivity test) and then re-coalesced. Splitting again here would mint
+    pieces the caller's atom indices cannot address, so the returned ``cuts``
+    would no longer point at anything it can inject.
     """
     current = list(atoms)
     injections = 0
-    guard = len(units) + len(current) + 2
+    guard = (len(units) + len(current) + 2) if allow_relief else 0
     while guard > 0:
         guard -= 1
         cuts = greedy_cap_partition(current, max_cue_s)
@@ -1348,6 +1372,71 @@ def relief_nodes(
     return tuple(sorted(out))
 
 
+# ------------------------------------------------------- granularity preflight
+
+
+@dataclass(frozen=True)
+class GranularityCheck:
+    """Whether a node space can express *any* legal partition of its interval."""
+
+    required_cuts: int
+    available_cuts: int
+
+    @property
+    def collapsed(self) -> bool:
+        return self.available_cuts < self.required_cuts
+
+
+def granularity_check(
+    atoms: Sequence[LatticeAtom], nodes: Sequence[int], profile: DisplayProfile
+) -> GranularityCheck:
+    """Count the interior cuts a legal partition needs against the ones on offer.
+
+    ``candidate_nodes`` intersects the linguistic break set with the source-unit
+    edges, because a boundary interior to a source unit is one the partition
+    cannot express. On a word-level stream that removes nothing. On a stream
+    whose ``word_data`` is coarser than a phrase -- the legacy sentence-level
+    granularity this repo documents as valid -- it can remove *everything*: the
+    phrase starts a no-space segmenter finds sit inside the units, so the node
+    space collapses to ``{0, N}`` and no cue short enough to fit the layout
+    budget can be expressed at all.
+
+    That is a structural fact about the input, not a search that failed, and it
+    is worth its own answer: the required cut count comes from a greedy chunking
+    at the loosest capacity a cue could ever have (``max_lines`` whole lines,
+    every atom at least one half-width cell), so it is a strict lower bound and
+    a ``collapsed`` verdict cannot be wrong about there being no legal path.
+
+    Being a lower bound, it is deliberately one-sided. A coarse stream that has
+    *enough* candidate boundaries but none of them in a usable place still fails,
+    and keeps the honest ``no-path``/``relief-insufficient`` reason -- this
+    counts boundaries, it does not place them.
+
+    P5 resolves this class by splitting *below* the source unit; P4 measures the
+    boundary decision on the units it is given and refuses to invent evidence,
+    so a collapsed interval takes the typed ``coarse-granularity`` fallback.
+    """
+    count = len(atoms)
+    capacity = profile.max_lines * _line_budget_width(
+        profile.max_line_length, profile.language
+    )
+    available = sum(1 for node in nodes if 0 < node < count)
+    if count == 0 or capacity <= 0:
+        return GranularityCheck(required_cuts=0, available_cuts=available)
+    separator = 0 if _no_spaces(profile.language) else 1
+    chunks = 1
+    width = 0
+    for atom in atoms:
+        piece = _vis_width(atom.display)
+        extra = separator if width else 0
+        if width and width + extra + piece > capacity:
+            chunks += 1
+            width = piece
+        else:
+            width += extra + piece
+    return GranularityCheck(required_cuts=chunks - 1, available_cuts=available)
+
+
 # --------------------------------------------------------------- sentences
 
 
@@ -1419,6 +1508,11 @@ class IntervalLattice:
     waivers: tuple[Waiver, ...]
     infeasible: Infeasible | None
     packer_steps: int
+    #: Candidate boundaries the duration ladder had to expose because the run
+    #: was over the cap and splittable at a source-unit edge the linguistic node
+    #: space had hidden. Counted apart from ``relief_injections`` so an artifact
+    #: reader can tell a layout rescue (C16) from a duration one (AD6-1).
+    cap_relief_nodes: int = 0
 
     def unit_bound(self, node: int) -> int:
         """The source-unit id a node cuts at, closed against the interval.
@@ -1440,6 +1534,7 @@ class IntervalLattice:
             "all_invisible": self.all_invisible,
             "atom_count": len(self.atoms),
             "candidate_count": len(self.nodes),
+            "cap_relief_nodes": self.cap_relief_nodes,
             "coalesced_atoms": self.coalesced_atoms,
             "edge_count": len(self.edges),
             "infeasible": None
@@ -1509,12 +1604,23 @@ def _relieve_over_cap_atoms(
     return tuple(current), injections
 
 
+@dataclass(frozen=True)
+class MixedEdges:
+    """One scan of the mixed branch: its edges, exemptions, and what it needs."""
+
+    edges: tuple[Edge, ...]
+    waivers: tuple[Waiver, ...]
+    infeasible: Infeasible | None
+    packer_steps: int
+    cap_nodes: tuple[int, ...] = ()
+
+
 def _build_mixed_edges(
     atoms: Sequence[LatticeAtom],
     nodes: Sequence[int],
     profile: DisplayProfile,
     units: Sequence[SourceUnit],
-) -> tuple[tuple[Edge, ...], tuple[Waiver, ...], Infeasible | None, int]:
+) -> MixedEdges:
     """Scan every start node forward until the first over-budget atom.
 
     Both stopping conditions are monotone in the end node -- visual load only
@@ -1523,6 +1629,18 @@ def _build_mixed_edges(
     blocker case (even the shortest candidate cue is over the cap) is the only
     place an exemption can enter, and it goes through the same resolution the
     all-invisible branch uses.
+
+    That resolution answers three different things and they must not be
+    conflated. It can say *the run splits* (a cap-legal partition exists at
+    source-unit edges this node space happened to hide), *the run is exempt* (one
+    word still sounding, held-chain evidence), or *the run is unwaivable*. Only
+    the third is a terminal. Reading an empty waiver list as the terminal --
+    which is what a bare ``if resolution.waivers: ... else: infeasible`` does --
+    turns a SUCCESSFUL split into ``duration-unwaivable``, skips the held-chain
+    test AD6-1 orders before it, and short-circuits the C16 relief valve, since
+    the valve only runs where no ``infeasible`` was set. Split points are
+    returned as ``cap_nodes`` for the caller to inject, exactly as C16 injects
+    relief nodes.
     """
     lang = profile.language
     max_cue_s = profile.max_cue_s
@@ -1530,6 +1648,7 @@ def _build_mixed_edges(
     packer = IncrementalPacker(lang, profile.max_line_length, profile.max_lines)
     edges: list[Edge] = []
     waivers: list[Waiver] = []
+    cap_nodes: set[int] = set()
     infeasible: Infeasible | None = None
     count = len(atoms)
     for start in nodes:
@@ -1567,16 +1686,26 @@ def _build_mixed_edges(
                         units,
                         max_cue_s=max_cue_s,
                         lang=lang,
+                        allow_relief=False,
                     )
+                    exposed = {start + cut for cut in resolution.cuts} - node_set
+                    if exposed:
+                        # The run IS splittable; this particular edge simply is
+                        # not legal. Expose the cuts and let the caller re-scan.
+                        cap_nodes |= exposed
+                        break
                     if resolution.waivers:
                         waiver = resolution.waivers[0]
                         waivers.append(waiver)
+                    elif resolution.infeasible is not None:
+                        infeasible = resolution.infeasible
+                        break
                     else:
-                        infeasible = resolution.infeasible or Infeasible(
-                            reason="duration-unwaivable",
-                            detail=f"nodes [{start}, {end_node}) exceed the cap",
-                            unit_range=(atoms[start].unit_start, atoms[index].unit_end),
-                        )
+                        # No split, no evidence, no typed terminal: the run has
+                        # no legal edge from here, which the reachability check
+                        # types honestly as no-path/relief-insufficient. Claiming
+                        # ``duration-unwaivable`` would name a terminal the
+                        # duration ladder never reached.
                         break
                 edges.append(
                     Edge(
@@ -1597,7 +1726,13 @@ def _build_mixed_edges(
         if infeasible is not None:
             break
     edges.sort(key=lambda e: (e.start_node, e.end_node))
-    return tuple(edges), tuple(waivers), infeasible, packer.steps
+    return MixedEdges(
+        edges=tuple(edges),
+        waivers=tuple(waivers),
+        infeasible=infeasible,
+        packer_steps=packer.steps,
+        cap_nodes=tuple(sorted(cap_nodes)),
+    )
 
 
 def _forced_chain(
@@ -1704,13 +1839,87 @@ def build_interval_lattice(
         )
 
     atoms = coalesced.atoms
+    coalesced_atoms = coalesced.coalesced_atoms
     relief_injections = 0
     if profile.max_cue_s > 0:
-        atoms, relief_injections = _relieve_over_cap_atoms(
+        relieved, relief_injections = _relieve_over_cap_atoms(
             atoms, units, profile.max_cue_s, lang
         )
+        if relief_injections:
+            # AD3-1, again: relief mints pieces by footprint and a piece that
+            # owns only punctuation renders to nothing. An invisible atom inside
+            # a MIXED interval breaks the very positive-display-progress
+            # invariant the band and the early break are proved from, and admits
+            # candidate edges whose whole display is empty. Re-coalescing
+            # restores it. Where that folds the split straight back, relief was
+            # not actually available on this atom, and the duration ladder falls
+            # through to the held-chain waiver -- which is the AD6-1 ordering.
+            recoalesced = coalesce_zero_display(relieved, lang=lang)
+            atoms = recoalesced.atoms
+            coalesced_atoms += recoalesced.coalesced_atoms
+        else:
+            atoms = relieved
     nodes = candidate_nodes(atoms, lang)
-    edges, waivers, infeasible, steps = _build_mixed_edges(atoms, nodes, profile, units)
+
+    granularity = granularity_check(atoms, nodes, profile)
+    if granularity.collapsed:
+        widened = nodes
+        if relief_trigger(
+            atoms,
+            max_line_length=profile.max_line_length,
+            max_lines=profile.max_lines,
+        ):
+            widened = tuple(
+                sorted(
+                    set(nodes)
+                    | set(
+                        relief_nodes(
+                            atoms,
+                            max_line_length=profile.max_line_length,
+                            max_lines=profile.max_lines,
+                        )
+                    )
+                )
+            )
+        if granularity_check(atoms, widened, profile).collapsed:
+            return IntervalLattice(
+                interval=interval,
+                atoms=atoms,
+                nodes=nodes,
+                edges=(),
+                edges_from={},
+                coalesced_atoms=coalesced_atoms,
+                all_invisible=False,
+                relief_injections=relief_injections,
+                waivers=(),
+                infeasible=Infeasible(
+                    reason=COARSE_GRANULARITY,
+                    detail=(
+                        f"{granularity.available_cuts} interior candidate "
+                        f"boundaries where a legal partition needs at least "
+                        f"{granularity.required_cuts}: the source units are "
+                        "coarser than a cue"
+                    ),
+                    unit_range=(interval.unit_start, interval.unit_end),
+                ),
+                packer_steps=0,
+                cap_relief_nodes=0,
+            )
+
+    scan = _build_mixed_edges(atoms, nodes, profile, units)
+    steps = scan.packer_steps
+    cap_relief_nodes = 0
+    guard = len(atoms) + 2
+    while scan.cap_nodes and guard > 0:
+        guard -= 1
+        fresh = tuple(node for node in scan.cap_nodes if node not in set(nodes))
+        if not fresh:
+            break
+        nodes = tuple(sorted(set(nodes) | set(fresh)))
+        cap_relief_nodes += len(fresh)
+        scan = _build_mixed_edges(atoms, nodes, profile, units)
+        steps += scan.packer_steps
+    edges, waivers, infeasible = scan.edges, scan.waivers, scan.infeasible
     edges_from = _edges_from(edges)
 
     if infeasible is None and not _reachable(edges_from, len(atoms)):
@@ -1725,10 +1934,9 @@ def build_interval_lattice(
                 max_lines=profile.max_lines,
             )
             nodes = tuple(sorted(set(nodes) | set(injected)))
-            edges, waivers, infeasible, extra = _build_mixed_edges(
-                atoms, nodes, profile, units
-            )
-            steps += extra
+            scan = _build_mixed_edges(atoms, nodes, profile, units)
+            edges, waivers, infeasible = scan.edges, scan.waivers, scan.infeasible
+            steps += scan.packer_steps
             edges_from = _edges_from(edges)
             relief_injections += len(injected)
             if infeasible is None and not _reachable(edges_from, len(atoms)):
@@ -1750,12 +1958,13 @@ def build_interval_lattice(
         nodes=nodes,
         edges=edges,
         edges_from=edges_from,
-        coalesced_atoms=coalesced.coalesced_atoms,
+        coalesced_atoms=coalesced_atoms,
         all_invisible=False,
         relief_injections=relief_injections,
         waivers=waivers,
         infeasible=infeasible,
         packer_steps=steps,
+        cap_relief_nodes=cap_relief_nodes,
     )
 
 

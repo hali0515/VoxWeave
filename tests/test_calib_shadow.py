@@ -785,6 +785,35 @@ def test_near_cliff_selection_catches_a_gap_straddling_a_knee(
     assert 5 in set(scan["near_cliff"])
 
 
+def test_near_cliff_selection_sees_a_state_flip_at_the_shifted_endpoint(
+    corpus_path: Path,
+) -> None:
+    """AD4-3's speech-overlap geometry, which the knee test cannot reach.
+
+    The classifier re-derives ``overlap_fraction`` at the SHIFTED endpoints
+    rather than assuming it constant, so a gap whose shifted end walks out of a
+    speech span changes both its curve and its state -- and that state change is
+    itself a cliff. The landed knee fixture sets ``vad_speech = []``, i.e. the
+    ``silence`` state at ``overlap_fraction == 0``, so it never exercises this.
+    """
+    corpus = calib.load_corpus(corpus_path)
+    case = _cases(corpus, "en-01")[0]
+    row = calib.run_shadow_case(case)
+    units = [dict(u) for u in case.units]
+    # a 200 ms gap whose first 5 ms carry speech: state "speech-overlap"
+    left_end = float(units[5]["end"])
+    units[6]["start"] = left_end + 0.200
+    doc = row.document
+    doc.vad_speech = [(left_end, left_end + 0.005)]
+    probed = calib.perturbed_case(case, units)
+
+    base = calib.near_cliff_scan(probed, doc, [10])
+    assert base["gap_states"][5] == "speech-overlap"
+    # a -10 ms nudge pulls the gap's start behind the speech span entirely, so
+    # the fraction goes to zero and the state flips to "silence"
+    assert 5 in set(base["near_cliff"])
+
+
 def test_perturbation_driver_shape(corpus_path: Path) -> None:
     corpus = calib.load_corpus(corpus_path)
     case = _cases(corpus, "en-01")[0]
@@ -915,3 +944,215 @@ def test_lane_cue_stream_refuses_an_unprojected_partition() -> None:
     built = calib.lane_cue_stream(resolved, units)
     assert built is not None
     assert built[0]["word_data"] == [{"text": "a", "start": 0.0, "end": 1.0}]
+
+
+# --------------------------------------------------------------------------- #
+# An unmeasured stage is an invalid measurement, never a clean one
+# --------------------------------------------------------------------------- #
+
+
+def _shadow_case_stub(case_id: str = "zh-01") -> Any:
+    return calib.Case(
+        path=Path(f"{case_id}.json"),
+        relpath=f"cases/{case_id}.json",
+        doc={"id": case_id, "language": case_id.split("-")[0]},
+        size_bytes=0,
+    )
+
+
+def _measurable(artifact: dict) -> dict:
+    """Add the fields ``shadow_measurement_errors`` reads to a hand-built artifact."""
+    artifact["lanes"][calib.SHADOW_LANE_CORE]["v2"]["projection_cross_check"] = {
+        "agrees": True,
+        "mode": "atom-char-cursor",
+    }
+    artifact["coverage"]["v1_unprojected"] = False
+    artifact["coverage"]["coarse_granularity_intervals"] = 0
+    artifact["v1_projection"] = {
+        "cut_count": 1,
+        "mode": "atom-char-cursor",
+        "unprojected": False,
+    }
+    return artifact
+
+
+@pytest.mark.parametrize("stage", ["raw", "core", "legacy_overlay"])
+def test_a_missing_validator_stage_is_reported_and_is_not_a_clean_run(stage) -> None:
+    """Bug pin: a falsy stage block used to read as "nothing to report".
+
+    The hook has exactly one producer per stage, and dropping the ``core``
+    assignment left the whole suite green while a real shipped defect could be
+    reintroduced with the gate still at exit 0.
+    """
+    artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
+    artifact["validator"][stage] = None
+    counts = calib.shadow_violation_counts(artifact)
+    assert counts["missing_stages"] == [stage]
+    assert counts["stages"][stage] is None
+    problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
+    assert any(stage in line for line in problems)
+
+
+def test_all_stages_present_reports_no_measurement_error() -> None:
+    artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
+    counts = calib.shadow_violation_counts(artifact)
+    assert counts["missing_stages"] == []
+    assert calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts) == []
+
+
+def test_a_disagreeing_projection_cross_check_invalidates_the_measurement() -> None:
+    """The delivery lane's whole metric set is read off that projection.
+
+    ``lane_cue_stream`` rebuilds every gated-lane cue's ``word_data`` from the
+    projected unit range, so a wrong cursor moves cps_p90 and the mid-phrase rate
+    without moving a boundary. The check was computed and thrown away before.
+    """
+    artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
+    artifact["lanes"][calib.SHADOW_LANE_CORE]["v2"]["projection_cross_check"] = {
+        "agrees": False,
+        "mode": "atom-char-cursor",
+    }
+    counts = calib.shadow_violation_counts(artifact)
+    problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
+    assert any("disagree" in line for line in problems)
+
+
+def test_a_missing_projection_cross_check_invalidates_the_measurement() -> None:
+    artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
+    artifact["lanes"][calib.SHADOW_LANE_CORE]["v2"].pop("projection_cross_check")
+    counts = calib.shadow_violation_counts(artifact)
+    problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
+    assert any("cross-check" in line for line in problems)
+
+
+def test_an_unprojected_v1_stream_invalidates_the_measurement() -> None:
+    """The tracked corpus is word-level and must project; if it stops, say so."""
+    artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
+    artifact["coverage"]["v1_unprojected"] = True
+    artifact["v1_projection"]["mode"] = "stream-ends-at-char-26-of-33"
+    counts = calib.shadow_violation_counts(artifact)
+    problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
+    assert any("no v1 reference" in line for line in problems)
+
+
+def test_measurement_errors_outrank_a_failed_gate() -> None:
+    assert (
+        calib.shadow_exit_code(
+            [_gate("fail")], ["zh-01: fallback"], [], [], ["zh-01: stage missing"]
+        )
+        == cc.EXIT_INVALID
+    )
+
+
+# --------------------------------------------------------------------------- #
+# AD-2 probes that cannot be evaluated
+# --------------------------------------------------------------------------- #
+
+
+def test_an_unresolvable_probe_is_unknown_not_a_pass() -> None:
+    """Bug pin: ``crossed_interval_boundary: False`` on a probe with no partition.
+
+    AD-2's rule is "FAIL when any moved boundary lies outside the influence
+    cell". A probe that could not report its moved set has not satisfied that
+    rule, it has failed to answer it -- and at the exit it was indistinguishable
+    from a clean one.
+    """
+    report = calib._cell_report(
+        {1, 2},
+        {
+            "partition": None,
+            "barrier_units": (),
+            "cue_count": 0,
+            "fallback_intervals": 0,
+        },
+        (),
+        (3,),
+    )
+    assert report["crossed_interval_boundary"] is None
+    assert report["error"] == "partition unresolved"
+    probe = {
+        "lanes": {"natural": report},
+        "gap_index": 0,
+        "magnitude_ms": 10,
+        "sign": 1,
+    }
+    assert calib._probe_failed(probe) is False
+    assert calib._probe_unknown(probe) is True
+
+
+def test_a_probe_that_raised_is_unknown_too() -> None:
+    probe = {
+        "lanes": {},
+        "error": "boom",
+        "gap_index": 0,
+        "magnitude_ms": 10,
+        "sign": 1,
+    }
+    assert calib._probe_failed(probe) is False
+    assert calib._probe_unknown(probe) is True
+
+
+def test_a_measured_clean_probe_is_neither_failed_nor_unknown() -> None:
+    report = calib._cell_report(
+        {1, 2},
+        {
+            "partition": {1, 2},
+            "barrier_units": (),
+            "cue_count": 3,
+            "fallback_intervals": 0,
+        },
+        (),
+        (3,),
+    )
+    probe = {
+        "lanes": {"natural": report},
+        "gap_index": 0,
+        "magnitude_ms": 10,
+        "sign": 1,
+    }
+    assert report["crossed_interval_boundary"] is False
+    assert calib._probe_failed(probe) is False
+    assert calib._probe_unknown(probe) is False
+
+
+def test_unknown_probes_are_retained_and_counted() -> None:
+    unknown = {
+        "lanes": {},
+        "error": "boom",
+        "gap_index": 4,
+        "magnitude_ms": 10,
+        "sign": 1,
+    }
+    retained, summary = calib.retain_probes([unknown])
+    assert summary["unknown"] == 1
+    assert summary["failures"] == 0
+    assert retained == [unknown]
+
+
+def test_an_unknown_probe_exits_invalid_not_ok() -> None:
+    assert calib.shadow_exit_code([_gate("pass")], [], [], [{"case": "en-01"}]) == (
+        cc.EXIT_INVALID
+    )
+    assert calib.shadow_exit_code([_gate("pass")], [], [], []) == cc.EXIT_OK
+
+
+def test_the_frozen_shadow_target_arms_the_ad2_exit_driver() -> None:
+    """AD-2's influence-cell FAIL is one of the three declared exits.
+
+    It is unreachable without ``--perturb``, so a target that omits the flag
+    leaves that exit structurally dead and the gate depends on a human
+    remembering it. The slice is deliberately bounded (one magnitude, near-cliff
+    gaps only, one case per language) -- pinned here so it stays a *bounded*
+    run rather than being widened into something nobody will wait for, or
+    quietly dropped again.
+    """
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    target = makefile.split("quality-shadow-segmentation:", 1)[1].split("\n\n", 1)[0]
+    assert "calib_segmentation.py shadow" in target
+    assert "--perturb " in target
+    assert "--perturb-near-cliff-only" in target
+    assert "--perturb-magnitude 50" in target
+    assert "--perturb-mode single_gap" in target
+    for case in ("en-01", "ja-01", "zh-01"):
+        assert f"--perturb-case {case}" in target
+    assert "--check" in target

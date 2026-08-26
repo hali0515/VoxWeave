@@ -412,3 +412,38 @@ def test_supported_pysbd_language_records_nothing():
     with providers.degradation_capture() as ledger:
         _segment_sentences("One. Two.", "en")
     assert ledger == []
+
+
+# --------------------------------- a measurement lane may not take the latch
+
+
+def test_a_quiet_capture_records_the_event_but_never_claims_the_warning(caplog):
+    """Bug pin: a nested measurement could steal production's one log line.
+
+    ``_WARNED`` is process-global, so whichever context reaches a ``(slot,
+    reason)`` pair first emits the single warning. A shadow lane re-tokenizes the
+    same document inside its own nested capture, so it could win that race and
+    leave the shipping run's degradation silent. ``quiet`` suppresses the log for
+    the measurement only -- the ledger entry is unaffected.
+    """
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        with providers.degradation_capture(quiet=True) as measured:
+            providers.note_degraded("atoms", "synthetic:quiet")
+        assert measured == [{"slot": "atoms", "reason": "synthetic:quiet", "count": 1}]
+        assert not caplog.records
+
+        with providers.degradation_capture() as shipped:
+            providers.note_degraded("atoms", "synthetic:quiet")
+    assert shipped == [{"slot": "atoms", "reason": "synthetic:quiet", "count": 1}]
+    assert [r.getMessage() for r in caplog.records] == [
+        "segmentation atoms provider degraded: synthetic:quiet"
+    ]
+
+
+def test_quiet_is_inherited_by_a_capture_nested_inside_a_quiet_one(caplog):
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        with providers.degradation_capture(quiet=True):
+            with providers.degradation_capture() as inner:
+                providers.note_degraded("pos", "synthetic:nested")
+    assert inner == [{"slot": "pos", "reason": "synthetic:nested", "count": 1}]
+    assert not caplog.records
