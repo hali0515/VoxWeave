@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "metric_definition_version": 2,
+  "description": "Tracked segmentation golden corpus: zh/en tutorial monologue plus ja anime dialogue (multi-speaker, song holes, shot changes).",
+  "cases": [
+    "cases/zh-01.json",
+    "cases/zh-02.json",
+    "cases/zh-03.json",
+    "cases/zh-04.json",
+    "cases/zh-05.json",
+    "cases/zh-06.json",
+    "cases/zh-07.json",
+    "cases/ja-01.json",
+    "cases/ja-02.json",
+    "cases/ja-03.json",
+    "cases/ja-04.json",
+    "cases/ja-05.json",
+    "cases/ja-06.json",
+    "cases/ja-07.json",
+    "cases/en-01.json",
+    "cases/en-02.json",
+    "cases/en-03.json",
+    "cases/en-04.json",
+    "cases/en-05.json",
+    "cases/en-06.json"
+  ],
+  "required_counts": {"zh": 7, "ja": 7, "en": 6},
+  "required_tags": ["tutorial", "anime", "dialogue", "song-hole", "tail"]
+}
