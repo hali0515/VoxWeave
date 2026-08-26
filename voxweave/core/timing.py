@@ -59,6 +59,19 @@ def _gap_between(a: Cue, b: Cue) -> float | None:
     return (bs - ae) if ae is not None and bs is not None else None
 
 
+def _speech_start(cue: Cue) -> float | None:
+    """Earliest word start in the cue, or None when it carries no timed word_data.
+
+    The mirror of :func:`_speech_end`: the cue's *speech* start, invariant under
+    the display-start lead-ins this module applies, so a pass can tell a free
+    lead-in from a move that would clip the first word.
+    """
+    starts = [
+        s for w in cue.get("word_data") or [] if (s := w.get("start")) is not None
+    ]
+    return min(starts) if starts else None
+
+
 def _speech_end(cue: Cue) -> float | None:
     """Latest word end in the cue, or None when it carries no timed word_data.
 
@@ -423,12 +436,17 @@ def _snap_to_shots(
     - 1-5 frames after: pull back to cut - 2 frames.
     - 6-11 frames after: extend out to 12 frames after.
 
-    No move ever sacrifices speech: starts stay clear of the previous cue end
-    + 2 frames and below the cue's own end; ends never pull below the last
-    word's end (dialogue that crosses the cut keeps its subtitle across it,
-    falling back to the 12-frames-after landing zone), never collide with the
-    next cue. Every move — the in-time lead-in included — respects the duration
-    cap, so snapping can never re-inflate a cue past the segmentation limit.
+    No move ever sacrifices speech. In-times that would *delay* the cue (flash
+    removal, landing-zone push) are vetoed outright when they would land after
+    the cue's own first word — vetoed rather than clamped, because a landing
+    that is not in a zone defeats the frame rules; a cue with no timed word_data
+    carries no acoustic evidence and still snaps. Starts also stay clear of the
+    previous cue end + 2 frames and below the cue's own end; ends never pull
+    below the last word's end (dialogue that crosses the cut keeps its subtitle
+    across it, falling back to the 12-frames-after landing zone), never collide
+    with the next cue. Every move — the in-time lead-in included — respects the
+    duration cap, so snapping can never re-inflate a cue past the segmentation
+    limit.
     """
     if snap_s <= 0 or not shots:
         return cues
@@ -452,6 +470,7 @@ def _snap_to_shots(
             continue
         last_word_end = _speech_end(c)
         speech_end = end if last_word_end is None else last_word_end
+        first_word_start = _speech_start(c)
         prev_end = out[i - 1].get("end") if i > 0 else None
         nxt_start = out[i + 1].get("start") if i + 1 < len(out) else None
 
@@ -472,10 +491,20 @@ def _snap_to_shots(
             # landing-zone push) must never delay the text by over half a second.
             # A lead-in also lengthens the cue, so it obeys the duration cap just
             # like the out-time branches: a cue already at the cap keeps its start.
+            # A delaying move that would land past the cue's own first word cuts
+            # speech off, the mirror of the out-time pull-back veto: skip it
+            # whole rather than clamp to the word (an off-zone landing would
+            # trade one rule break for another).
+            truncates = (
+                new_start > start
+                and first_word_start is not None
+                and new_start > first_word_start + _EPS
+            )
             if (
                 new_start < end - TWO_FRAME_S
                 and (new_start <= start or new_start - start <= _SHOT_LANDING_S)
                 and within_cap(new_start, end)
+                and not truncates
             ):
                 c["start"] = new_start
 

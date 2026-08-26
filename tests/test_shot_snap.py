@@ -3,7 +3,8 @@
 # before / 1-9 after a cut land on it, 8-11 before pull out to 12 before, 10-11
 # after push to 12 after; out-times die on cut-2frames (up to 12 before / 1-5
 # after) or land 12 after (6-11 after, or as last resort when speech crosses
-# the cut). Speech is never sacrificed: ends never pull below the last word.
+# the cut). Speech is never sacrificed: ends never pull below the last word and
+# a start move that would land after the cue's own first word is vetoed.
 # Detection itself is one ffmpeg pass parsed from showinfo stderr; audio-only
 # media degrades to None.
 import json
@@ -15,12 +16,17 @@ from voxweave import pipeline, shotdet
 from voxweave.core.timing import _FRAME_S, _SHOT_LANDING_S, TWO_FRAME_S, _snap_to_shots
 
 
-def _cue(start, end, speech_end=None, text="x"):
+def _cue(start, end, speech_end=None, speech_start=None, text="x"):
     return {
         "text": text,
         "start": start,
         "end": end,
-        "word_data": [{"start": start, "end": speech_end if speech_end else end}],
+        "word_data": [
+            {
+                "start": start if speech_start is None else speech_start,
+                "end": speech_end if speech_end else end,
+            }
+        ],
     }
 
 
@@ -49,10 +55,13 @@ def test_start_leads_in_to_cut():
     assert out[0]["start"] == pytest.approx(0.85)
 
 
-def test_start_shift_later_removes_precut_flash():
-    # cue starts 0.15s before a cut -> text would flash across it; start moves to the cut
+def test_start_flash_removal_vetoed_when_it_would_clip_speech():
+    # cue starts 0.15s before a cut -> text would flash across it, and removing
+    # the flash means delaying the start onto the cut. The first word is already
+    # sounding at 1.0, so the delay would swallow it: the move is vetoed whole
+    # (never clamped to the word, which would land outside every TTSG zone).
     out = _snap_to_shots([_cue(1.0, 3.0)], [1.15], snap_s=0.24, max_cue_s=7.0)
-    assert out[0]["start"] == pytest.approx(1.15)
+    assert out[0]["start"] == pytest.approx(1.0)
 
 
 def test_far_cut_untouched():
@@ -60,11 +69,14 @@ def test_far_cut_untouched():
     assert out[0]["start"] == 1.0 and out[0]["end"] == 2.0
 
 
-def test_lead_in_respects_previous_cue():
+def test_lead_in_clamp_vetoed_when_it_would_clip_speech():
     cues = [_cue(0.0, 0.95), _cue(1.0, 3.0)]
     out = _snap_to_shots(cues, [0.9], snap_s=0.24, max_cue_s=7.0)
-    # second cue wants to lead in to 0.9 but cue 1 ends at ~0.9; keep 2 frames clear
-    assert out[1]["start"] >= out[0]["end"] + TWO_FRAME_S - 1e-9
+    # second cue wants to sit on the 0.9 cut, but cue 1 ends at 0.95, so the
+    # 2-frame separation clamp turns the move into a *delay* to 1.0333 -- past
+    # its own first word at 1.0. Separation is not worth a clipped word: the cue
+    # keeps the start it came in with (the pass never created that tight gap).
+    assert out[1]["start"] == pytest.approx(1.0)
 
 
 def test_end_extension_respects_next_cue_and_cap():
@@ -82,11 +94,65 @@ def test_start_zone_8_to_11_before_pulls_out_to_12():
     assert out[0]["start"] == pytest.approx(cut - _SHOT_LANDING_S)
 
 
-def test_start_zone_10_to_11_after_pushes_out_to_12():
-    # start 10 frames after the cut -> pushed out to the 12-frames-after zone
+def test_start_zone_10_to_11_after_vetoed_when_it_would_clip_speech():
+    # start 10 frames after the cut -> the zone wants a push out to 12 frames
+    # after, but that delays past the first word (sounding at the cue start),
+    # so the push is vetoed and the cue keeps its start.
     cut = 5.0
     start = cut + 10 * _FRAME_S
     out = _snap_to_shots([_cue(start, 7.0)], [cut], snap_s=0.458, max_cue_s=7.0)
+    assert out[0]["start"] == pytest.approx(start)
+
+
+def test_start_delays_apply_when_speech_is_clear():
+    # Both delaying zones still fire when the landing does not clip the cue's
+    # own speech -- the veto is about speech, not about delays.
+    # 1-7 frames before the cut: flash removal onto the cut.
+    out = _snap_to_shots(
+        [_cue(1.0, 3.0, speech_start=1.2)], [1.15], snap_s=0.24, max_cue_s=7.0
+    )
+    assert out[0]["start"] == pytest.approx(1.15)
+    # 10-11 frames after the cut: push out to the 12-frames-after landing zone.
+    cut = 5.0
+    start = cut + 10 * _FRAME_S
+    out = _snap_to_shots(
+        [_cue(start, 7.0, speech_start=cut + _SHOT_LANDING_S)],
+        [cut],
+        snap_s=0.458,
+        max_cue_s=7.0,
+    )
+    assert out[0]["start"] == pytest.approx(cut + _SHOT_LANDING_S)
+
+
+def test_lead_in_clamp_applies_when_speech_starts_later():
+    # same geometry as the vetoed clamp above, but speech starts at 1.1, after
+    # the clamped landing -> the 2-frame separation from the previous cue holds.
+    cues = [_cue(0.0, 0.95), _cue(1.0, 3.0, speech_start=1.1)]
+    out = _snap_to_shots(cues, [0.9], snap_s=0.24, max_cue_s=7.0)
+    assert out[1]["start"] >= out[0]["end"] + TWO_FRAME_S - 1e-9
+
+
+def test_earlier_zones_snap_regardless_of_speech_start():
+    # Moving earlier can never clip speech, so the guard never touches the
+    # lead-in zones even though the cue's first word starts at the cue start.
+    out = _snap_to_shots([_cue(1.0, 3.0)], [0.85], snap_s=0.24, max_cue_s=7.0)
+    assert out[0]["start"] == pytest.approx(0.85)  # 1-7 frames before -> the cut
+    cut = 5.0
+    out = _snap_to_shots(
+        [_cue(cut - 9 * _FRAME_S, 7.0)], [cut], snap_s=0.458, max_cue_s=7.0
+    )
+    assert out[0]["start"] == pytest.approx(cut - _SHOT_LANDING_S)  # 8-11 before
+
+
+def test_untimed_cue_start_still_snaps():
+    # No word_data -> no acoustic evidence to protect; the zone rules apply as
+    # before (this is the stream align/legacy cues without word timing produce).
+    cue = {"text": "x", "start": 1.0, "end": 3.0, "word_data": []}
+    out = _snap_to_shots([cue], [1.15], snap_s=0.24, max_cue_s=7.0)
+    assert out[0]["start"] == pytest.approx(1.15)
+    cut = 5.0
+    cue = {"text": "x", "start": cut + 10 * _FRAME_S, "end": 7.0, "word_data": []}
+    out = _snap_to_shots([cue], [cut], snap_s=0.458, max_cue_s=7.0)
     assert out[0]["start"] == pytest.approx(cut + _SHOT_LANDING_S)
 
 
