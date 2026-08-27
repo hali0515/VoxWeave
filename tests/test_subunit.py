@@ -20,9 +20,9 @@ import pytest
 from voxweave.core.boundary_lattice import (
     CAP_EPS_S,
     Edge,
-    IncrementalPacker,
     LatticeAtom,
     band_atoms,
+    build_document_lattice,
 )
 from voxweave.core.boundary_v2 import (
     _document_partition,
@@ -972,7 +972,7 @@ def test_coarse_fixture_family_schema_and_per_case_gates() -> None:
 
 
 def test_coarse_candidate_spans_match_canonical_legality_both_directions() -> None:
-    """N14: direct refined-unit spans are admitted iff FinalText is legal."""
+    """N14: no-space coarse lattice edges exist iff FinalText is legal."""
     from voxweave.core.canonical_text import canonical_legal, canonical_text
 
     corpus = json.loads(COARSE_CORPUS.read_text(encoding="utf-8"))
@@ -982,35 +982,41 @@ def test_coarse_candidate_spans_match_canonical_legality_both_directions() -> No
         shadow, _split = refine_document(source)
         if shadow.language == "en":
             continue
-        limit = band_atoms(shadow.profile) + 2
-        for start in range(len(shadow.units)):
-            packer = IncrementalPacker(
-                shadow.language,
-                shadow.profile.max_line_length,
-                shadow.profile.max_lines,
-            )
-            for end in range(start + 1, min(len(shadow.units), start + limit) + 1):
-                owned = shadow.units[start:end]
-                measure = packer.extend(owned[-1].surface)
-                raw = _join([item.surface for item in owned], shadow.language)
-                final = canonical_text(
-                    [
-                        {"text": item.surface, "start": item.start, "end": item.end}
-                        for item in owned
-                    ],
-                    fallback_text=raw,
-                    lang=shadow.language,
-                    profile=shadow.profile,
-                    expected_footprint=raw,
-                )
-                assert measure.fits is canonical_legal(final, shadow.profile), (
-                    fixture["id"],
-                    start,
-                    end,
-                    measure,
-                    final,
-                )
-                checked += 1
+        # Disable duration so this probe isolates PD-TEXT admission.
+        prof = replace(shadow.profile, max_cue_s=0.0)
+        text_only = replace(shadow, profile=prof)
+        built = build_document_lattice(text_only)
+        for lattice in built.lattices:
+            actual = {(edge.start_node, edge.end_node) for edge in lattice.edges}
+            expected: set[tuple[int, int]] = set()
+            limit = band_atoms(prof) + 2
+            for position, start in enumerate(lattice.nodes):
+                for end in lattice.nodes[position + 1 :]:
+                    if end - start > limit:
+                        break
+                    owned = lattice.atoms[start:end]
+                    raw = _join([item.text for item in owned], shadow.language)
+                    final = canonical_text(
+                        [
+                            {
+                                "text": item.text,
+                                "start": item.start,
+                                "end": item.end,
+                            }
+                            for item in owned
+                        ],
+                        fallback_text=raw,
+                        lang=shadow.language,
+                        profile=prof,
+                        expected_footprint=raw,
+                    )
+                    if canonical_legal(final, prof):
+                        expected.add((start, end))
+                    checked += 1
+            assert actual == expected, fixture["id"]
+            raw_chars = sum(len(item.text) for item in lattice.atoms)
+            work_bound = 6 * raw_chars * (band_atoms(prof) + 2) ** 2
+            assert 0 < lattice.canonical_chars <= work_bound, fixture["id"]
     assert checked > 0
 
 

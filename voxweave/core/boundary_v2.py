@@ -19,10 +19,11 @@ Three properties make the exactness claim testable rather than merely asserted:
   induced canonical path is characterised globally as: among all optima minimise
   the last cut, then the one before it, and so on -- and that is what the
   brute-force test compares against.
-* **two counters, separately.** DP relaxations count ``(node, outgoing edge)``
-  pairs, not 2-best ranks; packer extensions are counted by the lattice. Both are
-  asserted against the resolved band by the tests rather than by production
-  asserts, because a work bound that fires in production is a crash, not a proof.
+* **work counters, separately.** DP relaxations count ``(node, outgoing edge)``
+  pairs, not 2-best ranks; spaced packer extensions and no-space canonical
+  character visits are counted independently by the lattice. Each is asserted
+  against its resolved bound by tests rather than production asserts, because a
+  work bound that fires in production is a crash, not a proof.
 
 The selection policy is deliberately conservative: v1's partition wins whenever
 it is a legal path here and within :data:`POLICY_MARGIN` of the optimum. The
@@ -63,12 +64,14 @@ from .boundary_lattice import (
     ProfileViolation,
     build_barriers,
     build_document_lattice,
+    _canonical_pack_measure,
     held_chain_continuous,
     preflight_profile,
     span_max,
     span_min,
 )
-from .layout import _join
+from .canonical_text import CanonicalWork
+from .layout import _join, _no_spaces
 from .partition_check import (
     Origin,
     PartitionCheckResult,
@@ -637,7 +640,12 @@ def score_v1_global(
         for barrier in build_barriers(layer, profile)
         if barrier.kind == "robust-silence"
     }
-    packer = IncrementalPacker(lang, profile.max_line_length, profile.max_lines)
+    packer = (
+        None
+        if _no_spaces(lang)
+        else IncrementalPacker(lang, profile.max_line_length, profile.max_lines)
+    )
+    canonical_work = CanonicalWork()
     parts: list[CostBreakdown] = []
     disagreements: list[dict[str, Any]] = []
 
@@ -645,12 +653,17 @@ def score_v1_global(
         if left >= right:
             continue
         chunk = atoms[left:right]
-        packer.reset()
-        measure = None
-        for atom in chunk:
-            measure = packer.extend(atom.text)
-        if measure is None:
-            continue
+        if packer is None:
+            measure = _canonical_pack_measure(
+                atoms, left, right, profile, canonical_work
+            )
+        else:
+            packer.reset()
+            measure = None
+            for atom in chunk:
+                measure = packer.extend(atom.text)
+            if measure is None:
+                continue
         low = span_min([atom.start for atom in chunk])
         high = span_max([atom.end for atom in chunk])
         edge = Edge(
@@ -848,6 +861,7 @@ class IntervalSolution:
             "barrier_left": self.interval.left.kind,
             "barrier_right": self.interval.right.kind,
             "candidate_count": len(self.lattice.nodes),
+            "canonical_chars": self.lattice.canonical_chars,
             "cap_relief_nodes": self.lattice.cap_relief_nodes,
             "coalesced_atoms": self.lattice.coalesced_atoms,
             "coarse_caused": self.coarse_caused,
@@ -1177,6 +1191,9 @@ def _artifact(
             ),
             "coalesced_atoms": sum(
                 solution.lattice.coalesced_atoms for solution in solutions
+            ),
+            "canonical_chars": sum(
+                solution.lattice.canonical_chars for solution in solutions
             ),
             "coarse_granularity_intervals": sum(
                 1

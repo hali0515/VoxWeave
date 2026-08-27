@@ -47,6 +47,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .canonical_text import (
+    CanonicalWork,
+    band_scan_lower_bound_exceeded,
+    canonical_legal,
+    canonical_text,
+)
 from .layout import (
     _PUNCT_TO_SPACE_RE,
     _UNIT_GLYPHS,
@@ -883,11 +889,11 @@ class IncrementalPacker:
 
     The input projection is ``strip_punct_for_subtitles(_join(texts, lang))``,
     and the naive way to get it per prefix is to redo all four passes every
-    time. That is not merely slower: it is the reason a tile-free exact DP looked
-    expensive in the first place, since edge features dominated the measured
-    cost.  For no-space languages, normalized spaces remain real delivered
-    cells: the fold charges one when adjacent tokens stay on a line and drops it
-    only when that boundary becomes a line break.
+    time. The production lattice uses this fold only for spaced languages, where
+    it is differential-pinned to the batch packing oracle. No-space admission is
+    governed by cached :func:`canonical_text` projections instead: kinsoku can
+    move a closing glyph across a normalized gap, so no bounded streaming state
+    is allowed to approximate that decision.
 
     Each pass is a left-to-right fold with bounded lookahead, so the whole chain
     streams:
@@ -1065,6 +1071,44 @@ class IncrementalPacker:
             line_widths=tuple(widths),
             text="".join(self._norm) + tail,
         )
+
+
+def _canonical_pack_measure(
+    atoms: Sequence[LatticeAtom],
+    start: int,
+    end: int,
+    profile: DisplayProfile,
+    work: CanonicalWork,
+) -> PackMeasure:
+    """Direct no-space admission facts for one cached lattice span.
+
+    The cache key is the lattice's own ``(start, end)`` pair. Legality and the
+    recorded line facts come only from ``FinalText``; the unwrapped display text
+    remains the direct batch strip used by the cost model before finalization.
+    """
+    chunk = atoms[start:end]
+    lang = profile.language
+    raw = _join([atom.text for atom in chunk], lang)
+    final = work.cached(
+        (start, end),
+        lambda: canonical_text(
+            [
+                {"text": atom.text, "start": atom.start, "end": atom.end}
+                for atom in chunk
+            ],
+            fallback_text=raw,
+            lang=lang,
+            profile=profile,
+            expected_footprint=raw,
+            work=work,
+        ),
+    )
+    return PackMeasure(
+        fits=canonical_legal(final, profile),
+        lines=len(final.lines),
+        line_widths=final.cell_widths,
+        text=strip_punct_for_subtitles(raw),
+    )
 
 
 # ------------------------------------------------------------------- edges
@@ -1521,6 +1565,8 @@ class IntervalLattice:
     waivers: tuple[Waiver, ...]
     infeasible: Infeasible | None
     packer_steps: int
+    #: Raw character visits charged by cached no-space FinalText projections.
+    canonical_chars: int
     #: Candidate boundaries the duration ladder had to expose because the run
     #: was over the cap and splittable at a source-unit edge the linguistic node
     #: space had hidden. Counted apart from ``relief_injections`` so an artifact
@@ -1547,6 +1593,7 @@ class IntervalLattice:
             "all_invisible": self.all_invisible,
             "atom_count": len(self.atoms),
             "candidate_count": len(self.nodes),
+            "canonical_chars": self.canonical_chars,
             "cap_relief_nodes": self.cap_relief_nodes,
             "coalesced_atoms": self.coalesced_atoms,
             "edge_count": len(self.edges),
@@ -1633,15 +1680,17 @@ def _build_mixed_edges(
     nodes: Sequence[int],
     profile: DisplayProfile,
     units: Sequence[SourceUnit],
+    *,
+    work: CanonicalWork | None = None,
 ) -> MixedEdges:
-    """Scan every start node forward until the first over-budget atom.
+    """Scan every start node through the provably bounded candidate band.
 
-    Both stopping conditions are monotone in the end node -- visual load only
-    grows and so does the aligned span -- so the first failure ends that start
-    node's scan instead of the scan examining every later end. The duration
-    blocker case (even the shortest candidate cue is over the cap) is the only
-    place an exemption can enter, and it goes through the same resolution the
-    all-invisible branch uses.
+    Spaced-language packing and aligned duration are monotone in the end node.
+    Canonical no-space legality is not: kinsoku can repair a prefix when a later
+    closing glyph arrives, so that branch stops only at the LAW's monotone
+    stripped-cell lower bound. The duration blocker case (even the shortest
+    candidate cue is over the cap) is the only place an exemption can enter,
+    and it goes through the same resolution the all-invisible branch uses.
 
     That resolution answers three different things and they must not be
     conflated. It can say *the run splits* (a cap-legal partition exists at
@@ -1656,9 +1705,15 @@ def _build_mixed_edges(
     relief nodes.
     """
     lang = profile.language
+    no_spaces = _no_spaces(lang)
     max_cue_s = profile.max_cue_s
     node_set = set(nodes)
-    packer = IncrementalPacker(lang, profile.max_line_length, profile.max_lines)
+    packer = (
+        None
+        if no_spaces
+        else IncrementalPacker(lang, profile.max_line_length, profile.max_lines)
+    )
+    canonical_work = work if work is not None else CanonicalWork()
     edges: list[Edge] = []
     waivers: list[Waiver] = []
     cap_nodes: set[int] = set()
@@ -1667,19 +1722,39 @@ def _build_mixed_edges(
     for start in nodes:
         if start >= count:
             continue
-        packer.reset()
+        if packer is not None:
+            packer.reset()
         surfaces: list[str] = []
         starts: list[float | None] = []
         ends: list[float | None] = []
         emitted = False
         for index in range(start, count):
             atom = atoms[index]
-            measure = packer.extend(atom.text)
             surfaces.append(atom.text)
             starts.append(atom.start)
             ends.append(atom.end)
             end_node = index + 1
+            if no_spaces:
+                joined = _join(surfaces, lang)
+                if band_scan_lower_bound_exceeded(joined, profile):
+                    break
+                if end_node not in node_set:
+                    # This atom edge is not a candidate boundary. Keep scanning
+                    # the raw source span, but do not spend canonical work on a
+                    # projection the lattice could never admit.
+                    continue
+                measure = _canonical_pack_measure(
+                    atoms, start, end_node, profile, canonical_work
+                )
+            else:
+                assert packer is not None
+                measure = packer.extend(atom.text)
             if not measure.fits:
+                if no_spaces:
+                    # Canonical wrapping is not monotone: a later kinsoku glyph
+                    # can repair this prefix. Only the stripped-cell lower bound
+                    # above is strong enough to terminate a no-space scan.
+                    continue
                 break
             low = span_min(starts)
             high = span_max(ends)
@@ -1743,7 +1818,7 @@ def _build_mixed_edges(
         edges=tuple(edges),
         waivers=tuple(waivers),
         infeasible=infeasible,
-        packer_steps=packer.steps,
+        packer_steps=0 if packer is None else packer.steps,
         cap_nodes=tuple(sorted(cap_nodes)),
     )
 
@@ -1816,6 +1891,7 @@ def build_interval_lattice(
                 unit_range=(interval.unit_start, interval.unit_end),
             ),
             packer_steps=0,
+            canonical_chars=0,
         )
 
     raw = _reindex(layer.atoms[interval.node_start : interval.node_end])
@@ -1849,6 +1925,7 @@ def build_interval_lattice(
             waivers=resolution.waivers,
             infeasible=resolution.infeasible,
             packer_steps=0,
+            canonical_chars=0,
         )
 
     atoms = coalesced.atoms
@@ -1916,10 +1993,12 @@ def build_interval_lattice(
                     unit_range=(interval.unit_start, interval.unit_end),
                 ),
                 packer_steps=0,
+                canonical_chars=0,
                 cap_relief_nodes=0,
             )
 
-    scan = _build_mixed_edges(atoms, nodes, profile, units)
+    canonical_work = CanonicalWork()
+    scan = _build_mixed_edges(atoms, nodes, profile, units, work=canonical_work)
     steps = scan.packer_steps
     cap_relief_nodes = 0
     guard = len(atoms) + 2
@@ -1930,7 +2009,7 @@ def build_interval_lattice(
             break
         nodes = tuple(sorted(set(nodes) | set(fresh)))
         cap_relief_nodes += len(fresh)
-        scan = _build_mixed_edges(atoms, nodes, profile, units)
+        scan = _build_mixed_edges(atoms, nodes, profile, units, work=canonical_work)
         steps += scan.packer_steps
     edges, waivers, infeasible = scan.edges, scan.waivers, scan.infeasible
     edges_from = _edges_from(edges)
@@ -1947,7 +2026,7 @@ def build_interval_lattice(
                 max_lines=profile.max_lines,
             )
             nodes = tuple(sorted(set(nodes) | set(injected)))
-            scan = _build_mixed_edges(atoms, nodes, profile, units)
+            scan = _build_mixed_edges(atoms, nodes, profile, units, work=canonical_work)
             edges, waivers, infeasible = scan.edges, scan.waivers, scan.infeasible
             steps += scan.packer_steps
             edges_from = _edges_from(edges)
@@ -1977,6 +2056,7 @@ def build_interval_lattice(
         waivers=waivers,
         infeasible=infeasible,
         packer_steps=steps,
+        canonical_chars=canonical_work.canonical_chars,
         cap_relief_nodes=cap_relief_nodes,
     )
 

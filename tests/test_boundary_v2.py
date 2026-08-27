@@ -532,6 +532,7 @@ def test_interval_blocks_expose_the_coverage_and_addendum_fields():
         "validator_raw",
         "dp_relaxations",
         "packer_steps",
+        "canonical_chars",
         "v2_partition",
         "coarse_caused",
     ):

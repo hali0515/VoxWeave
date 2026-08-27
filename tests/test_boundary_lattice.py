@@ -21,6 +21,7 @@ import random
 
 import pytest
 
+from voxweave.core.canonical_text import canonical_legal, canonical_text
 from voxweave.core.boundary_lattice import (
     BARRIER_KINDS,
     BARRIER_UNCERTAINTY_MS,
@@ -64,7 +65,6 @@ from voxweave.core.layout import (
     _vis_width,
     split_subtitle,
     strip_punct_for_subtitles,
-    wrap_cue_text,
 )
 from voxweave.core.segdoc import DisplayProfile, SegDocument, SourceUnit
 from voxweave.core.timing import HELD_WORD_MAX_GAP_S
@@ -456,53 +456,89 @@ def batch_measure(texts, lang, max_line_length, max_lines):
     )
 
 
-def direct_canonical_measure(texts, lang, max_line_length, max_lines):
-    stripped = strip_punct_for_subtitles(_join(list(texts), lang))
-    rendered = wrap_cue_text(
-        stripped,
-        lang,
-        max_lines,
-        max_line_length=_line_budget_width(max_line_length, lang),
-    )
-    lines = rendered.split("\n")
-    widths = tuple(_vis_width(line) for line in lines)
-    budget = _line_budget_width(max_line_length, lang)
-    return len(lines) <= max_lines and all(width <= budget for width in widths), (
-        len(lines),
-        widths,
-        stripped,
-    )
-
-
-@pytest.mark.parametrize(
-    "lang,vocab",
-    [
-        ("en", ["a", "bo", "cat", "deed", "3", ".", ",", "75", "e.g.", "10", "000"]),
-        ("ja", ["あ", "い", "。", "、", "3", ".", "75", ",", "000", "GPT", "!"]),
-    ],
-)
-def test_incremental_packer_matches_the_admission_oracle_on_every_prefix(lang, vocab):
-    """The joined strip and its normalized spaces are charged exactly."""
-    rng = random.Random(f"packer:{lang}")
-    mll, mlines = (42, 2) if lang == "en" else (18, 1)
-    for _ in range(60):
-        texts = [rng.choice(vocab) for _ in range(rng.randint(1, 30))]
+@pytest.mark.parametrize("lang", ["en", "fr", "de", "es"])
+def test_spaced_incremental_packer_matches_batch_on_every_prefix(lang):
+    """Round-2 differential: the unchanged spaced-language fold stays exact."""
+    vocab = [
+        "a",
+        "alpha",
+        "café",
+        "naïve",
+        "über",
+        "mañana",
+        "3",
+        ".",
+        ",",
+        "75",
+        "e.g.",
+        "10,000",
+        "embedded  whitespace",
+        "tab\tinside",
+        "!",
+        "?",
+    ]
+    rng = random.Random(f"spaced-packer:{lang}")
+    checked = 0
+    for _ in range(96):
+        mll = rng.choice([8, 12, 18, 42])
+        mlines = rng.choice([1, 2, 3])
+        texts = [rng.choice(vocab) for _ in range(rng.randint(1, 64))]
         packer = IncrementalPacker(lang, mll, mlines)
         for k, text in enumerate(texts, 1):
             measure = packer.extend(text)
-            if lang == "ja":
-                fits, (lines, widths, stripped) = direct_canonical_measure(
-                    texts[:k], lang, mll, mlines
-                )
-            else:
-                fits, lines, widths, stripped = batch_measure(
-                    texts[:k], lang, mll, mlines
-                )
+            fits, lines, widths, stripped = batch_measure(texts[:k], lang, mll, mlines)
             assert measure.fits is fits, (texts[:k], measure)
             assert measure.text == stripped
-            if measure.fits:
-                assert measure.lines == lines
-                assert measure.line_widths == widths
+            assert measure.lines == lines
+            assert measure.line_widths == widths
+            checked += 1
+    assert checked >= 2_500
+
+
+def test_real_lattice_admission_matches_canonical_kinsoku_gap_pullback() -> None:
+    """N14 both directions: a normalized gap may vanish during kinsoku."""
+    source = "テスト「）kgGPT（000あ丙000甲kg3丁!」0003?丁これはテスト%（」あ%あ」乙「"
+    assert "丁 」0003" in strip_punct_for_subtitles(source)
+    prof = profile("ja", max_line_length=18, max_lines=2, max_cue_s=0.0)
+    lattice = build_document_lattice(
+        document(timed(list(source), dur=0.05), prof=prof, text=source)
+    ).lattices[0]
+    assert len(lattice.atoms) == 32
+
+    actual = {(edge.start_node, edge.end_node) for edge in lattice.edges}
+    expected: set[tuple[int, int]] = set()
+    finals = {}
+    for position, start in enumerate(lattice.nodes):
+        for end in lattice.nodes[position + 1 :]:
+            chunk = lattice.atoms[start:end]
+            raw = _join([atom.text for atom in chunk], "ja")
+            final = canonical_text(
+                [
+                    {"text": atom.text, "start": atom.start, "end": atom.end}
+                    for atom in chunk
+                ],
+                fallback_text=raw,
+                lang="ja",
+                profile=prof,
+                expected_footprint=raw,
+            )
+            finals[(start, end)] = final
+            if canonical_legal(final, prof):
+                expected.add((start, end))
+
+    assert actual == expected
+    full_span = (0, len(lattice.atoms))
+    final = finals[full_span]
+    assert canonical_legal(final, prof) is True
+    assert final.cell_widths == (36, 35)
+    assert final.lines[0].endswith("」")
+    assert final.lines[1].startswith("0003")
+    full_edge = next(
+        edge for edge in lattice.edges if (edge.start_node, edge.end_node) == full_span
+    )
+    assert full_edge.line_widths == final.cell_widths
+    assert lattice.packer_steps == 0
+    assert lattice.canonical_chars > 0
 
 
 def test_packer_counts_its_own_steps_and_reset_keeps_the_counter():
