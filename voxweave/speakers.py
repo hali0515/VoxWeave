@@ -919,13 +919,19 @@ def _delete_stale_suggest_for_refusal(
     media: Path,
     *,
     sibling_path: Path,
-    sibling_bytes: bytes,
+    sibling_bytes: bytes | None,
 ) -> None:
     from voxweave import pipeline
 
     mapping_path = pipeline.swap_ext(media, ".speakers.json")
     with episode_lock(media):
         if mapping_path.exists():
+            return
+        if sibling_bytes is None:
+            # Initial sibling read failures have no exact observation to
+            # compare. The episode lock and absent completion marker exclude a
+            # cooperating successful generator, so any suggestion is stale.
+            delete_suggest(pipeline.speakers_suggest_path(media))
             return
         try:
             unchanged = sibling_path.read_bytes() == sibling_bytes
@@ -997,17 +1003,31 @@ def create_speaker_audition(
     html_path = pipeline.swap_ext(media, ".speakers.html")
     if mapping_path.exists():
         raise _mapping_exists_refusal(mapping_path)
-    if not json_path.exists():
-        raise FileNotFoundError(
-            f"sibling transcript {json_path.name} not found; run voxweave {media.name} --diarize first"
-        )
+    sibling_bytes: bytes | None = None
     try:
-        sibling_bytes = json_path.read_bytes()
-        data = json.loads(sibling_bytes.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"invalid sibling JSON in {json_path.name}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise RuntimeError(f"invalid sibling JSON in {json_path.name}: expected object")
+        if not json_path.exists():
+            raise FileNotFoundError(
+                f"sibling transcript {json_path.name} not found; run voxweave {media.name} --diarize first"
+            )
+        try:
+            sibling_bytes = json_path.read_bytes()
+            data = json.loads(sibling_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"invalid sibling JSON in {json_path.name}: {exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"invalid sibling JSON in {json_path.name}: expected object"
+            )
+    except BaseException:
+        _delete_stale_suggest_for_refusal(
+            media,
+            sibling_path=json_path,
+            sibling_bytes=sibling_bytes,
+        )
+        raise
+    assert sibling_bytes is not None
 
     declared = "voiceprint_capture" in data or "voiceprint_media" in data
     pair: tuple[str, str] | None = None

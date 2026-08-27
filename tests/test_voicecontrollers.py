@@ -325,6 +325,29 @@ def test_failed_no_match_clip_clears_stale_suggestion(tmp_path, monkeypatch):
     assert not (tmp_path / "episode.speakers.json").exists()
 
 
+@pytest.mark.parametrize(
+    ("sibling_bytes", "message"),
+    [
+        (b"{broken", "invalid sibling JSON"),
+        (b"\xff\xfe", "invalid sibling JSON"),
+        (b"[]", "expected object"),
+    ],
+    ids=["malformed-json", "invalid-utf8", "non-object-root"],
+)
+def test_invalid_sibling_clears_stale_suggestion(tmp_path, sibling_bytes, message):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    (tmp_path / "episode.json").write_bytes(sibling_bytes)
+    suggest_path = tmp_path / "episode.speakers.suggest.json"
+    suggest_path.write_text('{"stale": true}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=message):
+        speakers.create_speaker_audition(media, no_match=True)
+
+    assert not (tmp_path / "episode.speakers.json").exists()
+    assert not (tmp_path / "episode.speakers.html").exists()
+    assert not suggest_path.exists()
+
+
 def test_store_reread_failure_clears_stale_suggestion(tmp_path, monkeypatch):
     media, _sibling, _sidecar = _write_episode(tmp_path)
     store_path = tmp_path / "voices.json"
