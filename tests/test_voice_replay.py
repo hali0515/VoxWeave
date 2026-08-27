@@ -4,8 +4,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from voxweave import backend, pipeline
+from voxweave.cli import cli
 from voxweave.mediasnapshot import SnapshotUnavailable
 from voxweave.voicebase import media_fingerprint
 from voxweave.vocalscache import (
@@ -27,6 +29,7 @@ SEPARATOR = {
 @pytest.fixture(autouse=True)
 def _private_snapshot_root(tmp_path, monkeypatch):
     monkeypatch.setenv("VOXWEAVE_CACHE_ROOT", str(tmp_path / "cache-root"))
+    monkeypatch.setenv("VOXWEAVE_CONFIG", str(tmp_path / "voxweave.conf"))
 
 
 def _sibling(*, pair_media: str | None = None) -> dict:
@@ -168,17 +171,96 @@ def test_align_same_content_alternate_media_preserves_pair_and_snapshot_source(
         seen_snapshot.append(source)
         assert source != alternate
         assert source.read_bytes() == alternate.read_bytes()
+        original_bytes = alternate.read_bytes()
+        with alternate.open("r+b") as live:
+            live.truncate(0)
+            live.write(b"B" * len(original_bytes))
+            live.flush()
+            live.seek(0)
+            live.truncate(0)
+            live.write(original_bytes)
+            live.flush()
+        assert source.read_bytes() == original_bytes
         assert kwargs["cache_media"] == alternate
         assert kwargs["source_fingerprint"] == fingerprint
 
     _stub_align(tmp_path, monkeypatch, inspect_prepare=inspect_prepare)
 
-    pipeline.align(vtt_path, media_path=alternate)
+    result = CliRunner().invoke(
+        cli,
+        ["align", str(vtt_path), "--media", str(alternate), "--no-separate"],
+    )
 
+    assert result.exit_code == 0, result.output
     replayed = json.loads(json_path.read_text(encoding="utf-8"))
     assert replayed["voiceprint_capture"] == CAPTURE
     assert replayed["voiceprint_media"] == fingerprint
     assert seen_snapshot and not seen_snapshot[0].exists()
+
+
+def test_align_live_change_after_snapshot_omits_pair_and_cleans(tmp_path, monkeypatch):
+    media, vtt_path, json_path, _vtt, _json = _write_align_input(tmp_path)
+    fingerprint = media_fingerprint(media)
+    json_path.write_text(
+        json.dumps(_sibling(pair_media=fingerprint)),
+        encoding="utf-8",
+    )
+    artifacts = [
+        tmp_path / "episode.voiceprints.json",
+        tmp_path / "episode.speakers.suggest.json",
+        tmp_path / "episode.speakers.html",
+    ]
+    for artifact in artifacts:
+        artifact.write_text("sensitive", encoding="utf-8")
+
+    def inspect_prepare(source: Path, _kwargs: dict) -> None:
+        assert source != media
+        assert source.read_bytes() == media.read_bytes()
+        media.write_bytes(b"replacement media")
+
+    _stub_align(tmp_path, monkeypatch, inspect_prepare=inspect_prepare)
+
+    pipeline.align(vtt_path)
+
+    replayed = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "voiceprint_capture" not in replayed
+    assert "voiceprint_media" not in replayed
+    assert not any(path.exists() for path in artifacts)
+
+
+def test_align_omit_unlink_failure_names_landed_outputs_and_leftover(
+    tmp_path, monkeypatch
+):
+    prior = tmp_path / "prior.wav"
+    prior.write_bytes(b"prior media")
+    fingerprint = media_fingerprint(prior)
+    _media, vtt_path, json_path, _vtt, _json = _write_align_input(
+        tmp_path,
+        media_bytes=b"replacement media",
+        pair_media=fingerprint,
+    )
+    sidecar = tmp_path / "episode.voiceprints.json"
+    sidecar.write_text("sensitive", encoding="utf-8")
+    original_unlink = Path.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if Path(path) == sidecar:
+            raise OSError("permission denied")
+        return original_unlink(path, *args, **kwargs)
+
+    _stub_align(tmp_path, monkeypatch)
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"primary JSON/VTT outputs landed.*could not delete .*voiceprints",
+    ):
+        pipeline.align(vtt_path)
+
+    replayed = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "voiceprint_capture" not in replayed
+    assert "voiceprint_media" not in replayed
+    assert sidecar.exists()
 
 
 def test_align_different_selected_media_omits_pair_and_deletes_artifacts(

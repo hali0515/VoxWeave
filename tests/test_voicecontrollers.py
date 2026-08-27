@@ -211,6 +211,38 @@ def test_discovery_requires_show_confirmation(tmp_path, monkeypatch):
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
 
 
+def test_explicit_corrupt_store_is_fatal_but_discovered_corrupt_store_is_manual(
+    tmp_path, monkeypatch
+):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    explicit = tmp_path / "explicit.json"
+    explicit.write_text("{broken", encoding="utf-8")
+    _fake_clips(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="explicit voices store.*unusable"):
+        speakers.create_speaker_audition(media, voices=explicit)
+    assert not (tmp_path / "episode.speakers.json").exists()
+
+    discovered = tmp_path / "voxweave.voices.json"
+    discovered.write_text("{broken", encoding="utf-8")
+    page = speakers.create_speaker_audition(media)
+    assert page.exists()
+    assert (tmp_path / "episode.speakers.json").exists()
+    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+
+
+def test_voices_store_cannot_use_episode_artifact_namespace(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    forbidden = tmp_path / "episode.voices.json"
+    _write_store(forbidden)
+    _fake_clips(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="episode namespace"):
+        speakers.create_speaker_audition(media, voices=forbidden)
+
+    assert not (tmp_path / "episode.speakers.json").exists()
+
+
 def test_generation_detects_sibling_change_before_mapping_commit(tmp_path, monkeypatch):
     media, _sibling, _sidecar = _write_episode(tmp_path)
     sibling_path = tmp_path / "episode.json"
@@ -226,6 +258,149 @@ def test_generation_detects_sibling_change_before_mapping_commit(tmp_path, monke
         speakers.create_speaker_audition(media)
 
     assert not (tmp_path / "episode.speakers.json").exists()
+
+
+def test_first_clip_reads_stable_snapshot_through_truncate_aba(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    original = media.read_bytes()
+    seen: list[Path] = []
+
+    def mutate_live(source, _start, _end, output):
+        source = Path(source)
+        seen.append(source)
+        assert source != media
+        with media.open("r+b") as live:
+            live.truncate(0)
+            live.write(b"B" * len(original))
+            live.flush()
+            live.seek(0)
+            live.truncate(0)
+            live.write(original)
+            live.flush()
+        assert source.read_bytes() == original
+        Path(output).write_bytes(b"mp3")
+
+    monkeypatch.setattr(speakers, "extract_clip", mutate_live)
+
+    speakers.create_speaker_audition(media)
+
+    assert (tmp_path / "episode.speakers.json").exists()
+    assert seen and not seen[0].exists()
+
+
+def test_live_media_change_after_first_clip_aborts_without_mapping(
+    tmp_path, monkeypatch
+):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    original = media.read_bytes()
+
+    def replace_live(source, _start, _end, output):
+        assert Path(source) != media
+        assert Path(source).read_bytes() == original
+        media.write_bytes(b"replacement media")
+        Path(output).write_bytes(b"mp3")
+
+    monkeypatch.setattr(speakers, "extract_clip", replace_live)
+
+    with pytest.raises(RuntimeError, match="media changed"):
+        speakers.create_speaker_audition(media)
+
+    assert not (tmp_path / "episode.speakers.json").exists()
+
+
+def test_same_token_sidecar_content_change_aborts_revalidation(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    sidecar_path = tmp_path / "episode.voiceprints.json"
+
+    def mutate_sidecar(_source, _start, _end, output):
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["speakers"]["SPEAKER_00"] = list(OTHER_VECTOR)
+        write_voiceprints(sidecar_path, sidecar)
+        Path(output).write_bytes(b"mp3")
+
+    monkeypatch.setattr(speakers, "extract_clip", mutate_sidecar)
+
+    with pytest.raises(RuntimeError, match="input changed"):
+        speakers.create_speaker_audition(media)
+
+    assert not (tmp_path / "episode.speakers.json").exists()
+
+
+@pytest.mark.parametrize("failed_edge", ["suggest", "html", "mapping"])
+def test_generation_publication_edge_failure_leaves_no_mapping_or_machine_outputs(
+    tmp_path, monkeypatch, failed_edge
+):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    store_path = tmp_path / "voices.json"
+    _write_store(store_path)
+    _fake_clips(monkeypatch)
+    html_path = tmp_path / "episode.speakers.html"
+    original_html_write = speakers.fsio.atomic_write_text
+
+    if failed_edge == "suggest":
+        monkeypatch.setattr(
+            speakers,
+            "write_suggest",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("suggest edge")),
+        )
+    elif failed_edge == "html":
+
+        def fail_html(path, content):
+            if Path(path) == html_path:
+                raise OSError("html edge")
+            return original_html_write(path, content)
+
+        monkeypatch.setattr(speakers.fsio, "atomic_write_text", fail_html)
+    else:
+        monkeypatch.setattr(
+            speakers.fsio,
+            "atomic_write_text_new",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("mapping edge")),
+        )
+
+    with pytest.raises(OSError, match=f"{failed_edge} edge"):
+        speakers.create_speaker_audition(media, voices=store_path)
+
+    assert not (tmp_path / "episode.speakers.json").exists()
+    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+    assert not html_path.exists()
+
+
+def test_enrollment_store_write_failure_preserves_mapping_and_no_store(
+    tmp_path, monkeypatch
+):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    mapping_path = tmp_path / "episode.speakers.json"
+    mapping_path.write_text(
+        json.dumps({"version": 1, "speakers": {"SPEAKER_00": "Aqua"}}),
+        encoding="utf-8",
+    )
+    before = mapping_path.read_bytes()
+    store_path = tmp_path / "voices.json"
+    monkeypatch.setattr(
+        speakers,
+        "write_voice_store",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("store edge")),
+    )
+
+    with pytest.raises(OSError, match="store edge"):
+        speakers.enroll_speaker_voices(
+            media,
+            voices=store_path,
+            show="Example Show",
+        )
+
+    assert mapping_path.read_bytes() == before
+    assert not store_path.exists()
+
+
+def test_purge_io_failure_is_nonzero(tmp_path):
+    media = tmp_path / "missing.mkv"
+    sidecar_path = tmp_path / "missing.voiceprints.json"
+    sidecar_path.mkdir()
+
+    with pytest.raises(OSError):
+        speakers.purge_voiceprints(media)
 
 
 def test_enrollment_creates_store_from_human_mapping(tmp_path):
@@ -251,6 +426,42 @@ def test_enrollment_creates_store_from_human_mapping(tmp_path):
     assert identity["display_name"] == "Aqua"
     assert exemplar["capture_id"] == CAPTURE
     assert mapping_path.read_bytes() == before_mapping
+
+
+def test_enrollment_decodes_each_in_lock_evidence_observation_once(
+    tmp_path, monkeypatch
+):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    sibling_path = tmp_path / "episode.json"
+    sidecar_path = tmp_path / "episode.voiceprints.json"
+    mapping_path = tmp_path / "episode.speakers.json"
+    mapping_path.write_text(
+        json.dumps({"version": 1, "speakers": {"SPEAKER_00": "Aqua"}}),
+        encoding="utf-8",
+    )
+    observed = {path: 0 for path in (sibling_path, sidecar_path, mapping_path)}
+    original_read_bytes = Path.read_bytes
+
+    def counted_read_bytes(path):
+        if path in observed:
+            observed[path] += 1
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+
+    speakers.enroll_speaker_voices(
+        media,
+        voices=tmp_path / "voices.json",
+        show="Example Show",
+    )
+
+    # One staging observation and one authoritative observation under both
+    # locks. Parsing must use those bytes rather than opening the paths again.
+    assert observed == {
+        sibling_path: 2,
+        sidecar_path: 2,
+        mapping_path: 2,
+    }
 
 
 def test_enrollment_uses_longest_turn_for_one_identity(tmp_path):
@@ -351,6 +562,21 @@ def test_cli_voiceprints_env_requires_diarization_source(tmp_path, monkeypatch):
     assert "built-in default" in result.output
 
 
+def test_cli_voiceprints_config_error_names_both_config_sources(tmp_path):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    (tmp_path / "voxweave.conf").write_text(
+        "[defaults]\ndiarize = false\nvoiceprints = true\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(cli, [str(media)])
+
+    assert result.exit_code != 0
+    assert "config [defaults].voiceprints" in result.output
+    assert "config [defaults].diarize" in result.output
+
+
 def test_cli_voiceprints_precedence_reaches_process(tmp_path, monkeypatch):
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"media")
@@ -371,3 +597,24 @@ def test_cli_voiceprints_precedence_reaches_process(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert seen["diarize"] is True
     assert seen["voiceprints"] is False
+
+
+def test_cli_purge_accepts_missing_media_and_rejects_cross_mode_options(tmp_path):
+    media = tmp_path / "missing.mkv"
+    sidecar = tmp_path / "missing.voiceprints.json"
+    sidecar.write_text("sensitive", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        cli,
+        ["speakers", str(media), "--purge-voiceprints"],
+    )
+    assert result.exit_code == 0, result.output
+    assert str(sidecar) in result.output
+    assert not sidecar.exists()
+
+    invalid = CliRunner().invoke(
+        cli,
+        ["speakers", str(media), "--purge-voiceprints", "--no-match"],
+    )
+    assert invalid.exit_code == 2
+    assert "mutually exclusive" in invalid.output

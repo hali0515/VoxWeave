@@ -178,9 +178,19 @@ def _load_generation_store(
 
 
 def _load_voiceprints_exact(path: Path) -> tuple[bytes, dict[str, object]]:
-    raw, sidecar = _read_exact_object(path, VOICEPRINTS_MAX_BYTES)
-    validate_voiceprints_mapping(sidecar)
+    raw = Path(path).read_bytes()
+    sidecar = _voiceprints_from_bytes(raw, source=Path(path).name)
     return raw, sidecar
+
+
+def _voiceprints_from_bytes(raw: bytes, *, source: str) -> dict[str, object]:
+    sidecar = strict_json_object_loads(
+        raw,
+        max_bytes=VOICEPRINTS_MAX_BYTES,
+        source=source,
+    )
+    validate_voiceprints_mapping(sidecar)
+    return sidecar
 
 
 def _matching_record(
@@ -417,24 +427,27 @@ def select_snippets(
     return selected
 
 
-def _mapping_entries(path: Path) -> dict[str, Any]:
-    """Read and validate the entries object from a version-1 mapping."""
-    path = Path(path)
+def _mapping_entries_bytes(raw_bytes: bytes, *, source: str) -> dict[str, Any]:
+    """Decode version-1 mapping entries from one exact byte observation."""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"invalid speaker mapping JSON in {path.name}: {exc}"
-        ) from exc
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid speaker mapping JSON in {source}: {exc}") from exc
     version = raw.get("version") if isinstance(raw, dict) else None
     if type(version) is not int or version != MAPPING_VERSION:
         raise RuntimeError(
-            f"{path.name} must use speaker mapping version {MAPPING_VERSION}"
+            f"{source} must use speaker mapping version {MAPPING_VERSION}"
         )
     speakers = raw.get("speakers")
     if not isinstance(speakers, dict):
-        raise RuntimeError(f"{path.name} must contain a speakers object")
+        raise RuntimeError(f"{source} must contain a speakers object")
     return speakers
+
+
+def _mapping_entries(path: Path) -> dict[str, Any]:
+    """Read and validate the entries object from a version-1 mapping."""
+    path = Path(path)
+    return _mapping_entries_bytes(path.read_bytes(), source=path.name)
 
 
 def load_speaker_display_names(path: Path) -> list[str]:
@@ -1224,16 +1237,24 @@ def enroll_speaker_voices(
     try:
         with episode_lock(media):
             with exclusive_store_lock(store_path) as lock_handle:
-                if json_path.read_bytes() != sibling_bytes:
+                current_sibling_bytes = json_path.read_bytes()
+                if current_sibling_bytes != sibling_bytes:
                     raise RuntimeError("input changed during enrollment; re-run")
-                if sidecar_path.read_bytes() != sidecar_bytes:
+                current_sidecar_bytes = sidecar_path.read_bytes()
+                if current_sidecar_bytes != sidecar_bytes:
                     raise RuntimeError("input changed during enrollment; re-run")
-                if mapping_path.read_bytes() != mapping_bytes:
+                current_mapping_bytes = mapping_path.read_bytes()
+                if current_mapping_bytes != mapping_bytes:
                     raise RuntimeError("input changed during enrollment; re-run")
 
-                _current_sibling_bytes, current_sibling = _read_sibling_exact(json_path)
-                _current_sidecar_bytes, current_sidecar = _load_voiceprints_exact(
-                    sidecar_path
+                current_sibling = strict_json_object_loads(
+                    current_sibling_bytes,
+                    max_bytes=max(1, len(current_sibling_bytes)),
+                    source=json_path.name,
+                )
+                current_sidecar = _voiceprints_from_bytes(
+                    current_sidecar_bytes,
+                    source=sidecar_path.name,
                 )
                 validated_sidecar = validate_voiceprint_conjunction(
                     current_sidecar,
@@ -1273,7 +1294,10 @@ def enroll_speaker_voices(
                         "voice compatibility differs or is unresolved; enrollment refused"
                     )
 
-                mapping = _mapping_entries(mapping_path)
+                mapping = _mapping_entries_bytes(
+                    current_mapping_bytes,
+                    source=mapping_path.name,
+                )
                 named = {
                     str(local_id): raw_name
                     for local_id, raw_name in mapping.items()

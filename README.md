@@ -231,6 +231,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export).                                                                                                                                                                                              |
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
 | `--diarize`                    | pyannote speaker diarization: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). Needs `voxweave[diarize]` + an HF token for the gated checkpoint (`VOXWEAVE_HF_TOKEN` / `HF_TOKEN` / conf `hf_token`, or just `hf auth login` once). Speaker turns persist to the sibling JSON, so `voxweave split` replays the formatting without re-running the model. |
+| `--voiceprints/--no-voiceprints` | Opt in to a voice-biometric centroid sidecar for reviewed cross-episode speaker suggestions. Requires a fresh `--diarize` run and is off by default. Precedence: CLI, `VOXWEAVE_VOICEPRINTS`, `[defaults].voiceprints`, then off. |
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
 | `--vad-mask/--no-vad-mask`     | Suppress CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                    |
@@ -238,7 +239,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--semantic-model`             | Model id requested from that server, used only with `--semantic-split`; there is no size allow-list (default `Qwen/Qwen3.5-0.8B`). |
 | `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`.                                                                                                                                                                                                  |
 
-The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--timestamps`,
+The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--voiceprints`, `--timestamps`,
 `--shot-snap`, `--vad-mask`, `--semantic-split`) can have their defaults set persistently via the `[defaults]`
 section of `~/.config/voxweave.conf` — an explicit CLI flag always wins for that run.
 
@@ -258,6 +259,29 @@ voxweave speakers episode.mkv
 voxweave split episode.json
 ```
 
+Voice matching across episodes is a separate, opt-in layer. Capture centroids with
+`--diarize --voiceprints`, review the ordinary empty mapping, then enroll only those
+human-entered names into an explicitly selected show store:
+
+```bash
+voxweave episode.mkv --diarize --voiceprints
+voxweave speakers episode.mkv
+# review/edit episode.speakers.json first
+voxweave speakers episode.mkv --enroll \
+  --voices ./example-show.voices.json --show "Example Show"
+
+# Later episodes: suggestions stay in HTML + a regenerable sidecar.
+voxweave speakers episode-02.mkv --voices ./example-show.voices.json
+```
+
+A missing store is created only by `--enroll` with both explicit `--voices` and `--show`.
+For reuse-only discovery, name it `voxweave.voices.json` beside the media and pass an equal
+normalized `--show`; discovery without `--show` reports the store but stays in manual mode.
+The shipped matching policy is **suggest-only**: `VOXWEAVE_VOICES_ACCEPT` defaults to `off`,
+so stored names appear as review buttons and never become authoritative mapping values.
+Even when an operator configures a finite accept threshold, a machine prefill exists only in
+the HTML input; the on-disk v1 mapping is still created with empty names and must be reviewed.
+
 The versioned mapping is intentionally small:
 
 ```json
@@ -270,12 +294,17 @@ overwrite an existing mapping because it is user data. When burning a mapped SRT
 speaker identity is retained in the temporary ASS `Name` field while the visible dialogue
 remains prefix-free.
 
+`voxweave speakers episode.mkv --purge-voiceprints` removes that episode's voiceprint
+sidecar, suggestion record, and audition HTML while holding the episode transaction lock; it
+also works after the media has been removed. It deliberately keeps the human-edited mapping.
+
 ### Re-align after editing
 
 `voxweave align <vtt>` — takes the edited VTT text and **re-runs forced alignment against the
 original audio**, overwriting the timestamped VTT and updating the JSON. Does not re-run ASR
 or touch smart_split. Aligns on separated 16k vocals by default (prevents BGM interference);
-prefers a cached `cache/<stem>.16k.flac`, otherwise re-separates and caches.
+prefers a cached `cache/<stem>.vocals.32k.flac`, otherwise re-separates and caches. A document
+carrying a voiceprint pair accepts that cache only with its matching integrity companion.
 
 ```bash
 voxweave align episode.vtt                 # finds episode.<ext> in the same dir
@@ -523,6 +552,12 @@ to point at an explicit local file (which, if it exists, skips the HF download):
 
 **Tuning**
 
+- `VOXWEAVE_VOICEPRINTS` (`1/0`, `true/false`, `yes/no`, or `on/off`; opt-in capture,
+  overridden by the explicit CLI flag)
+- `VOXWEAVE_VOICES_ACCEPT` (default `off`; finite `[-1,1]` enables reviewed HTML prefills)
+- `VOXWEAVE_VOICES_SUGGEST` (default `0.45`; minimum similarity shown as a suggestion)
+- `VOXWEAVE_VOICES_MARGIN` (default `0.05`; minimum top-two margin for a prefill)
+
 - `VOXWEAVE_MAX_CHUNK_SEC` (default 120; shorter chunks reduce ASR repetition loops on long segments)
 - `VOXWEAVE_LOUDNORM` (default `loudnorm=I=-16:TP=-1.5:LRA=11`; the `-af` filter for `--normalize`)
 - `VOXWEAVE_MIN_CUE_SEC` (default 0.8; minimum cue display duration in `align`)
@@ -578,6 +613,7 @@ separate   = true                        # vocal separation before ASR/alignment
 skip_songs = true                        # PANNs music detection + skip before ASR (--skip-songs/--no-skip-songs)
 normalize  = false                       # loudnorm on the 16k input (--normalize/--no-normalize)
 diarize    = false                       # pyannote speaker diarization (--diarize/--no-diarize; needs voxweave[diarize] + HF token)
+voiceprints = false                      # opt-in biometric centroid capture; requires diarize
 timestamps = true                        # word-level timestamps in the VTT (--timestamps/--no-timestamps)
 shot_snap  = true                        # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
 vad_mask   = false                       # suppress CTC emissions outside speech (--vad-mask/--no-vad-mask)
@@ -621,6 +657,27 @@ Each input produces two sibling files:
   draft for hand-correction, which `align` re-times.
 - **`<stem>.speakers.json`** (optional) — versioned diarizer-id-to-name display mapping. Names
   render into VTT/SRT/ASS but never enter transcript text or `<stem>.json`.
+- **`<stem>.voiceprints.json`** (optional, sensitive) — episode-bound biometric centroids,
+  produced only by explicit capture. The sibling JSON carries only the non-biometric
+  `voiceprint_capture`/`voiceprint_media` binding strings.
+- **`<stem>.speakers.suggest.json`** and **`<stem>.speakers.html`** (optional, regenerable,
+  sensitive) — reproducible match suggestions and the offline audition page with embedded
+  audio. Machine names never enter the transcript or human mapping automatically.
+
+### Sensitive and derived speaker data
+
+Treat voiceprint sidecars, show-level voices stores, suggestion records, audition HTML,
+calibration reports, crash-temporary files, and media snapshots as sensitive or derived data.
+The audition page contains embedded audio; a snapshot contains private media bytes rather than
+biometrics. Snapshots live under `${VOXWEAVE_CACHE_ROOT:-~/.cache/voxweave}/snapshots`, are mode
+`0600` in an owner-only directory, and inactive crash residue older than one hour is cleaned on
+a later snapshot creation. Active snapshots are lock-protected from that janitor.
+
+The purge command removes only the three per-episode machine artifacts listed above. Remove a
+show voices store, calibration report, inactive snapshot residue, or crash-temporary file
+manually when it is no longer needed. Do not remove an active snapshot. Backups, filesystem
+snapshots, synced folders, and manual copies are outside VoxWeave's control and are not erased
+by purge; delete them separately according to their retention policy.
 
 Both VTT forms are accepted by `align`. The aligner strips punctuation as a hard constraint;
 ASR punctuation is re-injected by time so the final output has correct spacing and breaks

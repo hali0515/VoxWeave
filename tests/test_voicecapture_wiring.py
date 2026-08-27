@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from voxweave import backend, chunking, pipeline, songdet
+from voxweave import backend, chunking, diarize, pipeline, songdet
 from voxweave.mediasnapshot import SnapshotUnavailable
 from voxweave.voicebase import (
     load_voiceprints,
@@ -129,6 +129,73 @@ def test_process_routes_capture_shot_detection_through_snapshot(tmp_path, monkey
     assert seen["transcribe"] != media
 
 
+def test_capture_raw_decoder_reads_stable_snapshot_through_truncate_aba(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "episode.mkv"
+    original = b"A" * 64
+    media.write_bytes(original)
+    wav = tmp_path / "speech.wav"
+    wav.write_bytes(b"wav")
+    decoded_sources: list[Path] = []
+
+    def fake_decode(source, **_kwargs):
+        source = Path(source)
+        decoded_sources.append(source)
+        assert source != media
+        with media.open("r+b") as live:
+            live.truncate(0)
+            live.write(b"B" * len(original))
+            live.flush()
+            os.fsync(live.fileno())
+            live.seek(0)
+            live.truncate(0)
+            live.write(original)
+            live.flush()
+            os.fsync(live.fileno())
+        assert source.read_bytes() == original
+        return wav
+
+    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(
+        pipeline,
+        "vad_speech_segments",
+        lambda *_args, **_kwargs: [{"start": 0.0, "end": 1.0}],
+    )
+    monkeypatch.setattr(pipeline, "slice_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(backend, "chunk_pass_count", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(
+        backend,
+        "transcribe_chunks",
+        lambda *_args, **_kwargs: [("English", "hello", [dict(UNIT)])],
+    )
+    monkeypatch.setattr(backend, "release", lambda: None)
+    monkeypatch.setattr(chunking, "release_silero_vad", lambda: None)
+    monkeypatch.setattr(songdet, "release_model", lambda: None)
+    monkeypatch.setattr(
+        diarize,
+        "diarize_turns",
+        lambda *_args, **_kwargs: diarize.DiarizationResult(
+            turns=[TURN],
+            centroids={"SPEAKER_00": list(VECTOR)},
+            provenance=dict(PROVENANCE),
+        ),
+    )
+    monkeypatch.setattr(diarize, "release", lambda: None)
+
+    pipeline.process(
+        media,
+        separate=False,
+        diarize=True,
+        voiceprints=True,
+        shot_snap=False,
+    )
+
+    sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
+    assert sibling["voiceprint_media"] == media_fingerprint(media)
+    assert decoded_sources and not decoded_sources[0].exists()
+
+
 def test_live_media_mismatch_drops_pair_and_machine_artifacts(
     tmp_path, monkeypatch, caplog
 ):
@@ -180,6 +247,139 @@ def test_snapshot_unavailable_continues_without_capture(tmp_path, monkeypatch):
 
     sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
     assert "voiceprint_capture" not in sibling
+    assert not (tmp_path / "episode.voiceprints.json").exists()
+
+
+def test_no_diarize_rewrite_deletes_complete_machine_artifact_set(tmp_path):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    for suffix in (".voiceprints.json", ".speakers.suggest.json", ".speakers.html"):
+        pipeline.swap_ext(media, suffix).write_text("stale", encoding="utf-8")
+
+    pipeline.process(
+        media,
+        word_segments=("en", [dict(UNIT)]),
+        shot_snap=False,
+    )
+
+    sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
+    assert "voiceprint_capture" not in sibling
+    assert "voiceprint_media" not in sibling
+    for suffix in (".voiceprints.json", ".speakers.suggest.json", ".speakers.html"):
+        assert not pipeline.swap_ext(media, suffix).exists()
+
+
+@pytest.mark.parametrize("failed_suffix", [".json", ".vtt"])
+def test_process_primary_write_failure_exits_with_no_false_sidecar(
+    tmp_path, monkeypatch, failed_suffix
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    turns = [TURN]
+
+    def fake_transcribe(_source, **_kwargs):
+        return "en", [dict(UNIT)], [], [], turns, _capture(turns)
+
+    original_write = pipeline.fsio.atomic_write_text
+
+    def failing_write(path, content):
+        if Path(path).suffix == failed_suffix:
+            raise OSError(f"injected {failed_suffix} failure")
+        return original_write(path, content)
+
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    monkeypatch.setattr(pipeline.fsio, "atomic_write_text", failing_write)
+
+    with pytest.raises(OSError, match="injected"):
+        pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+
+    assert not (tmp_path / "episode.voiceprints.json").exists()
+    if failed_suffix == ".vtt":
+        sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
+        assert "voiceprint_capture" in sibling
+        assert not (tmp_path / "episode.vtt").exists()
+    else:
+        assert not (tmp_path / "episode.json").exists()
+
+
+def test_process_sidecar_write_failure_names_landed_primary_outputs(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    turns = [TURN]
+    for suffix in (".speakers.suggest.json", ".speakers.html"):
+        pipeline.swap_ext(media, suffix).write_text("stale", encoding="utf-8")
+
+    monkeypatch.setattr(
+        pipeline,
+        "transcribe",
+        lambda *_args, **_kwargs: (
+            "en",
+            [dict(UNIT)],
+            [],
+            [],
+            turns,
+            _capture(turns),
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "write_voiceprints",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="primary JSON/VTT outputs landed.*could not write.*voiceprints",
+    ):
+        pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+
+    assert (tmp_path / "episode.json").exists()
+    assert (tmp_path / "episode.vtt").exists()
+    assert not (tmp_path / "episode.voiceprints.json").exists()
+    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+    assert not (tmp_path / "episode.speakers.html").exists()
+
+
+def test_process_unlink_failure_names_landed_outputs_and_leftover(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    suggest = tmp_path / "episode.speakers.suggest.json"
+    suggest.write_text("stale", encoding="utf-8")
+    turns = [TURN]
+    original_unlink = Path.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if Path(path) == suggest:
+            raise OSError("permission denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        pipeline,
+        "transcribe",
+        lambda *_args, **_kwargs: (
+            "en",
+            [dict(UNIT)],
+            [],
+            [],
+            turns,
+            _capture(turns),
+        ),
+    )
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"primary JSON/VTT outputs landed.*could not delete .*suggest",
+    ):
+        pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+
+    assert (tmp_path / "episode.json").exists()
+    assert (tmp_path / "episode.vtt").exists()
+    assert suggest.exists()
     assert not (tmp_path / "episode.voiceprints.json").exists()
 
 
