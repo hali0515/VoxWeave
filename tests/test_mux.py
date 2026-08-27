@@ -626,6 +626,43 @@ def test_burn_ignores_corrupt_sidecar_and_keeps_sdh_prefix(
     )
 
 
+def test_burn_passes_mapping_recovered_srt_speakers_to_ass(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nAoi: Hello there\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\nAoi: -Stay\nRen: -Go\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ep.speakers.json").write_text(
+        '{"version":1,"speakers":{"S0":"Aoi","S1":"Ren"}}',
+        encoding="utf-8",
+    )
+    captured = {}
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: [
+            {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720}
+        ],
+    )
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "libx264")
+
+    def fake_ok(cmd, *, capture):
+        filter_arg = cmd[cmd.index("-vf") + 1]
+        ass_path = Path(filter_arg.removeprefix("ass=").split(",format=", 1)[0])
+        captured["ass"] = ass_path.read_text(encoding="utf-8")
+        Path(cmd[-1]).write_bytes(b"burned")
+
+    monkeypatch.setattr(mux, "_run_ffmpeg", fake_ok)
+
+    mux.burn(srt, output=tmp_path / "ep.burn.mkv", container="mkv")
+
+    assert "Default,Aoi,0,0,0,,Hello there" in captured["ass"]
+    assert "Default,Aoi / Ren,0,0,0,,-Stay\\N-Go" in captured["ass"]
+
+
 # --- output must never be the source media ----------------------------------
 
 

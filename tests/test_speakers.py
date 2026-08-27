@@ -62,14 +62,24 @@ def test_select_snippets_intersects_vad_and_subtracts_singing():
     assert selected == {"SPEAKER_00": [(3.0, 5.0), (6.0, 8.0)]}
 
 
-def test_select_snippets_keeps_one_six_second_run_as_one_long_clip():
+@pytest.mark.parametrize(
+    ("duration", "expected"),
+    [
+        (6.0, [(100.0, 102.5), (103.5, 106.0)]),
+        (12.0, [(100.0, 105.5), (106.5, 112.0)]),
+        (18.0, [(100.0, 106.0), (112.0, 118.0)]),
+    ],
+)
+def test_select_snippets_keeps_two_separated_windows_in_one_long_run(
+    duration, expected
+):
     selected = speakers.select_snippets(
-        [(100.0, 106.0, "SPEAKER_00")],
+        [(100.0, 100.0 + duration, "SPEAKER_00")],
         [(0.0, 700.0)],
         [],
     )
 
-    assert selected == {"SPEAKER_00": [(100.0, 106.0)]}
+    assert selected == {"SPEAKER_00": expected}
 
 
 def test_select_snippets_keeps_close_but_disjoint_clean_utterances():
@@ -86,7 +96,7 @@ def test_select_snippets_keeps_close_but_disjoint_clean_utterances():
     assert selected == {"SPEAKER_00": [(0.0, 2.5), (3.0, 5.5), (6.0, 8.5)]}
 
 
-def test_select_snippets_fill_can_reuse_one_clean_run_with_a_real_gap():
+def test_select_snippets_fill_can_manufacture_gap_within_one_clean_run():
     selected = speakers.select_snippets(
         [(0.0, 3.5, "SPEAKER_00"), (100.0, 120.0, "SPEAKER_00")],
         [(0.0, 200.0)],
@@ -158,7 +168,7 @@ def test_vtt_voice_tags_strip_and_render_idempotently():
     assert blocks[0]["text"] == "Hello there"
     assert blocks[0]["speaker"] == "Aoi"
     assert blocks[1]["text"] == "-Stay\n-Go"
-    assert blocks[1]["speakers"] == ["Aoi", "Ren"]
+    assert blocks[1]["speakers"] == [("Aoi", "-Stay"), ("Ren", "-Go")]
     spans = [(block["start"], block["end"]) for block in blocks]
     assert render_vtt(blocks, spans) == source
 
@@ -173,11 +183,24 @@ def test_whitespace_only_voice_annotations_strip_as_clean_text(wrapped):
     assert blocks == [{"text": "Text", "start": 1.0, "end": 2.0}]
 
 
+@pytest.mark.parametrize(
+    "line",
+    ["<v>Hello</v> <v Ren>Hi</v>", "<v Aoi>Hello</v> <v Ren>Hi</v>"],
+)
+def test_multiple_voice_spans_strip_balanced_without_line_attribution(line):
+    assert speakers.strip_voice_tags(line) == ("Hello Hi", None, None)
+    blocks = parse_vtt_blocks(f"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{line}\n")
+
+    assert blocks == [{"text": "Hello Hi", "start": 1.0, "end": 2.0}]
+    assert translate.build_payload(blocks) == [{"i": 0, "t": "Hello Hi"}]
+    assert "<v" not in render_srt([(1.0, 2.0, blocks[0]["text"])])
+
+
 def test_vtt_mixed_named_dash_line_round_trip():
     source = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<v Aoi>-Named</v>\n-Unnamed\n"
     blocks = parse_vtt_blocks(source)
     assert blocks[0]["text"] == "-Named\n-Unnamed"
-    assert blocks[0]["speakers"] == ["Aoi", None]
+    assert blocks[0]["speakers"] == [("Aoi", "-Named"), (None, "-Unnamed")]
     assert render_vtt(blocks, [(1.0, 2.0)]) == source
 
 
@@ -261,6 +284,27 @@ def test_name_sanitization_preserves_non_ascii_display_spaces():
     assert f"Default,{name},0,0,0,,Hello" in render_ass(rows, blocks=blocks)
 
 
+@pytest.mark.parametrize("name", ["\xa0Ren\xa0", "\u3000葵\u3000"])
+def test_edge_unicode_spaces_use_one_name_normalizer_for_srt_round_trip(tmp_path, name):
+    vtt = tmp_path / "episode.vtt"
+    safe = name.strip()
+    vtt.write_text(
+        render_vtt_rows([(1.0, 2.0, "Hello")], blocks=[{"speaker": name}]),
+        encoding="utf-8",
+    )
+    (tmp_path / "episode.speakers.json").write_text(
+        json.dumps({"version": 1, "speakers": {"SPEAKER_00": name}}),
+        encoding="utf-8",
+    )
+
+    export_subtitles(vtt, ("srt",))
+    block = load_subtitle_blocks(tmp_path / "episode.srt")[0]
+
+    assert f"{safe}: Hello" in (tmp_path / "episode.srt").read_text(encoding="utf-8")
+    assert block["text"] == "Hello"
+    assert block["speaker"] == safe
+
+
 def test_named_srt_round_trip_recovers_clean_text_and_dash_metadata(tmp_path):
     vtt = tmp_path / "episode.vtt"
     source = (
@@ -287,7 +331,7 @@ def test_named_srt_round_trip_recovers_clean_text_and_dash_metadata(tmp_path):
 
     assert blocks[0]["text"] == "Hello" and blocks[0]["speaker"] == "Aoi"
     assert blocks[1]["text"] == "-Stay\n-Go"
-    assert blocks[1]["speakers"] == ["Aoi", "Ren"]
+    assert blocks[1]["speakers"] == [("Aoi", "-Stay"), ("Ren", "-Go")]
     assert payload[1] == {"i": 1, "t": "-Stay -Go", "parts": ["Stay", "Go"]}
     assert "Aoi" not in json.dumps(payload) and "Ren" not in json.dumps(payload)
 
@@ -322,7 +366,7 @@ def test_correct_render_restores_voice_metadata_without_exposing_it_as_text():
     assert "<v Aoi>hello</v>" in render_corrected_vtt(blocks, ["hello"])
 
 
-def test_correct_keeps_all_names_when_a_fix_collapses_dual_speaker_lines(
+def test_correct_reapplies_only_unchanged_speaker_lines_by_content(
     tmp_path, monkeypatch
 ):
     vtt = tmp_path / "episode.vtt"
@@ -354,7 +398,67 @@ def test_correct_keeps_all_names_when_a_fix_collapses_dual_speaker_lines(
     pipeline.correct(vtt, apply=True)
 
     rendered = vtt.read_text(encoding="utf-8")
-    assert "<v Aoi>-Stay here</v>\n<v Ren>-Go now</v>" in rendered
+    assert "\n-Stay here\n<v Ren>-Go now</v>\n" in rendered
+    assert "<v Aoi>" not in rendered
+
+
+def test_per_line_speakers_follow_content_when_lines_move():
+    blocks = parse_vtt_blocks(
+        "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n"
+        "<v Aoi>Hello there</v>\n<v Ren>Hi</v>\n"
+    )
+
+    rendered = render_vtt_rows([(1.0, 4.0, "Hi\nHello there")], blocks=blocks)
+    srt = render_srt([(1.0, 4.0, "Hi\nHello there")], blocks=blocks)
+
+    assert "<v Ren>Hi</v>\n<v Aoi>Hello there</v>" in rendered
+    assert "Ren: Hi\nAoi: Hello there" in srt
+
+
+def test_per_line_speaker_mismatch_degrades_only_that_line():
+    blocks = parse_vtt_blocks(
+        "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n"
+        "<v Aoi>Hello thre</v>\n<v Ren>Hi</v>\n"
+    )
+
+    rendered = render_vtt_rows([(1.0, 4.0, "Hello there\nHi")], blocks=blocks)
+    srt = render_srt([(1.0, 4.0, "Hello there\nHi")], blocks=blocks)
+
+    assert "\nHello there\n<v Ren>Hi</v>\n" in rendered
+    assert "<v Aoi>" not in rendered
+    assert "\nHello there\nRen: Hi\n" in srt
+    assert "Aoi:" not in srt
+
+
+def test_cue_level_speaker_survives_line_count_change():
+    blocks = parse_vtt_blocks(
+        "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n<v Aoi>Hello there my friend</v>\n"
+    )
+
+    rendered = render_vtt_rows([(1.0, 4.0, "Hello there\nmy friend")], blocks=blocks)
+    srt = render_srt([(1.0, 4.0, "Hello there\nmy friend")], blocks=blocks)
+
+    assert "<v Aoi>Hello there\nmy friend</v>" in rendered
+    assert "Aoi: Hello there\nmy friend" in srt
+
+
+def test_translate_rewrap_never_attributes_speakers_by_line_index():
+    blocks = parse_vtt_blocks(
+        "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n"
+        "<v Aoi>Where on earth did you disappear to all afternoon</v>\n"
+        "<v Ren>Nowhere</v>\n"
+    )
+    translated = {0: "你到底整个下午跑到哪里去了我一直在找你 哪儿也没去"}
+
+    vtt = translate.render_translated_vtt(blocks, translated, to_iso="zh")
+    rows = translate.translated_rows(blocks, translated, to_iso="zh", voice_tags=False)
+    srt = render_srt(
+        [(float(start), float(end), text) for start, end, text in rows],
+        blocks=blocks,
+    )
+
+    assert "<v " not in vtt
+    assert "Aoi:" not in srt and "Ren:" not in srt
 
 
 def test_distinct_line_names_render_unnamed_after_unrecoverable_collapse():
@@ -372,13 +476,13 @@ def test_distinct_line_names_render_unnamed_after_unrecoverable_collapse():
     assert "\n你好 我的朋友 嗨\n" in rendered
     srt = render_srt(
         [(1.0, 4.0, "你好 我的朋友 嗨")],
-        blocks=[{"speakers": ["Aoi", "Ren"]}],
+        blocks=[{"speakers": [("Aoi", "Hello there my friend"), ("Ren", "Hi")]}],
     )
     assert "Aoi / Ren" not in srt
     assert "\n你好 我的朋友 嗨\n" in srt
     ass = render_ass(
         [(1.0, 4.0, "你好 我的朋友 嗨")],
-        blocks=[{"speakers": ["Aoi", "Ren"]}],
+        blocks=[{"speakers": [("Aoi", "Hello there my friend"), ("Ren", "Hi")]}],
     )
     assert "Default,Aoi / Ren,0,0,0,,你好 我的朋友 嗨" in ass
 
@@ -442,10 +546,12 @@ def test_correct_audit_records_reflowed_text_written_to_vtt(tmp_path, monkeypatc
     audit = json.loads(result["audit"].read_text(encoding="utf-8"))
 
     assert result["applied"][0]["fixed"] == expected
+    assert result["applied"][0]["orig"] == "-Stya here\n-Go now"
     assert audit["applied"][0]["fixed"] == expected
-    assert "<v Aoi>-Stay here</v>\n<v Ren>-Go now</v>" in result["out"].read_text(
-        encoding="utf-8"
-    )
+    assert audit["applied"][0]["orig"] == "-Stya here\n-Go now"
+    rendered = result["out"].read_text(encoding="utf-8")
+    assert "\n-Stay here\n<v Ren>-Go now</v>\n" in rendered
+    assert "<v Aoi>" not in rendered
 
 
 def test_clip_builder_leaves_audio_stream_selection_to_ffmpeg():

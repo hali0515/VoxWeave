@@ -321,6 +321,35 @@ def test_pipeline_translate_srt_mirrors_format(tmp_path, monkeypatch):
     assert "2\n00:00:03,000 --> 00:00:04,000\n世界" in txt
 
 
+def test_translated_srt_reuses_mapping_after_language_tag_is_stripped(
+    tmp_path, monkeypatch
+):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nAoi: -Stay\nRen: -Go\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ep.speakers.json").write_text(
+        '{"version":1,"speakers":{"S0":"Aoi","S1":"Ren"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline.translate_mod,
+        "translate_cues",
+        lambda payload, **_kwargs: {0: "你好", 1: "留下\n走吧"},
+    )
+
+    out = pipeline.translate(srt, to="zh")
+    blocks = pipeline._load_cues(out)
+
+    assert out.name == "ep.zh.srt"
+    assert not (tmp_path / "ep.zh.speakers.json").exists()
+    assert blocks[0]["text"] == "你好" and blocks[0]["speaker"] == "Aoi"
+    assert blocks[1]["text"] == "-留下\n-走吧"
+    assert blocks[1]["speakers"] == [("Aoi", "-留下"), ("Ren", "-走吧")]
+
+
 def test_pipeline_translate_sidecarless_sdh_prefixes_as_dialogue(tmp_path, monkeypatch):
     srt = tmp_path / "sdh.srt"
     srt.write_text(

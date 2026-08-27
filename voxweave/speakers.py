@@ -33,10 +33,15 @@ FFMPEG_TIMEOUT = float(os.environ.get("VOXWEAVE_FFMPEG_TIMEOUT", "3600"))
 
 Span = tuple[float, float]
 Turn = tuple[float, float, str]
+SpeakerLine = tuple[str | None, str]
 
 _VOICE_WRAP_RE = re.compile(
     r"\A<v(?:[ \t]+([^>]*?))?>(.*)</v>\Z", re.IGNORECASE | re.DOTALL
 )
+_VOICE_SPAN_RE = re.compile(
+    r"<v(?:[ \t]+([^>]*?))?>(.*?)</v>", re.IGNORECASE | re.DOTALL
+)
+_VOICE_TAG_RE = re.compile(r"(?:<v(?:[ \t]+[^>]*?)?>|</v>)", re.IGNORECASE)
 
 
 def _valid_spans(spans: Sequence[Span] | None) -> list[Span]:
@@ -111,16 +116,25 @@ def _window(span: Span, target: float | None = None) -> Span:
 def _pick_spread(regions: Sequence[Span], limit: int) -> list[Span]:
     """Pick long clean windows near the early, middle, and late extent.
 
-    Windows are always cut from whole clean spans, so a single 6-second
-    utterance stays one useful clip. The minimum gap applies only to multiple
-    cuts from the same continuous run; separately voiced runs remain eligible
-    even when their natural pause is shorter.
+    A single 6-18 second run yields two longest-possible windows with at least
+    one second between them. Otherwise the minimum gap applies only to cuts
+    from the same continuous run; separately voiced runs remain eligible even
+    when their natural pause is shorter.
     """
     clean = [
         span for span in _merge_spans(regions) if span[1] - span[0] >= MIN_SNIPPET_S
     ]
     if not clean or limit <= 0:
         return []
+    if len(clean) == 1 and limit >= 2:
+        start, end = clean[0]
+        run_length = end - start
+        if 6.0 <= run_length <= 18.0:
+            clip_length = min(MAX_SNIPPET_S, (run_length - MIN_SNIPPET_GAP_S) / 2.0)
+            return [
+                (start, start + clip_length),
+                (end - clip_length, end),
+            ]
     extent_start, extent_end = clean[0][0], clean[-1][1]
     bin_count = min(limit, MAX_SNIPPETS_PER_SPEAKER)
     bin_width = (extent_end - extent_start) / bin_count
@@ -292,11 +306,12 @@ _NAME_ASCII_WHITESPACE_RE = re.compile(r"[ \t]+")
 def sanitize_speaker_name(name: str) -> str:
     """Normalize record separators without changing display punctuation.
 
-    Only ASCII layout whitespace is collapsed; meaningful NBSP and ideographic
-    spaces remain as entered. ASS applies its comma escape separately.
+    Only ASCII layout runs are collapsed. Unicode whitespace is stripped at
+    name edges but remains meaningful inside a name. ASS applies its comma
+    escape separately.
     """
     normalized = name.translate(_NAME_TRANSLATION)
-    return _NAME_ASCII_WHITESPACE_RE.sub(" ", normalized).strip(" \t")
+    return _NAME_ASCII_WHITESPACE_RE.sub(" ", normalized).strip()
 
 
 def sanitize_ass_speaker_name(name: str) -> str:
@@ -309,12 +324,12 @@ def _normalized_name(value: object) -> str | None:
     if not isinstance(value, str):
         return None
     name = sanitize_speaker_name(value)
-    return name or None
+    return name if name.strip() else None
 
 
 def strip_srt_speaker_prefixes(
     text: str, known_names: Sequence[str]
-) -> tuple[str, str | None, list[str | None] | None]:
+) -> tuple[str, str | None, list[SpeakerLine] | None]:
     """Recover speaker metadata from SRT prefixes emitted by voxweave.
 
     A prefix is recognized only when its name appears in the sibling speaker
@@ -349,7 +364,7 @@ def strip_srt_speaker_prefixes(
     matched = sum(name is not None for name in line_names)
     is_dash = all(re.match(r"^-\s*\S", line) for line in plain_lines)
     if matched > 1 or line_names[0] is None or is_dash:
-        return plain, None, line_names
+        return plain, None, list(zip(line_names, plain_lines))
     return plain, line_names[0], None
 
 
@@ -362,25 +377,28 @@ def speaker_layout(
     text: str,
     *,
     speaker: str | None = None,
-    speakers: Sequence[str | None] | None = None,
+    speakers: Sequence[SpeakerLine] | None = None,
 ) -> tuple[str | None, list[str | None] | None]:
-    """Resolve safe cue/line names for the current rendered text layout.
+    """Resolve safe cue/line names by exact source-line content.
 
-    Text-mutating stages can collapse or wrap lines after names were parsed. A
-    single remaining identity can safely become a cue label; several distinct
-    identities stay unnamed instead of producing an unmappable composite.
+    Per-line names never follow a positional index across wrapping or edits.
+    Every current line independently inherits a name only when its text matches
+    an unambiguous stored source line. An explicit cue-level name owns the whole
+    cue and therefore survives line-count changes.
     """
     cue_name = _normalized_name(speaker)
-    line_names = (
-        [_normalized_name(name) for name in speakers] if speakers is not None else None
-    )
-    if line_names is not None and len(line_names) == len(text.split("\n")):
+    ownership: dict[str, set[str | None]] = {}
+    for name, source_line in speakers or ():
+        if not isinstance(source_line, str):
+            continue
+        ownership.setdefault(source_line, set()).add(_normalized_name(name))
+    if ownership:
+        line_names: list[str | None] = []
+        for line in text.split("\n"):
+            candidates = ownership.get(line, set())
+            line_names.append(next(iter(candidates)) if len(candidates) == 1 else None)
         if any(line_names):
             return None, line_names
-    if line_names:
-        distinct = list(dict.fromkeys(name for name in line_names if name))
-        if len(distinct) == 1:
-            return distinct[0], None
     return (cue_name or None), None
 
 
@@ -388,18 +406,18 @@ def voice_tag_text(
     text: str,
     *,
     speaker: str | None = None,
-    speakers: Sequence[str | None] | None = None,
+    speakers: Sequence[SpeakerLine] | None = None,
 ) -> str:
     """Apply one cue-level or several line-level WebVTT voice tags."""
-    speaker, speakers = speaker_layout(text, speaker=speaker, speakers=speakers)
+    cue_name, line_names = speaker_layout(text, speaker=speaker, speakers=speakers)
     lines = text.split("\n")
-    if speakers is not None:
+    if line_names is not None:
         return "\n".join(
             f"<v {_voice_name(name)}>{line}</v>" if name else line
-            for line, name in zip(lines, speakers)
+            for line, name in zip(lines, line_names)
         )
-    if speaker:
-        return f"<v {_voice_name(speaker)}>{text}</v>"
+    if cue_name:
+        return f"<v {_voice_name(cue_name)}>{text}</v>"
     return text
 
 
@@ -423,26 +441,28 @@ def voice_text_for_ids(
     resolved = [names.get(speaker_id) for speaker_id in speaker_ids]
     if len(resolved) == 1:
         return voice_tag_text(text, speaker=resolved[0])
-    return voice_tag_text(text, speakers=resolved)
+    return voice_tag_text(text, speakers=list(zip(resolved, text.split("\n"))))
 
 
-def strip_voice_tags(text: str) -> tuple[str, str | None, list[str | None] | None]:
+def strip_voice_tags(text: str) -> tuple[str, str | None, list[SpeakerLine] | None]:
     """Strip full-cue or per-line VTT voice tags into display metadata.
 
-    Returns ``(plain_text, speaker, speakers)``.  ``speaker`` is used for one
-    wrapper around the whole cue; ``speakers`` preserves line positions for a
-    dash cue where named and unnamed speakers may be mixed.
+    Returns ``(plain_text, speaker, speakers)``. ``speaker`` is used for one
+    wrapper around the whole cue; ``speakers`` stores ``(name, line_text)``
+    pairs so later renders match attribution by content rather than position.
     """
+
+    def voice_name(raw: str | None) -> str | None:
+        return _normalized_name(html.unescape(raw or ""))
 
     def unwrap(value: str) -> tuple[str, str | None] | None:
         match = _VOICE_WRAP_RE.fullmatch(value)
         if match is None:
             return None
-        name = html.unescape((match.group(1) or "").strip())
-        return match.group(2), name if name.strip() else None
+        return match.group(2), voice_name(match.group(1))
 
     whole = unwrap(text)
-    if whole is not None and not re.search(r"</?v(?:\s|>)", whole[0], re.IGNORECASE):
+    if whole is not None and _VOICE_TAG_RE.search(whole[0]) is None:
         plain, name = whole
         return plain, name, None
 
@@ -450,31 +470,48 @@ def strip_voice_tags(text: str) -> tuple[str, str | None, list[str | None] | Non
     names: list[str | None] = []
     tagged = False
     for line in text.split("\n"):
-        parsed = unwrap(line)
-        if parsed is None:
+        spans = list(_VOICE_SPAN_RE.finditer(line))
+        if not spans:
             plain_lines.append(line)
             names.append(None)
-        else:
-            plain, name = parsed
-            plain_lines.append(plain)
-            names.append(name)
-            tagged = True
+            continue
+        plain = _VOICE_SPAN_RE.sub(lambda match: match.group(2), line)
+        if _VOICE_TAG_RE.search(plain) is not None:
+            plain_lines.append(line)
+            names.append(None)
+            continue
+        name = (
+            voice_name(spans[0].group(1))
+            if len(spans) == 1 and spans[0].span() == (0, len(line))
+            else None
+        )
+        plain_lines.append(plain)
+        names.append(name)
+        tagged = True
     if tagged:
-        return "\n".join(plain_lines), None, names
+        clean = "\n".join(plain_lines)
+        pairs = list(zip(names, plain_lines))
+        return clean, None, pairs if any(name for name, _line in pairs) else None
     return text, None, None
 
 
 def speaker_metadata(
     block: Mapping[str, Any],
-) -> tuple[str | None, list[str | None] | None]:
-    """Return normalized cue-level and line-level name metadata."""
+) -> tuple[str | None, list[SpeakerLine] | None]:
+    """Return normalized cue-level and content-bound line metadata."""
     speaker = block.get("speaker")
-    line_names = block.get("speakers")
+    raw_lines = block.get("speakers")
+    lines: list[SpeakerLine] = []
+    if isinstance(raw_lines, list):
+        for entry in raw_lines:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                continue
+            name, line_text = entry
+            if isinstance(line_text, str):
+                lines.append((_normalized_name(name), line_text))
     return (
         _normalized_name(speaker),
-        [_normalized_name(name) for name in line_names]
-        if isinstance(line_names, list)
-        else None,
+        lines or None,
     )
 
 

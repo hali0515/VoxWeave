@@ -266,7 +266,9 @@ The versioned mapping is intentionally small:
 
 `split` renders mapped names as WebVTT voice tags while keeping transcript text and the
 sibling JSON clean. Empty or missing names remain unlabeled. The audition command refuses to
-overwrite an existing mapping because it is user data.
+overwrite an existing mapping because it is user data. When burning a mapped SRT, recovered
+speaker identity is retained in the temporary ASS `Name` field while the visible dialogue
+remains prefix-free.
 
 ### Re-align after editing
 

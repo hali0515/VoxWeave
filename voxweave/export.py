@@ -182,7 +182,9 @@ def render_ass(
             elif speakers:
                 # ASS has one Name field per Dialogue event.  Preserve the dual
                 # cue as one on-screen event and retain both actor names here.
-                name = " / ".join(dict.fromkeys(n for n in speakers if n))
+                name = " / ".join(
+                    dict.fromkeys(name for name, _line in speakers if name)
+                )
         name = sanitize_ass_speaker_name(name)
         events.append(
             f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(end)},Default,{name},0,0,0,,{body}"

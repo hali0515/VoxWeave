@@ -206,6 +206,33 @@ def _layout_dash_cue(block: dict, trans_text: str | None) -> str:
     return "\n".join(out)
 
 
+def _speaker_block_for_rendered(block: dict, rendered: str) -> dict:
+    """Bind structured dash translations to their source content identities.
+
+    Dash halves are separate keyed translation units, so their source-to-output
+    relationship is explicit. Generic wrapping and edits do not use this path;
+    their stored speaker lines remain bound to their original text.
+    """
+    raw_lines = block.get("speakers")
+    if not isinstance(raw_lines, list) or not is_dash_cue(block["text"]):
+        return block
+    source_lines = block["text"].split("\n")
+    rendered_lines = rendered.split("\n")
+    if len(source_lines) != 2 or len(rendered_lines) != 2:
+        return block
+    translated_by_source = dict(zip(source_lines, rendered_lines))
+    rebound = []
+    for entry in raw_lines:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            continue
+        name, source_line = entry
+        if isinstance(source_line, str) and source_line in translated_by_source:
+            rebound.append((name, translated_by_source[source_line]))
+    if not rebound:
+        return block
+    return {**block, "speakers": rebound}
+
+
 def translated_rows(
     blocks: list[dict],
     trans: dict[int, str],
@@ -231,7 +258,9 @@ def translated_rows(
             )
             rendered = f"♪ {t} ♪" if b.get("lyric") else t
         if voice_tags:
-            return voice_text_for_block(rendered, b)
+            return voice_text_for_block(
+                rendered, _speaker_block_for_rendered(b, rendered)
+            )
         return rendered
 
     return [(b.get("start"), b.get("end"), _text(i, b)) for i, b in enumerate(blocks)]

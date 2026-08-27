@@ -2318,9 +2318,16 @@ def split(
     speaker_names: dict[str, str] = {}
     mapping_path = swap_ext(json_path, ".speakers.json")
     if mapping_path.exists():
-        speaker_names = load_speaker_mapping(
-            mapping_path, {label for _start, _end, label in speaker_turns or ()}
-        )
+        try:
+            speaker_names = load_speaker_mapping(
+                mapping_path, {label for _start, _end, label in speaker_turns or ()}
+            )
+        except (OSError, RuntimeError, UnicodeError) as exc:
+            log.warning(
+                "%s: ignoring unreadable speaker mapping: %s",
+                mapping_path.name,
+                exc,
+            )
     semantic_engine = _make_semantic_engine(semantic_split)
     try:
         segmented = segment_document(
@@ -2762,9 +2769,9 @@ def translate(
             if s is not None and e is not None
         ]
         timed_blocks = [
-            block
-            for block in blocks
-            if block.get("start") is not None and block.get("end") is not None
+            translate_mod._speaker_block_for_rendered(block, text)
+            for block, (start, end, text) in zip(blocks, rows)
+            if start is not None and end is not None
         ]
         content = (
             render_srt(timed, blocks=timed_blocks)
