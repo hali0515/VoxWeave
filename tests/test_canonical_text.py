@@ -292,6 +292,24 @@ def test_band_scan_bound_is_a_monotone_true_lower_bound_only():
     )
 
 
+def test_band_scan_bound_discounts_a_removable_line_break_separator():
+    """A normalized separator may be discarded at either of two CJK lines."""
+    module = canon()
+    prof = ja_profile(max_lines=2)
+    source = "甲" * 18 + "。" + "乙" * 18
+
+    final = module.canonical_text(
+        wd(*source), fallback_text="", lang="ja", profile=prof
+    )
+    assert final.cell_widths == (36, 36)
+    assert module.canonical_legal(final, prof) is True
+    assert module.band_scan_lower_bound_exceeded(source, prof) is False
+
+    # Once the removable separator is excluded, one further half-width cell is
+    # genuinely above the two-line capacity.
+    assert module.band_scan_lower_bound_exceeded(source + "a", prof) is True
+
+
 # ------------------------------------------------------------- work counter
 
 

@@ -196,15 +196,17 @@ def canonical_legal(final: FinalText, profile: DisplayProfile) -> bool:
 def band_scan_lower_bound_exceeded(joined: str, profile: DisplayProfile) -> bool:
     """The ONLY early break a band scan may take: a monotone TRUE lower bound.
 
-    Total stripped visual cells above ``max_lines x budget`` proves no layout
-    can fit, whatever the packer would do. The packer's own cell arithmetic is
-    NOT a necessary condition (an ASCII run bridging a CJK line measures 41
-    cells yet lays out legally as ``(20, 20)``), so it is never consulted for
-    admission.
+    Wrapping may discard one normalized separator at each line break, so those
+    cells cannot prove illegality. After conservatively excluding up to
+    ``max_lines - 1`` such separators, visual cells above ``max_lines x budget``
+    prove no layout can fit. The packer's own cell arithmetic is NOT a necessary
+    condition (an ASCII run bridging a CJK line measures 41 cells yet lays out
+    legally as ``(20, 20)``), so it is never consulted for admission.
     """
-    return _vis_width(strip_punct_for_subtitles(joined)) > profile.max_lines * (
-        line_budget(profile)
-    )
+    stripped = strip_punct_for_subtitles(joined)
+    removable_separators = min(stripped.count(" "), max(profile.max_lines - 1, 0))
+    lower_bound = _vis_width(stripped) - removable_separators
+    return lower_bound > profile.max_lines * line_budget(profile)
 
 
 def over_wide_token(line: str, lang: str, budget: int) -> str | None:

@@ -541,6 +541,47 @@ def test_real_lattice_admission_matches_canonical_kinsoku_gap_pullback() -> None
     assert lattice.canonical_chars > 0
 
 
+def test_real_lattice_admission_keeps_capacity_plus_one_removable_separator() -> None:
+    """N14 both directions: the band bound cannot count a discarded separator."""
+    source = "甲" * 18 + "。" + "乙" * 18
+    prof = profile("ja", max_line_length=18, max_lines=2, max_cue_s=0.0)
+    lattice = build_document_lattice(
+        document(timed(list(source), dur=0.05), prof=prof, text=source)
+    ).lattices[0]
+    assert len(lattice.atoms) == 36
+    assert len(lattice.nodes) == 3
+
+    actual = {(edge.start_node, edge.end_node) for edge in lattice.edges}
+    expected: set[tuple[int, int]] = set()
+    finals = {}
+    for position, start in enumerate(lattice.nodes):
+        for end in lattice.nodes[position + 1 :]:
+            chunk = lattice.atoms[start:end]
+            raw = _join([atom.text for atom in chunk], "ja")
+            final = canonical_text(
+                [
+                    {"text": atom.text, "start": atom.start, "end": atom.end}
+                    for atom in chunk
+                ],
+                fallback_text=raw,
+                lang="ja",
+                profile=prof,
+                expected_footprint=raw,
+            )
+            finals[(start, end)] = final
+            if canonical_legal(final, prof):
+                expected.add((start, end))
+
+    assert actual == expected
+    full_span = (0, len(lattice.atoms))
+    final = finals[full_span]
+    assert canonical_legal(final, prof) is True
+    assert final.cell_widths == (36, 36)
+    assert full_span in actual
+    assert lattice.packer_steps == 0
+    assert lattice.canonical_chars > 0
+
+
 def test_packer_counts_its_own_steps_and_reset_keeps_the_counter():
     packer = IncrementalPacker("en", 42, 2)
     for text in ["a", "b", "c"]:
