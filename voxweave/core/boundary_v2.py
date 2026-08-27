@@ -66,6 +66,7 @@ from .boundary_lattice import (
     ProfileViolation,
     build_barriers,
     build_document_lattice,
+    _cache_candidate_evidence,
     _canonical_pack_measure,
     held_chain_continuous,
     preflight_profile,
@@ -84,13 +85,19 @@ from .partition_check import (
 from .policy_delta import delta_registry_data
 from .schema import Cue, Unit
 from .segdoc import DisplayProfile, SegDocument, SourceUnit
-from .subunit import RefineResult, empty_refine_result, speech_span_units
+from .subunit import (
+    RefineResult,
+    empty_refine_result,
+    require_issued_refinement,
+    speech_span_units,
+)
 from .speaker_evidence import (
     W_SPEAKER_INTERIOR,
     EvidenceSpan,
     SpeakerPricingSummary,
     UnitSpeakers,
     evidence_span_from_cue,
+    lyric_for_evidence,
     make_evidence_span,
     named_multi_cues_unannotated,
     speaker_edge_cost,
@@ -164,6 +171,10 @@ class CostTables:
     edges: Mapping[tuple[int, int], CostBreakdown]
     cuts: Mapping[int, CostBreakdown]
     speaker_pricing: SpeakerPricingSummary | None = None
+    base_edges: Mapping[tuple[int, int], CostBreakdown] | None = None
+    speaker_context: CostContext | None = None
+    fallback_start: float = 0.0
+    predecessor_stateful: bool = False
 
 
 def build_cost_context(
@@ -263,7 +274,91 @@ def _document_nodes(lattice: IntervalLattice, layer: AtomLayer) -> tuple[int, ..
     return tuple(out)
 
 
-def build_cost_tables(lattice: IntervalLattice, ctx: CostContext) -> CostTables:
+def _resolve_edge_for_previous(
+    lattice: IntervalLattice,
+    edge: Edge,
+    ctx: CostContext,
+    *,
+    previous_end: float,
+) -> Edge:
+    """Resolve/cache an edge against one actual predecessor-state value."""
+    input_start = (
+        float(edge.span_start)
+        if edge.span_start is not None and math.isfinite(edge.span_start)
+        else float(previous_end)
+    )
+    input_end = (
+        float(edge.span_end)
+        if edge.span_end is not None and math.isfinite(edge.span_end)
+        else input_start
+    )
+    if (
+        isinstance(edge.evidence_span, EvidenceSpan)
+        and edge.input_start == input_start
+        and edge.input_end == input_end
+    ):
+        return edge
+
+    unit_range = (
+        lattice.unit_bound(edge.start_node),
+        lattice.unit_bound(edge.end_node),
+    )
+    evidence_span = make_evidence_span(
+        ctx.units,
+        unit_range,
+        input_start=input_start,
+        input_end=input_end,
+    )
+    return replace(
+        edge,
+        evidence_span=evidence_span,
+        lyric=lyric_for_evidence(evidence_span, ctx.sing_spans),
+        input_start=input_start,
+        input_end=input_end,
+        evidence_deferred=False,
+    )
+
+
+def _speaker_price(
+    lattice: IntervalLattice,
+    edge: Edge,
+    ctx: CostContext,
+    base: CostBreakdown,
+    *,
+    previous_end: float,
+) -> tuple[Edge, CostBreakdown]:
+    """Resolve one predecessor-dependent edge and compose its speaker term."""
+    if not isinstance(ctx.speaker_evidence, UnitSpeakers):
+        return edge, base
+    resolved = _resolve_edge_for_previous(
+        lattice,
+        edge,
+        ctx,
+        previous_end=previous_end,
+    )
+    if not isinstance(resolved.evidence_span, EvidenceSpan):
+        raise ValueError("resolved speaker edge has no EvidenceSpan")
+    unit_range = (
+        lattice.unit_bound(edge.start_node),
+        lattice.unit_bound(edge.end_node),
+    )
+    speaker = speaker_edge_cost(
+        ctx.speaker_evidence,
+        unit_range,
+        evidence_span=resolved.evidence_span,
+        sing_spans=ctx.sing_spans,
+        weight=ctx.speaker_weight,
+        suppressed_lyric=resolved.lyric,
+    )
+    return resolved, _with_speaker_cost(base, speaker)
+
+
+def build_cost_tables(
+    lattice: IntervalLattice,
+    ctx: CostContext,
+    *,
+    fallback_start: float = 0.0,
+) -> CostTables:
     """Price every legal edge and every candidate cut of one interval.
 
     The DP, an independent path scorer and the v1 reference all read from here,
@@ -276,7 +371,9 @@ def build_cost_tables(lattice: IntervalLattice, ctx: CostContext) -> CostTables:
     sentence_nodes = ctx.sentence_nodes
 
     edges: dict[tuple[int, int], CostBreakdown] = {}
+    base_edges: dict[tuple[int, int], CostBreakdown] = {}
     speaker_parts: list[CostBreakdown] = []
+    predecessor_stateful = False
     for edge in lattice.edges:
         left = document_nodes[edge.start_node]
         right = document_nodes[edge.end_node]
@@ -290,6 +387,8 @@ def build_cost_tables(lattice: IntervalLattice, ctx: CostContext) -> CostTables:
                 1 for node in sentence_nodes if left < node < right
             ),
         )
+        key = (edge.start_node, edge.end_node)
+        base_edges[key] = base
         if isinstance(ctx.speaker_evidence, UnitSpeakers):
             unit_range = (
                 lattice.unit_bound(edge.start_node),
@@ -297,21 +396,35 @@ def build_cost_tables(lattice: IntervalLattice, ctx: CostContext) -> CostTables:
             )
             evidence_span = edge.evidence_span
             if not isinstance(evidence_span, EvidenceSpan):
-                raise ValueError(
-                    "speaker pricing requires cached candidate EvidenceSpan values"
+                if not edge.evidence_deferred:
+                    raise ValueError(
+                        "speaker pricing requires cached candidate EvidenceSpan values"
+                    )
+                predecessor_stateful = True
+                representative = _resolve_edge_for_previous(
+                    lattice,
+                    edge,
+                    ctx,
+                    previous_end=fallback_start,
                 )
+                evidence_span = representative.evidence_span
+                if not isinstance(evidence_span, EvidenceSpan):
+                    raise ValueError("deferred candidate did not resolve EvidenceSpan")
+                lyric = representative.lyric
+            else:
+                lyric = edge.lyric
             speaker = speaker_edge_cost(
                 ctx.speaker_evidence,
                 unit_range,
                 evidence_span=evidence_span,
                 sing_spans=ctx.sing_spans,
                 weight=ctx.speaker_weight,
-                suppressed_lyric=edge.lyric,
+                suppressed_lyric=lyric,
             )
             speaker_parts.append(speaker)
-            edges[(edge.start_node, edge.end_node)] = _with_speaker_cost(base, speaker)
+            edges[key] = _with_speaker_cost(base, speaker)
         else:
-            edges[(edge.start_node, edge.end_node)] = base
+            edges[key] = base
 
     cuts: dict[int, CostBreakdown] = {}
     for node in lattice.nodes:
@@ -334,6 +447,12 @@ def build_cost_tables(lattice: IntervalLattice, ctx: CostContext) -> CostTables:
             if isinstance(ctx.speaker_evidence, UnitSpeakers)
             else None
         ),
+        base_edges=base_edges,
+        speaker_context=(
+            ctx if isinstance(ctx.speaker_evidence, UnitSpeakers) else None
+        ),
+        fallback_start=float(fallback_start),
+        predecessor_stateful=predecessor_stateful,
     )
 
 
@@ -390,13 +509,30 @@ def _assemble_path(
 ) -> PathResult:
     count = len(lattice.atoms)
     nodes = (0, *cuts, count)
+    edge_index = {(edge.start_node, edge.end_node): edge for edge in lattice.edges}
     total = 0.0
+    previous_end = tables.fallback_start
     edge_parts: list[CostBreakdown] = []
     cut_parts: list[CostBreakdown] = []
     for left, right in zip(nodes, nodes[1:]):
-        edge = tables.edges.get((left, right))
-        if edge is None:
+        key = (left, right)
+        edge = tables.edges.get(key)
+        candidate = edge_index.get(key)
+        if edge is None or candidate is None:
             raise ValueError(f"edge({left}, {right}): no legal cue spans these atoms")
+        if tables.speaker_context is not None and tables.predecessor_stateful:
+            if tables.base_edges is None:
+                raise ValueError("speaker cost table has no base-edge authority")
+            candidate, edge = _speaker_price(
+                lattice,
+                candidate,
+                tables.speaker_context,
+                tables.base_edges[key],
+                previous_end=previous_end,
+            )
+            if candidate.input_end is None:
+                raise ValueError("resolved speaker edge has no input end")
+            previous_end = float(candidate.input_end)
         edge_parts.append(edge)
         total = quantize(total + edge.total)
         if right != count:
@@ -458,6 +594,9 @@ def solve_interval(lattice: IntervalLattice, tables: CostTables) -> DPResult:
     induction, so the runner-up is genuinely path-distinct rather than merely
     differently priced.
     """
+    if tables.predecessor_stateful:
+        return _solve_interval_with_predecessor_state(lattice, tables)
+
     count = len(lattice.atoms)
     ranked: dict[int, list[tuple[float, int, int]]] = {0: [(0.0, -1, -1)]}
     pending: dict[int, list[tuple[float, int, int]]] = {}
@@ -502,6 +641,97 @@ def solve_interval(lattice: IntervalLattice, tables: CostTables) -> DPResult:
 
     best = _assemble_path(lattice, tables, rebuild(0))
     runner_up = _assemble_path(lattice, tables, rebuild(1)) if len(final) > 1 else None
+    return DPResult(best=best, runner_up=runner_up, relaxations=relaxations)
+
+
+def _state_path_key(item: tuple[float, tuple[int, ...]]) -> tuple[Any, ...]:
+    """Whole-path order matching the ordinary DP's recursive local tie-break."""
+    total, cuts = item
+    return (total, *reversed(cuts))
+
+
+def _top_two_state_paths(
+    candidates: Sequence[tuple[float, tuple[int, ...]]],
+) -> list[tuple[float, tuple[int, ...]]]:
+    by_path: dict[tuple[int, ...], float] = {}
+    for total, cuts in candidates:
+        prior = by_path.get(cuts)
+        if prior is None or total < prior:
+            by_path[cuts] = total
+    ranked = [(total, cuts) for cuts, total in by_path.items()]
+    ranked.sort(key=_state_path_key)
+    return ranked[:2]
+
+
+def _solve_interval_with_predecessor_state(
+    lattice: IntervalLattice,
+    tables: CostTables,
+) -> DPResult:
+    """Exact two-best DP when an edge start inherits its selected predecessor.
+
+    The state is the preceding resolved edge end.  Keeping two paths per
+    ``(node, end)`` is sufficient: every continuation from that state has the
+    same future costs, so a third path can never become the global runner-up.
+    """
+    ctx = tables.speaker_context
+    bases = tables.base_edges
+    if ctx is None or bases is None:
+        raise ValueError("predecessor-state solve requires speaker cost authority")
+
+    count = len(lattice.atoms)
+    ranked: dict[int, dict[float, list[tuple[float, tuple[int, ...]]]]] = {
+        0: {tables.fallback_start: [(0.0, ())]}
+    }
+    pending: dict[int, dict[float, list[tuple[float, tuple[int, ...]]]]] = {}
+    relaxations = 0
+
+    for node in lattice.nodes:
+        if node != 0:
+            states = pending.get(node, {})
+            ranked[node] = {
+                previous_end: _top_two_state_paths(candidates)
+                for previous_end, candidates in states.items()
+            }
+        states = ranked.get(node, {})
+        if not states:
+            continue
+        for previous_end, entries in states.items():
+            for edge in lattice.edges_from.get(node, ()):
+                relaxations += 1
+                key = (edge.start_node, edge.end_node)
+                resolved, step = _speaker_price(
+                    lattice,
+                    edge,
+                    ctx,
+                    bases[key],
+                    previous_end=previous_end,
+                )
+                if resolved.input_end is None:
+                    raise ValueError("resolved speaker edge has no input end")
+                next_end = float(resolved.input_end)
+                interior = edge.end_node != count
+                cut = tables.cuts[edge.end_node].total if interior else 0.0
+                bucket = pending.setdefault(edge.end_node, {}).setdefault(next_end, [])
+                for total, cuts in entries:
+                    value = quantize(total + step.total)
+                    next_cuts = cuts
+                    if interior:
+                        value = quantize(value + cut)
+                        next_cuts = (*cuts, edge.end_node)
+                    bucket.append((value, next_cuts))
+
+    final_candidates = [
+        candidate
+        for candidates in ranked.get(count, {}).values()
+        for candidate in candidates
+    ]
+    final = _top_two_state_paths(final_candidates)
+    if not final:
+        raise ValueError(
+            f"interval {lattice.interval.index}: no legal path reaches node {count}"
+        )
+    best = _assemble_path(lattice, tables, final[0][1])
+    runner_up = _assemble_path(lattice, tables, final[1][1]) if len(final) > 1 else None
     return DPResult(best=best, runner_up=runner_up, relaxations=relaxations)
 
 
@@ -1043,6 +1273,45 @@ def _path_edges(lattice: IntervalLattice, cuts: Sequence[int]) -> tuple[Edge, ..
     return tuple(index[(left, right)] for left, right in zip(nodes, nodes[1:]))
 
 
+def _resolve_selected_path(
+    lattice: IntervalLattice,
+    tables: CostTables,
+    cuts: Sequence[int],
+) -> tuple[IntervalLattice, tuple[Edge, ...]]:
+    """Resolve the selected chain and install those exact facts before sealing."""
+    selected = _path_edges(lattice, cuts)
+    ctx = tables.speaker_context
+    if ctx is None:
+        return lattice, selected
+
+    previous_end = tables.fallback_start
+    resolved: list[Edge] = []
+    for edge in selected:
+        item = _resolve_edge_for_previous(
+            lattice,
+            edge,
+            ctx,
+            previous_end=previous_end,
+        )
+        if item.input_end is None:
+            raise ValueError("selected speaker edge has no resolved input end")
+        resolved.append(item)
+        previous_end = float(item.input_end)
+
+    replacements = {(edge.start_node, edge.end_node): edge for edge in resolved}
+    edges = tuple(
+        replacements.get((edge.start_node, edge.end_node), edge)
+        for edge in lattice.edges
+    )
+    edges_from: dict[int, tuple[Edge, ...]] = {}
+    for node in lattice.nodes:
+        outgoing = tuple(edge for edge in edges if edge.start_node == node)
+        if outgoing:
+            edges_from[node] = outgoing
+    sealed_lattice = replace(lattice, edges=edges, edges_from=edges_from)
+    return sealed_lattice, tuple(resolved)
+
+
 def optimize_interval(
     lattice: IntervalLattice,
     tables: CostTables,
@@ -1088,10 +1357,10 @@ def optimize_interval(
     dp = solve_interval(lattice, tables)
     selection = _select(lattice, tables, dp, v1)
     chosen = selection.policy_selected
-    edges = _path_edges(lattice, chosen.cuts)
+    selected_lattice, edges = _resolve_selected_path(lattice, tables, chosen.cuts)
     cues = materialize_cues(
         edges,
-        lattice.atoms,
+        selected_lattice.atoms,
         lang,
         fallback_start=fallback_start,
         units=units,
@@ -1105,7 +1374,7 @@ def optimize_interval(
     low, high = interval.unit_start, interval.unit_end
     return IntervalSolution(
         interval=interval,
-        lattice=lattice,
+        lattice=selected_lattice,
         selection=selection,
         adopted=None,
         cues=cues,
@@ -1549,6 +1818,7 @@ def optimize_document(
         split = empty_refine_result(document.units, language=document.language)
     else:
         split = subunit_split
+    require_issued_refinement(split)
     if tuple(document.units) != split.units or len(split.origin) != len(document.units):
         raise ValueError("subunit_split does not describe this document's unit stream")
 
@@ -1572,7 +1842,10 @@ def optimize_document(
         if speaker_enabled
         else None
     )
-    lattice = build_document_lattice(document, cache_speaker_evidence=speaker_enabled)
+    # The first fabricated bound of each interval depends on the preceding
+    # selected interval's delivered input end.  Build admission first, then
+    # resolve each interval only when that predecessor is known.
+    lattice = build_document_lattice(document, cache_speaker_evidence=False)
     ctx = build_cost_context(
         document,
         lattice,
@@ -1583,9 +1856,23 @@ def optimize_document(
     )
 
     solutions: list[IntervalSolution] = []
+    resolved_lattices: list[IntervalLattice] = []
     fallback_start = 0.0
-    for interval_lattice in lattice.lattices:
-        tables = build_cost_tables(interval_lattice, ctx)
+    for raw_interval_lattice in lattice.lattices:
+        interval_lattice = (
+            _cache_candidate_evidence(
+                raw_interval_lattice,
+                document,
+                fallback_start=fallback_start,
+            )
+            if speaker_enabled
+            else raw_interval_lattice
+        )
+        tables = build_cost_tables(
+            interval_lattice,
+            ctx,
+            fallback_start=fallback_start,
+        )
         solution = optimize_interval(
             interval_lattice,
             tables,
@@ -1595,8 +1882,11 @@ def optimize_document(
             fallback_start=fallback_start,
         )
         solutions.append(solution)
+        resolved_lattices.append(solution.lattice)
         if solution.cues:
             fallback_start = float(solution.cues[-1]["end"])
+
+    lattice = replace(lattice, lattices=tuple(resolved_lattices))
 
     v1_reference = (
         None

@@ -19,10 +19,11 @@ import math
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
+from .authority import digest_payload
 from .boundary_lattice import CAP_EPS_S, preflight_profile, preflight_units
 from .breakpoints import _load_jieba, _load_parser, phrase_atoms
 from .langsets import LANGUAGES_WITHOUT_SPACES
@@ -40,11 +41,13 @@ __all__ = [
     "EVIDENCE_KINDS",
     "EVIDENCE_RANKING",
     "RefineResult",
+    "RefinementAuthorityError",
     "RefinementConservationError",
     "assert_refinement_conserved",
     "empty_refine_result",
     "refine_document",
     "refine_units",
+    "require_issued_refinement",
     "speech_span_units",
 ]
 
@@ -62,6 +65,19 @@ EVIDENCE_KINDS: tuple[str, ...] = tuple(sorted(EVIDENCE_RANKING))
 
 class RefinementConservationError(ValueError):
     """A proposed refinement changed or ambiguously owned the source text."""
+
+
+class RefinementAuthorityError(RefinementConservationError):
+    """A refinement payload was not issued intact by this module's refiner."""
+
+
+_REFINEMENT_ISSUER = object()
+
+
+@dataclass(frozen=True)
+class _RefinementSeal:
+    issuer: object
+    digest: str
 
 
 @dataclass(frozen=True)
@@ -84,6 +100,12 @@ class RefineResult:
     parent_units: tuple[SourceUnit, ...]
     parent_language: str
     degraded: tuple[str, ...] = ()
+    _seal: _RefinementSeal | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         units = tuple(self.units)
@@ -204,6 +226,57 @@ class RefineResult:
         }
 
 
+def _unit_payload(unit: SourceUnit) -> dict[str, Any]:
+    return {
+        "confidence": unit.confidence,
+        "end": unit.end,
+        "id": unit.id,
+        "provenance": unit.provenance,
+        "start": unit.start,
+        "surface": unit.surface,
+    }
+
+
+def _refinement_payload(result: RefineResult) -> dict[str, Any]:
+    """Complete immutable parent/child relationship covered by the seal."""
+    return {
+        "degraded": list(result.degraded),
+        "evidence": {kind: int(result.evidence[kind]) for kind in EVIDENCE_KINDS},
+        "minted": result.minted,
+        "origin": list(result.origin),
+        "parent_language": result.parent_language,
+        "parent_units": [_unit_payload(unit) for unit in result.parent_units],
+        "refined_parent_count": result.refined_parent_count,
+        "units": [_unit_payload(unit) for unit in result.units],
+    }
+
+
+def _issue_refinement(result: RefineResult) -> RefineResult:
+    """Seal a result at the sole refiner-controlled issuance point."""
+    object.__setattr__(
+        result,
+        "_seal",
+        _RefinementSeal(
+            issuer=_REFINEMENT_ISSUER,
+            digest=digest_payload(_refinement_payload(result)),
+        ),
+    )
+    return result
+
+
+def require_issued_refinement(result: RefineResult) -> None:
+    """Reject unissued or altered refinement metadata before optimization."""
+    seal = result._seal
+    if not isinstance(seal, _RefinementSeal) or seal.issuer is not _REFINEMENT_ISSUER:
+        raise RefinementAuthorityError(
+            "subunit_split lacks issued refinement authority"
+        )
+    if seal.digest != digest_payload(_refinement_payload(result)):
+        raise RefinementAuthorityError(
+            "subunit_split broke its issued refinement authority seal"
+        )
+
+
 @dataclass(frozen=True)
 class _Piece:
     surface: str
@@ -214,15 +287,17 @@ def empty_refine_result(
     units: Sequence[SourceUnit] = (), *, language: str = "und"
 ) -> RefineResult:
     """Identity metadata for a row on which no refiner result was supplied."""
-    return RefineResult(
-        units=tuple(units),
-        origin=tuple(range(len(units))),
-        refined_parent_count=0,
-        minted=0,
-        evidence={kind: 0 for kind in EVIDENCE_KINDS},
-        parent_units=tuple(units),
-        parent_language=language,
-        degraded=(),
+    return _issue_refinement(
+        RefineResult(
+            units=tuple(units),
+            origin=tuple(range(len(units))),
+            refined_parent_count=0,
+            minted=0,
+            evidence={kind: 0 for kind in EVIDENCE_KINDS},
+            parent_units=tuple(units),
+            parent_language=language,
+            degraded=(),
+        )
     )
 
 
@@ -243,14 +318,16 @@ def _remint(
 
 def _identity(units: Sequence[SourceUnit], *, lang: str) -> RefineResult:
     reminted = tuple(_remint(item, index=index) for index, item in enumerate(units))
-    return RefineResult(
-        units=reminted,
-        origin=tuple(range(len(reminted))),
-        refined_parent_count=0,
-        minted=0,
-        evidence={kind: 0 for kind in EVIDENCE_KINDS},
-        parent_units=tuple(units),
-        parent_language=lang,
+    return _issue_refinement(
+        RefineResult(
+            units=reminted,
+            origin=tuple(range(len(reminted))),
+            refined_parent_count=0,
+            minted=0,
+            evidence={kind: 0 for kind in EVIDENCE_KINDS},
+            parent_units=tuple(units),
+            parent_language=lang,
+        )
     )
 
 
@@ -601,15 +678,17 @@ def refine_units(
             )
             origin.append(parent_index)
 
-    result = RefineResult(
-        units=tuple(output),
-        origin=tuple(origin),
-        refined_parent_count=refined_parents,
-        minted=minted,
-        evidence=evidence,
-        parent_units=source,
-        parent_language=lang,
-        degraded=tuple(sorted(degraded)),
+    result = _issue_refinement(
+        RefineResult(
+            units=tuple(output),
+            origin=tuple(origin),
+            refined_parent_count=refined_parents,
+            minted=minted,
+            evidence=evidence,
+            parent_units=source,
+            parent_language=lang,
+            degraded=tuple(sorted(degraded)),
+        )
     )
     assert_refinement_conserved(source, result.units, result.origin, lang=lang)
     expected_length = len(source) - refined_parents + minted

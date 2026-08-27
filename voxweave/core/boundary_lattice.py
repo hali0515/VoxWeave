@@ -1134,6 +1134,10 @@ class Edge:
     lyric: bool = False
     input_start: float | None = None
     input_end: float | None = None
+    # A free-lattice edge with no measured start inherits the end of whichever
+    # predecessor path reaches it.  Such an edge has no single candidate-global
+    # input span; boundary_v2 resolves it as part of its predecessor-state DP.
+    evidence_deferred: bool = False
 
     @property
     def vis_width(self) -> int:
@@ -2089,73 +2093,89 @@ class DocumentLattice:
     sentence_ends: SentenceEnds
 
 
+def _resolve_candidate_evidence(
+    edge: Edge,
+    lattice: IntervalLattice,
+    document: SegDocument,
+    *,
+    previous_end: float,
+) -> Edge:
+    """Resolve one edge with the phase-1 predecessor bound it will consume."""
+    from .speaker_evidence import lyric_for_evidence, make_evidence_span
+
+    low = lattice.unit_bound(edge.start_node)
+    high = lattice.unit_bound(edge.end_node)
+    if low >= high:
+        return edge
+    input_start = (
+        float(edge.span_start)
+        if edge.span_start is not None and math.isfinite(edge.span_start)
+        else float(previous_end)
+    )
+    input_end = (
+        float(edge.span_end)
+        if edge.span_end is not None and math.isfinite(edge.span_end)
+        else input_start
+    )
+    span = make_evidence_span(
+        document.units,
+        (low, high),
+        input_start=input_start,
+        input_end=input_end,
+    )
+    return dataclass_replace(
+        edge,
+        evidence_span=span,
+        lyric=lyric_for_evidence(span, document.sing_spans),
+        input_start=input_start,
+        input_end=input_end,
+        evidence_deferred=False,
+    )
+
+
 def _cache_candidate_evidence(
-    lattice: IntervalLattice, document: SegDocument
+    lattice: IntervalLattice,
+    document: SegDocument,
+    *,
+    fallback_start: float = 0.0,
 ) -> IntervalLattice:
     """Attach W3 EvidenceSpan/lyric facts without changing edge admission.
 
     The edge set is already closed when this runs.  Thus singing evidence can
     neither admit nor reject a candidate; it only supplies the stable cache the
-    cost and selected materializer share. Missing endpoints use a source-prefix
-    phase-1 cursor: a finite start wins, a missing start inherits the cursor,
-    and a missing end equals that resolved start. The resolved input pair is
-    cached on the edge and consumed by materialization too, so partially timed
-    candidates cannot acquire a second fallback authority after selection.
+    cost and selected materializer share.  A forced chain has exactly one path,
+    so its cache is resolved in selected order from the preceding resolved edge
+    end.  A free-lattice edge with a missing start is predecessor-dependent and
+    is deliberately left deferred for boundary_v2's stateful solver; assigning
+    one document-prefix value would manufacture an authority no selected path
+    actually supplied.
     """
-    from .speaker_evidence import lyric_for_evidence, make_evidence_span
-
-    prefix_cursor: list[float] = [0.0]
-    cursor = 0.0
-    for unit in document.units:
-        unit_start = (
-            float(unit.start)
-            if unit.start is not None
-            and not isinstance(unit.start, bool)
-            and math.isfinite(unit.start)
-            else cursor
-        )
-        cursor = (
-            float(unit.end)
-            if unit.end is not None
-            and not isinstance(unit.end, bool)
-            and math.isfinite(unit.end)
-            else unit_start
-        )
-        prefix_cursor.append(cursor)
-
     decorated: list[Edge] = []
-    for edge in lattice.edges:
-        low = lattice.unit_bound(edge.start_node)
-        high = lattice.unit_bound(edge.end_node)
-        if low < high:
-            fallback = prefix_cursor[low]
-            input_start = (
-                float(edge.span_start)
-                if edge.span_start is not None and math.isfinite(edge.span_start)
-                else fallback
+    if lattice.all_invisible:
+        previous_end = float(fallback_start)
+        for edge in sorted(lattice.edges, key=lambda item: item.start_node):
+            resolved = _resolve_candidate_evidence(
+                edge,
+                lattice,
+                document,
+                previous_end=previous_end,
             )
-            input_end = (
-                float(edge.span_end)
-                if edge.span_end is not None and math.isfinite(edge.span_end)
-                else input_start
-            )
-            span = make_evidence_span(
-                document.units,
-                (low, high),
-                input_start=input_start,
-                input_end=input_end,
-            )
+            decorated.append(resolved)
+            if resolved.input_end is not None:
+                previous_end = float(resolved.input_end)
+    else:
+        for edge in lattice.edges:
+            if edge.span_start is None and edge.start_node != 0:
+                decorated.append(dataclass_replace(edge, evidence_deferred=True))
+                continue
             decorated.append(
-                dataclass_replace(
+                _resolve_candidate_evidence(
                     edge,
-                    evidence_span=span,
-                    lyric=lyric_for_evidence(span, document.sing_spans),
-                    input_start=input_start,
-                    input_end=input_end,
+                    lattice,
+                    document,
+                    previous_end=fallback_start,
                 )
             )
-        else:
-            decorated.append(edge)
     edges = tuple(decorated)
     return dataclass_replace(lattice, edges=edges, edges_from=_edges_from(edges))
 

@@ -98,7 +98,7 @@ DELTA_REGISTRY: tuple[DeltaRecord, ...] = (
         "any veto/refusal fact",
         (),
         "n/a",
-        None,
+        "report-only",
         "report equality",
     ),
     DeltaRecord(

@@ -202,6 +202,45 @@ def test_forced_partial_timing_uses_one_input_bound_authority():
     assert "lyric" not in interval.cues[1]
 
 
+def test_forced_chain_resolves_from_selected_predecessor_at_exact_lyric_half():
+    """A start-only source unit cannot become an edge-global fallback cursor."""
+    doc = SegDocument(
+        language="en",
+        units=[
+            source(0, ".", 5.0, 6.0),
+            source(1, ",", 6.1, None),
+            source(2, "!", None, 8.0),
+        ],
+        profile=replace(profile(), max_cue_s=1.2),
+        vad_speech=None,
+        shot_changes=None,
+        sing_spans=[(6.0, 7.0)],
+        speaker_turns=[],
+        manifest={},
+        text=". , !",
+    )
+
+    ordinary = optimize_document(doc)
+    counterfactual = optimize_document(doc, speaker_weight=0.0)
+    ordinary_interval = ordinary.solutions[0]
+    explicit_interval = counterfactual.solutions[0]
+
+    assert ordinary_interval.partition_units == (2,)
+    assert explicit_interval.partition_units == (2,)
+    ordinary_times = [
+        (float(cue["start"]), float(cue["end"])) for cue in ordinary_interval.cues
+    ]
+    explicit_times = [
+        (float(cue["start"]), float(cue["end"])) for cue in explicit_interval.cues
+    ]
+    assert ordinary_times == explicit_times == [(5.0, 6.0), (6.0, 8.0)]
+
+    spans = selected_evidence_spans(counterfactual)
+    assert spans[1] == EvidenceSpan(6.0, 8.0, "fabricated", "exact")
+    # [6, 7] covers exactly 1/2 of [6, 8]; threshold equality is lyric.
+    assert explicit_interval.cues[1]["lyric"] is True
+
+
 def test_partially_untimed_candidate_caches_independent_endpoint_kinds():
     doc = SegDocument(
         language="en",
@@ -429,6 +468,25 @@ def test_supplied_projection_is_bound_to_exact_production_parents():
 
     with pytest.raises(ValueError, match="production parent"):
         optimize_document(refined, subunit_split=split, speakers=stale)
+
+    honest = speaker_evidence(
+        parent,
+        refined_units=split.units,
+        origin=split.origin,
+    )
+    accepted = optimize_document(refined, subunit_split=split, speakers=honest)
+    assert tuple(item.kind for item in accepted.speaker_evidence.unit_speakers) == (
+        "ambiguous",
+        "ambiguous",
+    )
+
+    cloned_split = replace(split, parent_units=tuple(stale_parent.units))
+    with pytest.raises(ValueError, match="issued refinement authority"):
+        optimize_document(
+            refined,
+            subunit_split=cloned_split,
+            speakers=stale,
+        )
 
 
 def test_no_turn_refined_documents_keep_existing_w2_callers_valid():
