@@ -495,6 +495,37 @@ def test_enrollment_uses_longest_turn_for_one_identity(tmp_path):
     assert identity["exemplars"][0]["vector"] == QUERY_VECTOR
 
 
+def test_multi_identity_enrollment_increments_revision_once_per_write(tmp_path):
+    media, _sibling, _sidecar = _write_episode(
+        tmp_path,
+        labels=("SPEAKER_A", "SPEAKER_B"),
+        vectors={
+            "SPEAKER_A": list(QUERY_VECTOR),
+            "SPEAKER_B": list(OTHER_VECTOR),
+        },
+    )
+    (tmp_path / "episode.speakers.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "speakers": {"SPEAKER_A": "Aqua", "SPEAKER_B": "Beryl"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store_path = tmp_path / "voices.json"
+
+    speakers.enroll_speaker_voices(
+        media,
+        voices=store_path,
+        show="Example Show",
+    )
+
+    store, validated = load_voice_store(store_path)
+    assert len(store["identities"]) == 2
+    assert validated.revision == 1
+
+
 def test_exact_repeat_enrollment_is_byte_noop(tmp_path):
     media, _sibling, _sidecar = _write_episode(tmp_path)
     (tmp_path / "episode.speakers.json").write_text(

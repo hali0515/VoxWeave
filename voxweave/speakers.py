@@ -1357,6 +1357,7 @@ def enroll_speaker_voices(
 
                 episode_key = normalize_episode(episode or media.stem)
                 working = store
+                base_revision = cast(int, store["revision"])
                 mutations = 0
                 noops = 0
                 for _local_id, raw_name, vector in selected:
@@ -1375,6 +1376,8 @@ def enroll_speaker_voices(
                     else:
                         mutations += 1
                 if mutations:
+                    working["revision"] = base_revision + 1
+                    validate_voice_store(working)
                     write_voice_store(lock_handle.store_path, working)
                     log.info(
                         "enrolled %d voice exemplar(s) into %s", mutations, store_path
