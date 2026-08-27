@@ -44,7 +44,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_right
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any
 
 from .canonical_text import (
@@ -1127,6 +1127,11 @@ class Edge:
     span_start: float | None
     span_end: float | None
     waiver: Waiver | None
+    # W3 candidate cache.  Typed as Any here so the hard-lattice module does
+    # not import the policy module at import time; build_document_lattice fills
+    # it through one local import after hard admission has finished.
+    evidence_span: Any | None = None
+    lyric: bool = False
 
     @property
     def vis_width(self) -> int:
@@ -1142,8 +1147,12 @@ class Edge:
         return {
             "display_text": self.display_text,
             "end_node": self.end_node,
+            "evidence_span": None
+            if self.evidence_span is None
+            else self.evidence_span.to_dict(),
             "line_widths": list(self.line_widths),
             "lines": self.lines,
+            "lyric": self.lyric,
             "span": [self.span_start, self.span_end],
             "start_node": self.start_node,
             "waiver": None if self.waiver is None else self.waiver.to_dict(),
@@ -2073,7 +2082,70 @@ class DocumentLattice:
     sentence_ends: SentenceEnds
 
 
-def build_document_lattice(document: SegDocument) -> DocumentLattice:
+def _cache_candidate_evidence(
+    lattice: IntervalLattice, document: SegDocument
+) -> IntervalLattice:
+    """Attach W3 EvidenceSpan/lyric facts without changing edge admission.
+
+    The edge set is already closed when this runs.  Thus singing evidence can
+    neither admit nor reject a candidate; it only supplies the stable cache the
+    cost and selected materializer share.  Missing display endpoints use the
+    same deterministic prior-end chain as materialization: the latest finite
+    source end before the candidate, or zero at the document front.  This keeps
+    fully and partially untimed candidates typed without inventing an acoustic
+    anchor.
+    """
+    from .speaker_evidence import lyric_for_evidence, make_evidence_span
+
+    prior_end: list[float] = [0.0]
+    latest = 0.0
+    for unit in document.units:
+        if (
+            unit.end is not None
+            and not isinstance(unit.end, bool)
+            and math.isfinite(unit.end)
+        ):
+            latest = float(unit.end)
+        prior_end.append(latest)
+
+    decorated: list[Edge] = []
+    for edge in lattice.edges:
+        low = lattice.unit_bound(edge.start_node)
+        high = lattice.unit_bound(edge.end_node)
+        if low < high:
+            fallback = prior_end[low]
+            input_start = (
+                float(edge.span_start)
+                if edge.span_start is not None and math.isfinite(edge.span_start)
+                else fallback
+            )
+            input_end = (
+                float(edge.span_end)
+                if edge.span_end is not None and math.isfinite(edge.span_end)
+                else input_start
+            )
+            span = make_evidence_span(
+                document.units,
+                (low, high),
+                input_start=input_start,
+                input_end=input_end,
+            )
+            decorated.append(
+                dataclass_replace(
+                    edge,
+                    evidence_span=span,
+                    lyric=lyric_for_evidence(span, document.sing_spans),
+                )
+            )
+        else:
+            decorated.append(edge)
+    edges = tuple(decorated)
+    return dataclass_replace(lattice, edges=edges, edges_from=_edges_from(edges))
+
+
+def build_document_lattice(
+    document: SegDocument, *, cache_speaker_evidence: bool = False
+) -> DocumentLattice:
     """Preflight, atom layer, barriers, intervals, per-interval lattices.
 
     Raises nothing. A profile violation is the caller's business (the shadow
@@ -2084,7 +2156,7 @@ def build_document_lattice(document: SegDocument) -> DocumentLattice:
     layer = build_atom_layer(document)
     barriers = build_barriers(layer, document.profile)
     intervals = build_intervals(layer, barriers)
-    lattices = tuple(
+    raw_lattices = tuple(
         build_interval_lattice(
             interval,
             layer,
@@ -2093,6 +2165,11 @@ def build_document_lattice(document: SegDocument) -> DocumentLattice:
             span_violations=span_violations,
         )
         for interval in intervals
+    )
+    lattices = (
+        tuple(_cache_candidate_evidence(item, document) for item in raw_lattices)
+        if cache_speaker_evidence
+        else raw_lattices
     )
     return DocumentLattice(
         layer=layer,

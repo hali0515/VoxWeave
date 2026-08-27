@@ -1,4 +1,4 @@
-"""``experimental_policy_1``: the only place P4 encodes a preference.
+"""``experimental_policy_2``: the only place P4/P5 encodes a preference.
 
 Legality lives in the lattice; everything here is opinion, and it is kept
 separable on purpose. A cost that could veto is a hard rule in disguise, so no
@@ -50,13 +50,13 @@ from .layout import (
     _vis_width,
     _wrap_units,
 )
-from .segdoc import DisplayProfile
+from .segdoc import DisplayProfile, SourceUnit
 from .timing_preview import DisplayTimingPreview
 
 #: Bump before comparing two runs whose numbers were produced by different
 #: weights: an artifact is only meaningful against its own policy version.
-POLICY_VERSION: int = 1
-POLICY_NAME: str = "experimental_policy_1"
+POLICY_VERSION: int = 2
+POLICY_NAME: str = "experimental_policy_2"
 
 #: Comparison quantum. Every weighted term is rounded to it before summation, so
 #: two paths that differ only by float association compare exactly equal rather
@@ -325,7 +325,7 @@ class CostBreakdown:
     second.
     """
 
-    features: Mapping[str, float | str | None]
+    features: Mapping[str, bool | float | str | None]
     weighted_terms: Mapping[str, float]
     total: float
 
@@ -340,7 +340,7 @@ class CostBreakdown:
 
 
 def make_breakdown(
-    features: Mapping[str, float | str | None],
+    features: Mapping[str, bool | float | str | None],
     weighted_terms: Mapping[str, float],
 ) -> CostBreakdown:
     """Quantize every term, then sum the quantized values -- in that order."""
@@ -372,7 +372,7 @@ def sum_breakdowns(parts: Iterable[CostBreakdown]) -> CostBreakdown:
             feature_values.setdefault(key, []).append(value)
         for key, value in part.weighted_terms.items():
             term_totals[key] = term_totals.get(key, 0.0) + value
-    features: dict[str, float | str | None] = {}
+    features: dict[str, bool | float | str | None] = {}
     for key, values in feature_values.items():
         if len(values) == len(items) and all(_numeric(value) for value in values):
             features[key] = float(sum(values))
@@ -393,6 +393,16 @@ class CostContext:
     sentence_nodes: frozenset[int]
     v1_cut_units: frozenset[int]
     layer: AtomLayer
+    # W3 additions.  ``speaker_evidence`` retains parent support/lineage while
+    # ``unit_speakers`` is the index-aligned optimizer-space projection costs
+    # consume.  Kept as ``Any`` here to avoid a boundary_cost ->
+    # speaker_evidence import cycle: the speaker module itself returns this
+    # module's CostBreakdown.
+    units: Sequence[SourceUnit] = ()
+    unit_speakers: tuple[Any, ...] = ()
+    speaker_evidence: Any = None
+    sing_spans: Sequence[tuple[float, float]] | None = None
+    speaker_weight: float = 0.0
 
     def next_start_after(self, document_node: int) -> float | None:
         """The first known start at or after a document atom-stream node.
@@ -420,6 +430,16 @@ def _shot_distance(
     return nearest if nearest < window else None
 
 
+def transition_time(left_end: float | None, right_start: float | None) -> float | None:
+    """The frozen source-boundary coordinate used by pricing and lineage.
+
+    The right unit's start wins when present; only a missing right bound falls
+    back to the left end.  In particular this is neither the midpoint nor the
+    left edge of a nonzero gap (W1 R8-2).
+    """
+    return right_start if right_start is not None else left_end
+
+
 def cut_cost(
     left: LatticeAtom,
     right: LatticeAtom,
@@ -440,7 +460,7 @@ def cut_cost(
     evidence = pause_evidence(
         left.end, right.start, speech_spans=speech_spans, profile=profile
     )
-    cut_time = right.start if right.start is not None else left.end
+    cut_time = transition_time(left.end, right.start)
     distance = _shot_distance(cut_time, shot_changes, profile.shot_snap_s)
     shot_term = (
         0.0

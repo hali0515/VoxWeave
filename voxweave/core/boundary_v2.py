@@ -34,6 +34,7 @@ separates that from a rounding error.
 from __future__ import annotations
 
 import bisect
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, cast
@@ -46,6 +47,7 @@ from .boundary_cost import (
     CostContext,
     cut_cost,
     edge_cost,
+    make_breakdown,
     pause_knees,
     quantize,
     sum_breakdowns,
@@ -82,6 +84,18 @@ from .partition_check import (
 from .schema import Cue, Unit
 from .segdoc import DisplayProfile, SegDocument, SourceUnit
 from .subunit import RefineResult, empty_refine_result, speech_span_units
+from .speaker_evidence import (
+    W_SPEAKER_INTERIOR,
+    EvidenceSpan,
+    SpeakerPricingSummary,
+    UnitSpeakers,
+    evidence_span_from_cue,
+    make_evidence_span,
+    named_multi_cues_unannotated,
+    speaker_edge_cost,
+    speaker_evidence,
+    summarize_speaker_prices,
+)
 from .timing_preview import DisplayTimingPreview, LegacyCleanupPreview
 
 __all__ = [
@@ -143,6 +157,7 @@ class CostTables:
 
     edges: Mapping[tuple[int, int], CostBreakdown]
     cuts: Mapping[int, CostBreakdown]
+    speaker_pricing: SpeakerPricingSummary | None = None
 
 
 def build_cost_context(
@@ -151,12 +166,35 @@ def build_cost_context(
     *,
     preview: DisplayTimingPreview | None = None,
     v1: V1Partition | None = None,
+    speakers: UnitSpeakers | None = None,
+    speaker_weight: float | None = None,
 ) -> CostContext:
     """Bundle everything a cost term needs that is not the edge or the cut.
 
     The preview defaults to the mirror of today's cleanup pass; P5 hands in the
     finalizer's own preview and nothing else here changes.
     """
+    resolved_speakers = speakers
+    if resolved_speakers is not None and tuple(
+        resolved_speakers.refined_units
+    ) != tuple(document.units):
+        raise ValueError(
+            "speaker evidence does not describe this document's unit stream"
+        )
+    resolved_weight = (
+        0.0
+        if resolved_speakers is None
+        else W_SPEAKER_INTERIOR
+        if speaker_weight is None
+        else speaker_weight
+    )
+    if (
+        isinstance(resolved_weight, bool)
+        or not isinstance(resolved_weight, (int, float))
+        or not math.isfinite(resolved_weight)
+        or resolved_weight < 0
+    ):
+        raise ValueError("speaker weight must be finite and non-negative")
     return CostContext(
         profile=document.profile,
         preview=LegacyCleanupPreview() if preview is None else preview,
@@ -165,6 +203,28 @@ def build_cost_context(
         sentence_nodes=lattice.sentence_ends.nodes,
         v1_cut_units=frozenset() if v1 is None else frozenset(v1.cuts),
         layer=lattice.layer,
+        units=tuple(document.units),
+        unit_speakers=()
+        if resolved_speakers is None
+        else resolved_speakers.unit_speakers,
+        speaker_evidence=resolved_speakers,
+        sing_spans=document.sing_spans,
+        speaker_weight=resolved_weight,
+    )
+
+
+def _with_speaker_cost(base: CostBreakdown, speaker: CostBreakdown) -> CostBreakdown:
+    """Add the disjoint W3 feature/term block without lossy aggregation."""
+    duplicate_features = set(base.features) & set(speaker.features)
+    duplicate_terms = set(base.weighted_terms) & set(speaker.weighted_terms)
+    if duplicate_features or duplicate_terms:
+        raise ValueError(
+            "speaker cost collided with existing cost keys: "
+            f"features={sorted(duplicate_features)}, terms={sorted(duplicate_terms)}"
+        )
+    return make_breakdown(
+        {**base.features, **speaker.features},
+        {**base.weighted_terms, **speaker.weighted_terms},
     )
 
 
@@ -210,10 +270,11 @@ def build_cost_tables(lattice: IntervalLattice, ctx: CostContext) -> CostTables:
     sentence_nodes = ctx.sentence_nodes
 
     edges: dict[tuple[int, int], CostBreakdown] = {}
+    speaker_parts: list[CostBreakdown] = []
     for edge in lattice.edges:
         left = document_nodes[edge.start_node]
         right = document_nodes[edge.end_node]
-        edges[(edge.start_node, edge.end_node)] = edge_cost(
+        base = edge_cost(
             edge,
             atoms,
             profile=profile,
@@ -223,6 +284,28 @@ def build_cost_tables(lattice: IntervalLattice, ctx: CostContext) -> CostTables:
                 1 for node in sentence_nodes if left < node < right
             ),
         )
+        if isinstance(ctx.speaker_evidence, UnitSpeakers):
+            unit_range = (
+                lattice.unit_bound(edge.start_node),
+                lattice.unit_bound(edge.end_node),
+            )
+            evidence_span = edge.evidence_span
+            if not isinstance(evidence_span, EvidenceSpan):
+                raise ValueError(
+                    "speaker pricing requires cached candidate EvidenceSpan values"
+                )
+            speaker = speaker_edge_cost(
+                ctx.speaker_evidence,
+                unit_range,
+                evidence_span=evidence_span,
+                sing_spans=ctx.sing_spans,
+                weight=ctx.speaker_weight,
+                suppressed_lyric=edge.lyric,
+            )
+            speaker_parts.append(speaker)
+            edges[(edge.start_node, edge.end_node)] = _with_speaker_cost(base, speaker)
+        else:
+            edges[(edge.start_node, edge.end_node)] = base
 
     cuts: dict[int, CostBreakdown] = {}
     for node in lattice.nodes:
@@ -237,7 +320,15 @@ def build_cost_tables(lattice: IntervalLattice, ctx: CostContext) -> CostTables:
             shot_changes=ctx.shot_changes,
             v1_cut_units=ctx.v1_cut_units,
         )
-    return CostTables(edges=edges, cuts=cuts)
+    return CostTables(
+        edges=edges,
+        cuts=cuts,
+        speaker_pricing=(
+            summarize_speaker_prices(speaker_parts)
+            if isinstance(ctx.speaker_evidence, UnitSpeakers)
+            else None
+        ),
+    )
 
 
 # ------------------------------------------------------------------- paths
@@ -553,6 +644,8 @@ def materialize_cues(
             "speech_start": speech_start,
             "speech_end": speech_end,
         }
+        if edge.lyric:
+            cue["lyric"] = True
         cues.append(cue)
         previous_end = end
     return tuple(cues)
@@ -678,18 +771,46 @@ def score_v1_global(
             waiver=None,
         )
         unit_range = (layer.unit_bound(left), layer.unit_bound(right))
-        parts.append(
-            edge_cost(
-                edge,
-                atoms,
-                profile=profile,
-                preview=ctx.preview,
-                next_start=ctx.next_start_after(right),
-                sentence_cross_count=sum(
-                    1 for node in ctx.sentence_nodes if left < node < right
-                ),
-            )
+        base = edge_cost(
+            edge,
+            atoms,
+            profile=profile,
+            preview=ctx.preview,
+            next_start=ctx.next_start_after(right),
+            sentence_cross_count=sum(
+                1 for node in ctx.sentence_nodes if left < node < right
+            ),
         )
+        if isinstance(ctx.speaker_evidence, UnitSpeakers):
+            if cue_index < len(v1.cues):
+                evidence_span = evidence_span_from_cue(v1.cues[cue_index])
+            elif (
+                low is not None
+                and high is not None
+                and isinstance(low, (int, float))
+                and isinstance(high, (int, float))
+                and math.isfinite(low)
+                and math.isfinite(high)
+                and low <= high
+            ):
+                evidence_span = make_evidence_span(
+                    ctx.units,
+                    unit_range,
+                    input_start=float(low),
+                    input_end=float(high),
+                )
+            else:
+                evidence_span = EvidenceSpan(0.0, 0.0, "fabricated", "fabricated")
+            speaker = speaker_edge_cost(
+                ctx.speaker_evidence,
+                unit_range,
+                evidence_span=evidence_span,
+                sing_spans=ctx.sing_spans,
+                weight=ctx.speaker_weight,
+            )
+            parts.append(_with_speaker_cost(base, speaker))
+        else:
+            parts.append(base)
         if left != 0:
             parts.append(
                 cut_cost(
@@ -825,6 +946,7 @@ class IntervalSolution:
     dp_relaxations: int
     packer_steps: int
     waivers: tuple[Waiver, ...] = ()
+    speaker_pricing: SpeakerPricingSummary | None = None
 
     @property
     def optimized(self) -> bool:
@@ -948,6 +1070,7 @@ def optimize_interval(
             ),
             dp_relaxations=0,
             packer_steps=lattice.packer_steps,
+            speaker_pricing=tables.speaker_pricing,
         )
 
     dp = solve_interval(lattice, tables)
@@ -987,6 +1110,7 @@ def optimize_interval(
         dp_relaxations=dp.relaxations,
         packer_steps=lattice.packer_steps,
         waivers=waivers,
+        speaker_pricing=tables.speaker_pricing,
     )
 
 
@@ -1005,6 +1129,7 @@ class DocumentSolution:
     invalid_profile: tuple[ProfileViolation, ...]
     subunit_split: RefineResult
     artifact: dict[str, Any]
+    speaker_evidence: UnitSpeakers | None = None
 
 
 def _profile_dict(profile: DisplayProfile) -> dict[str, Any]:
@@ -1123,6 +1248,95 @@ def _vad_state_totals(solutions: Sequence[IntervalSolution]) -> dict[str, Any]:
     return {"selected_cuts_by_state": counts, "unclassified_cuts": unknown}
 
 
+def _speaker_pricing_totals(
+    solutions: Sequence[IntervalSolution],
+) -> SpeakerPricingSummary:
+    summaries = [
+        solution.speaker_pricing
+        for solution in solutions
+        if solution.speaker_pricing is not None
+    ]
+    return SpeakerPricingSummary(
+        priced_edges=sum(item.priced_edges for item in summaries),
+        speaker_changes_in_cue_raw=sum(
+            item.speaker_changes_in_cue_raw for item in summaries
+        ),
+        suppressed_lyric_edges=sum(item.suppressed_lyric_edges for item in summaries),
+        two_speaker_edges=sum(item.two_speaker_edges for item in summaries),
+        turn_states={
+            state: sum(item.turn_states.get(state, 0) for item in summaries)
+            for state in ("absent", "overlap", "multi", "single", "unattributed")
+        },
+    )
+
+
+def _resolve_speaker_evidence(
+    document: SegDocument,
+    split: RefineResult,
+    supplied: UnitSpeakers | None,
+) -> UnitSpeakers:
+    """Return evidence whose optimizer-space projection is exactly ``split``.
+
+    A non-identity refinement has destroyed the production-parent records that
+    attribution must read.  If a speaker track exists, only the caller that
+    still owns those parents can construct the projection, so silently
+    classifying the proportional child times is forbidden.  When the track is
+    absent there is no acoustic fact to reconstruct; a ghost parent stream is
+    sufficient to produce the explicit all-``none`` projection while retaining
+    the complete origin tuple for audit.
+    """
+    identity = split.refined_parent_count == 0 and split.origin == tuple(
+        range(len(document.units))
+    )
+    if supplied is not None:
+        if tuple(supplied.refined_units) != tuple(document.units):
+            raise ValueError(
+                "parent-projected speaker evidence does not describe this unit stream"
+            )
+        if supplied.origin != split.origin:
+            raise ValueError(
+                "parent-projected speaker evidence does not use this origin tuple"
+            )
+        if not supplied.matches_document_track(document):
+            raise ValueError(
+                "parent-projected speaker evidence disagrees with the document track"
+            )
+        return supplied
+    if identity:
+        return speaker_evidence(document)
+    if document.speaker_turns is not None:
+        raise ValueError(
+            "a refined speaker track requires explicit parent-projected speaker evidence"
+        )
+
+    parent_count = 0 if not split.origin else split.origin[-1] + 1
+    parent_document = SegDocument(
+        language=document.language,
+        units=[
+            SourceUnit(
+                id=f"u{index}",
+                surface="",
+                start=None,
+                end=None,
+                provenance="aligner",
+            )
+            for index in range(parent_count)
+        ],
+        profile=document.profile,
+        vad_speech=None,
+        shot_changes=None,
+        sing_spans=None,
+        speaker_turns=None,
+        manifest={},
+        text=None,
+    )
+    return speaker_evidence(
+        parent_document,
+        refined_units=document.units,
+        origin=split.origin,
+    )
+
+
 def _artifact(
     document: SegDocument,
     lattice: DocumentLattice,
@@ -1130,6 +1344,8 @@ def _artifact(
     v1_reference: V1Reference | None,
     document_check: PartitionCheckResult,
     subunit_split: RefineResult,
+    speakers: UnitSpeakers | None,
+    speaker_weight: float,
 ) -> dict[str, Any]:
     unit_count = len(document.units)
     optimized = [solution for solution in solutions if solution.optimized]
@@ -1144,13 +1360,36 @@ def _artifact(
         len(solution.validator_raw.exit_driving) for solution in solutions
     )
     coarse_caused_intervals = sum(solution.coarse_caused for solution in solutions)
+    speaker_pricing = (
+        _speaker_pricing_totals(solutions) if speakers is not None else None
+    )
+    named_multi = 0
+    if speakers is not None:
+        cues = tuple(cue for solution in solutions for cue in solution.cues)
+        cue_ranges = tuple(
+            pair
+            for solution in solutions
+            for pair in zip(
+                (solution.unit_range[0], *solution.partition_units),
+                (*solution.partition_units, solution.unit_range[1]),
+            )
+        )
+        if cues and len(cue_ranges) != len(cues):
+            raise ValueError(
+                "selected cue ownership does not match materialized cue count"
+            )
+        if cues:
+            named_multi = named_multi_cues_unannotated(
+                cue_ranges, speakers.unit_speakers
+            )
     return {
         "coverage": {
             "coarse_caused_intervals": coarse_caused_intervals,
-            # W3 owns the producer for both counters.  No speaker edge or named
-            # multi cue has been evaluated in this standalone W2 row.
-            "dual_form_unmeasured": False,
-            "named_multi_cues_unannotated": 0,
+            "dual_form_unmeasured": speakers is not None
+            and document.profile.max_lines >= 2
+            and speaker_pricing is not None
+            and speaker_pricing.two_speaker_edges > 0,
+            "named_multi_cues_unannotated": named_multi,
         },
         "engine_v2": ENGINE_V2,
         # W1 supplied the finalizer and W3 supplies speaker evidence; W4 wires
@@ -1177,7 +1416,12 @@ def _artifact(
         "providers": {},
         "schema_version": SCHEMA_VERSION,
         "shadow_degraded": [],
-        "speaker_evidence": None,
+        "speaker_evidence": None
+        if speakers is None
+        else speakers.to_dict(
+            pricing=speaker_pricing,
+            speaker_weight=speaker_weight,
+        ),
         "subunit_split": subunit_split.to_dict(),
         "vad_state": _vad_state_totals(solutions),
         "totals": {
@@ -1242,6 +1486,8 @@ def optimize_document(
     v1: V1Partition | None = None,
     preview: DisplayTimingPreview | None = None,
     subunit_split: RefineResult | None = None,
+    speakers: UnitSpeakers | None = None,
+    speaker_weight: float | None = None,
 ) -> DocumentSolution:
     """Solve every hard interval of one document and assemble its artifact.
 
@@ -1249,7 +1495,9 @@ def optimize_document(
     it declares the identity mapping.  The profile preflight is fatal for the
     document: a knob with no defined meaning makes the measurement invalid, and
     reporting an invalid measurement as a degraded one is how a shadow lane
-    starts lying.
+    starts lying.  W3 remains staged behind an explicit ``speaker_weight`` (or
+    supplied parent projection): ``None`` preserves the pre-W4 live call, while
+    W4 can request the full and counterfactual rows with ``3.0`` and ``0.0``.
     """
     if subunit_split is None:
         if any(unit.provenance.startswith("subunit-") for unit in document.units):
@@ -1275,8 +1523,22 @@ def optimize_document(
             artifact=_invalid_artifact(invalid),
         )
 
-    lattice = build_document_lattice(document)
-    ctx = build_cost_context(document, lattice, preview=preview, v1=v1)
+    speaker_enabled = speakers is not None or speaker_weight is not None
+    resolved_weight = W_SPEAKER_INTERIOR if speaker_weight is None else speaker_weight
+    resolved_speakers = (
+        _resolve_speaker_evidence(document, split, speakers)
+        if speaker_enabled
+        else None
+    )
+    lattice = build_document_lattice(document, cache_speaker_evidence=speaker_enabled)
+    ctx = build_cost_context(
+        document,
+        lattice,
+        preview=preview,
+        v1=v1,
+        speakers=resolved_speakers,
+        speaker_weight=resolved_weight,
+    )
 
     solutions: list[IntervalSolution] = []
     fallback_start = 0.0
@@ -1329,7 +1591,10 @@ def optimize_document(
             v1_reference,
             document_check,
             split,
+            resolved_speakers,
+            resolved_weight,
         ),
+        speaker_evidence=resolved_speakers,
     )
 
 
@@ -1339,8 +1604,15 @@ def shadow_artifact(
     v1: V1Partition | None = None,
     preview: DisplayTimingPreview | None = None,
     subunit_split: RefineResult | None = None,
+    speakers: UnitSpeakers | None = None,
+    speaker_weight: float | None = None,
 ) -> dict[str, Any]:
     """The one call the Wave B hook makes."""
     return optimize_document(
-        document, v1=v1, preview=preview, subunit_split=subunit_split
+        document,
+        v1=v1,
+        preview=preview,
+        subunit_split=subunit_split,
+        speakers=speakers,
+        speaker_weight=speaker_weight,
     ).artifact

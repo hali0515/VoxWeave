@@ -1,5 +1,5 @@
 # tests/test_boundary_cost.py
-"""``experimental_policy_1``: features, weights, and the pause uncertainty integral.
+"""``experimental_policy_2``: features, weights, and the pause uncertainty integral.
 
 The cost module is the only place P4 encodes an opinion, so its whole surface is
 pinned: every raw feature is recorded even when its weight is zero, every
@@ -54,6 +54,7 @@ from voxweave.core.boundary_cost import (
     quantize,
     ramp_integral_mean,
     sum_breakdowns,
+    transition_time,
 )
 from voxweave.core.boundary_lattice import Edge, LatticeAtom
 from voxweave.core.segdoc import DisplayProfile
@@ -128,8 +129,8 @@ def terms(breakdown):
 
 
 def test_policy_identity_is_explicit_and_versioned():
-    assert POLICY_VERSION == 1
-    assert POLICY_NAME == "experimental_policy_1"
+    assert POLICY_VERSION == 2
+    assert POLICY_NAME == "experimental_policy_2"
     assert QUANTUM == 1e-6
 
 
@@ -342,6 +343,14 @@ def test_shot_preview_is_a_mild_affinity_inside_the_snap_window():
     assert terms(breakdown)["shot_preview"] == pytest.approx(
         W_SHOT_PREVIEW * (1.0 - 0.1 / 0.458)
     )
+
+
+def test_cut_cost_uses_the_frozen_transition_time_helper_across_a_gap():
+    cut = transition_time(1.0, 1.4)
+    assert cut == 1.4
+    breakdown = base_cut(shot_changes=[cut])
+    assert breakdown.features["shot_preview_raw"] == 0.0
+    assert terms(breakdown)["shot_preview"] == W_SHOT_PREVIEW
 
 
 def test_shot_preview_ignores_a_cut_outside_the_snap_window():

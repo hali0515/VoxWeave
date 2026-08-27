@@ -1719,7 +1719,21 @@ def _selection_payload(
             for atom in atoms
         ],
         "edges": [
-            [edge.start_node, edge.end_node, edge.span_start, edge.span_end]
+            [
+                edge.start_node,
+                edge.end_node,
+                edge.span_start,
+                edge.span_end,
+                None
+                if edge.evidence_span is None
+                else [
+                    edge.evidence_span.start,
+                    edge.evidence_span.end,
+                    edge.evidence_span.start_kind,
+                    edge.evidence_span.end_kind,
+                ],
+                edge.lyric,
+            ]
             for edge in edges
         ],
         "fallback_start": fallback_start,

@@ -485,8 +485,8 @@ def test_artifact_carries_the_declared_schema():
     # assembler stops replacing this complete standalone coverage contract.
     assert SCHEMA_VERSION == 1
     assert art["engine_v2"] == ENGINE_V2
-    assert art["policy_version"] == 1
-    assert art["policy_name"] == "experimental_policy_1"
+    assert art["policy_version"] == 2
+    assert art["policy_name"] == "experimental_policy_2"
     for key in (
         "totals",
         "intervals",
