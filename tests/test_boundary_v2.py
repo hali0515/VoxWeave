@@ -481,7 +481,9 @@ def test_artifact_carries_the_declared_schema():
     art = solution.artifact
     assert art["kind"] == "segmentation-shadow"
     assert art["schema_version"] == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 2
+    # W2 stages the additive fields, but W4 owns the version flip once the live
+    # assembler stops replacing this complete standalone coverage contract.
+    assert SCHEMA_VERSION == 1
     assert art["engine_v2"] == ENGINE_V2
     assert art["policy_version"] == 1
     assert art["policy_name"] == "experimental_policy_1"

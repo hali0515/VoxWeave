@@ -111,8 +111,10 @@ __all__ = [
 #: The engine name every shadow artifact is stamped with.
 ENGINE_V2: str = "boundary-optimizer-v2"
 
-#: Artifact schema version. Bumped when a reader would have to change.
-SCHEMA_VERSION: int = 2
+#: Live artifact schema version. W2 adds future-v2 fields to its standalone
+#: artifact, but W4 owns the flip after its assembler preserves that complete
+#: coverage contract instead of replacing it with the legacy coverage block.
+SCHEMA_VERSION: int = 1
 
 #: How much worse than the raw optimum a legal v1 path may be and still be
 #: selected. A margin rather than an equality test because the point of the

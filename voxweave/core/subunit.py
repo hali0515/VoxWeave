@@ -172,7 +172,7 @@ class RefineResult:
         object.__setattr__(self, "degraded", degraded)
 
     def to_dict(self) -> dict[str, Any]:
-        """Return the schema-v2 ``subunit_split`` block in stable key order."""
+        """Return the staged ``subunit_split`` block in stable key order."""
         return {
             "degraded": list(self.degraded),
             "evidence": {kind: int(self.evidence[kind]) for kind in EVIDENCE_KINDS},
@@ -416,8 +416,8 @@ def _split_recursive(
                     continue
             out.append(_Piece(surface=surface, evidence=evidence))
 
-        if evidence == "per-char" and pending_degradation is not None:
-            degraded.add(pending_degradation)
+        if evidence == "per-char":
+            degraded.add(pending_degradation or "no-usable-boundary:per-char")
         return out, degraded
     return [_Piece(surface=text, evidence="per-char")], set()
 

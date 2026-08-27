@@ -348,6 +348,22 @@ def test_artifact_carries_both_lanes_with_stage_attribution(shadow_on):
     assert core["agreement"]["identical_cuts"] >= 0
 
 
+def test_live_artifact_stays_schema_one_until_w4_preserves_v2_coverage(shadow_on):
+    artifact = _segment(_case_plain()).shadow
+    assert artifact is not None
+    assert artifact["schema_version"] == 1
+
+    # The W4 assembler currently replaces the standalone W2 coverage block.
+    # A live artifact may not claim schema 2 until all three staged fields make
+    # it through that assembly boundary.
+    staged = {
+        "coarse_caused_intervals",
+        "dual_form_unmeasured",
+        "named_multi_cues_unannotated",
+    }
+    assert staged.isdisjoint(artifact["coverage"])
+
+
 def test_coverage_block_reports_the_c13_fields(shadow_on):
     for name, build in CASES.items():
         artifact = _segment(build()).shadow

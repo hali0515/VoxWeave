@@ -1672,6 +1672,7 @@ def register_optimizer_selection(
                 )
             )
     cuts = _document_cuts(solution)
+    fallback_start = 0.0
     capability = ledger.issue(
         issuer="voxweave.core.finalizer.register_optimizer_selection",
         kind="optimizer-selection",
@@ -1681,6 +1682,7 @@ def register_optimizer_selection(
             cuts,
             _profile_payload(solution.document.profile),
             solution.document.units,
+            fallback_start,
         ),
     )
     return OptimizerSelectionAuthority(
@@ -1688,7 +1690,7 @@ def register_optimizer_selection(
         partition=cuts,
         edges=tuple(edges),
         atoms=tuple(atoms),
-        fallback_start=0.0,
+        fallback_start=fallback_start,
         capability=capability,
     )
 
@@ -1699,6 +1701,7 @@ def _selection_payload(
     partition: Sequence[int],
     profile: dict[str, Any] | None,
     units: Sequence[SourceUnit],
+    fallback_start: float,
 ) -> dict[str, Any]:
     """The projection an optimizer selection is sealed over.
 
@@ -1707,11 +1710,19 @@ def _selection_payload(
     breaks the first time one of them is edited.
     """
     return {
-        "atoms": [[atom.text, atom.start, atom.end] for atom in atoms],
+        # These five atom fields are the complete projection read by
+        # ``materialize_cues``.  Footprints are load-bearing for W2's
+        # provenance-aware acoustic anchors and therefore cannot remain mutable
+        # outside the same seal as the selected edge chain.
+        "atoms": [
+            [atom.text, atom.start, atom.end, atom.unit_start, atom.unit_end]
+            for atom in atoms
+        ],
         "edges": [
             [edge.start_node, edge.end_node, edge.span_start, edge.span_end]
             for edge in edges
         ],
+        "fallback_start": fallback_start,
         "partition": list(partition),
         "profile": profile,
         # W2's materializer reads endpoint provenance from the registered
@@ -1837,6 +1848,7 @@ def phase1_from_optimizer_selection(
             authority.partition,
             _profile_payload(authority.document.profile),
             authority.document.units,
+            authority.fallback_start,
         )
     )
     profile = authority.document.profile

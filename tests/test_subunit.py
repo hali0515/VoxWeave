@@ -292,6 +292,35 @@ def test_phrase_beats_per_character(monkeypatch: pytest.MonkeyPatch) -> None:
     assert {item.provenance for item in result.units} == {"subunit-phrase"}
 
 
+def test_single_phrase_provider_records_per_char_degradation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present provider that cannot split is still degraded per-char evidence."""
+    from voxweave.core import subunit
+
+    monkeypatch.setattr(
+        subunit,
+        "_phrase_pieces",
+        lambda text, _lang: ([text], None),
+    )
+    with degradation_capture(quiet=True) as degraded:
+        result = refine_units(
+            [unit("甲乙丙丁", 0.0, 8.0)],
+            lang="ja",
+            profile=profile("ja", max_cue_s=2.5),
+        )
+    assert [item.surface for item in result.units] == list("甲乙丙丁")
+    assert {item.provenance for item in result.units} == {"subunit-per-char"}
+    assert result.degraded == ("no-usable-boundary:per-char",)
+    assert degraded == [
+        {
+            "slot": "subunit",
+            "reason": "no-usable-boundary:per-char",
+            "count": 1,
+        }
+    ]
+
+
 def test_providerless_language_uses_per_char_and_records_degradation() -> None:
     with degradation_capture(quiet=True) as degraded:
         result = refine_units(
@@ -616,6 +645,38 @@ def test_optimizer_authority_rematerializes_and_seals_provenance() -> None:
             row_id="delivery_finalizer/v2",
             evaluation_id="subunit-seal-negative",
         )
+
+
+@pytest.mark.parametrize("field", ["unit_start", "unit_end", "fallback_start"])
+def test_optimizer_authority_seals_every_rematerialization_input(field: str) -> None:
+    """Every W2 value consumed before phase 1 must remain under the W1 seal."""
+    from voxweave.core.authority import AuthorityLedger, SealBroken
+    from voxweave.core.finalizer import (
+        phase1_from_optimizer_selection,
+        register_optimizer_selection,
+    )
+
+    prof = profile("en", max_cue_s=7.0)
+    shadow, split = refine_document(document([unit("ab cd", 0.0, 8.0)], prof))
+    solution = optimize_document(shadow, subunit_split=split)
+    ledger = AuthorityLedger()
+    issued = register_optimizer_selection(solution, ledger=ledger)
+
+    if field == "fallback_start":
+        forged = replace(issued, fallback_start=issued.fallback_start + 0.25)
+    else:
+        first = issued.atoms[0]
+        forged_atom = replace(first, **{field: getattr(first, field) + 1})
+        forged = replace(issued, atoms=(forged_atom, *issued.atoms[1:]))
+
+    with pytest.raises(SealBroken):
+        phase1_from_optimizer_selection(
+            forged,
+            ledger=ledger,
+            row_id="delivery_finalizer/v2",
+            evaluation_id=f"subunit-seal-{field}",
+        )
+    assert ledger.events == (), "a broken selection must not mint a phase-1 root"
 
 
 # --------------------------------------------- Probe A / artifact / fixtures
