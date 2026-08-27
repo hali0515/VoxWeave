@@ -198,7 +198,7 @@ def apply_fixes(
         if isinstance(blocks[i].get("speakers"), list):
             fixed = restore_dash_layout(actual, fixed)
         new_texts[i] = fixed
-        applied.append(f)
+        applied.append({**f, "fixed": fixed})
     return new_texts, applied, rejected
 
 

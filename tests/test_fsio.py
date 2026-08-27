@@ -1,6 +1,8 @@
 # tests/test_fsio.py
 # Atomic file writes: replaceable artifacts use os.replace, while protected new
-# user sidecars use race-safe exclusive creation.
+# user sidecars publish completed content without overwriting concurrent files.
+
+import errno
 
 import pytest
 
@@ -42,17 +44,78 @@ def test_atomic_write_text_new_refuses_existing_file(tmp_path):
     assert list(tmp_path.iterdir()) == [dst]
 
 
-def test_atomic_write_text_new_does_not_require_hard_links(tmp_path, monkeypatch):
+def test_atomic_write_text_new_prefers_content_atomic_hard_link(tmp_path, monkeypatch):
     dst = tmp_path / "mapping.json"
 
-    def unavailable(*_args, **_kwargs):
-        raise PermissionError("hard links unsupported")
+    def unexpected_replace(*_args, **_kwargs):
+        raise AssertionError("hard-link capable filesystems must not use the fallback")
 
-    monkeypatch.setattr(fsio.os, "link", unavailable)
+    monkeypatch.setattr(fsio.os, "replace", unexpected_replace)
     fsio.atomic_write_text_new(dst, '{"version": 1}')
 
     assert dst.read_text(encoding="utf-8") == '{"version": 1}'
     assert list(tmp_path.iterdir()) == [dst]
+
+
+@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV])
+def test_atomic_write_text_new_claims_then_replaces_when_links_unavailable(
+    tmp_path, monkeypatch, link_errno
+):
+    dst = tmp_path / "mapping.json"
+    payload = '{"version": 1}'
+    real_replace = fsio.os.replace
+    replacements = []
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError(link_errno, "hard links unsupported")
+
+    def replace_owned_claim(src, target):
+        assert target == dst
+        assert dst.exists() and dst.stat().st_size == 0
+        assert src.read_text(encoding="utf-8") == payload
+        replacements.append((src, target))
+        real_replace(src, target)
+
+    monkeypatch.setattr(fsio.os, "link", unavailable)
+    monkeypatch.setattr(fsio.os, "replace", replace_owned_claim)
+    fsio.atomic_write_text_new(dst, payload)
+
+    assert dst.read_text(encoding="utf-8") == payload
+    assert len(replacements) == 1
+    assert list(tmp_path.iterdir()) == [dst]
+
+
+def test_atomic_write_text_new_fallback_still_refuses_existing_file(
+    tmp_path, monkeypatch
+):
+    dst = tmp_path / "mapping.json"
+    dst.write_text("user data", encoding="utf-8")
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    monkeypatch.setattr(fsio.os, "link", unavailable)
+    with pytest.raises(FileExistsError):
+        fsio.atomic_write_text_new(dst, "replacement")
+
+    assert dst.read_text(encoding="utf-8") == "user data"
+    assert list(tmp_path.iterdir()) == [dst]
+
+
+def test_atomic_write_text_new_does_not_publish_incomplete_content(
+    tmp_path, monkeypatch
+):
+    dst = tmp_path / "mapping.json"
+
+    def fail_fsync(_fd):
+        assert not dst.exists()
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(fsio.os, "fsync", fail_fsync)
+    with pytest.raises(OSError, match="simulated disk failure"):
+        fsio.atomic_write_text_new(dst, '{"version": 1}')
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_atomic_path_failure_preserves_existing_dst(tmp_path):

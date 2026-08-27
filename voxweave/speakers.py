@@ -37,7 +37,6 @@ Turn = tuple[float, float, str]
 _VOICE_WRAP_RE = re.compile(
     r"\A<v(?:[ \t]+([^>]*?))?>(.*)</v>\Z", re.IGNORECASE | re.DOTALL
 )
-_SRT_PREFIX_CANDIDATE_RE = re.compile(r"^([^:\r\n]{1,80}): (.+)$")
 
 
 def _valid_spans(spans: Sequence[Span] | None) -> list[Span]:
@@ -110,12 +109,12 @@ def _window(span: Span, target: float | None = None) -> Span:
 
 
 def _pick_spread(regions: Sequence[Span], limit: int) -> list[Span]:
-    """Pick long clean windows from the early, middle, and late thirds.
+    """Pick long clean windows near the early, middle, and late extent.
 
-    Each time bin considers windows from the original clean spans, rather than
-    clipping a span at the bin boundary.  That keeps a single 6-second utterance
-    as one useful clip instead of three adjacent 2-second fragments.  Distinct
-    picks retain at least a small temporal gap so cuts are genuinely spread.
+    Windows are always cut from whole clean spans, so a single 6-second
+    utterance stays one useful clip. The minimum gap applies only to multiple
+    cuts from the same continuous run; separately voiced runs remain eligible
+    even when their natural pause is shorter.
     """
     clean = [
         span for span in _merge_spans(regions) if span[1] - span[0] >= MIN_SNIPPET_S
@@ -129,48 +128,64 @@ def _pick_spread(regions: Sequence[Span], limit: int) -> list[Span]:
         (extent_start + bin_width * index, extent_start + bin_width * (index + 1))
         for index in range(bin_count)
     ]
-    picked: list[Span] = []
+    picked: list[tuple[Span, int]] = []
 
-    def separated(candidate: Span) -> bool:
-        return all(
-            candidate[1] + MIN_SNIPPET_GAP_S <= start
-            or end + MIN_SNIPPET_GAP_S <= candidate[0]
-            for start, end in picked
-        )
+    def separated(candidate: Span, source_index: int) -> bool:
+        for (start, end), picked_source in picked:
+            if source_index != picked_source:
+                continue
+            if not (
+                candidate[1] + MIN_SNIPPET_GAP_S <= start
+                or end + MIN_SNIPPET_GAP_S <= candidate[0]
+            ):
+                return False
+        return True
 
     for bin_start, bin_end in bins:
         target = (bin_start + bin_end) / 2.0
         candidates = [
-            _window(span, target)
-            for span in clean
+            (_window(span, target), source_index)
+            for source_index, span in enumerate(clean)
             if span[0] < bin_end and span[1] > bin_start
         ]
-        candidates = [span for span in candidates if separated(span)]
+        candidates = [
+            (span, source_index)
+            for span, source_index in candidates
+            if separated(span, source_index)
+        ]
         if not candidates:
             continue
-        best = max(
+        best, source_index = max(
             candidates,
-            key=lambda span: (
-                span[1] - span[0],
-                -abs((span[0] + span[1]) / 2.0 - target),
-                -span[0],
+            key=lambda item: (
+                item[0][1] - item[0][0],
+                -abs((item[0][0] + item[0][1]) / 2.0 - target),
+                -item[0][0],
             ),
         )
-        picked.append(best)
+        picked.append((best, source_index))
         if len(picked) == limit:
-            return sorted(picked)
+            return sorted(span for span, _source in picked)
 
-    # A narrow/empty time bin can hide another independent clean utterance.
-    # Fill from whole original spans only; never manufacture fragments beside a
-    # window already cut from the same continuous run.
+    # A narrow or empty time bin can leave another usable window unselected.
+    # Fill with centered whole-span windows, retaining the same-run gap above.
     while len(picked) < limit:
-        candidates = [_window(span) for span in clean]
-        candidates = [span for span in candidates if separated(span)]
+        candidates = [
+            (_window(span), source_index) for source_index, span in enumerate(clean)
+        ]
+        candidates = [
+            (span, source_index)
+            for span, source_index in candidates
+            if separated(span, source_index)
+        ]
         if not candidates:
             break
-        best = max(candidates, key=lambda span: (span[1] - span[0], -span[0]))
-        picked.append(best)
-    return sorted(picked)
+        best, source_index = max(
+            candidates,
+            key=lambda item: (item[0][1] - item[0][0], -item[0][0]),
+        )
+        picked.append((best, source_index))
+    return sorted(span for span, _source in picked)
 
 
 def select_snippets(
@@ -270,19 +285,23 @@ def load_speaker_mapping(
 
 
 _NAME_RECORD_SEPARATORS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
-_NAME_TRANSLATION = str.maketrans(
-    {char: " " for char in _NAME_RECORD_SEPARATORS} | {",": "，"}
-)
+_NAME_TRANSLATION = str.maketrans({char: " " for char in _NAME_RECORD_SEPARATORS})
+_NAME_ASCII_WHITESPACE_RE = re.compile(r"[ \t]+")
 
 
 def sanitize_speaker_name(name: str) -> str:
-    """Normalize a display name for every subtitle render format.
+    """Normalize record separators without changing display punctuation.
 
-    ASS uses commas as field separators and physical line separators as event
-    separators.  Apply the same safe spelling to VTT and SRT so moving between
-    formats never changes the rendered identity.
+    Only ASCII layout whitespace is collapsed; meaningful NBSP and ideographic
+    spaces remain as entered. ASS applies its comma escape separately.
     """
-    return " ".join(name.translate(_NAME_TRANSLATION).split())
+    normalized = name.translate(_NAME_TRANSLATION)
+    return _NAME_ASCII_WHITESPACE_RE.sub(" ", normalized).strip(" \t")
+
+
+def sanitize_ass_speaker_name(name: str) -> str:
+    """Normalize a name and escape ASS's unquotable comma field delimiter."""
+    return sanitize_speaker_name(name).replace(",", "，")
 
 
 def _normalized_name(value: object) -> str | None:
@@ -334,36 +353,6 @@ def strip_srt_speaker_prefixes(
     return plain, line_names[0], None
 
 
-def infer_srt_speaker_names(texts: Sequence[str]) -> list[str]:
-    """Infer names only from a high-confidence generated-SRT pattern.
-
-    A two-line cue whose prefixed bodies are both dash dialogue is the phase-1
-    renderer's distinctive dual-speaker form.  Once present, other prefixes in
-    the same document share that channel.  Without such a cue, require a name
-    to recur in separate cues; an isolated ``Name: dialogue`` remains literal.
-    """
-    candidates: list[tuple[int, str, str]] = []
-    dual_pattern = False
-    for cue_index, text in enumerate(texts):
-        per_cue: list[tuple[str, str]] = []
-        for line in text.split("\n"):
-            match = _SRT_PREFIX_CANDIDATE_RE.fullmatch(line)
-            if match is not None:
-                name = sanitize_speaker_name(match.group(1))
-                if name:
-                    per_cue.append((name, match.group(2)))
-                    candidates.append((cue_index, name, match.group(2)))
-        if len(per_cue) == 2 and all(re.match(r"^-\s*\S", body) for _, body in per_cue):
-            dual_pattern = True
-    if dual_pattern:
-        return list(dict.fromkeys(name for _cue, name, _body in candidates))
-
-    cue_ids: dict[str, set[int]] = {}
-    for cue_index, name, _body in candidates:
-        cue_ids.setdefault(name, set()).add(cue_index)
-    return [name for name, seen in cue_ids.items() if len(seen) >= 2]
-
-
 def _voice_name(name: str) -> str:
     """Escape a display name for a WebVTT voice annotation."""
     return html.escape(sanitize_speaker_name(name), quote=False)
@@ -377,9 +366,9 @@ def speaker_layout(
 ) -> tuple[str | None, list[str | None] | None]:
     """Resolve safe cue/line names for the current rendered text layout.
 
-    Text-mutating stages can collapse or wrap lines after names were parsed.
-    When line metadata no longer matches, preserve every distinct name as one
-    cue-level label instead of silently discarding the metadata.
+    Text-mutating stages can collapse or wrap lines after names were parsed. A
+    single remaining identity can safely become a cue label; several distinct
+    identities stay unnamed instead of producing an unmappable composite.
     """
     cue_name = _normalized_name(speaker)
     line_names = (
@@ -389,9 +378,9 @@ def speaker_layout(
         if any(line_names):
             return None, line_names
     if line_names:
-        combined = " / ".join(dict.fromkeys(name for name in line_names if name))
-        if combined:
-            return combined, None
+        distinct = list(dict.fromkeys(name for name in line_names if name))
+        if len(distinct) == 1:
+            return distinct[0], None
     return (cue_name or None), None
 
 
@@ -445,11 +434,12 @@ def strip_voice_tags(text: str) -> tuple[str, str | None, list[str | None] | Non
     dash cue where named and unnamed speakers may be mixed.
     """
 
-    def unwrap(value: str) -> tuple[str, str] | None:
+    def unwrap(value: str) -> tuple[str, str | None] | None:
         match = _VOICE_WRAP_RE.fullmatch(value)
-        if match is None or not (match.group(1) or "").strip():
+        if match is None:
             return None
-        return match.group(2), html.unescape(match.group(1).strip())
+        name = html.unescape((match.group(1) or "").strip())
+        return match.group(2), name if name.strip() else None
 
     whole = unwrap(text)
     if whole is not None and not re.search(r"</?v(?:\s|>)", whole[0], re.IGNORECASE):
@@ -714,10 +704,10 @@ __all__ = [
     "build_clip_command",
     "create_speaker_audition",
     "extract_clip",
-    "infer_srt_speaker_names",
     "load_speaker_display_names",
     "load_speaker_mapping",
     "run_clip_command",
+    "sanitize_ass_speaker_name",
     "sanitize_speaker_name",
     "select_snippets",
     "speaker_layout",

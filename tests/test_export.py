@@ -95,6 +95,46 @@ def test_export_srt_input_to_vtt_and_ass(tmp_path):
     assert "Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,hello\\Nworld" in ass
 
 
+def test_export_sidecarless_sdh_srt_preserves_literal_speaker_labels(tmp_path):
+    srt = tmp_path / "sdh.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nMAN: Get down!\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nMAN: Now!\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nWOMAN: I can't.\n\n"
+        "4\n00:00:07,000 --> 00:00:08,000\nWOMAN: Help me.\n",
+        encoding="utf-8",
+    )
+
+    export_subtitles(srt, ("vtt", "ass"))
+    vtt = (tmp_path / "sdh.vtt").read_text(encoding="utf-8")
+    ass = (tmp_path / "sdh.ass").read_text(encoding="utf-8")
+
+    assert "\nMAN: Get down!\n" in vtt
+    assert "\nWOMAN: Help me.\n" in vtt
+    assert "<v " not in vtt
+    assert "Default,,0,0,0,,MAN: Get down!" in ass
+    assert "Default,,0,0,0,,WOMAN: Help me." in ass
+
+
+def test_export_srt_ignores_corrupt_speaker_sidecar_once(tmp_path, caplog):
+    srt = tmp_path / "ep.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n", encoding="utf-8")
+    (tmp_path / "ep.speakers.json").write_text("", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        export_subtitles(srt, ("vtt",))
+
+    rendered = (tmp_path / "ep.vtt").read_text(encoding="utf-8")
+    assert "\nAoi: Hello\n" in rendered
+    assert (
+        sum(
+            "ignoring unreadable speaker mapping" in record.message
+            for record in caplog.records
+        )
+        == 1
+    )
+
+
 def test_export_ass_input_to_srt(tmp_path):
     ass = tmp_path / "ep.ass"
     ass.write_text(

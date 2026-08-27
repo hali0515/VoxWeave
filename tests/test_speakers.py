@@ -72,6 +72,30 @@ def test_select_snippets_keeps_one_six_second_run_as_one_long_clip():
     assert selected == {"SPEAKER_00": [(100.0, 106.0)]}
 
 
+def test_select_snippets_keeps_close_but_disjoint_clean_utterances():
+    selected = speakers.select_snippets(
+        [
+            (0.0, 2.5, "SPEAKER_00"),
+            (3.0, 5.5, "SPEAKER_00"),
+            (6.0, 8.5, "SPEAKER_00"),
+        ],
+        [(0.0, 8.5)],
+        [],
+    )
+
+    assert selected == {"SPEAKER_00": [(0.0, 2.5), (3.0, 5.5), (6.0, 8.5)]}
+
+
+def test_select_snippets_fill_can_reuse_one_clean_run_with_a_real_gap():
+    selected = speakers.select_snippets(
+        [(0.0, 3.5, "SPEAKER_00"), (100.0, 120.0, "SPEAKER_00")],
+        [(0.0, 200.0)],
+        [],
+    )
+
+    assert selected == {"SPEAKER_00": [(0.0, 3.5), (100.0, 106.0), (107.0, 113.0)]}
+
+
 def test_mapping_reader_ignores_empty_and_unknown_ids_once(tmp_path, caplog):
     mapping = tmp_path / "episode.speakers.json"
     mapping.write_text(
@@ -137,6 +161,16 @@ def test_vtt_voice_tags_strip_and_render_idempotently():
     assert blocks[1]["speakers"] == ["Aoi", "Ren"]
     spans = [(block["start"], block["end"]) for block in blocks]
     assert render_vtt(blocks, spans) == source
+
+
+@pytest.mark.parametrize(
+    "wrapped",
+    ["<v>Text</v>", "<v >Text</v>", "<v   >Text</v>", "<v &#10;>Text</v>"],
+)
+def test_whitespace_only_voice_annotations_strip_as_clean_text(wrapped):
+    assert speakers.strip_voice_tags(wrapped) == ("Text", None, None)
+    blocks = parse_vtt_blocks(f"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n{wrapped}\n")
+    assert blocks == [{"text": "Text", "start": 1.0, "end": 2.0}]
 
 
 def test_vtt_mixed_named_dash_line_round_trip():
@@ -207,13 +241,24 @@ def test_named_exports_sanitize_literal_and_entity_line_breaks(tmp_path):
 def test_all_named_renderers_share_structural_name_sanitization():
     rows = [(1.0, 2.0, "Hello")]
     blocks = [{"speaker": "Ren,\r\nKai\x1eMei\u2028Lin"}]
-    safe = "Ren， Kai Mei Lin"
+    display_safe = "Ren, Kai Mei Lin"
+    ass_safe = "Ren， Kai Mei Lin"
 
-    assert f"<v {safe}>Hello</v>" in render_vtt_rows(rows, blocks=blocks)
-    assert f"{safe}: Hello" in render_srt(rows, blocks=blocks)
+    assert f"<v {display_safe}>Hello</v>" in render_vtt_rows(rows, blocks=blocks)
+    assert f"{display_safe}: Hello" in render_srt(rows, blocks=blocks)
     ass = render_ass(rows, blocks=blocks)
-    assert f"Default,{safe},0,0,0,,Hello" in ass
+    assert f"Default,{ass_safe},0,0,0,,Hello" in ass
     assert "\r" not in ass and "\x1e" not in ass and "\u2028" not in ass
+
+
+def test_name_sanitization_preserves_non_ascii_display_spaces():
+    rows = [(1.0, 2.0, "Hello")]
+    name = "山田　太郎 / Jean\xa0Luc"
+    blocks = [{"speaker": name}]
+
+    assert f"<v {name}>Hello</v>" in render_vtt_rows(rows, blocks=blocks)
+    assert f"{name}: Hello" in render_srt(rows, blocks=blocks)
+    assert f"Default,{name},0,0,0,,Hello" in render_ass(rows, blocks=blocks)
 
 
 def test_named_srt_round_trip_recovers_clean_text_and_dash_metadata(tmp_path):
@@ -225,6 +270,15 @@ def test_named_srt_round_trip_recovers_clean_text_and_dash_metadata(tmp_path):
         "<v Aoi>-Stay</v>\n<v Ren>-Go</v>\n"
     )
     vtt.write_text(source, encoding="utf-8")
+    (tmp_path / "episode.speakers.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "speakers": {"SPEAKER_00": "Aoi", "SPEAKER_01": "Ren"},
+            }
+        ),
+        encoding="utf-8",
+    )
 
     export_subtitles(vtt, ("srt",))
     srt = tmp_path / "episode.srt"
@@ -303,7 +357,7 @@ def test_correct_keeps_all_names_when_a_fix_collapses_dual_speaker_lines(
     assert "<v Aoi>-Stay here</v>\n<v Ren>-Go now</v>" in rendered
 
 
-def test_translate_keeps_all_names_when_per_line_text_collapses():
+def test_distinct_line_names_render_unnamed_after_unrecoverable_collapse():
     blocks = parse_vtt_blocks(
         "WEBVTT\n\n"
         "00:00:01.000 --> 00:00:04.000\n"
@@ -314,12 +368,84 @@ def test_translate_keeps_all_names_when_per_line_text_collapses():
         blocks, {0: "你好 我的朋友 嗨"}, to_iso="zh"
     )
 
-    assert "<v Aoi / Ren>你好 我的朋友 嗨</v>" in rendered
+    assert "<v " not in rendered
+    assert "\n你好 我的朋友 嗨\n" in rendered
     srt = render_srt(
         [(1.0, 4.0, "你好 我的朋友 嗨")],
         blocks=[{"speakers": ["Aoi", "Ren"]}],
     )
-    assert "Aoi / Ren: 你好 我的朋友 嗨" in srt
+    assert "Aoi / Ren" not in srt
+    assert "\n你好 我的朋友 嗨\n" in srt
+    ass = render_ass(
+        [(1.0, 4.0, "你好 我的朋友 嗨")],
+        blocks=[{"speakers": ["Aoi", "Ren"]}],
+    )
+    assert "Default,Aoi / Ren,0,0,0,,你好 我的朋友 嗨" in ass
+
+
+def test_collapsed_names_do_not_bake_into_srt_round_trip(tmp_path, monkeypatch):
+    vtt = tmp_path / "episode.vtt"
+    vtt.write_text(
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:04.000\n"
+        "<v Aoi>Hello thre my friend</v>\n<v Ren>Hi</v>\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "episode.speakers.json").write_text(
+        '{"version":1,"speakers":{"S0":"Aoi","S1":"Ren"}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline.asrfix_mod,
+        "correct_cues",
+        lambda _payload, **_kwargs: [
+            {
+                "i": 0,
+                "orig": "Hello thre my friend Hi",
+                "fixed": "Hello there my friend Hi",
+                "reason": "typo",
+            }
+        ],
+    )
+
+    pipeline.correct(vtt, apply=True)
+    assert "<v " not in vtt.read_text(encoding="utf-8")
+    export_subtitles(vtt, ("srt",))
+    srt = tmp_path / "episode.srt"
+    assert "Aoi / Ren" not in srt.read_text(encoding="utf-8")
+    assert load_subtitle_blocks(srt)[0]["text"] == "Hello there my friend Hi"
+
+
+def test_correct_audit_records_reflowed_text_written_to_vtt(tmp_path, monkeypatch):
+    vtt = tmp_path / "episode.vtt"
+    vtt.write_text(
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:04.000\n"
+        "<v Aoi>-Stya here</v>\n<v Ren>-Go now</v>\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline.asrfix_mod,
+        "correct_cues",
+        lambda _payload, **_kwargs: [
+            {
+                "i": 0,
+                "orig": "-Stya here -Go now",
+                "fixed": "-Stay here -Go now",
+                "reason": "typo",
+            }
+        ],
+    )
+
+    result = pipeline.correct(vtt)
+    expected = "-Stay here\n-Go now"
+    audit = json.loads(result["audit"].read_text(encoding="utf-8"))
+
+    assert result["applied"][0]["fixed"] == expected
+    assert audit["applied"][0]["fixed"] == expected
+    assert "<v Aoi>-Stay here</v>\n<v Ren>-Go now</v>" in result["out"].read_text(
+        encoding="utf-8"
+    )
 
 
 def test_clip_builder_leaves_audio_stream_selection_to_ffmpeg():

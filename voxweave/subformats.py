@@ -249,24 +249,23 @@ def load_subtitle_blocks(path: Path) -> list[dict]:
     if is_ass:
         blocks = parse_ass_blocks(text)
     elif p.suffix.lower() == ".srt":
-        from voxweave.speakers import (
-            infer_srt_speaker_names,
-            load_speaker_display_names,
-        )
+        from voxweave.speakers import load_speaker_display_names
 
         mapping_path = p.parent / f"{p.stem}.speakers.json"
-        known_names = (
-            load_speaker_display_names(mapping_path) if mapping_path.exists() else ()
-        )
+        known_names: list[str] = []
+        if mapping_path.exists():
+            try:
+                known_names = load_speaker_display_names(mapping_path)
+            except (OSError, RuntimeError, UnicodeError) as exc:
+                log.warning(
+                    "%s: ignoring unreadable speaker mapping: %s",
+                    mapping_path.name,
+                    exc,
+                )
         if known_names:
             blocks = parse_vtt_blocks(text, srt_speaker_names=known_names)
         else:
             blocks = parse_vtt_blocks(text)
-            inferred = infer_srt_speaker_names(
-                [str(block.get("text", "")) for block in blocks]
-            )
-            if inferred:
-                blocks = parse_vtt_blocks(text, srt_speaker_names=inferred)
     else:
         blocks = parse_vtt_blocks(text)
     if not blocks:

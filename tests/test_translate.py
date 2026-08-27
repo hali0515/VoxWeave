@@ -321,6 +321,59 @@ def test_pipeline_translate_srt_mirrors_format(tmp_path, monkeypatch):
     assert "2\n00:00:03,000 --> 00:00:04,000\n世界" in txt
 
 
+def test_pipeline_translate_sidecarless_sdh_prefixes_as_dialogue(tmp_path, monkeypatch):
+    srt = tmp_path / "sdh.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nMAN: Get down!\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nMAN: Now!\n",
+        encoding="utf-8",
+    )
+    received = []
+
+    def fake_translate(payload, **_kwargs):
+        received.extend(payload)
+        return {0: "男人：趴下！", 1: "男人：快！"}
+
+    monkeypatch.setattr(pipeline.translate_mod, "translate_cues", fake_translate)
+
+    out = pipeline.translate(srt, to="zh")
+
+    assert received == [
+        {"i": 0, "t": "MAN: Get down!"},
+        {"i": 1, "t": "MAN: Now!"},
+    ]
+    rendered = out.read_text(encoding="utf-8")
+    assert "男人 趴下" in rendered and "男人 快" in rendered
+    assert "MAN:" not in rendered
+
+
+def test_pipeline_translate_ignores_corrupt_speaker_sidecar_once(
+    tmp_path, monkeypatch, caplog
+):
+    srt = tmp_path / "ep.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n", encoding="utf-8")
+    (tmp_path / "ep.speakers.json").write_text("{", encoding="utf-8")
+    received = []
+
+    def fake_translate(payload, **_kwargs):
+        received.extend(payload)
+        return {0: "葵：你好"}
+
+    monkeypatch.setattr(pipeline.translate_mod, "translate_cues", fake_translate)
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = pipeline.translate(srt, to="zh")
+
+    assert received == [{"i": 0, "t": "Aoi: Hello"}]
+    assert "葵 你好" in out.read_text(encoding="utf-8")
+    assert (
+        sum(
+            "ignoring unreadable speaker mapping" in record.message
+            for record in caplog.records
+        )
+        == 1
+    )
+
+
 def test_pipeline_translate_filters_srt_speaker_blocks_with_timed_rows(
     tmp_path, monkeypatch
 ):

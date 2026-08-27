@@ -185,6 +185,24 @@ def test_pack_accepts_srt_past_the_gate(tmp_path):
         mux.pack([srt])
 
 
+def test_pack_ignores_corrupt_srt_speaker_sidecar_at_gate(tmp_path, caplog):
+    srt = tmp_path / "ep.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nAoi: hi\n", encoding="utf-8")
+    (tmp_path / "ep.speakers.json").write_text("", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        with pytest.raises(FileNotFoundError, match="no sibling media"):
+            mux.pack([srt])
+
+    assert (
+        sum(
+            "ignoring unreadable speaker mapping" in record.message
+            for record in caplog.records
+        )
+        == 1
+    )
+
+
 def test_burn_accepts_ass_past_the_gate(tmp_path):
     ass = tmp_path / "ep.ass"
     ass.write_text(
@@ -564,6 +582,48 @@ def test_burn_failure_leaves_no_output(tmp_path, monkeypatch):
         mux.burn(vtt, output=out)
     assert not out.exists()
     assert not list(tmp_path.glob("*.part*"))
+
+
+def test_burn_ignores_corrupt_sidecar_and_keeps_sdh_prefix(
+    tmp_path, monkeypatch, caplog
+):
+    media = tmp_path / "sdh.mkv"
+    media.write_bytes(b"src")
+    srt = tmp_path / "sdh.srt"
+    srt.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nMAN: Get down!\n", encoding="utf-8"
+    )
+    (tmp_path / "sdh.speakers.json").write_text("{", encoding="utf-8")
+    captured = {}
+
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: [
+            {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720}
+        ],
+    )
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "libx264")
+
+    def fake_ok(cmd, *, capture):
+        filter_arg = cmd[cmd.index("-vf") + 1]
+        ass_path = Path(filter_arg.removeprefix("ass=").split(",format=", 1)[0])
+        captured["ass"] = ass_path.read_text(encoding="utf-8")
+        Path(cmd[-1]).write_bytes(b"burned")
+
+    monkeypatch.setattr(mux, "_run_ffmpeg", fake_ok)
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        out = mux.burn(srt, output=tmp_path / "sdh.burn.mkv", container="mkv")
+
+    assert out.read_bytes() == b"burned"
+    assert "Default,,0,0,0,,MAN: Get down!" in captured["ass"]
+    assert (
+        sum(
+            "ignoring unreadable speaker mapping" in record.message
+            for record in caplog.records
+        )
+        == 1
+    )
 
 
 # --- output must never be the source media ----------------------------------
