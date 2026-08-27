@@ -367,6 +367,36 @@ def test_generation_rechecks_live_media_after_matching_decision(tmp_path, monkey
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
 
 
+def test_generation_rechecks_live_media_at_mapping_install_edge(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    store_path = tmp_path / "voices.json"
+    _write_store(store_path)
+    _fake_clips(monkeypatch)
+    html_path = tmp_path / "episode.speakers.html"
+    original_html_write = speakers.fsio.atomic_write_text
+    mutated = []
+
+    def mutate_from_html_writer(path, content, **kwargs):
+        original_html_write(path, content, **kwargs)
+        if Path(path) == html_path:
+            media.write_bytes(b"replacement media in sampled region")
+            mutated.append(True)
+
+    monkeypatch.setattr(
+        speakers.fsio,
+        "atomic_write_text",
+        mutate_from_html_writer,
+    )
+
+    with pytest.raises(RuntimeError, match="media changed"):
+        speakers.create_speaker_audition(media, voices=store_path)
+
+    assert mutated == [True]
+    assert not (tmp_path / "episode.speakers.json").exists()
+    assert not html_path.exists()
+    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+
+
 def test_same_token_sidecar_content_change_aborts_revalidation(tmp_path, monkeypatch):
     media, _sibling, _sidecar = _write_episode(tmp_path)
     sidecar_path = tmp_path / "episode.voiceprints.json"

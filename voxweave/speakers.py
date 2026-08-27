@@ -16,7 +16,7 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, cast
@@ -943,6 +943,7 @@ def _publish_audition(
     page: str,
     skeleton: Mapping[str, object],
     suggest_record: Mapping[str, object] | None,
+    before_mapping_install: Callable[[], None] | None = None,
 ) -> None:
     from voxweave import pipeline
 
@@ -956,7 +957,9 @@ def _publish_audition(
             write_suggest(suggest_path, suggest_record)
         fsio.atomic_write_text(html_path, page)
         fsio.atomic_write_text_new(
-            mapping_path, json.dumps(skeleton, ensure_ascii=False, indent=2) + "\n"
+            mapping_path,
+            json.dumps(skeleton, ensure_ascii=False, indent=2) + "\n",
+            before_install=before_mapping_install,
         )
     except FileExistsError as exc:
         delete_suggest(suggest_path)
@@ -1158,7 +1161,8 @@ def create_speaker_audition(
             )
             if mapping_path.exists():
                 raise _mapping_exists_refusal(mapping_path)
-            if pair is not None:
+
+            def recheck_media_before_mapping_install() -> None:
                 assert snapshot_fingerprint is not None
                 try:
                     live_fingerprint = media_fingerprint(media)
@@ -1170,6 +1174,7 @@ def create_speaker_audition(
                     raise RuntimeError(
                         "media changed during speaker generation; re-run"
                     )
+
             _publish_audition(
                 media,
                 mapping_path=mapping_path,
@@ -1177,6 +1182,9 @@ def create_speaker_audition(
                 page=page,
                 skeleton=skeleton,
                 suggest_record=suggest_record,
+                before_mapping_install=(
+                    recheck_media_before_mapping_install if pair is not None else None
+                ),
             )
 
         with episode_lock(media):

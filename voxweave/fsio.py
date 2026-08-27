@@ -69,13 +69,24 @@ def atomic_write_text(
                 write_temp(tmp, fallback)
 
 
-def atomic_write_text_new(dst: Path, text: str, *, encoding: str = "utf-8") -> None:
+def atomic_write_text_new(
+    dst: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    before_install: Callable[[], None] | None = None,
+) -> None:
     """Atomically create a text file, raising ``FileExistsError`` if it exists.
 
     Prefer installing a completed, fsynced temp through an atomic hard link. On
     filesystems without hard links, atomically claim ``dst`` with ``O_EXCL`` and
     replace that claim with the completed temp. The fallback has a tiny crash
     window where an empty claim can remain, but never overwrites another writer.
+
+    ``before_install`` runs after the requested bytes are durable and adjacent
+    to each protected install attempt. A fallback from hard links to ``O_EXCL``
+    therefore invokes it again before claiming ``dst``. Raising leaves ``dst``
+    absent and removes the prepared temp.
     """
     dst = Path(dst)
     fd, name = tempfile.mkstemp(
@@ -87,6 +98,8 @@ def atomic_write_text_new(dst: Path, text: str, *, encoding: str = "utf-8") -> N
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+        if before_install is not None:
+            before_install()
         try:
             os.link(tmp, dst)
         except OSError as exc:
@@ -96,6 +109,8 @@ def atomic_write_text_new(dst: Path, text: str, *, encoding: str = "utf-8") -> N
                 errno.EXDEV,
             }:
                 raise
+            if before_install is not None:
+                before_install()
             claim_fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
             os.close(claim_fd)
             try:

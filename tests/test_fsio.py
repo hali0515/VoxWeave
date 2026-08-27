@@ -55,6 +55,41 @@ def test_atomic_write_text_new_creates_without_temp_residue(tmp_path):
     assert list(tmp_path.iterdir()) == [dst]
 
 
+def test_atomic_write_text_new_checks_authority_at_install_edge(tmp_path):
+    dst = tmp_path / "mapping.json"
+    checked = []
+
+    def check_authority():
+        assert not dst.exists()
+        checked.append(True)
+
+    fsio.atomic_write_text_new(
+        dst,
+        '{"version": 1}',
+        before_install=check_authority,
+    )
+
+    assert checked == [True]
+    assert dst.read_text(encoding="utf-8") == '{"version": 1}'
+    assert list(tmp_path.iterdir()) == [dst]
+
+
+def test_atomic_write_text_new_failed_install_check_publishes_nothing(tmp_path):
+    dst = tmp_path / "mapping.json"
+
+    def reject():
+        raise RuntimeError("authority changed")
+
+    with pytest.raises(RuntimeError, match="authority changed"):
+        fsio.atomic_write_text_new(
+            dst,
+            '{"version": 1}',
+            before_install=reject,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_atomic_write_text_new_refuses_existing_file(tmp_path):
     dst = tmp_path / "mapping.json"
     dst.write_text("user data", encoding="utf-8")
@@ -120,6 +155,31 @@ def test_atomic_write_text_new_fallback_still_refuses_existing_file(
 
     assert dst.read_text(encoding="utf-8") == "user data"
     assert list(tmp_path.iterdir()) == [dst]
+
+
+def test_atomic_write_text_new_fallback_rechecks_before_claim(tmp_path, monkeypatch):
+    dst = tmp_path / "mapping.json"
+    checks = []
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    def reject_second_install_attempt():
+        assert not dst.exists()
+        checks.append(True)
+        if len(checks) == 2:
+            raise RuntimeError("authority changed before claim")
+
+    monkeypatch.setattr(fsio.os, "link", unavailable)
+    with pytest.raises(RuntimeError, match="authority changed before claim"):
+        fsio.atomic_write_text_new(
+            dst,
+            '{"version": 1}',
+            before_install=reject_second_install_attempt,
+        )
+
+    assert checks == [True, True]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_atomic_write_text_new_does_not_publish_incomplete_content(
