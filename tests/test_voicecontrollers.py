@@ -308,9 +308,48 @@ def test_live_media_change_after_first_clip_aborts_without_mapping(
     assert not (tmp_path / "episode.speakers.json").exists()
 
 
+def test_failed_no_match_clip_clears_stale_suggestion(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    suggest_path = tmp_path / "episode.speakers.suggest.json"
+    suggest_path.write_text('{"stale": true}', encoding="utf-8")
+    monkeypatch.setattr(
+        speakers,
+        "extract_clip",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("clip edge")),
+    )
+
+    with pytest.raises(OSError, match="clip edge"):
+        speakers.create_speaker_audition(media, no_match=True)
+
+    assert not suggest_path.exists()
+    assert not (tmp_path / "episode.speakers.json").exists()
+
+
+def test_store_reread_failure_clears_stale_suggestion(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    store_path = tmp_path / "voices.json"
+    _write_store(store_path)
+    suggest_path = tmp_path / "episode.speakers.suggest.json"
+    suggest_path.write_text('{"stale": true}', encoding="utf-8")
+
+    def corrupt_store(_source, _start, _end, output):
+        store_path.write_text("{broken", encoding="utf-8")
+        Path(output).write_bytes(b"mp3")
+
+    monkeypatch.setattr(speakers, "extract_clip", corrupt_store)
+
+    with pytest.raises(Exception, match="invalid voices.json"):
+        speakers.create_speaker_audition(media, voices=store_path)
+
+    assert not suggest_path.exists()
+    assert not (tmp_path / "episode.speakers.json").exists()
+
+
 def test_same_token_sidecar_content_change_aborts_revalidation(tmp_path, monkeypatch):
     media, _sibling, _sidecar = _write_episode(tmp_path)
     sidecar_path = tmp_path / "episode.voiceprints.json"
+    suggest_path = tmp_path / "episode.speakers.suggest.json"
+    suggest_path.write_text('{"stale": true}', encoding="utf-8")
 
     def mutate_sidecar(_source, _start, _end, output):
         sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
@@ -324,6 +363,7 @@ def test_same_token_sidecar_content_change_aborts_revalidation(tmp_path, monkeyp
         speakers.create_speaker_audition(media)
 
     assert not (tmp_path / "episode.speakers.json").exists()
+    assert not suggest_path.exists()
 
 
 @pytest.mark.parametrize("failed_edge", ["suggest", "html", "mapping"])

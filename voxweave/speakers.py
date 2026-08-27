@@ -1162,25 +1162,32 @@ def create_speaker_audition(
                 )
         return html_path
 
-    if pair is not None:
-        snapshots = ExitStack()
-        try:
-            snapshot = snapshots.enter_context(MediaSnapshot(media))
-        except SnapshotUnavailable as exc:
-            snapshots.close()
-            _delete_stale_suggest_for_refusal(
-                media,
-                sibling_path=json_path,
-                sibling_bytes=sibling_bytes,
-            )
-            raise RuntimeError(
-                f"cannot validate declared voiceprints without a media snapshot: {exc}"
-            ) from exc
+    try:
+        if pair is not None:
+            snapshots = ExitStack()
+            try:
+                snapshot = snapshots.enter_context(MediaSnapshot(media))
+            except SnapshotUnavailable as exc:
+                snapshots.close()
+                raise RuntimeError(
+                    "cannot validate declared voiceprints without a media snapshot: "
+                    f"{exc}"
+                ) from exc
+            else:
+                with snapshots:
+                    output = generate_from(snapshot.path, snapshot.fingerprint)
         else:
-            with snapshots:
-                output = generate_from(snapshot.path, snapshot.fingerprint)
-    else:
-        output = generate_from(media, None)
+            output = generate_from(media, None)
+    except BaseException:
+        # A failed attempt must not leave an older machine claim behind. The
+        # helper rechecks the exact staged sibling and mapping absence under the
+        # episode lock, so it cannot erase a cooperating concurrent winner.
+        _delete_stale_suggest_for_refusal(
+            media,
+            sibling_path=json_path,
+            sibling_bytes=sibling_bytes,
+        )
+        raise
     log.info("wrote %s and %s", html_path.name, mapping_path.name)
     return output
 
