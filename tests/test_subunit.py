@@ -17,8 +17,18 @@ from pathlib import Path
 
 import pytest
 
-from voxweave.core.boundary_lattice import CAP_EPS_S, Edge, LatticeAtom
-from voxweave.core.boundary_v2 import materialize_cues, optimize_document
+from voxweave.core.boundary_lattice import (
+    CAP_EPS_S,
+    Edge,
+    IncrementalPacker,
+    LatticeAtom,
+    band_atoms,
+)
+from voxweave.core.boundary_v2 import (
+    _document_partition,
+    materialize_cues,
+    optimize_document,
+)
 from voxweave.core.layout import _join, _line_budget_width, _vis_width
 from voxweave.core.providers import degradation_capture
 from voxweave.core.segdoc import DisplayProfile, SegDocument, SourceUnit
@@ -898,6 +908,106 @@ def test_coarse_fixture_family_schema_and_per_case_gates() -> None:
         p90 = ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
         assert p90 <= 0.75, (case["id"], p90)
         assert max(errors) <= 2.0, (case["id"], max(errors))
+
+
+def test_coarse_candidate_spans_match_canonical_legality_both_directions() -> None:
+    """N14: direct refined-unit spans are admitted iff FinalText is legal."""
+    from voxweave.core.canonical_text import canonical_legal, canonical_text
+
+    corpus = json.loads(COARSE_CORPUS.read_text(encoding="utf-8"))
+    checked = 0
+    for fixture in corpus["cases"]:
+        _source_case, source = _sentence_merged_document(fixture)
+        shadow, _split = refine_document(source)
+        if shadow.language == "en":
+            continue
+        limit = band_atoms(shadow.profile) + 2
+        for start in range(len(shadow.units)):
+            packer = IncrementalPacker(
+                shadow.language,
+                shadow.profile.max_line_length,
+                shadow.profile.max_lines,
+            )
+            for end in range(start + 1, min(len(shadow.units), start + limit) + 1):
+                owned = shadow.units[start:end]
+                measure = packer.extend(owned[-1].surface)
+                raw = _join([item.surface for item in owned], shadow.language)
+                final = canonical_text(
+                    [
+                        {"text": item.surface, "start": item.start, "end": item.end}
+                        for item in owned
+                    ],
+                    fallback_text=raw,
+                    lang=shadow.language,
+                    profile=shadow.profile,
+                    expected_footprint=raw,
+                )
+                assert measure.fits is canonical_legal(final, shadow.profile), (
+                    fixture["id"],
+                    start,
+                    end,
+                    measure,
+                    final,
+                )
+                checked += 1
+    assert checked > 0
+
+
+def test_coarse_finalizer_stage_has_no_exit_driving_violations() -> None:
+    """N5: every refined coarse partition remains legal after finalization."""
+    from voxweave.core.authority import AuthorityLedger
+    from voxweave.core.finalizer import (
+        FinalizeEvidence,
+        FinalizePolicy,
+        finalize,
+        phase1_from_optimizer_selection,
+        register_optimizer_selection,
+    )
+    from voxweave.core.partition_check import check_partition
+
+    corpus = json.loads(COARSE_CORPUS.read_text(encoding="utf-8"))
+    line_capacity = 0
+    failures: dict[str, list[dict[str, object]]] = {}
+    for fixture in corpus["cases"]:
+        _source_case, source = _sentence_merged_document(fixture)
+        shadow, split = refine_document(source)
+        solution = optimize_document(shadow, subunit_split=split)
+        ledger = AuthorityLedger()
+        authority = register_optimizer_selection(solution, ledger=ledger)
+        phase1 = phase1_from_optimizer_selection(
+            authority,
+            ledger=ledger,
+            row_id="delivery_finalizer/v2",
+            evaluation_id=f"coarse-n5:{fixture['id']}",
+        )
+        delivered = finalize(
+            phase1,
+            profile=shadow.profile,
+            evidence=FinalizeEvidence(
+                shots=tuple(shadow.shot_changes or ()),
+                sing_spans=tuple(shadow.sing_spans or ()),
+            ),
+            policy=FinalizePolicy(),
+        )
+        checked = check_partition(
+            _document_partition(solution.solutions, len(shadow.units)),
+            delivered.cues,
+            units=shadow.units,
+            profile=shadow.profile,
+            origin="v2",
+            stage="finalizer",
+            reports=delivered.report.entries,
+            waivers={waiver.cue_index: waiver for waiver in delivered.report.waivers},
+        )
+        line_capacity += sum(
+            violation.kind == "line-capacity" for violation in checked.exit_driving
+        )
+        if checked.exit_driving:
+            failures[str(fixture["id"])] = [
+                violation.to_dict() for violation in checked.exit_driving
+            ]
+    assert line_capacity == 0, (line_capacity, sorted(failures))
+    assert failures == {}
 
 
 def test_refinement_metadata_cannot_be_attached_to_another_document() -> None:

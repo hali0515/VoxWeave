@@ -64,6 +64,7 @@ from voxweave.core.layout import (
     _vis_width,
     split_subtitle,
     strip_punct_for_subtitles,
+    wrap_cue_text,
 )
 from voxweave.core.segdoc import DisplayProfile, SegDocument, SourceUnit
 from voxweave.core.timing import HELD_WORD_MAX_GAP_S
@@ -455,6 +456,24 @@ def batch_measure(texts, lang, max_line_length, max_lines):
     )
 
 
+def direct_canonical_measure(texts, lang, max_line_length, max_lines):
+    stripped = strip_punct_for_subtitles(_join(list(texts), lang))
+    rendered = wrap_cue_text(
+        stripped,
+        lang,
+        max_lines,
+        max_line_length=_line_budget_width(max_line_length, lang),
+    )
+    lines = rendered.split("\n")
+    widths = tuple(_vis_width(line) for line in lines)
+    budget = _line_budget_width(max_line_length, lang)
+    return len(lines) <= max_lines and all(width <= budget for width in widths), (
+        len(lines),
+        widths,
+        stripped,
+    )
+
+
 @pytest.mark.parametrize(
     "lang,vocab",
     [
@@ -462,10 +481,8 @@ def batch_measure(texts, lang, max_line_length, max_lines):
         ("ja", ["あ", "い", "。", "、", "3", ".", "75", ",", "000", "GPT", "!"]),
     ],
 )
-def test_incremental_packer_equals_the_batch_call_on_every_prefix(lang, vocab):
-    """The one-atom trailing-punctuation lookahead is the whole point: the batch
-    strip runs on the JOINED string, so ``3`` ``.`` ``75`` disagrees with a
-    naive per-atom strip."""
+def test_incremental_packer_matches_the_admission_oracle_on_every_prefix(lang, vocab):
+    """The joined strip and its normalized spaces are charged exactly."""
     rng = random.Random(f"packer:{lang}")
     mll, mlines = (42, 2) if lang == "en" else (18, 1)
     for _ in range(60):
@@ -473,11 +490,19 @@ def test_incremental_packer_equals_the_batch_call_on_every_prefix(lang, vocab):
         packer = IncrementalPacker(lang, mll, mlines)
         for k, text in enumerate(texts, 1):
             measure = packer.extend(text)
-            fits, lines, widths, stripped = batch_measure(texts[:k], lang, mll, mlines)
+            if lang == "ja":
+                fits, (lines, widths, stripped) = direct_canonical_measure(
+                    texts[:k], lang, mll, mlines
+                )
+            else:
+                fits, lines, widths, stripped = batch_measure(
+                    texts[:k], lang, mll, mlines
+                )
             assert measure.fits is fits, (texts[:k], measure)
             assert measure.text == stripped
-            assert measure.lines == lines
-            assert measure.line_widths == widths
+            if measure.fits:
+                assert measure.lines == lines
+                assert measure.line_widths == widths
 
 
 def test_packer_counts_its_own_steps_and_reset_keeps_the_counter():

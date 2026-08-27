@@ -845,6 +845,7 @@ class _PackState:
         "token_ascii",
         "gap",
         "held",
+        "held_gap",
         "finished",
         "cur_width",
         "cur_open",
@@ -857,6 +858,7 @@ class _PackState:
         self.token_ascii = False
         self.gap = ""
         self.held: str | None = None
+        self.held_gap = ""
         self.finished: list[int] = []
         self.cur_width = 0
         self.cur_open = False
@@ -869,6 +871,7 @@ class _PackState:
         other.token_ascii = self.token_ascii
         other.gap = self.gap
         other.held = self.held
+        other.held_gap = self.held_gap
         other.finished = list(self.finished)
         other.cur_width = self.cur_width
         other.cur_open = self.cur_open
@@ -876,13 +879,15 @@ class _PackState:
 
 
 class IncrementalPacker:
-    """Prefix-extension oracle that agrees with the batch layout call exactly.
+    """Prefix-extension oracle over the normalized display stream.
 
-    The batch answer is ``_fits_budget(strip_punct_for_subtitles(_join(texts,
-    lang)), ...)``, and the naive way to get it per prefix is to redo all four
-    passes every time. That is not merely slower: it is the reason a tile-free
-    exact DP looked expensive in the first place, since edge features dominated
-    the measured cost.
+    The input projection is ``strip_punct_for_subtitles(_join(texts, lang))``,
+    and the naive way to get it per prefix is to redo all four passes every
+    time. That is not merely slower: it is the reason a tile-free exact DP looked
+    expensive in the first place, since edge features dominated the measured
+    cost.  For no-space languages, normalized spaces remain real delivered
+    cells: the fold charges one when adjacent tokens stay on a line and drops it
+    only when that boundary becomes a line break.
 
     Each pass is a left-to-right fold with bounded lookahead, so the whole chain
     streams:
@@ -982,15 +987,15 @@ class IncrementalPacker:
                 state.token += char
             return
         if char == " ":
-            if state.token and state.token_ascii:
-                state.gap += char
-            else:
-                self._close_token(state)
+            self._close_token(state)
+            # The strip pass emits one normalized space.  Keep it as the gap
+            # before the next token so packing charges it when both tokens stay
+            # on one line and drops it when the line breaks at that boundary.
+            state.gap = char
             return
         if _is_ascii_run_char(char):
             if state.token and state.token_ascii:
-                state.token += state.gap + char
-                state.gap = ""
+                state.token += char
             else:
                 self._close_token(state)
                 state.token = char
@@ -1004,24 +1009,31 @@ class IncrementalPacker:
             self._emit_token(state, state.token)
         state.token = ""
         state.token_ascii = False
-        state.gap = ""
 
     def _emit_token(self, state: _PackState, token: str) -> None:
         if not self._no_spaces:
             self._commit_token(state, token)
             return
+        gap_before = state.gap
+        state.gap = ""
         if state.held is not None:
-            if token in _UNIT_GLYPHS and state.held[-1:].isdigit():
+            if not gap_before and token in _UNIT_GLYPHS and state.held[-1:].isdigit():
                 state.held += token
                 return
-            self._commit_token(state, state.held)
+            self._commit_token(state, state.held, gap_before=state.held_gap)
         state.held = token
+        state.held_gap = gap_before
 
     # -- stage D: greedy first-fit packing -----------------------------------
 
-    def _commit_token(self, state: _PackState, token: str) -> None:
+    def _commit_token(
+        self, state: _PackState, token: str, *, gap_before: str | None = None
+    ) -> None:
         width = _vis_width(token)
-        extra = self._sep_width if state.cur_open else 0
+        separator_width = (
+            self._sep_width if gap_before is None else _vis_width(gap_before)
+        )
+        extra = separator_width if state.cur_open else 0
         if state.cur_open and state.cur_width + width + extra > self._budget:
             state.finished.append(state.cur_width)
             state.cur_width = width
@@ -1036,8 +1048,9 @@ class IncrementalPacker:
             tail = self._feed(state, self._resolve(self._hold, None))
         self._close_token(state)
         if state.held is not None:
-            self._commit_token(state, state.held)
+            self._commit_token(state, state.held, gap_before=state.held_gap)
             state.held = None
+            state.held_gap = ""
         widths = list(state.finished)
         if state.cur_open:
             widths.append(state.cur_width)
