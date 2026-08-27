@@ -186,13 +186,8 @@ _BOM_ENCODINGS = (
 _FALLBACK_ENCODINGS = ("gb18030", "cp1252")
 
 
-def read_subtitle_text(path: Path) -> str:
-    """Read a subtitle file tolerating the encodings found in the wild: any BOM
-    (UTF-8/16/32) decides outright, then strict UTF-8, then the fallback chain
-    (logged, since the guess can be wrong). Raises RuntimeError with a
-    convert-to-UTF-8 hint when nothing decodes."""
-    p = Path(path)
-    data = p.read_bytes()
+def decode_subtitle_bytes(data: bytes, name: str) -> str:
+    """Decode one already-snapshotted subtitle byte string."""
     for bom, enc in _BOM_ENCODINGS:
         if data.startswith(bom):
             return data.decode(enc)
@@ -205,12 +200,21 @@ def read_subtitle_text(path: Path) -> str:
             text = data.decode(enc)
         except UnicodeDecodeError:
             continue
-        log.warning("%s is not UTF-8; decoded as %s", p.name, enc)
+        log.warning("%s is not UTF-8; decoded as %s", name, enc)
         return text
     raise RuntimeError(
-        f"{p.name}: cannot determine text encoding"
+        f"{name}: cannot determine text encoding"
         f" (tried utf-8, {', '.join(_FALLBACK_ENCODINGS)}); convert the file to UTF-8"
     )
+
+
+def read_subtitle_text(path: Path) -> str:
+    """Read a subtitle file tolerating the encodings found in the wild: any BOM
+    (UTF-8/16/32) decides outright, then strict UTF-8, then the fallback chain
+    (logged, since the guess can be wrong). Raises RuntimeError with a
+    convert-to-UTF-8 hint when nothing decodes."""
+    p = Path(path)
+    return decode_subtitle_bytes(p.read_bytes(), p.name)
 
 
 def sniff_format(text: str) -> str | None:
@@ -231,13 +235,10 @@ def sniff_format(text: str) -> str | None:
     return None
 
 
-def load_subtitle_blocks(path: Path) -> list[dict]:
-    """Read and parse a subtitle file by extension -> cue blocks; raise when the
-    format is unsupported, the content belongs to the other parser family (an
-    ASS file renamed ``.vtt`` would otherwise parse into garbage cues), or the
-    file yields no cues."""
+def load_subtitle_blocks_bytes(path: Path, data: bytes) -> list[dict]:
+    """Parse exact staged subtitle bytes using ``path`` for format context."""
     p = require_subtitle(path)
-    text = read_subtitle_text(p)
+    text = decode_subtitle_bytes(data, p.name)
     is_ass = p.suffix.lower() in (".ass", ".ssa")
     sniffed = sniff_format(text)
     if sniffed is not None and (sniffed == "ass") != is_ass:
@@ -276,6 +277,15 @@ def load_subtitle_blocks(path: Path) -> list[dict]:
         raise RuntimeError(f"no cues in {p.name}")
     _sanitize_block_order(blocks, p.name)
     return blocks
+
+
+def load_subtitle_blocks(path: Path) -> list[dict]:
+    """Read and parse a subtitle file by extension -> cue blocks; raise when the
+    format is unsupported, the content belongs to the other parser family (an
+    ASS file renamed ``.vtt`` would otherwise parse into garbage cues), or the
+    file yields no cues."""
+    p = require_subtitle(path)
+    return load_subtitle_blocks_bytes(p, p.read_bytes())
 
 
 def _sanitize_block_order(blocks: list[dict], name: str) -> None:

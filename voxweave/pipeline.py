@@ -62,6 +62,7 @@ from voxweave.voicebase import (
     mint_capture_id,
     require_capture_id,
     require_sha256,
+    strict_json_object_loads,
     utc_timestamp,
     validate_voiceprints_mapping,
     write_voiceprints,
@@ -398,16 +399,23 @@ def _separate_to_16k_32k(
         raise
 
 
-def _load_sibling_json(json_path: Path, *, require: str | None = None) -> dict:
-    """Load a sibling ``.json`` with readable failures: a corrupt file or a
-    missing required key names the file and points at regeneration instead of
-    surfacing a bare JSONDecodeError/KeyError deep in the stack."""
-    json_path = Path(json_path)
+def _load_sibling_json_bytes(
+    json_path: Path,
+    raw: bytes,
+    *,
+    require: str | None = None,
+) -> dict:
+    """Decode the exact sibling bytes staged by an optimistic transaction."""
     try:
-        data = json.loads(json_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        detail = (
+            f"{e.msg} at line {e.lineno}"
+            if isinstance(e, json.JSONDecodeError)
+            else "invalid UTF-8"
+        )
         raise RuntimeError(
-            f"{json_path.name} is corrupt JSON ({e.msg} at line {e.lineno});"
+            f"{json_path.name} is corrupt JSON ({detail});"
             " re-run transcribe/process to regenerate it"
         ) from e
     if not isinstance(data, dict):
@@ -421,6 +429,44 @@ def _load_sibling_json(json_path: Path, *, require: str | None = None) -> dict:
             " re-run transcribe/process to regenerate it"
         )
     return data
+
+
+def _load_sibling_json(json_path: Path, *, require: str | None = None) -> dict:
+    """Load a sibling ``.json`` with readable failures: a corrupt file or a
+    missing required key names the file and points at regeneration instead of
+    surfacing a bare JSONDecodeError/KeyError deep in the stack."""
+    json_path = Path(json_path)
+    return _load_sibling_json_bytes(
+        json_path,
+        json_path.read_bytes(),
+        require=require,
+    )
+
+
+def _replay_voiceprint_pair(
+    data: Mapping[str, object],
+    raw: bytes,
+    *,
+    source: str,
+) -> tuple[str, str] | None:
+    """Return an exact grammar-valid replay pair, warning and dropping otherwise."""
+    if "voiceprint_capture" not in data and "voiceprint_media" not in data:
+        return None
+    try:
+        strict = strict_json_object_loads(
+            raw,
+            max_bytes=max(1, len(raw)),
+            source=source,
+        )
+        capture = require_capture_id(
+            strict.get("voiceprint_capture"),
+            "voiceprint_capture",
+        )
+        media = require_sha256(strict.get("voiceprint_media"), "voiceprint_media")
+    except Phase2DataError as exc:
+        log.warning("%s: dropping invalid voiceprint replay pair: %s", source, exc)
+        return None
+    return capture, media
 
 
 def resolve_segmentation_manifest(data: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -3859,7 +3905,17 @@ def split(
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
     json_path = swap_ext(Path(json_path), ".json")
-    data = _load_sibling_json(json_path, require="word_segments")
+    input_bytes = json_path.read_bytes()
+    data = _load_sibling_json_bytes(
+        json_path,
+        input_bytes,
+        require="word_segments",
+    )
+    voiceprint_pair = _replay_voiceprint_pair(
+        data,
+        input_bytes,
+        source=json_path.name,
+    )
     # Label what produced the document being replayed before touching it: split
     # re-segments, so it regenerates the manifest rather than preserving one.
     log.debug("replaying %s (%s)", json_path.name, resolve_segmentation_manifest(data))
@@ -3899,19 +3955,28 @@ def split(
     finally:
         _release_semantic_engine(semantic_engine)
     units, cues = segmented.units, segmented.cues
-    vtt_out = _write_siblings(
-        json_path,
-        cues,
-        units,
-        iso,
-        vad_speech=speech_spans,
-        timestamps=timestamps,
-        shot_changes=shot_changes,
-        sing_spans=sing_spans,
-        speaker_turns=speaker_turns,
-        manifest=segmented.manifest,
-        speaker_names=speaker_names,
-    )
+    with episode_lock(json_path):
+        try:
+            unchanged = json_path.read_bytes() == input_bytes
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            raise RuntimeError("input changed during replay; re-run")
+        vtt_out = _write_siblings(
+            json_path,
+            cues,
+            units,
+            iso,
+            vad_speech=speech_spans,
+            timestamps=timestamps,
+            shot_changes=shot_changes,
+            sing_spans=sing_spans,
+            speaker_turns=speaker_turns,
+            voiceprint_capture=(voiceprint_pair[0] if voiceprint_pair else None),
+            voiceprint_media=(voiceprint_pair[1] if voiceprint_pair else None),
+            manifest=segmented.manifest,
+            speaker_names=speaker_names,
+        )
     log.info("re-split %s → %d cues", vtt_out.name, len(cues))
     return vtt_out
 
@@ -3923,33 +3988,77 @@ def _prepare_16k_for_align(
     normalize: bool,
     reporter: Reporter,
     tmp: list[Path],
+    cache_media: Path | None = None,
+    source_fingerprint: str | None = None,
 ) -> Path:
     """Prepare 16k vocals for align; append temp paths to tmp. Return the 16k wav path.
 
-    Cache priority: 32k vocals flac -> legacy 16k flac -> re-run separation -> decode raw.
-    Either cache is used only while its duration still matches the source media
-    (_vocals_cache_fresh); a stale hit falls through to separation, which overwrites it.
+    ``media`` is the byte authority used for a cache miss. ``cache_media`` owns
+    the persistent cache namespace and defaults to the same path. When
+    ``source_fingerprint`` is present, only a fully validated v1 companion can
+    establish a hit; legacy duration-only caches remain unbound-only behavior.
     """
+    media = Path(media)
+    cache_owner = Path(cache_media) if cache_media is not None else media
+    bound = source_fingerprint is not None
     af = ASR_LOUDNORM if normalize else None
     if separate:
-        cache = cache_vocals_path(media)
-        if cache.exists() and _vocals_cache_fresh(cache, media):
-            reporter.stage("vocals cache (32k)")
-            log.info("reuse cached vocals %s", cache)
-            wav = decode_to_wav(cache, audio_filter=af)  # 32k flac -> 16k
-            tmp.append(wav)
-            return wav
-        legacy = cache_16k_path(media)
-        if legacy.exists() and _vocals_cache_fresh(legacy, media):
-            reporter.stage("vocals cache (16k legacy)")
-            log.info("reuse legacy 16k vocals %s", legacy)
-            return legacy
+        cache = cache_vocals_path(cache_owner)
+        separator_identity = backend.separator_identity() if bound else None
+        with cache_lock(cache) as cache_handle:
+            cache_hit = False
+            if cache_handle.cache_path.exists():
+                if bound:
+                    try:
+                        companion, _validated = load_cache_companion(
+                            cache_handle.companion_path
+                        )
+                        validate_cache_pair(
+                            companion,
+                            cache_handle.cache_path,
+                            media_fingerprint=source_fingerprint or "",
+                            separator=separator_identity or {},
+                        )
+                        cache_hit = True
+                    except (OSError, Phase2DataError):
+                        log.info(
+                            "vocals cache is not bound to this align source; "
+                            "re-separating: %s",
+                            cache_handle.cache_path,
+                        )
+                else:
+                    cache_hit = _vocals_cache_fresh(
+                        cache_handle.cache_path,
+                        cache_owner,
+                    )
+            if cache_hit:
+                reporter.stage("vocals cache (32k)")
+                log.info("reuse cached vocals %s", cache_handle.cache_path)
+                wav = decode_to_wav(
+                    cache_handle.cache_path,
+                    audio_filter=af,
+                )  # 32k flac -> 16k
+                tmp.append(wav)
+                return wav
+        if not bound:
+            legacy = cache_16k_path(cache_owner)
+            with cache_lock(legacy) as legacy_handle:
+                if legacy_handle.cache_path.exists() and _vocals_cache_fresh(
+                    legacy_handle.cache_path,
+                    cache_owner,
+                ):
+                    reporter.stage("vocals cache (16k legacy)")
+                    log.info("reuse legacy 16k vocals %s", legacy_handle.cache_path)
+                    wav = decode_to_wav(legacy_handle.cache_path, audio_filter=af)
+                    tmp.append(wav)
+                    return wav
         fullband, vocals, wav, voc32 = _separate_to_16k_32k(
             media, reporter=reporter, normalize=normalize
         )
         tmp.extend((fullband, vocals, wav, voc32))
         try:
-            _encode_flac(voc32, cache)
+            with cache_write_window(cache) as cache_handle:
+                _encode_flac(voc32, cache_handle.cache_path)
             log.info("cached vocals 32k → %s", cache)
         except (OSError, subprocess.CalledProcessError) as e:
             log.warning("cache vocals failed (non-fatal): %r", e)
@@ -3970,6 +4079,8 @@ def _write_align_json(
     shot_changes: list[float] | None = None,
     sing_spans: list[tuple[float, float]] | None = None,
     speaker_turns: list[tuple[float, float, str]] | None = None,
+    voiceprint_capture: str | None = None,
+    voiceprint_media: str | None = None,
     manifest: Mapping[str, Any] | None = None,
 ) -> None:
     """Update the sibling JSON with new alignment timing. Passes vad_speech,
@@ -4004,6 +4115,8 @@ def _write_align_json(
         shot_changes=shot_changes,
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
+        voiceprint_capture=voiceprint_capture,
+        voiceprint_media=voiceprint_media,
         manifest=manifest,
     )
 
@@ -4093,13 +4206,31 @@ def align(
     vtt_path = require_vtt(Path(vtt_path))  # align overwrites the input as VTT
     rep = reporter or Reporter()
     json_path = swap_ext(vtt_path, ".json")
-    data = _load_sibling_json(json_path) if json_path.exists() else {}
+    vtt_input_bytes = vtt_path.read_bytes()
+    json_input_bytes = json_path.read_bytes() if json_path.exists() else None
+    data = (
+        _load_sibling_json_bytes(json_path, json_input_bytes)
+        if json_input_bytes is not None
+        else {}
+    )
+    pair_declared = "voiceprint_capture" in data or "voiceprint_media" in data
+    voiceprint_pair = (
+        _replay_voiceprint_pair(
+            data,
+            json_input_bytes,
+            source=json_path.name,
+        )
+        if json_input_bytes is not None
+        else None
+    )
     # align re-times an existing cue stream; it never re-segments, so it only
     # labels (and later preserves) whatever produced that stream.
     log.debug("re-timing %s (%s)", vtt_path.name, resolve_segmentation_manifest(data))
     word_segments = data.get("word_segments", [])
 
-    blocks = _load_cues(vtt_path)
+    from voxweave.subformats import load_subtitle_blocks_bytes
+
+    blocks = load_subtitle_blocks_bytes(vtt_path, vtt_input_bytes)
 
     lang_name = lang_override or data.get("language") or "english"
     iso = to_iso_or(lang_name, "en")
@@ -4144,13 +4275,31 @@ def align(
 
     tmp: list[Path] = []
     tmp_chunks: list[Path] = []
+    snapshots = ExitStack()
+    selected_snapshot = None
+    acquisition_media = media
+    if voiceprint_pair is not None:
+        try:
+            selected_snapshot = snapshots.enter_context(MediaSnapshot(media))
+        except SnapshotUnavailable as exc:
+            log.warning(
+                "voiceprint binding will be omitted during align: "
+                "selected media snapshot unavailable: %s",
+                exc,
+            )
+        else:
+            acquisition_media = selected_snapshot.path
     try:
         wav = _prepare_16k_for_align(
-            media,
+            acquisition_media,
             separate=separate,
             normalize=normalize,
             reporter=rep,
             tmp=tmp,
+            cache_media=media,
+            source_fingerprint=(
+                selected_snapshot.fingerprint if selected_snapshot is not None else None
+            ),
         )
         block_units = _align_blocks(
             wav,
@@ -4183,8 +4332,6 @@ def align(
             )
         )
 
-        rep.stage("write VTT + JSON")
-        fsio.atomic_write_text(vtt_path, realign.render_vtt(blocks, spans_filled))
         # Preserve vad_speech / shot_changes from the original JSON (computed by
         # transcribe from the original media; align does not recompute them).
         keep_vad = _spans_in(data.get("vad_speech"))
@@ -4197,24 +4344,72 @@ def align(
         keep_manifest = (
             stored_manifest if isinstance(stored_manifest, Mapping) else None
         )
-        _write_align_json(
-            json_path,
-            blocks,
-            spans_filled,
-            all_units,
-            iso,
-            keep_vad,
-            keep_shots,
-            keep_sing,
-            keep_turns,
-            keep_manifest,
-        )
+        rendered_vtt = realign.render_vtt(blocks, spans_filled)
+
+        rep.stage("write VTT + JSON")
+        with episode_lock(vtt_path):
+            try:
+                vtt_unchanged = vtt_path.read_bytes() == vtt_input_bytes
+                if json_input_bytes is None:
+                    json_unchanged = not json_path.exists()
+                else:
+                    json_unchanged = json_path.read_bytes() == json_input_bytes
+            except OSError:
+                vtt_unchanged = json_unchanged = False
+            if not vtt_unchanged or not json_unchanged:
+                raise RuntimeError("input changed during replay; re-run")
+
+            preserve_pair = False
+            if voiceprint_pair is not None and selected_snapshot is not None:
+                try:
+                    live_fingerprint = media_fingerprint(media)
+                except OSError as exc:
+                    log.warning(
+                        "voiceprint binding omitted during align: "
+                        "selected media could not be rechecked: %s",
+                        exc,
+                    )
+                else:
+                    preserve_pair = (
+                        selected_snapshot.fingerprint == voiceprint_pair[1]
+                        and live_fingerprint == selected_snapshot.fingerprint
+                    )
+                    if not preserve_pair:
+                        log.warning(
+                            "voiceprint binding omitted during align: "
+                            "selected media does not match the sibling binding"
+                        )
+
+            fsio.atomic_write_text(vtt_path, rendered_vtt)
+            _write_align_json(
+                json_path,
+                blocks,
+                spans_filled,
+                all_units,
+                iso,
+                keep_vad,
+                keep_shots,
+                keep_sing,
+                keep_turns,
+                voiceprint_capture=(
+                    voiceprint_pair[0] if preserve_pair and voiceprint_pair else None
+                ),
+                voiceprint_media=(
+                    voiceprint_pair[1] if preserve_pair and voiceprint_pair else None
+                ),
+                manifest=keep_manifest,
+            )
+            if pair_declared and not preserve_pair:
+                _delete_after_primary(voiceprints_path(vtt_path))
+                _delete_after_primary(speakers_suggest_path(vtt_path))
+                _delete_after_primary(speakers_html_path(vtt_path))
         log.info(
             "aligned %s → %d cues, %d units", vtt_path.name, len(blocks), len(all_units)
         )
         return vtt_path
     finally:
         # Release aligner singleton VRAM (separation self-releases earlier).
+        snapshots.close()
         backend.release()
         for p in tmp:
             p.unlink(missing_ok=True)
