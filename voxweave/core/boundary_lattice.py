@@ -1138,6 +1138,7 @@ class Edge:
     # predecessor path reaches it.  Such an edge has no single candidate-global
     # input span; boundary_v2 resolves it as part of its predecessor-state DP.
     evidence_deferred: bool = False
+    evidence_unavailable_reason: str | None = None
 
     @property
     def vis_width(self) -> int:
@@ -1165,6 +1166,14 @@ class Edge:
                     "evidence_span": self.evidence_span.to_dict(),
                     "input_span": [self.input_start, self.input_end],
                     "lyric": self.lyric,
+                }
+            )
+        elif self.evidence_unavailable_reason is not None:
+            result.update(
+                {
+                    "evidence_span_refusal": self.evidence_unavailable_reason,
+                    "input_span": [self.input_start, self.input_end],
+                    "lyric": False,
                 }
             )
         return result
@@ -2093,20 +2102,12 @@ class DocumentLattice:
     sentence_ends: SentenceEnds
 
 
-def _resolve_candidate_evidence(
+def _resolve_edge_input_bounds(
     edge: Edge,
-    lattice: IntervalLattice,
-    document: SegDocument,
     *,
     previous_end: float,
-) -> Edge:
-    """Resolve one edge with the phase-1 predecessor bound it will consume."""
-    from .speaker_evidence import lyric_for_evidence, make_evidence_span
-
-    low = lattice.unit_bound(edge.start_node)
-    high = lattice.unit_bound(edge.end_node)
-    if low >= high:
-        return edge
+) -> tuple[float, float]:
+    """The total phase-1 input-bound authority shared by every materializer."""
     input_start = (
         float(edge.span_start)
         if edge.span_start is not None and math.isfinite(edge.span_start)
@@ -2117,12 +2118,47 @@ def _resolve_candidate_evidence(
         if edge.span_end is not None and math.isfinite(edge.span_end)
         else input_start
     )
-    span = make_evidence_span(
+    return input_start, input_end
+
+
+def _resolve_candidate_evidence(
+    edge: Edge,
+    lattice: IntervalLattice,
+    document: SegDocument,
+    *,
+    previous_end: float,
+) -> Edge:
+    """Resolve one edge with the phase-1 predecessor bound it will consume."""
+    from .speaker_evidence import (
+        EVIDENCE_SPAN_REFUSAL_REVERSED,
+        lyric_for_evidence,
+        try_make_evidence_span,
+    )
+
+    low = lattice.unit_bound(edge.start_node)
+    high = lattice.unit_bound(edge.end_node)
+    if low >= high:
+        return edge
+    input_start, input_end = _resolve_edge_input_bounds(
+        edge,
+        previous_end=previous_end,
+    )
+    span = try_make_evidence_span(
         document.units,
         (low, high),
         input_start=input_start,
         input_end=input_end,
     )
+    if span is None:
+        return dataclass_replace(
+            edge,
+            evidence_span=None,
+            lyric=False,
+            input_start=input_start,
+            input_end=input_end,
+            evidence_deferred=False,
+            evidence_unavailable_reason=EVIDENCE_SPAN_REFUSAL_REVERSED,
+        )
     return dataclass_replace(
         edge,
         evidence_span=span,
@@ -2130,6 +2166,7 @@ def _resolve_candidate_evidence(
         input_start=input_start,
         input_end=input_end,
         evidence_deferred=False,
+        evidence_unavailable_reason=None,
     )
 
 

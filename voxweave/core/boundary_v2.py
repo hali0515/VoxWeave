@@ -68,6 +68,7 @@ from .boundary_lattice import (
     build_document_lattice,
     _cache_candidate_evidence,
     _canonical_pack_measure,
+    _resolve_edge_input_bounds,
     held_chain_continuous,
     preflight_profile,
     span_max,
@@ -92,6 +93,7 @@ from .subunit import (
     speech_span_units,
 )
 from .speaker_evidence import (
+    EVIDENCE_SPAN_REFUSAL_REVERSED,
     W_SPEAKER_INTERIOR,
     EvidenceSpan,
     SpeakerPricingSummary,
@@ -103,6 +105,7 @@ from .speaker_evidence import (
     speaker_edge_cost,
     speaker_evidence,
     summarize_speaker_prices,
+    try_make_evidence_span,
 )
 from .timing_preview import DisplayTimingPreview, LegacyCleanupPreview
 
@@ -175,6 +178,7 @@ class CostTables:
     speaker_context: CostContext | None = None
     fallback_start: float = 0.0
     predecessor_stateful: bool = False
+    speaker_pricing_refused: bool = False
 
 
 def build_cost_context(
@@ -282,20 +286,17 @@ def _resolve_edge_for_previous(
     previous_end: float,
 ) -> Edge:
     """Resolve/cache an edge against one actual predecessor-state value."""
-    input_start = (
-        float(edge.span_start)
-        if edge.span_start is not None and math.isfinite(edge.span_start)
-        else float(previous_end)
-    )
-    input_end = (
-        float(edge.span_end)
-        if edge.span_end is not None and math.isfinite(edge.span_end)
-        else input_start
+    input_start, input_end = _resolve_edge_input_bounds(
+        edge,
+        previous_end=previous_end,
     )
     if (
-        isinstance(edge.evidence_span, EvidenceSpan)
-        and edge.input_start == input_start
+        edge.input_start == input_start
         and edge.input_end == input_end
+        and (
+            isinstance(edge.evidence_span, EvidenceSpan)
+            or edge.evidence_unavailable_reason is not None
+        )
     ):
         return edge
 
@@ -303,12 +304,22 @@ def _resolve_edge_for_previous(
         lattice.unit_bound(edge.start_node),
         lattice.unit_bound(edge.end_node),
     )
-    evidence_span = make_evidence_span(
+    evidence_span = try_make_evidence_span(
         ctx.units,
         unit_range,
         input_start=input_start,
         input_end=input_end,
     )
+    if evidence_span is None:
+        return replace(
+            edge,
+            evidence_span=None,
+            lyric=False,
+            input_start=input_start,
+            input_end=input_end,
+            evidence_deferred=False,
+            evidence_unavailable_reason=EVIDENCE_SPAN_REFUSAL_REVERSED,
+        )
     return replace(
         edge,
         evidence_span=evidence_span,
@@ -316,6 +327,7 @@ def _resolve_edge_for_previous(
         input_start=input_start,
         input_end=input_end,
         evidence_deferred=False,
+        evidence_unavailable_reason=None,
     )
 
 
@@ -336,6 +348,8 @@ def _speaker_price(
         ctx,
         previous_end=previous_end,
     )
+    if resolved.evidence_unavailable_reason is not None:
+        return resolved, base
     if not isinstance(resolved.evidence_span, EvidenceSpan):
         raise ValueError("resolved speaker edge has no EvidenceSpan")
     unit_range = (
@@ -374,6 +388,7 @@ def build_cost_tables(
     base_edges: dict[tuple[int, int], CostBreakdown] = {}
     speaker_parts: list[CostBreakdown] = []
     predecessor_stateful = False
+    speaker_pricing_refused = False
     for edge in lattice.edges:
         left = document_nodes[edge.start_node]
         right = document_nodes[edge.end_node]
@@ -396,6 +411,10 @@ def build_cost_tables(
             )
             evidence_span = edge.evidence_span
             if not isinstance(evidence_span, EvidenceSpan):
+                if edge.evidence_unavailable_reason is not None:
+                    speaker_pricing_refused = True
+                    edges[key] = base
+                    continue
                 if not edge.evidence_deferred:
                     raise ValueError(
                         "speaker pricing requires cached candidate EvidenceSpan values"
@@ -408,6 +427,10 @@ def build_cost_tables(
                     previous_end=fallback_start,
                 )
                 evidence_span = representative.evidence_span
+                if representative.evidence_unavailable_reason is not None:
+                    speaker_pricing_refused = True
+                    edges[key] = base
+                    continue
                 if not isinstance(evidence_span, EvidenceSpan):
                     raise ValueError("deferred candidate did not resolve EvidenceSpan")
                 lyric = representative.lyric
@@ -425,6 +448,14 @@ def build_cost_tables(
             edges[key] = _with_speaker_cost(base, speaker)
         else:
             edges[key] = base
+
+    # A raw reversed-cue violation is already the typed outcome for this
+    # interval.  Do not let a subset of its candidates receive W3 terms while
+    # the complementary-endpoint candidate is intentionally unpriceable.
+    if speaker_pricing_refused:
+        edges = dict(base_edges)
+        speaker_parts = []
+        predecessor_stateful = False
 
     cuts: dict[int, CostBreakdown] = {}
     for node in lattice.nodes:
@@ -453,6 +484,7 @@ def build_cost_tables(
         ),
         fallback_start=float(fallback_start),
         predecessor_stateful=predecessor_stateful,
+        speaker_pricing_refused=speaker_pricing_refused,
     )
 
 
@@ -856,8 +888,6 @@ def materialize_cues(
     previous_end = float(fallback_start)
     for edge in edges:
         chunk = list(atoms[edge.start_node : edge.end_node])
-        display_start = edge.span_start
-        display_end = edge.span_end
         speech_start = edge.span_start
         speech_end = edge.span_end
         if provenance_aware and units is not None and chunk:
@@ -873,8 +903,10 @@ def materialize_cues(
             start = float(edge.input_start)
             end = float(edge.input_end)
         else:
-            start = previous_end if display_start is None else float(display_start)
-            end = start if display_end is None else float(display_end)
+            start, end = _resolve_edge_input_bounds(
+                edge,
+                previous_end=previous_end,
+            )
         word_data: list[Unit] = [
             {"text": atom.text, "start": atom.start, "end": atom.end} for atom in chunk
         ]

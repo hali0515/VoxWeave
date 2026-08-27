@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import random
 from dataclasses import replace
 
 import pytest
@@ -14,7 +15,7 @@ from voxweave.core.boundary_v2 import (
     optimize_document,
     selected_evidence_spans,
 )
-from voxweave.core.boundary_lattice import build_document_lattice
+from voxweave.core.boundary_lattice import build_document_lattice, preflight_units
 from voxweave.core.finalizer import (
     phase1_from_optimizer_selection,
     register_optimizer_selection,
@@ -241,6 +242,121 @@ def test_forced_chain_resolves_from_selected_predecessor_at_exact_lyric_half():
     assert explicit_interval.cues[1]["lyric"] is True
 
 
+def test_complementary_partial_endpoints_reach_the_same_typed_reversed_outcome():
+    doc = SegDocument(
+        language="en",
+        units=[source(0, "?", None, 6.8), source(1, ";", 6.83, None)],
+        profile=replace(profile(), max_cue_s=0.9),
+        vad_speech=None,
+        shot_changes=None,
+        sing_spans=None,
+        speaker_turns=[],
+        manifest={},
+        text="? ;",
+    )
+
+    ordinary = optimize_document(doc)
+    counterfactual = optimize_document(doc, speaker_weight=0.0)
+    ordinary_interval = ordinary.solutions[0]
+    explicit_interval = counterfactual.solutions[0]
+
+    assert preflight_units(doc.units) == ()
+    assert ordinary_interval.partition_units == explicit_interval.partition_units == ()
+    assert ordinary_interval.cues == explicit_interval.cues
+    assert (explicit_interval.cues[0]["start"], explicit_interval.cues[0]["end"]) == (
+        6.83,
+        6.8,
+    )
+    assert ordinary_interval.validator_raw.to_dict() == (
+        explicit_interval.validator_raw.to_dict()
+    )
+    assert (
+        ordinary.artifact["validator"]["raw"]
+        == (counterfactual.artifact["validator"]["raw"])
+    )
+    assert [
+        violation.kind for violation in explicit_interval.validator_raw.exit_driving
+    ] == ["reversed-cue"]
+
+    selected_edge = explicit_interval.lattice.edges[0]
+    assert selected_edge.evidence_span is None
+    assert selected_edge.evidence_unavailable_reason == "reversed-input-span"
+    assert selected_edge.to_dict()["evidence_span_refusal"] == "reversed-input-span"
+    assert explicit_interval.speaker_pricing is not None
+    assert explicit_interval.speaker_pricing.priced_edges == 0
+    selection = explicit_interval.selection
+    assert selection is not None
+    assert "speaker_interior" not in (
+        selection.policy_selected.edge_breakdowns[0].weighted_terms
+    )
+
+
+def test_seeded_complementary_partial_endpoint_totality_sweep():
+    """2,000 reproducible valid-source rows cover both cross-endpoint orders."""
+    rng = random.Random("p5-w3-complementary-endpoints-v1")
+    reversed_cases = 0
+    forward_cases = 0
+
+    for case_index in range(2_000):
+        first_end = round(rng.uniform(0.5, 120.0), 3)
+        # Stay below every hard-gap threshold so both complementary endpoints
+        # remain in the same admitted candidate, as in the reviewer's probe.
+        cross_delta = round(rng.uniform(-0.25, 0.25), 3)
+        if cross_delta == 0.0:
+            cross_delta = 0.001 if case_index % 2 else -0.001
+        second_start = round(first_end + cross_delta, 3)
+        doc = SegDocument(
+            language="en",
+            units=[
+                source(0, "?", None, first_end),
+                source(1, ";", second_start, None),
+            ],
+            profile=replace(profile(), max_cue_s=0.9),
+            vad_speech=None,
+            shot_changes=None,
+            sing_spans=None,
+            speaker_turns=[],
+            manifest={},
+            text="? ;",
+        )
+
+        ordinary = optimize_document(doc)
+        counterfactual = optimize_document(doc, speaker_weight=0.0)
+        ordinary_interval = ordinary.solutions[0]
+        explicit_interval = counterfactual.solutions[0]
+        assert ordinary_interval.partition_units == explicit_interval.partition_units
+        assert ordinary_interval.cues == explicit_interval.cues
+        assert ordinary_interval.validator_raw.to_dict() == (
+            explicit_interval.validator_raw.to_dict()
+        )
+
+        if second_start > first_end:
+            reversed_cases += 1
+            assert [
+                violation.kind
+                for violation in explicit_interval.validator_raw.exit_driving
+            ] == ["reversed-cue"]
+            assert explicit_interval.speaker_pricing is not None
+            assert explicit_interval.speaker_pricing.priced_edges == 0
+            edge = explicit_interval.lattice.edges[0]
+            assert edge.evidence_span is None
+            assert edge.evidence_unavailable_reason == "reversed-input-span"
+        else:
+            forward_cases += 1
+            assert selected_evidence_spans(counterfactual) == (
+                EvidenceSpan(
+                    second_start,
+                    first_end,
+                    "fabricated",
+                    "fabricated",
+                ),
+            )
+
+    assert reversed_cases + forward_cases == 2_000
+    assert reversed_cases > 0
+    assert forward_cases > 0
+
+
 def test_partially_untimed_candidate_caches_independent_endpoint_kinds():
     doc = SegDocument(
         language="en",
@@ -355,6 +471,40 @@ def test_cached_phase1_input_bounds_are_inside_the_selection_seal():
             ledger=ledger,
             row_id="delivery_finalizer/v2",
             evaluation_id="speaker-input-span-seal-negative",
+        )
+    assert ledger.events == ()
+
+
+def test_evidence_span_refusal_is_inside_the_selection_seal():
+    doc = SegDocument(
+        language="en",
+        units=[source(0, "?", None, 6.8), source(1, ";", 6.83, None)],
+        profile=replace(profile(), max_cue_s=0.9),
+        vad_speech=None,
+        shot_changes=None,
+        sing_spans=None,
+        speaker_turns=[],
+        manifest={},
+        text="? ;",
+    )
+    result = optimize_document(doc, speaker_weight=0.0)
+    ledger = AuthorityLedger()
+    authority = register_optimizer_selection(result, ledger=ledger)
+    first = authority.edges[0]
+    assert first.evidence_unavailable_reason == "reversed-input-span"
+    forged = replace(
+        authority,
+        edges=(
+            replace(first, evidence_unavailable_reason=None),
+            *authority.edges[1:],
+        ),
+    )
+    with pytest.raises(SealBroken):
+        phase1_from_optimizer_selection(
+            forged,
+            ledger=ledger,
+            row_id="delivery_finalizer/v2",
+            evaluation_id="speaker-evidence-refusal-seal-negative",
         )
     assert ledger.events == ()
 

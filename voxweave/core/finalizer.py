@@ -1735,6 +1735,7 @@ def _selection_payload(
                     edge.evidence_span.end_kind,
                 ],
                 edge.lyric,
+                edge.evidence_unavailable_reason,
             ]
             for edge in edges
         ],

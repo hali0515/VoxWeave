@@ -26,6 +26,7 @@ from .segdoc import SegDocument, SourceUnit, normalize_speaker_turn_bounds
 __all__ = [
     "BUCKET_KINDS",
     "ENDPOINT_KINDS",
+    "EVIDENCE_SPAN_REFUSAL_REVERSED",
     "EXPRESS_TOL_S",
     "SPEAKER_EDGE_RUN_MIN_S",
     "SPEAKER_MIN_RUN_S",
@@ -56,6 +57,7 @@ __all__ = [
     "speaker_edge_cost",
     "speaker_evidence",
     "summarize_speaker_prices",
+    "try_make_evidence_span",
 ]
 
 
@@ -65,6 +67,7 @@ SPEAKER_MIN_RUN_S: float = 0.2
 SPEAKER_EDGE_RUN_MIN_S: float = 0.12
 W_SPEAKER_INTERIOR: float = 3.0
 EXPRESS_TOL_S: float = 0.5
+EVIDENCE_SPAN_REFUSAL_REVERSED: str = "reversed-input-span"
 
 ENDPOINT_KINDS: tuple[str, ...] = ("exact", "fabricated")
 TURN_STATES: tuple[str, ...] = (
@@ -147,6 +150,51 @@ class EvidenceSpan:
         }
 
 
+def _evidence_span_components(
+    units: Sequence[SourceUnit],
+    unit_range: tuple[int, int],
+    *,
+    input_start: float,
+    input_end: float,
+) -> tuple[float, float, EndpointKind, EndpointKind]:
+    """Resolve the four constructor inputs without constructing a reversed span."""
+    low, high = _checked_unit_range(unit_range, len(units))
+    first, last = units[low], units[high - 1]
+    exact_start = first.provenance == "aligner" and _finite(first.start)
+    exact_end = last.provenance == "aligner" and _finite(last.end)
+    return (
+        float(cast("float", first.start)) if exact_start else input_start,
+        float(cast("float", last.end)) if exact_end else input_end,
+        "exact" if exact_start else "fabricated",
+        "exact" if exact_end else "fabricated",
+    )
+
+
+def try_make_evidence_span(
+    units: Sequence[SourceUnit],
+    unit_range: tuple[int, int],
+    *,
+    input_start: float,
+    input_end: float,
+) -> EvidenceSpan | None:
+    """Build the one EvidenceSpan, or return ``None`` for a reversed input fact.
+
+    Complementary partial endpoints can be valid at source preflight while the
+    selected aggregate cue is reversed.  The raw validator owns that typed
+    outcome; W3 must not turn it into an exception by constructing a type whose
+    invariant correctly forbids reversal.
+    """
+    start, end, start_kind, end_kind = _evidence_span_components(
+        units,
+        unit_range,
+        input_start=input_start,
+        input_end=input_end,
+    )
+    if end < start:
+        return None
+    return EvidenceSpan(start, end, start_kind, end_kind)
+
+
 def make_evidence_span(
     units: Sequence[SourceUnit],
     unit_range: tuple[int, int],
@@ -160,16 +208,15 @@ def make_evidence_span(
     bound is exact; every other endpoint uses the phase-1 input bound.  No
     parent envelope and no interior unit can substitute for an invalid endpoint.
     """
-    low, high = _checked_unit_range(unit_range, len(units))
-    first, last = units[low], units[high - 1]
-    exact_start = first.provenance == "aligner" and _finite(first.start)
-    exact_end = last.provenance == "aligner" and _finite(last.end)
-    return EvidenceSpan(
-        float(cast("float", first.start)) if exact_start else input_start,
-        float(cast("float", last.end)) if exact_end else input_end,
-        "exact" if exact_start else "fabricated",
-        "exact" if exact_end else "fabricated",
+    span = try_make_evidence_span(
+        units,
+        unit_range,
+        input_start=input_start,
+        input_end=input_end,
     )
+    if span is None:
+        raise SpeakerEvidenceError("evidence span is reversed")
+    return span
 
 
 def evidence_span_from_cue(cue: Mapping[str, Any]) -> EvidenceSpan:
