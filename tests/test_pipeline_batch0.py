@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from voxweave import backend, chunking, pipeline, songdet
+from voxweave import backend, chunking, diarize, pipeline, songdet
 from voxweave.config import gap_thresholds
 from voxweave.core.smart_split import smart_split_segments
 from voxweave.diarize import apply_speaker_format
@@ -108,7 +108,7 @@ def test_process_resnaps_shots_after_speaker_format(tmp_path, monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "transcribe",
-        lambda *a, **kw: ("en", UNITS, [(0.0, 3.6)], [], list(TURNS)),
+        lambda *a, **kw: ("en", UNITS, [(0.0, 3.6)], [], list(TURNS), None),
     )
     monkeypatch.setattr(
         "voxweave.shotdet.detect_shot_changes", lambda *a, **kw: list(SHOTS)
@@ -207,6 +207,46 @@ def test_transcribe_releases_panns_and_silero(tmp_path, monkeypatch):
     assert "panns" in released and "silero" in released
 
 
+def test_transcribe_returns_sixth_voiceprint_carrier(tmp_path, monkeypatch):
+    _stub_transcribe_models(monkeypatch, tmp_path)
+    turns = list(TURNS)
+    provenance = {"embedding_dim": 16}
+    seen: dict[str, object] = {}
+
+    def fake_diarize(*args, **kwargs):
+        seen.update(kwargs)
+        return diarize.DiarizationResult(
+            turns=turns,
+            centroids={"SPEAKER_00": [1.0, *([0.0] * 15)]},
+            provenance=provenance,
+        )
+
+    monkeypatch.setattr(diarize, "diarize_turns", fake_diarize)
+    monkeypatch.setattr(diarize, "release", lambda: None)
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"x")
+
+    result = pipeline.transcribe(
+        media,
+        separate=False,
+        diarize=True,
+        voiceprints=True,
+    )
+
+    assert len(result) == 6
+    capture = result[5]
+    assert capture is not None
+    assert capture.turns is result[4]
+    assert capture.turns is turns
+    assert capture.centroids["SPEAKER_00"][0] == 1.0
+    assert seen["want_embeddings"] is True
+    assert seen["audio_profile"] == {
+        "separated": False,
+        "normalized": False,
+        "sample_rate": 16000,
+    }
+
+
 def test_transcribe_releases_panns_even_when_it_fails(tmp_path, monkeypatch):
     """A failed run must not strand PANNs, deferral requested or not."""
     released: list[str] = []
@@ -235,7 +275,7 @@ def test_process_defers_panns_release_to_the_sdh_pass(tmp_path, monkeypatch):
 
     def fake_transcribe(*a, **kw):
         order.append(f"transcribe(release_panns={kw['release_panns']})")
-        return ("en", UNITS, None, [], [])
+        return ("en", UNITS, None, [], [], None)
 
     def fake_sidecar(*a, **kw):
         order.append("sdh")
@@ -258,7 +298,7 @@ def test_process_releases_panns_after_failed_sdh_sidecar(tmp_path, monkeypatch):
         raise RuntimeError("PANNs exploded")
 
     monkeypatch.setattr(
-        pipeline, "transcribe", lambda *a, **kw: ("en", UNITS, None, [], [])
+        pipeline, "transcribe", lambda *a, **kw: ("en", UNITS, None, [], [], None)
     )
     monkeypatch.setattr(pipeline, "_write_sdh_sidecar", boom)
     monkeypatch.setattr(songdet, "release_model", lambda: order.append("release"))

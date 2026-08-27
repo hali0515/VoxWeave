@@ -384,7 +384,7 @@ def test_process_sdh_sidecar_failure_does_not_lose_main_vtt(
     units = [{"text": "hello", "start": 0.0, "end": 1.0}]
 
     def fake_transcribe(*a, **kw):
-        return ("en", units, None, [], [])
+        return ("en", units, None, [], [], None)
 
     def boom_sdh(*a, **kw):
         raise RuntimeError("PANNs exploded")

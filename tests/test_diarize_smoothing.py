@@ -70,22 +70,33 @@ class _FakeSeg:
 
 
 class _FakeAnnotation:
-    def __init__(self, tracks):
+    def __init__(self, tracks, labels=None):
         self._tracks = tracks
+        self._labels = labels
 
     def itertracks(self, yield_label=False):
         for seg, name, label in self._tracks:
             yield (seg, name, label) if yield_label else (seg, name)
 
+    def labels(self):
+        if self._labels is not None:
+            return self._labels
+        return list(dict.fromkeys(label for _seg, _name, label in self._tracks))
+
 
 class _FakePipeline:
-    def __init__(self, tracks):
+    def __init__(self, tracks, *, labels=None, embeddings=None):
         self._tracks = tracks
+        self._labels = labels
+        self._embeddings = embeddings
         self.calls = []
 
     def __call__(self, file, **kwargs):
         self.calls.append((file, kwargs))
-        return _FakeAnnotation(self._tracks)
+        annotation = _FakeAnnotation(self._tracks, self._labels)
+        if kwargs.get("return_embeddings"):
+            return annotation, self._embeddings
+        return annotation
 
 
 def _wav(tmp_path):
@@ -102,8 +113,8 @@ def test_diarize_turns_smooths_output(monkeypatch, tmp_path):
     ]
     fake = _FakePipeline(tracks)
     monkeypatch.setattr(diarize, "_get_pipeline", lambda token: fake)
-    turns = diarize.diarize_turns(_wav(tmp_path), token="hf_test")
-    assert turns == [(0.0, 2.0, "SPEAKER_00")]
+    result = diarize.diarize_turns(_wav(tmp_path), token="hf_test")
+    assert result.turns == [(0.0, 2.0, "SPEAKER_00")]
 
 
 def test_diarize_turns_forwards_min_max_speakers(monkeypatch, tmp_path):
@@ -115,6 +126,36 @@ def test_diarize_turns_forwards_min_max_speakers(monkeypatch, tmp_path):
     _, kwargs = fake.calls[0]
     assert kwargs.get("min_speakers") == 2
     assert kwargs.get("max_speakers") == 3
+
+
+def test_embedding_rows_follow_labels_and_drop_zero_padding(monkeypatch, tmp_path):
+    tracks = [
+        (_FakeSeg(0.0, 1.0), "a", "SPEAKER_A"),
+        (_FakeSeg(1.0, 2.0), "b", "SPEAKER_B"),
+        (_FakeSeg(2.0, 3.0), "c", "SPEAKER_C"),
+    ]
+    fake = _FakePipeline(
+        tracks,
+        labels=["SPEAKER_B", "SPEAKER_A", "SPEAKER_C"],
+        embeddings=np.array(
+            [
+                [3.0, 4.0, *([0.0] * 14)],
+                [0.0, 0.0, 5.0, *([0.0] * 13)],
+                [0.0] * 16,
+            ]
+        ),
+    )
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda token: fake)
+
+    result = diarize.diarize_turns(
+        _wav(tmp_path), token="hf_test", want_embeddings=True
+    )
+
+    assert fake.calls[0][1]["return_embeddings"] is True
+    assert set(result.centroids or {}) == {"SPEAKER_A", "SPEAKER_B"}
+    assert (result.centroids or {})["SPEAKER_B"][:2] == pytest.approx([0.6, 0.8])
+    assert (result.centroids or {})["SPEAKER_A"][2] == pytest.approx(1.0)
+    assert result.provenance["embedding_dim"] == 16
 
 
 # --- min/max speaker plumbing -----------------------------------------------
@@ -160,7 +201,7 @@ def test_process_forwards_min_max_speakers_to_transcribe(tmp_path, monkeypatch):
     def fake_transcribe(path, **kw):
         captured.update(kw)
         units = [{"text": "hi", "start": 0.0, "end": 0.5}]
-        return "en", units, [(0.0, 0.5)], [], []
+        return "en", units, [(0.0, 0.5)], [], [], None
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
     pipeline.process(

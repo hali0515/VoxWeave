@@ -16,17 +16,20 @@ provide a token (VOXWEAVE_HF_TOKEN / HF_TOKEN env, or ``hf_token`` in the conf).
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import logging
 import math
 import os
 import warnings
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from voxweave import config
 from voxweave.core.schema import Cue
+from voxweave.voicebase import MAX_EMBEDDING_DIM, MIN_EMBEDDING_DIM
 
 if TYPE_CHECKING:
     from voxweave.core.smart_split import SplitThresholds
@@ -81,6 +84,151 @@ DIARIZE_DROP_CONTAINED_S = (
 )
 
 Turn = tuple[float, float, str]
+
+
+@dataclass(frozen=True)
+class DiarizationResult:
+    """Diarization turns plus optional, label-keyed speaker centroids."""
+
+    turns: list[Turn]
+    centroids: dict[str, list[float]] | None
+    provenance: dict[str, object]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _outer_config_identity() -> str:
+    """Hash the exact cached/local pyannote pipeline config, if discoverable."""
+    configured = Path(DIARIZE_MODEL)
+    if configured.is_file():
+        try:
+            return _sha256_file(configured)
+        except OSError:
+            return "unresolved"
+    if "@" in DIARIZE_MODEL:
+        model_id, revision = DIARIZE_MODEL.rsplit("@", 1)
+    else:
+        model_id, revision = DIARIZE_MODEL, None
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(
+            model_id,
+            "config.yaml",
+            revision=revision,
+            cache_dir=config.AUDIO_CACHE,
+        )
+        if isinstance(cached, str):
+            return _sha256_file(Path(cached))
+    except (ImportError, OSError, ValueError):
+        pass
+    return "unresolved"
+
+
+def _checkpoint_identity(pipeline: object) -> str:
+    """Return a content-addressed HF blob name, never a mutable local filename."""
+    embedder = getattr(pipeline, "_embedding", None)
+    raw_path = getattr(embedder, "embedding", None)
+    if not isinstance(raw_path, (str, os.PathLike)):
+        return "unresolved"
+    try:
+        resolved = Path(raw_path).resolve(strict=True)
+    except OSError:
+        return "unresolved"
+    return resolved.name if resolved.parent.name == "blobs" else "unresolved"
+
+
+def _package_version(distribution: str) -> str:
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "unresolved"
+
+
+def _build_provenance(
+    pipeline: object,
+    *,
+    embedding_dim: int | str,
+    audio_profile: Mapping[str, object] | None,
+    torch_version: str,
+) -> dict[str, object]:
+    embedding_model = getattr(pipeline, "embedding", "unresolved")
+    if not isinstance(embedding_model, str) or not embedding_model:
+        embedding_model = "unresolved"
+    audio: dict[str, object] = (
+        dict(audio_profile)
+        if audio_profile is not None
+        else {"separated": False, "normalized": False, "sample_rate": 16000}
+    )
+    return {
+        "diarization_model": DIARIZE_MODEL,
+        "outer_config_sha256": _outer_config_identity(),
+        "embedding_model": embedding_model,
+        "embedding_checkpoint": _checkpoint_identity(pipeline),
+        "embedding_dim": embedding_dim,
+        "audio": audio,
+        "pyannote_version": _package_version("pyannote.audio"),
+        "torch_version": torch_version,
+    }
+
+
+def _normalized_centroids(
+    annotation: object,
+    embeddings: object,
+) -> tuple[dict[str, list[float]] | None, int | str]:
+    """Map row i through labels()[i], dropping unusable padded rows."""
+    labels_method: Any = getattr(annotation, "labels", None)
+    if not callable(labels_method) or embeddings is None:
+        log.warning("diarization pipeline did not return label-keyed embeddings")
+        return None, "unresolved"
+    try:
+        labels = [str(label) for label in cast(Any, labels_method)()]
+        rows = list(cast(Any, embeddings))
+    except (TypeError, ValueError):
+        log.warning("diarization pipeline returned unusable embeddings")
+        return None, "unresolved"
+    if len(labels) != len(set(labels)):
+        log.warning("diarization pipeline returned duplicate speaker labels")
+        return None, "unresolved"
+    dimension: int | None = None
+    centroids: dict[str, list[float]] = {}
+    for index, label in enumerate(labels):
+        if index >= len(rows):
+            log.debug("dropping embedding-missing speaker %s", label)
+            continue
+        raw_row = rows[index]
+        try:
+            converted = raw_row.tolist() if hasattr(raw_row, "tolist") else raw_row
+            values = [float(value) for value in converted]
+        except (TypeError, ValueError, OverflowError):
+            log.debug("dropping malformed centroid for speaker %s", label)
+            continue
+        if dimension is None:
+            dimension = len(values)
+        elif len(values) != dimension:
+            log.warning("diarization pipeline returned ragged speaker embeddings")
+            return None, "unresolved"
+        norm = math.sqrt(math.fsum(value * value for value in values))
+        if (
+            not math.isfinite(norm)
+            or norm <= 0.0
+            or any(not math.isfinite(value) for value in values)
+        ):
+            log.debug("dropping zero/non-finite centroid for speaker %s", label)
+            continue
+        centroids[label] = [value / norm for value in values]
+    if dimension is None:
+        return None, "unresolved"
+    if not MIN_EMBEDDING_DIM <= dimension <= MAX_EMBEDDING_DIM:
+        log.warning("diarization pipeline returned unsupported embedding dimension")
+        return None, "unresolved"
+    return centroids, dimension
 
 
 def _env_float(name: str, default: float) -> float:
@@ -224,8 +372,10 @@ def diarize_turns(
     token: str | None = None,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
-) -> list[Turn]:
-    """Run diarization over ``wav_path`` and return sorted ``(start, end, label)`` turns."""
+    want_embeddings: bool = False,
+    audio_profile: Mapping[str, object] | None = None,
+) -> DiarizationResult:
+    """Run diarization and optionally return normalized, label-keyed centroids."""
     token = token or config.conf_hf_token()
     if not token:
         raise RuntimeError(
@@ -272,13 +422,27 @@ def diarize_turns(
             warnings.filterwarnings(
                 "ignore", message=r"TensorFloat-32 \(TF32\) has been disabled"
             )
-            annotation = pl({"waveform": wav, "sample_rate": int(sr)}, **kwargs)
+            raw_result = pl(
+                {"waveform": wav, "sample_rate": int(sr)},
+                return_embeddings=want_embeddings,
+                **kwargs,
+            )
     finally:
         torch.set_float32_matmul_precision(matmul_precision)
         torch.backends.cudnn.allow_tf32 = cudnn_tf32
+    if want_embeddings and isinstance(raw_result, tuple) and len(raw_result) == 2:
+        annotation, embeddings = raw_result
+        centroids, embedding_dim = _normalized_centroids(annotation, embeddings)
+    else:
+        annotation = raw_result
+        centroids = None
+        embedding_dim = "unresolved"
+        if want_embeddings:
+            log.warning("diarization pipeline cannot provide speaker embeddings")
+    annotation_view = cast(Any, annotation)
     turns = [
         (float(seg.start), float(seg.end), str(label))
-        for seg, _, label in annotation.itertracks(yield_label=True)
+        for seg, _, label in annotation_view.itertracks(yield_label=True)
     ]
     turns = _smooth_turns(turns)
     log.info(
@@ -286,7 +450,17 @@ def diarize_turns(
         len(turns),
         len({lb for _, _, lb in turns}),
     )
-    return turns
+    provenance = _build_provenance(
+        pl,
+        embedding_dim=embedding_dim,
+        audio_profile=audio_profile,
+        torch_version=str(torch.__version__),
+    )
+    return DiarizationResult(
+        turns=turns,
+        centroids=centroids,
+        provenance=provenance,
+    )
 
 
 def _smooth_turns(turns: Sequence[Turn]) -> list[Turn]:

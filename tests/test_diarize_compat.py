@@ -40,6 +40,9 @@ class _FakeAnnotation:
         for seg, name, label in self._tracks:
             yield (seg, name, label) if yield_label else (seg, name)
 
+    def labels(self):
+        return list(dict.fromkeys(label for _seg, _name, label in self._tracks))
+
 
 class _CapturePipeline:
     """Callable pipeline stub recording the exact input pyannote is handed."""
@@ -132,8 +135,8 @@ def test_diarize_turns_feeds_waveform_dict(monkeypatch, tmp_path):
     fake = _CapturePipeline()
     monkeypatch.setattr(diarize, "_get_pipeline", lambda token: fake)
 
-    turns = diarize.diarize_turns(wav_path, token="hf_test")
-    assert turns == [(0.0, 1.0, "SPEAKER_00")]
+    result = diarize.diarize_turns(wav_path, token="hf_test")
+    assert result.turns == [(0.0, 1.0, "SPEAKER_00")]
 
     file_arg, _ = fake.calls[0]
     assert isinstance(file_arg, dict)

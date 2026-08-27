@@ -117,6 +117,15 @@ MEDIA_EXTS = (
 )
 
 
+@dataclass(frozen=True)
+class VoiceprintCapture:
+    """Embedding evidence kept alive from diarization through episode commit."""
+
+    centroids: dict[str, list[float]]
+    provenance: dict[str, object]
+    turns: list[tuple[float, float, str]]
+
+
 def _release_semantic_engine(engine: Any | None) -> None:
     """Best-effort optional-model cleanup; never replace deterministic output."""
 
@@ -494,6 +503,7 @@ def transcribe(
     skip_songs: bool = False,
     keep_lyrics: bool = False,
     diarize: bool = False,
+    voiceprints: bool = False,
     normalize: bool = False,
     reporter: Reporter | None = None,
     debug: bool = False,
@@ -509,10 +519,12 @@ def transcribe(
     list[tuple[float, float]],
     list[tuple[float, float]],
     list[tuple[float, float, str]],
+    VoiceprintCapture | None,
 ]:
     """Run separation -> song skip -> VAD chunking -> ASR -> alignment.
 
-    Returns ``(iso_language, word_segments, vad_spans, sing_spans, speaker_turns)``.
+    Returns ``(iso_language, word_segments, vad_spans, sing_spans, speaker_turns,
+    voiceprint_capture)``. The original five positions remain unchanged.
     vad_spans are the original-audio speech intervals, persisted to JSON for gap
     splitting. ``keep_lyrics`` runs song detection but skips excision: sung regions go
     through ASR/alignment like dialogue, and the detected singing spans come back so
@@ -831,16 +843,44 @@ def transcribe(
             }
         )
         speaker_turns: list[tuple[float, float, str]] = []
+        voiceprint_capture: VoiceprintCapture | None = None
         if diarize:
             from voxweave import diarize as diarize_mod
 
             rep.stage("speaker diarization (pyannote)")
             try:
-                speaker_turns = diarize_mod.diarize_turns(
-                    wav, min_speakers=min_speakers, max_speakers=max_speakers
+                diarization = diarize_mod.diarize_turns(
+                    wav,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                    want_embeddings=voiceprints,
+                    audio_profile={
+                        "separated": separate,
+                        "normalized": normalize,
+                        "sample_rate": 16000,
+                        **(
+                            {
+                                "separator": {
+                                    "repo": backend.SEPARATOR_REPO,
+                                    "file": backend.SEPARATOR_REPO_FILE,
+                                    "checkpoint": "unresolved",
+                                    "config_sha256": "unresolved",
+                                }
+                            }
+                            if separate
+                            else {}
+                        ),
+                    },
                 )
             finally:
                 diarize_mod.release()
+            speaker_turns = diarization.turns
+            if voiceprints and diarization.centroids:
+                voiceprint_capture = VoiceprintCapture(
+                    centroids=diarization.centroids,
+                    provenance=diarization.provenance,
+                    turns=diarization.turns,
+                )
         panns_handoff = not release_panns
         return (
             iso,
@@ -848,6 +888,7 @@ def transcribe(
             vad_spans,
             sing_spans if keep_lyrics else [],
             speaker_turns,
+            voiceprint_capture,
         )
     finally:
         # Release ASR/alignment singleton VRAM (separation self-releases earlier).
@@ -3310,6 +3351,7 @@ def process(
     keep_lyrics: bool = False,
     sdh: bool = False,
     diarize: bool = False,
+    voiceprints: bool = False,
     word_segments: tuple[str, list[dict]] | None = None,
     asr_model: str | None = None,
     context: str | None = None,
@@ -3345,19 +3387,28 @@ def process(
     shot_changes: list[float] | None = None
     sing_spans: list[tuple[float, float]] | None = None
     speaker_turns: list[tuple[float, float, str]] | None = None
+    _voiceprint_capture: VoiceprintCapture | None = None
     if word_segments is not None:
         iso, units = word_segments
         iso, units = _reconcile_word_segment_language(
             iso, units, override=lang_override
         )
     else:
-        iso, units, vad_speech, sing_spans, speaker_turns = transcribe(
+        (
+            iso,
+            units,
+            vad_speech,
+            sing_spans,
+            speaker_turns,
+            _voiceprint_capture,
+        ) = transcribe(
             media_path,
             lang_override=lang_override,
             separate=separate,
             skip_songs=skip_songs,
             keep_lyrics=keep_lyrics,
             diarize=diarize,
+            voiceprints=voiceprints,
             normalize=normalize,
             reporter=reporter,
             debug=debug,

@@ -82,8 +82,8 @@ def test_diarize_disables_tf32_for_inference_and_restores(
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.allow_tf32 = True
     try:
-        turns = diarize.diarize_turns(tiny_wav, token="dummy")
-        assert turns == []
+        result = diarize.diarize_turns(tiny_wav, token="dummy")
+        assert result.turns == []
         assert pl.seen_matmul_tf32 is False
         assert pl.seen_cudnn_tf32 is False
         assert torch.get_float32_matmul_precision() == "high"
