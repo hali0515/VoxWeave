@@ -647,6 +647,44 @@ def test_optimizer_authority_rematerializes_and_seals_provenance() -> None:
         )
 
 
+def test_optimizer_factory_uses_its_sealed_owned_surface_as_canonical_footprint() -> (
+    None
+):
+    """N20: punctuation context may defeat no-footprint surface reconciliation.
+
+    A comma before a numeric unit is retained when unit surfaces are concatenated
+    but stripped when the English reconstruction inserts a space. The optimizer
+    authority already seals the exact owned source units, so their joined surface
+    is the hand-derived canonical footprint and no fallback is permitted.
+    """
+    from voxweave.core.authority import AuthorityLedger
+    from voxweave.core.finalizer import (
+        phase1_from_optimizer_selection,
+        register_optimizer_selection,
+    )
+
+    prof = profile("en", max_line_length=80, max_cue_s=0.0, min_cue_s=0.0, cps=0.0)
+    units = [
+        unit(surface, index * 0.35, index * 0.35 + 0.3, index=index)
+        for index, surface in enumerate(("If", "you", "have,", "24,", "32,"))
+    ]
+    solution = optimize_document(document(units, prof))
+    ledger = AuthorityLedger()
+    authority = register_optimizer_selection(solution, ledger=ledger)
+    stream = phase1_from_optimizer_selection(
+        authority,
+        ledger=ledger,
+        row_id="delivery_finalizer/v2",
+        evaluation_id="n20-owned-footprint",
+    )
+
+    assert len(stream.cues) == 1
+    assert stream.cues[0].text == "If you have 24 32"
+    assert not any(
+        report.kind == "canonical-text-fallback" for report in stream.cues[0].reports
+    )
+
+
 @pytest.mark.parametrize("field", ["unit_start", "unit_end", "fallback_start"])
 def test_optimizer_authority_seals_every_rematerialization_input(field: str) -> None:
     """Every W2 value consumed before phase 1 must remain under the W1 seal."""

@@ -609,7 +609,7 @@ def test_standalone_artifact_populates_speaker_block_and_w3_coverage():
     # measurement buckets are not yet attached instead of measuring raw cues as
     # if they were finalizer output.
     assert block["measurement"] is None
-    assert on.artifact["schema_version"] == 1
+    assert on.artifact["schema_version"] == 2
     assert on.artifact["delta_registry"] == [
         record.to_dict() for record in DELTA_REGISTRY
     ]

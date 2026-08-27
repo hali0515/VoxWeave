@@ -143,7 +143,7 @@ ENGINE_V2: str = "boundary-optimizer-v2"
 #: Live artifact schema version. W2 adds future-v2 fields to its standalone
 #: artifact, but W4 owns the flip after its assembler preserves that complete
 #: coverage contract instead of replacing it with the legacy coverage block.
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 
 #: How much worse than the raw optimum a legal v1 path may be and still be
 #: selected. A margin rather than an equality test because the point of the
@@ -278,6 +278,47 @@ def _document_nodes(lattice: IntervalLattice, layer: AtomLayer) -> tuple[int, ..
     return tuple(out)
 
 
+def _base_edge_cost(
+    lattice: IntervalLattice,
+    edge: Edge,
+    ctx: CostContext,
+) -> CostBreakdown:
+    """Price one edge from the same phase-1 facts materialization will use."""
+    document_nodes = _document_nodes(lattice, ctx.layer)
+    left = document_nodes[edge.start_node]
+    right = document_nodes[edge.end_node]
+    common = {
+        "profile": ctx.profile,
+        "preview": ctx.preview,
+        "next_start": ctx.next_start_after(right),
+        "sentence_cross_count": sum(
+            1 for node in ctx.sentence_nodes if left < node < right
+        ),
+    }
+    # The staged policy-1 solve remains the exact legacy experiment. Explicit
+    # P5 rows always carry UnitSpeakers (including an absent track), and consume
+    # the finalizer preview's input/acoustic split below.
+    if not isinstance(ctx.speaker_evidence, UnitSpeakers):
+        return edge_cost(edge, lattice.atoms, **common)
+
+    low = lattice.unit_bound(edge.start_node)
+    high = lattice.unit_bound(edge.end_node)
+    speech_start, speech_end = speech_span_units(ctx.units[low:high])
+    owned_footprint = _join(
+        [unit.surface for unit in ctx.units[low:high]], ctx.profile.language
+    )
+    return edge_cost(
+        edge,
+        lattice.atoms,
+        **common,
+        input_start=edge.input_start,
+        input_end=edge.input_end,
+        speech_start=speech_start,
+        speech_end=speech_end,
+        expected_footprint=owned_footprint,
+    )
+
+
 def _resolve_edge_for_previous(
     lattice: IntervalLattice,
     edge: Edge,
@@ -349,7 +390,7 @@ def _speaker_price(
         previous_end=previous_end,
     )
     if resolved.evidence_unavailable_reason is not None:
-        return resolved, base
+        return resolved, _base_edge_cost(lattice, resolved, ctx)
     if not isinstance(resolved.evidence_span, EvidenceSpan):
         raise ValueError("resolved speaker edge has no EvidenceSpan")
     unit_range = (
@@ -364,7 +405,12 @@ def _speaker_price(
         weight=ctx.speaker_weight,
         suppressed_lyric=resolved.lyric,
     )
-    return resolved, _with_speaker_cost(base, speaker)
+    # A fabricated start can inherit the selected predecessor's end. That value
+    # is a phase-1 input, so both the speaker term and the base preview price must
+    # be recomputed for the resolved edge rather than retaining a representative
+    # table entry produced with ``fallback_start``.
+    resolved_base = _base_edge_cost(lattice, resolved, ctx)
+    return resolved, _with_speaker_cost(resolved_base, speaker)
 
 
 def build_cost_tables(
@@ -381,27 +427,18 @@ def build_cost_tables(
     """
     profile = ctx.profile
     atoms = lattice.atoms
-    document_nodes = _document_nodes(lattice, ctx.layer)
-    sentence_nodes = ctx.sentence_nodes
-
     edges: dict[tuple[int, int], CostBreakdown] = {}
     base_edges: dict[tuple[int, int], CostBreakdown] = {}
     speaker_parts: list[CostBreakdown] = []
     predecessor_stateful = False
     speaker_pricing_refused = False
     for edge in lattice.edges:
-        left = document_nodes[edge.start_node]
-        right = document_nodes[edge.end_node]
-        base = edge_cost(
-            edge,
-            atoms,
-            profile=profile,
-            preview=ctx.preview,
-            next_start=ctx.next_start_after(right),
-            sentence_cross_count=sum(
-                1 for node in sentence_nodes if left < node < right
-            ),
-        )
+        priced_edge = edge
+        if isinstance(ctx.speaker_evidence, UnitSpeakers) and edge.evidence_deferred:
+            priced_edge = _resolve_edge_for_previous(
+                lattice, edge, ctx, previous_end=fallback_start
+            )
+        base = _base_edge_cost(lattice, priced_edge, ctx)
         key = (edge.start_node, edge.end_node)
         base_edges[key] = base
         if isinstance(ctx.speaker_evidence, UnitSpeakers):
@@ -775,8 +812,6 @@ class Selection:
     raw_optimum: PathResult
     policy_selected: PathResult
     selected_is_v1: bool
-    margin: float | None
-    low_margin: bool
     v1_path_legal: bool
     v1_illegality: str | None
     v1_cost_under_v2: CostBreakdown | None
@@ -815,7 +850,6 @@ def _select(
     v1: V1Partition | None,
 ) -> Selection:
     raw = dp.best
-    margin = None if dp.runner_up is None else quantize(dp.runner_up.total - raw.total)
 
     v1_path: PathResult | None = None
     illegality: str | None = None
@@ -834,13 +868,69 @@ def _select(
         raw_optimum=raw,
         policy_selected=v1_path if (within and v1_path is not None) else raw,
         selected_is_v1=within,
-        margin=margin,
-        low_margin=(margin is not None and margin < POLICY_MARGIN) or within,
         v1_path_legal=v1_path is not None,
         v1_illegality=illegality,
         v1_cost_under_v2=None if v1_path is None else v1_path.breakdown,
         v1_supplied=v1 is not None,
     )
+
+
+def _pinned_neighbour_margins(
+    lattice: IntervalLattice,
+    tables: CostTables,
+    selected: PathResult,
+) -> tuple[float, ...]:
+    """Best single-cut relocation delta with adjacent selected cuts pinned."""
+    if not selected.cuts:
+        return ()
+    edge_keys = {(edge.start_node, edge.end_node) for edge in lattice.edges}
+    chain = (0, *selected.cuts, len(lattice.atoms))
+    margins: list[float] = []
+    for index, cut in enumerate(selected.cuts):
+        previous_node, next_node = chain[index], chain[index + 2]
+        alternatives: list[float] = []
+        for candidate in lattice.nodes:
+            if (
+                candidate == cut
+                or not previous_node < candidate < next_node
+                or (previous_node, candidate) not in edge_keys
+                or (candidate, next_node) not in edge_keys
+            ):
+                continue
+            relocated = list(selected.cuts)
+            relocated[index] = candidate
+            try:
+                result = score_path(lattice, tables, relocated)
+            except ValueError:
+                continue
+            alternatives.append(quantize(result.total - selected.total))
+        if alternatives:
+            margins.append(min(alternatives))
+    return tuple(margins)
+
+
+def _nearest_rank(values: Sequence[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(0, math.ceil(percentile * len(ordered)) - 1)
+    return ordered[rank]
+
+
+def _margin_summary(
+    margins: Sequence[float], *, selected_cut_count: int
+) -> dict[str, Any] | None:
+    """Artifact-only pinned-neighbour relocation summary (nearest-rank)."""
+    if selected_cut_count == 0:
+        return None
+    values = tuple(margins)
+    return {
+        "count": len(values),
+        "exact_ties": sum(value == 0.0 for value in values),
+        "min": min(values) if values else None,
+        "p05": _nearest_rank(values, 0.05),
+        "p50": _nearest_rank(values, 0.50),
+    }
 
 
 # ---------------------------------------------------------- materialization
@@ -1213,6 +1303,7 @@ class IntervalSolution:
     packer_steps: int
     waivers: tuple[Waiver, ...] = ()
     speaker_pricing: SpeakerPricingSummary | None = None
+    decision_margins: tuple[float, ...] = ()
 
     @property
     def optimized(self) -> bool:
@@ -1260,8 +1351,12 @@ class IntervalSolution:
             else list(self.adopted.fallback_expansion_units),
             "infeasible": None if infeasible is None else infeasible.to_dict(),
             "interval_index": self.interval.index,
-            "low_margin": None if selection is None else selection.low_margin,
-            "margin": None if selection is None else selection.margin,
+            "margin_summary": _margin_summary(
+                self.decision_margins,
+                selected_cut_count=0
+                if selection is None
+                else len(selection.policy_selected.cuts),
+            ),
             "node_range": [self.interval.node_start, self.interval.node_end],
             "packer_steps": self.packer_steps,
             "policy_selected": None
@@ -1271,9 +1366,6 @@ class IntervalSolution:
             if selection is None
             else selection.raw_optimum.to_dict(),
             "relief_injections": self.lattice.relief_injections,
-            "runner_up_total": None
-            if selection is None or selection.margin is None
-            else quantize(selection.raw_optimum.total + selection.margin),
             "selected_is_v1": None
             if selection is None or not selection.v1_supplied
             else selection.selected_is_v1,
@@ -1380,6 +1472,9 @@ def optimize_interval(
 
     dp = solve_interval(lattice, tables)
     selection = _select(lattice, tables, dp, v1)
+    decision_margins = _pinned_neighbour_margins(
+        lattice, tables, selection.policy_selected
+    )
     chosen = selection.policy_selected
     selected_lattice, edges = _resolve_selected_path(lattice, tables, chosen.cuts)
     cues = materialize_cues(
@@ -1416,6 +1511,7 @@ def optimize_interval(
         packer_steps=lattice.packer_steps,
         waivers=waivers,
         speaker_pricing=tables.speaker_pricing,
+        decision_margins=decision_margins,
     )
 
 
@@ -1693,10 +1789,11 @@ def _artifact(
     )
     named_multi = 0
     if speakers is not None:
-        cues = tuple(cue for solution in solutions for cue in solution.cues)
+        materialized = tuple(solution for solution in solutions if solution.cues)
+        cues = tuple(cue for solution in materialized for cue in solution.cues)
         cue_ranges = tuple(
             pair
-            for solution in solutions
+            for solution in materialized
             for pair in zip(
                 (solution.unit_range[0], *solution.partition_units),
                 (*solution.partition_units, solution.unit_range[1]),
@@ -1706,7 +1803,15 @@ def _artifact(
             raise ValueError(
                 "selected cue ownership does not match materialized cue count"
             )
-        if cues:
+        complete_ownership = (
+            bool(cue_ranges)
+            and cue_ranges[0][0] == 0
+            and cue_ranges[-1][1] == unit_count
+            and all(
+                left[1] == right[0] for left, right in zip(cue_ranges, cue_ranges[1:])
+            )
+        )
+        if cues and complete_ownership:
             named_multi = named_multi_cues_unannotated(
                 cue_ranges, speakers.unit_speakers
             )
@@ -1729,6 +1834,15 @@ def _artifact(
         "kind": "segmentation-shadow",
         "language": document.language,
         "lanes": None,
+        "margin_summary": _margin_summary(
+            [margin for solution in solutions for margin in solution.decision_margins],
+            selected_cut_count=sum(
+                0
+                if solution.selection is None
+                else len(solution.selection.policy_selected.cuts)
+                for solution in solutions
+            ),
+        ),
         "pause_knees": {
             state: list(values)
             for state, values in sorted(pause_knees(document.profile).items())

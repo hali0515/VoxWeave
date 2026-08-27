@@ -57,6 +57,7 @@ from voxweave.core.boundary_cost import (
     transition_time,
 )
 from voxweave.core.boundary_lattice import Edge, LatticeAtom
+from voxweave.core.finalizer import FinalizerPreview
 from voxweave.core.segdoc import DisplayProfile
 from voxweave.core.timing_preview import LegacyCleanupPreview
 
@@ -542,6 +543,25 @@ def test_an_unresolvable_span_degrades_rather_than_raising():
     assert breakdown.total == pytest.approx(
         quantize(sum(breakdown.weighted_terms.values()))
     )
+
+
+def test_finalizer_preview_preserves_an_explicitly_anchorless_endpoint() -> None:
+    """N7: ``None`` is evidence, not the absence of an override argument."""
+    breakdown = edge_cost(
+        edge(start=0.0, end=0.2),
+        PAIR,
+        profile=profile(min_cue_s=1.0, cps=0.0, lag_out_s=0.0),
+        preview=FinalizerPreview(),
+        next_start=None,
+        sentence_cross_count=0,
+        input_start=0.0,
+        input_end=0.2,
+        speech_start=None,
+        speech_end=None,
+        expected_footprint="ab cd",
+    )
+    assert breakdown.features["preview_display_end"] == 0.2
+    assert breakdown.features["available_s"] == 0.2
 
 
 def test_the_sentence_algebra_prefers_splitting_a_clean_sentence_boundary():

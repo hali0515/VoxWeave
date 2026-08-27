@@ -1,4 +1,4 @@
-"""Contract tests for the P4 shadow harness (``calib_segmentation.py shadow``).
+"""Contract tests for the P5 shadow harness (``calib_segmentation.py shadow``).
 
 The shadow lane measures BoundaryOptimizer v2 beside the v1 answer that actually
 ships. Nothing it produces may reach the quality report, and nothing it reports
@@ -8,12 +8,12 @@ quietly relax --
 * ``SHADOW_GATES`` still has the tracked baseline's configured modes (three
   blocking, ``forbidden_end_rate`` warning), while the shared evaluator applies
   the same per-language sample promotion as the production quality report;
-* the three verdicts (C13 coverage, C14 non-inferiority, AD-2 locality) fold onto
-  the shared 0/1/2 exits with "invalid" outranking "failed";
-* a full run over a small synthetic corpus produces both lanes, both engines
+* the N4/N5 coverage, N1/N3 non-inferiority, and P1-P3 perturbation verdicts
+  fold onto the shared 0/1/2 exits with "invalid" outranking "failed";
+* a full run over a small synthetic corpus produces the complete lane/row matrix
   and a schema-valid aggregate;
-* the perturbation runner reports both lanes per probe, freezes the barrier set
-  in the pinned lane, and accounts for the influence cell;
+* the perturbation runner reports both natural and pinned recomputations, freezes
+  the barrier set in the pinned lane, and accounts for the influence cell;
 * the overlapping-``adopted_v1`` duplicate-cue annotation is never read as
   conservation evidence.
 
@@ -203,7 +203,7 @@ def test_shadow_gates_carry_the_tracked_baseline_modes() -> None:
     """The frozen literal must still describe the gate the corpus is armed with.
 
     ``SHADOW_GATES`` is deliberately not read from the baseline at run time -- a
-    baseline edit would otherwise redefine the P4 acceptance criterion silently.
+    baseline edit would otherwise redefine the P5 acceptance criterion silently.
     This is the seam that makes such an edit visible: it fails here, in a test
     whose message says which mode moved.
     """
@@ -358,7 +358,7 @@ def test_shadow_run_measures_both_lanes_and_both_engines(corpus_path: Path) -> N
         assert row.artifact["kind"] == "segmentation-shadow"
         assert row.artifact["engine_v2"] == "boundary-optimizer-v2"
         for lane in calib.SHADOW_LANES:
-            for engine in calib.SHADOW_ENGINES:
+            for engine in calib.SHADOW_LANE_ROWS[lane]:
                 result = row.lanes[(lane, engine)]
                 assert result.error is None, (lane, engine, result.error)
                 assert result.measurement is not None
@@ -380,7 +380,7 @@ def test_lane_aggregates_are_schema_valid(corpus_path: Path) -> None:
         for case in _cases(corpus, "en-01", "ja-01", "zh-01")
     ]
     for lane in calib.SHADOW_LANES:
-        for engine in calib.SHADOW_ENGINES:
+        for engine in calib.SHADOW_LANE_ROWS[lane]:
             groups = calib.lane_groups(rows, lane, engine)
             assert calib.shadow_group_errors(groups) == []
 
@@ -405,7 +405,9 @@ def test_shadow_cli_writes_a_report_and_leaves_quality_alone(
     assert report["metric_definition_digest"] == cc.canonical_digest(
         report["metric_definition"]
     )
-    assert report["gated_lane"] == calib.SHADOW_LANE_DELIVERY
+    assert report["schema_version"] == calib.SHADOW_SCHEMA_VERSION == 2
+    assert report["gated_lane"] == calib.SHADOW_LANE_FINALIZER
+    assert report["gated_row"] == "v2"
     assert set(report["lanes"]) == set(calib.SHADOW_LANES)
     assert report["ablation"] is None
     assert report["perturbation"] is None
@@ -850,24 +852,32 @@ def test_perturbation_driver_shape(corpus_path: Path) -> None:
 
 def _artifact_with(violations: list[dict], *, duplicated: bool, fallbacks: int) -> dict:
     empty = {"violations": [], "waivers": []}
+    lanes: dict[str, Any] = {}
+    for lane, row_ids in calib.SHADOW_LANE_ROWS.items():
+        rows = {row_id: {"validator": dict(empty)} for row_id in row_ids}
+        lanes[lane] = (
+            rows
+            if lane in {calib.SHADOW_LANE_CORE, calib.SHADOW_LANE_DELIVERY}
+            else {"rows": rows}
+        )
     return {
+        "schema_version": calib.SHADOW_SCHEMA_VERSION,
         "coverage": {
             "fallback_intervals": fallbacks,
             "fallback_ranges_overlap": duplicated,
             "fallback_unit_ranges": [[0, 4], [2, 8]] if duplicated else [],
             "optimized_intervals": 0,
             "optimized_unit_ratio": 1.0 if not fallbacks else 0.5,
+            "named_multi_cues_unannotated": 0,
             "raw_conservation_trustworthy": not duplicated,
             "unit_count": 8,
         },
-        "lanes": {
-            lane: {engine: {"validator": dict(empty)} for engine in ("v1", "v2")}
-            for lane in calib.SHADOW_LANES
-        },
+        "lanes": lanes,
         "validator": {
             "raw": {"violations": violations, "waivers": []},
             "core": dict(empty),
             "legacy_overlay": dict(empty),
+            "finalizer": dict(empty),
             "raw_duplicate_v1_cues": duplicated,
         },
     }
@@ -973,19 +983,58 @@ def _measurable(artifact: dict) -> dict:
     """Add the fields ``shadow_measurement_errors`` reads to a hand-built artifact."""
     artifact["lanes"][calib.SHADOW_LANE_CORE]["v2"]["projection_cross_check"] = {
         "agrees": True,
-        "mode": "atom-char-cursor",
+        "mode": "surface-reconciled",
     }
     artifact["coverage"]["v1_unprojected"] = False
     artifact["coverage"]["coarse_granularity_intervals"] = 0
     artifact["v1_projection"] = {
         "cut_count": 1,
-        "mode": "atom-char-cursor",
+        "mode": "parent-surface-translated",
         "unprojected": False,
+    }
+    for row in artifact["lanes"][calib.SHADOW_LANE_FINALIZER]["rows"].values():
+        row["finalizer"] = {
+            "stability_errors": [],
+            "trace_errors": [],
+            "valid": True,
+        }
+    finalizer_v2 = artifact["lanes"][calib.SHADOW_LANE_FINALIZER]["rows"]["v2"]
+    finalizer_v2["cues"] = [{"unit_range": [0, 8]}]
+    artifact["preview_fidelity"] = {
+        "checked_edges": 1,
+        "mismatches": [],
+        "scored_edges": 1,
+        "selected_rows": {
+            row_id: {"cue_count": 1, "edge_count": 1, "mismatches": []}
+            for row_id in ("v2", "v2-speaker-off")
+        },
+        "uncheckable_edges": 0,
+    }
+    zero = {
+        "buckets": {
+            "expressed": 0,
+            "policy_filtered": 0,
+            "survived_expressible_but_missed": 0,
+            "unattributed_loss": 0,
+            "unexpressible": 0,
+        },
+        "raw_in_speech_turn_changes": 0,
+    }
+    artifact["speaker_evidence"] = {
+        "measurement": dict(zero),
+        "measurement_refusal": None,
+        "off_row_measurement": dict(zero),
+        "projection": {
+            "cue_count": 1,
+            "named_multi_cues_unannotated": 0,
+            "range_count": 1,
+            "status": "verified",
+        },
     }
     return artifact
 
 
-@pytest.mark.parametrize("stage", ["raw", "core", "legacy_overlay"])
+@pytest.mark.parametrize("stage", calib.SHADOW_REQUIRED_STAGES)
 def test_a_missing_validator_stage_is_reported_and_is_not_a_clean_run(stage) -> None:
     """Bug pin: a falsy stage block used to read as "nothing to report".
 
@@ -1009,17 +1058,52 @@ def test_all_stages_present_reports_no_measurement_error() -> None:
     assert calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts) == []
 
 
-def test_a_disagreeing_projection_cross_check_invalidates_the_measurement() -> None:
-    """The delivery lane's whole metric set is read off that projection.
+def test_a_forged_finalizer_trace_invalidates_the_measurement() -> None:
+    artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
+    artifact["lanes"][calib.SHADOW_LANE_FINALIZER]["rows"]["v1"]["finalizer"][
+        "trace_errors"
+    ] = ["forged neighbour snapshot"]
+    counts = calib.shadow_violation_counts(artifact)
+    problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
+    assert any("trace_errors" in line and "'v1'" in line for line in problems)
 
-    ``lane_cue_stream`` rebuilds every gated-lane cue's ``word_data`` from the
-    projected unit range, so a wrong cursor moves cps_p90 and the mid-phrase rate
-    without moving a boundary. The check was computed and thrown away before.
+
+def test_a_preview_fidelity_mismatch_invalidates_the_measurement() -> None:
+    artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
+    artifact["preview_fidelity"]["mismatches"] = [{"edge_index": 0}]
+    counts = calib.shadow_violation_counts(artifact)
+    problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
+    assert any("N7 preview fidelity" in line for line in problems)
+
+
+def test_an_inconsistent_speaker_projection_invalidates_the_measurement() -> None:
+    artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
+    artifact["speaker_evidence"]["projection"]["range_count"] = 2
+    counts = calib.shadow_violation_counts(artifact)
+    problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
+    assert any("N19 speaker-id projection" in line for line in problems)
+
+
+def test_speaker_on_off_conservation_is_an_invalid_measurement_precondition() -> None:
+    artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
+    artifact["speaker_evidence"]["measurement"]["raw_in_speech_turn_changes"] = 1
+    counts = calib.shadow_violation_counts(artifact)
+    problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
+    assert any("does not conserve" in line for line in problems)
+    assert any("one raw denominator" in line for line in problems)
+
+
+def test_a_disagreeing_projection_cross_check_invalidates_the_measurement() -> None:
+    """Every measured lane row is keyed by that structural projection.
+
+    ``lane_cue_stream`` rebuilds cue ``word_data`` from the projected unit range,
+    so a bad reconciliation moves CPS and mid-phrase measurements without moving
+    a boundary.
     """
     artifact = _measurable(_artifact_with([], duplicated=False, fallbacks=0))
     artifact["lanes"][calib.SHADOW_LANE_CORE]["v2"]["projection_cross_check"] = {
         "agrees": False,
-        "mode": "atom-char-cursor",
+        "mode": "surface-reconciled",
     }
     counts = calib.shadow_violation_counts(artifact)
     problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)

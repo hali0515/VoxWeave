@@ -45,13 +45,20 @@ from .boundary_lattice import (
 )
 from .layout import (
     _line_budget_width,
-    _reading_chars,
     _two_line_break,
     _vis_width,
     _wrap_units,
 )
+from .schema import Unit
 from .segdoc import DisplayProfile, SourceUnit
-from .timing_preview import DisplayTimingPreview
+from .timing_preview import CueCandidate, DisplayTimingPreview, LegacyCleanupPreview
+
+
+class _UnsetPreviewFact:
+    """Distinguish an omitted override from an explicit acoustic ``None``."""
+
+
+_UNSET_PREVIEW_FACT = _UnsetPreviewFact()
 
 #: Bump before comparing two runs whose numbers were produced by different
 #: weights: an artifact is only meaningful against its own policy version.
@@ -571,6 +578,11 @@ def edge_cost(
     preview: DisplayTimingPreview,
     next_start: float | None,
     sentence_cross_count: int,
+    input_start: float | None | _UnsetPreviewFact = _UNSET_PREVIEW_FACT,
+    input_end: float | None | _UnsetPreviewFact = _UNSET_PREVIEW_FACT,
+    speech_start: float | None | _UnsetPreviewFact = _UNSET_PREVIEW_FACT,
+    speech_end: float | None | _UnsetPreviewFact = _UNSET_PREVIEW_FACT,
+    expected_footprint: str | None = None,
 ) -> CostBreakdown:
     """What one candidate cue costs, priced against its *display* duration.
 
@@ -590,38 +602,58 @@ def edge_cost(
     ``packed_line_count_raw``/``packed_balance_raw``, so the two readings can be
     compared in an artifact instead of being conflated in one field.
     """
-    available: float | None = None
-    if edge.span_start is not None and edge.span_end is not None:
-        available = preview.preview_display_span(
-            edge.span_start,
-            edge.span_end,
-            next_start,
-            # The RAW join, not the stripped projection. The pass this preview
-            # claims to mirror bit for bit (``timing._cleanup_cues``) reads
-            # ``cue["text"]``, and cleanup runs BEFORE the strip and the wrap in
-            # both engines -- so the CPS reading load it will use is the raw
-            # one. Handing the stripped text here made ``available_s``
-            # under-predict, always in the same direction, on every cue whose
-            # punctuation carried reading load.
+    word_data: list[Unit] = [
+        {"text": atom.text, "start": atom.start, "end": atom.end}
+        for atom in atoms[edge.start_node : edge.end_node]
+    ]
+    start = (
+        edge.span_start if isinstance(input_start, _UnsetPreviewFact) else input_start
+    )
+    end = edge.span_end if isinstance(input_end, _UnsetPreviewFact) else input_end
+    acoustic_start = (
+        edge.span_start if isinstance(speech_start, _UnsetPreviewFact) else speech_start
+    )
+    acoustic_end = (
+        edge.span_end if isinstance(speech_end, _UnsetPreviewFact) else speech_end
+    )
+    cue_preview = preview.preview_cue(
+        CueCandidate(
+            start=start,
+            end=end,
+            next_start=next_start,
             text=edge.text,
-            word_data=[
-                {"text": atom.text, "start": atom.start, "end": atom.end}
-                for atom in atoms[edge.start_node : edge.end_node]
-            ],
-            min_cue_s=profile.min_cue_s,
-            max_cue_s=profile.max_cue_s,
-            cps=profile.cps,
-            lag_out_s=profile.lag_out_s,
+            word_data=word_data,
+            speech_start=acoustic_start,
+            speech_end=acoustic_end,
+            profile=profile,
+            expected_footprint=expected_footprint,
         )
+    )
+    available: float | None = (
+        None
+        if cue_preview.display_start is None or cue_preview.display_end is None
+        else cue_preview.available_s
+    )
     usable = 0.0 if available is None else available
 
-    layout = rendered_layout(edge.display_text, profile)
-    if layout.source == "greedy-packer":
-        lines, balance = edge.lines, edge.balance
+    if isinstance(preview, LegacyCleanupPreview):
+        layout = rendered_layout(edge.display_text, profile)
+        if layout.source == "greedy-packer":
+            lines, balance = edge.lines, edge.balance
+        else:
+            lines, balance = layout.lines, layout.balance
+        layout_source = layout.source
+        width = edge.vis_width
     else:
-        lines, balance = layout.lines, layout.balance
-
-    width = edge.vis_width
+        widths = tuple(_vis_width(line) for line in cue_preview.final_text.split("\n"))
+        lines = cue_preview.line_count
+        balance = (
+            float(abs(widths[0] - widths[1]))
+            if lines == 2 and len(widths) == 2
+            else 0.0
+        )
+        layout_source = "preview-final-text"
+        width = max(widths, default=0)
     if width <= SHORT_FRAGMENT_TIGHT_MAX_W:
         fragment = SHORT_FRAGMENT_TIGHT
     elif width <= SHORT_FRAGMENT_LOOSE_MAX_W:
@@ -629,7 +661,7 @@ def edge_cost(
     else:
         fragment = 0.0
 
-    need = _reading_chars(edge.display_text) / profile.cps if profile.cps > 0 else 0.0
+    need = cue_preview.reading_chars / profile.cps if profile.cps > 0 else 0.0
     reading = W_READING * max(0.0, need - usable) / need if need > 0 else 0.0
     floor = profile.min_cue_s
     min_duration = (
@@ -639,10 +671,16 @@ def edge_cost(
     features: dict[str, float | str | None] = {
         "available_s": available,
         "balance_raw": balance,
-        "layout_source": layout.source,
+        "layout_source": layout_source,
         "line_count_raw": lines,
         "packed_balance_raw": edge.balance,
         "packed_line_count_raw": edge.lines,
+        "preview_display_end": cue_preview.display_end,
+        "preview_display_start": cue_preview.display_start,
+        "preview_final_text": cue_preview.final_text,
+        "preview_line_count": float(cue_preview.line_count),
+        "preview_reading_chars": float(cue_preview.reading_chars),
+        "preview_refusal_count": float(len(cue_preview.refusals)),
         "reading_need_s": need,
         "sentence_cross_raw": float(sentence_cross_count),
         "vis_width_raw": float(width),

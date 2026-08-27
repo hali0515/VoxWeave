@@ -52,7 +52,7 @@ Subcommands::
     validate-corpus   schema + coverage + size + digest, no replay
     evaluate          replay, measure, compare to baseline, write the report
     record-baseline   promote a report to the tracked baseline (never run by CI)
-    shadow            P4: measure BoundaryOptimizer v2 beside the shipped v1
+    shadow            P5: measure the full finalizer lane/row matrix beside v1
     compare-video-dir legacy: run the same metrics over private media siblings
 
 The last stdout line is always a machine summary::
@@ -121,6 +121,9 @@ METRIC_DEFINITION_VERSION = 3
 
 DEFAULT_CORPUS = REPO_ROOT / "calibration" / "segmentation" / "corpus.json"
 DEFAULT_BASELINE = REPO_ROOT / "calibration" / "segmentation" / "baseline.json"
+DEFAULT_COARSE_CORPUS = (
+    REPO_ROOT / "calibration" / "segmentation" / "corpus-coarse.json"
+)
 
 #: Tracked-size ceilings from design 4.4; exceeding either is exit 2, not a gate.
 MAX_CASE_BYTES = 256 * 1024
@@ -2530,27 +2533,26 @@ def cmd_compare_video_dir(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# P4 shadow lane: BoundaryOptimizer v2 measured beside the shipped v1 answer
+# P5 shadow harness: optimizer, finalizer, speaker counterfactual, and comparators
 # --------------------------------------------------------------------------- #
 #
 # The shadow ships nothing. ``segment_document`` returns v1's cues either way and
 # writes the same bytes; with ``VOXWEAVE_SEG_V2_SHADOW=1`` it *also* returns a
 # measurement artifact on ``result.shadow``. Everything below reads that artifact
-# and answers three separate questions, each with its own exit:
+# and answers the independent coverage, correctness, non-inferiority, and
+# perturbation questions in the P5 gate law:
 #
-#   C13  did v2 actually optimize the whole corpus (no typed fallback, no
-#        unwaived hard-contract violation it caused itself)?          -> exit 1
-#   C14  is v2 non-inferior to the *recorded v1 baseline* on the four
-#        tracked metrics, under the baseline's own gate modes?        -> exit 1/2
-#   AD-2 does a +/-10..50 ms nudge to one gap move a decision outside
-#        a bounded influence cell?                                    -> exit 1
+#   N4/N5  did v2 optimize the whole corpus without an unwaived contract breach?
+#   N1/N3  are finalizer/v2 and the v1 isolation treatment non-inferior?
+#   N7/N11/N19  are the preview, classifier, and speaker projections verified?
+#   P1-P3  are perturbations evaluable and confined to their declared classes?
 #
 # None of it touches the quality report: this writes its own file, and no shadow
 # number ever enters ``report["groups"]`` (``baseline_from_report`` copies that
 # block verbatim into the tracked baseline, so a v2 number parked there would
 # silently become the v1 gate's reference).
 
-SHADOW_SCHEMA_VERSION = 1
+SHADOW_SCHEMA_VERSION = 2
 SHADOW_REPORT_KIND = "segmentation-shadow-report"
 
 #: The hook's opt-in. Pinned around the replay and restored afterwards, exactly
@@ -2559,23 +2561,36 @@ SHADOW_REPORT_KIND = "segmentation-shadow-report"
 #: quality run that may follow in the same process.
 SHADOW_ENV = "VOXWEAVE_SEG_V2_SHADOW"
 
-#: C11's two lanes, named by ``pipeline.SHADOW_LANE_*``.
+#: P5's lane/row matrix, named by ``pipeline.SHADOW_LANE_*``.
 SHADOW_LANE_CORE = "core_partition_pre_overlay"
-SHADOW_LANE_DELIVERY = "delivery_proxy_post_overlay"
-SHADOW_LANES = (SHADOW_LANE_CORE, SHADOW_LANE_DELIVERY)
+SHADOW_LANE_DELIVERY = "delivery_v1_legacy"
+SHADOW_LANE_FINALIZER = "delivery_finalizer"
+SHADOW_LANE_LEGACY_DISPLAY = "legacy_display"
+SHADOW_LANES = (
+    SHADOW_LANE_CORE,
+    SHADOW_LANE_DELIVERY,
+    SHADOW_LANE_FINALIZER,
+    SHADOW_LANE_LEGACY_DISPLAY,
+)
 SHADOW_ENGINES = ("v1", "v2")
+SHADOW_LANE_ROWS: dict[str, tuple[str, ...]] = {
+    SHADOW_LANE_CORE: SHADOW_ENGINES,
+    SHADOW_LANE_DELIVERY: SHADOW_ENGINES,
+    SHADOW_LANE_FINALIZER: ("v1", "v2", "v2-speaker-off"),
+    SHADOW_LANE_LEGACY_DISPLAY: ("v1",),
+}
 
-#: Which lane the non-inferiority gate reads. The tracked baseline was recorded
-#: on ``segment_document``'s *returned* cues, i.e. after lyric marking, speaker
-#: formatting and the second shot snap -- so the delivery proxy is the only lane
-#: whose numbers are comparable with it. The core lane is boundary evidence and
-#: is reported, never gated.
-SHADOW_GATED_LANE = SHADOW_LANE_DELIVERY
+#: N1's binding W4 retarget. The tracked baseline remains the shipped delivery
+#: stream, while the candidate is now the complete P5 finalizer/v2 row. The
+#: legacy-proxy lane survives solely as the byte tripwire and P4 continuity
+#: evidence; the core lane remains ungated boundary evidence.
+SHADOW_GATED_LANE = SHADOW_LANE_FINALIZER
+SHADOW_GATED_ROW = "v2"
 
-#: C14: frozen before the optimizer was written, and deliberately a literal
+#: N1: frozen before the optimizer was written, and deliberately a literal
 #: rather than a read of ``baseline["gates"]``. The gate table is what "not
 #: worse" *means*; loading it from the same file the comparison targets would let
-#: a future baseline edit silently redefine the P4 acceptance criterion. A test
+#: a future baseline edit silently redefine the P5 acceptance criterion. A test
 #: asserts these modes still match the tracked baseline, so a deliberate edit is
 #: visible as a failing test rather than as a quietly moved goalpost.
 #: The shared ``evaluate_gates`` still applies per-group sample promotion to the
@@ -2654,7 +2669,12 @@ ABLATION_WEIGHTS: dict[str, tuple[str, ...]] = {
     "shot_preview": ("W_SHOT_PREVIEW",),
 }
 ABLATION_TERM_PAUSE = "pause_cut"
-ABLATION_TERMS = (*sorted(ABLATION_WEIGHTS), ABLATION_TERM_PAUSE)
+ABLATION_TERM_SPEAKER = "speaker"
+ABLATION_TERMS = (
+    *sorted(ABLATION_WEIGHTS),
+    ABLATION_TERM_PAUSE,
+    ABLATION_TERM_SPEAKER,
+)
 
 
 @contextlib.contextmanager
@@ -2698,7 +2718,7 @@ def shadow_artifact_of(case: Case, result: Any) -> dict[str, Any]:
             f"{case.relpath}: the replay returned no shadow artifact",
             [
                 f"the hook is gated on {SHADOW_ENV}=1 and this run pinned it on",
-                "the installed voxweave predates the P4 hook, or the flag was"
+                "the installed voxweave predates the P5 hook, or the flag was"
                 " consumed by a different process",
             ],
         )
@@ -2787,13 +2807,17 @@ def measure_lane(
     case: Case, artifact: Mapping[str, Any], lane: str, engine: str
 ) -> LaneResult:
     """Run the four metrics over one lane of one case's artifact."""
-    block = artifact["lanes"][lane][engine]
+    lane_block = artifact["lanes"][lane]
+    block = lane_block["rows"][engine] if "rows" in lane_block else lane_block[engine]
     result = LaneResult(
         lane=lane,
         engine=engine,
         projection=str(block.get("projection")),
         cue_count=int(block.get("cue_count") or 0),
     )
+    if block.get("materialized") is False:
+        result.error = str(block.get("reason") or "row was not materialized")
+        return result
     cues = lane_cue_stream(block.get("cues") or (), case.units)
     if cues is None:
         result.error = f"partition unresolved ({result.projection})"
@@ -2956,7 +2980,7 @@ def merge_feature_scans(scans: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 #: checker at all three, and a stage that is simply *absent* used to read here as
 #: "nothing to report" -- which made the whole exit driver blindable by deleting
 #: one assignment in the hook, with no test and no schema noticing.
-SHADOW_REQUIRED_STAGES = ("raw", "core", "legacy_overlay")
+SHADOW_REQUIRED_STAGES = ("raw", "core", "legacy_overlay", "finalizer")
 
 
 def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
@@ -2989,9 +3013,17 @@ def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
     sources: list[tuple[str, Any]] = [
         (name, artifact["validator"].get(name)) for name in SHADOW_REQUIRED_STAGES
     ]
-    for lane in SHADOW_LANES:
-        block = artifact["lanes"][lane]["v1"]
-        sources.append((f"{lane}:v1", block.get("validator")))
+    for lane, row_ids in SHADOW_LANE_ROWS.items():
+        lane_block = artifact["lanes"][lane]
+        for row_id in row_ids:
+            block = (
+                lane_block["rows"].get(row_id)
+                if "rows" in lane_block
+                else lane_block.get(row_id)
+            )
+            if not isinstance(block, Mapping):
+                continue
+            sources.append((f"{lane}:{row_id}", block.get("validator")))
     for name, block in sources:
         if not block:
             stages[name] = None
@@ -3043,6 +3075,28 @@ def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _preview_fidelity_valid(block: Any) -> bool:
+    """N7's complete scored-edge and selected-factory bridge predicate."""
+    if not isinstance(block, Mapping):
+        return False
+    scored = int(block.get("scored_edges") or 0)
+    checked = int(block.get("checked_edges") or 0)
+    selected = block.get("selected_rows")
+    return (
+        scored > 0
+        and checked == scored
+        and not int(block.get("uncheckable_edges") or 0)
+        and not (block.get("mismatches") or ())
+        and isinstance(selected, Mapping)
+        and all(
+            isinstance(row := selected.get(row_id), Mapping)
+            and int(row.get("edge_count") or 0) == int(row.get("cue_count") or 0)
+            and not (row.get("mismatches") or ())
+            for row_id in ("v2", "v2-speaker-off")
+        )
+    )
+
+
 def shadow_measurement_errors(
     case: Case, artifact: Mapping[str, Any], violations: Mapping[str, Any]
 ) -> list[str]:
@@ -3053,24 +3107,130 @@ def shadow_measurement_errors(
     either way, and folding the two together would let an unmeasured stage read
     as a passing one.
 
-    Three checks:
+    The checks cover:
 
     * a mandatory validator stage did not run -- see :func:`shadow_violation_counts`;
     * the two independent derivations of v2's partition (the solver's own cut
-      list and the character-cursor projection) disagree. That projection is not
-      decorative: the GATED delivery lane has no solver partition of its own and
-      rebuilds every cue's ``word_data`` from the projected unit range, so a
-      wrong cursor moves cps_p90 and the mid-phrase rate without moving a single
-      boundary. The cross-check was computed and thrown away before this;
+      list and structural surface reconciliation) disagree. That projection is
+      not decorative: every measured row is keyed by its owned unit range, so a
+      bad reconciliation moves CPS and mid-phrase measurements without moving a
+      single boundary;
     * the v1 stream could not be projected onto source units. The tracked corpus
       is word-level and must project; if it does not, the comparison the whole
-      report is built on has no v1 side.
+      report is built on has no v1 side;
+    * N7's edge-by-edge preview audit or N19's selected speaker projection is
+      incomplete or inconsistent.
     """
     problems = [
         f"{case.id}: validator stage {name!r} did not run (AD-4 requires all of"
         f" {', '.join(SHADOW_REQUIRED_STAGES)})"
         for name in violations["missing_stages"]
     ]
+    if artifact.get("schema_version") != 2:
+        problems.append(
+            f"{case.id}: live shadow schema is {artifact.get('schema_version')!r}, expected 2"
+        )
+    fidelity = artifact.get("preview_fidelity")
+    if not isinstance(fidelity, Mapping):
+        problems.append(f"{case.id}: N7 preview-fidelity audit is absent")
+    else:
+        scored = int(fidelity.get("scored_edges") or 0)
+        checked = int(fidelity.get("checked_edges") or 0)
+        uncheckable = int(fidelity.get("uncheckable_edges") or 0)
+        mismatches = fidelity.get("mismatches") or ()
+        if not _preview_fidelity_valid(fidelity):
+            problems.append(
+                f"{case.id}: N7 preview fidelity is incomplete "
+                f"(scored={scored}, checked={checked}, "
+                f"uncheckable={uncheckable}, mismatches={len(mismatches)})"
+            )
+    invalid_finalizers = artifact.get("invalid_finalizer_rows") or ()
+    if invalid_finalizers:
+        problems.append(
+            f"{case.id}: finalizer budget/validity short-circuit on rows "
+            + ", ".join(map(str, invalid_finalizers))
+        )
+    finalizer_rows = artifact["lanes"][SHADOW_LANE_FINALIZER].get("rows") or {}
+    for row_id in SHADOW_LANE_ROWS[SHADOW_LANE_FINALIZER]:
+        row = finalizer_rows.get(row_id)
+        if not isinstance(row, Mapping) or row.get("materialized") is False:
+            problems.append(f"{case.id}: finalizer row {row_id!r} was not materialized")
+            continue
+        finalizer = row.get("finalizer")
+        if not isinstance(finalizer, Mapping):
+            problems.append(f"{case.id}: finalizer row {row_id!r} has no report")
+            continue
+        for check in ("trace_errors", "stability_errors"):
+            errors = finalizer.get(check) or ()
+            if errors:
+                problems.append(
+                    f"{case.id}: finalizer row {row_id!r} has {len(errors)} {check}"
+                )
+        if not isinstance(row.get("validator"), Mapping):
+            problems.append(
+                f"{case.id}: finalizer row {row_id!r} has no finalizer-stage validator"
+            )
+    speaker = artifact.get("speaker_evidence")
+    if not isinstance(speaker, Mapping):
+        problems.append(f"{case.id}: speaker evidence block is absent")
+    else:
+        refusal = speaker.get("measurement_refusal")
+        if refusal:
+            problems.append(f"{case.id}: speaker measurement refused: {refusal}")
+        measurements = {
+            "v2": speaker.get("measurement"),
+            "v2-speaker-off": speaker.get("off_row_measurement"),
+        }
+        raw_counts: set[int] = set()
+        for row_id, measurement in measurements.items():
+            if not isinstance(measurement, Mapping):
+                problems.append(
+                    f"{case.id}: speaker measurement for {row_id!r} is absent"
+                )
+                continue
+            raw = int(measurement.get("raw_in_speech_turn_changes") or 0)
+            buckets = measurement.get("buckets")
+            if (
+                not isinstance(buckets, Mapping)
+                or sum(map(int, buckets.values())) != raw
+            ):
+                problems.append(
+                    f"{case.id}: speaker measurement for {row_id!r} does not conserve"
+                )
+            raw_counts.add(raw)
+        if len(raw_counts) > 1:
+            problems.append(
+                f"{case.id}: speaker on/off rows do not share one raw denominator"
+            )
+        projection = speaker.get("projection")
+        v2_row = finalizer_rows.get("v2") or {}
+        cue_rows = v2_row.get("cues") or ()
+        ranges = [
+            tuple(row["unit_range"])
+            for row in cue_rows
+            if row.get("unit_range") is not None
+        ]
+        unit_count = int((artifact.get("coverage") or {}).get("unit_count") or 0)
+        ranges_valid = (
+            len(ranges) == len(cue_rows)
+            and (bool(ranges) or unit_count == 0)
+            and (not ranges or ranges[0][0] == 0)
+            and all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+            and (not ranges or ranges[-1][1] == unit_count)
+        )
+        if (
+            not isinstance(projection, Mapping)
+            or projection.get("status") != "verified"
+            or int(projection.get("cue_count") or 0) != len(cue_rows)
+            or int(projection.get("range_count") or 0) != len(ranges)
+            or int(projection.get("named_multi_cues_unannotated") or 0)
+            != int(
+                (artifact.get("coverage") or {}).get("named_multi_cues_unannotated")
+                or 0
+            )
+            or not ranges_valid
+        ):
+            problems.append(f"{case.id}: N19 speaker-id projection is not verified")
     cross = (artifact["lanes"][SHADOW_LANE_CORE]["v2"] or {}).get(
         "projection_cross_check"
     )
@@ -3081,7 +3241,7 @@ def shadow_measurement_errors(
         )
     elif not cross.get("agrees"):
         problems.append(
-            f"{case.id}: the solver partition and the character projection"
+            f"{case.id}: the solver partition and structural surface projection"
             f" disagree (mode {cross.get('mode')!r})"
         )
     if artifact["coverage"].get("v1_unprojected"):
@@ -3096,7 +3256,7 @@ def shadow_measurement_errors(
 def c13_case_failures(
     case: Case, coverage: Mapping[str, Any], violations: Mapping[str, Any]
 ) -> list[str]:
-    """C13 + AD3-3: the reasons this document alone fails the shadow exit."""
+    """N4/N5 (formerly C13): per-document shadow coverage failures."""
     problems: list[str] = []
     if int(coverage["fallback_intervals"]):
         problems.append(
@@ -3108,6 +3268,11 @@ def c13_case_failures(
         problems.append(
             f"{case.id}: optimized_unit_ratio {ratio:.4f} < 1.0"
             " (C13 requires the whole document optimized)"
+        )
+    if int(coverage.get("coarse_caused_intervals") or 0):
+        problems.append(
+            f"{case.id}: {coverage['coarse_caused_intervals']} coarse-caused "
+            "interval(s) remain after refinement"
         )
     for row in violations["exit_driving"]:
         problems.append(
@@ -3124,7 +3289,7 @@ def merge_violation_counts(
 
     The v1 streams go through the same validator at the same stages, so the two
     engines are directly comparable here. That comparison is the evidence a
-    reader needs for the one open policy question P4 hands to its caller: ja
+    reader needs for the remaining P5 policy diagnostic: ja
     documents inherit a ``speech-truncated-start`` class from the shared shot
     snap, and whether v2 owning fewer of them than v1 counts as acceptable is a
     decision, not a measurement. This block states the counts and takes no view.
@@ -3168,8 +3333,7 @@ def interval_changes(case: Case, artifact: Mapping[str, Any]) -> list[dict[str, 
                 "case": case.id,
                 "interval_index": int(interval["interval_index"]),
                 "language": case.language,
-                "low_margin": bool(interval["low_margin"]),
-                "margin": interval.get("margin"),
+                "margin_summary": interval.get("margin_summary"),
                 "selected_is_v1": bool(interval["selected_is_v1"]),
                 "unit_range": [low, high],
                 "v1_cost_total": v1_cost.get("total"),
@@ -3196,6 +3360,8 @@ class ShadowCase:
     lanes: dict[tuple[str, str], LaneResult]
     features: dict[str, Any]
     barrier_units: tuple[int, ...]
+    production: CaseMeasurement
+    tripwire_error: str | None
     wall_time_s: float = 0.0
 
     @property
@@ -3213,9 +3379,24 @@ def run_shadow_case(case: Case) -> ShadowCase:
     lanes = {
         (lane, engine): measure_lane(case, artifact, lane, engine)
         for lane in SHADOW_LANES
-        for engine in SHADOW_ENGINES
+        for engine in SHADOW_LANE_ROWS[lane]
+        if engine in (artifact["lanes"][lane].get("rows") or artifact["lanes"][lane])
     }
     partition = artifact["lanes"][SHADOW_LANE_CORE]["v2"]["partition"] or ()
+    production = measure_case(case, result)
+    legacy = lanes[(SHADOW_LANE_DELIVERY, "v1")].measurement
+    tripwire_error: str | None = None
+    if legacy is None:
+        tripwire_error = "delivery_v1_legacy/v1 is not measurable"
+    elif (
+        legacy.cue_count != production.cue_count
+        or legacy.cps_samples != production.cps_samples
+        or {key: (value.bad, value.eligible) for key, value in legacy.ratios.items()}
+        != {
+            key: (value.bad, value.eligible) for key, value in production.ratios.items()
+        }
+    ):
+        tripwire_error = "delivery_v1_legacy/v1 drifted from production replay"
     shadow_case = ShadowCase(
         case=case,
         artifact=artifact,
@@ -3223,6 +3404,8 @@ def run_shadow_case(case: Case) -> ShadowCase:
         lanes=lanes,
         features=cut_feature_scan(document, [int(u) for u in partition]),
         barrier_units=barrier_unit_ids(document),
+        production=production,
+        tripwire_error=tripwire_error,
     )
     shadow_case.wall_time_s = time.perf_counter() - started
     return shadow_case
@@ -3236,7 +3419,8 @@ def lane_groups(
         [
             row.lanes[(lane, engine)].measurement
             for row in shadow_cases
-            if row.lanes[(lane, engine)].measurement is not None
+            if (lane, engine) in row.lanes
+            and row.lanes[(lane, engine)].measurement is not None
         ]
     )
 
@@ -3249,6 +3433,639 @@ def shadow_group_errors(groups: Mapping[str, Mapping[str, Any]]) -> list[str]:
         for name, block in sorted(groups.items())
         for error in cc.schema_errors(block, definition)
     ]
+
+
+def finalizer_vs_legacy_gates(
+    shadow_cases: Sequence[ShadowCase],
+) -> list[dict[str, Any]]:
+    """N3a: identical committed v1 input, finalizer versus legacy display."""
+    current = lane_groups(shadow_cases, SHADOW_LANE_FINALIZER, "v1")
+    reference = lane_groups(shadow_cases, SHADOW_LANE_LEGACY_DISPLAY, "v1")
+    results = evaluate_gates(current, SHADOW_GATES, {"groups": reference})
+    for result in results:
+        result["family"] = "N3a-finalizer-vs-legacy-display"
+    return results
+
+
+def speaker_gate_block(shadow_cases: Sequence[ShadowCase]) -> dict[str, Any]:
+    """N3b's four ja gates plus non-blocking zh/en diagnostics."""
+
+    def aggregate_language(language: str) -> dict[str, Any]:
+        raw = expressed = missed = off_expressed = attributable = 0
+        eligible_ceiling = 0
+        activation_cases = 0
+        case_count = 0
+        for row in shadow_cases:
+            if (
+                cc.canonical_language_or(row.case.language, row.case.language)
+                != language
+            ):
+                continue
+            evidence = row.artifact.get("speaker_evidence") or {}
+            on = evidence.get("measurement")
+            off = evidence.get("off_row_measurement")
+            if not isinstance(on, Mapping) or not isinstance(off, Mapping):
+                continue
+            case_count += 1
+            on_buckets = on["buckets"]
+            off_buckets = off["buckets"]
+            raw += int(on["raw_in_speech_turn_changes"])
+            expressed += int(on_buckets["expressed"])
+            missed += int(on_buckets["survived_expressible_but_missed"])
+            off_expressed += int(off_buckets["expressed"])
+            attributable += int(on["speaker_attributable_expressed_cuts"])
+            eligible_ceiling += int(on_buckets["expressed"]) + int(
+                on_buckets["survived_expressible_but_missed"]
+            )
+            if int(on["speaker_attributable_expressed_cuts"]) > 0 or int(
+                on_buckets["expressed"]
+            ) > int(off_buckets["expressed"]):
+                activation_cases += 1
+        rate = 0.0 if raw == 0 else expressed / raw
+        off_rate = 0.0 if raw == 0 else off_expressed / raw
+        hit = None if expressed + missed == 0 else expressed / (expressed + missed)
+        return {
+            "activation_cases": activation_cases,
+            "case_count": case_count,
+            "eligible_ceiling": eligible_ceiling,
+            "expressed": expressed,
+            "expressed_rate": rate,
+            "expressible_hit_rate": hit,
+            "missed": missed,
+            "off_expressed": off_expressed,
+            "off_expressed_rate": off_rate,
+            "raw_in_speech_turn_changes": raw,
+            "speaker_attributable_expressed_cuts": attributable,
+        }
+
+    diagnostics = {
+        language: aggregate_language(language) for language in cc.CALIBRATION_LANGUAGES
+    }
+    ja = diagnostics["ja"]
+    target = 21.0 / 136.0
+    possible_rate = (
+        0.0
+        if ja["raw_in_speech_turn_changes"] == 0
+        else ja["eligible_ceiling"] / ja["raw_in_speech_turn_changes"]
+    )
+    rate_status = (
+        "pass"
+        if ja["expressed_rate"] >= max(target, ja["off_expressed_rate"])
+        else "stopped"
+        if possible_rate < target
+        else "fail"
+    )
+    gates = [
+        {
+            "id": "N3b-activation",
+            "status": "pass" if ja["activation_cases"] > 0 else "fail",
+            "value": ja["activation_cases"],
+        },
+        {
+            "id": "N3b-expressed-rate",
+            "possible_rate": possible_rate,
+            "status": rate_status,
+            "target": max(target, ja["off_expressed_rate"]),
+            "value": ja["expressed_rate"],
+        },
+        {
+            "id": "N3b-attributable",
+            "status": (
+                "pass" if ja["speaker_attributable_expressed_cuts"] >= 1 else "fail"
+            ),
+            "value": ja["speaker_attributable_expressed_cuts"],
+        },
+        {
+            "id": "N3b-expressible-hit",
+            "status": (
+                "pass"
+                if ja["expressible_hit_rate"] is not None
+                and ja["expressible_hit_rate"] >= 0.5
+                else "fail"
+            ),
+            "target": 0.5,
+            "value": ja["expressible_hit_rate"],
+        },
+    ]
+    return {"diagnostics": diagnostics, "gates": gates}
+
+
+_SPEECH_TRUNCATION_KINDS = frozenset({"speech-truncated-start", "speech-truncated-end"})
+
+
+def _speech_truncation_count(block: Mapping[str, Any] | None) -> int:
+    if not isinstance(block, Mapping):
+        return 0
+    return sum(
+        not bool(row.get("waived")) and str(row.get("kind")) in _SPEECH_TRUNCATION_KINDS
+        for row in block.get("violations") or ()
+    )
+
+
+def speech_truncation_gates(
+    shadow_cases: Sequence[ShadowCase],
+) -> dict[str, Any]:
+    """N6: finalizer/v2 may not exceed shipped legacy truncation by language."""
+    languages: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+    for language in cc.CALIBRATION_LANGUAGES:
+        current = legacy = 0
+        for row in shadow_cases:
+            if (
+                cc.canonical_language_or(row.case.language, row.case.language)
+                != language
+            ):
+                continue
+            lanes = row.artifact["lanes"]
+            current += _speech_truncation_count(
+                lanes[SHADOW_LANE_FINALIZER]["rows"]["v2"].get("validator")
+            )
+            legacy += _speech_truncation_count(
+                lanes[SHADOW_LANE_DELIVERY]["v1"].get("validator")
+            )
+        passed = current <= legacy
+        languages[language] = {
+            "legacy": legacy,
+            "status": "pass" if passed else "fail",
+            "v2": current,
+        }
+        if not passed:
+            failures.append(
+                f"N6/{language}: finalizer/v2 speech truncations {current} "
+                f"exceed legacy {legacy}"
+            )
+    return {"failures": failures, "languages": languages}
+
+
+def speaker_cliff_diagnostics() -> dict[str, Any]:
+    """P3's six deterministic threshold probes plus per-turn-state coverage."""
+    from voxweave.core import speaker_evidence as se
+    from voxweave.core.segdoc import DisplayProfile, SegDocument, SourceUnit
+
+    def profile(language: str = "en") -> DisplayProfile:
+        return DisplayProfile(
+            language=language,
+            max_line_length=42 if language == "en" else 18,
+            max_lines=2,
+            clause_ms=400.0,
+            vad_skip_ms=250.0,
+            offline_ms=700.0,
+            min_cue_s=0.0,
+            max_cue_s=7.0,
+            glue_gap_s=0.3,
+            cps=0.0,
+            lag_out_s=0.0,
+            shot_snap_s=11 / 24,
+        )
+
+    def document(
+        spans: Sequence[tuple[str, float, float]],
+        turns: Sequence[tuple[float, float, str]] | None,
+        *,
+        language: str = "en",
+    ) -> SegDocument:
+        units = [
+            SourceUnit(f"u{index}", surface, start, end)
+            for index, (surface, start, end) in enumerate(spans)
+        ]
+        return SegDocument(
+            language=language,
+            units=units,
+            profile=profile(language),
+            vad_speech=None,
+            shot_changes=None,
+            sing_spans=None,
+            speaker_turns=None if turns is None else list(turns),
+            manifest={},
+            text=(" " if language == "en" else "").join(
+                surface for surface, _start, _end in spans
+            ),
+        )
+
+    def signature(evidence: Any) -> dict[str, Any]:
+        return {
+            "labels": list(evidence.labels),
+            "phrase_snaps": evidence.stats.phrase_snaps,
+            "runs_absorbed": evidence.stats.runs_absorbed,
+            "transitions_after": evidence.stats.transitions_after,
+        }
+
+    def turn_state(evidence: Any) -> str:
+        starts = [
+            unit.start for unit in evidence.parent_units if unit.start is not None
+        ]
+        ends = [unit.end for unit in evidence.parent_units if unit.end is not None]
+        span = se.EvidenceSpan(min(starts), max(ends), "exact", "exact")
+        return str(
+            se.speaker_edge_cost(
+                evidence, (0, len(evidence.unit_speakers)), evidence_span=span
+            ).features["turn_state"]
+        )
+
+    probes: list[dict[str, Any]] = []
+
+    def compare(name: str, before_doc: SegDocument, after_doc: SegDocument) -> None:
+        before = se.speaker_evidence(before_doc)
+        after = se.speaker_evidence(after_doc)
+        before_signature, after_signature = signature(before), signature(after)
+        probes.append(
+            {
+                "after": after_signature,
+                "before": before_signature,
+                "effective": before_signature != after_signature,
+                "name": name,
+                "turn_states": sorted({turn_state(before), turn_state(after)}),
+            }
+        )
+
+    compare(
+        "cover-frac",
+        document([("x", 0.0, 1.0)], [(0.0, 0.499, "A")]),
+        document([("x", 0.0, 1.0)], [(0.0, 0.5, "A")]),
+    )
+    compare(
+        "MIN_RUN",
+        document(
+            [("a", 0.0, 0.4), ("b", 0.4, 0.599), ("a", 0.599, 1.0)],
+            [(0.0, 0.4, "A"), (0.4, 0.599, "B"), (0.599, 1.0, "A")],
+        ),
+        document(
+            [("a", 0.0, 0.4), ("b", 0.4, 0.601), ("a", 0.601, 1.0)],
+            [(0.0, 0.4, "A"), (0.4, 0.601, "B"), (0.601, 1.0, "A")],
+        ),
+    )
+    compare(
+        "EDGE_RUN",
+        document(
+            [("a", 0.0, 0.5), ("b", 0.5, 0.619)],
+            [(0.0, 0.5, "A"), (0.5, 0.619, "B")],
+        ),
+        document(
+            [("a", 0.0, 0.5), ("b", 0.5, 0.62)],
+            [(0.0, 0.5, "A"), (0.5, 0.62, "B")],
+        ),
+    )
+
+    saved_phrase_ranges = se._phrase_ranges
+    se._phrase_ranges = lambda _units, _lang: ((0, 2),)
+    try:
+        compare(
+            "phrase-vote",
+            document(
+                [("大", 0.0, 0.3), ("碴子", 0.3, 0.59)],
+                [(0.0, 0.3, "A"), (0.3, 0.59, "B")],
+                language="zh",
+            ),
+            document(
+                [("大", 0.0, 0.3), ("碴子", 0.3, 0.61)],
+                [(0.0, 0.3, "A"), (0.3, 0.61, "B")],
+                language="zh",
+            ),
+        )
+    finally:
+        se._phrase_ranges = saved_phrase_ranges
+
+    compare(
+        "region-silence",
+        document(
+            [("a", 0.0, 1.0), ("hole", 1.299, 2.0)],
+            [(0.0, 1.0, "A")],
+        ),
+        document(
+            [("a", 0.0, 1.0), ("hole", 1.3, 2.0)],
+            [(0.0, 1.0, "A")],
+        ),
+    )
+
+    crossing = se.speaker_evidence(
+        document(
+            [("a", 0.0, 1.0), ("b", 1.0, 2.0)],
+            [(0.0, 1.0, "A"), (1.0, 2.0, "B")],
+        )
+    )
+    span = (se.EvidenceSpan(0.0, 2.0, "exact", "exact"),)
+    before_measure = se.measure_speaker_events(
+        crossing, evidence_spans=span, delivered_boundaries=(1.5,)
+    )
+    after_measure = se.measure_speaker_events(
+        crossing, evidence_spans=span, delivered_boundaries=(1.500001,)
+    )
+    probes.append(
+        {
+            "after": after_measure.to_dict(),
+            "before": before_measure.to_dict(),
+            "effective": before_measure.buckets != after_measure.buckets,
+            "name": "transition-crossing",
+            "turn_states": [turn_state(crossing)],
+        }
+    )
+
+    state_examples = {
+        "absent": se.speaker_evidence(document([("x", 0.0, 1.0)], None)),
+        "overlap": se.speaker_evidence(
+            document(
+                [("x", 0.0, 1.0)],
+                [(0.0, 0.8, "A"), (0.2, 1.0, "B")],
+            )
+        ),
+        "unattributed": se.speaker_evidence(document([("x", 0.0, 1.0)], [])),
+    }
+    attempted = {state: 0 for state in se.TURN_STATES}
+    effective = {state: 0 for state in se.TURN_STATES}
+    for probe in probes:
+        for state in probe["turn_states"]:
+            attempted[state] += 1
+            effective[state] += int(probe["effective"])
+    for expected, evidence in state_examples.items():
+        observed = turn_state(evidence)
+        if observed != expected:
+            raise cc.CalibrationError(
+                f"P3 state fixture expected {expected!r}, observed {observed!r}"
+            )
+        attempted[observed] += 1
+    warnings = [
+        f"P3/{state}: zero effective probes (warning-uncovered)"
+        for state in se.TURN_STATES
+        if effective[state] == 0
+    ]
+    failures = [
+        f"P3/{probe['name']}: threshold probe was ineffective"
+        for probe in probes
+        if not probe["effective"]
+    ]
+    return {
+        "attempted_by_turn_state": attempted,
+        "effective_by_turn_state": effective,
+        "failures": failures,
+        "probes": probes,
+        "warnings": warnings,
+    }
+
+
+_COARSE_BREAKERS = frozenset("。！？、，,.!?；;：:")
+
+
+def load_coarse_manifest(path: str | Path = DEFAULT_COARSE_CORPUS) -> dict[str, Any]:
+    """Load W2's shadow-only derivation registry under a closed local schema."""
+    source = Path(path)
+    try:
+        payload = cc.read_json(source)
+    except OSError as exc:
+        raise cc.CalibrationError(f"coarse corpus not found: {source}") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "description",
+        "cases",
+    }:
+        raise cc.CalibrationError(f"{source}: invalid coarse registry shape")
+    if payload.get("schema_version") != 1 or not isinstance(
+        payload.get("description"), str
+    ):
+        raise cc.CalibrationError(f"{source}: invalid coarse registry header")
+    rows = payload.get("cases")
+    if not isinstance(rows, list) or not rows:
+        raise cc.CalibrationError(f"{source}: coarse registry has no cases")
+    expected_variants = {"width", "duration", "both", "per-char", "mixed"}
+    if len(rows) != len(expected_variants):
+        raise cc.CalibrationError(
+            f"{source}: coarse registry must contain exactly five variants"
+        )
+    required = {
+        "id",
+        "variant",
+        "source_case",
+        "max_block_units",
+        "profile_overrides",
+    }
+    variants: set[str] = set()
+    ids: set[str] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != required:
+            raise cc.CalibrationError(
+                f"{source}: coarse cases[{index}] has an invalid shape"
+            )
+        case_id = row["id"]
+        block = row["max_block_units"]
+        variant = row["variant"]
+        source_case = row["source_case"]
+        if (
+            not isinstance(case_id, str)
+            or not case_id.startswith("coarse-")
+            or case_id in ids
+            or not isinstance(variant, str)
+            or variant not in expected_variants
+            or variant in variants
+            or not isinstance(source_case, str)
+            or not source_case.startswith("cases/")
+            or isinstance(block, bool)
+            or not isinstance(block, int)
+            or block <= 0
+            or not isinstance(row["profile_overrides"], dict)
+        ):
+            raise cc.CalibrationError(
+                f"{source}: coarse cases[{index}] has invalid values"
+            )
+        ids.add(case_id)
+        variants.add(variant)
+    if variants != expected_variants:
+        raise cc.CalibrationError(f"{source}: coarse variants are incomplete")
+    return payload
+
+
+def _derived_coarse_case(source: Case, fixture: Mapping[str, Any]) -> Case:
+    """Apply the manifest's deterministic sentence/block merge derivation."""
+    from voxweave.core.layout import _join
+
+    blocks: list[list[dict[str, Any]]] = []
+    pending: list[dict[str, Any]] = []
+    limit = int(fixture["max_block_units"])
+    for source_unit in source.units:
+        pending.append(source_unit)
+        surface = str(source_unit["text"])
+        if (surface and surface[-1] in _COARSE_BREAKERS) or len(pending) >= limit:
+            blocks.append(pending)
+            pending = []
+    if pending:
+        blocks.append(pending)
+
+    overrides = dict(fixture["profile_overrides"])
+    language = str(overrides.pop("language", source.language))
+    doc = copy.deepcopy(source.doc)
+    doc["id"] = str(fixture["id"])
+    doc["language"] = language
+    doc["word_segments"] = [
+        {
+            "id": f"u{index}",
+            "text": _join([str(unit["text"]) for unit in block], language),
+            "start": block[0]["start"],
+            "end": block[-1]["end"],
+        }
+        for index, block in enumerate(blocks)
+    ]
+    config = doc["capture"]["config"]
+    gaps = config["gap_thresholds"]
+    for key, value in overrides.items():
+        if key in gaps:
+            gaps[key] = value
+        elif key in config:
+            config[key] = value
+        else:
+            raise cc.CalibrationError(
+                f"{fixture['id']}: unknown profile override {key!r}"
+            )
+    return Case(source.path, str(fixture["source_case"]), doc, source.size_bytes)
+
+
+def _coarse_start_errors(fine: Case, rows: Sequence[Mapping[str, Any]]) -> list[float]:
+    """Boundary start error against the frozen fine stream, by display cursor."""
+    from voxweave.core.partition_check import normalize_text
+    from voxweave.core.smart_split import _display_chars
+
+    truth = [
+        float(unit["start"])
+        for unit, chars in zip(
+            fine.units,
+            _display_chars([str(unit["text"]) for unit in fine.units]),
+        )
+        for _character in chars
+    ]
+    offset = 0
+    errors: list[float] = []
+    for row in rows:
+        if 0 < offset < len(truth):
+            errors.append(abs(float(row["start"]) - truth[offset]))
+        offset += len("".join(normalize_text(str(row["text"])).split()))
+    return errors
+
+
+def run_coarse_gates(
+    tracked: Corpus,
+    path: str | Path = DEFAULT_COARSE_CORPUS,
+) -> dict[str, Any]:
+    """N4c/PD-SUBUNIT over W2's isolated, derived coarse family."""
+    manifest = load_coarse_manifest(path)
+    by_relpath = {case.relpath: case for case in tracked.cases}
+    rows: list[dict[str, Any]] = []
+    failures: list[str] = []
+    stops: list[str] = []
+    for fixture in manifest["cases"]:
+        source = by_relpath.get(str(fixture["source_case"]))
+        if source is None:
+            raise cc.CalibrationError(
+                f"{fixture['id']}: source case is not in the tracked registry"
+            )
+        derived = _derived_coarse_case(source, fixture)
+        result = replay_shadow(derived)
+        artifact = shadow_artifact_of(derived, result)
+        final_row = artifact["lanes"][SHADOW_LANE_FINALIZER]["rows"].get("v2") or {}
+        errors = _coarse_start_errors(source, final_row.get("cues") or ())
+        ordered = sorted(errors)
+        p90 = (
+            None if not ordered else ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
+        )
+        maximum = max(ordered, default=None)
+        adopted = sum(bool(item["adopted_v1"]) for item in artifact["intervals"])
+        raw_validator = artifact["validator"].get("raw") or {}
+        finalizer_validator = artifact["validator"].get("finalizer") or {}
+        trigger_counts = {"duration": 0, "width": 0}
+        from voxweave.core.boundary_lattice import CAP_EPS_S
+        from voxweave.core.layout import _line_budget_width, _vis_width
+
+        parent_document = seg_document_of(derived, result)
+        width_budget = _line_budget_width(
+            parent_document.profile.max_line_length,
+            parent_document.profile.language,
+        )
+        for unit in parent_document.units:
+            if _vis_width(unit.surface) > width_budget:
+                trigger_counts["width"] += 1
+            if (
+                parent_document.profile.max_cue_s > 0
+                and unit.start is not None
+                and unit.end is not None
+                and unit.end - unit.start
+                > parent_document.profile.max_cue_s + CAP_EPS_S
+            ):
+                trigger_counts["duration"] += 1
+        evidence = artifact["subunit_split"]["evidence"]
+        variant = str(fixture["variant"])
+        variant_exercised = {
+            "width": trigger_counts["width"] > 0 and trigger_counts["duration"] == 0,
+            "duration": trigger_counts["duration"] > 0 and trigger_counts["width"] == 0,
+            "both": trigger_counts["width"] > 0 and trigger_counts["duration"] > 0,
+            "per-char": int(evidence["per-char"]) > 0,
+            "mixed": int(evidence["whitespace"]) > 0,
+        }[variant]
+        checks = {
+            "adopted_v1": adopted == 0,
+            "coarse_caused_intervals": int(
+                artifact["coverage"]["coarse_caused_intervals"]
+            )
+            == 0,
+            "fallback_intervals": int(artifact["coverage"]["fallback_intervals"]) == 0,
+            "max_start_error": maximum is not None and maximum <= 2.0,
+            "optimized_unit_ratio": float(artifact["coverage"]["optimized_unit_ratio"])
+            == 1.0,
+            "p90_start_error": p90 is not None and p90 <= 0.75,
+            "preview_fidelity": _preview_fidelity_valid(
+                artifact.get("preview_fidelity")
+            ),
+            "variant_exercised": variant_exercised,
+            "zero_unwaived_v2_raw_finalizer": (
+                int(raw_validator.get("unwaived") or 0) == 0
+                and int(finalizer_validator.get("unwaived") or 0) == 0
+            ),
+        }
+        for name, passed in checks.items():
+            if not passed:
+                failures.append(f"{fixture['id']}: {name} failed")
+        comparison = artifact.get("refiner_comparison") or {}
+        if comparison.get("materialized") is not True:
+            stops.append(
+                f"{fixture['id']}: refiner-off optimizer root unavailable "
+                "because the frozen factory refuses adopted-v1 intervals"
+            )
+        elif comparison.get("diffs_confined_to_coarse_caused") is not True:
+            stops.append(
+                f"{fixture['id']}: refiner-off diff is not confined to a "
+                "coarse_caused interval"
+            )
+        rows.append(
+            {
+                "case": fixture["id"],
+                "checks": checks,
+                "max_start_error_s": maximum,
+                "p90_start_error_s": p90,
+                "refiner_comparison": comparison,
+                "subunit_split": artifact["subunit_split"],
+                "trigger_counts": trigger_counts,
+                "variant": fixture["variant"],
+            }
+        )
+    exercised = {
+        trigger: any(int(row["trigger_counts"][trigger]) > 0 for row in rows)
+        for trigger in ("width", "duration")
+    }
+    evidence_exercised = {
+        "per-char": any(
+            int(row["subunit_split"]["evidence"]["per-char"]) > 0 for row in rows
+        ),
+        "whitespace": any(
+            int(row["subunit_split"]["evidence"]["whitespace"]) > 0 for row in rows
+        ),
+    }
+    for name, passed in {**exercised, **evidence_exercised}.items():
+        if not passed:
+            failures.append(f"coarse family did not exercise {name}")
+    return {
+        "adjudication": "accepted deterministic derivation registry",
+        "cases": rows,
+        "evidence_exercised": evidence_exercised,
+        "failures": failures,
+        "path": str(path),
+        "stops": stops,
+        "trigger_classes_exercised": exercised,
+    }
 
 
 # ------------------------------------------------------- weight ablation (OAT)
@@ -3267,9 +4084,15 @@ def _ablated_weight(term: str) -> Iterator[None]:
     from voxweave.core import boundary_cost as bc
 
     saved: list[tuple[str, Any]] = []
+    speaker_saved: float | None = None
     if term == ABLATION_TERM_PAUSE:
         saved.append(("pause_cut_cost", bc.pause_cut_cost))
         setattr(bc, "pause_cut_cost", lambda evidence: 0.0)
+    elif term == ABLATION_TERM_SPEAKER:
+        from voxweave.core import speaker_evidence as se
+
+        speaker_saved = se.W_SPEAKER_INTERIOR
+        se.W_SPEAKER_INTERIOR = 0.0
     else:
         for name in ABLATION_WEIGHTS[term]:
             saved.append((name, getattr(bc, name)))
@@ -3279,6 +4102,10 @@ def _ablated_weight(term: str) -> Iterator[None]:
     finally:
         for name, value in reversed(saved):
             setattr(bc, name, value)
+        if speaker_saved is not None:
+            from voxweave.core import speaker_evidence as se
+
+            se.W_SPEAKER_INTERIOR = speaker_saved
 
 
 def run_ablation(
@@ -3286,10 +4113,10 @@ def run_ablation(
 ) -> dict[str, Any]:
     """One-at-a-time: zero each term, re-solve the corpus, report the deltas.
 
-    Cost is |terms| extra corpus replays -- twelve weights plus the pause term,
-    so thirteen. That is bounded and known rather than swept, which is the point:
+    Cost is |terms| extra corpus replays -- twelve legacy weights plus the pause
+    and speaker terms, so fourteen. That is bounded and known rather than swept:
     a sweep would need a search budget and a stopping rule, and an OAT table
-    answers the only question P4 has to answer about the weights ("does any one
+    answers the P5 stability question about the weights ("does any one
     of them carry the whole result").
     """
     rows: list[dict[str, Any]] = []
@@ -3317,6 +4144,8 @@ def run_ablation(
                 "weights": (
                     ["pause_cut_cost"]
                     if term == ABLATION_TERM_PAUSE
+                    else ["W_SPEAKER_INTERIOR"]
+                    if term == ABLATION_TERM_SPEAKER
                     else list(ABLATION_WEIGHTS[term])
                 ),
             }
@@ -3421,6 +4250,19 @@ def perturbed_case(case: Case, units: Sequence[Mapping[str, Any]]) -> Case:
     )
     _validate_case_semantics(out)
     return out
+
+
+def perturbation_unit_stable(
+    original: Sequence[Mapping[str, Any]], perturbed: Sequence[Mapping[str, Any]]
+) -> bool:
+    """P1: a timing probe may alter only start/end, never unit topology."""
+    if len(original) != len(perturbed):
+        return False
+    return all(
+        {key: value for key, value in left.items() if key not in {"start", "end"}}
+        == {key: value for key, value in right.items() if key not in {"start", "end"}}
+        for left, right in zip(original, perturbed)
+    )
 
 
 def shifted_gap_end(
@@ -3685,8 +4527,15 @@ def run_single_gap_probes(
             "near_cliff": index in near,
             "probe_unit": index + 1,
             "sign": sign,
+            "unit_stable": perturbation_unit_stable(case.units, units),
             "vad_state": scan["gap_states"][index],
         }
+        if not row["unit_stable"]:
+            row["error"] = "P1 unit-stability precondition failed"
+            row["lanes"] = {}
+            row["value"] = 0.0
+            probes.append(row)
+            continue
         lanes: dict[str, Any] = {}
         if base_partition is None:
             row["error"] = "unperturbed partition unresolved"
@@ -3843,6 +4692,18 @@ def run_global_jitter(
         rng = random.Random(f"{case.id}:global_jitter:{magnitude}")
         for draw in range(PERTURB_JITTER_DRAWS):
             units = perturb_global(case.units, magnitude, rng)
+            unit_stable = perturbation_unit_stable(case.units, units)
+            if not unit_stable:
+                rows.append(
+                    {
+                        "case": case.id,
+                        "draw": draw,
+                        "error": "P1 unit-stability precondition failed",
+                        "magnitude_ms": magnitude,
+                        "unit_stable": False,
+                    }
+                )
+                continue
             try:
                 probe = _probe_partition(case, units)
             except cc.CalibrationError as exc:
@@ -3852,15 +4713,23 @@ def run_global_jitter(
                         "draw": draw,
                         "error": exc.message,
                         "magnitude_ms": magnitude,
+                        "unit_stable": True,
                     }
                 )
                 continue
             partition = probe["partition"]
-            moved = (
-                None
-                if partition is None or base_partition is None
-                else len(set(base_partition) ^ partition)
-            )
+            if partition is None or base_partition is None:
+                rows.append(
+                    {
+                        "case": case.id,
+                        "draw": draw,
+                        "error": "partition unresolved",
+                        "magnitude_ms": magnitude,
+                        "unit_stable": True,
+                    }
+                )
+                continue
+            moved = len(set(base_partition) ^ partition)
             rows.append(
                 {
                     "barrier_flips": len(
@@ -3873,9 +4742,84 @@ def run_global_jitter(
                     "fallback_intervals": probe["fallback_intervals"],
                     "magnitude_ms": magnitude,
                     "moved_count": moved,
+                    "unit_stable": True,
                 }
             )
     return {"draws_per_magnitude": PERTURB_JITTER_DRAWS, "rows": rows}
+
+
+def shot_cycle_probe() -> dict[str, Any]:
+    """P2's neighbour-free 9f->10f terminal/cycle envelope crossing."""
+    from voxweave.core import finalizer as fin
+    from voxweave.core.authority import AuthorityLedger
+    from voxweave.core.segdoc import DisplayProfile
+
+    frame = 1.0 / 24.0
+    profile = DisplayProfile(
+        language="en",
+        max_line_length=42,
+        max_lines=2,
+        clause_ms=400.0,
+        vad_skip_ms=250.0,
+        offline_ms=700.0,
+        min_cue_s=0.0,
+        max_cue_s=0.0,
+        glue_gap_s=0.3,
+        cps=0.0,
+        lag_out_s=0.0,
+        shot_snap_s=11 * frame,
+    )
+
+    def solve(frames: int, evaluation_id: str) -> Any:
+        cue = {
+            "text": "word",
+            "start": frames * frame,
+            "end": 5.0,
+            "word_data": [{"text": "word", "start": None, "end": None}],
+            "speech_start": None,
+            "speech_end": None,
+        }
+        ledger = AuthorityLedger()
+        capture = fin.capture_v1_reference([cue], ledger=ledger)
+        stream = fin.phase1_from_v1_capture(
+            capture,
+            profile=profile,
+            ledger=ledger,
+            row_id="delivery_finalizer/v1",
+            evaluation_id=evaluation_id,
+        )
+        return fin.finalize(
+            stream,
+            profile=profile,
+            evidence=fin.FinalizeEvidence(shots=(0.0, 22 * frame)),
+            policy=fin.FinalizePolicy(),
+        )
+
+    before, after = solve(9, "P2-9f"), solve(10, "P2-10f")
+    toggled = {before.trace.terminal, after.trace.terminal} == {
+        "fixed-point",
+        "cycle-adoption",
+    }
+    effective = before.cues[0]["start"] != after.cues[0]["start"]
+    return {
+        "after_start": after.cues[0]["start"],
+        "after_terminal": after.trace.terminal,
+        "attempted": 1,
+        "before_start": before.cues[0]["start"],
+        "before_terminal": before.trace.terminal,
+        "cycle_terminal_toggled": toggled,
+        "effective": int(effective),
+        "failures": (
+            []
+            if toggled and effective
+            else ["P2 cycle-adjacent shot probe did not cross its frozen envelope"]
+        ),
+        "influence_cell": {
+            "outside": [],
+            "radius_units": 0,
+            "unit_count": 1,
+        },
+    }
 
 
 def run_perturbation(
@@ -3912,7 +4856,41 @@ def run_perturbation(
             block["case"] = shadow_case.case.id
             block["language"] = shadow_case.case.language
             jitter.append(block)
+            unknown.extend(
+                {
+                    "case": shadow_case.case.id,
+                    "error": row["error"],
+                    "mode": "global_jitter",
+                }
+                for row in block["rows"]
+                if row.get("error")
+            )
+    p2 = shot_cycle_probe()
+    p3 = speaker_cliff_diagnostics()
+    unknown.extend({"error": failure, "mode": "P2"} for failure in p2["failures"])
+    unknown.extend({"error": failure, "mode": "P3"} for failure in p3["failures"])
+    p1_attempted = sum(block["summary"]["probes"] for block in single) + sum(
+        len(block["rows"]) for block in jitter
+    )
+    p1_failures = sum(
+        int(row.get("unit_stable") is False)
+        for block in jitter
+        for row in block["rows"]
+    ) + sum(
+        int(probe.get("unit_stable") is False)
+        for block in single
+        for probe in block["probes"]
+    )
     return {
+        "classes": {
+            "P1-unit-stability": {
+                "attempted": p1_attempted,
+                "failures": p1_failures,
+                "status": "pass" if p1_failures == 0 else "unknown",
+            },
+            "P2-shot": p2,
+            "P3-speaker-cliffs": p3,
+        },
         "exhaustive": all(block["coverage"]["exhaustive"] for block in single),
         "failures": failures,
         "global_jitter": jitter,
@@ -3930,7 +4908,7 @@ def run_perturbation(
         ),
         "single_gap": single,
         "totals": {
-            "errors": sum(block["summary"]["errors"] for block in single),
+            "errors": len(unknown),
             "failures": sum(block["summary"]["failures"] for block in single),
             "jitter_draws": sum(len(block["rows"]) for block in jitter),
             "max_influence_radius_units": max(
@@ -3938,7 +4916,7 @@ def run_perturbation(
                 default=0,
             ),
             "probes": sum(block["summary"]["probes"] for block in single),
-            "unknown": sum(block["summary"]["unknown"] for block in single),
+            "unknown": len(unknown),
             "with_movement": sum(block["summary"]["with_movement"] for block in single),
         },
     }
@@ -4017,7 +4995,11 @@ def build_shadow_report(
     partial: bool,
     ablation: Mapping[str, Any] | None,
     perturbation: Mapping[str, Any] | None,
-    warnings: Sequence[str],
+    speaker_gates: Mapping[str, Any] | None = None,
+    speech_truncation: Mapping[str, Any] | None = None,
+    coarse_gates: Mapping[str, Any] | None = None,
+    stop_items: Sequence[str] = (),
+    warnings: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Assemble the shadow report -- its own file, sharing no block with quality."""
     definition = metric_definition_block()
@@ -4029,6 +5011,9 @@ def build_shadow_report(
     changes: list[dict[str, Any]] = []
     for row in shadow_cases:
         changes.extend(interval_changes(row.case, row.artifact))
+    preview_blocks = [
+        row.artifact.get("preview_fidelity") or {} for row in shadow_cases
+    ]
 
     report: dict[str, Any] = {
         "schema_version": SHADOW_SCHEMA_VERSION,
@@ -4052,9 +5037,35 @@ def build_shadow_report(
         "policy_deltas": first.get("policy_deltas"),
         "shadow_env": SHADOW_ENV,
         "gated_lane": SHADOW_GATED_LANE,
+        "gated_row": SHADOW_GATED_ROW,
         "influence_radius_units": INFLUENCE_RADIUS_UNITS,
         "gates": {metric: dict(SHADOW_GATES[metric]) for metric in METRICS},
         "gate_results": [dict(r) for r in gate_results],
+        "preview_fidelity": {
+            "checked_edges": sum(
+                int(row.get("checked_edges") or 0) for row in preview_blocks
+            ),
+            "mismatch_count": sum(
+                len(row.get("mismatches") or ()) for row in preview_blocks
+            ),
+            "scored_edges": sum(
+                int(row.get("scored_edges") or 0) for row in preview_blocks
+            ),
+            "selected_mismatch_count": sum(
+                len(selected.get("mismatches") or ())
+                for block in preview_blocks
+                for selected in (block.get("selected_rows") or {}).values()
+            ),
+            "uncheckable_edges": sum(
+                int(row.get("uncheckable_edges") or 0) for row in preview_blocks
+            ),
+        },
+        "speaker_gates": None if speaker_gates is None else dict(speaker_gates),
+        "speech_truncation": (
+            None if speech_truncation is None else dict(speech_truncation)
+        ),
+        "coarse_gates": None if coarse_gates is None else dict(coarse_gates),
+        "stop_items": list(stop_items),
         "baseline": (
             None
             if baseline is None
@@ -4070,7 +5081,7 @@ def build_shadow_report(
             "by_group": merge_violation_counts(shadow_cases),
             "note": (
                 "keys are origin/stage/kind (+/waived); only unwaived v2 rows at"
-                " stage raw or core drive the exit (AD3-3), and the v1 rows are"
+                " an exit-driving validator stage drive the exit, and the v1 rows are"
                 " here so an inherited class can be told from one v2 caused"
             ),
         },
@@ -4116,16 +5127,28 @@ def build_shadow_report(
                 "wall_time_s": round(row.wall_time_s, 4),
                 "totals": row.artifact["totals"],
                 "coverage": row.artifact["coverage"],
+                "authorities": row.artifact.get("authorities"),
+                "canonical_fallback_rechecks": row.artifact.get(
+                    "canonical_fallback_rechecks"
+                ),
+                "diff_classification": row.artifact.get("diff_classification"),
+                "margin_summary": row.artifact.get("margin_summary"),
+                "preview_fidelity": row.artifact.get("preview_fidelity"),
+                "refiner_comparison": row.artifact.get("refiner_comparison"),
+                "speaker_projection": (row.artifact.get("speaker_evidence") or {}).get(
+                    "projection"
+                ),
                 "v1_projection": row.artifact["v1_projection"],
                 "validator": shadow_violation_counts(row.artifact),
                 "agreement": {
-                    lane: row.artifact["lanes"][lane]["agreement"]
+                    lane: row.artifact["lanes"][lane].get("agreement")
                     for lane in SHADOW_LANES
                 },
                 "lanes": {
                     lane: {
                         engine: _lane_case_row(row.lanes[(lane, engine)])
-                        for engine in SHADOW_ENGINES
+                        for engine in SHADOW_LANE_ROWS[lane]
+                        if (lane, engine) in row.lanes
                     }
                     for lane in SHADOW_LANES
                 },
@@ -4165,7 +5188,7 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
         )
         print("  " + "-" * 86)
         for name in (GROUP_ALL, *cc.CALIBRATION_LANGUAGES):
-            for engine in SHADOW_ENGINES:
+            for engine in SHADOW_LANE_ROWS[lane]:
                 groups = block.get(engine) or {}
                 row = groups.get(name)
                 if row is None or not row["case_count"]:
@@ -4231,6 +5254,32 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
             f" {totals['failures']} outside the influence cell,"
             f" {totals['unknown']} unevaluable"
         )
+        classes = perturbation.get("classes") or {}
+        if classes:
+            p1 = classes["P1-unit-stability"]
+            p2 = classes["P2-shot"]
+            p3 = classes["P3-speaker-cliffs"]
+            print(
+                f"  P1/P2/P3    unit={p1['attempted']}/{p1['failures']}"
+                f" shot={p2['effective']}/{p2['attempted']}"
+                f" speaker={len(p3['probes'])}/{len(p3['failures'])}"
+            )
+    coarse = report.get("coarse_gates")
+    if coarse:
+        print()
+        print(
+            f"  coarse N4c: {len(coarse['cases'])} cases,"
+            f" {len(coarse['failures'])} failures, {len(coarse['stops'])} STOPs"
+        )
+    speech = report.get("speech_truncation")
+    if speech:
+        print(
+            "  N6 speech   "
+            + "  ".join(
+                f"{language}: v2={row['v2']} legacy={row['legacy']}"
+                for language, row in sorted(speech["languages"].items())
+            )
+        )
     for warning in report.get("warnings") or ():
         print(f"  warning: {warning}")
 
@@ -4252,16 +5301,23 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         raise cc.CalibrationError(f"{corpus.path} selected no cases")
 
     warnings: list[str] = []
+    stop_items: list[str] = []
     baseline: dict[str, Any] | None = None
-    if args.baseline:
-        baseline = load_baseline(args.baseline, corpus)
+    baseline_path = args.baseline
+    if (
+        baseline_path is None
+        and Path(args.corpus).resolve() == DEFAULT_CORPUS.resolve()
+    ):
+        baseline_path = str(DEFAULT_BASELINE)
+    if baseline_path:
+        baseline = load_baseline(baseline_path, corpus)
         drift = environment_drift(baseline)
         if drift:
             if args.allow_environment_drift:
                 warnings.extend(f"environment drift ignored: {d}" for d in drift)
             else:
                 raise cc.CalibrationError(
-                    f"{args.baseline} was recorded in a different environment",
+                    f"{baseline_path} was recorded in a different environment",
                     [
                         *drift,
                         "segmenter versions move where breaks land",
@@ -4281,6 +5337,75 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         coverage_failures.extend(
             c13_case_failures(row.case, row.artifact["coverage"], violations)
         )
+        if row.tripwire_error is not None:
+            coverage_failures.append(f"{row.case.id}: {row.tripwire_error}")
+        for violation in (row.artifact.get("authorities") or {}).get("violations", ()):
+            coverage_failures.append(f"{row.case.id}: authority: {violation}")
+        classification = row.artifact.get("diff_classification") or {}
+        if classification.get("alignment_error"):
+            coverage_failures.append(f"{row.case.id}: N11 unit-range alignment failed")
+        if int(classification.get("unclassified_field_diff") or 0):
+            coverage_failures.append(
+                f"{row.case.id}: N11 has "
+                f"{classification['unclassified_field_diff']} unclassified field diff(s)"
+            )
+        if int(classification.get("relation_failures") or 0):
+            coverage_failures.append(
+                f"{row.case.id}: N11 has "
+                f"{classification['relation_failures']} allowed-relation failure(s)"
+            )
+        if classification.get("trigger_mismatches"):
+            coverage_failures.append(
+                f"{row.case.id}: N11 producer/independent triggers disagree: "
+                + ", ".join(classification["trigger_mismatches"])
+            )
+        refiner = row.artifact.get("refiner_comparison") or {}
+        if (
+            refiner.get("status") == "tracked-identity"
+            and refiner.get("byte_identical") is not True
+        ):
+            coverage_failures.append(
+                f"{row.case.id}: tracked refiner-on/off optimizer artifacts differ"
+            )
+        finalizer_rows = row.artifact["lanes"][SHADOW_LANE_FINALIZER]["rows"]
+        for row_id in ("v1", "v2"):
+            finalizer = (finalizer_rows.get(row_id) or {}).get("finalizer") or {}
+            fallback_rows = [
+                entry
+                for entry in finalizer.get("refusals") or ()
+                if entry.get("kind") == "canonical-text-fallback"
+            ]
+            rechecks = [
+                check
+                for check in row.artifact.get("canonical_fallback_rechecks") or ()
+                if check.get("row") == row_id
+            ]
+            if (
+                fallback_rows
+                and all(
+                    (entry.get("evidence") or {}).get("reason")
+                    == "granularity-unreconciled"
+                    for entry in fallback_rows
+                )
+                and len(rechecks) == len(fallback_rows)
+                and all(
+                    check.get("with_owned_footprint") == "word-data"
+                    for check in rechecks
+                )
+            ):
+                item = (
+                    f"N20/{row.case.id}/{row_id}: {len(fallback_rows)} canonical "
+                    "fallback(s); the frozen W1 authority factory exposes no "
+                    "owned-footprint input, although the same word_data "
+                    "reconciles when that normative footprint is supplied"
+                )
+                stop_items.append(item)
+                warnings.append(f"STOP: {item}")
+            elif fallback_rows:
+                coverage_failures.append(
+                    f"{row.case.id}: {row_id} fired "
+                    f"{len(fallback_rows)} canonical fallback(s)"
+                )
         if int(row.artifact["coverage"].get("coarse_granularity_intervals") or 0):
             warnings.append(
                 f"{row.case.id}: "
@@ -4314,7 +5439,9 @@ def cmd_shadow(args: argparse.Namespace) -> int:
 
     lanes = {
         lane: {
-            engine: lane_groups(shadow_cases, lane, engine) for engine in SHADOW_ENGINES
+            engine: lane_groups(shadow_cases, lane, engine)
+            for engine in SHADOW_LANE_ROWS[lane]
+            if any((lane, engine) in row.lanes for row in shadow_cases)
         }
         for lane in SHADOW_LANES
     }
@@ -4329,10 +5456,42 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             "a shadow lane aggregate is not schema-valid", schema_problems
         )
 
-    gated = lanes[SHADOW_GATED_LANE]["v2"]
-    gate_results = [] if partial else evaluate_gates(gated, SHADOW_GATES, baseline)
+    gated = lanes[SHADOW_GATED_LANE][SHADOW_GATED_ROW]
+    n1_results = [] if partial else evaluate_gates(gated, SHADOW_GATES, baseline)
+    for result in n1_results:
+        result["family"] = "N1-finalizer-v2-vs-tracked-baseline"
+    n3a_results = [] if partial else finalizer_vs_legacy_gates(shadow_cases)
+    gate_results = [*n1_results, *n3a_results]
+    tracked_full = (
+        not partial and Path(corpus.path).resolve() == DEFAULT_CORPUS.resolve()
+    )
+    speaker_gates = speaker_gate_block(shadow_cases)
+    speech_truncation = None if partial else speech_truncation_gates(shadow_cases)
+    if speech_truncation is not None:
+        coverage_failures.extend(speech_truncation["failures"])
+    if tracked_full:
+        for gate in speaker_gates["gates"]:
+            if gate["status"] == "fail":
+                coverage_failures.append(
+                    f"{gate['id']}: value={gate.get('value')} target={gate.get('target')}"
+                )
+            elif gate["status"] == "stopped":
+                item = (
+                    f"{gate['id']} STOP: requested rate {gate['target']:.6f} exceeds "
+                    f"the frozen lineage's expressible ceiling {gate['possible_rate']:.6f}"
+                )
+                stop_items.append(item)
+                warnings.append(item)
     if partial:
         warnings.append("partial run (--case): non-inferiority gates skipped")
+
+    coarse_gates = run_coarse_gates(corpus) if tracked_full else None
+    if coarse_gates is not None:
+        coverage_failures.extend(coarse_gates["failures"])
+        for coarse_stop in coarse_gates["stops"]:
+            item = f"PD-SUBUNIT STOP: {coarse_stop}"
+            stop_items.append(item)
+            warnings.append(item)
 
     ablation = run_ablation(cases, gated) if args.ablation else None
 
@@ -4364,6 +5523,7 @@ def cmd_shadow(args: argparse.Namespace) -> int:
                 "--perturb-near-cliff-only skipped the seeded 10% sample of"
                 " non-near-cliff gaps: a bounded AD-2 slice, not full coverage"
             )
+        warnings.extend(perturbation["classes"]["P3-speaker-cliffs"]["warnings"])
 
     report = build_shadow_report(
         corpus,
@@ -4372,10 +5532,14 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         gate_results=gate_results,
         coverage_failures=coverage_failures,
         baseline=baseline,
-        baseline_path=args.baseline,
+        baseline_path=baseline_path,
         partial=partial,
         ablation=ablation,
         perturbation=perturbation,
+        speaker_gates=speaker_gates,
+        speech_truncation=speech_truncation,
+        coarse_gates=coarse_gates,
+        stop_items=stop_items,
         warnings=warnings,
     )
 
@@ -4485,7 +5649,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     shadow = sub.add_parser(
         "shadow",
-        help="P4: measure BoundaryOptimizer v2 beside v1 (never gates `quality`)",
+        help="P5: measure the complete shadow lane/row matrix (separate from `quality`)",
     )
     shadow.add_argument("--corpus", default=str(DEFAULT_CORPUS))
     shadow.add_argument(
@@ -4515,7 +5679,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="ablation",
         action="store_false",
         default=True,
-        help="skip the one-at-a-time weight ablation (13 extra corpus replays)",
+        help="skip the one-at-a-time weight ablation (14 extra corpus replays)",
     )
     shadow.add_argument(
         "--perturb",

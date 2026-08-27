@@ -1880,10 +1880,26 @@ def phase1_from_optimizer_selection(
     unit_ranges = [
         (bounds[index], bounds[index + 1]) for index in range(len(bounds) - 1)
     ]
+    owned_ranges = unit_ranges if len(unit_ranges) == len(cues) else None
+    footprints: list[str] | None = None
+    if owned_ranges is not None:
+        from .layout import _join
+
+        footprints = [
+            _join(
+                [
+                    unit.surface
+                    for unit in authority.document.units[unit_start:unit_end]
+                ],
+                profile.language,
+            )
+            for unit_start, unit_end in owned_ranges
+        ]
     stream = phase1_stream(
         cues,
         profile=profile,
-        unit_ranges=unit_ranges if len(unit_ranges) == len(cues) else None,
+        footprints=footprints,
+        unit_ranges=owned_ranges,
     )
     return _mint_stream(
         stream,

@@ -184,6 +184,7 @@ V2_ONLY_MODULES = (
     "voxweave.core.authority",
     "voxweave.core.canonical_text",
     "voxweave.core.finalizer",
+    "voxweave.core.speaker_evidence",
     "voxweave.core.subunit",
     "voxweave.core.partition_check",
     "voxweave.core.trace_validator",
@@ -341,27 +342,27 @@ def test_artifact_carries_both_lanes_with_stage_attribution(shadow_on):
                 if origin == "v1" or stage == "legacy-overlay":
                     assert violation["exit_driving"] is False
 
-    # The solver's own partition and the character projection the overlay lane
-    # must rely on are independent derivations; they have to agree.
+    # The solver partition and structural surface reconciliation are independent
+    # derivations; they have to agree.
     assert core["v2"]["projection_cross_check"]["agrees"] is True
     assert core["v2"]["projection"] == "solver-partition"
     assert core["agreement"]["identical_cuts"] >= 0
 
 
-def test_live_artifact_stays_schema_one_until_w4_preserves_v2_coverage(shadow_on):
+def test_live_artifact_is_schema_two_and_preserves_staged_coverage(shadow_on):
     artifact = _segment(_case_plain()).shadow
     assert artifact is not None
-    assert artifact["schema_version"] == 1
+    assert artifact["schema_version"] == 2
 
-    # The W4 assembler currently replaces the standalone W2 coverage block.
-    # A live artifact may not claim schema 2 until all three staged fields make
-    # it through that assembly boundary.
     staged = {
         "coarse_caused_intervals",
         "dual_form_unmeasured",
         "named_multi_cues_unannotated",
     }
-    assert staged.isdisjoint(artifact["coverage"])
+    assert staged <= set(artifact["coverage"])
+    assert artifact["subunit_split"] is not None
+    assert artifact["speaker_evidence"]["measurement"] is not None
+    assert artifact["finalizer"] is not None
 
 
 def test_coverage_block_reports_the_c13_fields(shadow_on):
@@ -450,8 +451,11 @@ def test_post_overlay_lane_runs_the_diarize_formatter(shadow_on):
     assert artifact is not None
     assert result.diagnostics["speaker_formatted"] is True
 
-    core = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v2"]
-    delivery = artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY]["v2"]
+    # The speaker-aware v2 partition can already cut exactly at the turn and
+    # make the formatter a visible no-op. The v1 proxy is the stable tripwire
+    # that proves this legacy overlay lane still invokes its old treatment.
+    core = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v1"]
+    delivery = artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY]["v1"]
     assert delivery["cue_count"] >= core["cue_count"]
     # The formatter either split at the speaker turn or dashed a shared cue;
     # either way the delivery stream is not simply the core stream renamed.
@@ -460,13 +464,15 @@ def test_post_overlay_lane_runs_the_diarize_formatter(shadow_on):
     )
 
 
-def test_lyric_flags_only_appear_in_the_delivery_lane(shadow_on):
+def test_legacy_lyric_overlay_and_v2_evidence_lyric_are_both_visible(shadow_on):
     artifact = _segment(_case_lyrics()).shadow
     assert artifact is not None
-    core = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v2"]["cues"]
-    delivery = artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY]["v2"]["cues"]
-    assert not any(row["lyric"] for row in core)
-    assert any(row["lyric"] for row in delivery)
+    core_v1 = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v1"]["cues"]
+    delivery_v1 = artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY]["v1"]["cues"]
+    core_v2 = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v2"]["cues"]
+    assert not any(row["lyric"] for row in core_v1)
+    assert any(row["lyric"] for row in delivery_v1)
+    assert any(row["lyric"] for row in core_v2)
 
 
 # --- the two degradation ledgers (AD3-5 / AD4-4) ----------------------------
@@ -694,14 +700,16 @@ def test_an_unprojectable_v1_stream_is_measured_without_a_v1_reference(
 ):
     """Adjudication B: never fabricate an empty v1 partition.
 
-    ``_shadow_partition`` returns ``None`` when the character cursor cannot land
-    on an atom edge. ``None or ()`` used to collapse that into "v1 chose no
+    ``_shadow_v1_partition`` returns ``None`` when structural origin translation
+    cannot reconcile a source boundary. ``None or ()`` used to collapse that into "v1 chose no
     cuts", which is indistinguishable from the legitimate single-cue answer --
     and then wins the C8 policy comparison outright, because every legal path is
     trivially within margin of a reference that made no cuts.
     """
     monkeypatch.setattr(
-        pipeline, "_shadow_partition", lambda *a, **k: (None, "unresolved-at-char-7")
+        pipeline,
+        "_shadow_v1_partition",
+        lambda *a, **k: (None, "surface-boundary-unresolved"),
     )
     artifact = _segment(_case_plain()).shadow
     assert artifact is not None
@@ -713,8 +721,12 @@ def test_an_unprojectable_v1_stream_is_measured_without_a_v1_reference(
         assert block["selected_is_v1"] is None
         assert block["v1_path_legal"] is None
         assert block["v1_cost_under_v2"] is None
-    for lane in (pipeline.SHADOW_LANE_CORE, pipeline.SHADOW_LANE_DELIVERY):
-        assert artifact["lanes"][lane]["v1"]["validator"] is None
+    assert artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v1"]["validator"] is None
+    # The legacy proxy independently reconciles its post-overlay surfaces, but
+    # that cannot retroactively manufacture the missing optimizer reference.
+    assert (
+        artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY]["v1"]["validator"] is not None
+    )
 
 
 def test_a_projected_run_records_v1_and_says_so(shadow_on):

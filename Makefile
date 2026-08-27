@@ -116,7 +116,7 @@ quality-segmentation:
 	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \
 	  --json-out $(SEG_REPORT) --check
 
-# P4: the BoundaryOptimizer v2 shadow lane, measured beside the shipped v1 answer.
+# P5: full optimizer/finalizer/speaker shadow matrix beside the shipped v1 answer.
 # Same corpus, same baseline, same environment as `quality-segmentation` -- the
 # non-inferiority numbers are only comparable against a baseline recorded here.
 # Deliberately NOT part of `quality`: the shadow ships nothing, so a v2 regression
@@ -133,7 +133,7 @@ quality-segmentation:
 # clock: --perturb-case, --perturb-magnitude and dropping
 # --perturb-near-cliff-only all take the run back toward full AD-2 coverage.
 quality-shadow-segmentation:
-	uv run python scripts/calib_segmentation.py shadow \
+	uv run --extra $(VARIANT) python scripts/calib_segmentation.py shadow \
 	  --corpus $(SEG_CORPUS) \
 	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \
 	  --perturb --perturb-mode single_gap --perturb-magnitude 50 \

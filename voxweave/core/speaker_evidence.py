@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from .boundary_cost import CostBreakdown, make_breakdown, transition_time
@@ -54,6 +54,7 @@ __all__ = [
     "make_evidence_span",
     "measure_speaker_events",
     "named_multi_cues_unannotated",
+    "project_speaker_evidence",
     "speaker_edge_cost",
     "speaker_evidence",
     "summarize_speaker_prices",
@@ -1114,6 +1115,31 @@ def speaker_evidence(
         filled_labels=tuple(filled),
         absorbed_labels=tuple(absorbed),
         snapped_labels=tuple(snapped),
+    )
+
+
+def project_speaker_evidence(
+    evidence: UnitSpeakers,
+    *,
+    refined_units: Sequence[SourceUnit],
+    origin: Sequence[int],
+) -> UnitSpeakers:
+    """Project already-conditioned parent evidence without re-attributing it.
+
+    The live hook must take the acoustic snapshot before refinement.  This
+    additive seam lets it do exactly that: all attribution, conditioning and raw
+    event lineage remain the objects produced on production parents, while only
+    the optimizer-space unit projection is rebuilt from the refiner's complete
+    positional origin tuple.
+    """
+    units, owners = _checked_projection(
+        len(evidence.parent_units), refined_units, origin
+    )
+    return replace(
+        evidence,
+        refined_units=units,
+        origin=owners,
+        unit_speakers=_project_units(evidence.conditioned_parents, owners),
     )
 
 

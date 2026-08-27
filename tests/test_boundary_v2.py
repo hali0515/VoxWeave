@@ -38,6 +38,7 @@ from voxweave.core.boundary_v2 import (
     POLICY_MARGIN,
     SCHEMA_VERSION,
     V1Partition,
+    _margin_summary,
     build_cost_context,
     build_cost_tables,
     materialize_cues,
@@ -111,6 +112,31 @@ def tie_document():
     return document(
         [("ab", 0.0, 0.0)] * 6, prof=profile(max_line_length=12, max_lines=1)
     )
+
+
+def test_pinned_neighbour_margin_summary_has_hand_derived_tie_and_ranks():
+    """W4 §11: relocation ties stay exact and negative deltas stay negative."""
+    solution = optimize_document(tie_document())
+    interval = solution.solutions[0]
+    # The selected cut at unit 2 can move to the equal-cost cut at unit 3.
+    assert interval.partition_units == (2,)
+    assert interval.decision_margins == (0.0,)
+    assert interval.to_dict()["margin_summary"] == {
+        "count": 1,
+        "exact_ties": 1,
+        "min": 0.0,
+        "p05": 0.0,
+        "p50": 0.0,
+    }
+    # Nearest rank uses ceil(p*n), one-indexed: ranks 1 and 3 here.
+    assert _margin_summary([-2.0, 0.0, 3.0, 8.0, 10.0], selected_cut_count=5) == {
+        "count": 5,
+        "exact_ties": 1,
+        "min": -2.0,
+        "p05": -2.0,
+        "p50": 3.0,
+    }
+    assert _margin_summary([], selected_cut_count=0) is None
 
 
 def atom(index, text, *, start=None, end=None, **over):
@@ -270,8 +296,7 @@ def test_the_tie_fixture_really_ties_and_the_local_rule_picks_the_low_last_cut()
 
     interval = solved(doc).solutions[0]
     assert interval.selection.raw_optimum.cuts == (2,)
-    assert interval.selection.margin == pytest.approx(0.0)
-    assert interval.selection.low_margin is True
+    assert interval.decision_margins == (0.0,)
 
 
 # ---------------------------------------------------------------- AD4-2 work gate
@@ -482,9 +507,9 @@ def test_artifact_carries_the_declared_schema():
     art = solution.artifact
     assert art["kind"] == "segmentation-shadow"
     assert art["schema_version"] == SCHEMA_VERSION
-    # W2 stages the additive fields, but W4 owns the version flip once the live
-    # assembler stops replacing this complete standalone coverage contract.
-    assert SCHEMA_VERSION == 1
+    # W4 is the sole schema-flip owner, after every staged block survives live
+    # assembly.
+    assert SCHEMA_VERSION == 2
     assert art["engine_v2"] == ENGINE_V2
     # Omitting both W3 arguments is the frozen pre-W3 solve seam.  Policy 2 is
     # named only by an explicit speaker/full or counterfactual solve.
@@ -553,13 +578,12 @@ def test_the_artifact_is_byte_stable_across_identical_runs():
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
 
 
-def test_w3_off_artifact_is_byte_identical_to_pre_w3_base():
-    """Staging law: the no-argument solve is the exact ``a238e48`` artifact.
+def test_no_argument_artifact_retains_policy_one_with_only_w4_artifact_deltas():
+    """The ordinary solve remains W3-off while W4 changes artifact structure.
 
-    The digest was produced from the base commit with this same four-unit
-    fixture and canonical JSON settings.  Pinning the whole serialization (not
-    just the selected partition) catches policy identity and any future staged
-    field leaking into the disabled world.
+    Cue bytes and edge serialization remain the ``a238e48`` seam. The artifact
+    hash deliberately moves once in W4 for schema 2 and the mandated margin
+    summary, while the policy stays 1 and no W3 candidate fields leak in.
     """
     solution = optimize_document(document(timed(["the", "cat", "sat", "down"])))
     assert solution.solutions[0].partition_units == ()
@@ -586,7 +610,7 @@ def test_w3_off_artifact_is_byte_identical_to_pre_w3_base():
         ensure_ascii=False,
     ).encode()
     assert hashlib.sha256(payload).hexdigest() == (
-        "b3fe11c932e2a12d170ab198e282a8840da783f4f4471bc5a92f321cf1f41969"
+        "1dc113c5ef9e298496366d0e959da8776bc168266fe75287a08407c9f2ae767e"
     )
 
 
