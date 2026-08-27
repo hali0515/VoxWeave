@@ -315,6 +315,7 @@ def delete_cache_companion_first(
 def cache_lock(cache_path: Path) -> Iterator[CacheLockHandle]:
     """Serialize every cache reader/writer through the canonical realpath lock."""
     resolved = canonical_cache_path(cache_path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
     lock = Path(f"{resolved}.lock")
     descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:

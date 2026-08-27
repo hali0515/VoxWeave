@@ -10,6 +10,7 @@ import platform
 import subprocess
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,7 @@ from voxweave.lang import (
     to_iso_or,
     transcript_content_weight,
 )
+from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
 from voxweave.progress import Reporter
 from voxweave.songdet import (
     detect_song_spans,
@@ -52,6 +54,25 @@ from voxweave.songdet import (
 )
 from voxweave.speakers import load_speaker_mapping, voice_text_for_ids
 from voxweave.timestamps import shift_units
+from voxweave.voicebase import (
+    Phase2DataError,
+    canonical_turns_digest,
+    media_fingerprint,
+    mint_capture_id,
+    require_capture_id,
+    require_sha256,
+    utc_timestamp,
+    validate_voiceprints_mapping,
+    write_voiceprints,
+)
+from voxweave.voiceepisode import episode_lock
+from voxweave.vocalscache import (
+    cache_lock,
+    cache_write_window,
+    load_cache_companion,
+    publish_cache_companion,
+    validate_cache_pair,
+)
 
 if TYPE_CHECKING:  # the v2 shadow is import-free unless its flag is on
     from voxweave.core.boundary_v2 import DocumentSolution
@@ -508,6 +529,8 @@ def transcribe(
     reporter: Reporter | None = None,
     debug: bool = False,
     cache_vocals: Path | None = None,
+    source_fingerprint: str | None = None,
+    debug_stem: str | None = None,
     asr_model: str | None = None,
     context: str | None = None,
     min_speakers: int | None = None,
@@ -540,7 +563,9 @@ def transcribe(
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
-    dbg: DebugSink = FileDebugSink(media_path.stem) if debug else DebugSink()
+    dbg: DebugSink = (
+        FileDebugSink(debug_stem or media_path.stem) if debug else DebugSink()
+    )
     af = ASR_LOUDNORM if normalize else None
     tmp: list[
         Path
@@ -553,17 +578,47 @@ def transcribe(
         vocals: Path | None = None
         fullband: Path | None = None
         voc32: Path | None = None  # 32k mono vocals: PANNs input + cache source
+        separator_identity: dict[str, object] | None = None
+        if separate and voiceprints:
+            separator_identity = backend.separator_identity()
+            require_sha256(source_fingerprint, "capture media fingerprint")
         if separate:
-            if (
-                cache_vocals is not None
-                and Path(cache_vocals).exists()
-                and _vocals_cache_fresh(Path(cache_vocals), media_path)
-            ):
+            cache_hit = False
+            if cache_vocals is not None:
+                with cache_lock(Path(cache_vocals)) as cache_handle:
+                    cache_path = cache_handle.cache_path
+                    if cache_path.exists():
+                        if voiceprints:
+                            try:
+                                companion, _validated = load_cache_companion(
+                                    cache_handle.companion_path
+                                )
+                                validate_cache_pair(
+                                    companion,
+                                    cache_path,
+                                    media_fingerprint=source_fingerprint or "",
+                                    separator=separator_identity or {},
+                                )
+                                cache_hit = True
+                            except (OSError, Phase2DataError):
+                                log.info(
+                                    "vocals cache is not bound to this capture; re-separating: %s",
+                                    cache_path,
+                                )
+                        else:
+                            cache_hit = _vocals_cache_fresh(cache_path, media_path)
+                    if cache_hit:
+                        # Keep the cache lock through decoder completion. A validated
+                        # hash followed by an unlocked open is not a stable read.
+                        rep.stage("vocals cache (32k)")
+                        log.info("reuse cached vocals %s", cache_path)
+                        voc32 = cache_path
+                        wav = decode_to_wav(
+                            voc32, audio_filter=af
+                        )  # 32k flac -> 16k mono
+            if cache_hit:
                 # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
-                rep.stage("vocals cache (32k)")
-                log.info("reuse cached vocals %s", cache_vocals)
-                voc32 = Path(cache_vocals)
-                wav = decode_to_wav(voc32, audio_filter=af)  # 32k flac -> 16k mono
+                pass
             else:
                 fullband, vocals, wav, voc32 = _separate_to_16k_32k(
                     media_path, reporter=rep, normalize=normalize
@@ -576,9 +631,21 @@ def transcribe(
                 log.info("separated vocals (local Roformer)")
                 if cache_vocals is not None:
                     try:
-                        _encode_flac(voc32, Path(cache_vocals))
+                        with cache_write_window(Path(cache_vocals)) as cache_handle:
+                            _encode_flac(voc32, cache_handle.cache_path)
+                            if voiceprints:
+                                publish_cache_companion(
+                                    cache_handle.cache_path,
+                                    media_fingerprint=source_fingerprint or "",
+                                    separator=separator_identity or {},
+                                    companion_path=cache_handle.companion_path,
+                                )
                         log.info("cached vocals 32k → %s", cache_vocals)
-                    except (OSError, subprocess.CalledProcessError) as e:
+                    except (
+                        OSError,
+                        subprocess.CalledProcessError,
+                        Phase2DataError,
+                    ) as e:
                         log.warning("cache vocals failed (non-fatal): %r", e)
         else:
             rep.stage("decode 16k")
@@ -861,10 +928,15 @@ def transcribe(
                         **(
                             {
                                 "separator": {
-                                    "repo": backend.SEPARATOR_REPO,
-                                    "file": backend.SEPARATOR_REPO_FILE,
-                                    "checkpoint": "unresolved",
-                                    "config_sha256": "unresolved",
+                                    **(
+                                        separator_identity
+                                        or {
+                                            "repo": backend.SEPARATOR_REPO,
+                                            "file": backend.SEPARATOR_REPO_FILE,
+                                            "checkpoint": "unresolved",
+                                            "config_sha256": "unresolved",
+                                        }
+                                    ),
                                 }
                             }
                             if separate
@@ -1049,6 +1121,8 @@ def _dump_sibling_json(
     shot_changes: list[float] | None = None,
     sing_spans: list[tuple[float, float]] | None = None,
     speaker_turns: list[tuple[float, float, str]] | None = None,
+    voiceprint_capture: str | None = None,
+    voiceprint_media: str | None = None,
     manifest: Mapping[str, Any] | None = None,
 ) -> None:
     """Write the sibling JSON document (language + segments + word_segments + optional
@@ -1083,6 +1157,11 @@ def _dump_sibling_json(
         data["speaker_turns"] = [
             [float(s), float(e), str(lb)] for s, e, lb in speaker_turns
         ]
+    if (voiceprint_capture is None) != (voiceprint_media is None):
+        raise Phase2DataError("voiceprint sibling keys must be present as a pair")
+    if voiceprint_capture is not None and voiceprint_media is not None:
+        data["voiceprint_capture"] = require_capture_id(voiceprint_capture)
+        data["voiceprint_media"] = require_sha256(voiceprint_media, "voiceprint_media")
     if manifest is not None:
         data["segmentation"] = dict(manifest)
     fsio.atomic_write_text(json_path, json.dumps(data, ensure_ascii=False, indent=2))
@@ -1115,6 +1194,8 @@ def _write_siblings(
     shot_changes: list[float] | None = None,
     sing_spans: list[tuple[float, float]] | None = None,
     speaker_turns: list[tuple[float, float, str]] | None = None,
+    voiceprint_capture: str | None = None,
+    voiceprint_media: str | None = None,
     manifest: Mapping[str, Any] | None = None,
     speaker_names: Mapping[str, str] | None = None,
 ) -> Path:
@@ -1140,6 +1221,8 @@ def _write_siblings(
         shot_changes=shot_changes,
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
+        voiceprint_capture=voiceprint_capture,
+        voiceprint_media=voiceprint_media,
         manifest=manifest,
     )
     rows = []
@@ -3340,6 +3423,160 @@ def _reconcile_word_segment_language(
     return effective_iso, rebuilt
 
 
+def voiceprints_path(path: Path) -> Path:
+    return swap_ext(Path(path), ".voiceprints.json")
+
+
+def speakers_suggest_path(path: Path) -> Path:
+    return swap_ext(Path(path), ".speakers.suggest.json")
+
+
+def speakers_html_path(path: Path) -> Path:
+    return swap_ext(Path(path), ".speakers.html")
+
+
+def _current_voiceprint_capture(json_path: Path) -> str | None:
+    try:
+        value = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if isinstance(value, dict) and isinstance(value.get("voiceprint_capture"), str):
+        return value["voiceprint_capture"]
+    return None
+
+
+def _voiceprints_document(
+    media_path: Path,
+    capture: VoiceprintCapture,
+    *,
+    capture_id: str,
+    source_fingerprint: str,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "version": 1,
+        "capture_id": capture_id,
+        "provenance": capture.provenance,
+        "binding": {
+            "turns_digest": canonical_turns_digest(capture.turns),
+            "media_fingerprint": source_fingerprint,
+            "media_stem": media_path.stem,
+            "created": utc_timestamp(),
+        },
+        "speakers": capture.centroids,
+    }
+    validate_voiceprints_mapping(value)
+    return value
+
+
+def _machine_artifact_error(path: Path, action: str, exc: OSError) -> RuntimeError:
+    return RuntimeError(
+        "primary JSON/VTT outputs landed but the speaker machine-artifact set "
+        f"is inconsistent: could not {action} {path}: {exc}"
+    )
+
+
+def _delete_after_primary(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise _machine_artifact_error(path, "delete", exc) from exc
+
+
+def _commit_process_outputs(
+    media_path: Path,
+    cues: Sequence[Mapping[str, Any]],
+    units: list[dict],
+    lang: str,
+    *,
+    vad_speech: list[tuple[float, float]] | None,
+    timestamps: bool,
+    shot_changes: list[float] | None,
+    sing_spans: list[tuple[float, float]] | None,
+    speaker_turns: list[tuple[float, float, str]] | None,
+    manifest: Mapping[str, Any] | None,
+    capture: VoiceprintCapture | None,
+    snapshot_fingerprint: str | None,
+) -> Path:
+    """Commit primary siblings and the complete machine-artifact state under lock."""
+    json_path = swap_ext(media_path, ".json")
+    sidecar_path = voiceprints_path(media_path)
+    suggest_path = speakers_suggest_path(media_path)
+    html_path = speakers_html_path(media_path)
+    with episode_lock(media_path):
+        effective_capture = capture
+        if effective_capture is not None:
+            if effective_capture.turns is not speaker_turns:
+                raise RuntimeError(
+                    "voiceprint capture turns diverged from sibling turns"
+                )
+            try:
+                live_fingerprint = media_fingerprint(media_path)
+            except OSError as exc:
+                log.warning(
+                    "voiceprint capture dropped: live media recheck failed: %s", exc
+                )
+                effective_capture = None
+            else:
+                if live_fingerprint != snapshot_fingerprint:
+                    log.warning(
+                        "voiceprint capture dropped: live media changed before commit"
+                    )
+                    effective_capture = None
+
+        capture_id: str | None = None
+        sidecar: dict[str, object] | None = None
+        if effective_capture is not None and snapshot_fingerprint is not None:
+            capture_id = mint_capture_id(current=_current_voiceprint_capture(json_path))
+            try:
+                sidecar = _voiceprints_document(
+                    media_path,
+                    effective_capture,
+                    capture_id=capture_id,
+                    source_fingerprint=snapshot_fingerprint,
+                )
+            except Phase2DataError as exc:
+                log.warning("voiceprint capture dropped: %s", exc)
+                capture_id = None
+                sidecar = None
+
+        vtt_out = _write_siblings(
+            media_path,
+            cues,
+            units,
+            lang,
+            vad_speech=vad_speech,
+            timestamps=timestamps,
+            shot_changes=shot_changes,
+            sing_spans=sing_spans,
+            speaker_turns=speaker_turns,
+            voiceprint_capture=capture_id,
+            voiceprint_media=(snapshot_fingerprint if capture_id is not None else None),
+            manifest=manifest,
+        )
+
+        # Delete regenerable claims before publishing the one non-regenerable
+        # capture artifact. Every process rewrite, including no-diarize, follows
+        # this branch.
+        _delete_after_primary(suggest_path)
+        _delete_after_primary(html_path)
+        if sidecar is None:
+            _delete_after_primary(sidecar_path)
+        else:
+            try:
+                write_voiceprints(sidecar_path, sidecar)
+            except (OSError, Phase2DataError) as exc:
+                if isinstance(exc, OSError):
+                    error = _machine_artifact_error(sidecar_path, "write", exc)
+                else:
+                    error = RuntimeError(
+                        "primary JSON/VTT outputs landed but the speaker "
+                        f"machine-artifact set is inconsistent: {exc}"
+                    )
+                raise error from exc
+            log.info("wrote voice-biometric sidecar %s", sidecar_path.name)
+        return vtt_out
+
+
 def process(
     media_path: Path,
     lang_override: str | None = None,
@@ -3377,6 +3614,84 @@ def process(
     automatic fallback; model output can never replace text or timestamps.
     """
     media_path = Path(media_path)
+    if voiceprints and (not diarize or word_segments is not None):
+        raise ValueError("voiceprint capture requires a fresh diarization run")
+
+    def run_with_source(
+        source_path: Path,
+        snapshot_fingerprint: str | None,
+        capture_enabled: bool,
+    ) -> Path:
+        return _process_from_source(
+            media_path,
+            source_path=source_path,
+            snapshot_fingerprint=snapshot_fingerprint,
+            lang_override=lang_override,
+            separate=separate,
+            reporter=reporter,
+            debug=debug,
+            normalize=normalize,
+            skip_songs=skip_songs,
+            keep_lyrics=keep_lyrics,
+            sdh=sdh,
+            diarize=diarize,
+            voiceprints=capture_enabled,
+            word_segments=word_segments,
+            asr_model=asr_model,
+            context=context,
+            timestamps=timestamps,
+            shot_snap=shot_snap,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            semantic_split=semantic_split,
+            semantic_model=semantic_model,
+        )
+
+    if voiceprints:
+        snapshots = ExitStack()
+        try:
+            snapshot = snapshots.enter_context(MediaSnapshot(media_path))
+        except SnapshotUnavailable as exc:
+            snapshots.close()
+            log.warning(
+                "voiceprint capture unavailable; continuing without capture: %s", exc
+            )
+        else:
+            with snapshots:
+                return run_with_source(
+                    snapshot.path,
+                    snapshot.fingerprint,
+                    True,
+                )
+    return run_with_source(media_path, None, False)
+
+
+def _process_from_source(
+    media_path: Path,
+    *,
+    source_path: Path,
+    snapshot_fingerprint: str | None,
+    lang_override: str | None = None,
+    separate: bool = True,
+    reporter: Reporter | None = None,
+    debug: bool = False,
+    normalize: bool = False,
+    skip_songs: bool = False,
+    keep_lyrics: bool = False,
+    sdh: bool = False,
+    diarize: bool = False,
+    voiceprints: bool = False,
+    word_segments: tuple[str, list[dict]] | None = None,
+    asr_model: str | None = None,
+    context: str | None = None,
+    timestamps: bool = True,
+    shot_snap: bool = True,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+    semantic_split: bool = False,
+    semantic_model: str | None = None,
+) -> Path:
+    """Execute one process run against the selected immutable/live source."""
     rep = reporter or Reporter()
     # Resolve the optional semantic backend up front: a missing endpoint must
     # abort here, not after a full separation/ASR/alignment run.  Construction
@@ -3402,7 +3717,7 @@ def process(
             speaker_turns,
             _voiceprint_capture,
         ) = transcribe(
-            media_path,
+            source_path,
             lang_override=lang_override,
             separate=separate,
             skip_songs=skip_songs,
@@ -3413,6 +3728,8 @@ def process(
             reporter=reporter,
             debug=debug,
             cache_vocals=cache_vocals_path(media_path),
+            source_fingerprint=snapshot_fingerprint,
+            debug_stem=media_path.stem,
             asr_model=asr_model,
             context=context,
             min_speakers=min_speakers,
@@ -3427,7 +3744,9 @@ def process(
             from voxweave import shotdet
 
             rep.stage("shot detection")
-            shot_changes = shotdet.detect_shot_changes(media_path)
+            # Shot cuts are non-binding output, but capture-on still routes them
+            # through the same immutable bytes to avoid a mixed-source sibling.
+            shot_changes = shotdet.detect_shot_changes(source_path)
 
     rep.stage(
         "semantic subtitle boundaries" if semantic_engine else "smart_split layout"
@@ -3448,7 +3767,7 @@ def process(
     units, cues = segmented.units, segmented.cues
 
     rep.stage("write siblings")
-    vtt_out = _write_siblings(
+    vtt_out = _commit_process_outputs(
         media_path,
         cues,
         units,
@@ -3459,6 +3778,8 @@ def process(
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
         manifest=segmented.manifest,
+        capture=_voiceprint_capture,
+        snapshot_fingerprint=snapshot_fingerprint,
     )
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
     if sdh and word_segments is None:

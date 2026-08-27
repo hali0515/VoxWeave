@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import logging
 import os
@@ -198,6 +199,24 @@ def _resolve_separator_files() -> tuple[Path, Path]:
     if not conf.exists():
         conf = _BUNDLED_SEPARATOR_CONFIG
     return ckpt, conf
+
+
+def separator_identity() -> dict[str, object]:
+    """Describe the exact separator weights/config used by this runtime."""
+    checkpoint, config_path = _resolve_separator_files()
+    resolved_checkpoint = checkpoint.resolve(strict=True)
+    checkpoint_identity = (
+        resolved_checkpoint.name
+        if resolved_checkpoint.parent.name == "blobs"
+        else "unresolved"
+    )
+    config_digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    return {
+        "repo": SEPARATOR_REPO,
+        "file": SEPARATOR_REPO_FILE,
+        "checkpoint": checkpoint_identity,
+        "config_sha256": config_digest,
+    }
 
 
 _FALSE_ENV_VALUES = frozenset({"0", "false", "off"})

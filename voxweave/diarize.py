@@ -478,7 +478,7 @@ def _smooth_turns(turns: Sequence[Turn]) -> list[Turn]:
     """
     if not turns:
         return []
-    ordered = sorted(turns, key=lambda t: (t[0], t[1]))
+    ordered = sorted(turns, key=lambda t: (t[0], t[1], t[2]))
     drop_s = _env_float("VOXWEAVE_DIARIZE_DROP_CONTAINED_S", DIARIZE_DROP_CONTAINED_S)
     merge_gap = _env_float("VOXWEAVE_DIARIZE_MERGE_GAP_S", DIARIZE_MERGE_GAP_S)
     kept: list[Turn] = []
