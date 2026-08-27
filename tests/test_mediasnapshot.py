@@ -4,6 +4,7 @@ import errno
 import os
 import stat
 import time
+from pathlib import Path
 
 import pytest
 
@@ -186,6 +187,21 @@ def test_source_permission_failure_is_typed_and_creates_no_partial(
     assert list((cache / "snapshots").iterdir()) == []
 
 
+def test_destination_mode_failure_cleans_o_excl_file(tmp_path, monkeypatch):
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"A")
+    cache = tmp_path / "cache"
+
+    def denied(_descriptor, _mode):
+        raise PermissionError(errno.EPERM, "fchmod denied")
+
+    monkeypatch.setattr(mediasnapshot.os, "fchmod", denied)
+    with pytest.raises(mediasnapshot.SnapshotUnavailable, match="cannot create"):
+        with mediasnapshot.MediaSnapshot(source, cache_root=cache):
+            pass
+    assert list((cache / "snapshots").iterdir()) == []
+
+
 def test_non_regular_source_fails_closed(tmp_path):
     source = tmp_path / "media-dir"
     source.mkdir()
@@ -310,6 +326,25 @@ def test_janitor_removes_only_old_regular_unleased_owned_names(tmp_path):
     assert nonregular.is_dir()
     assert unrelated.exists()
     assert outside.read_bytes() == b"keep"
+
+
+def test_janitor_cleanup_failures_are_best_effort(tmp_path, monkeypatch):
+    directory = tmp_path / "snapshots"
+    directory.mkdir()
+    now = time.time()
+    residue = directory / ("snapshot-" + "1" * 32 + ".mp4")
+    residue.write_bytes(b"old")
+    os.utime(residue, (now - 7200, now - 7200))
+    original_unlink = Path.unlink
+
+    def refuse_residue(path, *args, **kwargs):
+        if path == residue:
+            raise PermissionError(errno.EPERM, "cannot unlink")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_residue)
+    assert mediasnapshot.cleanup_stale_snapshots(directory, now=now) == ()
+    assert residue.exists()
 
 
 def test_new_snapshot_runs_crash_residue_janitor(tmp_path):

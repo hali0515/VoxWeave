@@ -340,7 +340,10 @@ def validate_vector(
     for index, element in enumerate(value):
         if type(element) not in (int, float):
             _invalid(f"{field}[{index}] must be a non-bool number")
-        numeric = float(element)
+        try:
+            numeric = float(element)
+        except OverflowError as exc:
+            raise Phase2DataError(f"{field}[{index}] exceeds finite range") from exc
         if not math.isfinite(numeric):
             _invalid(f"{field}[{index}] must be finite")
         if abs(numeric) > 1.0 + 1e-6:
@@ -371,8 +374,13 @@ def strict_turn_projection(
         start, end, raw_label = entry
         if type(start) not in (int, float) or type(end) not in (int, float):
             _invalid(f"speaker_turns[{index}] bounds must be non-bool numbers")
-        start_f = float(start)
-        end_f = float(end)
+        try:
+            start_f = float(start)
+            end_f = float(end)
+        except OverflowError as exc:
+            raise Phase2DataError(
+                f"speaker_turns[{index}] bounds exceed finite range"
+            ) from exc
         if not math.isfinite(start_f) or not math.isfinite(end_f):
             _invalid(f"speaker_turns[{index}] bounds must be finite")
         if not 0 <= start_f < end_f:
@@ -480,6 +488,8 @@ def validate_voiceprints_mapping(value: object) -> ValidatedVoiceprints:
     require_utc_timestamp(binding.get("created"), "binding.created")
 
     speakers = require_mapping(root.get("speakers"), "speakers")
+    if not speakers:
+        _invalid("speakers must contain at least one usable centroid")
     if len(speakers) > MAX_SIDECAR_SPEAKERS:
         _invalid(f"speakers may contain at most {MAX_SIDECAR_SPEAKERS} entries")
     checked: dict[str, tuple[int | float, ...]] = {}

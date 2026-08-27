@@ -356,6 +356,19 @@ def test_overlong_raw_enrollment_name_is_typed_refusal():
         )
 
 
+def test_enrollment_never_coerces_replace_flag():
+    with pytest.raises(voicestore.EnrollmentRefusal, match="must be a boolean"):
+        voicestore.enroll_exemplar(
+            _store(),
+            raw_name="Aqua",
+            capture_id=f"c{2:032x}",
+            media_fingerprint=f"{2:064x}",
+            episode="ep02",
+            vector=_unit(1),
+            replace_episode=1,
+        )
+
+
 def test_exact_capture_repeat_is_noop_without_revision_or_log_change():
     store = _store()
     result = voicestore.enroll_exemplar(

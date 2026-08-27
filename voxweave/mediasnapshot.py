@@ -86,7 +86,15 @@ def _create_destination(directory: Path, suffix: str) -> tuple[Path, int]:
             descriptor = os.open(path, flags, 0o600)
         except FileExistsError:
             continue
-        os.fchmod(descriptor, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+        except BaseException:
+            os.close(descriptor)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         return path, descriptor
     raise SnapshotUnavailable("could not allocate an unpredictable snapshot name")
 
@@ -95,15 +103,19 @@ def _open_source(path: Path) -> int:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags)
-    metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode):
-        os.close(descriptor)
-        raise SnapshotUnavailable(f"media source is not a regular file: {path}")
     try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SnapshotUnavailable(f"media source is not a regular file: {path}")
         os.pread(descriptor, 0, 0)
-    except OSError as exc:
+    except SnapshotUnavailable:
         os.close(descriptor)
-        raise SnapshotUnavailable(f"media source is not seekable: {path}") from exc
+        raise
+    except BaseException as exc:
+        os.close(descriptor)
+        if isinstance(exc, OSError):
+            raise SnapshotUnavailable(f"media source is not seekable: {path}") from exc
+        raise
     return descriptor
 
 
@@ -229,7 +241,7 @@ def cleanup_stale_snapshots(
     removed: list[Path] = []
     try:
         candidates = tuple(Path(directory).iterdir())
-    except FileNotFoundError:
+    except OSError:
         return ()
     for candidate in candidates:
         if SNAPSHOT_NAME_RE.fullmatch(candidate.name) is None:
@@ -257,8 +269,12 @@ def cleanup_stale_snapshots(
             except BlockingIOError:
                 continue
             if _same_open_file(candidate, descriptor):
-                candidate.unlink()
-                removed.append(candidate)
+                try:
+                    candidate.unlink()
+                except OSError:
+                    continue
+                else:
+                    removed.append(candidate)
         finally:
             os.close(descriptor)
     return tuple(removed)

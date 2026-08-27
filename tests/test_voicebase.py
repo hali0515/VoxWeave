@@ -16,9 +16,9 @@ def _unit(dim=16, index=0):
 
 
 def _sidecar(*, turns=None, media=None, speakers=None, dim=16):
-    turns = turns or [[0, 1, "SPEAKER_00"]]
-    media = media or ("a" * 64)
-    speakers = speakers or {"SPEAKER_00": _unit(dim)}
+    turns = [[0, 1, "SPEAKER_00"]] if turns is None else turns
+    media = "a" * 64 if media is None else media
+    speakers = {"SPEAKER_00": _unit(dim)} if speakers is None else speakers
     return {
         "version": 1,
         "capture_id": "c" + "1" * 32,
@@ -148,6 +148,7 @@ def test_vector_accepts_finite_non_bool_unit_values_at_dimension_bounds():
         [float("nan")] + [0.0] * 15,
         [float("inf")] + [0.0] * 15,
         [1e308] + [0.0] * 15,
+        [10**1000] + [0.0] * 15,
         [1.00001] + [0.0] * 15,
         _unit(15),
         _unit(769),
@@ -178,6 +179,7 @@ def test_turn_projection_and_digest_are_numeric_deterministic():
         [[0, 1]],
         [[True, 1, "A"]],
         [[0, float("nan"), "A"]],
+        [[0, 10**1000, "A"]],
         [[-1, 1, "A"]],
         [[1, 1, "A"]],
         [[0, 1, ""]],
@@ -233,6 +235,8 @@ def test_voiceprints_rejects_ragged_vectors_and_too_many_speakers():
     too_many = _sidecar(speakers={f"S{index:02}": _unit() for index in range(65)})
     with pytest.raises(voicebase.Phase2DataError, match="at most 64"):
         voicebase.validate_voiceprints_mapping(too_many)
+    with pytest.raises(voicebase.Phase2DataError, match="at least one"):
+        voicebase.validate_voiceprints_mapping(_sidecar(speakers={}))
 
 
 def test_voiceprints_writer_cap_preserves_existing_file(tmp_path):

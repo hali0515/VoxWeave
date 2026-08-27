@@ -130,7 +130,7 @@ def _finite_float(raw: object, field: str) -> float:
         raise ThresholdError(f"{field} must be a finite number")
     try:
         value = float(raw)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ThresholdError(f"{field} must be a finite number") from exc
     if not math.isfinite(value):
         raise ThresholdError(f"{field} must be a finite number")
@@ -250,6 +250,11 @@ def build_compatibility_fingerprint(
             provenance.get("pyannote_version"),
             "pyannote_version",
             unresolved,
+        )
+        require_string(
+            provenance.get("torch_version"),
+            "torch_version",
+            max_bytes=MAX_PROVENANCE_STRING_BYTES,
         )
         audio = require_mapping(provenance.get("audio"), "audio")
         separated = audio.get("separated")
@@ -463,7 +468,10 @@ def _validate_record_thresholds(value: object) -> None:
 def _exact_record_float(raw: object, field: str) -> float:
     if type(raw) not in (int, float):
         raise Phase2DataError(f"{field} must be a non-bool number")
-    value = float(cast(int | float, raw))
+    try:
+        value = float(cast(int | float, raw))
+    except OverflowError as exc:
+        raise Phase2DataError(f"{field} exceeds finite range") from exc
     if not math.isfinite(value):
         raise Phase2DataError(f"{field} must be finite")
     return value

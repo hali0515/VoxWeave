@@ -405,6 +405,8 @@ def enroll_exemplar(
     The input mapping is never mutated.  Refusals therefore leave both its
     revision and its audit log unchanged; a true no-op returns an equal copy.
     """
+    if type(replace_episode) is not bool:
+        raise EnrollmentRefusal("replace_episode must be a boolean")
     validated = validate_voice_store(store)
     normalized_name = normalize_speaker_key(raw_name)
     incoming_capture = require_capture_id(capture_id)

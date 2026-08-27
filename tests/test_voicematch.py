@@ -206,6 +206,10 @@ def test_compatibility_requires_literal_runtime_profile_types():
     del provenance["audio"]["separator"]
     with pytest.raises(voicematch.CompatibilityError, match="audio.separator"):
         voicematch.build_compatibility_fingerprint(provenance)
+    provenance = _provenance()
+    provenance["torch_version"] = "x" * 513
+    with pytest.raises(voicematch.CompatibilityError, match="torch_version"):
+        voicematch.build_compatibility_fingerprint(provenance)
 
 
 def test_max_dot_chooses_winning_exemplar_with_stable_tie_break():
@@ -374,6 +378,10 @@ def test_suggest_validator_never_coerces_numeric_strings():
     record = _record()
     record["thresholds"]["suggest"] = "0.45"
     with pytest.raises(voicebase.Phase2DataError, match="non-bool number"):
+        voicematch.validate_suggest_record(record)
+    record = _record()
+    record["thresholds"]["suggest"] = 10**1000
+    with pytest.raises(voicebase.Phase2DataError, match="finite range"):
         voicematch.validate_suggest_record(record)
 
 
