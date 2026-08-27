@@ -189,7 +189,7 @@ def test_read_json_or_exit2_uses_exit_code_2(tmp_path: Path) -> None:
 def test_corpus_registry_rejects_escaping_paths() -> None:
     registry = {
         "schema_version": 1,
-        "metric_definition_version": 2,
+        "metric_definition_version": 3,
         "cases": ["cases/zh-01.json"],
         "required_counts": {"zh": 7, "ja": 7, "en": 6},
         "required_tags": ["fast", "sparse-tail"],
@@ -206,7 +206,27 @@ def test_corpus_registry_rejects_escaping_paths() -> None:
 def test_baseline_ratio_and_metric_shapes_validate() -> None:
     baseline = {
         "schema_version": 1,
-        "metric_definition_version": 2,
+        "metric_definition_version": 3,
+        "metric_definition": {
+            "version": 3,
+            "forbidden_end": {
+                "tail_scope": "eligible-internal-plus-document-final",
+                "alternative_source": "pre-split-punctuated-source-phrase-lattice",
+                "reported_measure": "rate-with-bad-and-eligible",
+                "gate_measure": "bad-count",
+                "baseline_bad_slack": 1.0,
+                "ja_tail_lens": {
+                    "id": "ja-char-table-level1",
+                    "source": "kinsoku.line_end_penalty",
+                    "provider": None,
+                    "provider_version": None,
+                    "dictionary": None,
+                    "context": "punctuated-source-phrase-atom",
+                    "missing_offset_fallback": None,
+                },
+            },
+        },
+        "metric_definition_digest": DIGEST_64,
         "corpus_digest": DIGEST_64,
         "generated_from_commit": "aaea548",
         "environment": {"python": "3.11.9", "dependencies": {"pysbd": "0.3.4"}},

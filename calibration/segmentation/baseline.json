@@ -1,8 +1,28 @@
 {
   "schema_version": 1,
-  "metric_definition_version": 2,
-  "corpus_digest": "6c4e05cec8a674b0dc5ca2a65b779d74f4e0d56d43e90bae730665d3db9226ae",
-  "generated_from_commit": "768aad0ac1ef84c4825da1983092074dd168ccff",
+  "metric_definition_version": 3,
+  "metric_definition": {
+    "version": 3,
+    "forbidden_end": {
+      "tail_scope": "eligible-internal-plus-document-final",
+      "alternative_source": "pre-split-punctuated-source-phrase-lattice",
+      "reported_measure": "rate-with-bad-and-eligible",
+      "gate_measure": "bad-count",
+      "baseline_bad_slack": 1.0,
+      "ja_tail_lens": {
+        "id": "ja-unidic-level2",
+        "source": "kinsoku.ja_pos_end_penalties",
+        "provider": "fugashi-unidic",
+        "provider_version": "1.5.2",
+        "dictionary": "unidic-lite 1.0.8 (UnidicFeatures26)",
+        "context": "punctuated-source-phrase-atom",
+        "missing_offset_fallback": "ja-char-table-level1"
+      }
+    }
+  },
+  "metric_definition_digest": "89bf5b31753e9d80b132f0df154ac341a12082e0e340eee37b68342264842425",
+  "corpus_digest": "23df693e438693bc5192acd1f605b394d93a2bd5ada39e63ba38a3fef6fae9c6",
+  "generated_from_commit": "83233811692eb1a1b1ab0b859cb77236ad1f4a34",
   "environment": {
     "python": "3.13.12",
     "dependencies": {
@@ -15,12 +35,12 @@
   "groups": {
     "all": {
       "case_count": 20,
-      "cue_count": 2082,
+      "cue_count": 2081,
       "cps_p90": {
-        "n": 2082,
+        "n": 2081,
         "value": 16.514285714285688,
         "median": 7.065217391304334,
-        "p95": 18.798839600470078,
+        "p95": 18.801410105757952,
         "target_cps": null,
         "absolute_max": null
       },
@@ -30,31 +50,33 @@
       ],
       "diagnostics": {
         "unit_count": 22972,
-        "cue_count": 2082,
+        "cue_count": 2081,
         "lyric_cue_count": 0,
-        "internal_boundaries": 2062,
+        "internal_boundaries": 2061,
         "unmapped_boundaries": 0,
         "overlapping_cues": 0,
-        "silence_breaks": 284,
-        "forced_breaks": 236,
-        "punctuation_breaks": 1351,
-        "no_legal_alternative": 70,
+        "silence_breaks": 283,
+        "forced_breaks": 235,
+        "punctuation_breaks": 1360,
+        "no_legal_alternative": 69,
+        "final_tail_eligible": 18,
+        "terminal_final_tails": 2,
         "exempted_cues": 0
       },
       "len_break_mid_phrase_rate": {
-        "bad": 3,
+        "bad": 1,
         "eligible": 1778,
-        "value": 0.001687289088863892
+        "value": 0.0005624296962879641
       },
       "over_7s_rate": {
         "bad": 0,
-        "eligible": 2082,
+        "eligible": 2081,
         "value": 0.0
       },
       "forbidden_end_rate": {
-        "bad": 1,
-        "eligible": 405,
-        "value": 0.0024691358024691358
+        "bad": 3,
+        "eligible": 415,
+        "value": 0.007228915662650603
       }
     },
     "en": {
@@ -82,6 +104,8 @@
         "forced_breaks": 39,
         "punctuation_breaks": 472,
         "no_legal_alternative": 0,
+        "final_tail_eligible": 6,
+        "terminal_final_tails": 0,
         "exempted_cues": 0
       },
       "len_break_mid_phrase_rate": {
@@ -95,19 +119,19 @@
         "value": 0.0
       },
       "forbidden_end_rate": {
-        "bad": 0,
-        "eligible": 48,
-        "value": 0.0
+        "bad": 3,
+        "eligible": 54,
+        "value": 0.05555555555555555
       }
     },
     "ja": {
       "case_count": 7,
-      "cue_count": 660,
+      "cue_count": 659,
       "cps_p90": {
-        "n": 660,
-        "value": 7.142857142857179,
-        "median": 5.108315247681275,
-        "p95": 7.927313201703442,
+        "n": 659,
+        "value": 7.142857142857198,
+        "median": 5.065666041275786,
+        "p95": 7.929600886917963,
         "target_cps": 7.0,
         "absolute_max": 8.75
       },
@@ -116,31 +140,33 @@
       ],
       "diagnostics": {
         "unit_count": 6491,
-        "cue_count": 660,
+        "cue_count": 659,
         "lyric_cue_count": 0,
-        "internal_boundaries": 653,
+        "internal_boundaries": 652,
         "unmapped_boundaries": 0,
         "overlapping_cues": 0,
-        "silence_breaks": 189,
-        "forced_breaks": 189,
-        "punctuation_breaks": 250,
-        "no_legal_alternative": 67,
+        "silence_breaks": 188,
+        "forced_breaks": 188,
+        "punctuation_breaks": 259,
+        "no_legal_alternative": 66,
+        "final_tail_eligible": 6,
+        "terminal_final_tails": 1,
         "exempted_cues": 0
       },
       "len_break_mid_phrase_rate": {
-        "bad": 3,
+        "bad": 1,
         "eligible": 464,
-        "value": 0.00646551724137931
+        "value": 0.0021551724137931034
       },
       "over_7s_rate": {
         "bad": 0,
-        "eligible": 660,
+        "eligible": 659,
         "value": 0.0
       },
       "forbidden_end_rate": {
-        "bad": 1,
-        "eligible": 147,
-        "value": 0.006802721088435374
+        "bad": 0,
+        "eligible": 145,
+        "value": 0.0
       }
     },
     "zh": {
@@ -168,6 +194,8 @@
         "forced_breaks": 8,
         "punctuation_breaks": 629,
         "no_legal_alternative": 3,
+        "final_tail_eligible": 6,
+        "terminal_final_tails": 1,
         "exempted_cues": 0
       },
       "len_break_mid_phrase_rate": {
@@ -182,7 +210,7 @@
       },
       "forbidden_end_rate": {
         "bad": 0,
-        "eligible": 210,
+        "eligible": 216,
         "value": 0.0
       }
     }
@@ -215,9 +243,9 @@
     "forbidden_end_rate": {
       "direction": "lower_is_better",
       "mode": "warning",
-      "absolute_max": 0.02,
-      "absolute_tolerance": 0.005,
-      "relative_tolerance": 0.1,
+      "absolute_max": null,
+      "absolute_tolerance": 1.0,
+      "relative_tolerance": 0.0,
       "min_samples": 100
     }
   }

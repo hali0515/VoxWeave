@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "metric_definition_version": 2,
+  "metric_definition_version": 3,
   "description": "Tracked segmentation golden corpus: zh/en tutorial monologue plus ja anime dialogue (multi-speaker, song holes, shot changes).",
   "cases": [
     "cases/zh-01.json",

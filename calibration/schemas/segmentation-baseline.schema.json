@@ -2,13 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://voxweave.local/schemas/segmentation-baseline.schema.json",
   "title": "voxweave segmentation baseline",
-  "description": "Recorded reference point for the four segmentation gates. Every rule is one-sided (lower is better), so an improvement can never fail a gate: allowed = baseline_value + max(absolute_tolerance, baseline_value * relative_tolerance), and absolute_max must hold as well. A mismatch in corpus_digest, metric_definition_version or environment is exit code 2 and demands a reviewed `record-baseline`, which is never a CI action.",
+  "description": "Recorded reference point for the four segmentation gates. Every rule is one-sided (lower is better), so an improvement can never fail a gate. forbidden_end_rate reports a rate with counts but compares bad counts (baseline_bad + 1); the other rules use allowed = baseline_value + max(absolute_tolerance, baseline_value * relative_tolerance), and absolute_max must hold as well. A mismatch in corpus_digest, metric_definition_version, metric_definition_digest or environment is exit code 2 and demands a reviewed `record-baseline`, which is never a CI action.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "metric_definition_version", "corpus_digest", "generated_from_commit", "environment", "groups", "gates"],
+  "required": ["schema_version", "metric_definition_version", "metric_definition", "metric_definition_digest", "corpus_digest", "generated_from_commit", "environment", "groups", "gates"],
   "properties": {
     "schema_version": {"const": 1},
-    "metric_definition_version": {"const": 2},
+    "metric_definition_version": {"const": 3},
+    "metric_definition": {"$ref": "#/$defs/metric_definition"},
+    "metric_definition_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "corpus_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "generated_from_commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
     "environment": {
@@ -37,6 +39,40 @@
     }
   },
   "$defs": {
+    "metric_definition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "forbidden_end"],
+      "properties": {
+        "version": {"const": 3},
+        "forbidden_end": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["tail_scope", "alternative_source", "reported_measure", "gate_measure", "baseline_bad_slack", "ja_tail_lens"],
+          "properties": {
+            "tail_scope": {"const": "eligible-internal-plus-document-final"},
+            "alternative_source": {"const": "pre-split-punctuated-source-phrase-lattice"},
+            "reported_measure": {"const": "rate-with-bad-and-eligible"},
+            "gate_measure": {"const": "bad-count"},
+            "baseline_bad_slack": {"const": 1.0},
+            "ja_tail_lens": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "source", "provider", "provider_version", "dictionary", "context", "missing_offset_fallback"],
+              "properties": {
+                "id": {"enum": ["ja-unidic-level2", "ja-char-table-level1"]},
+                "source": {"enum": ["kinsoku.ja_pos_end_penalties", "kinsoku.line_end_penalty"]},
+                "provider": {"type": ["string", "null"]},
+                "provider_version": {"type": ["string", "null"]},
+                "dictionary": {"type": ["string", "null"]},
+                "context": {"const": "punctuated-source-phrase-atom"},
+                "missing_offset_fallback": {"type": ["string", "null"]}
+              }
+            }
+          }
+        }
+      }
+    },
     "ratio": {
       "type": "object",
       "additionalProperties": false,
