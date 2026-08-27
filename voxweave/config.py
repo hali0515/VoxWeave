@@ -101,6 +101,7 @@ _TEMPLATE = """\
 # skip_songs = true    # PANNs music detection + skip before ASR (--skip-songs/--no-skip-songs)
 # normalize = false    # loudnorm on the 16k input (--normalize/--no-normalize)
 # diarize = false      # pyannote speaker diarization; needs voxweave[diarize] + HF token (--diarize/--no-diarize)
+# voiceprints = false   # opt-in biometric sidecar capture; requires diarize (--voiceprints/--no-voiceprints)
 # timestamps = true    # word-level timestamps in the VTT (--timestamps/--no-timestamps)
 # shot_snap = true     # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
 # vad_mask = false     # suppress CTC emissions outside speech spans (--vad-mask/--no-vad-mask)
@@ -383,16 +384,21 @@ def conf_default_flag(key: str, builtin: bool) -> bool:
     value applies. Non-boolean values are warned about and fall back to
     ``builtin``.
     """
+    return conf_default_flag_source(key, builtin)[0]
+
+
+def conf_default_flag_source(key: str, builtin: bool) -> tuple[bool, str]:
+    """Resolve a config boolean and report its source for cross-flag errors."""
     defaults = _load().get("defaults")
     if isinstance(defaults, dict) and key in defaults:
         v = defaults[key]
         if isinstance(v, bool):
-            return v
+            return v, f"config [defaults].{key}"
         log.warning(
             "config [defaults].%s has wrong type (expected boolean), using default",
             key,
         )
-    return builtin
+    return builtin, "built-in default"
 
 
 def align_model_for(iso: str) -> str | None:

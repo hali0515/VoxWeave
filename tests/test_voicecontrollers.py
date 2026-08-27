@@ -1,0 +1,373 @@
+import copy
+import json
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from voxweave import pipeline, speakers
+from voxweave.cli import cli
+from voxweave.voicebase import (
+    canonical_turns_digest,
+    media_fingerprint,
+    write_voiceprints,
+)
+from voxweave.voicematch import load_suggest
+from voxweave.voicestore import (
+    enroll_exemplar,
+    load_voice_store,
+    new_voice_store,
+    write_voice_store,
+)
+
+
+CAPTURE = "c" + "1" * 32
+PRIOR_CAPTURE = "c" + "2" * 32
+QUERY_VECTOR = [1.0, *([0.0] * 15)]
+OTHER_VECTOR = [0.0, 1.0, *([0.0] * 14)]
+PROVENANCE = {
+    "diarization_model": "example/diarizer",
+    "outer_config_sha256": "a" * 64,
+    "embedding_model": "example/embedder",
+    "embedding_checkpoint": "b" * 64,
+    "embedding_dim": 16,
+    "audio": {"separated": False, "normalized": False, "sample_rate": 16000},
+    "pyannote_version": "3.4.0",
+    "torch_version": "test",
+}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOXWEAVE_CONFIG", str(tmp_path / "voxweave.conf"))
+    monkeypatch.setenv("VOXWEAVE_CACHE_ROOT", str(tmp_path / "cache-root"))
+    monkeypatch.delenv("VOXWEAVE_VOICEPRINTS", raising=False)
+    monkeypatch.delenv("VOXWEAVE_VOICES_ACCEPT", raising=False)
+    monkeypatch.delenv("VOXWEAVE_VOICES_SUGGEST", raising=False)
+    monkeypatch.delenv("VOXWEAVE_VOICES_MARGIN", raising=False)
+
+
+def _write_episode(
+    tmp_path: Path,
+    *,
+    labels=("SPEAKER_00",),
+    vectors=None,
+    provenance=None,
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"episode media")
+    vectors = vectors or {label: list(QUERY_VECTOR) for label in labels}
+    turns = []
+    units = []
+    cursor = 0.0
+    for index, label in enumerate(labels):
+        duration = 4.0 if index == 0 else 2.0
+        turns.append([cursor, cursor + duration, label])
+        units.append(
+            {
+                "text": f"line{index}",
+                "start": cursor,
+                "end": cursor + duration,
+            }
+        )
+        cursor += duration
+    fingerprint = media_fingerprint(media)
+    sibling = {
+        "language": "en",
+        "segments": [],
+        "word_segments": units,
+        "vad_speech": [[0.0, cursor]],
+        "speaker_turns": turns,
+        "voiceprint_capture": CAPTURE,
+        "voiceprint_media": fingerprint,
+    }
+    (tmp_path / "episode.json").write_text(
+        json.dumps(sibling, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    sidecar = {
+        "version": 1,
+        "capture_id": CAPTURE,
+        "provenance": copy.deepcopy(provenance or PROVENANCE),
+        "binding": {
+            "turns_digest": canonical_turns_digest(turns),
+            "media_fingerprint": fingerprint,
+            "media_stem": "episode",
+            "created": "2026-08-28T00:00:00Z",
+        },
+        "speakers": vectors,
+    }
+    write_voiceprints(tmp_path / "episode.voiceprints.json", sidecar)
+    return media, sibling, sidecar
+
+
+def _write_store(path: Path, *, name="Aqua", vector=None, provenance=None):
+    store = new_voice_store("Example Show", provenance or PROVENANCE)
+    store = enroll_exemplar(
+        store,
+        raw_name=name,
+        capture_id=PRIOR_CAPTURE,
+        media_fingerprint="f" * 64,
+        episode="prior",
+        vector=vector or QUERY_VECTOR,
+    ).store
+    write_voice_store(path, store)
+    return store
+
+
+def _fake_clips(monkeypatch, seen=None):
+    def extract(source, _start, _end, output):
+        if seen is not None:
+            seen.append(Path(source))
+        Path(output).write_bytes(b"mp3")
+
+    monkeypatch.setattr(speakers, "extract_clip", extract)
+
+
+def test_matching_prefill_stays_html_only_and_mapping_empty(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    store_path = tmp_path / "voices.json"
+    _write_store(store_path)
+    seen_sources: list[Path] = []
+    _fake_clips(monkeypatch, seen_sources)
+    monkeypatch.setenv("VOXWEAVE_VOICES_ACCEPT", "0.9")
+
+    html_path = speakers.create_speaker_audition(media, voices=store_path)
+
+    mapping = json.loads((tmp_path / "episode.speakers.json").read_text())
+    assert mapping == {"version": 1, "speakers": {"SPEAKER_00": ""}}
+    page = html_path.read_text(encoding="utf-8")
+    assert 'value="Aqua"' in page
+    assert "machine-suggested" in page
+    suggestion = load_suggest(tmp_path / "episode.speakers.suggest.json")
+    assert suggestion["speakers"]["SPEAKER_00"]["decision"] == "prefill"
+    assert seen_sources and all(source != media for source in seen_sources)
+    assert all(not source.exists() for source in seen_sources)
+
+    rendered = pipeline.split(tmp_path / "episode.json").read_text(encoding="utf-8")
+    assert "Aqua" not in rendered
+
+
+def test_store_names_are_context_escaped_and_vectors_never_render(
+    tmp_path, monkeypatch
+):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    store_path = tmp_path / "voices.json"
+    malicious = '"><script>alert(1)</script>\u2028"quoted"'
+    _write_store(store_path, name=malicious)
+    _fake_clips(monkeypatch)
+
+    page = speakers.create_speaker_audition(
+        media,
+        voices=store_path,
+    ).read_text(encoding="utf-8")
+
+    assert "<script>alert(1)</script>" not in page
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
+    assert "&quot;" in page
+    assert str(QUERY_VECTOR) not in page
+
+
+def test_no_match_is_manual_escape_and_mints_no_snapshot(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    sibling_path = tmp_path / "episode.json"
+    sibling = json.loads(sibling_path.read_text())
+    sibling["voiceprint_capture"] = "invalid"
+    sibling_path.write_text(json.dumps(sibling), encoding="utf-8")
+    (tmp_path / "episode.speakers.suggest.json").write_text("stale", encoding="utf-8")
+    _fake_clips(monkeypatch)
+
+    class ForbiddenSnapshot:
+        def __init__(self, _path):
+            raise AssertionError("--no-match must stay snapshot-free")
+
+    monkeypatch.setattr(speakers, "MediaSnapshot", ForbiddenSnapshot)
+    speakers.create_speaker_audition(media, no_match=True)
+
+    assert (tmp_path / "episode.speakers.json").exists()
+    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+
+
+def test_declared_missing_sidecar_refuses_without_mapping(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    (tmp_path / "episode.voiceprints.json").unlink()
+    (tmp_path / "episode.speakers.suggest.json").write_text("stale", encoding="utf-8")
+    _fake_clips(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="declared but not usable"):
+        speakers.create_speaker_audition(media)
+
+    assert not (tmp_path / "episode.speakers.json").exists()
+    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+
+
+def test_discovery_requires_show_confirmation(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    _write_store(tmp_path / "voxweave.voices.json")
+    _fake_clips(monkeypatch)
+
+    page = speakers.create_speaker_audition(media).read_text(encoding="utf-8")
+
+    assert "machine-suggested" not in page
+    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+
+
+def test_generation_detects_sibling_change_before_mapping_commit(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    sibling_path = tmp_path / "episode.json"
+
+    def mutate(_source, _start, _end, output):
+        payload = json.loads(sibling_path.read_text())
+        payload["language"] = "changed"
+        sibling_path.write_text(json.dumps(payload), encoding="utf-8")
+        Path(output).write_bytes(b"mp3")
+
+    monkeypatch.setattr(speakers, "extract_clip", mutate)
+    with pytest.raises(RuntimeError, match="input changed"):
+        speakers.create_speaker_audition(media)
+
+    assert not (tmp_path / "episode.speakers.json").exists()
+
+
+def test_enrollment_creates_store_from_human_mapping(tmp_path):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    mapping_path = tmp_path / "episode.speakers.json"
+    mapping_path.write_text(
+        json.dumps({"version": 1, "speakers": {"SPEAKER_00": "Aqua"}}),
+        encoding="utf-8",
+    )
+    before_mapping = mapping_path.read_bytes()
+    store_path = tmp_path / "new-voices.json"
+
+    output = speakers.enroll_speaker_voices(
+        media,
+        voices=store_path,
+        show="Example Show",
+    )
+
+    store, validated = load_voice_store(output)
+    identity = next(iter(store["identities"].values()))
+    exemplar = identity["exemplars"][0]
+    assert validated.show == "Example Show"
+    assert identity["display_name"] == "Aqua"
+    assert exemplar["capture_id"] == CAPTURE
+    assert mapping_path.read_bytes() == before_mapping
+
+
+def test_enrollment_uses_longest_turn_for_one_identity(tmp_path):
+    media, _sibling, _sidecar = _write_episode(
+        tmp_path,
+        labels=("SPEAKER_LONG", "SPEAKER_SHORT"),
+        vectors={
+            "SPEAKER_LONG": list(QUERY_VECTOR),
+            "SPEAKER_SHORT": list(OTHER_VECTOR),
+        },
+    )
+    (tmp_path / "episode.speakers.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "speakers": {"SPEAKER_LONG": "Aqua", "SPEAKER_SHORT": "Aqua"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store_path = tmp_path / "voices.json"
+
+    speakers.enroll_speaker_voices(
+        media,
+        voices=store_path,
+        show="Example Show",
+    )
+
+    store, _validated = load_voice_store(store_path)
+    identity = next(iter(store["identities"].values()))
+    assert identity["exemplars"][0]["vector"] == QUERY_VECTOR
+
+
+def test_exact_repeat_enrollment_is_byte_noop(tmp_path):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    (tmp_path / "episode.speakers.json").write_text(
+        json.dumps({"version": 1, "speakers": {"SPEAKER_00": "Aqua"}}),
+        encoding="utf-8",
+    )
+    store_path = tmp_path / "voices.json"
+    speakers.enroll_speaker_voices(
+        media,
+        voices=store_path,
+        show="Example Show",
+    )
+    before = store_path.read_bytes()
+
+    speakers.enroll_speaker_voices(media, voices=store_path)
+
+    assert store_path.read_bytes() == before
+
+
+def test_unknown_compatibility_refuses_store_creation(tmp_path):
+    provenance = copy.deepcopy(PROVENANCE)
+    provenance["outer_config_sha256"] = "unresolved"
+    media, _sibling, _sidecar = _write_episode(tmp_path, provenance=provenance)
+    (tmp_path / "episode.speakers.json").write_text(
+        json.dumps({"version": 1, "speakers": {"SPEAKER_00": "Aqua"}}),
+        encoding="utf-8",
+    )
+    store_path = tmp_path / "voices.json"
+
+    with pytest.raises(Exception, match="unresolved"):
+        speakers.enroll_speaker_voices(
+            media,
+            voices=store_path,
+            show="Example Show",
+        )
+
+    assert not store_path.exists()
+
+
+def test_purge_works_after_media_deletion(tmp_path):
+    media = tmp_path / "missing.mkv"
+    targets = [
+        tmp_path / "missing.voiceprints.json",
+        tmp_path / "missing.speakers.suggest.json",
+        tmp_path / "missing.speakers.html",
+    ]
+    for target in targets:
+        target.write_text("sensitive", encoding="utf-8")
+
+    removed = speakers.purge_voiceprints(media)
+
+    assert set(removed) == set(targets)
+    assert not any(target.exists() for target in targets)
+
+
+def test_cli_voiceprints_env_requires_diarization_source(tmp_path, monkeypatch):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    monkeypatch.setenv("VOXWEAVE_VOICEPRINTS", "1")
+
+    result = CliRunner().invoke(cli, [str(media)])
+
+    assert result.exit_code != 0
+    assert "environment VOXWEAVE_VOICEPRINTS" in result.output
+    assert "built-in default" in result.output
+
+
+def test_cli_voiceprints_precedence_reaches_process(tmp_path, monkeypatch):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    output = tmp_path / "episode.vtt"
+    seen = {}
+    monkeypatch.setenv("VOXWEAVE_VOICEPRINTS", "1")
+
+    def fake_process(_media, **kwargs):
+        seen.update(kwargs)
+        return output
+
+    monkeypatch.setattr(pipeline, "process", fake_process)
+    result = CliRunner().invoke(
+        cli,
+        ["--diarize", "--no-voiceprints", str(media)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["diarize"] is True
+    assert seen["voiceprints"] is False

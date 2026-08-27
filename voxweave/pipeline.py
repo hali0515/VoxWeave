@@ -8,6 +8,7 @@ import math
 import os
 import platform
 import subprocess
+import threading
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
@@ -79,6 +80,21 @@ if TYPE_CHECKING:  # the v2 shadow is import-free unless its flag is on
     from voxweave.core.partition_check import Origin, Stage
 
 log = logging.getLogger("voxweave")
+
+_VOICEPRINT_NOTICE_LOCK = threading.Lock()
+_voiceprint_notice_logged = False
+
+
+def _log_voiceprint_notice_once() -> None:
+    global _voiceprint_notice_logged
+    with _VOICEPRINT_NOTICE_LOCK:
+        if _voiceprint_notice_logged:
+            return
+        log.warning(
+            "voiceprint capture enabled: a sensitive voice-biometric sidecar may be written"
+        )
+        _voiceprint_notice_logged = True
+
 
 # ≤120s: long chunks occasionally trigger ASR repetition loops (stuck token ->
 # zero-duration wall). Do NOT raise this to pack more; the risk and blast radius grow.
@@ -3616,6 +3632,8 @@ def process(
     media_path = Path(media_path)
     if voiceprints and (not diarize or word_segments is not None):
         raise ValueError("voiceprint capture requires a fresh diarization run")
+    if voiceprints:
+        _log_voiceprint_notice_once()
 
     def run_with_source(
         source_path: Path,

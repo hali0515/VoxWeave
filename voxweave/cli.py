@@ -38,6 +38,29 @@ def _flag(value: bool | None, key: str, builtin: bool) -> bool:
     return value if value is not None else config.conf_default_flag(key, builtin)
 
 
+_TRUE_FLAG_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_FLAG_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def _flag_source(
+    value: bool | None,
+    key: str,
+    builtin: bool,
+    *,
+    envvar: str | None = None,
+) -> tuple[bool, str]:
+    if value is not None:
+        return value, f"CLI --{key.replace('_', '-')}"
+    if envvar is not None and envvar in os.environ:
+        raw = os.environ[envvar].strip().lower()
+        if raw in _TRUE_FLAG_VALUES:
+            return True, f"environment {envvar}"
+        if raw in _FALSE_FLAG_VALUES:
+            return False, f"environment {envvar}"
+        raise ValueError(f"{envvar} must be one of: 1/0, true/false, yes/no, on/off")
+    return config.conf_default_flag_source(key, builtin)
+
+
 def _apply_vad_mask(vad_mask: bool | None) -> None:
     """Propagate the --vad-mask flag to VOXWEAVE_VAD_EMISSION_MASK (read by the backend
     at align time). Precedence: explicit CLI flag > pre-set env > conf [defaults].vad_mask."""
@@ -225,6 +248,15 @@ def cli(verbose: bool) -> None:
     " Default: off, or conf [defaults].diarize.",
 )
 @click.option(
+    "--voiceprints/--no-voiceprints",
+    default=None,
+    help=(
+        "Opt in to a biometric speaker-centroid sidecar. Requires diarization; "
+        "precedence is CLI, VOXWEAVE_VOICEPRINTS, conf [defaults].voiceprints, "
+        "then off."
+    ),
+)
+@click.option(
     "--min-speakers",
     type=int,
     default=None,
@@ -312,6 +344,7 @@ def cmd_transcribe(
     keep_lyrics: bool,
     sdh: bool,
     diarize: bool | None,
+    voiceprints: bool | None,
     min_speakers: int | None,
     max_speakers: int | None,
     context: str | None,
@@ -327,7 +360,22 @@ def cmd_transcribe(
     separate = _flag(separate, "separate", True)
     normalize = _flag(normalize, "normalize", False)
     skip_songs = _flag(skip_songs, "skip_songs", True)
-    diarize = _flag(diarize, "diarize", False)
+    try:
+        diarize, diarize_source = _flag_source(diarize, "diarize", False)
+        voiceprints, voiceprints_source = _flag_source(
+            voiceprints,
+            "voiceprints",
+            False,
+            envvar="VOXWEAVE_VOICEPRINTS",
+        )
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if voiceprints and not diarize:
+        raise click.UsageError(
+            "voiceprint capture is on from "
+            f"{voiceprints_source}, but diarization is off from {diarize_source}; "
+            "enable --diarize or disable voiceprints"
+        )
     timestamps = _flag(timestamps, "timestamps", True)
     shot_snap = _flag(shot_snap, "shot_snap", True)
     semantic_split = _flag(semantic_split, "semantic_split", False)
@@ -343,6 +391,7 @@ def cmd_transcribe(
             keep_lyrics=keep_lyrics,
             sdh=sdh,
             diarize=diarize,
+            voiceprints=voiceprints,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
             asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
@@ -369,12 +418,91 @@ cli.default_cmd = (
 
 
 @cli.command("speakers")
-@click.argument("media", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-def cmd_speakers(media: Path) -> None:
-    """Build an offline audition page and empty name mapping for diarized speakers."""
-    from voxweave.speakers import create_speaker_audition
+@click.argument("media", type=click.Path(exists=False, dir_okay=False, path_type=Path))
+@click.option(
+    "--voices",
+    type=click.Path(exists=False, dir_okay=False, path_type=Path),
+    default=None,
+    help="Show-level voices store. Relative paths resolve from the current directory.",
+)
+@click.option(
+    "--show", default=None, help="Show name used to confirm a discovered store."
+)
+@click.option(
+    "--no-match", is_flag=True, help="Ignore declared voiceprints and use manual mode."
+)
+@click.option(
+    "--enroll",
+    is_flag=True,
+    help="Enroll reviewed mapping names into the voices store.",
+)
+@click.option(
+    "--episode", default=None, help="Enrollment episode label (default: media stem)."
+)
+@click.option(
+    "--replace-episode",
+    is_flag=True,
+    help="Replace the existing exemplar for the selected episode key.",
+)
+@click.option(
+    "--purge-voiceprints",
+    is_flag=True,
+    help="Delete voiceprints, suggestions, and audition HTML; media may be absent.",
+)
+def cmd_speakers(
+    media: Path,
+    voices: Path | None,
+    show: str | None,
+    no_match: bool,
+    enroll: bool,
+    episode: str | None,
+    replace_episode: bool,
+    purge_voiceprints: bool,
+) -> None:
+    """Generate auditions, enroll reviewed names, or purge speaker biometrics."""
+    from voxweave.speakers import (
+        create_speaker_audition,
+        enroll_speaker_voices,
+        purge_voiceprints as purge,
+    )
 
-    out = _run(lambda _rep: create_speaker_audition(media), reporter=False)
+    if purge_voiceprints:
+        if any((voices, show, no_match, enroll, episode, replace_episode)):
+            raise click.UsageError(
+                "--purge-voiceprints is mutually exclusive with generation/enrollment options"
+            )
+        removed = _run(lambda _rep: purge(media), reporter=False)
+        for path in removed:
+            click.echo(path)
+        return
+    if enroll:
+        if no_match:
+            raise click.UsageError("--no-match cannot be combined with --enroll")
+        out = _run(
+            lambda _rep: enroll_speaker_voices(
+                media,
+                voices=voices,
+                show=show,
+                episode=episode,
+                replace_episode=replace_episode,
+            ),
+            reporter=False,
+        )
+    else:
+        if episode is not None or replace_episode:
+            raise click.UsageError("--episode/--replace-episode require --enroll")
+        if voices is None and show is None and not no_match:
+            out = _run(lambda _rep: create_speaker_audition(media), reporter=False)
+        else:
+            out = _run(
+                lambda _rep: create_speaker_audition(
+                    media,
+                    voices=voices,
+                    show=show,
+                    no_match=no_match,
+                ),
+                reporter=False,
+            )
     click.echo(out)
 
 

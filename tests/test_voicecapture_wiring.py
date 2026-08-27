@@ -90,6 +90,23 @@ def test_process_uses_snapshot_and_commits_bound_pair(tmp_path, monkeypatch):
     assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
 
 
+def test_capture_logs_biometric_notice_once_per_process(tmp_path, monkeypatch, caplog):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+
+    def fake_transcribe(_source, **_kwargs):
+        turns = [TURN]
+        return "en", [dict(UNIT)], [], [], turns, _capture(turns)
+
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    monkeypatch.setattr(pipeline, "_voiceprint_notice_logged", False)
+    with caplog.at_level("WARNING", logger="voxweave"):
+        pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+        pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+
+    assert caplog.text.count("sensitive voice-biometric sidecar") == 1
+
+
 def test_process_routes_capture_shot_detection_through_snapshot(tmp_path, monkeypatch):
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"stable media bytes")

@@ -226,10 +226,10 @@ def validate_voice_store(value: object) -> ValidatedVoiceStore:
                 media.add(source_media)
                 episodes.add(episode)
 
-        for key, owners in namespace_owners.items():
+        for owners in namespace_owners.values():
             if len(owners) > 1:
                 owner_list = ", ".join(sorted(owners))
-                _raise(f"normalized name namespace collision for {key!r}: {owner_list}")
+                _raise(f"normalized name namespace collision: {owner_list}")
 
         log = _require_list(root.get("log"), "log")
         if len(log) > MAX_LOG_ROWS:
@@ -338,8 +338,7 @@ def resolve_identity_id(store: Mapping[str, object], raw_name: str) -> str | Non
     owners = _identity_owners(validated.identities, key)
     if len(owners) > 1:
         raise EnrollmentRefusal(
-            f"speaker name {raw_name!r} is owned by multiple identities: "
-            + ", ".join(sorted(owners))
+            "speaker name is owned by multiple identities: " + ", ".join(sorted(owners))
         )
     return next(iter(owners), None)
 
@@ -422,8 +421,7 @@ def enroll_exemplar(
     owners = _identity_owners(identities, normalized_name)
     if len(owners) > 1:
         raise EnrollmentRefusal(
-            f"speaker name {raw_name!r} is owned by multiple identities: "
-            + ", ".join(sorted(owners))
+            "speaker name is owned by multiple identities: " + ", ".join(sorted(owners))
         )
 
     used_identity_ids = set(identities)
