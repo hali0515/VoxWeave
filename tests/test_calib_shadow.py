@@ -1165,3 +1165,22 @@ def test_the_frozen_shadow_target_arms_the_ad2_exit_driver() -> None:
     for case in ("en-01", "ja-01", "zh-01"):
         assert f"--perturb-case {case}" in target
     assert "--check" in target
+
+
+def test_exit_driving_stage_set_is_partition_checks_not_a_restated_literal() -> None:
+    """The harness must honour partition_check.EXIT_DRIVING_STAGES verbatim.
+
+    The rule used to be restated as a ("raw", "core") literal here, so a stage
+    added to the validator vocabulary (P5 adds "finalizer") would drive the
+    validator exit while the harness silently ignored it. Pin: a violation at
+    every member of EXIT_DRIVING_STAGES is counted as exit-driving evidence.
+    """
+    from voxweave.core.partition_check import EXIT_DRIVING_STAGES
+
+    assert EXIT_DRIVING_STAGES  # non-empty guard: an empty set would void the pin
+    for stage in sorted(EXIT_DRIVING_STAGES):
+        artifact = _artifact_with(
+            [_violation("overlap", stage=stage)], duplicated=False, fallbacks=0
+        )
+        counts = calib.shadow_violation_counts(artifact)
+        assert counts["exit_driving"], f"stage {stage!r} must drive the exit"

@@ -2979,6 +2979,8 @@ def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
     open. The v1 lane stages stay optional -- an unprojectable v1 stream has no
     partition to check, which is a fact about v1, not a broken measurement.
     """
+    from voxweave.core.partition_check import EXIT_DRIVING_STAGES
+
     duplicated = bool(artifact["validator"].get("raw_duplicate_v1_cues"))
     stages: dict[str, Any] = {}
     exit_driving: list[dict[str, Any]] = []
@@ -3007,7 +3009,10 @@ def shadow_violation_counts(artifact: Mapping[str, Any]) -> dict[str, Any]:
                 key += "/waived"
             kinds[key] = kinds.get(key, 0) + 1
             if not violation["waived"] and violation["origin"] == "v2":
-                if violation["stage"] not in ("raw", "core"):
+                # Single source of truth: partition_check owns the exit-driving
+                # stage set; restating it as a literal here silently ignored any
+                # stage added there (P5 adds "finalizer").
+                if violation["stage"] not in EXIT_DRIVING_STAGES:
                     continue
                 conservation = violation["kind"] in (
                     "text-conservation",
