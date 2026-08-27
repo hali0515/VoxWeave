@@ -3,7 +3,9 @@ import os
 import stat
 from pathlib import Path
 
+import numpy as np
 import pytest
+import soundfile as sf
 
 from voxweave import backend, chunking, diarize, pipeline, songdet
 from voxweave.mediasnapshot import SnapshotUnavailable
@@ -402,6 +404,69 @@ def _stub_transcribe_tail(tmp_path, monkeypatch):
     monkeypatch.setattr(chunking, "release_silero_vad", lambda: None)
     monkeypatch.setattr(songdet, "release_model", lambda: None)
     return wav
+
+
+class _RawSegment:
+    def __init__(self, start: float, end: float):
+        self.start = start
+        self.end = end
+
+
+class _SmoothingAnnotation:
+    def itertracks(self, *, yield_label=False):
+        rows = (
+            (_RawSegment(0.0, 2.0), "track-a", "SPEAKER_A"),
+            (_RawSegment(0.5, 0.55), "track-b", "SPEAKER_B"),
+        )
+        for row in rows:
+            yield row if yield_label else row[:2]
+
+    def labels(self):
+        return ["SPEAKER_A", "SPEAKER_B"]
+
+
+class _SmoothingPipeline:
+    def __call__(self, _source, **kwargs):
+        assert kwargs["return_embeddings"] is True
+        embeddings = np.array(
+            [
+                [1.0, *([0.0] * 15)],
+                [0.0, 1.0, *([0.0] * 14)],
+            ],
+            dtype=np.float32,
+        )
+        return _SmoothingAnnotation(), embeddings
+
+
+def test_smoothing_active_capture_publishes_valid_four_part_conjunction(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    wav = _stub_transcribe_tail(tmp_path, monkeypatch)
+    sf.write(wav, np.zeros(16000, dtype=np.float32), 16000)
+    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: _SmoothingPipeline())
+    monkeypatch.setattr(
+        diarize,
+        "_build_provenance",
+        lambda *_args, **_kwargs: dict(PROVENANCE),
+    )
+    monkeypatch.setattr(diarize, "release", lambda: None)
+
+    pipeline.process(
+        media,
+        separate=False,
+        diarize=True,
+        voiceprints=True,
+        shot_snap=False,
+    )
+
+    sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
+    sidecar, validated = load_voiceprints(tmp_path / "episode.voiceprints.json")
+    assert sibling["speaker_turns"] == [[0.0, 2.0, "SPEAKER_A"]]
+    assert set(validated.speakers) == {"SPEAKER_A"}
+    validate_voiceprint_conjunction(sidecar, sibling, media_fingerprint(media))
 
 
 def test_capture_cache_hit_validates_pair_before_decode(tmp_path, monkeypatch):

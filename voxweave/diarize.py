@@ -445,6 +445,15 @@ def diarize_turns(
         for seg, _, label in annotation_view.itertracks(yield_label=True)
     ]
     turns = _smooth_turns(turns)
+    if centroids is not None:
+        persisted_labels = {label for _start, _end, label in turns}
+        centroids = {
+            label: vector
+            for label, vector in centroids.items()
+            if label in persisted_labels
+        }
+        if not centroids:
+            centroids = None
     log.info(
         "diarization: %d turn(s), %d speaker(s)",
         len(turns),
