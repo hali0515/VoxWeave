@@ -19,7 +19,13 @@ from voxweave.core.timing import (
     TWO_FRAME_S,
     _cleanup_cues,
 )
-from voxweave.core.timing_preview import DisplayTimingPreview, LegacyCleanupPreview
+from voxweave.core.segdoc import DisplayProfile
+from voxweave.core.timing_preview import (
+    CueCandidate,
+    CuePreview,
+    DisplayTimingPreview,
+    LegacyCleanupPreview,
+)
 
 PREVIEW = LegacyCleanupPreview()
 
@@ -515,3 +521,118 @@ def test_random_sweep_matches_cleanup(case):
         cps=rng.choice(_CPS),
         lag_out_s=rng.choice(_LAG_OUT),
     )
+
+
+# --- preview_cue: the widened seam (P5 spec section 4) ------------------------
+#
+# The scalar above is the contract P4 shipped and it does not move. ``preview_cue``
+# only wraps it, so every test here either checks the wrapper's own facts or
+# checks that the wrapper reproduces the scalar exactly.
+
+
+def _profile(language="en", **thresholds):
+    base = dict(
+        language=language,
+        max_line_length=42,
+        max_lines=2,
+        clause_ms=400.0,
+        vad_skip_ms=250.0,
+        offline_ms=700.0,
+        min_cue_s=0.0,
+        max_cue_s=0.0,
+        glue_gap_s=0.3,
+        cps=0.0,
+        lag_out_s=0.0,
+        shot_snap_s=11 / 24,
+    )
+    base.update(thresholds)
+    return DisplayProfile(**base)
+
+
+def _candidate(text, start, end, next_start=None, words=None, **thresholds):
+    return CueCandidate(
+        start=start,
+        end=end,
+        next_start=next_start,
+        text=text,
+        word_data=list(words or []),
+        speech_start=None if not words else words[0]["start"],
+        speech_end=None if not words else words[-1]["end"],
+        profile=_profile(**thresholds),
+    )
+
+
+def test_preview_cue_reproduces_the_scalar_exactly():
+    """The wrapper adds facts; it must not add arithmetic."""
+    words = _words((1.0, 1.3))
+    candidate = _candidate("hello", 1.0, 1.3, words=words, **PROFILE)
+    preview = PREVIEW.preview_cue(candidate)
+    assert preview.available_s == PREVIEW.preview_display_span(
+        1.0, 1.3, None, text="hello", word_data=words, **PROFILE
+    )
+    assert preview.display_start == 1.0
+    assert preview.display_end == 1.0 + preview.available_s
+
+
+@pytest.mark.parametrize("case", range(60))
+def test_preview_cue_reproduces_the_scalar_over_the_random_sweep(case):
+    rng = random.Random(f"timing-preview-cue:{case}")
+    thresholds = dict(
+        min_cue_s=rng.choice(_MIN_CUE),
+        max_cue_s=rng.choice(_MAX_CUE),
+        cps=rng.choice(_CPS),
+        lag_out_s=rng.choice(_LAG_OUT),
+    )
+    start = round(rng.uniform(0.0, 5.0), 3)
+    end = start + rng.choice((0.12, 0.9, 3.4, 9.0))
+    next_start = None if rng.random() < 0.3 else end + rng.choice(_GAPS)
+    words = _random_words(rng, start, end)
+    text = " ".join(["word"] * rng.randint(0, 8))
+    candidate = _candidate(text, start, end, next_start, words=words, **thresholds)
+    preview = PREVIEW.preview_cue(candidate)
+    assert preview.available_s == PREVIEW.preview_display_span(
+        start, end, next_start, text=text, word_data=words, **thresholds
+    )
+
+
+def test_preview_cue_reports_the_RAW_reading_load():
+    """The declared FD-1 asymmetry: this mirror prices what the legacy pass prices.
+
+    ``"Hello, world!!"`` is 13 non-space characters here and 10 after the
+    canonical strip. The gap IS registry FD-1, and hiding it by canonicalizing
+    inside the legacy mirror would make the two lanes agree by construction
+    instead of by measurement.
+    """
+    preview = PREVIEW.preview_cue(_candidate("Hello, world!!", 0.0, 0.5))
+    assert preview.final_text == "Hello, world!!"
+    assert preview.reading_chars == 13
+
+
+def test_preview_cue_line_count_is_the_raw_newline_count():
+    assert PREVIEW.preview_cue(_candidate("one\ntwo", 0.0, 0.5)).line_count == 2
+    assert PREVIEW.preview_cue(_candidate("one two", 0.0, 0.5)).line_count == 1
+
+
+def test_preview_cue_never_waives_and_never_refuses():
+    """P5's only waiver kind is minted by the cap slot, outside every preview."""
+    preview = PREVIEW.preview_cue(_candidate("x" * 100, 0.0, 9.0, max_cue_s=7.0))
+    assert (preview.waivers, preview.refusals) == ((), ())
+
+
+def test_preview_cue_on_an_untimed_candidate_previews_no_span():
+    """``display_end`` is ``start + span``; without a start it has no value."""
+    preview = PREVIEW.preview_cue(_candidate("a", None, None))
+    assert (preview.display_start, preview.display_end) == (None, None)
+    assert preview.available_s == 0.0
+
+
+def test_cue_preview_available_s_is_zero_when_either_bound_is_absent():
+    for start, end in ((None, 1.0), (1.0, None), (None, None)):
+        preview = CuePreview(
+            display_start=start,
+            display_end=end,
+            final_text="a",
+            line_count=1,
+            reading_chars=1,
+        )
+        assert preview.available_s == 0.0

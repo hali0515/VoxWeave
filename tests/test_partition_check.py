@@ -111,7 +111,9 @@ def test_vocabularies_are_sorted_and_closed():
     assert list(WAIVER_KINDS) == sorted(WAIVER_KINDS)
     assert "held-chain-duration" in WAIVER_KINDS
     assert set(ORIGINS) == {"v1", "v2"}
-    assert set(STAGES) == {"raw", "core", "legacy-overlay"}
+    # P5 section 10.3 adds the exit-driving ``finalizer`` stage; the set stays
+    # closed, it just grew by exactly one member.
+    assert set(STAGES) == {"raw", "core", "legacy-overlay", "finalizer"}
 
 
 def test_owned_unit_ids_tiles_exactly():
@@ -463,6 +465,185 @@ def test_every_violation_carries_origin_and_stage():
         assert violation.origin == "v1"
         assert violation.stage == "legacy-overlay"
         assert violation.kind in VIOLATION_KINDS
+
+
+# ------------------------------------------- the finalizer stage (P5 section 10.3)
+#
+# Three predicates come alive only at ``stage="finalizer"``. Every one of them is
+# a question about DELIVERED text or DELIVERED bounds, which is why it cannot be
+# asked at ``raw``: a raw cue's text has not been through the wrap pass, and a
+# raw stream has not been through the ladder.
+
+
+def two_frame_case(gap):
+    """Two legal cues separated by ``gap`` seconds."""
+    partition, cues, us = clean_case()
+    cues[0]["end"] = round(2.0 - gap, 6)
+    return partition, cues, us
+
+
+def min_gap_tag(cue_index, *, speech_end, next_start):
+    from voxweave.core.partition_check import ReportTag
+
+    return ReportTag(
+        kind="min-gap-unmet",
+        cue_index=cue_index,
+        evidence={
+            "next_start": next_start,
+            "prev_end_before": 2.4,
+            "resulting_gap": next_start - speech_end,
+            "speech_end": speech_end,
+        },
+    )
+
+
+def test_finalizer_stage_reports_an_unexplained_sub_two_frame_gap():
+    partition, cues, us = two_frame_case(0.02)
+    result = check_partition(
+        partition, cues, units=us, profile=profile(), origin="v2", stage="finalizer"
+    )
+    assert "min-gap" in kinds(result)
+
+
+def test_a_min_gap_unmet_tag_naming_the_left_cue_explains_the_gap():
+    """Speech running into the two-frame band is legal WHEN it is reported."""
+    partition, cues, us = two_frame_case(0.02)
+    cues[0]["speech_end"] = 1.98
+    result = check_partition(
+        partition,
+        cues,
+        units=us,
+        profile=profile(),
+        origin="v2",
+        stage="finalizer",
+        reports=[min_gap_tag(0, speech_end=1.98, next_start=2.0)],
+    )
+    assert "min-gap" not in kinds(result)
+    assert "forged-report" not in kinds(result)
+
+
+def test_a_tag_whose_branch_does_not_recompute_is_a_forged_report():
+    """PF-3: the evidence must re-derive the branch, or the tag is not evidence."""
+    partition, cues, us = two_frame_case(0.02)
+    cues[0]["speech_end"] = 1.98
+    forged = min_gap_tag(0, speech_end=1.98, next_start=2.0)
+    lying = type(forged)(
+        kind=forged.kind,
+        cue_index=0,
+        evidence={**dict(forged.evidence), "resulting_gap": 0.0},
+    )
+    result = check_partition(
+        partition,
+        cues,
+        units=us,
+        profile=profile(),
+        origin="v2",
+        stage="finalizer",
+        reports=[lying],
+    )
+    assert "forged-report" in kinds(result)
+
+
+def test_exactly_two_frames_apart_is_legal():
+    """The floor is inclusive: a gap AT two frames is what chaining aims for."""
+    from voxweave.core.timing import TWO_FRAME_S
+
+    partition, cues, us = two_frame_case(TWO_FRAME_S)
+    result = check_partition(
+        partition, cues, units=us, profile=profile(), origin="v2", stage="finalizer"
+    )
+    assert "min-gap" not in kinds(result)
+
+
+def test_true_crosstalk_stays_an_overlap_and_no_tag_excuses_it():
+    """Ladder branch 3: the trim stops at speech and the overlap STANDS.
+
+    ``min-gap`` and ``overlap`` split the band at zero, and only the first is
+    excusable by a report. A tag naming the left cue must not launder a real
+    overlap into a reported near-miss -- which is the whole reason the two
+    predicates are separate kinds rather than one severity.
+    """
+    partition, cues, us = two_frame_case(-0.1)
+    cues[0]["speech_end"] = 2.1
+    result = check_partition(
+        partition,
+        cues,
+        units=us,
+        profile=profile(),
+        origin="v2",
+        stage="finalizer",
+        reports=[min_gap_tag(0, speech_end=2.1, next_start=2.0)],
+    )
+    assert "overlap" in kinds(result)
+    assert "min-gap" not in kinds(result)
+    # ... and the tag itself does not recompute as a branch-2 outcome.
+    assert "forged-report" in kinds(result)
+
+
+def test_a_tag_cannot_hide_crosstalk_inside_the_comparison_tolerance():
+    """PF-3's band test is not implied by the other two, and this is the gap.
+
+    The first two conditions -- the reported gap sits in ``[0, 2f)`` and equals
+    ``next_start - speech_end`` -- pin the speech end only to within ``EPS``,
+    because the second is an approximate equality. That slack is exactly wide
+    enough to smuggle in a branch-3 fact: speech that runs 0.5 microseconds PAST
+    the next start is true crosstalk, yet a tag claiming ``resulting_gap = 0.0``
+    passes both tests (``|0.0 - (-5e-07)| = 5e-07 <= EPS``).
+
+    The third condition is the branch-2 precondition itself (``speech_end <=
+    next_start``), asked exactly rather than within tolerance, and it is the
+    only one that refuses. The delivered stream here is otherwise clean -- the
+    cues touch at ``2.0``, a zero gap the tag would legitimately explain -- so
+    ``forged-report`` is the whole finding, not a side effect of a broken
+    stream.
+    """
+    partition, cues, us = two_frame_case(0.0)
+    cues[0]["speech_end"] = 2.0000005
+    smuggled = min_gap_tag(0, speech_end=2.0000005, next_start=2.0)
+    tag = type(smuggled)(
+        kind=smuggled.kind,
+        cue_index=0,
+        evidence={**dict(smuggled.evidence), "resulting_gap": 0.0},
+    )
+    result = check_partition(
+        partition,
+        cues,
+        units=us,
+        profile=profile(),
+        origin="v2",
+        stage="finalizer",
+        reports=[tag],
+    )
+    assert kinds(result) == ["forged-report"]
+
+
+def test_the_new_predicates_are_silent_at_every_other_stage():
+    partition, cues, us = two_frame_case(0.02)
+    for stage in ("raw", "core", "legacy-overlay"):
+        result = check_partition(
+            partition, cues, units=us, profile=profile(), origin="v2", stage=stage
+        )
+        assert "min-gap" not in kinds(result), stage
+
+
+def test_finalizer_line_capacity_bypasses_the_rewrap_excuse():
+    """PF-1: what ships is measured, not what some rewrap could have folded.
+
+    A 49-cell single line has no newline, so ``_wrappable`` answers "a wrap
+    could still fit this" and the raw stage forgives it. At the finalizer stage
+    the wrap has run and this IS the delivered line, so it is a violation.
+    """
+    text = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj"
+    us = units((text, 0.0, 3.0))
+    cues = [cue(text, 0.0, 3.0, speech_start=0.0, speech_end=3.0)]
+    forgiving = check_partition(
+        [], cues, units=us, profile=profile(), origin="v2", stage="raw"
+    )
+    strict = check_partition(
+        [], cues, units=us, profile=profile(), origin="v2", stage="finalizer"
+    )
+    assert "line-capacity" not in kinds(forgiving)
+    assert "line-capacity" in kinds(strict)
 
 
 def test_violations_are_sorted_for_byte_stable_artifacts():

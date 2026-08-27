@@ -174,6 +174,21 @@ def test_only_the_exact_string_one_turns_the_shadow_on(
     assert _segment(_case_plain()).shadow is None
 
 
+#: Modules the production path may never pull in. Everything the shadow lane
+#: owns imports lazily inside the flag branch, so a name arriving here means an
+#: import moved to module level -- which is how a shadow-only cost lands on
+#: every production run. The P5 modules join the list as they are written (spec
+#: section 10.2), before anything imports them, because the pin is only worth
+#: having while it is still cheap to keep true.
+V2_ONLY_MODULES = (
+    "voxweave.core.authority",
+    "voxweave.core.canonical_text",
+    "voxweave.core.finalizer",
+    "voxweave.core.partition_check",
+    "voxweave.core.trace_validator",
+)
+
+
 def test_off_path_imports_no_v2_module(tmp_path: Path):
     """A fresh interpreter must not have the optimizer in ``sys.modules``.
 
@@ -188,11 +203,11 @@ def test_off_path_imports_no_v2_module(tmp_path: Path):
         "from voxweave import pipeline\n"
         f"units = {EN_UNITS!r}\n"
         "result = pipeline.segment_document(language='en', word_segments=units)\n"
+        f"watched = {V2_ONLY_MODULES!r}\n"
         "leaked = sorted(\n"
         "    name\n"
         "    for name in sys.modules\n"
-        "    if name.startswith('voxweave.core.boundary')\n"
-        "    or name == 'voxweave.core.partition_check'\n"
+        "    if name.startswith('voxweave.core.boundary') or name in watched\n"
         ")\n"
         "print(json.dumps({'shadow': result.shadow, 'leaked': leaked,\n"
         "                  'cues': len(result.cues)}))\n",

@@ -40,7 +40,9 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from .layout import _reading_chars
+from .partition_check import ReportTag, Waiver
 from .schema import Unit
+from .segdoc import DisplayProfile
 from .timing import (
     CHAIN_MAX_GAP_S,
     HELD_WORD_MAX_GAP_S,
@@ -48,7 +50,64 @@ from .timing import (
     TWO_FRAME_S,
 )
 
-__all__ = ["DisplayTimingPreview", "LegacyCleanupPreview"]
+__all__ = [
+    "CueCandidate",
+    "CuePreview",
+    "DisplayTimingPreview",
+    "LegacyCleanupPreview",
+]
+
+
+@dataclass(frozen=True)
+class CueCandidate:
+    """Everything a preview may read about one candidate cue.
+
+    Carried whole rather than as loose arguments because the two
+    implementations read *different* subsets and the seam must not grow a
+    parameter every time one of them learns something: the legacy mirror scores
+    ``text`` and the four thresholds, while the finalizer's preview projects
+    ``word_data`` and reads the speech anchors. ``next_start`` is phase-2
+    context and is present only so a caller need not carry two shapes -- the
+    finalizer's preview ignores it by contract.
+    """
+
+    start: float | None
+    end: float | None
+    next_start: float | None
+    text: str
+    word_data: Sequence[Unit]
+    speech_start: float | None
+    speech_end: float | None
+    profile: DisplayProfile
+    expected_footprint: str | None = None
+
+
+@dataclass(frozen=True)
+class CuePreview:
+    """What a preview promises about one candidate: span, text, load, refusals.
+
+    The refusal channel is what makes the preview honest. A predictor that can
+    only return a number has to encode "this cue cannot be laid out legally" as
+    some number, and every such encoding is a silent lie to whoever ranks the
+    candidates.
+    """
+
+    display_start: float | None
+    display_end: float | None
+    final_text: str
+    line_count: int
+    reading_chars: int
+    #: Always empty in P5: the only waiver kind is minted by the duration cap,
+    #: which is a sweep rule and therefore outside the preview by contract.
+    waivers: tuple[Waiver, ...] = ()
+    refusals: tuple[ReportTag, ...] = ()
+
+    @property
+    def available_s(self) -> float:
+        """The previewed display duration; ``0.0`` when either bound is absent."""
+        if self.display_start is None or self.display_end is None:
+            return 0.0
+        return self.display_end - self.display_start
 
 
 @runtime_checkable
@@ -81,6 +140,16 @@ class DisplayTimingPreview(Protocol):
         ``start``/``end`` are the candidate's raw span, ``next_start`` the next
         cue's start or ``None`` at the document end. The cue's start is never
         moved by the modelled pass, so the duration fully describes the result.
+        """
+        ...
+
+    def preview_cue(self, candidate: CueCandidate) -> CuePreview:
+        """Return the full promise: display span, delivered text, refusals.
+
+        Wider than :meth:`preview_display_span` on purpose. A cost model that
+        prices reading load off the raw string and duration off this scalar is
+        pricing two different cues, and the P5 finalizer's own preview answers
+        both questions from one projection.
         """
         ...
 
@@ -174,6 +243,44 @@ class LegacyCleanupPreview:
                 cur_end = cap
 
         return cur_end - start
+
+    def preview_cue(self, candidate: CueCandidate) -> CuePreview:
+        """Wrap the scalar above with RAW text facts.
+
+        The asymmetry against the finalizer's preview is declared, not
+        accidental: this mirror reports the candidate's raw join, its raw
+        newline count and its raw reading load, because that is what the pass it
+        mirrors actually consumes. Registry FD-1 is exactly the duration
+        difference that follows from the canonical projection stripping
+        punctuation the raw load still charges for.
+
+        ``display_end`` is defined as ``start + span`` and has no value without
+        a start, so an untimed candidate previews ``None`` rather than being
+        handed back its own end as though a span had been computed.
+        """
+        profile = candidate.profile
+        display_end: float | None = None
+        if candidate.start is not None and candidate.end is not None:
+            display_end = candidate.start + self.preview_display_span(
+                candidate.start,
+                candidate.end,
+                candidate.next_start,
+                text=candidate.text,
+                word_data=candidate.word_data,
+                min_cue_s=profile.min_cue_s,
+                max_cue_s=profile.max_cue_s,
+                cps=profile.cps,
+                lag_out_s=profile.lag_out_s,
+            )
+        return CuePreview(
+            display_start=candidate.start,
+            display_end=display_end,
+            final_text=candidate.text,
+            line_count=candidate.text.count("\n") + 1,
+            reading_chars=_reading_chars(candidate.text),
+            waivers=(),
+            refusals=(),
+        )
 
 
 def _speech_end(word_data: Sequence[Unit]) -> float | None:

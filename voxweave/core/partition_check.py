@@ -41,6 +41,7 @@ from .layout import (
 from .schema import Cue
 from .segdoc import DisplayProfile, SourceUnit
 from .smart_split import _display_chars
+from .timing import TWO_FRAME_S
 
 #: The single comparison tolerance of this module. Stated once so no call site
 #: can drift: it is deliberately coarser than the lattice's own duration
@@ -49,16 +50,18 @@ from .smart_split import _display_chars
 EPS: float = 1e-6
 
 Origin = Literal["v1", "v2"]
-Stage = Literal["raw", "core", "legacy-overlay"]
+Stage = Literal["raw", "core", "legacy-overlay", "finalizer"]
 
 ORIGINS: tuple[Origin, ...] = ("v1", "v2")
-STAGES: tuple[Stage, ...] = ("raw", "core", "legacy-overlay")
+STAGES: tuple[Stage, ...] = ("raw", "core", "legacy-overlay", "finalizer")
 
 #: Closed vocabulary of hard-contract failures, sorted so artifact bytes are
 #: stable and a reader can diff two runs' violation sets directly.
 VIOLATION_KINDS: tuple[str, ...] = (
     "duration-cap",
+    "forged-report",
     "line-capacity",
+    "min-gap",
     "non-finite-time",
     "non-monotone-time",
     "overlap",
@@ -71,10 +74,12 @@ VIOLATION_KINDS: tuple[str, ...] = (
 
 #: Closed vocabulary of declared exemptions. Only the held-word duration waiver
 #: exists today; the tuple is the whitelist a new one has to join explicitly.
+#: The finalizer's ``fabricated-time`` is a *report*, not a waiver, so it does
+#: not join this tuple -- it suppresses nothing.
 WAIVER_KINDS: tuple[str, ...] = ("held-chain-duration",)
 
 #: Stages whose unwaived ``v2`` violations drive the shadow exit.
-EXIT_DRIVING_STAGES: frozenset[str] = frozenset({"raw", "core"})
+EXIT_DRIVING_STAGES: frozenset[str] = frozenset({"core", "finalizer", "raw"})
 
 
 def normalize_text(text: str) -> str:
@@ -125,6 +130,29 @@ class Waiver:
             "kind": self.kind,
             "span": list(self.span),
             "unit_ids": list(self.unit_ids),
+        }
+
+
+@dataclass(frozen=True)
+class ReportTag:
+    """One typed finalizer report, in the shape the validator recomputes from.
+
+    A report is a *fact*, not an exemption: it never waives a predicate (that is
+    what :class:`Waiver` is for) and the closed vocabulary lives with the
+    producer. It carries its own ``evidence`` so a checker can re-derive the
+    branch that minted it instead of trusting the label -- a tag whose
+    recomputation fails is itself a violation (``forged-report``).
+    """
+
+    kind: str
+    cue_index: int | None
+    evidence: Mapping[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cue_index": self.cue_index,
+            "evidence": dict(sorted(self.evidence.items())),
+            "kind": self.kind,
         }
 
 
@@ -267,6 +295,38 @@ def _clamp_range(lo: Any, hi: Any, unit_count: int) -> tuple[int, int]:
     return low, high
 
 
+def _forged_min_gap(tag: ReportTag) -> str | None:
+    """PF-3: recompute one ``min-gap-unmet`` tag's branch from its own evidence.
+
+    A report is only worth reading if it can be re-derived, so the checker never
+    trusts the label: it re-runs the branch-2 eligibility test the producer
+    claims fired. The three conditions are the ladder's own (spec section 2.4) --
+    the gap it left is inside the two-frame band, that gap is exactly what
+    stopping at the speech end yields, and the speech end really did sit inside
+    the band. Returns the failure detail, or ``None`` when the tag holds up.
+    """
+    evidence = tag.evidence
+    try:
+        gap = float(evidence["resulting_gap"])
+        speech_end = float(evidence["speech_end"])
+        next_start = float(evidence["next_start"])
+    except (KeyError, TypeError, ValueError):
+        return "min-gap-unmet evidence is missing a recomputable bound"
+    if not (0.0 <= gap < TWO_FRAME_S):
+        return f"resulting_gap {gap} is not inside [0, {TWO_FRAME_S})"
+    if abs(gap - (next_start - speech_end)) > EPS:
+        return (
+            f"resulting_gap {gap} does not equal next_start - speech_end "
+            f"{next_start - speech_end}"
+        )
+    if not (next_start - TWO_FRAME_S < speech_end <= next_start):
+        return (
+            f"speech_end {speech_end} is not inside the two-frame band before "
+            f"next_start {next_start}"
+        )
+    return None
+
+
 def check_partition(
     partition: Sequence[int],
     cues: Sequence[Cue],
@@ -278,6 +338,7 @@ def check_partition(
     waivers: Mapping[int, Waiver] | None = None,
     origins: Mapping[int, Origin] | None = None,
     expect_no_overlap: bool = True,
+    reports: Sequence[ReportTag] = (),
 ) -> PartitionCheckResult:
     """Run every hard predicate over one locked partition and its cue stream.
 
@@ -300,6 +361,21 @@ def check_partition(
     the default for cues the mapping does not name and for the whole-partition
     row, which belongs to no single cue.
 
+    ``reports`` is the finalizer's typed report ledger and is read only at the
+    ``finalizer`` stage, where three predicates come alive (P5 spec sections 2.4
+    and 10.3): line capacity is decided by DIRECT inspection of the delivered
+    lines rather than by ``_wrappable``'s rewrap excuse, two-frame separation is
+    enforced unless a ``min-gap-unmet`` tag names the left cue, and every such
+    tag is itself recomputed from its own evidence. Every other stage behaves
+    exactly as before, which is what keeps the P4 suite bit-identical.
+
+    The finalizer stage's fourth check -- re-running one sweep on the delivered
+    stream -- is NOT here. It needs the solver, and this module deliberately
+    imports no lattice, no cost model and no solver (the P6 seam), so it lives in
+    :func:`voxweave.core.trace_validator.stability_check`, where it is also
+    labelled for what it is: common-mode, a corruption check rather than a
+    correctness one.
+
     The checks are independent by construction -- one cue can raise several --
     except that a cue whose own display times are not real numbers skips the
     comparisons those times would poison, since a NaN compares false against
@@ -310,6 +386,12 @@ def check_partition(
     unit_count = len(units)
     lang = profile.language
     violations: list[Violation] = []
+    finalizing = stage == "finalizer"
+    min_gap_reported = {
+        tag.cue_index
+        for tag in reports
+        if tag.kind == "min-gap-unmet" and tag.cue_index is not None
+    }
 
     def report(
         kind: str,
@@ -407,6 +489,21 @@ def check_partition(
                             unit_ids,
                             f"start {start} overlaps the previous cue's end {p_end}",
                         )
+                    # PF-2: two-frame separation, the exact complement of the
+                    # ladder's own trigger. A sub-floor gap is legal only when
+                    # the producer said so about THIS pair -- speech that runs
+                    # into the two-frame band is a reported fact, never a silent
+                    # one, and an unreported one is a violation.
+                    gap = start - p_end
+                    if finalizing and -EPS <= gap < TWO_FRAME_S - EPS:
+                        if index - 1 not in min_gap_reported:
+                            report(
+                                "min-gap",
+                                index,
+                                unit_ids,
+                                f"gap {gap} to the previous cue is below "
+                                f"{TWO_FRAME_S} with no min-gap-unmet report",
+                            )
 
             speech_start = cue.get("speech_start")
             if _is_real(speech_start) and start > speech_start + EPS:
@@ -428,8 +525,13 @@ def check_partition(
         text = str(cue.get("text", ""))
         lines = text.split("\n")
         widths = [_vis_width(line) for line in lines]
+        # PF-1: at the finalizer stage what ships IS the delivered text, so the
+        # question is whether those lines are legal -- not whether some rewrap
+        # could have folded them. ``_wrappable`` answers the second question and
+        # at degenerate profiles admits text that ships over-wide.
+        over_wide = any(w > budget for w in widths)
         if len(lines) > profile.max_lines or (
-            any(w > budget for w in widths) and not _wrappable(text, profile, lang)
+            over_wide and (finalizing or not _wrappable(text, profile, lang))
         ):
             report(
                 "line-capacity",
@@ -448,6 +550,20 @@ def check_partition(
                 f"span {end - start} exceeds the cap {cap}",
                 waived_by=candidate if _whitelisted(candidate) else None,
             )
+
+    if finalizing:
+        for tag in reports:
+            if tag.kind != "min-gap-unmet":
+                continue
+            detail = _forged_min_gap(tag)
+            if detail is not None:
+                index = tag.cue_index
+                lo, hi = (
+                    _clamp_range(*bounds[index], unit_count)
+                    if index is not None and index < len(bounds)
+                    else (unit_count, unit_count)
+                )
+                report("forged-report", index, tuple(range(lo, hi)), detail)
 
     violations.sort(key=lambda v: (-1 if v.cue_index is None else v.cue_index, v.kind))
     return PartitionCheckResult(
