@@ -75,6 +75,39 @@ def test_load_srt_via_vtt_parser(tmp_path):
     assert blocks[1]["start"] == 3.5
 
 
+def test_load_srt_does_not_guess_speaker_prefixes_without_mapping(tmp_path):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: ordinary dialogue\n",
+        encoding="utf-8",
+    )
+
+    assert load_subtitle_blocks(srt)[0] == {
+        "text": "Aoi: ordinary dialogue",
+        "start": 1.0,
+        "end": 2.0,
+    }
+
+
+def test_load_single_named_srt_uses_mapping_as_safe_prefix_gate(tmp_path):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ep.speakers.json").write_text(
+        '{"version":1,"speakers":{"SPEAKER_00":"Aoi"}}',
+        encoding="utf-8",
+    )
+
+    assert load_subtitle_blocks(srt)[0] == {
+        "text": "Hello",
+        "start": 1.0,
+        "end": 2.0,
+        "speaker": "Aoi",
+    }
+
+
 def test_load_ssa_uses_ass_parser(tmp_path):
     ssa = tmp_path / "ep.ssa"
     ssa.write_text(

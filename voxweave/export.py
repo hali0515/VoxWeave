@@ -18,7 +18,7 @@ from typing import Any
 
 from voxweave import fsio
 from voxweave.realign import render_cues
-from voxweave.speakers import speaker_metadata, voice_text_for_block
+from voxweave.speakers import speaker_layout, speaker_metadata, voice_text_for_block
 
 
 def ass_header(
@@ -116,8 +116,9 @@ def _srt_speaker_text(text: str, block: Mapping[str, Any] | None) -> str:
     if block is None:
         return text
     speaker, speakers = speaker_metadata(block)
+    speaker, speakers = speaker_layout(text, speaker=speaker, speakers=speakers)
     lines = text.split("\n")
-    if speakers is not None and len(speakers) == len(lines):
+    if speakers is not None:
         return "\n".join(
             f"{name}: {line}" if name else line for name, line in zip(speakers, lines)
         )
@@ -177,8 +178,6 @@ def render_ass(
                 # ASS has one Name field per Dialogue event.  Preserve the dual
                 # cue as one on-screen event and retain both actor names here.
                 name = " / ".join(dict.fromkeys(n for n in speakers if n))
-        # ASS fields are comma-delimited and provide no escape for a comma.
-        name = name.replace(",", "，")
         events.append(
             f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(end)},Default,{name},0,0,0,,{body}"
         )

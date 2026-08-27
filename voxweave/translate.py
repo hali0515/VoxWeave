@@ -91,6 +91,23 @@ def _clean_half(text: str) -> str:
     return " ".join(_LEADING_DASH_RE.sub("", text.strip(), count=1).split())
 
 
+def restore_dash_layout(source: str, rendered: str) -> str:
+    """Restore the source's two-line dash boundary after a flat text edit.
+
+    Correction payloads intentionally flatten cue whitespace.  Choose the dash
+    boundary closest to the source's first-line length, which avoids confusing
+    a later hyphen inside either speaker's dialogue for the speaker transition.
+    """
+    if not is_dash_cue(source) or "\n" in rendered:
+        return rendered
+    boundaries = list(re.finditer(r"\s+(?=-\s*\S)", rendered))
+    if not boundaries:
+        return rendered
+    target = len(source.split("\n", 1)[0])
+    boundary = min(boundaries, key=lambda match: abs(match.start() - target))
+    return f"{rendered[: boundary.start()].rstrip()}\n{rendered[boundary.end() :].lstrip()}"
+
+
 def build_payload(blocks: list[dict]) -> list[dict]:
     """Cue blocks -> numbered list [{i, t}]; multi-line cue text is joined into a
     single string. A dual-speaker dash cue (see :func:`is_dash_cue`) additionally

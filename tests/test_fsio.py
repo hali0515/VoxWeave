@@ -1,6 +1,6 @@
 # tests/test_fsio.py
-# Atomic file writes: content lands only via os.replace, so an interrupted
-# write can never leave a truncated file at the destination path.
+# Atomic file writes: replaceable artifacts use os.replace, while protected new
+# user sidecars use race-safe exclusive creation.
 
 import pytest
 
@@ -39,6 +39,19 @@ def test_atomic_write_text_new_refuses_existing_file(tmp_path):
     with pytest.raises(FileExistsError):
         fsio.atomic_write_text_new(dst, "replacement")
     assert dst.read_text(encoding="utf-8") == "user data"
+    assert list(tmp_path.iterdir()) == [dst]
+
+
+def test_atomic_write_text_new_does_not_require_hard_links(tmp_path, monkeypatch):
+    dst = tmp_path / "mapping.json"
+
+    def unavailable(*_args, **_kwargs):
+        raise PermissionError("hard links unsupported")
+
+    monkeypatch.setattr(fsio.os, "link", unavailable)
+    fsio.atomic_write_text_new(dst, '{"version": 1}')
+
+    assert dst.read_text(encoding="utf-8") == '{"version": 1}'
     assert list(tmp_path.iterdir()) == [dst]
 
 

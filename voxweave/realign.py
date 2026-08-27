@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
 
-from voxweave.speakers import strip_voice_tags, voice_text_for_block
+from voxweave.speakers import (
+    strip_srt_speaker_prefixes,
+    strip_voice_tags,
+    voice_text_for_block,
+)
 
 log = logging.getLogger("voxweave")
 
@@ -49,7 +54,7 @@ def _parse_ts(token: str) -> float | None:
     return h * 3600 + mm * 60 + ss + ms / 1000.0
 
 
-def parse_vtt_blocks(text: str) -> list[dict]:
+def parse_vtt_blocks(text: str, *, srt_speaker_names: Sequence[str] = ()) -> list[dict]:
     """Parse both plain-text and timestamped VTT → ordered cues ``[{text, start, end}]``.
 
     Handles both formats: if a ``-->`` timing line is present, start/end are populated
@@ -85,6 +90,10 @@ def parse_vtt_blocks(text: str) -> list[dict]:
         if not cue:
             continue
         clean, speaker, speakers = strip_voice_tags(cue)
+        if speaker is None and speakers is None and srt_speaker_names:
+            clean, speaker, speakers = strip_srt_speaker_prefixes(
+                clean, srt_speaker_names
+            )
         block = {"text": clean, "start": start, "end": end}
         if speaker is not None:
             block["speaker"] = speaker

@@ -12,8 +12,14 @@ from click.testing import CliRunner
 from voxweave import pipeline, speakers, translate
 from voxweave.asrfix import render_vtt as render_corrected_vtt
 from voxweave.cli import cli
-from voxweave.export import export_subtitles
+from voxweave.export import (
+    export_subtitles,
+    render_ass,
+    render_srt,
+    render_vtt_rows,
+)
 from voxweave.realign import parse_vtt_blocks, render_vtt
+from voxweave.subformats import load_subtitle_blocks, parse_ass_blocks
 
 
 def _overlap(left, right):
@@ -54,6 +60,16 @@ def test_select_snippets_intersects_vad_and_subtracts_singing():
         [(5.0, 6.0)],
     )
     assert selected == {"SPEAKER_00": [(3.0, 5.0), (6.0, 8.0)]}
+
+
+def test_select_snippets_keeps_one_six_second_run_as_one_long_clip():
+    selected = speakers.select_snippets(
+        [(100.0, 106.0, "SPEAKER_00")],
+        [(0.0, 700.0)],
+        [],
+    )
+
+    assert selected == {"SPEAKER_00": [(100.0, 106.0)]}
 
 
 def test_mapping_reader_ignores_empty_and_unknown_ids_once(tmp_path, caplog):
@@ -162,6 +178,70 @@ def test_named_srt_and_ass_exports_cover_single_dash_and_unnamed(tmp_path):
     assert "Default,,0,0,0,,Plain" in ass
 
 
+def test_named_exports_sanitize_literal_and_entity_line_breaks(tmp_path):
+    vtt = tmp_path / "episode.vtt"
+    vtt.write_text(
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:02.000\n<v Ren\nKai>hello</v>\n\n"
+        "00:00:03.000 --> 00:00:04.000\n<v Mei&#10;Ling>bye</v>\n\n"
+        "00:00:05.000 --> 00:00:06.000\n<v Sane>ok</v>\n",
+        encoding="utf-8",
+    )
+
+    export_subtitles(vtt, ("ass", "srt"))
+    ass = (tmp_path / "episode.ass").read_text(encoding="utf-8")
+    srt = (tmp_path / "episode.srt").read_text(encoding="utf-8")
+
+    assert [block["text"] for block in parse_ass_blocks(ass)] == [
+        "hello",
+        "bye",
+        "ok",
+    ]
+    assert len([line for line in ass.splitlines() if line.startswith("Dialogue:")]) == 3
+    assert "Default,Ren Kai,0,0,0,,hello" in ass
+    assert "Default,Mei Ling,0,0,0,,bye" in ass
+    assert "Ren Kai: hello" in srt
+    assert "Mei Ling: bye" in srt
+
+
+def test_all_named_renderers_share_structural_name_sanitization():
+    rows = [(1.0, 2.0, "Hello")]
+    blocks = [{"speaker": "Ren,\r\nKai\x1eMei\u2028Lin"}]
+    safe = "Ren， Kai Mei Lin"
+
+    assert f"<v {safe}>Hello</v>" in render_vtt_rows(rows, blocks=blocks)
+    assert f"{safe}: Hello" in render_srt(rows, blocks=blocks)
+    ass = render_ass(rows, blocks=blocks)
+    assert f"Default,{safe},0,0,0,,Hello" in ass
+    assert "\r" not in ass and "\x1e" not in ass and "\u2028" not in ass
+
+
+def test_named_srt_round_trip_recovers_clean_text_and_dash_metadata(tmp_path):
+    vtt = tmp_path / "episode.vtt"
+    source = (
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:03.000\n<v Aoi>Hello</v>\n\n"
+        "00:00:04.000 --> 00:00:06.000\n"
+        "<v Aoi>-Stay</v>\n<v Ren>-Go</v>\n"
+    )
+    vtt.write_text(source, encoding="utf-8")
+
+    export_subtitles(vtt, ("srt",))
+    srt = tmp_path / "episode.srt"
+    blocks = load_subtitle_blocks(srt)
+    payload = translate.build_payload(blocks)
+
+    assert blocks[0]["text"] == "Hello" and blocks[0]["speaker"] == "Aoi"
+    assert blocks[1]["text"] == "-Stay\n-Go"
+    assert blocks[1]["speakers"] == ["Aoi", "Ren"]
+    assert payload[1] == {"i": 1, "t": "-Stay -Go", "parts": ["Stay", "Go"]}
+    assert "Aoi" not in json.dumps(payload) and "Ren" not in json.dumps(payload)
+
+    vtt.unlink()
+    export_subtitles(srt, ("vtt",))
+    assert vtt.read_text(encoding="utf-8") == source
+
+
 def test_translate_keeps_names_out_of_payload_and_restores_vtt_tags():
     blocks = parse_vtt_blocks(
         "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<v Aoi>Hello</v>\n\n"
@@ -188,6 +268,66 @@ def test_correct_render_restores_voice_metadata_without_exposing_it_as_text():
     assert "<v Aoi>hello</v>" in render_corrected_vtt(blocks, ["hello"])
 
 
+def test_correct_keeps_all_names_when_a_fix_collapses_dual_speaker_lines(
+    tmp_path, monkeypatch
+):
+    vtt = tmp_path / "episode.vtt"
+    vtt.write_text(
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:04.000\n"
+        "<v Aoi>-Stya here</v>\n<v Ren>-Go now</v>\n",
+        encoding="utf-8",
+    )
+
+    def fake_correct(payload, **_kwargs):
+        assert payload == [
+            {
+                "i": 0,
+                "t": "-Stya here -Go now",
+                "parts": ["Stya here", "Go now"],
+            }
+        ]
+        return [
+            {
+                "i": 0,
+                "orig": "-Stya here -Go now",
+                "fixed": "-Stay here -Go now",
+                "reason": "typo",
+            }
+        ]
+
+    monkeypatch.setattr(pipeline.asrfix_mod, "correct_cues", fake_correct)
+    pipeline.correct(vtt, apply=True)
+
+    rendered = vtt.read_text(encoding="utf-8")
+    assert "<v Aoi>-Stay here</v>\n<v Ren>-Go now</v>" in rendered
+
+
+def test_translate_keeps_all_names_when_per_line_text_collapses():
+    blocks = parse_vtt_blocks(
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:04.000\n"
+        "<v Aoi>Hello there my friend</v>\n<v Ren>Hi</v>\n"
+    )
+
+    rendered = translate.render_translated_vtt(
+        blocks, {0: "你好 我的朋友 嗨"}, to_iso="zh"
+    )
+
+    assert "<v Aoi / Ren>你好 我的朋友 嗨</v>" in rendered
+    srt = render_srt(
+        [(1.0, 4.0, "你好 我的朋友 嗨")],
+        blocks=[{"speakers": ["Aoi", "Ren"]}],
+    )
+    assert "Aoi / Ren: 你好 我的朋友 嗨" in srt
+
+
+def test_clip_builder_leaves_audio_stream_selection_to_ffmpeg():
+    cmd = speakers.build_clip_command(Path("episode.mkv"), 1.0, 4.0, Path("clip.mp3"))
+
+    assert "-map" not in cmd
+
+
 def test_clip_builder_and_atomic_extraction_contract(tmp_path, monkeypatch):
     media = tmp_path / "episode.mkv"
     output = tmp_path / "clip.mp3"
@@ -202,6 +342,7 @@ def test_clip_builder_and_atomic_extraction_contract(tmp_path, monkeypatch):
 
     cmd = seen["cmd"]
     assert cmd[0] == "ffmpeg" and "-nostdin" in cmd
+    assert "-map" not in cmd
     assert cmd[cmd.index("-ac") + 1] == "1"
     assert cmd[cmd.index("-ar") + 1] == "16000"
     assert cmd[-1] != str(output)

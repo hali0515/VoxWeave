@@ -29,6 +29,7 @@ from voxweave.translate import (
     _make_client,
     build_payload,
     format_glossary,
+    restore_dash_layout,
 )
 
 log = logging.getLogger("voxweave")
@@ -193,7 +194,10 @@ def apply_fixes(
         if why is not None:
             rejected.append({**f, "_why": why})
             continue
-        new_texts[i] = f["fixed"]
+        fixed = f["fixed"]
+        if isinstance(blocks[i].get("speakers"), list):
+            fixed = restore_dash_layout(actual, fixed)
+        new_texts[i] = fixed
         applied.append(f)
     return new_texts, applied, rejected
 

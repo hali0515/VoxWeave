@@ -106,7 +106,9 @@ def parse_ass_blocks(text: str) -> list[dict]:
 
     Honors the section's Format line for field order (falling back to the
     standard v4.00+ layout), skips Comment lines, and sorts by start time
-    (ASS events are not required to be chronological).
+    (ASS events are not required to be chronological).  The Name/Actor field is
+    authoring metadata in foreign scripts and is deliberately not promoted to a
+    display speaker.
     """
     blocks: list[dict] = []
     fields: list[str] | None = None
@@ -148,9 +150,6 @@ def parse_ass_blocks(text: str) -> list[dict]:
             if cue:
                 music_only += 1
             continue
-        name = row.get("name", "").strip()
-        if name:
-            block["speaker"] = name
         blocks.append(block)
     if music_only:
         log.info(
@@ -247,7 +246,29 @@ def load_subtitle_blocks(path: Path) -> list[dict]:
             f"{p.name}: content is {actual} but the extension says"
             f" {p.suffix.lower().lstrip('.')}; rename the file to its real format"
         )
-    blocks = parse_ass_blocks(text) if is_ass else parse_vtt_blocks(text)
+    if is_ass:
+        blocks = parse_ass_blocks(text)
+    elif p.suffix.lower() == ".srt":
+        from voxweave.speakers import (
+            infer_srt_speaker_names,
+            load_speaker_display_names,
+        )
+
+        mapping_path = p.parent / f"{p.stem}.speakers.json"
+        known_names = (
+            load_speaker_display_names(mapping_path) if mapping_path.exists() else ()
+        )
+        if known_names:
+            blocks = parse_vtt_blocks(text, srt_speaker_names=known_names)
+        else:
+            blocks = parse_vtt_blocks(text)
+            inferred = infer_srt_speaker_names(
+                [str(block.get("text", "")) for block in blocks]
+            )
+            if inferred:
+                blocks = parse_vtt_blocks(text, srt_speaker_names=inferred)
+    else:
+        blocks = parse_vtt_blocks(text)
     if not blocks:
         raise RuntimeError(f"no cues in {p.name}")
     _sanitize_block_order(blocks, p.name)

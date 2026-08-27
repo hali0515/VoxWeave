@@ -321,6 +321,30 @@ def test_pipeline_translate_srt_mirrors_format(tmp_path, monkeypatch):
     assert "2\n00:00:03,000 --> 00:00:04,000\n世界" in txt
 
 
+def test_pipeline_translate_filters_srt_speaker_blocks_with_timed_rows(
+    tmp_path, monkeypatch
+):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:2,000\n<v Aoi>A</v>\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n<v Ren>B</v>\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\n<v Kai>C</v>\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline.translate_mod,
+        "translate_cues",
+        lambda payload, **_kwargs: {0: "A", 1: "B", 2: "C"},
+    )
+
+    out = pipeline.translate(srt, to="zh")
+    rendered = out.read_text(encoding="utf-8")
+
+    assert "00:00:03,000 --> 00:00:04,000\nRen: B" in rendered
+    assert "00:00:05,000 --> 00:00:06,000\nKai: C" in rendered
+    assert "Aoi: B" not in rendered and "Ren: C" not in rendered
+
+
 def test_pipeline_translate_ass_mirrors_format(tmp_path, monkeypatch):
     ass = tmp_path / "ep.ass"
     ass.write_text(
@@ -814,6 +838,13 @@ def test_dash_cue_strips_model_prepended_dash_and_reapplies_our_own():
     trans = translate.translate_cues(payload, to="zh", model="m", client=client)
     out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
     assert _cue_lines(out) == ["-你好", "-再见"]
+
+
+def test_restore_dash_layout_recovers_flat_correction_boundary():
+    assert (
+        translate.restore_dash_layout("-Stya here\n-Go now", "-Stay here -Go now")
+        == "-Stay here\n-Go now"
+    )
 
 
 def test_dash_cue_halves_never_merge_or_wrap_even_over_budget():

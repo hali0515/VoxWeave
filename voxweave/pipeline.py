@@ -2761,10 +2761,15 @@ def translate(
             for s, e, t in rows
             if s is not None and e is not None
         ]
+        timed_blocks = [
+            block
+            for block in blocks
+            if block.get("start") is not None and block.get("end") is not None
+        ]
         content = (
-            render_srt(timed, blocks=blocks)
+            render_srt(timed, blocks=timed_blocks)
             if ext == ".srt"
-            else render_ass(timed, blocks=blocks)
+            else render_ass(timed, blocks=timed_blocks)
         )
     out_path = swap_ext(vtt_path, f".{to}{ext}")
     fsio.atomic_write_text(out_path, content)

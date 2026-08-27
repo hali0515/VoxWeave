@@ -28,6 +28,7 @@ MAPPING_VERSION = 1
 MIN_SNIPPET_S = 2.0
 MAX_SNIPPET_S = 6.0
 MAX_SNIPPETS_PER_SPEAKER = 3
+MIN_SNIPPET_GAP_S = 1.0
 FFMPEG_TIMEOUT = float(os.environ.get("VOXWEAVE_FFMPEG_TIMEOUT", "3600"))
 
 Span = tuple[float, float]
@@ -36,6 +37,7 @@ Turn = tuple[float, float, str]
 _VOICE_WRAP_RE = re.compile(
     r"\A<v(?:[ \t]+([^>]*?))?>(.*)</v>\Z", re.IGNORECASE | re.DOTALL
 )
+_SRT_PREFIX_CANDIDATE_RE = re.compile(r"^([^:\r\n]{1,80}): (.+)$")
 
 
 def _valid_spans(spans: Sequence[Span] | None) -> list[Span]:
@@ -110,9 +112,10 @@ def _window(span: Span, target: float | None = None) -> Span:
 def _pick_spread(regions: Sequence[Span], limit: int) -> list[Span]:
     """Pick long clean windows from the early, middle, and late thirds.
 
-    Each third is considered independently first, which makes a long clean run
-    spanning an episode yield genuinely separated samples.  Empty thirds are
-    then filled from the longest remaining clean material.
+    Each time bin considers windows from the original clean spans, rather than
+    clipping a span at the bin boundary.  That keeps a single 6-second utterance
+    as one useful clip instead of three adjacent 2-second fragments.  Distinct
+    picks retain at least a small temporal gap so cuts are genuinely spread.
     """
     clean = [
         span for span in _merge_spans(regions) if span[1] - span[0] >= MIN_SNIPPET_S
@@ -120,29 +123,53 @@ def _pick_spread(regions: Sequence[Span], limit: int) -> list[Span]:
     if not clean or limit <= 0:
         return []
     extent_start, extent_end = clean[0][0], clean[-1][1]
-    third = (extent_end - extent_start) / 3.0
+    bin_count = min(limit, MAX_SNIPPETS_PER_SPEAKER)
+    bin_width = (extent_end - extent_start) / bin_count
     bins = [
-        (extent_start + third * index, extent_start + third * (index + 1))
-        for index in range(3)
+        (extent_start + bin_width * index, extent_start + bin_width * (index + 1))
+        for index in range(bin_count)
     ]
     picked: list[Span] = []
+
+    def separated(candidate: Span) -> bool:
+        return all(
+            candidate[1] + MIN_SNIPPET_GAP_S <= start
+            or end + MIN_SNIPPET_GAP_S <= candidate[0]
+            for start, end in picked
+        )
+
     for bin_start, bin_end in bins:
-        candidates = _intersect_spans(clean, [(bin_start, bin_end)])
-        candidates = [span for span in candidates if span[1] - span[0] >= MIN_SNIPPET_S]
+        target = (bin_start + bin_end) / 2.0
+        candidates = [
+            _window(span, target)
+            for span in clean
+            if span[0] < bin_end and span[1] > bin_start
+        ]
+        candidates = [span for span in candidates if separated(span)]
         if not candidates:
             continue
-        best = max(candidates, key=lambda span: (span[1] - span[0], -span[0]))
-        picked.append(_window(best, (bin_start + bin_end) / 2.0))
+        best = max(
+            candidates,
+            key=lambda span: (
+                span[1] - span[0],
+                -abs((span[0] + span[1]) / 2.0 - target),
+                -span[0],
+            ),
+        )
+        picked.append(best)
         if len(picked) == limit:
             return sorted(picked)
 
+    # A narrow/empty time bin can hide another independent clean utterance.
+    # Fill from whole original spans only; never manufacture fragments beside a
+    # window already cut from the same continuous run.
     while len(picked) < limit:
-        remaining = _subtract_spans(clean, picked)
-        candidates = [span for span in remaining if span[1] - span[0] >= MIN_SNIPPET_S]
+        candidates = [_window(span) for span in clean]
+        candidates = [span for span in candidates if separated(span)]
         if not candidates:
             break
         best = max(candidates, key=lambda span: (span[1] - span[0], -span[0]))
-        picked.append(_window(best))
+        picked.append(best)
     return sorted(picked)
 
 
@@ -180,16 +207,8 @@ def select_snippets(
     return selected
 
 
-def load_speaker_mapping(
-    path: Path, known_ids: Sequence[str] | set[str]
-) -> dict[str, str]:
-    """Read a version-1 mapping, ignoring empty names and unknown speaker ids.
-
-    Unknown ids are reported in one logger call so a stale phase-1 mapping is
-    visible without flooding an episode replay.  Non-empty names are preserved
-    exactly as entered; surrounding whitespace only decides whether a value is
-    effectively empty.
-    """
+def _mapping_entries(path: Path) -> dict[str, Any]:
+    """Read and validate the entries object from a version-1 mapping."""
     path = Path(path)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -205,6 +224,30 @@ def load_speaker_mapping(
     speakers = raw.get("speakers")
     if not isinstance(speakers, dict):
         raise RuntimeError(f"{path.name} must contain a speakers object")
+    return speakers
+
+
+def load_speaker_display_names(path: Path) -> list[str]:
+    """Return the non-empty names in a mapping, in stable mapping order."""
+    names: list[str] = []
+    for raw_name in _mapping_entries(path).values():
+        if isinstance(raw_name, str) and raw_name.strip():
+            names.append(raw_name)
+    return list(dict.fromkeys(names))
+
+
+def load_speaker_mapping(
+    path: Path, known_ids: Sequence[str] | set[str]
+) -> dict[str, str]:
+    """Read a version-1 mapping, ignoring empty names and unknown speaker ids.
+
+    Unknown ids are reported in one logger call so a stale phase-1 mapping is
+    visible without flooding an episode replay.  Non-empty names are preserved
+    exactly as entered; surrounding whitespace only decides whether a value is
+    effectively empty.
+    """
+    path = Path(path)
+    speakers = _mapping_entries(path)
 
     known = set(known_ids)
     unknown: list[str] = []
@@ -226,9 +269,130 @@ def load_speaker_mapping(
     return names
 
 
+_NAME_RECORD_SEPARATORS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+_NAME_TRANSLATION = str.maketrans(
+    {char: " " for char in _NAME_RECORD_SEPARATORS} | {",": "，"}
+)
+
+
+def sanitize_speaker_name(name: str) -> str:
+    """Normalize a display name for every subtitle render format.
+
+    ASS uses commas as field separators and physical line separators as event
+    separators.  Apply the same safe spelling to VTT and SRT so moving between
+    formats never changes the rendered identity.
+    """
+    return " ".join(name.translate(_NAME_TRANSLATION).split())
+
+
+def _normalized_name(value: object) -> str | None:
+    """Return one safe non-empty name, or None for non-name values."""
+    if not isinstance(value, str):
+        return None
+    name = sanitize_speaker_name(value)
+    return name or None
+
+
+def strip_srt_speaker_prefixes(
+    text: str, known_names: Sequence[str]
+) -> tuple[str, str | None, list[str | None] | None]:
+    """Recover speaker metadata from SRT prefixes emitted by voxweave.
+
+    A prefix is recognized only when its name appears in the sibling speaker
+    mapping.  This avoids interpreting ordinary dialogue containing a colon as
+    metadata.  Multi-line dash cues retain line-level attribution; a normal
+    multi-line cue with only its first line prefixed retains cue-level metadata.
+    """
+    names = sorted(
+        {rendered for name in known_names if (rendered := sanitize_speaker_name(name))},
+        key=len,
+        reverse=True,
+    )
+    if not names:
+        return text, None, None
+
+    def strip_line(line: str) -> tuple[str, str | None]:
+        for name in names:
+            prefix = f"{name}: "
+            if line.startswith(prefix):
+                return line[len(prefix) :], name
+        return line, None
+
+    parsed = [strip_line(line) for line in text.split("\n")]
+    line_names = [name for _line, name in parsed]
+    if not any(line_names):
+        return text, None, None
+    plain_lines = [line for line, _name in parsed]
+    plain = "\n".join(plain_lines)
+    if len(parsed) == 1:
+        return plain, line_names[0], None
+
+    matched = sum(name is not None for name in line_names)
+    is_dash = all(re.match(r"^-\s*\S", line) for line in plain_lines)
+    if matched > 1 or line_names[0] is None or is_dash:
+        return plain, None, line_names
+    return plain, line_names[0], None
+
+
+def infer_srt_speaker_names(texts: Sequence[str]) -> list[str]:
+    """Infer names only from a high-confidence generated-SRT pattern.
+
+    A two-line cue whose prefixed bodies are both dash dialogue is the phase-1
+    renderer's distinctive dual-speaker form.  Once present, other prefixes in
+    the same document share that channel.  Without such a cue, require a name
+    to recur in separate cues; an isolated ``Name: dialogue`` remains literal.
+    """
+    candidates: list[tuple[int, str, str]] = []
+    dual_pattern = False
+    for cue_index, text in enumerate(texts):
+        per_cue: list[tuple[str, str]] = []
+        for line in text.split("\n"):
+            match = _SRT_PREFIX_CANDIDATE_RE.fullmatch(line)
+            if match is not None:
+                name = sanitize_speaker_name(match.group(1))
+                if name:
+                    per_cue.append((name, match.group(2)))
+                    candidates.append((cue_index, name, match.group(2)))
+        if len(per_cue) == 2 and all(re.match(r"^-\s*\S", body) for _, body in per_cue):
+            dual_pattern = True
+    if dual_pattern:
+        return list(dict.fromkeys(name for _cue, name, _body in candidates))
+
+    cue_ids: dict[str, set[int]] = {}
+    for cue_index, name, _body in candidates:
+        cue_ids.setdefault(name, set()).add(cue_index)
+    return [name for name, seen in cue_ids.items() if len(seen) >= 2]
+
+
 def _voice_name(name: str) -> str:
     """Escape a display name for a WebVTT voice annotation."""
-    return html.escape(name.replace("\n", " ").replace("\r", " "), quote=False)
+    return html.escape(sanitize_speaker_name(name), quote=False)
+
+
+def speaker_layout(
+    text: str,
+    *,
+    speaker: str | None = None,
+    speakers: Sequence[str | None] | None = None,
+) -> tuple[str | None, list[str | None] | None]:
+    """Resolve safe cue/line names for the current rendered text layout.
+
+    Text-mutating stages can collapse or wrap lines after names were parsed.
+    When line metadata no longer matches, preserve every distinct name as one
+    cue-level label instead of silently discarding the metadata.
+    """
+    cue_name = _normalized_name(speaker)
+    line_names = (
+        [_normalized_name(name) for name in speakers] if speakers is not None else None
+    )
+    if line_names is not None and len(line_names) == len(text.split("\n")):
+        if any(line_names):
+            return None, line_names
+    if line_names:
+        combined = " / ".join(dict.fromkeys(name for name in line_names if name))
+        if combined:
+            return combined, None
+    return (cue_name or None), None
 
 
 def voice_tag_text(
@@ -238,8 +402,9 @@ def voice_tag_text(
     speakers: Sequence[str | None] | None = None,
 ) -> str:
     """Apply one cue-level or several line-level WebVTT voice tags."""
+    speaker, speakers = speaker_layout(text, speaker=speaker, speakers=speakers)
     lines = text.split("\n")
-    if speakers is not None and len(speakers) == len(lines):
+    if speakers is not None:
         return "\n".join(
             f"<v {_voice_name(name)}>{line}</v>" if name else line
             for line, name in zip(lines, speakers)
@@ -316,15 +481,21 @@ def speaker_metadata(
     speaker = block.get("speaker")
     line_names = block.get("speakers")
     return (
-        speaker if isinstance(speaker, str) and speaker else None,
-        line_names if isinstance(line_names, list) else None,
+        _normalized_name(speaker),
+        [_normalized_name(name) for name in line_names]
+        if isinstance(line_names, list)
+        else None,
     )
 
 
 def build_clip_command(
     media: Path, start: float, end: float, output: Path
 ) -> list[str]:
-    """Build the ffmpeg argv for one compact 16 kHz mono MP3 snippet."""
+    """Build one 16 kHz mono MP3 clip using ffmpeg's default audio stream.
+
+    The transcription decoder also leaves stream choice to ffmpeg; keeping the
+    same selection rule is essential for multi-audio media.
+    """
     duration = float(end) - float(start)
     if duration <= 0:
         raise ValueError("speaker snippet end must be after start")
@@ -341,8 +512,6 @@ def build_clip_command(
         str(media),
         "-t",
         f"{duration:.3f}",
-        "-map",
-        "0:a:0",
         "-vn",
         "-ac",
         "1",
@@ -540,14 +709,20 @@ __all__ = [
     "FFMPEG_TIMEOUT",
     "MAPPING_VERSION",
     "MAX_SNIPPET_S",
+    "MIN_SNIPPET_GAP_S",
     "MIN_SNIPPET_S",
     "build_clip_command",
     "create_speaker_audition",
     "extract_clip",
+    "infer_srt_speaker_names",
+    "load_speaker_display_names",
     "load_speaker_mapping",
     "run_clip_command",
+    "sanitize_speaker_name",
     "select_snippets",
+    "speaker_layout",
     "speaker_metadata",
+    "strip_srt_speaker_prefixes",
     "strip_voice_tags",
     "voice_tag_text",
     "voice_text_for_block",
