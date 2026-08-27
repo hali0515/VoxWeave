@@ -228,6 +228,47 @@ def test_align_live_change_after_snapshot_omits_pair_and_cleans(tmp_path, monkey
     assert not any(path.exists() for path in artifacts)
 
 
+def test_align_final_json_replace_recheck_observes_change_after_vtt(
+    tmp_path, monkeypatch
+):
+    media, vtt_path, json_path, _vtt, _json = _write_align_input(
+        tmp_path,
+        media_bytes=b"A" * 64,
+    )
+    fingerprint = media_fingerprint(media)
+    json_path.write_text(
+        json.dumps(_sibling(pair_media=fingerprint)),
+        encoding="utf-8",
+    )
+    artifacts = [
+        tmp_path / "episode.voiceprints.json",
+        tmp_path / "episode.speakers.suggest.json",
+        tmp_path / "episode.speakers.html",
+    ]
+    for artifact in artifacts:
+        artifact.write_text("sensitive", encoding="utf-8")
+    _stub_align(tmp_path, monkeypatch)
+    original_write = pipeline.fsio.atomic_write_text
+    changed = []
+
+    def mutate_after_vtt_write(path, content, **kwargs):
+        result = original_write(path, content, **kwargs)
+        if Path(path) == vtt_path:
+            media.write_bytes(b"B" * 64)
+            changed.append(True)
+        return result
+
+    monkeypatch.setattr(pipeline.fsio, "atomic_write_text", mutate_after_vtt_write)
+
+    pipeline.align(vtt_path)
+
+    replayed = json.loads(json_path.read_text(encoding="utf-8"))
+    assert changed == [True]
+    assert "voiceprint_capture" not in replayed
+    assert "voiceprint_media" not in replayed
+    assert not any(path.exists() for path in artifacts)
+
+
 def test_align_omit_unlink_failure_names_landed_outputs_and_leftover(
     tmp_path, monkeypatch
 ):

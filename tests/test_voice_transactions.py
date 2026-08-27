@@ -19,6 +19,7 @@ from voxweave.voicestore import (
     exclusive_store_lock as real_exclusive_store_lock,
     load_voice_store,
     new_voice_store,
+    shared_store_lock as real_shared_store_lock,
     write_voice_store,
 )
 
@@ -388,3 +389,39 @@ def test_generation_shared_store_lock_blocks_enrollment_mutation(tmp_path, monke
         "Aqua",
         "Blaze",
     }
+
+
+def test_generation_rechecks_live_media_after_waiting_for_shared_store(
+    tmp_path, monkeypatch
+):
+    media = _episode(tmp_path, capture="c" + "8" * 32)
+    store_path = tmp_path / "voices.json"
+    _store(store_path)
+    monkeypatch.setattr(speakers, "extract_clip", _write_clip)
+    shared_attempted = threading.Event()
+    stale_suggest = tmp_path / "episode.speakers.suggest.json"
+    stale_suggest.write_text('{"stale": true}', encoding="utf-8")
+
+    @contextmanager
+    def observed_shared(path: Path):
+        shared_attempted.set()
+        with real_shared_store_lock(path) as handle:
+            yield handle
+
+    monkeypatch.setattr(speakers, "shared_store_lock", observed_shared)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with real_exclusive_store_lock(store_path):
+            generation = pool.submit(
+                speakers.create_speaker_audition,
+                media,
+                voices=store_path,
+            )
+            assert shared_attempted.wait(timeout=5)
+            media.write_bytes(b"replacement media in sampled region")
+        with pytest.raises(RuntimeError, match="media changed"):
+            generation.result(timeout=10)
+
+    assert not (tmp_path / "episode.speakers.json").exists()
+    assert not (tmp_path / "episode.speakers.html").exists()
+    assert not stale_suggest.exists()

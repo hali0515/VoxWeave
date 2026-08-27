@@ -1076,18 +1076,6 @@ def create_speaker_audition(
                     f"--diarize --voiceprints or use --no-match: {exc}"
                 ) from exc
 
-        matches: dict[str, SpeakerMatch] | None = None
-        suggest_record: dict[str, object] | None = None
-        if pair is not None and sidecar is not None and store_stage is not None:
-            store_path, _store_bytes, store = store_stage
-            try:
-                matched = _matching_record(sidecar, store_path, store)
-            except (CompatibilityError, Phase2DataError) as exc:
-                log.warning("voice matching skipped: %s", exc)
-                matched = None
-            if matched is not None:
-                matches, suggest_record, _thresholds = matched
-
         embedded: dict[str, list[tuple[Span, str]]] = {label: [] for label in picks}
         with tempfile.TemporaryDirectory(prefix="voxweave_speakers_") as tmp_dir:
             root = Path(tmp_dir)
@@ -1100,66 +1088,104 @@ def create_speaker_audition(
                         ((start, end), f"data:audio/mpeg;base64,{encoded}")
                     )
 
-        page = _render_audition_html(
-            media.name,
-            mapping_path.name,
-            embedded,
-            matches,
-        )
         skeleton = {
             "version": MAPPING_VERSION,
             "speakers": {speaker_id: "" for speaker_id in picks},
         }
-        with episode_lock(media):
-            if json_path.read_bytes() != sibling_bytes:
+
+        def publish_locked(store_handle=None) -> None:
+            current_data = data
+            current_sidecar = sidecar
+            current_sibling_bytes = json_path.read_bytes()
+            if current_sibling_bytes != sibling_bytes:
                 raise RuntimeError("input changed during speaker generation; re-run")
             if pair is not None:
                 assert sidecar_bytes is not None
-                assert sidecar is not None
-                if pipeline.voiceprints_path(media).read_bytes() != sidecar_bytes:
-                    delete_suggest(pipeline.speakers_suggest_path(media))
+                assert snapshot_fingerprint is not None
+                current_data = strict_json_object_loads(
+                    current_sibling_bytes,
+                    max_bytes=max(1, len(current_sibling_bytes)),
+                    source=json_path.name,
+                )
+                current_sidecar_bytes = pipeline.voiceprints_path(media).read_bytes()
+                if current_sidecar_bytes != sidecar_bytes:
                     raise RuntimeError(
                         "input changed during speaker generation; re-run"
                     )
+                current_sidecar = _voiceprints_from_bytes(
+                    current_sidecar_bytes,
+                    source=pipeline.voiceprints_path(media).name,
+                )
+                validate_voiceprint_conjunction(
+                    current_sidecar,
+                    current_data,
+                    snapshot_fingerprint,
+                )
+
+            matches: dict[str, SpeakerMatch] | None = None
+            suggest_record: dict[str, object] | None = None
+            if store_handle is not None:
+                assert pair is not None
+                assert current_sidecar is not None
+                assert store_stage is not None
+                store_path, store_bytes, _staged_store = store_stage
+                current_bytes, current_store = _read_exact_object(
+                    store_handle.store_path,
+                    VOICES_STORE_MAX_BYTES,
+                )
+                validate_voice_store(current_store)
+                if current_bytes != store_bytes:
+                    raise RuntimeError(
+                        "voices store changed during speaker generation; re-run"
+                    )
+                try:
+                    matched = _matching_record(
+                        current_sidecar,
+                        store_path,
+                        current_store,
+                    )
+                except (CompatibilityError, Phase2DataError) as exc:
+                    log.warning("voice matching skipped: %s", exc)
+                    matched = None
+                if matched is not None:
+                    matches, suggest_record, _thresholds = matched
+
+            page = _render_audition_html(
+                media.name,
+                mapping_path.name,
+                embedded,
+                matches,
+            )
+            if mapping_path.exists():
+                raise _mapping_exists_refusal(mapping_path)
+            if pair is not None:
                 assert snapshot_fingerprint is not None
-                validate_voiceprint_conjunction(sidecar, data, snapshot_fingerprint)
-                if media_fingerprint(media) != snapshot_fingerprint:
-                    delete_suggest(pipeline.speakers_suggest_path(media))
+                try:
+                    live_fingerprint = media_fingerprint(media)
+                except OSError as exc:
+                    raise RuntimeError(
+                        "media could not be rechecked during speaker generation; re-run"
+                    ) from exc
+                if live_fingerprint != snapshot_fingerprint:
                     raise RuntimeError(
                         "media changed during speaker generation; re-run"
                     )
-            if mapping_path.exists():
-                raise _mapping_exists_refusal(mapping_path)
-            if suggest_record is not None and store_stage is not None:
-                store_path, store_bytes, _store = store_stage
+            _publish_audition(
+                media,
+                mapping_path=mapping_path,
+                html_path=html_path,
+                page=page,
+                skeleton=skeleton,
+                suggest_record=suggest_record,
+            )
+
+        with episode_lock(media):
+            if pair is not None and store_stage is not None:
+                store_path, _store_bytes, _store = store_stage
                 with shared_store_lock(store_path) as lock_handle:
-                    current_bytes, current_store = _read_exact_object(
-                        lock_handle.store_path,
-                        VOICES_STORE_MAX_BYTES,
-                    )
-                    validate_voice_store(current_store)
-                    if current_bytes != store_bytes:
-                        delete_suggest(pipeline.speakers_suggest_path(media))
-                        raise RuntimeError(
-                            "voices store changed during speaker generation; re-run"
-                        )
-                    _publish_audition(
-                        media,
-                        mapping_path=mapping_path,
-                        html_path=html_path,
-                        page=page,
-                        skeleton=skeleton,
-                        suggest_record=suggest_record,
-                    )
+                    publish_locked(lock_handle)
             else:
-                _publish_audition(
-                    media,
-                    mapping_path=mapping_path,
-                    html_path=html_path,
-                    page=page,
-                    skeleton=skeleton,
-                    suggest_record=None,
-                )
+                publish_locked()
         return html_path
 
     try:

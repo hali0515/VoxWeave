@@ -11,6 +11,7 @@ from __future__ import annotations
 import errno
 import os
 import tempfile
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -39,13 +40,33 @@ def atomic_path(dst: Path) -> Iterator[Path]:
         raise
 
 
-def atomic_write_text(dst: Path, text: str, *, encoding: str = "utf-8") -> None:
-    """``Path.write_text`` with atomic-replace semantics (fsynced before rename)."""
-    with atomic_path(dst) as tmp:
-        with open(tmp, "w", encoding=encoding) as f:
-            f.write(text)
+def atomic_write_text(
+    dst: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    before_replace: Callable[[], str | None] | None = None,
+) -> None:
+    """Write fsynced text and atomically replace ``dst``.
+
+    ``before_replace`` runs after the requested bytes are durable in the temp
+    file and immediately before the rename. Returning text substitutes a
+    fsynced fallback; returning ``None`` keeps the prepared bytes. This lets a
+    transaction make its last authority decision at the actual replace edge.
+    """
+
+    def write_temp(path: Path, content: str) -> None:
+        with open(path, "w", encoding=encoding) as f:
+            f.write(content)
             f.flush()
             os.fsync(f.fileno())
+
+    with atomic_path(dst) as tmp:
+        write_temp(tmp, text)
+        if before_replace is not None:
+            fallback = before_replace()
+            if fallback is not None:
+                write_temp(tmp, fallback)
 
 
 def atomic_write_text_new(dst: Path, text: str, *, encoding: str = "utf-8") -> None:

@@ -10,7 +10,7 @@ import platform
 import subprocess
 import threading
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -1185,6 +1185,7 @@ def _dump_sibling_json(
     speaker_turns: list[tuple[float, float, str]] | None = None,
     voiceprint_capture: str | None = None,
     voiceprint_media: str | None = None,
+    final_voiceprint_check: Callable[[], bool] | None = None,
     manifest: Mapping[str, Any] | None = None,
 ) -> None:
     """Write the sibling JSON document (language + segments + word_segments + optional
@@ -1226,7 +1227,26 @@ def _dump_sibling_json(
         data["voiceprint_media"] = require_sha256(voiceprint_media, "voiceprint_media")
     if manifest is not None:
         data["segmentation"] = dict(manifest)
-    fsio.atomic_write_text(json_path, json.dumps(data, ensure_ascii=False, indent=2))
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    fallback_selector: Callable[[], str | None] | None = None
+    if final_voiceprint_check is not None:
+        if voiceprint_capture is None or voiceprint_media is None:
+            raise Phase2DataError("a final voiceprint check requires a complete pair")
+        unbound = dict(data)
+        del unbound["voiceprint_capture"]
+        del unbound["voiceprint_media"]
+        unbound_text = json.dumps(unbound, ensure_ascii=False, indent=2)
+
+        def select_unbound() -> str | None:
+            return None if final_voiceprint_check() else unbound_text
+
+        fallback_selector = select_unbound
+
+    fsio.atomic_write_text(
+        json_path,
+        text,
+        before_replace=fallback_selector,
+    )
 
 
 # Cue keys that exist only in memory: raw acoustic anchors captured at cue
@@ -1258,6 +1278,7 @@ def _write_siblings(
     speaker_turns: list[tuple[float, float, str]] | None = None,
     voiceprint_capture: str | None = None,
     voiceprint_media: str | None = None,
+    final_voiceprint_check: Callable[[], bool] | None = None,
     manifest: Mapping[str, Any] | None = None,
     speaker_names: Mapping[str, str] | None = None,
 ) -> Path:
@@ -1285,6 +1306,7 @@ def _write_siblings(
         speaker_turns=speaker_turns,
         voiceprint_capture=voiceprint_capture,
         voiceprint_media=voiceprint_media,
+        final_voiceprint_check=final_voiceprint_check,
         manifest=manifest,
     )
     rows = []
@@ -3571,19 +3593,6 @@ def _commit_process_outputs(
                 raise RuntimeError(
                     "voiceprint capture turns diverged from sibling turns"
                 )
-            try:
-                live_fingerprint = media_fingerprint(media_path)
-            except OSError as exc:
-                log.warning(
-                    "voiceprint capture dropped: live media recheck failed: %s", exc
-                )
-                effective_capture = None
-            else:
-                if live_fingerprint != snapshot_fingerprint:
-                    log.warning(
-                        "voiceprint capture dropped: live media changed before commit"
-                    )
-                    effective_capture = None
 
         capture_id: str | None = None
         sidecar: dict[str, object] | None = None
@@ -3601,6 +3610,30 @@ def _commit_process_outputs(
                 capture_id = None
                 sidecar = None
 
+        final_voiceprint_check: Callable[[], bool] | None = None
+        if sidecar is not None and capture_id is not None:
+
+            def check_live_media_at_json_replace() -> bool:
+                nonlocal capture_id, sidecar
+                try:
+                    live_fingerprint = media_fingerprint(media_path)
+                except OSError as exc:
+                    log.warning(
+                        "voiceprint capture dropped: live media recheck failed: %s",
+                        exc,
+                    )
+                else:
+                    if live_fingerprint == snapshot_fingerprint:
+                        return True
+                    log.warning(
+                        "voiceprint capture dropped: live media changed before commit"
+                    )
+                capture_id = None
+                sidecar = None
+                return False
+
+            final_voiceprint_check = check_live_media_at_json_replace
+
         vtt_out = _write_siblings(
             media_path,
             cues,
@@ -3613,6 +3646,7 @@ def _commit_process_outputs(
             speaker_turns=speaker_turns,
             voiceprint_capture=capture_id,
             voiceprint_media=(snapshot_fingerprint if capture_id is not None else None),
+            final_voiceprint_check=final_voiceprint_check,
             manifest=manifest,
         )
 
@@ -4081,6 +4115,7 @@ def _write_align_json(
     speaker_turns: list[tuple[float, float, str]] | None = None,
     voiceprint_capture: str | None = None,
     voiceprint_media: str | None = None,
+    final_voiceprint_check: Callable[[], bool] | None = None,
     manifest: Mapping[str, Any] | None = None,
 ) -> None:
     """Update the sibling JSON with new alignment timing. Passes vad_speech,
@@ -4117,6 +4152,7 @@ def _write_align_json(
         speaker_turns=speaker_turns,
         voiceprint_capture=voiceprint_capture,
         voiceprint_media=voiceprint_media,
+        final_voiceprint_check=final_voiceprint_check,
         manifest=manifest,
     )
 
@@ -4359,26 +4395,41 @@ def align(
             if not vtt_unchanged or not json_unchanged:
                 raise RuntimeError("input changed during replay; re-run")
 
-            preserve_pair = False
-            if voiceprint_pair is not None and selected_snapshot is not None:
-                try:
-                    live_fingerprint = media_fingerprint(media)
-                except OSError as exc:
-                    log.warning(
-                        "voiceprint binding omitted during align: "
-                        "selected media could not be rechecked: %s",
-                        exc,
-                    )
-                else:
-                    preserve_pair = (
-                        selected_snapshot.fingerprint == voiceprint_pair[1]
-                        and live_fingerprint == selected_snapshot.fingerprint
-                    )
-                    if not preserve_pair:
+            preserve_pair = bool(
+                voiceprint_pair is not None
+                and selected_snapshot is not None
+                and selected_snapshot.fingerprint == voiceprint_pair[1]
+            )
+            final_voiceprint_check: Callable[[], bool] | None = None
+            if preserve_pair:
+                assert selected_snapshot is not None
+
+                def check_live_media_at_align_json_replace() -> bool:
+                    nonlocal preserve_pair
+                    try:
+                        live_fingerprint = media_fingerprint(media)
+                    except OSError as exc:
+                        log.warning(
+                            "voiceprint binding omitted during align: "
+                            "selected media could not be rechecked: %s",
+                            exc,
+                        )
+                    else:
+                        if live_fingerprint == selected_snapshot.fingerprint:
+                            return True
                         log.warning(
                             "voiceprint binding omitted during align: "
                             "selected media does not match the sibling binding"
                         )
+                    preserve_pair = False
+                    return False
+
+                final_voiceprint_check = check_live_media_at_align_json_replace
+            elif voiceprint_pair is not None and selected_snapshot is not None:
+                log.warning(
+                    "voiceprint binding omitted during align: "
+                    "selected media does not match the sibling binding"
+                )
 
             fsio.atomic_write_text(vtt_path, rendered_vtt)
             _write_align_json(
@@ -4397,6 +4448,7 @@ def align(
                 voiceprint_media=(
                     voiceprint_pair[1] if preserve_pair and voiceprint_pair else None
                 ),
+                final_voiceprint_check=final_voiceprint_check,
                 manifest=keep_manifest,
             )
             if pair_declared and not preserve_pair:

@@ -223,6 +223,54 @@ def test_live_media_mismatch_drops_pair_and_machine_artifacts(
     assert "live media changed" in caplog.text
 
 
+def test_process_final_json_replace_recheck_drops_late_media_change(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"A" * 64)
+    turns = [TURN]
+    for suffix in (".voiceprints.json", ".speakers.suggest.json", ".speakers.html"):
+        pipeline.swap_ext(media, suffix).write_text("stale", encoding="utf-8")
+
+    monkeypatch.setattr(
+        pipeline,
+        "transcribe",
+        lambda *_args, **_kwargs: (
+            "en",
+            [dict(UNIT)],
+            [],
+            [],
+            turns,
+            _capture(turns),
+        ),
+    )
+    original_write = pipeline.fsio.atomic_write_text
+    changed = []
+
+    def mutate_at_json_replace(path, content, **kwargs):
+        if Path(path).suffix == ".json" and "voiceprint_capture" in content:
+            final_check = kwargs["before_replace"]
+
+            def mutate_then_check():
+                media.write_bytes(b"B" * 64)
+                changed.append(True)
+                return final_check()
+
+            kwargs["before_replace"] = mutate_then_check
+        return original_write(path, content, **kwargs)
+
+    monkeypatch.setattr(pipeline.fsio, "atomic_write_text", mutate_at_json_replace)
+
+    pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+
+    sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
+    assert changed == [True]
+    assert "voiceprint_capture" not in sibling
+    assert "voiceprint_media" not in sibling
+    for suffix in (".voiceprints.json", ".speakers.suggest.json", ".speakers.html"):
+        assert not pipeline.swap_ext(media, suffix).exists()
+
+
 def test_snapshot_unavailable_continues_without_capture(tmp_path, monkeypatch):
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"stable media bytes")
@@ -284,10 +332,10 @@ def test_process_primary_write_failure_exits_with_no_false_sidecar(
 
     original_write = pipeline.fsio.atomic_write_text
 
-    def failing_write(path, content):
+    def failing_write(path, content, **kwargs):
         if Path(path).suffix == failed_suffix:
             raise OSError(f"injected {failed_suffix} failure")
-        return original_write(path, content)
+        return original_write(path, content, **kwargs)
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
     monkeypatch.setattr(pipeline.fsio, "atomic_write_text", failing_write)

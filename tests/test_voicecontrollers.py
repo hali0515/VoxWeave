@@ -345,6 +345,28 @@ def test_store_reread_failure_clears_stale_suggestion(tmp_path, monkeypatch):
     assert not (tmp_path / "episode.speakers.json").exists()
 
 
+def test_generation_rechecks_live_media_after_matching_decision(tmp_path, monkeypatch):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    store_path = tmp_path / "voices.json"
+    _write_store(store_path)
+    _fake_clips(monkeypatch)
+    original_matching = speakers._matching_record
+
+    def mutate_after_matching(*args, **kwargs):
+        result = original_matching(*args, **kwargs)
+        media.write_bytes(b"replacement after matching work")
+        return result
+
+    monkeypatch.setattr(speakers, "_matching_record", mutate_after_matching)
+
+    with pytest.raises(RuntimeError, match="media changed"):
+        speakers.create_speaker_audition(media, voices=store_path)
+
+    assert not (tmp_path / "episode.speakers.json").exists()
+    assert not (tmp_path / "episode.speakers.html").exists()
+    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+
+
 def test_same_token_sidecar_content_change_aborts_revalidation(tmp_path, monkeypatch):
     media, _sibling, _sidecar = _write_episode(tmp_path)
     sidecar_path = tmp_path / "episode.voiceprints.json"

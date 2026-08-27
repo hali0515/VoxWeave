@@ -28,6 +28,26 @@ def test_atomic_write_text_leaves_no_temp_residue(tmp_path):
     assert [p.name for p in tmp_path.iterdir()] == ["out.json"]
 
 
+def test_atomic_write_text_can_select_fallback_at_replace_edge(tmp_path):
+    dst = tmp_path / "out.json"
+    dst.write_text("old", encoding="utf-8")
+    checked = []
+
+    def select_fallback():
+        assert dst.read_text(encoding="utf-8") == "old"
+        checked.append(True)
+        return "unbound"
+
+    fsio.atomic_write_text(
+        dst,
+        "bound",
+        before_replace=select_fallback,
+    )
+
+    assert checked == [True]
+    assert dst.read_text(encoding="utf-8") == "unbound"
+
+
 def test_atomic_write_text_new_creates_without_temp_residue(tmp_path):
     dst = tmp_path / "mapping.json"
     fsio.atomic_write_text_new(dst, '{"version": 1}')
