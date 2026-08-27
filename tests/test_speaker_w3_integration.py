@@ -12,12 +12,14 @@ from voxweave.core.boundary_v2 import (
     build_cost_context,
     build_cost_tables,
     optimize_document,
+    selected_evidence_spans,
 )
 from voxweave.core.boundary_lattice import build_document_lattice
 from voxweave.core.finalizer import (
     phase1_from_optimizer_selection,
     register_optimizer_selection,
 )
+from voxweave.core.policy_delta import DELTA_REGISTRY
 from voxweave.core.segdoc import DisplayProfile, SegDocument, SourceUnit
 from voxweave.core.speaker_evidence import (
     SPEAKER_EDGE_RUN_MIN_S,
@@ -25,6 +27,8 @@ from voxweave.core.speaker_evidence import (
     SPEAKER_MULTI_MIN_FRAC,
     SPEAKER_UNIT_COVER_FRAC,
     W_SPEAKER_INTERIOR,
+    EvidenceSpan,
+    measure_speaker_events,
     speaker_evidence,
 )
 from voxweave.core.subunit import refine_document
@@ -147,6 +151,57 @@ def test_candidate_evidence_span_is_cached_and_lyric_suppression_matches_flag():
     )
 
 
+def test_selected_evidence_spans_are_the_common_on_off_h_basis():
+    solution = optimize_document(
+        activation_document(), speaker_weight=W_SPEAKER_INTERIOR
+    )
+    spans = selected_evidence_spans(solution)
+    assert spans
+    assert all(
+        any(span is edge.evidence_span for edge in solution.solutions[0].lattice.edges)
+        for span in spans
+    )
+    boundaries = tuple(float(cue["end"]) for cue in solution.solutions[0].cues[:-1])
+    assert solution.speaker_evidence is not None
+    measured = measure_speaker_events(
+        solution.speaker_evidence,
+        evidence_spans=spans,
+        delivered_boundaries=boundaries,
+        off_boundaries=(),
+    )
+    assert measured.raw_in_speech_turn_changes == 1
+    assert measured.speaker_attributable_expressed_cuts == 1
+
+
+def test_forced_partial_timing_uses_one_input_bound_authority():
+    """The cached candidate and phase-1 materializer must see the same bounds.
+
+    The first punctuation cue has an exact start but no end, so its materialized
+    end becomes 5.0.  That is the second cue's input start.  A document-global
+    scan of finite *ends* incorrectly chose 0.0 and marked the second cue lyric.
+    """
+    doc = SegDocument(
+        language="en",
+        units=[source(0, ".", 5.0, None), source(1, "!", None, 6.0)],
+        profile=replace(profile(), max_cue_s=0.4),
+        vad_speech=None,
+        shot_changes=None,
+        sing_spans=[(0.0, 3.0)],
+        speaker_turns=[],
+        manifest={},
+        text=". !",
+    )
+
+    result = optimize_document(doc, speaker_weight=0.0)
+    interval = result.solutions[0]
+    assert len(interval.cues) == 2
+    second_edge = interval.lattice.edges[1]
+    assert second_edge.evidence_span == EvidenceSpan(5.0, 6.0, "fabricated", "exact")
+    assert second_edge.lyric is False
+    assert (interval.cues[1]["start"], interval.cues[1]["end"]) == (5.0, 6.0)
+    assert "lyric" not in interval.cues[1]
+
+
 def test_partially_untimed_candidate_caches_independent_endpoint_kinds():
     doc = SegDocument(
         language="en",
@@ -240,6 +295,31 @@ def test_cached_lyric_is_inside_the_optimizer_selection_seal():
     assert ledger.events == ()
 
 
+def test_cached_phase1_input_bounds_are_inside_the_selection_seal():
+    result = optimize_document(
+        activation_document(singing=True), speaker_weight=W_SPEAKER_INTERIOR
+    )
+    ledger = AuthorityLedger()
+    authority = register_optimizer_selection(result, ledger=ledger)
+    first = authority.edges[0]
+    assert first.input_start is not None
+    forged = replace(
+        authority,
+        edges=(
+            replace(first, input_start=first.input_start + 0.25),
+            *authority.edges[1:],
+        ),
+    )
+    with pytest.raises(SealBroken):
+        phase1_from_optimizer_selection(
+            forged,
+            ledger=ledger,
+            row_id="delivery_finalizer/v2",
+            evaluation_id="speaker-input-span-seal-negative",
+        )
+    assert ledger.events == ()
+
+
 def test_standalone_artifact_populates_speaker_block_and_w3_coverage():
     on = optimize_document(activation_document(), speaker_weight=W_SPEAKER_INTERIOR)
     off = optimize_document(activation_document(), speaker_weight=0.0)
@@ -268,6 +348,11 @@ def test_standalone_artifact_populates_speaker_block_and_w3_coverage():
     # if they were finalizer output.
     assert block["measurement"] is None
     assert on.artifact["schema_version"] == 1
+    assert on.artifact["delta_registry"] == [
+        record.to_dict() for record in DELTA_REGISTRY
+    ]
+    assert "PD-SPK" in on.artifact["policy_deltas"]
+    assert "delta_registry" not in optimize_document(activation_document()).artifact
 
 
 def test_single_line_profile_does_not_claim_dual_form_coverage():
@@ -316,6 +401,34 @@ def test_supplied_projection_must_describe_the_same_turn_track():
     doc.speaker_turns = [(0.0, 1.0, "A"), (1.25, 2.25, "C")]
     with pytest.raises(ValueError, match="document track"):
         optimize_document(doc, speakers=projected)
+
+
+def test_supplied_projection_is_bound_to_exact_production_parents():
+    parent = SegDocument(
+        language="en",
+        units=[source(0, "alpha bravo", 0.0, 2.0)],
+        profile=profile(max_line_length=5),
+        vad_speech=None,
+        shot_changes=None,
+        sing_spans=None,
+        speaker_turns=[(0.0, 1.0, "A"), (1.0, 2.0, "B")],
+        manifest={},
+        text="alpha bravo",
+    )
+    refined, split = refine_document(parent)
+    stale_parent = replace(
+        parent,
+        units=[source(0, "alpha bravo", 0.0, 0.8)],
+    )
+    stale = speaker_evidence(
+        stale_parent,
+        refined_units=split.units,
+        origin=split.origin,
+    )
+    assert tuple(item.kind for item in stale.unit_speakers) == ("single", "single")
+
+    with pytest.raises(ValueError, match="production parent"):
+        optimize_document(refined, subunit_split=split, speakers=stale)
 
 
 def test_no_turn_refined_documents_keep_existing_w2_callers_valid():

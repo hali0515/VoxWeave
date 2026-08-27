@@ -20,6 +20,7 @@ materialized cues carry ``_chunk_to_cue``'s shapes, and the artifact is byte
 stable across identical runs.
 """
 
+import hashlib
 import json
 import random
 
@@ -485,8 +486,10 @@ def test_artifact_carries_the_declared_schema():
     # assembler stops replacing this complete standalone coverage contract.
     assert SCHEMA_VERSION == 1
     assert art["engine_v2"] == ENGINE_V2
-    assert art["policy_version"] == 2
-    assert art["policy_name"] == "experimental_policy_2"
+    # Omitting both W3 arguments is the frozen pre-W3 solve seam.  Policy 2 is
+    # named only by an explicit speaker/full or counterfactual solve.
+    assert art["policy_version"] == 1
+    assert art["policy_name"] == "experimental_policy_1"
     for key in (
         "totals",
         "intervals",
@@ -548,6 +551,43 @@ def test_the_artifact_is_byte_stable_across_identical_runs():
     first = shadow_artifact(document(timed(["the", "cat", "sat", "down"])))
     second = shadow_artifact(document(timed(["the", "cat", "sat", "down"])))
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+
+
+def test_w3_off_artifact_is_byte_identical_to_pre_w3_base():
+    """Staging law: the no-argument solve is the exact ``a238e48`` artifact.
+
+    The digest was produced from the base commit with this same four-unit
+    fixture and canonical JSON settings.  Pinning the whole serialization (not
+    just the selected partition) catches policy identity and any future staged
+    field leaking into the disabled world.
+    """
+    solution = optimize_document(document(timed(["the", "cat", "sat", "down"])))
+    assert solution.solutions[0].partition_units == ()
+    cue_payload = json.dumps(
+        [cue for interval in solution.solutions for cue in interval.cues],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    assert hashlib.sha256(cue_payload).hexdigest() == (
+        "b3c8b2cf5e06126a3c874dcf848439d88863fd9eb5b60cc990c18ec006ca1af5"
+    )
+    assert solution.lattice is not None
+    for interval in solution.lattice.lattices:
+        for edge in interval.edges:
+            assert edge.evidence_span is None
+            assert edge.input_start is None and edge.input_end is None
+            assert not {"evidence_span", "input_span", "lyric"} & edge.to_dict().keys()
+
+    payload = json.dumps(
+        solution.artifact,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "b3fe11c932e2a12d170ab198e282a8840da783f4f4471bc5a92f321cf1f41969"
+    )
 
 
 def test_an_invalid_profile_aborts_the_measurement_instead_of_degrading():

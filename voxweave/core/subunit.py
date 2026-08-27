@@ -81,13 +81,20 @@ class RefineResult:
     refined_parent_count: int
     minted: int
     evidence: Mapping[str, int]
+    parent_units: tuple[SourceUnit, ...]
+    parent_language: str
     degraded: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         units = tuple(self.units)
         origin = tuple(self.origin)
+        parent_units = tuple(self.parent_units)
         evidence = dict(self.evidence)
         degraded = tuple(self.degraded)
+        if not isinstance(self.parent_language, str) or not self.parent_language:
+            raise RefinementConservationError(
+                "refinement parent language must be non-empty"
+            )
         if (
             isinstance(self.refined_parent_count, bool)
             or not isinstance(self.refined_parent_count, int)
@@ -123,6 +130,10 @@ class RefineResult:
         ):
             raise RefinementConservationError(
                 "origin map and refinement counts claim different parent streams"
+            )
+        if len(parent_units) != actual_parent_count:
+            raise RefinementConservationError(
+                "refinement parent payload cardinality disagrees with origin"
             )
         group_sizes = Counter(origin)
         if self.refined_parent_count != sum(size > 1 for size in group_sizes.values()):
@@ -168,8 +179,19 @@ class RefineResult:
 
         object.__setattr__(self, "units", units)
         object.__setattr__(self, "origin", origin)
+        object.__setattr__(self, "parent_units", parent_units)
         object.__setattr__(self, "evidence", MappingProxyType(evidence))
         object.__setattr__(self, "degraded", degraded)
+
+        # The payload is the immutable authority W3 later compares with its
+        # parent-projected speaker evidence.  Validate that it really is the
+        # source stream claimed by the origin map before accepting the result.
+        assert_refinement_conserved(
+            parent_units,
+            units,
+            origin,
+            lang=self.parent_language,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Return the staged ``subunit_split`` block in stable key order."""
@@ -188,7 +210,9 @@ class _Piece:
     evidence: str
 
 
-def empty_refine_result(units: Sequence[SourceUnit] = ()) -> RefineResult:
+def empty_refine_result(
+    units: Sequence[SourceUnit] = (), *, language: str = "und"
+) -> RefineResult:
     """Identity metadata for a row on which no refiner result was supplied."""
     return RefineResult(
         units=tuple(units),
@@ -196,6 +220,8 @@ def empty_refine_result(units: Sequence[SourceUnit] = ()) -> RefineResult:
         refined_parent_count=0,
         minted=0,
         evidence={kind: 0 for kind in EVIDENCE_KINDS},
+        parent_units=tuple(units),
+        parent_language=language,
         degraded=(),
     )
 
@@ -215,12 +241,17 @@ def _remint(
     )
 
 
-def _identity(units: Sequence[SourceUnit]) -> RefineResult:
+def _identity(units: Sequence[SourceUnit], *, lang: str) -> RefineResult:
     reminted = tuple(_remint(item, index=index) for index, item in enumerate(units))
-    result = empty_refine_result(reminted)
-    # ``empty_refine_result``'s identity refers to its own stream, which is the
-    # same positional parent space in this no-op case.
-    return result
+    return RefineResult(
+        units=reminted,
+        origin=tuple(range(len(reminted))),
+        refined_parent_count=0,
+        minted=0,
+        evidence={kind: 0 for kind in EVIDENCE_KINDS},
+        parent_units=tuple(units),
+        parent_language=lang,
+    )
 
 
 def _timed_span(unit: SourceUnit) -> float | None:
@@ -526,7 +557,7 @@ def refine_units(
     """
     source = tuple(units)
     if preflight_profile(profile):
-        return _identity(source)
+        return _identity(source, lang=lang)
     invalid_units = {violation.unit_index for violation in preflight_units(source)}
 
     output: list[SourceUnit] = []
@@ -576,6 +607,8 @@ def refine_units(
         refined_parent_count=refined_parents,
         minted=minted,
         evidence=evidence,
+        parent_units=source,
+        parent_language=lang,
         degraded=tuple(sorted(degraded)),
     )
     assert_refinement_conserved(source, result.units, result.origin, lang=lang)

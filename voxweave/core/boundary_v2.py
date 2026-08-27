@@ -81,6 +81,7 @@ from .partition_check import (
     check_partition,
     owned_unit_ids,
 )
+from .policy_delta import delta_registry_data
 from .schema import Cue, Unit
 from .segdoc import DisplayProfile, SegDocument, SourceUnit
 from .subunit import RefineResult, empty_refine_result, speech_span_units
@@ -121,6 +122,7 @@ __all__ = [
     "optimize_interval",
     "score_path",
     "score_v1_global",
+    "selected_evidence_spans",
     "shadow_artifact",
     "solve_interval",
 ]
@@ -146,6 +148,10 @@ POLICY_DELTAS: tuple[str, ...] = (
     "missing-pause-evidence-1.5",
     "v2-untimed-chunk-fallback",
 )
+
+LEGACY_POLICY_NAME: str = "experimental_policy_1"
+LEGACY_POLICY_VERSION: int = 1
+SPEAKER_POLICY_DELTAS: tuple[str, ...] = (*POLICY_DELTAS, "PD-SPK")
 
 
 # ---------------------------------------------------------------- cost tables
@@ -631,8 +637,14 @@ def materialize_cues(
         # Derived sub-unit spans remain the display/cap time authority even when
         # provenance correctly withholds an acoustic anchor.  Conflating these
         # channels would collapse every all-refined cue to zero duration.
-        start = previous_end if display_start is None else float(display_start)
-        end = start if display_end is None else float(display_end)
+        if (edge.input_start is None) != (edge.input_end is None):
+            raise ValueError("candidate input-bound cache is only partially populated")
+        if edge.input_start is not None and edge.input_end is not None:
+            start = float(edge.input_start)
+            end = float(edge.input_end)
+        else:
+            start = previous_end if display_start is None else float(display_start)
+            end = start if display_end is None else float(display_end)
         word_data: list[Unit] = [
             {"text": atom.text, "start": atom.start, "end": atom.end} for atom in chunk
         ]
@@ -1132,6 +1144,29 @@ class DocumentSolution:
     speaker_evidence: UnitSpeakers | None = None
 
 
+def selected_evidence_spans(solution: DocumentSolution) -> tuple[EvidenceSpan, ...]:
+    """Return the selected row's cached H/lyric evidence basis in cue order.
+
+    Optimized intervals carry the exact objects priced by the solver. A typed
+    v1 adoption has no candidate edge, so its retained cue is converted through
+    the same v1 EvidenceSpan constructor frozen by section 6.4.
+    """
+    spans: list[EvidenceSpan] = []
+    for interval in solution.solutions:
+        if interval.selection is not None:
+            for edge in _path_edges(
+                interval.lattice, interval.selection.policy_selected.cuts
+            ):
+                if not isinstance(edge.evidence_span, EvidenceSpan):
+                    raise ValueError(
+                        "selected row does not carry cached EvidenceSpan authority"
+                    )
+                spans.append(edge.evidence_span)
+        elif interval.adopted is not None:
+            spans.extend(evidence_span_from_cue(cue) for cue in interval.adopted.cues)
+    return tuple(spans)
+
+
 def _profile_dict(profile: DisplayProfile) -> dict[str, Any]:
     return {
         "clause_ms": profile.clause_ms,
@@ -1149,7 +1184,9 @@ def _profile_dict(profile: DisplayProfile) -> dict[str, Any]:
     }
 
 
-def _invalid_artifact(violations: Sequence[ProfileViolation]) -> dict[str, Any]:
+def _invalid_artifact(
+    violations: Sequence[ProfileViolation], *, speaker_enabled: bool
+) -> dict[str, Any]:
     """An invalid measurement, stated as one -- never a degraded measurement.
 
     The block is deliberately minimal: a reader that finds ``invalid_profile``
@@ -1160,7 +1197,7 @@ def _invalid_artifact(violations: Sequence[ProfileViolation]) -> dict[str, Any]:
         "engine_v2": ENGINE_V2,
         "invalid_profile": [violation.to_dict() for violation in violations],
         "kind": "segmentation-shadow",
-        "policy_version": POLICY_VERSION,
+        "policy_version": POLICY_VERSION if speaker_enabled else LEGACY_POLICY_VERSION,
         "schema_version": SCHEMA_VERSION,
     }
 
@@ -1297,6 +1334,14 @@ def _resolve_speaker_evidence(
             raise ValueError(
                 "parent-projected speaker evidence does not use this origin tuple"
             )
+        if (
+            supplied.parent_units != split.parent_units
+            or supplied.language != split.parent_language
+        ):
+            raise ValueError(
+                "parent-projected speaker evidence disagrees with the production "
+                "parent payload"
+            )
         if not supplied.matches_document_track(document):
             raise ValueError(
                 "parent-projected speaker evidence disagrees with the document track"
@@ -1309,19 +1354,9 @@ def _resolve_speaker_evidence(
             "a refined speaker track requires explicit parent-projected speaker evidence"
         )
 
-    parent_count = 0 if not split.origin else split.origin[-1] + 1
     parent_document = SegDocument(
-        language=document.language,
-        units=[
-            SourceUnit(
-                id=f"u{index}",
-                surface="",
-                start=None,
-                end=None,
-                provenance="aligner",
-            )
-            for index in range(parent_count)
-        ],
+        language=split.parent_language,
+        units=list(split.parent_units),
         profile=document.profile,
         vad_speech=None,
         shot_changes=None,
@@ -1382,7 +1417,7 @@ def _artifact(
             named_multi = named_multi_cues_unannotated(
                 cue_ranges, speakers.unit_speakers
             )
-    return {
+    artifact: dict[str, Any] = {
         "coverage": {
             "coarse_caused_intervals": coarse_caused_intervals,
             "dual_form_unmeasured": speakers is not None
@@ -1405,9 +1440,13 @@ def _artifact(
             state: list(values)
             for state, values in sorted(pause_knees(document.profile).items())
         },
-        "policy_deltas": list(POLICY_DELTAS),
-        "policy_name": POLICY_NAME,
-        "policy_version": POLICY_VERSION,
+        "policy_deltas": list(
+            SPEAKER_POLICY_DELTAS if speakers is not None else POLICY_DELTAS
+        ),
+        "policy_name": POLICY_NAME if speakers is not None else LEGACY_POLICY_NAME,
+        "policy_version": (
+            POLICY_VERSION if speakers is not None else LEGACY_POLICY_VERSION
+        ),
         "production_degraded": [],
         "profile": _profile_dict(document.profile),
         # AD3-5: filled by the hook's caller once the outer capture has closed.
@@ -1478,6 +1517,9 @@ def _artifact(
             "raw": document_check.to_dict(),
         },
     }
+    if speakers is not None:
+        artifact["delta_registry"] = delta_registry_data()
+    return artifact
 
 
 def optimize_document(
@@ -1504,12 +1546,13 @@ def optimize_document(
             raise ValueError(
                 "a derived sub-unit stream requires its audited subunit_split result"
             )
-        split = empty_refine_result(document.units)
+        split = empty_refine_result(document.units, language=document.language)
     else:
         split = subunit_split
     if tuple(document.units) != split.units or len(split.origin) != len(document.units):
         raise ValueError("subunit_split does not describe this document's unit stream")
 
+    speaker_enabled = speakers is not None or speaker_weight is not None
     invalid = preflight_profile(document.profile)
     if invalid:
         return DocumentSolution(
@@ -1520,10 +1563,9 @@ def optimize_document(
             v1_reference=None,
             invalid_profile=invalid,
             subunit_split=split,
-            artifact=_invalid_artifact(invalid),
+            artifact=_invalid_artifact(invalid, speaker_enabled=speaker_enabled),
         )
 
-    speaker_enabled = speakers is not None or speaker_weight is not None
     resolved_weight = W_SPEAKER_INTERIOR if speaker_weight is None else speaker_weight
     resolved_speakers = (
         _resolve_speaker_evidence(document, split, speakers)

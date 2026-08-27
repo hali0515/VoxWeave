@@ -1132,6 +1132,8 @@ class Edge:
     # it through one local import after hard admission has finished.
     evidence_span: Any | None = None
     lyric: bool = False
+    input_start: float | None = None
+    input_end: float | None = None
 
     @property
     def vis_width(self) -> int:
@@ -1144,19 +1146,24 @@ class Edge:
         return float(abs(self.line_widths[0] - self.line_widths[1]))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "display_text": self.display_text,
             "end_node": self.end_node,
-            "evidence_span": None
-            if self.evidence_span is None
-            else self.evidence_span.to_dict(),
             "line_widths": list(self.line_widths),
             "lines": self.lines,
-            "lyric": self.lyric,
             "span": [self.span_start, self.span_end],
             "start_node": self.start_node,
             "waiver": None if self.waiver is None else self.waiver.to_dict(),
         }
+        if self.evidence_span is not None:
+            result.update(
+                {
+                    "evidence_span": self.evidence_span.to_dict(),
+                    "input_span": [self.input_start, self.input_end],
+                    "lyric": self.lyric,
+                }
+            )
+        return result
 
 
 @dataclass(frozen=True)
@@ -2089,31 +2096,39 @@ def _cache_candidate_evidence(
 
     The edge set is already closed when this runs.  Thus singing evidence can
     neither admit nor reject a candidate; it only supplies the stable cache the
-    cost and selected materializer share.  Missing display endpoints use the
-    same deterministic prior-end chain as materialization: the latest finite
-    source end before the candidate, or zero at the document front.  This keeps
-    fully and partially untimed candidates typed without inventing an acoustic
-    anchor.
+    cost and selected materializer share. Missing endpoints use a source-prefix
+    phase-1 cursor: a finite start wins, a missing start inherits the cursor,
+    and a missing end equals that resolved start. The resolved input pair is
+    cached on the edge and consumed by materialization too, so partially timed
+    candidates cannot acquire a second fallback authority after selection.
     """
     from .speaker_evidence import lyric_for_evidence, make_evidence_span
 
-    prior_end: list[float] = [0.0]
-    latest = 0.0
+    prefix_cursor: list[float] = [0.0]
+    cursor = 0.0
     for unit in document.units:
-        if (
-            unit.end is not None
+        unit_start = (
+            float(unit.start)
+            if unit.start is not None
+            and not isinstance(unit.start, bool)
+            and math.isfinite(unit.start)
+            else cursor
+        )
+        cursor = (
+            float(unit.end)
+            if unit.end is not None
             and not isinstance(unit.end, bool)
             and math.isfinite(unit.end)
-        ):
-            latest = float(unit.end)
-        prior_end.append(latest)
+            else unit_start
+        )
+        prefix_cursor.append(cursor)
 
     decorated: list[Edge] = []
     for edge in lattice.edges:
         low = lattice.unit_bound(edge.start_node)
         high = lattice.unit_bound(edge.end_node)
         if low < high:
-            fallback = prior_end[low]
+            fallback = prefix_cursor[low]
             input_start = (
                 float(edge.span_start)
                 if edge.span_start is not None and math.isfinite(edge.span_start)
@@ -2135,6 +2150,8 @@ def _cache_candidate_evidence(
                     edge,
                     evidence_span=span,
                     lyric=lyric_for_evidence(span, document.sing_spans),
+                    input_start=input_start,
+                    input_end=input_end,
                 )
             )
         else:

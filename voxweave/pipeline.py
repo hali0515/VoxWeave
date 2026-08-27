@@ -31,6 +31,7 @@ from voxweave.core.segdoc import (
     DisplayProfile,
     SegDocument,
     build_seg_document,
+    normalize_speaker_turn_bounds,
 )
 from voxweave.debug import DebugSink, FileDebugSink
 from voxweave.lang import (
@@ -887,7 +888,9 @@ def _turns_in(raw: Any) -> list[tuple[float, float, str]] | None:
     """Parse persisted ``speaker_turns`` (``[[start, end, label], ...]``).
 
     Malformed entries (wrong arity, non-numeric bounds) are skipped with a warning.
-    None if absent/empty or nothing survives.
+    Point turns survive; reversed turns collapse at their declared start through
+    the shared typed normalization used by speaker evidence. None if
+    absent/empty or nothing survives.
     """
     if not raw:
         return None
@@ -895,7 +898,8 @@ def _turns_in(raw: Any) -> list[tuple[float, float, str]] | None:
     for entry in raw:
         try:
             s, e, lb = entry
-            out.append((float(s), float(e), str(lb)))
+            start, end = normalize_speaker_turn_bounds(float(s), float(e))
+            out.append((start, end, str(lb)))
         except (TypeError, ValueError):
             log.warning("skipping malformed speaker_turns entry: %r", entry)
     return out or None

@@ -1103,6 +1103,8 @@ def test_refinement_metadata_is_immutable_and_rejects_forged_accounting() -> Non
             refined_parent_count=split.refined_parent_count,
             minted=split.minted,
             evidence=forged,
+            parent_units=split.parent_units,
+            parent_language=split.parent_language,
             degraded=split.degraded,
         )
 
@@ -1116,5 +1118,7 @@ def test_refinement_metadata_is_immutable_and_rejects_forged_accounting() -> Non
             refined_parent_count=split.refined_parent_count,
             minted=split.minted,
             evidence=rebalanced,
+            parent_units=split.parent_units,
+            parent_language=split.parent_language,
             degraded=split.degraded,
         )

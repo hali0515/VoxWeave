@@ -21,7 +21,7 @@ from typing import Any, Literal, cast
 from .boundary_cost import CostBreakdown, make_breakdown, transition_time
 from .layout import _join, _no_spaces
 from .schema import Cue
-from .segdoc import SegDocument, SourceUnit
+from .segdoc import SegDocument, SourceUnit, normalize_speaker_turn_bounds
 
 __all__ = [
     "BUCKET_KINDS",
@@ -367,9 +367,9 @@ class UnitSpeakers:
     edge_silence_s: float
     stats: SpeakerConditioningStats
     raw_events: tuple[RawSpeakerEvent, ...]
-    in_speech_event_ids: tuple[str, ...]
-    base_event_buckets: tuple[tuple[str, BucketKind], ...]
-    live_events: tuple[LiveSpeakerEvent, ...]
+    filled_labels: tuple[str | None, ...]
+    absorbed_labels: tuple[str | None, ...]
+    snapped_labels: tuple[str | None, ...]
 
     @property
     def labels(self) -> tuple[str | None, ...]:
@@ -422,9 +422,7 @@ def _checked_turns(turns: Sequence[Turn]) -> tuple[Turn, ...]:
             raise SpeakerEvidenceError("speaker turn must have three fields") from exc
         if not _finite(raw_start) or not _finite(raw_end):
             raise SpeakerEvidenceError("speaker turn bounds must be finite")
-        start, end = float(raw_start), float(raw_end)
-        if end <= start:
-            raise SpeakerEvidenceError("speaker turn duration must be positive")
+        start, end = normalize_speaker_turn_bounds(float(raw_start), float(raw_end))
         if not isinstance(raw_label, str) or not raw_label:
             raise SpeakerEvidenceError("speaker turn label must be non-empty")
         label = raw_label
@@ -738,15 +736,13 @@ def _raw_events(turns: Sequence[Turn]) -> tuple[RawSpeakerEvent, ...]:
     return tuple(out)
 
 
-def _event_in_speech(event: RawSpeakerEvent, units: Sequence[SourceUnit]) -> bool:
+def _event_in_speech(
+    event: RawSpeakerEvent, evidence_spans: Sequence[EvidenceSpan]
+) -> bool:
+    """Apply H's one EvidenceSpan-based denominator predicate."""
     return any(
-        _finite(unit.start)
-        and _finite(unit.end)
-        and float(cast("float", unit.start))
-        <= event.time
-        <= float(cast("float", unit.end))
-        and float(cast("float", unit.end)) > float(cast("float", unit.start))
-        for unit in units
+        span.end > span.start and span.start <= event.time <= span.end
+        for span in evidence_spans
     )
 
 
@@ -915,7 +911,6 @@ def _advance_lineage(
 
 
 def _lineage(
-    raw_events: Sequence[RawSpeakerEvent],
     in_speech_events: Sequence[RawSpeakerEvent],
     parents: Sequence[ParentSpeaker],
     parent_units: Sequence[SourceUnit],
@@ -927,9 +922,29 @@ def _lineage(
     tuple[LiveSpeakerEvent, ...],
     int,
 ]:
+    # Precedence is applied before the first injective reservation.  A terminal
+    # event cannot consume the only attribution transition that an eligible
+    # event needs, and an out-of-H event never enters this function at all.
+    terminal: dict[str, BucketKind] = {}
+    eligible: list[RawSpeakerEvent] = []
+    unexpressible_count = 0
+    for event in in_speech_events:
+        if _structurally_unexpressible(event, parent_units):
+            terminal[event.event_id] = "unexpressible"
+            unexpressible_count += 1
+            continue
+        boundary = _nearest_parent_boundary(event, parent_units)
+        if boundary is not None:
+            left = filled_labels[boundary - 1]
+            right = filled_labels[boundary]
+            if left is None or right is None:
+                terminal[event.event_id] = "unattributed_loss"
+                continue
+        eligible.append(event)
+
     attribution_labels = _raw_labels(parents)
     initial, attached = _initial_ancestry(
-        raw_events, _transitions(attribution_labels, parent_units)
+        eligible, _transitions(attribution_labels, parent_units)
     )
     removed: set[str] = set()
     current = initial
@@ -947,19 +962,10 @@ def _lineage(
 
     buckets: list[tuple[str, BucketKind]] = []
     live: list[LiveSpeakerEvent] = []
-    unexpressible_count = 0
     for event in in_speech_events:
-        if _structurally_unexpressible(event, parent_units):
-            buckets.append((event.event_id, "unexpressible"))
-            unexpressible_count += 1
+        if event.event_id in terminal:
+            buckets.append((event.event_id, terminal[event.event_id]))
             continue
-        boundary = _nearest_parent_boundary(event, parent_units)
-        if boundary is not None:
-            left = filled_labels[boundary - 1]
-            right = filled_labels[boundary]
-            if left is None or right is None:
-                buckets.append((event.event_id, "unattributed_loss"))
-                continue
         # R8-3: this is deliberately a named, literal terminal branch.  It is
         # not an ``else`` that happens to catch an initially unmatched event.
         initially_unmatched = event.event_id not in attached
@@ -1028,15 +1034,11 @@ def speaker_evidence(
     projected = _project_units(conditioned, owners)
 
     raw = _raw_events(turns)
-    in_speech = tuple(event for event in raw if _event_in_speech(event, parent_units))
-    base_buckets, live, unexpressible_count = _lineage(
-        raw,
-        in_speech,
-        parents,
-        parent_units,
-        filled,
-        absorbed,
-        snapped,
+    # The selected EvidenceSpan set does not exist until a row has selected its
+    # candidates.  H denominator membership and injective lineage are therefore
+    # deliberately deferred to ``measure_speaker_events``.
+    unexpressible_count = sum(
+        _structurally_unexpressible(event, parent_units) for event in raw
     )
     stats = SpeakerConditioningStats(
         units_attributed=sum(item.kind == "single" for item in parents),
@@ -1062,9 +1064,9 @@ def speaker_evidence(
         edge_silence_s=edge_silence_s,
         stats=stats,
         raw_events=raw,
-        in_speech_event_ids=tuple(event.event_id for event in in_speech),
-        base_event_buckets=base_buckets,
-        live_events=live,
+        filled_labels=tuple(filled),
+        absorbed_labels=tuple(absorbed),
+        snapped_labels=tuple(snapped),
     )
 
 
@@ -1323,19 +1325,33 @@ def _boundary_points(values: Sequence[float]) -> tuple[BoundaryPoint, ...]:
 def measure_speaker_events(
     evidence: UnitSpeakers,
     *,
+    evidence_spans: Sequence[EvidenceSpan],
     delivered_boundaries: Sequence[float],
     off_boundaries: Sequence[float] | None = None,
 ) -> SpeakerMeasurement:
-    """Classify every raw in-speech event into exactly one conserved bucket."""
-    base = dict(evidence.base_event_buckets)
-    matches = injective_time_match(
-        evidence.live_events, _boundary_points(delivered_boundaries)
+    """Classify H events using one selected EvidenceSpan basis for both rows."""
+    spans = tuple(evidence_spans)
+    if any(not isinstance(span, EvidenceSpan) for span in spans):
+        raise SpeakerEvidenceError("H evidence spans must be typed EvidenceSpan values")
+    in_speech = tuple(
+        event for event in evidence.raw_events if _event_in_speech(event, spans)
     )
+    base_buckets, live_events, _unexpressible = _lineage(
+        in_speech,
+        evidence.parent_speakers,
+        evidence.parent_units,
+        evidence.filled_labels,
+        evidence.absorbed_labels,
+        evidence.snapped_labels,
+    )
+    base = dict(base_buckets)
+    matches = injective_time_match(live_events, _boundary_points(delivered_boundaries))
     expressed_ids = {match.event_id for match in matches}
     event_buckets: dict[str, str] = {}
     counts = {kind: 0 for kind in BUCKET_KINDS}
     raw_by_id = {event.event_id: event for event in evidence.raw_events}
-    for event_id in evidence.in_speech_event_ids:
+    for event in in_speech:
+        event_id = event.event_id
         bucket: str
         if event_id in base:
             bucket = base[event_id]
@@ -1349,7 +1365,7 @@ def measure_speaker_events(
     attributable = 0
     if off_boundaries is not None:
         off_matches = injective_time_match(
-            evidence.live_events, _boundary_points(off_boundaries)
+            live_events, _boundary_points(off_boundaries)
         )
         off_ids = {match.event_id for match in off_matches}
         attributable = sum(
@@ -1357,7 +1373,7 @@ def measure_speaker_events(
             for event_id in expressed_ids
             if event_id in raw_by_id
         )
-    raw_count = len(evidence.in_speech_event_ids)
+    raw_count = len(in_speech)
     if sum(counts.values()) != raw_count:
         raise SpeakerEvidenceError("speaker bucket conservation failed")
     return SpeakerMeasurement(

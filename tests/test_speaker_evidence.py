@@ -8,6 +8,7 @@ is display timing and must never become speaker evidence.
 from __future__ import annotations
 
 import copy
+import random
 
 import pytest
 
@@ -103,6 +104,18 @@ def cue(text: str = "x") -> Cue:
         "speech_start": 0.0,
         "speech_end": 1.0,
     }
+
+
+def measure_full_speech(evidence, **kwargs):
+    """Measure against one selected EvidenceSpan covering the parent envelope."""
+    starts = [item.start for item in evidence.parent_units if item.start is not None]
+    ends = [item.end for item in evidence.parent_units if item.end is not None]
+    assert starts and ends
+    return measure_speaker_events(
+        evidence,
+        evidence_spans=(EvidenceSpan(min(starts), max(ends), "exact", "exact"),),
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------- constants
@@ -584,7 +597,7 @@ def test_injective_match_rejects_duplicate_endpoint_identities():
 def test_expression_matching_and_miss_bucket_conserve_raw_denominator():
     units = [unit(0, "a", 0.0, 1.0), unit(1, "b", 1.0, 2.0)]
     evidence = speaker_evidence(document(units, [(0.0, 1.0, "A"), (1.0, 2.0, "B")]))
-    expressed = measure_speaker_events(evidence, delivered_boundaries=(0.75, 1.25))
+    expressed = measure_full_speech(evidence, delivered_boundaries=(0.75, 1.25))
     assert expressed.buckets == {
         "expressed": 1,
         "policy_filtered": 0,
@@ -594,7 +607,7 @@ def test_expression_matching_and_miss_bucket_conserve_raw_denominator():
     }
     assert expressed.matches[0].boundary_time == 0.75
 
-    missed = measure_speaker_events(evidence, delivered_boundaries=())
+    missed = measure_full_speech(evidence, delivered_boundaries=())
     assert missed.buckets["survived_expressible_but_missed"] == 1
     assert sum(missed.buckets.values()) == missed.raw_in_speech_turn_changes == 1
 
@@ -610,7 +623,7 @@ def test_a_a_b_c_c_phrase_collision_preserves_b_to_c_ancestry(monkeypatch):
     units = [unit(i, text, float(i), float(i + 1)) for i, text in enumerate("aabcc")]
     turns = [(0.0, 2.0, "A"), (2.0, 3.0, "B"), (3.0, 5.0, "C")]
     evidence = speaker_evidence(document(units, turns, language="ja"))
-    measurement = measure_speaker_events(evidence, delivered_boundaries=(3.0,))
+    measurement = measure_full_speech(evidence, delivered_boundaries=(3.0,))
     assert evidence.labels == ("A", "A", "A", "C", "C")
     assert measurement.event_buckets == {"e0": "policy_filtered", "e1": "expressed"}
 
@@ -626,7 +639,7 @@ def test_unmatched_initial_event_takes_literal_policy_filtered_branch():
     ]
     turns = [(0.0, 0.6, "A"), (1.0, 1.1, "B")]
     evidence = speaker_evidence(document(units, turns))
-    measurement = measure_speaker_events(evidence, delivered_boundaries=(1.0,))
+    measurement = measure_full_speech(evidence, delivered_boundaries=(1.0,))
     assert evidence.labels == ("A", "A", "A")
     assert measurement.event_buckets == {"e0": "policy_filtered"}
 
@@ -639,7 +652,7 @@ def test_unattributed_loss_precedes_the_unmatched_initial_branch():
     ]
     turns = [(0.9, 1.0, "A"), (1.0, 1.1, "B")]
     evidence = speaker_evidence(document(units, turns))
-    measurement = measure_speaker_events(evidence, delivered_boundaries=(1.0,))
+    measurement = measure_full_speech(evidence, delivered_boundaries=(1.0,))
     assert evidence.labels == (None, None, None)
     assert measurement.event_buckets == {"e0": "unattributed_loss"}
 
@@ -652,7 +665,7 @@ def test_absorb_fixpoint_is_one_lineage_step_and_filters_both_a_b_a_events():
     ]
     turns = [(0.0, 0.4, "A"), (0.4, 0.5, "B"), (0.5, 0.9, "A")]
     evidence = speaker_evidence(document(units, turns))
-    measurement = measure_speaker_events(evidence, delivered_boundaries=(0.4, 0.5))
+    measurement = measure_full_speech(evidence, delivered_boundaries=(0.4, 0.5))
     assert measurement.event_buckets == {
         "e0": "policy_filtered",
         "e1": "policy_filtered",
@@ -663,7 +676,7 @@ def test_160ms_edge_event_survives_lineage_and_can_be_expressed():
     units = [unit(0, "a", 0.0, 0.5), unit(1, "b", 0.5, 0.66)]
     turns = [(0.0, 0.5, "A"), (0.5, 0.66, "B")]
     evidence = speaker_evidence(document(units, turns))
-    measurement = measure_speaker_events(evidence, delivered_boundaries=(0.5,))
+    measurement = measure_full_speech(evidence, delivered_boundaries=(0.5,))
     assert evidence.labels == ("A", "B")
     assert measurement.event_buckets == {"e0": "expressed"}
 
@@ -678,7 +691,7 @@ def test_coarse_parent_event_stays_unexpressible_after_refinement():
     evidence = speaker_evidence(
         document(parents, turns), refined_units=refined, origin=(0, 0)
     )
-    measurement = measure_speaker_events(evidence, delivered_boundaries=(1.0,))
+    measurement = measure_full_speech(evidence, delivered_boundaries=(1.0,))
     assert measurement.event_buckets == {"e0": "unexpressible"}
     assert measurement.buckets["unexpressible"] == 1
 
@@ -686,20 +699,214 @@ def test_coarse_parent_event_stays_unexpressible_after_refinement():
 def test_speaker_attributable_count_uses_off_rows_own_global_match():
     units = [unit(0, "a", 0.0, 1.0), unit(1, "b", 1.0, 2.0)]
     evidence = speaker_evidence(document(units, [(0.0, 1.0, "A"), (1.0, 2.0, "B")]))
-    attributable = measure_speaker_events(
+    attributable = measure_full_speech(
         evidence, delivered_boundaries=(1.0,), off_boundaries=()
     )
-    shared = measure_speaker_events(
+    shared = measure_full_speech(
         evidence, delivered_boundaries=(1.0,), off_boundaries=(1.4,)
     )
     assert attributable.speaker_attributable_expressed_cuts == 1
     assert shared.speaker_attributable_expressed_cuts == 0
 
 
-def test_hostile_turns_fail_closed_inside_the_shadow_module():
+def test_unexpressible_event_cannot_reserve_an_eligible_lineage_transition():
+    units = [unit(0, "a", 0.0, 1.0), unit(1, "c", 1.4, 2.4)]
+    turns = [
+        (0.0, 1.0, "A"),
+        (1.0, 1.41, "B"),
+        (1.41, 2.4, "C"),
+    ]
+    evidence = speaker_evidence(document(units, turns))
+    measurement = measure_speaker_events(
+        evidence,
+        evidence_spans=(EvidenceSpan(0.0, 2.4, "exact", "exact"),),
+        delivered_boundaries=(1.4,),
+    )
+    assert measurement.event_buckets == {
+        "e0": "expressed",
+        "e1": "unexpressible",
+    }
+
+
+def test_out_of_speech_gap_event_cannot_reserve_an_eligible_transition():
+    units = [unit(0, "a", 0.0, 1.0), unit(1, "c", 1.4, 2.4)]
+    turns = [
+        (0.0, 1.0, "A"),
+        (1.0, 1.39, "B"),
+        (1.39, 2.4, "C"),
+    ]
+    evidence = speaker_evidence(document(units, turns))
+    measurement = measure_speaker_events(
+        evidence,
+        evidence_spans=(
+            EvidenceSpan(0.0, 1.0, "exact", "exact"),
+            EvidenceSpan(1.4, 2.4, "exact", "exact"),
+        ),
+        delivered_boundaries=(1.4,),
+    )
+    assert measurement.raw_in_speech_turn_changes == 1
+    assert measurement.event_buckets == {"e0": "expressed"}
+
+
+def test_h_denominator_uses_selected_evidence_span_envelope_not_parent_union():
+    units = [unit(0, "a", 0.0, 1.0), unit(1, "b", 2.0, 3.0)]
+    evidence = speaker_evidence(document(units, [(0.0, 1.5, "A"), (1.5, 3.0, "B")]))
+    separated = measure_speaker_events(
+        evidence,
+        evidence_spans=(
+            EvidenceSpan(0.0, 1.0, "exact", "exact"),
+            EvidenceSpan(2.0, 3.0, "exact", "exact"),
+        ),
+        delivered_boundaries=(2.0,),
+    )
+    envelope = measure_speaker_events(
+        evidence,
+        evidence_spans=(EvidenceSpan(0.0, 3.0, "exact", "exact"),),
+        delivered_boundaries=(2.0,),
+    )
+    assert separated.raw_in_speech_turn_changes == 0
+    assert envelope.raw_in_speech_turn_changes == 1
+    assert envelope.event_buckets == {"e0": "expressed"}
+
+
+def test_h_denominator_respects_fabricated_prefix_and_suffix_bounds():
+    parents = [unit(0, "a", 0.0, 1.0), unit(1, "b", 1.0, 2.0)]
+    evidence = speaker_evidence(document(parents, [(0.0, 1.0, "A"), (1.0, 2.0, "B")]))
+    derived_prefix = (
+        unit(0, "a", 0.0, 0.5, provenance="subunit-per-char"),
+        unit(1, "b", 1.0, 2.0),
+    )
+    derived_suffix = (
+        unit(0, "a", 0.0, 1.0),
+        unit(1, "b", 1.5, 2.0, provenance="subunit-per-char"),
+    )
+    prefix_span = make_evidence_span(
+        derived_prefix, (0, 2), input_start=1.1, input_end=2.0
+    )
+    suffix_span = make_evidence_span(
+        derived_suffix, (0, 2), input_start=0.0, input_end=0.9
+    )
+    assert prefix_span == EvidenceSpan(1.1, 2.0, "fabricated", "exact")
+    assert suffix_span == EvidenceSpan(0.0, 0.9, "exact", "fabricated")
+    for span in (prefix_span, suffix_span):
+        measured = measure_speaker_events(
+            evidence,
+            evidence_spans=(span,),
+            delivered_boundaries=(1.0,),
+        )
+        assert measured.raw_in_speech_turn_changes == 0
+        assert measured.event_buckets == {}
+
+
+def test_zero_duration_turns_mint_coincident_events_and_conserve_all_buckets():
+    units = [unit(0, "a", 0.0, 1.0), unit(1, "c", 1.0, 2.0)]
+    evidence = speaker_evidence(
+        document(
+            units,
+            [(0.0, 1.0, "A"), (1.0, 1.0, "B"), (1.0, 2.0, "C")],
+        )
+    )
+    measured = measure_speaker_events(
+        evidence,
+        evidence_spans=(EvidenceSpan(0.0, 2.0, "exact", "exact"),),
+        delivered_boundaries=(1.0,),
+    )
+    assert [(event.event_id, event.time) for event in evidence.raw_events] == [
+        ("e0", 1.0),
+        ("e1", 1.0),
+    ]
+    assert measured.event_buckets == {
+        "e0": "expressed",
+        "e1": "policy_filtered",
+    }
+    assert measured.buckets == {
+        "expressed": 1,
+        "policy_filtered": 1,
+        "survived_expressible_but_missed": 0,
+        "unattributed_loss": 0,
+        "unexpressible": 0,
+    }
+    assert sum(measured.buckets.values()) == measured.raw_in_speech_turn_changes == 2
+
+
+def test_seeded_speaker_measurement_conservation_sweep():
+    """500 reproducible generated streams; seed/domain/oracle live in the suite."""
+    rng = random.Random("p5-w3-measurement-conservation-v1")
+    labels = ("A", "B", "C")
+    for case in range(500):
+        count = rng.randint(2, 9)
+        clock = 0.0
+        units: list[SourceUnit] = []
+        turns: list[tuple[float, float, str]] = []
+        for index in range(count):
+            duration = rng.choice((0.1, 0.16, 0.25, 0.4, 0.75))
+            start = round(clock, 6)
+            end = round(start + duration, 6)
+            units.append(unit(index, chr(97 + index), start, end))
+            turns.append((start, end, rng.choice(labels)))
+            clock = end + rng.choice((0.0, 0.05, 0.2))
+        evidence = speaker_evidence(document(units, turns))
+        delivered = tuple(
+            event.time + rng.choice((-0.5, -0.1, 0.0, 0.1, 0.5, 0.75))
+            for event in evidence.raw_events
+            if rng.random() < 0.7
+        )
+        measured = measure_speaker_events(
+            evidence,
+            evidence_spans=(
+                EvidenceSpan(
+                    float(units[0].start),
+                    float(units[-1].end),
+                    "exact",
+                    "exact",
+                ),
+            ),
+            delivered_boundaries=delivered,
+        )
+        assert set(measured.event_buckets) <= {
+            event.event_id for event in evidence.raw_events
+        }, case
+        assert set(measured.buckets) == set(BUCKET_KINDS), case
+        assert sum(measured.buckets.values()) == measured.raw_in_speech_turn_changes, (
+            case
+        )
+
+
+def test_seeded_hostile_child_time_projection_sweep():
+    """250 hostile child clocks prove only production parents drive projection."""
+    rng = random.Random("p5-w3-parent-projection-v1")
+    for case in range(250):
+        child_count = rng.randint(2, 7)
+        multi = bool(rng.getrandbits(1))
+        turns = [(0.0, 1.0, "A"), (1.0, 2.0, "B")] if multi else [(0.0, 2.0, "A")]
+        parent_doc = document([unit(0, "parent", 0.0, 2.0)], turns)
+        first: list[SourceUnit] = []
+        second: list[SourceUnit] = []
+        for index in range(child_count):
+            a = rng.uniform(-100.0, 100.0)
+            b = rng.uniform(-100.0, 100.0)
+            first.append(unit(index, str(index), a, b, provenance="subunit-per-char"))
+            second.append(
+                unit(index, str(index), -b, -a, provenance="subunit-per-char")
+            )
+        left = speaker_evidence(
+            parent_doc, refined_units=first, origin=(0,) * child_count
+        )
+        right = speaker_evidence(
+            parent_doc, refined_units=second, origin=(0,) * child_count
+        )
+        assert left.unit_speakers == right.unit_speakers, case
+        assert {item.kind for item in left.unit_speakers} == {
+            "ambiguous" if multi else "single"
+        }, case
+
+
+def test_reversed_turns_are_normalized_to_a_typed_point_event():
     doc = document([unit(0, "a", 0.0, 1.0)], [(0.5, 0.5, "A")])
-    with pytest.raises(SpeakerEvidenceError, match="positive"):
-        speaker_evidence(doc)
+    assert speaker_evidence(doc).turns == ((0.5, 0.5, "A"),)
+
+    reversed_doc = document([unit(0, "a", 0.0, 2.0)], [(1.5, 0.5, "A")])
+    assert speaker_evidence(reversed_doc).turns == ((1.5, 1.5, "A"),)
 
 
 def test_hostile_non_string_label_fails_closed():

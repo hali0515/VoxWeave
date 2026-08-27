@@ -14,6 +14,7 @@ defaults, ``0.458`` vs ``11/24`` for the shot-snap window), so a profile that
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -32,6 +33,22 @@ THRESHOLD_KEYS: tuple[str, ...] = (
     "lag_out_s",
     "shot_snap_s",
 )
+
+
+def normalize_speaker_turn_bounds(start: float, end: float) -> tuple[float, float]:
+    """Normalize a persisted turn to a total, forward interval.
+
+    Point turns are retained because adjacent records on either side can encode
+    two distinct, coincident label changes.  A reversed persisted record is
+    collapsed at its declared start instead of being allowed to create negative
+    overlap or crash a shadow-only consumer.  Both the persisted parser and W3
+    evidence use this function, so normalization cannot diverge by lane.
+    """
+    normalized_start = float(start)
+    normalized_end = float(end)
+    if not math.isfinite(normalized_start) or not math.isfinite(normalized_end):
+        raise ValueError("speaker turn bounds must be finite")
+    return normalized_start, max(normalized_start, normalized_end)
 
 
 @dataclass(frozen=True)

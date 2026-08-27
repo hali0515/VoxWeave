@@ -1724,6 +1724,8 @@ def _selection_payload(
                 edge.end_node,
                 edge.span_start,
                 edge.span_end,
+                edge.input_start,
+                edge.input_end,
                 None
                 if edge.evidence_span is None
                 else [
