@@ -2141,7 +2141,9 @@ def print_summary(report: Mapping[str, Any]) -> None:
     lens = report["metric_definition"]["forbidden_end"]["ja_tail_lens"]
     print(f"corpus   : {report['corpus']['path']}")
     print(f"digest   : {report['corpus_digest'][:16]}...")
-    print(f"metric   : {report['metric_definition_digest'][:16]}... ja-tail={lens['id']}")
+    print(
+        f"metric   : {report['metric_definition_digest'][:16]}... ja-tail={lens['id']}"
+    )
     print(f"cases    : {report['corpus']['case_count']}")
     print()
     print(
@@ -4144,7 +4146,9 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
     lens = report["metric_definition"]["forbidden_end"]["ja_tail_lens"]
     print(f"corpus   : {report['corpus']['path']}")
     print(f"digest   : {report['corpus_digest'][:16]}...")
-    print(f"metric   : {report['metric_definition_digest'][:16]}... ja-tail={lens['id']}")
+    print(
+        f"metric   : {report['metric_definition_digest'][:16]}... ja-tail={lens['id']}"
+    )
     print(f"engine   : {report['engine_v2']} policy={report['policy_version']}")
     for lane in SHADOW_LANES:
         block = lanes.get(lane) or {}

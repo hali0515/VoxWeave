@@ -207,6 +207,26 @@ def test_baseline_ratio_and_metric_shapes_validate() -> None:
     baseline = {
         "schema_version": 1,
         "metric_definition_version": 3,
+        "metric_definition": {
+            "version": 3,
+            "forbidden_end": {
+                "tail_scope": "eligible-internal-plus-document-final",
+                "alternative_source": "pre-split-punctuated-source-phrase-lattice",
+                "reported_measure": "rate-with-bad-and-eligible",
+                "gate_measure": "bad-count",
+                "baseline_bad_slack": 1.0,
+                "ja_tail_lens": {
+                    "id": "ja-char-table-level1",
+                    "source": "kinsoku.line_end_penalty",
+                    "provider": None,
+                    "provider_version": None,
+                    "dictionary": None,
+                    "context": "punctuated-source-phrase-atom",
+                    "missing_offset_fallback": None,
+                },
+            },
+        },
+        "metric_definition_digest": DIGEST_64,
         "corpus_digest": DIGEST_64,
         "generated_from_commit": "aaea548",
         "environment": {"python": "3.11.9", "dependencies": {"pysbd": "0.3.4"}},
