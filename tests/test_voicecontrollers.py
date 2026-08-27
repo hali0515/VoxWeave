@@ -1,4 +1,5 @@
 import copy
+import errno
 import json
 from pathlib import Path
 
@@ -418,6 +419,60 @@ def test_generation_rechecks_live_media_at_mapping_install_edge(tmp_path, monkey
     assert not (tmp_path / "episode.speakers.json").exists()
     assert not html_path.exists()
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "install_route",
+    ["hard-link", "o-excl-fallback"],
+)
+def test_generation_combined_mapping_and_media_race_cleans_only_machine_outputs(
+    tmp_path, monkeypatch, install_route
+):
+    media, _sibling, _sidecar = _write_episode(tmp_path)
+    store_path = tmp_path / "voices.json"
+    _write_store(store_path)
+    _fake_clips(monkeypatch)
+    mapping_path = tmp_path / "episode.speakers.json"
+    html_path = tmp_path / "episode.speakers.html"
+    suggest_path = tmp_path / "episode.speakers.suggest.json"
+    human_mapping = {
+        "version": 1,
+        "speakers": {"SPEAKER_00": "Human-reviewed name"},
+    }
+    human_bytes = json.dumps(human_mapping, ensure_ascii=False).encode("utf-8")
+    original_html_write = speakers.fsio.atomic_write_text
+    race_injected = []
+
+    def inject_race():
+        mapping_path.write_bytes(human_bytes)
+        media.write_bytes(b"replacement media in sampled region")
+        race_injected.append(True)
+
+    def write_html_then_race(path, content, **kwargs):
+        original_html_write(path, content, **kwargs)
+        if Path(path) == html_path and install_route == "hard-link":
+            inject_race()
+
+    monkeypatch.setattr(
+        speakers.fsio,
+        "atomic_write_text",
+        write_html_then_race,
+    )
+    if install_route == "o-excl-fallback":
+
+        def unavailable_after_race(*_args, **_kwargs):
+            inject_race()
+            raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+        monkeypatch.setattr(speakers.fsio.os, "link", unavailable_after_race)
+
+    with pytest.raises(RuntimeError, match="media changed"):
+        speakers.create_speaker_audition(media, voices=store_path)
+
+    assert race_injected == [True]
+    assert mapping_path.read_bytes() == human_bytes
+    assert not suggest_path.exists()
+    assert not html_path.exists()
 
 
 def test_same_token_sidecar_content_change_aborts_revalidation(tmp_path, monkeypatch):

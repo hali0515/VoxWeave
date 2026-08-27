@@ -956,6 +956,19 @@ def _publish_audition(
     suggest_path = pipeline.speakers_suggest_path(media)
     if mapping_path.exists():
         raise _mapping_exists_refusal(mapping_path)
+
+    def check_authority_before_install() -> None:
+        assert before_mapping_install is not None
+        try:
+            before_mapping_install()
+        except BaseException:
+            # The callback runs before this invocation can install the
+            # protected mapping. These replaceable outputs therefore remain
+            # ours to remove even if another actor created a mapping meanwhile.
+            delete_suggest(suggest_path)
+            html_path.unlink(missing_ok=True)
+            raise
+
     try:
         if suggest_record is None:
             delete_suggest(suggest_path)
@@ -965,7 +978,11 @@ def _publish_audition(
         fsio.atomic_write_text_new(
             mapping_path,
             json.dumps(skeleton, ensure_ascii=False, indent=2) + "\n",
-            before_install=before_mapping_install,
+            before_install=(
+                check_authority_before_install
+                if before_mapping_install is not None
+                else None
+            ),
         )
     except FileExistsError as exc:
         delete_suggest(suggest_path)
