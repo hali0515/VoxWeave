@@ -9,9 +9,16 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
+
+from voxweave.speakers import (
+    strip_srt_speaker_prefixes,
+    strip_voice_tags,
+    voice_text_for_block,
+)
 
 log = logging.getLogger("voxweave")
 
@@ -47,7 +54,7 @@ def _parse_ts(token: str) -> float | None:
     return h * 3600 + mm * 60 + ss + ms / 1000.0
 
 
-def parse_vtt_blocks(text: str) -> list[dict]:
+def parse_vtt_blocks(text: str, *, srt_speaker_names: Sequence[str] = ()) -> list[dict]:
     """Parse both plain-text and timestamped VTT → ordered cues ``[{text, start, end}]``.
 
     Handles both formats: if a ``-->`` timing line is present, start/end are populated
@@ -82,12 +89,22 @@ def parse_vtt_blocks(text: str) -> list[dict]:
         cue = "\n".join(body).strip()
         if not cue:
             continue
-        block = {"text": cue, "start": start, "end": end}
+        clean, speaker, speakers = strip_voice_tags(cue)
+        if speaker is None and speakers is None and srt_speaker_names:
+            clean, speaker, speakers = strip_srt_speaker_prefixes(
+                clean, srt_speaker_names
+            )
+        block = {"text": clean, "start": start, "end": end}
+        if speaker is not None:
+            block["speaker"] = speaker
+        if speakers is not None:
+            block["speakers"] = speakers
         # Keep-lyrics marking: "♪ text ♪" wraps are display decoration, not content.
         # Strip them so alignment/translation see clean text, and flag the block so
         # writers (align rewrite, translated VTT) can restore the wrap.
-        if len(cue) > 2 and cue.startswith("♪") and cue.endswith("♪"):
-            block["text"] = cue[1:-1].strip()
+        clean = block["text"]
+        if len(clean) > 2 and clean.startswith("♪") and clean.endswith("♪"):
+            block["text"] = clean[1:-1].strip()
             block["lyric"] = True
             if not block["text"]:
                 music_only += 1
@@ -1167,10 +1184,17 @@ def render_cues(rows: list[tuple[float | None, float | None, str]]) -> str:
 
 def render_vtt(blocks: list[dict], spans: list[tuple[float, float]]) -> str:
     """Block text + timestamps → standard timestamped VTT string. Lyric-flagged
-    blocks (see :func:`parse_vtt_blocks`) get their music-note wrap restored."""
+    blocks get their music-note wrap restored; speaker metadata is restored as
+    WebVTT voice tags around the final display text."""
     return render_cues(
         [
-            (a, e, f"♪ {b['text']} ♪" if b.get("lyric") else b["text"])
+            (
+                a,
+                e,
+                voice_text_for_block(
+                    f"♪ {b['text']} ♪" if b.get("lyric") else b["text"], b
+                ),
+            )
             for b, (a, e) in zip(blocks, spans)
         ]
     )

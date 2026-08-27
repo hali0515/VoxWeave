@@ -368,6 +368,16 @@ cli.default_cmd = (
 )
 
 
+@cli.command("speakers")
+@click.argument("media", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+def cmd_speakers(media: Path) -> None:
+    """Build an offline audition page and empty name mapping for diarized speakers."""
+    from voxweave.speakers import create_speaker_audition
+
+    out = _run(lambda _rep: create_speaker_audition(media), reporter=False)
+    click.echo(out)
+
+
 @cli.command("split")
 @click.argument(
     "json_path",

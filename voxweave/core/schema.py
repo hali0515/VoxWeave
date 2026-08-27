@@ -80,5 +80,8 @@ class Cue(TypedDict):
     end: float
     word_data: list[Unit]
     lyric: NotRequired[bool]
+    # Transient display metadata populated only while a named split replay is
+    # rendering.  The sibling writer drops it alongside the acoustic anchors.
+    speaker_ids: NotRequired[list[str]]
     speech_start: NotRequired[float | None]
     speech_end: NotRequired[float | None]

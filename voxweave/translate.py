@@ -10,6 +10,7 @@ from pathlib import Path
 
 from voxweave import fsio
 from voxweave.realign import render_cues
+from voxweave.speakers import voice_text_for_block
 
 log = logging.getLogger("voxweave")
 
@@ -88,6 +89,23 @@ def _clean_half(text: str) -> str:
     """Strip any model-prepended dash and flatten internal whitespace so a half is
     always a single line (dash cues recombine two halves on one ``\\n``)."""
     return " ".join(_LEADING_DASH_RE.sub("", text.strip(), count=1).split())
+
+
+def restore_dash_layout(source: str, rendered: str) -> str:
+    """Restore the source's two-line dash boundary after a flat text edit.
+
+    Correction payloads intentionally flatten cue whitespace.  Choose the dash
+    boundary closest to the source's first-line length, which avoids confusing
+    a later hyphen inside either speaker's dialogue for the speaker transition.
+    """
+    if not is_dash_cue(source) or "\n" in rendered:
+        return rendered
+    boundaries = list(re.finditer(r"\s+(?=-\s*\S)", rendered))
+    if not boundaries:
+        return rendered
+    target = len(source.split("\n", 1)[0])
+    boundary = min(boundaries, key=lambda match: abs(match.start() - target))
+    return f"{rendered[: boundary.start()].rstrip()}\n{rendered[boundary.end() :].lstrip()}"
 
 
 def build_payload(blocks: list[dict]) -> list[dict]:
@@ -188,22 +206,62 @@ def _layout_dash_cue(block: dict, trans_text: str | None) -> str:
     return "\n".join(out)
 
 
+def _speaker_block_for_rendered(block: dict, rendered: str) -> dict:
+    """Bind structured dash translations to their source content identities.
+
+    Dash halves are separate keyed translation units, so their source-to-output
+    relationship is explicit. Generic wrapping and edits do not use this path;
+    their stored speaker lines remain bound to their original text.
+    """
+    raw_lines = block.get("speakers")
+    if not isinstance(raw_lines, list) or not is_dash_cue(block["text"]):
+        return block
+    source_lines = block["text"].split("\n")
+    rendered_lines = rendered.split("\n")
+    if len(source_lines) != 2 or len(rendered_lines) != 2:
+        return block
+    translated_by_source = dict(zip(source_lines, rendered_lines))
+    rebound = []
+    for entry in raw_lines:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            continue
+        name, source_line = entry
+        if isinstance(source_line, str) and source_line in translated_by_source:
+            rebound.append((name, translated_by_source[source_line]))
+    if not rebound:
+        return block
+    return {**block, "speakers": rebound}
+
+
 def translated_rows(
-    blocks: list[dict], trans: dict[int, str], to_iso: str | None = None
+    blocks: list[dict],
+    trans: dict[int, str],
+    to_iso: str | None = None,
+    *,
+    voice_tags: bool = True,
 ) -> list[tuple[float | None, float | None, str]]:
     """Translated text + per-block timestamps -> (start, end, text) rows;
     missing translations fall back to the original text. ``to_iso`` enables
     target-language soft-wrap (see _layout_translated). Lyric-flagged blocks
     get their music-note wrap restored after layout. Dual-speaker dash cues are
-    rendered as two unwrapped speaker lines (see :func:`_layout_dash_cue`)."""
+    rendered as two unwrapped speaker lines (see :func:`_layout_dash_cue`).
+    Parsed speaker metadata is restored as WebVTT voice tags by default; callers
+    targeting SRT/ASS disable that and hand the metadata to their renderer."""
 
     def _text(i: int, b: dict) -> str:
         if not b.get("lyric") and is_dash_cue(b["text"]):
-            return _layout_dash_cue(b, trans.get(i))
-        t = _layout_translated(
-            strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]), to_iso
-        )
-        return f"♪ {t} ♪" if b.get("lyric") else t
+            rendered = _layout_dash_cue(b, trans.get(i))
+        else:
+            t = _layout_translated(
+                strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]),
+                to_iso,
+            )
+            rendered = f"♪ {t} ♪" if b.get("lyric") else t
+        if voice_tags:
+            return voice_text_for_block(
+                rendered, _speaker_block_for_rendered(b, rendered)
+            )
+        return rendered
 
     return [(b.get("start"), b.get("end"), _text(i, b)) for i, b in enumerate(blocks)]
 

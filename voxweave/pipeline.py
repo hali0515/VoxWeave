@@ -49,6 +49,7 @@ from voxweave.songdet import (
     rescue_speech_segments,
     subtract_spans,
 )
+from voxweave.speakers import load_speaker_mapping, voice_text_for_ids
 from voxweave.timestamps import shift_units
 
 if TYPE_CHECKING:  # the v2 shadow is import-free unless its flag is on
@@ -1044,9 +1045,10 @@ def _dump_sibling_json(
 
 
 # Cue keys that exist only in memory: raw acoustic anchors captured at cue
-# construction (``core.schema.Cue``). Nothing in legacy-v1 reads them and the
-# sibling JSON predates them, so the writer drops exactly these two.
-_UNPERSISTED_CUE_KEYS = ("speech_start", "speech_end")
+# construction plus speaker ids used while rendering a named VTT. Nothing in
+# legacy-v1 reads them and the sibling JSON predates them, so the writer drops
+# all three.
+_UNPERSISTED_CUE_KEYS = ("speech_start", "speech_end", "speaker_ids")
 
 
 def _persistable_cue(cue: Mapping[str, Any]) -> dict[str, Any]:
@@ -1070,6 +1072,7 @@ def _write_siblings(
     sing_spans: list[tuple[float, float]] | None = None,
     speaker_turns: list[tuple[float, float, str]] | None = None,
     manifest: Mapping[str, Any] | None = None,
+    speaker_names: Mapping[str, str] | None = None,
 ) -> Path:
     """Write sibling .json (ground truth) and .vtt alongside src; return the .vtt path.
 
@@ -1081,8 +1084,8 @@ def _write_siblings(
     ``with_suffix``) to preserve interior dots in filenames.
 
     The persisted cues are projected through :func:`_persistable_cue`, which drops
-    the in-memory-only acoustic anchors; ``manifest`` is forwarded to the JSON
-    writer, which appends it as the last top-level key.
+    the in-memory-only acoustic anchors and speaker ids; ``manifest`` is
+    forwarded to the JSON writer, which appends it as the last top-level key.
     """
     _dump_sibling_json(
         swap_ext(src, ".json"),
@@ -1095,14 +1098,18 @@ def _write_siblings(
         speaker_turns=speaker_turns,
         manifest=manifest,
     )
-    rows = [
-        (
-            c.get("start") if timestamps else None,
-            c.get("end") if timestamps else None,
-            lyric_display_text(c),
+    rows = []
+    for c in cues:
+        text = lyric_display_text(c)
+        if speaker_names:
+            text = voice_text_for_ids(text, c.get("speaker_ids"), speaker_names)
+        rows.append(
+            (
+                c.get("start") if timestamps else None,
+                c.get("end") if timestamps else None,
+                text,
+            )
         )
-        for c in cues
-    ]
     vtt_path = swap_ext(src, ".vtt")
     fsio.atomic_write_text(vtt_path, realign.render_cues(rows))
     return vtt_path
@@ -1741,6 +1748,7 @@ def segment_document(
     semantic_engine: Any | None = None,
     semantic_model: str | None = None,
     smart_split_kwargs: Mapping[str, Any] | None = None,
+    annotate_speakers: bool = False,
 ) -> SegmentationResult:
     """Turn aligned word segments into the final cue stream. Pure and deterministic.
 
@@ -1914,6 +1922,7 @@ def segment_document(
                 thresholds=effective,
                 max_line_length=max_line_length,
                 max_lines=max_lines,
+                annotate_speakers=annotate_speakers,
             )
             # ... and its cleanup can push a boundary back across a cut, so snap again.
             cues = _resnap_shots(cues, cuts, effective)
@@ -2306,6 +2315,19 @@ def split(
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = _spans_in(data.get("sing_spans"))
     speaker_turns = _turns_in(data.get("speaker_turns"))
+    speaker_names: dict[str, str] = {}
+    mapping_path = swap_ext(json_path, ".speakers.json")
+    if mapping_path.exists():
+        try:
+            speaker_names = load_speaker_mapping(
+                mapping_path, {label for _start, _end, label in speaker_turns or ()}
+            )
+        except (OSError, RuntimeError, UnicodeError) as exc:
+            log.warning(
+                "%s: ignoring unreadable speaker mapping: %s",
+                mapping_path.name,
+                exc,
+            )
     semantic_engine = _make_semantic_engine(semantic_split)
     try:
         segmented = segment_document(
@@ -2318,6 +2340,7 @@ def split(
             semantic_engine=semantic_engine,
             semantic_model=semantic_model,
             smart_split_kwargs=smart_split_kwargs,
+            annotate_speakers=bool(speaker_names),
         )
     finally:
         _release_semantic_engine(semantic_engine)
@@ -2333,6 +2356,7 @@ def split(
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
         manifest=segmented.manifest,
+        speaker_names=speaker_names,
     )
     log.info("re-split %s → %d cues", vtt_out.name, len(cues))
     return vtt_out
@@ -2728,7 +2752,12 @@ def translate(
         raise
 
     rep.stage(f"write translated {ext.lstrip('.').upper()}")
-    rows = translate_mod.translated_rows(blocks, trans, to_iso=to_iso_or(to, None))
+    rows = translate_mod.translated_rows(
+        blocks,
+        trans,
+        to_iso=to_iso_or(to, None),
+        voice_tags=ext == ".vtt",
+    )
     if ext == ".vtt":
         content = realign.render_cues(rows)
     else:
@@ -2739,7 +2768,16 @@ def translate(
             for s, e, t in rows
             if s is not None and e is not None
         ]
-        content = render_srt(timed) if ext == ".srt" else render_ass(timed)
+        timed_blocks = [
+            translate_mod._speaker_block_for_rendered(block, text)
+            for block, (start, end, text) in zip(blocks, rows)
+            if start is not None and end is not None
+        ]
+        content = (
+            render_srt(timed, blocks=timed_blocks)
+            if ext == ".srt"
+            else render_ass(timed, blocks=timed_blocks)
+        )
     out_path = swap_ext(vtt_path, f".{to}{ext}")
     fsio.atomic_write_text(out_path, content)
     progress_path.unlink(missing_ok=True)  # translation landed; sidecar done

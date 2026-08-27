@@ -629,7 +629,17 @@ def burn(
     require_subtitle(vtt)
     native_ass = Path(vtt).suffix.lower() in (".ass", ".ssa")
     src = resolve_media(vtt, media)
-    rows = None if native_ass else _timed_rows(load_subtitle_blocks(Path(vtt)))
+    timed_blocks = None
+    if native_ass:
+        rows = None
+    else:
+        blocks = load_subtitle_blocks(Path(vtt))
+        rows = _timed_rows(blocks)
+        timed_blocks = [
+            block
+            for block in blocks
+            if block.get("start") is not None and block.get("end") is not None
+        ]
 
     streams = probe_streams(src)
     videos = [s for s in streams if s.get("codec_type") == "video"]
@@ -674,7 +684,10 @@ def burn(
         os.close(fd)  # mkstemp fds leak one per call unless closed explicitly
         tmp_ass = Path(tmp_name)
         assert rows is not None
-        tmp_ass.write_text(render_ass(rows, header=header), encoding="utf-8")
+        assert timed_blocks is not None
+        tmp_ass.write_text(
+            render_ass(rows, header=header, blocks=timed_blocks), encoding="utf-8"
+        )
         ass_path = tmp_ass
     try:
         with fsio.atomic_path(out) as tmp_out:

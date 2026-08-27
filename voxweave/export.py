@@ -12,10 +12,18 @@ editing workflow (they carry no word-level JSON, so align works from scratch).
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from voxweave import fsio
 from voxweave.realign import render_cues
+from voxweave.speakers import (
+    sanitize_ass_speaker_name,
+    speaker_layout,
+    speaker_metadata,
+    voice_text_for_block,
+)
 
 
 def ass_header(
@@ -108,13 +116,32 @@ def _timed_rows(
     return rows
 
 
-def render_srt(rows: list[tuple[float, float, str]]) -> str:
-    """Render numbered SRT cues. Inline ``<i>`` tags pass through."""
+def _srt_speaker_text(text: str, block: Mapping[str, Any] | None) -> str:
+    """Apply ``NAME: `` prefixes without changing the underlying cue text."""
+    if block is None:
+        return text
+    speaker, speakers = speaker_metadata(block)
+    speaker, speakers = speaker_layout(text, speaker=speaker, speakers=speakers)
+    lines = text.split("\n")
+    if speakers is not None:
+        return "\n".join(
+            f"{name}: {line}" if name else line for name, line in zip(speakers, lines)
+        )
+    return f"{speaker}: {text}" if speaker else text
+
+
+def render_srt(
+    rows: list[tuple[float, float, str]],
+    *,
+    blocks: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    """Render numbered SRT cues, including speaker-name prefixes when supplied."""
     out: list[str] = []
     for n, (start, end, text) in enumerate(rows, start=1):
         out.append(str(n))
         out.append(f"{_srt_ts(start)} --> {_srt_ts(end)}")
-        out.append(text)
+        block = blocks[n - 1] if blocks is not None and n - 1 < len(blocks) else None
+        out.append(_srt_speaker_text(text, block))
         out.append("")
     return "\n".join(out).rstrip() + "\n"
 
@@ -131,7 +158,10 @@ def _ass_text(text: str) -> str:
 
 
 def render_ass(
-    rows: list[tuple[float, float, str]], *, header: str | None = None
+    rows: list[tuple[float, float, str]],
+    *,
+    header: str | None = None,
+    blocks: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     """Render an ASS script with a single Default style. Lyric cues (wrapped in
     music notes by keep-lyrics mode) render italic per the Netflix convention.
@@ -140,22 +170,51 @@ def render_ass(
     the burn path passes one sized to the actual video frame.
     """
     events = []
-    for start, end, text in rows:
+    for index, (start, end, text) in enumerate(rows):
         body = _ass_text(text)
         if text.startswith("♪") and text.endswith("♪"):
             body = f"{{\\i1}}{body}{{\\i0}}"
+        name = ""
+        if blocks is not None and index < len(blocks):
+            speaker, speakers = speaker_metadata(blocks[index])
+            if speaker:
+                name = speaker
+            elif speakers:
+                # ASS has one Name field per Dialogue event.  Preserve the dual
+                # cue as one on-screen event and retain both actor names here.
+                name = " / ".join(
+                    dict.fromkeys(name for name, _line in speakers if name)
+                )
+        name = sanitize_ass_speaker_name(name)
         events.append(
-            f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(end)},Default,,0,0,0,,{body}"
+            f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(end)},Default,{name},0,0,0,,{body}"
         )
     return (header if header is not None else _ASS_HEADER) + "\n".join(events) + "\n"
 
 
-def render_vtt_rows(rows: list[tuple[float, float, str]]) -> str:
-    """Render timed rows as WEBVTT (thin adapter over :func:`render_cues`)."""
-    return render_cues([(s, e, t) for s, e, t in rows])
+def render_vtt_rows(
+    rows: list[tuple[float, float, str]],
+    *,
+    blocks: Sequence[Mapping[str, Any]] | None = None,
+) -> str:
+    """Render timed rows as WebVTT, restoring any speaker voice tags."""
+    if blocks is None:
+        return render_cues([(s, e, t) for s, e, t in rows])
+    return render_cues(
+        [
+            (
+                start,
+                end,
+                voice_text_for_block(text, blocks[index])
+                if index < len(blocks)
+                else text,
+            )
+            for index, (start, end, text) in enumerate(rows)
+        ]
+    )
 
 
-_RENDERERS = {"srt": render_srt, "ass": render_ass, "vtt": render_vtt_rows}
+_EXPORT_FORMATS = {"srt", "ass", "vtt"}
 
 
 def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
@@ -165,16 +224,28 @@ def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
     from voxweave.pipeline import swap_ext
     from voxweave.subformats import load_subtitle_blocks
 
-    unknown = [f for f in formats if f not in _RENDERERS]
+    unknown = [f for f in formats if f not in _EXPORT_FORMATS]
     if unknown:
         raise ValueError(f"unknown export format(s): {', '.join(unknown)}")
     src_fmt = sub_path.suffix.lower().lstrip(".")
     if src_fmt in formats:
         raise ValueError(f"{sub_path.name} is already .{src_fmt}; pick another --to")
-    rows = _timed_rows(load_subtitle_blocks(sub_path))
+    blocks = load_subtitle_blocks(sub_path)
+    timed_blocks = [
+        block
+        for block in blocks
+        if block.get("start") is not None and block.get("end") is not None
+    ]
+    rows = _timed_rows(blocks)
     out: list[Path] = []
     for fmt in dict.fromkeys(formats):  # dedupe, keep order
         path = swap_ext(sub_path, f".{fmt}")
-        fsio.atomic_write_text(path, _RENDERERS[fmt](rows))
+        if fmt == "srt":
+            rendered = render_srt(rows, blocks=timed_blocks)
+        elif fmt == "ass":
+            rendered = render_ass(rows, blocks=timed_blocks)
+        else:
+            rendered = render_vtt_rows(rows, blocks=timed_blocks)
+        fsio.atomic_write_text(path, rendered)
         out.append(path)
     return out

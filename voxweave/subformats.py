@@ -3,7 +3,7 @@
 ``realign.parse_vtt_blocks`` already reads SRT (the numeric index line and the
 comma-decimal timing line are within its tolerance), so only ASS/SSA needs a
 dedicated parser. All loaders return the realign block contract:
-``[{text, start, end, lyric?}]``.
+``[{text, start, end, lyric?, speaker?, speakers?}]``.
 """
 
 from __future__ import annotations
@@ -106,7 +106,9 @@ def parse_ass_blocks(text: str) -> list[dict]:
 
     Honors the section's Format line for field order (falling back to the
     standard v4.00+ layout), skips Comment lines, and sorts by start time
-    (ASS events are not required to be chronological).
+    (ASS events are not required to be chronological).  The Name/Actor field is
+    authoring metadata in foreign scripts and is deliberately not promoted to a
+    display speaker.
     """
     blocks: list[dict] = []
     fields: list[str] | None = None
@@ -244,7 +246,32 @@ def load_subtitle_blocks(path: Path) -> list[dict]:
             f"{p.name}: content is {actual} but the extension says"
             f" {p.suffix.lower().lstrip('.')}; rename the file to its real format"
         )
-    blocks = parse_ass_blocks(text) if is_ass else parse_vtt_blocks(text)
+    if is_ass:
+        blocks = parse_ass_blocks(text)
+    elif p.suffix.lower() == ".srt":
+        from voxweave.mux import detect_subtitle_language
+        from voxweave.pipeline import swap_ext
+        from voxweave.speakers import load_speaker_display_names
+
+        mapping_path = swap_ext(p, ".speakers.json")
+        if not mapping_path.exists() and detect_subtitle_language(p) is not None:
+            mapping_path = swap_ext(swap_ext(p, ""), ".speakers.json")
+        known_names: list[str] = []
+        if mapping_path.exists():
+            try:
+                known_names = load_speaker_display_names(mapping_path)
+            except (OSError, RuntimeError, UnicodeError) as exc:
+                log.warning(
+                    "%s: ignoring unreadable speaker mapping: %s",
+                    mapping_path.name,
+                    exc,
+                )
+        if known_names:
+            blocks = parse_vtt_blocks(text, srt_speaker_names=known_names)
+        else:
+            blocks = parse_vtt_blocks(text)
+    else:
+        blocks = parse_vtt_blocks(text)
     if not blocks:
         raise RuntimeError(f"no cues in {p.name}")
     _sanitize_block_order(blocks, p.name)

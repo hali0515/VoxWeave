@@ -660,6 +660,7 @@ def format_speaker_cues(
     *,
     max_line_length: int | None = None,
     max_lines: int | None = None,
+    annotate_speakers: bool = False,
 ) -> list[Cue]:
     """Speaker-aware post-pass over smart_split's cues (pure, replayable).
 
@@ -673,7 +674,8 @@ def format_speaker_cues(
     ``max_line_length`` and ``max_lines`` are the same per-cue budgets that
     smart_split used for this file (``None`` = the language defaults), so the
     dual gate and the piece re-wrap render for the configured player instead of
-    the built-in layout profile.
+    the built-in layout profile.  ``annotate_speakers`` adds transient diarizer
+    ids for the display layer; the sibling JSON writer always removes them.
     """
     if not turns:
         return cues
@@ -697,7 +699,14 @@ def format_speaker_cues(
     for cue in cues:
         word_data = cue.get("word_data") or []
         if cue.get("lyric") or not word_data:
-            out.append(cue)
+            if annotate_speakers:
+                tagged = cast(Cue, dict(cue))
+                label = _span_speaker(cue.get("start"), cue.get("end"), turns)
+                if label is not None:
+                    tagged["speaker_ids"] = [label]
+                out.append(tagged)
+            else:
+                out.append(cue)
             continue
         atoms = _build_atoms(
             cue["text"],
@@ -707,7 +716,12 @@ def format_speaker_cues(
         )
         runs = _speaker_runs(atoms, turns, lang)
         if len(runs) <= 1:
-            out.append(cue)
+            if annotate_speakers and runs:
+                tagged = cast(Cue, dict(cue))
+                tagged["speaker_ids"] = [runs[0][0]]
+                out.append(tagged)
+            else:
+                out.append(cue)
             continue
         pieces = _slice_text_by_runs(cue["text"], runs)
         # Collapse each piece to one logical line before the dual-budget test:
@@ -723,6 +737,8 @@ def format_speaker_cues(
             # Netflix dual-speaker event: one line per speaker, both within budget.
             dual = cast(Cue, dict(cue))
             dual["text"] = f"-{one_line[0]}\n-{one_line[1]}"
+            if annotate_speakers:
+                dual["speaker_ids"] = [label for label, _atoms in runs]
             out.append(dual)
             continue
         wd_cursor = 0
@@ -756,6 +772,8 @@ def format_speaker_cues(
             part["end"] = end
             part["speech_start"], part["speech_end"] = _run_speech_span(atoms_run)
             part["word_data"] = list(word_data[wd_cursor:wd_end])
+            if annotate_speakers:
+                part["speaker_ids"] = [_label]
             wd_cursor = wd_end
             out.append(part)
     return out
@@ -768,6 +786,7 @@ def _ordered_speaker_format(
     *,
     max_line_length: int | None = None,
     max_lines: int | None = None,
+    annotate_speakers: bool = False,
 ) -> list[Cue]:
     """format_speaker_cues + re-sort + overlap trim (splits can abut)."""
     out = format_speaker_cues(
@@ -776,6 +795,7 @@ def _ordered_speaker_format(
         lang,
         max_line_length=max_line_length,
         max_lines=max_lines,
+        annotate_speakers=annotate_speakers,
     )
     out.sort(key=lambda c: (c["start"], c["end"]))
     for prev, nxt in zip(out, out[1:]):
@@ -791,6 +811,7 @@ def apply_speaker_format(
     thresholds: dict | SplitThresholds | None = None,
     max_line_length: int | None = None,
     max_lines: int | None = None,
+    annotate_speakers: bool = False,
 ) -> list[Cue]:
     """Public entry: no-op without turns, otherwise format + keep cue order sane.
 
@@ -813,6 +834,7 @@ def apply_speaker_format(
         lang,
         max_line_length=max_line_length,
         max_lines=max_lines,
+        annotate_speakers=annotate_speakers,
     )
     if thresholds is not None:
         from voxweave.core.smart_split import SplitThresholds

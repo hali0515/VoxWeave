@@ -9,6 +9,8 @@ deterministic layout + timing chain.
 import json
 from pathlib import Path
 
+import pytest
+
 from voxweave import backend, chunking, pipeline, songdet
 from voxweave.config import gap_thresholds
 from voxweave.core.smart_split import smart_split_segments
@@ -127,6 +129,30 @@ def test_split_replay_without_shots_keeps_speaker_format(tmp_path):
     pipeline.split(j)
     cues = json.loads(j.read_text(encoding="utf-8"))["segments"]
     assert any("-" in c["text"] for c in cues)
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    ["", "{", '{"version":2,"speakers":{}}', '{"version":1,"speakers":[]}'],
+)
+def test_split_ignores_corrupt_speaker_mapping_once(tmp_path, caplog, mapping):
+    j = _write_json(
+        tmp_path / "ep.json", speaker_turns=[[s, e, label] for s, e, label in TURNS]
+    )
+    (tmp_path / "ep.speakers.json").write_text(mapping, encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = pipeline.split(j)
+
+    assert out.exists()
+    assert "<v " not in out.read_text(encoding="utf-8")
+    assert (
+        sum(
+            "ignoring unreadable speaker mapping" in record.message
+            for record in caplog.records
+        )
+        == 1
+    )
 
 
 def test_split_passes_layout_budget_to_speaker_format(tmp_path, monkeypatch):

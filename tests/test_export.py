@@ -12,6 +12,7 @@ from voxweave.export import (
     render_ass,
     render_srt,
 )
+from voxweave.subformats import parse_ass_blocks
 
 ROWS = [
     (0.0, 1.25, "Hello there"),
@@ -94,6 +95,46 @@ def test_export_srt_input_to_vtt_and_ass(tmp_path):
     assert "Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,hello\\Nworld" in ass
 
 
+def test_export_sidecarless_sdh_srt_preserves_literal_speaker_labels(tmp_path):
+    srt = tmp_path / "sdh.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nMAN: Get down!\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nMAN: Now!\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nWOMAN: I can't.\n\n"
+        "4\n00:00:07,000 --> 00:00:08,000\nWOMAN: Help me.\n",
+        encoding="utf-8",
+    )
+
+    export_subtitles(srt, ("vtt", "ass"))
+    vtt = (tmp_path / "sdh.vtt").read_text(encoding="utf-8")
+    ass = (tmp_path / "sdh.ass").read_text(encoding="utf-8")
+
+    assert "\nMAN: Get down!\n" in vtt
+    assert "\nWOMAN: Help me.\n" in vtt
+    assert "<v " not in vtt
+    assert "Default,,0,0,0,,MAN: Get down!" in ass
+    assert "Default,,0,0,0,,WOMAN: Help me." in ass
+
+
+def test_export_srt_ignores_corrupt_speaker_sidecar_once(tmp_path, caplog):
+    srt = tmp_path / "ep.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n", encoding="utf-8")
+    (tmp_path / "ep.speakers.json").write_text("", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        export_subtitles(srt, ("vtt",))
+
+    rendered = (tmp_path / "ep.vtt").read_text(encoding="utf-8")
+    assert "\nAoi: Hello\n" in rendered
+    assert (
+        sum(
+            "ignoring unreadable speaker mapping" in record.message
+            for record in caplog.records
+        )
+        == 1
+    )
+
+
 def test_export_ass_input_to_srt(tmp_path):
     ass = tmp_path / "ep.ass"
     ass.write_text(
@@ -106,6 +147,31 @@ def test_export_ass_input_to_srt(tmp_path):
     assert [p.name for p in paths] == ["ep.srt"]
     srt = (tmp_path / "ep.srt").read_text(encoding="utf-8")
     assert "1\n00:00:01,000 --> 00:00:02,000\nhi there" in srt
+
+
+def test_export_does_not_promote_foreign_ass_actor_names(tmp_path):
+    ass = tmp_path / "fansub.ass"
+    ass.write_text(
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:03.00,Default,sign,0,0,0,,Chapter One\n"
+        "Dialogue: 0,0:00:04.00,0:00:06.00,Default,TS note: fix later,0,0,0,,Hello there\n"
+        "Dialogue: 0,0:00:07.00,0:00:09.00,Default,,0,0,0,,Plain cue\n",
+        encoding="utf-8",
+    )
+
+    export_subtitles(ass, ("srt", "vtt"))
+    srt = (tmp_path / "fansub.srt").read_text(encoding="utf-8")
+    vtt = (tmp_path / "fansub.vtt").read_text(encoding="utf-8")
+
+    assert "\nChapter One\n" in srt and "\nHello there\n" in srt
+    assert "sign: Chapter One" not in srt and "TS note" not in srt
+    assert "<v " not in vtt
+    parsed = parse_ass_blocks(ass.read_text(encoding="utf-8"))
+    assert ["Chapter One", "Hello there", "Plain cue"] == [
+        block["text"] for block in parsed
+    ]
+    assert all("speaker" not in block for block in parsed)
 
 
 def test_ass_header_strips_commas_from_font_name():

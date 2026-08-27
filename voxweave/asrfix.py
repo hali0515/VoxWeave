@@ -22,12 +22,14 @@ import logging
 import os
 
 from voxweave.realign import render_cues
+from voxweave.speakers import voice_text_for_block
 from voxweave.translate import (
     _call,
     _loads_salvage,
     _make_client,
     build_payload,
     format_glossary,
+    restore_dash_layout,
 )
 
 log = logging.getLogger("voxweave")
@@ -192,16 +194,29 @@ def apply_fixes(
         if why is not None:
             rejected.append({**f, "_why": why})
             continue
-        new_texts[i] = f["fixed"]
-        applied.append(f)
+        fixed = f["fixed"]
+        if isinstance(blocks[i].get("speakers"), list):
+            fixed = restore_dash_layout(actual, fixed)
+        new_texts[i] = fixed
+        applied.append({**f, "orig": actual, "fixed": fixed})
     return new_texts, applied, rejected
 
 
 def render_vtt(blocks: list[dict], texts: list[str]) -> str:
     """Render cues with corrected ``texts``, preserving each block's timestamps
-    when present (text-only otherwise). Structure-preserving: one cue in, one out."""
+    when present (text-only otherwise). Structure-preserving: one cue in, one out;
+    lyric and speaker display metadata are restored after correction."""
     return render_cues(
-        [(b.get("start"), b.get("end"), text) for b, text in zip(blocks, texts)]
+        [
+            (
+                block.get("start"),
+                block.get("end"),
+                voice_text_for_block(
+                    f"♪ {text} ♪" if block.get("lyric") else text, block
+                ),
+            )
+            for block, text in zip(blocks, texts)
+        ]
     )
 
 

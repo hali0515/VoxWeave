@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from voxweave import speakers
 from voxweave.subformats import (
     load_subtitle_blocks,
     parse_ass_blocks,
@@ -73,6 +74,154 @@ def test_load_srt_via_vtt_parser(tmp_path):
     blocks = load_subtitle_blocks(srt)
     assert [b["text"] for b in blocks] == ["hello", "world"]
     assert blocks[1]["start"] == 3.5
+
+
+def test_load_srt_does_not_guess_speaker_prefixes_without_mapping(tmp_path):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: ordinary dialogue\n",
+        encoding="utf-8",
+    )
+
+    assert load_subtitle_blocks(srt)[0] == {
+        "text": "Aoi: ordinary dialogue",
+        "start": 1.0,
+        "end": 2.0,
+    }
+
+
+def test_load_srt_without_mapping_preserves_recurring_sdh_prefixes(tmp_path):
+    srt = tmp_path / "sdh.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nMAN: Get down!\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nMAN: Now!\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nWOMAN: I can't.\n\n"
+        "4\n00:00:07,000 --> 00:00:08,000\nWOMAN: Help me.\n",
+        encoding="utf-8",
+    )
+
+    blocks = load_subtitle_blocks(srt)
+
+    assert not hasattr(speakers, "infer_srt_speaker_names")
+    assert [block["text"] for block in blocks] == [
+        "MAN: Get down!",
+        "MAN: Now!",
+        "WOMAN: I can't.",
+        "WOMAN: Help me.",
+    ]
+    assert all("speaker" not in block and "speakers" not in block for block in blocks)
+
+
+def test_load_srt_without_mapping_preserves_colons_beside_dual_dash(tmp_path):
+    srt = tmp_path / "foreign.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: -Stay\nRen: -Go\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nListen: you have to go now.\n\n"
+        "3\n00:00:05,000 --> 00:00:06,000\nRule one: never look back.\n",
+        encoding="utf-8",
+    )
+
+    blocks = load_subtitle_blocks(srt)
+
+    assert [block["text"] for block in blocks] == [
+        "Aoi: -Stay\nRen: -Go",
+        "Listen: you have to go now.",
+        "Rule one: never look back.",
+    ]
+    assert all("speaker" not in block and "speakers" not in block for block in blocks)
+
+
+def test_load_single_named_srt_uses_mapping_as_safe_prefix_gate(tmp_path):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ep.speakers.json").write_text(
+        '{"version":1,"speakers":{"SPEAKER_00":"Aoi"}}',
+        encoding="utf-8",
+    )
+
+    assert load_subtitle_blocks(srt)[0] == {
+        "text": "Hello",
+        "start": 1.0,
+        "end": 2.0,
+        "speaker": "Aoi",
+    }
+
+
+def test_load_named_srt_matches_srt_sanitized_mapping_name(tmp_path):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nSmith, Jr.: Hello\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ep.speakers.json").write_text(
+        '{"version":1,"speakers":{"SPEAKER_00":"Smith, Jr."}}',
+        encoding="utf-8",
+    )
+
+    assert load_subtitle_blocks(srt)[0] == {
+        "text": "Hello",
+        "start": 1.0,
+        "end": 2.0,
+        "speaker": "Smith, Jr.",
+    }
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        "",
+        "{",
+        '{"version":2,"speakers":{}}',
+        '{"version":1,"speakers":[]}',
+    ],
+)
+def test_load_srt_ignores_corrupt_speaker_sidecar_once(tmp_path, caplog, mapping):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ep.speakers.json").write_text(mapping, encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        blocks = load_subtitle_blocks(srt)
+
+    assert blocks[0]["text"] == "Aoi: Hello"
+    warnings = [
+        record
+        for record in caplog.records
+        if "ignoring unreadable speaker mapping" in record.message
+    ]
+    assert len(warnings) == 1
+
+
+def test_load_srt_ignores_unreadable_speaker_sidecar_once(
+    tmp_path, caplog, monkeypatch
+):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ep.speakers.json").write_text("{}", encoding="utf-8")
+
+    def unreadable(_path):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(speakers, "load_speaker_display_names", unreadable)
+    with caplog.at_level("WARNING", logger="voxweave"):
+        blocks = load_subtitle_blocks(srt)
+
+    assert blocks[0]["text"] == "Aoi: Hello"
+    warnings = [
+        record
+        for record in caplog.records
+        if "ignoring unreadable speaker mapping" in record.message
+    ]
+    assert len(warnings) == 1
 
 
 def test_load_ssa_uses_ass_parser(tmp_path):
