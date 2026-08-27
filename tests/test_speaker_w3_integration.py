@@ -116,6 +116,79 @@ def test_policy_v2_speaker_term_activates_selection_in_expression_direction():
     assert doc == pristine
 
 
+def test_unselected_refused_candidate_does_not_disable_valid_edge_pricing():
+    """A refused candidate is local; it cannot switch off its whole interval."""
+    doc = SegDocument(
+        language="en",
+        units=[
+            source(0, "alpha", 0.0, 0.9),
+            source(1, "bravo", None, 1.0),
+            source(2, "charlie", 1.1, None),
+            source(3, "echo", 1.2, 1.3),
+            source(4, "foxtrot", 1.55, 2.55),
+        ],
+        profile=profile(),
+        vad_speech=[],
+        shot_changes=None,
+        sing_spans=None,
+        speaker_turns=[(0.0, 1.3, "A"), (1.55, 2.55, "B")],
+        manifest={},
+        text="alpha bravo charlie echo foxtrot",
+    )
+
+    full = optimize_document(doc, speaker_weight=W_SPEAKER_INTERIOR)
+    counterfactual = optimize_document(doc, speaker_weight=0.0)
+    full_interval = full.solutions[0]
+    counterfactual_interval = counterfactual.solutions[0]
+
+    assert full.speaker_evidence is not None
+    assert full.speaker_evidence.labels == ("A", "A", "A", "A", "B")
+    refused = tuple(
+        edge
+        for edge in full_interval.lattice.edges
+        if edge.evidence_unavailable_reason is not None
+    )
+    assert [
+        (
+            full_interval.lattice.unit_bound(edge.start_node),
+            full_interval.lattice.unit_bound(edge.end_node),
+            edge.evidence_unavailable_reason,
+        )
+        for edge in refused
+    ] == [(1, 3, "reversed-input-span")]
+
+    assert full_interval.partition_units == (4,)
+    assert counterfactual_interval.partition_units == ()
+    full_selection = full_interval.selection
+    counterfactual_selection = counterfactual_interval.selection
+    assert full_selection is not None and counterfactual_selection is not None
+    assert full_selection.raw_optimum.total == pytest.approx(4.027273, abs=1e-12)
+    assert counterfactual_selection.raw_optimum.total == 2.0
+    assert full_interval.validator_raw.violations == ()
+    selected_nodes = (
+        0,
+        *full_selection.policy_selected.cuts,
+        len(full_interval.lattice.atoms),
+    )
+    selected_edge_keys = tuple(zip(selected_nodes, selected_nodes[1:]))
+    assert selected_edge_keys == ((0, 4), (4, 5))
+    assert (refused[0].start_node, refused[0].end_node) not in selected_edge_keys
+    assert all(
+        "speaker_interior" in part.weighted_terms
+        for part in full_selection.policy_selected.edge_breakdowns
+    )
+
+    assert full.lattice is not None and full.ctx is not None
+    tables = build_cost_tables(full.lattice.lattices[0], full.ctx)
+    assert tables.edges[(0, 5)].total == 5.0
+    assert tables.speaker_pricing is not None
+    assert tables.speaker_pricing.priced_edges == len(full_interval.lattice.edges) - 1
+    assert full_interval.speaker_pricing is not None
+    assert counterfactual_interval.speaker_pricing is not None
+    assert full_interval.speaker_pricing.priced_edges > 0
+    assert counterfactual_interval.speaker_pricing.priced_edges > 0
+
+
 def test_cost_context_carries_projected_units_and_singing_evidence():
     doc = activation_document(singing=True)
     lattice = build_document_lattice(doc, cache_speaker_evidence=True)

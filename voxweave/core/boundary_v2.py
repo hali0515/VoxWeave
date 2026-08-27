@@ -449,14 +449,6 @@ def build_cost_tables(
         else:
             edges[key] = base
 
-    # A raw reversed-cue violation is already the typed outcome for this
-    # interval.  Do not let a subset of its candidates receive W3 terms while
-    # the complementary-endpoint candidate is intentionally unpriceable.
-    if speaker_pricing_refused:
-        edges = dict(base_edges)
-        speaker_parts = []
-        predecessor_stateful = False
-
     cuts: dict[int, CostBreakdown] = {}
     for node in lattice.nodes:
         if not 0 < node < len(atoms):
