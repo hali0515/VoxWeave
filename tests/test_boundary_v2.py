@@ -481,6 +481,7 @@ def test_artifact_carries_the_declared_schema():
     art = solution.artifact
     assert art["kind"] == "segmentation-shadow"
     assert art["schema_version"] == SCHEMA_VERSION
+    assert SCHEMA_VERSION == 2
     assert art["engine_v2"] == ENGINE_V2
     assert art["policy_version"] == 1
     assert art["policy_name"] == "experimental_policy_1"
@@ -493,8 +494,27 @@ def test_artifact_carries_the_declared_schema():
         "influence_cell",
         "pause_knees",
         "policy_deltas",
+        "coverage",
+        "finalizer",
+        "speaker_evidence",
+        "subunit_split",
     ):
         assert key in art
+    assert not {"barrier_flips", "perturbation", "quality"} & set(art)
+    assert art["subunit_split"] == {
+        "degraded": [],
+        "evidence": {
+            "per-char": 0,
+            "phrase": 0,
+            "punct": 0,
+            "whitespace": 0,
+        },
+        "minted": 0,
+        "origin": [0, 1, 2],
+        "refined_parent_count": 0,
+    }
+    assert art["coverage"]["coarse_caused_intervals"] == 0
+    assert art["coverage"]["dual_form_unmeasured"] is False
     assert art["validator"]["raw"] is not None
     assert art["production_degraded"] == []  # Wave B fills these
     assert art["shadow_degraded"] == []
@@ -511,6 +531,7 @@ def test_interval_blocks_expose_the_coverage_and_addendum_fields():
         "dp_relaxations",
         "packer_steps",
         "v2_partition",
+        "coarse_caused",
     ):
         assert key in block
 

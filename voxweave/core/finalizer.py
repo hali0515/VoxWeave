@@ -79,7 +79,7 @@ from .timing_preview import CueCandidate, CuePreview
 if TYPE_CHECKING:  # pragma: no cover - typing only, never a runtime import
     from .boundary_lattice import Edge, LatticeAtom
     from .boundary_v2 import DocumentSolution, IntervalSolution
-    from .segdoc import SegDocument
+    from .segdoc import SegDocument, SourceUnit
 
 __all__ = [
     "DELTA_IDS",
@@ -1676,7 +1676,11 @@ def register_optimizer_selection(
         issuer="voxweave.core.finalizer.register_optimizer_selection",
         kind="optimizer-selection",
         payload=_selection_payload(
-            edges, atoms, cuts, _profile_payload(solution.document.profile)
+            edges,
+            atoms,
+            cuts,
+            _profile_payload(solution.document.profile),
+            solution.document.units,
         ),
     )
     return OptimizerSelectionAuthority(
@@ -1694,6 +1698,7 @@ def _selection_payload(
     atoms: Sequence[LatticeAtom],
     partition: Sequence[int],
     profile: dict[str, Any] | None,
+    units: Sequence[SourceUnit],
 ) -> dict[str, Any]:
     """The projection an optimizer selection is sealed over.
 
@@ -1709,6 +1714,21 @@ def _selection_payload(
         ],
         "partition": list(partition),
         "profile": profile,
+        # W2's materializer reads endpoint provenance from the registered
+        # document.  Those records therefore join the seal: otherwise a caller
+        # could mutate provenance after issuance and change the phase-1 anchors
+        # without breaking the capability digest.
+        "units": [
+            [
+                unit.id,
+                unit.surface,
+                unit.start,
+                unit.end,
+                unit.provenance,
+                unit.confidence,
+            ]
+            for unit in units
+        ],
     }
 
 
@@ -1816,6 +1836,7 @@ def phase1_from_optimizer_selection(
             authority.atoms,
             authority.partition,
             _profile_payload(authority.document.profile),
+            authority.document.units,
         )
     )
     profile = authority.document.profile
@@ -1824,6 +1845,7 @@ def phase1_from_optimizer_selection(
         authority.atoms,
         profile.language,
         fallback_start=authority.fallback_start,
+        units=authority.document.units,
     )
     bounds = (0, *authority.partition, len(authority.document.units))
     unit_ranges = [

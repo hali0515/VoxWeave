@@ -78,6 +78,7 @@ from .partition_check import (
 )
 from .schema import Cue, Unit
 from .segdoc import DisplayProfile, SegDocument, SourceUnit
+from .subunit import RefineResult, empty_refine_result, speech_span_units
 from .timing_preview import DisplayTimingPreview, LegacyCleanupPreview
 
 __all__ = [
@@ -111,7 +112,7 @@ __all__ = [
 ENGINE_V2: str = "boundary-optimizer-v2"
 
 #: Artifact schema version. Bumped when a reader would have to change.
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 
 #: How much worse than the raw optimum a legal v1 path may be and still be
 #: selected. A margin rather than an equality test because the point of the
@@ -495,6 +496,7 @@ def materialize_cues(
     lang: str,
     *,
     fallback_start: float = 0.0,
+    units: Sequence[SourceUnit] | None = None,
 ) -> tuple[Cue, ...]:
     """Turn a chosen edge chain into cues with the engine's own cue shapes.
 
@@ -507,16 +509,34 @@ def materialize_cues(
     cue's* bounds for an untimed chunk, and a v2 partition has no parent cue, so
     the fallback here is the previous cue's end (or ``fallback_start`` at the
     front). The acoustic anchors take no fallback at all in either engine:
-    invented display time must never be laundered into the evidence layer.
+    invented display time must never be laundered into the evidence layer.  If
+    ``units`` contains derived provenance, each cue's exact start/end is taken
+    only from its first/last owned aligner unit; an all-aligner stream retains
+    the legacy edge fold byte-for-byte.
     """
     cues: list[Cue] = []
+    # Absolute byte freeze for the ordinary stream: when every source unit is
+    # still aligner-provenance, retain the original edge span fold verbatim.
+    # Only a mixed-provenance shadow stream takes the W2 sibling fold.
+    provenance_aware = bool(units) and any(
+        unit.provenance != "aligner" for unit in units or ()
+    )
     previous_end = float(fallback_start)
     for edge in edges:
         chunk = list(atoms[edge.start_node : edge.end_node])
+        display_start = edge.span_start
+        display_end = edge.span_end
         speech_start = edge.span_start
         speech_end = edge.span_end
-        start = previous_end if speech_start is None else float(speech_start)
-        end = start if speech_end is None else float(speech_end)
+        if provenance_aware and units is not None and chunk:
+            unit_start = chunk[0].unit_start
+            unit_end = chunk[-1].unit_end
+            speech_start, speech_end = speech_span_units(units[unit_start:unit_end])
+        # Derived sub-unit spans remain the display/cap time authority even when
+        # provenance correctly withholds an acoustic anchor.  Conflating these
+        # channels would collapse every all-refined cue to zero duration.
+        start = previous_end if display_start is None else float(display_start)
+        end = start if display_end is None else float(display_end)
         word_data: list[Unit] = [
             {"text": atom.text, "start": atom.start, "end": atom.end} for atom in chunk
         ]
@@ -801,6 +821,21 @@ class IntervalSolution:
             return self.adopted.unit_range
         return (self.interval.unit_start, self.interval.unit_end)
 
+    @property
+    def coarse_caused(self) -> bool:
+        """Whether shared-unit atoms caused this interval's infeasibility.
+
+        ``coarse-granularity`` is only one possible terminal for that input
+        class.  A locally collapsed stream can honestly end as ``no-path`` or
+        ``relief-insufficient`` too, so the cause is the shared footprint plus
+        any typed infeasibility, never the terminal's spelling.
+        """
+        atoms = self.lattice.atoms
+        shared = any(
+            left.unit_end > right.unit_start for left, right in zip(atoms, atoms[1:])
+        )
+        return self.lattice.infeasible is not None and shared
+
     def to_dict(self) -> dict[str, Any]:
         selection = self.selection
         infeasible = self.lattice.infeasible
@@ -813,6 +848,7 @@ class IntervalSolution:
             "candidate_count": len(self.lattice.nodes),
             "cap_relief_nodes": self.lattice.cap_relief_nodes,
             "coalesced_atoms": self.lattice.coalesced_atoms,
+            "coarse_caused": self.coarse_caused,
             "dp_relaxations": self.dp_relaxations,
             "edge_count": len(self.lattice.edges),
             "fallback_expansion_units": None
@@ -902,7 +938,13 @@ def optimize_interval(
     selection = _select(lattice, tables, dp, v1)
     chosen = selection.policy_selected
     edges = _path_edges(lattice, chosen.cuts)
-    cues = materialize_cues(edges, lattice.atoms, lang, fallback_start=fallback_start)
+    cues = materialize_cues(
+        edges,
+        lattice.atoms,
+        lang,
+        fallback_start=fallback_start,
+        units=units,
+    )
     waivers = tuple(
         replace(edge.waiver, cue_index=index)
         for index, edge in enumerate(edges)
@@ -945,6 +987,7 @@ class DocumentSolution:
     solutions: tuple[IntervalSolution, ...]
     v1_reference: V1Reference | None
     invalid_profile: tuple[ProfileViolation, ...]
+    subunit_split: RefineResult
     artifact: dict[str, Any]
 
 
@@ -1070,6 +1113,7 @@ def _artifact(
     solutions: Sequence[IntervalSolution],
     v1_reference: V1Reference | None,
     document_check: PartitionCheckResult,
+    subunit_split: RefineResult,
 ) -> dict[str, Any]:
     unit_count = len(document.units)
     optimized = [solution for solution in solutions if solution.optimized]
@@ -1083,9 +1127,20 @@ def _artifact(
     interval_hard = sum(
         len(solution.validator_raw.exit_driving) for solution in solutions
     )
+    coarse_caused_intervals = sum(solution.coarse_caused for solution in solutions)
     return {
-        "barrier_flips": None,
+        "coverage": {
+            "coarse_caused_intervals": coarse_caused_intervals,
+            # W3 owns the producer for both counters.  No speaker edge or named
+            # multi cue has been evaluated in this standalone W2 row.
+            "dual_form_unmeasured": False,
+            "named_multi_cues_unannotated": 0,
+        },
         "engine_v2": ENGINE_V2,
+        # W1 supplied the finalizer and W3 supplies speaker evidence; W4 wires
+        # their row-specific blocks.  ``None`` means that stage did not run for
+        # this standalone optimizer artifact, not a reserved metric value.
+        "finalizer": None,
         "influence_cell": {"radius_units": INFLUENCE_RADIUS_UNITS},
         "intervals": [solution.to_dict() for solution in solutions],
         "kind": "segmentation-shadow",
@@ -1095,7 +1150,6 @@ def _artifact(
             state: list(values)
             for state, values in sorted(pause_knees(document.profile).items())
         },
-        "perturbation": None,
         "policy_deltas": list(POLICY_DELTAS),
         "policy_name": POLICY_NAME,
         "policy_version": POLICY_VERSION,
@@ -1105,9 +1159,10 @@ def _artifact(
         # Reserved here so the artifact's key order does not depend on when the
         # value arrives.
         "providers": {},
-        "quality": None,
         "schema_version": SCHEMA_VERSION,
         "shadow_degraded": [],
+        "speaker_evidence": None,
+        "subunit_split": subunit_split.to_dict(),
         "vad_state": _vad_state_totals(solutions),
         "totals": {
             "all_invisible_intervals": sum(
@@ -1127,6 +1182,7 @@ def _artifact(
                 if solution.lattice.infeasible is not None
                 and solution.lattice.infeasible.reason == COARSE_GRANULARITY
             ),
+            "coarse_caused_intervals": coarse_caused_intervals,
             "dp_relaxations": sum(solution.dp_relaxations for solution in solutions),
             "fallback_intervals": len(solutions) - len(optimized),
             "hard_violations": interval_hard,
@@ -1166,13 +1222,27 @@ def optimize_document(
     *,
     v1: V1Partition | None = None,
     preview: DisplayTimingPreview | None = None,
+    subunit_split: RefineResult | None = None,
 ) -> DocumentSolution:
     """Solve every hard interval of one document and assemble its artifact.
 
-    The profile preflight runs first and is fatal for the document: a knob with
-    no defined meaning makes the measurement invalid, and reporting an invalid
-    measurement as a degraded one is how a shadow lane starts lying.
+    ``subunit_split`` is the audited result that produced ``document``; omitting
+    it declares the identity mapping.  The profile preflight is fatal for the
+    document: a knob with no defined meaning makes the measurement invalid, and
+    reporting an invalid measurement as a degraded one is how a shadow lane
+    starts lying.
     """
+    if subunit_split is None:
+        if any(unit.provenance.startswith("subunit-") for unit in document.units):
+            raise ValueError(
+                "a derived sub-unit stream requires its audited subunit_split result"
+            )
+        split = empty_refine_result(document.units)
+    else:
+        split = subunit_split
+    if tuple(document.units) != split.units or len(split.origin) != len(document.units):
+        raise ValueError("subunit_split does not describe this document's unit stream")
+
     invalid = preflight_profile(document.profile)
     if invalid:
         return DocumentSolution(
@@ -1182,6 +1252,7 @@ def optimize_document(
             solutions=(),
             v1_reference=None,
             invalid_profile=invalid,
+            subunit_split=split,
             artifact=_invalid_artifact(invalid),
         )
 
@@ -1231,7 +1302,15 @@ def optimize_document(
         solutions=tuple(solutions),
         v1_reference=v1_reference,
         invalid_profile=(),
-        artifact=_artifact(document, lattice, solutions, v1_reference, document_check),
+        subunit_split=split,
+        artifact=_artifact(
+            document,
+            lattice,
+            solutions,
+            v1_reference,
+            document_check,
+            split,
+        ),
     )
 
 
@@ -1240,6 +1319,9 @@ def shadow_artifact(
     *,
     v1: V1Partition | None = None,
     preview: DisplayTimingPreview | None = None,
+    subunit_split: RefineResult | None = None,
 ) -> dict[str, Any]:
     """The one call the Wave B hook makes."""
-    return optimize_document(document, v1=v1, preview=preview).artifact
+    return optimize_document(
+        document, v1=v1, preview=preview, subunit_split=subunit_split
+    ).artifact

@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "description": "P5 shadow-only sentence-merged variants derived from frozen tracked cases; this registry never enters the tracked baseline or evaluate lane.",
+  "cases": [
+    {
+      "id": "coarse-width-ja",
+      "variant": "width",
+      "source_case": "cases/ja-01.json",
+      "max_block_units": 20,
+      "profile_overrides": {}
+    },
+    {
+      "id": "coarse-duration-ja",
+      "variant": "duration",
+      "source_case": "cases/ja-01.json",
+      "max_block_units": 40,
+      "profile_overrides": {
+        "max_line_length": 100,
+        "max_cue_s": 4.0
+      }
+    },
+    {
+      "id": "coarse-both-ja",
+      "variant": "both",
+      "source_case": "cases/ja-05.json",
+      "max_block_units": 40,
+      "profile_overrides": {
+        "max_line_length": 10,
+        "max_cue_s": 3.0
+      }
+    },
+    {
+      "id": "coarse-per-char-yue",
+      "variant": "per-char",
+      "source_case": "cases/zh-01.json",
+      "max_block_units": 20,
+      "profile_overrides": {
+        "language": "yue"
+      }
+    },
+    {
+      "id": "coarse-mixed-en",
+      "variant": "mixed",
+      "source_case": "cases/en-01.json",
+      "max_block_units": 40,
+      "profile_overrides": {}
+    }
+  ]
+}

@@ -184,6 +184,7 @@ V2_ONLY_MODULES = (
     "voxweave.core.authority",
     "voxweave.core.canonical_text",
     "voxweave.core.finalizer",
+    "voxweave.core.subunit",
     "voxweave.core.partition_check",
     "voxweave.core.trace_validator",
 )
