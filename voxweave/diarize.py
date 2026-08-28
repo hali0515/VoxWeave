@@ -22,11 +22,14 @@ import logging
 import math
 import os
 import sys
+import tempfile
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+
+import yaml
 
 from voxweave import config
 from voxweave.core.schema import Cue
@@ -101,13 +104,36 @@ class DiarizationResult:
 
 @dataclass(frozen=True)
 class _EmbeddingCheckpointBinding:
-    """Exact checkpoint path and content identity observed at construction."""
+    """Exact checkpoint path and content identity fixed before construction."""
 
     path: Path
     sha256: str
 
 
+@dataclass(frozen=True)
+class _EmbeddingLoadAuthority:
+    """Embedding source passed to the loader and its pre-load authority."""
+
+    loader_value: str
+    provenance_value: str
+    binding: _EmbeddingCheckpointBinding
+    local_path: Path | None
+
+
+@dataclass(frozen=True)
+class _PipelineLoadPlan:
+    """Immutable pipeline config plus the embedding authority it carries."""
+
+    config_yaml: str | None
+    authority: _EmbeddingLoadAuthority | None
+
+
+class EmbeddingCheckpointChangedError(RuntimeError):
+    """The configured local embedding checkpoint changed during construction."""
+
+
 _EMBEDDING_BINDING_ATTR = "_voxweave_embedding_checkpoint_binding"
+_EMBEDDING_MODEL_ATTR = "_voxweave_embedding_model"
 
 
 def _sha256_file(path: Path) -> str:
@@ -157,12 +183,26 @@ def _configure_pyannote_cache() -> None:
         os.environ[PYANNOTE_CACHE_ENV] = os.fspath(_private_pyannote_cache())
 
 
-def _resolve_embedding_checkpoint(
-    pipeline: object,
-) -> _EmbeddingCheckpointBinding | None:
-    """Resolve and hash the embedding checkpoint at pipeline construction."""
-    embedder = getattr(pipeline, "_embedding", None)
-    raw_path = getattr(embedder, "embedding", None)
+def _snapshot_commit(cached_path: Path, model_id: str) -> str | None:
+    """Extract a content-addressed commit from a standard HF snapshot path."""
+    if cached_path.name != EMBEDDING_CHECKPOINT_FILE:
+        return None
+    snapshot = cached_path.parent
+    snapshots = snapshot.parent
+    repo_cache = snapshots.parent
+    commit = snapshot.name
+    expected_repo_cache = f"models--{model_id.replace('/', '--')}"
+    if snapshots.name != "snapshots" or repo_cache.name != expected_repo_cache:
+        return None
+    if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+        return None
+    return commit
+
+
+def _embedding_load_authority(
+    raw_path: object,
+) -> _EmbeddingLoadAuthority | None:
+    """Fix one local path or cached hub snapshot before model construction."""
     if not isinstance(raw_path, (str, os.PathLike)):
         return None
     try:
@@ -171,9 +211,14 @@ def _resolve_embedding_checkpoint(
         pass
     else:
         try:
-            return _EmbeddingCheckpointBinding(
-                path=resolved,
-                sha256=_sha256_file(resolved),
+            binding = _EmbeddingCheckpointBinding(
+                path=resolved, sha256=_sha256_file(resolved)
+            )
+            return _EmbeddingLoadAuthority(
+                loader_value=os.fspath(resolved),
+                provenance_value=os.fspath(raw_path),
+                binding=binding,
+                local_path=resolved,
             )
         except OSError:
             return None
@@ -204,22 +249,93 @@ def _resolve_embedding_checkpoint(
             cache_dir=cache_dir,
         )
         if isinstance(cached, str):
-            resolved = Path(cached).resolve(strict=True)
-            return _EmbeddingCheckpointBinding(
-                path=resolved,
-                sha256=_sha256_file(resolved),
+            cached_path = Path(cached).absolute()
+            commit = _snapshot_commit(cached_path, model_id)
+            if commit is None:
+                return None
+            resolved = cached_path.resolve(strict=True)
+            binding = _EmbeddingCheckpointBinding(
+                path=resolved, sha256=_sha256_file(resolved)
+            )
+            return _EmbeddingLoadAuthority(
+                loader_value=os.fspath(resolved),
+                provenance_value=raw_path,
+                binding=binding,
+                local_path=None,
             )
     except (OSError, ValueError):
         pass
     return None
 
 
-def _bind_embedding_checkpoint(pipeline: object) -> None:
-    """Store one construction-edge observation; never refresh it later."""
-    if hasattr(pipeline, _EMBEDDING_BINDING_ATTR):
-        return
-    binding = _resolve_embedding_checkpoint(pipeline)
+def _pipeline_config_path() -> Path | None:
+    """Resolve the exact local/cached pipeline config used to plan construction."""
+    configured = Path(DIARIZE_MODEL)
     try:
+        return configured.resolve(strict=True)
+    except OSError:
+        pass
+    if "@" in DIARIZE_MODEL:
+        model_id, revision = DIARIZE_MODEL.rsplit("@", 1)
+    else:
+        model_id, revision = DIARIZE_MODEL, None
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(
+            model_id,
+            "config.yaml",
+            revision=revision,
+            cache_dir=config.AUDIO_CACHE,
+        )
+        if isinstance(cached, str):
+            return Path(cached).absolute()
+    except (ImportError, OSError, ValueError):
+        pass
+    return None
+
+
+def _prepare_pipeline_load() -> _PipelineLoadPlan:
+    """Pin the nested embedding source in a private pipeline-config copy."""
+    config_path = _pipeline_config_path()
+    if config_path is None:
+        return _PipelineLoadPlan(config_yaml=None, authority=None)
+    try:
+        with config_path.open("r", encoding="utf-8") as stream:
+            document: Any = yaml.safe_load(stream)
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return _PipelineLoadPlan(config_yaml=None, authority=None)
+    if not isinstance(document, dict):
+        return _PipelineLoadPlan(config_yaml=None, authority=None)
+
+    authority = None
+    pipeline_config = document.get("pipeline")
+    if isinstance(pipeline_config, dict):
+        params = pipeline_config.get("params")
+        if isinstance(params, dict):
+            authority = _embedding_load_authority(params.get("embedding"))
+            if authority is not None:
+                params["embedding"] = authority.loader_value
+    try:
+        config_yaml = yaml.safe_dump(
+            document,
+            allow_unicode=True,
+            sort_keys=False,
+        )
+    except yaml.YAMLError:
+        return _PipelineLoadPlan(config_yaml=None, authority=None)
+    return _PipelineLoadPlan(config_yaml=config_yaml, authority=authority)
+
+
+def _store_embedding_checkpoint(
+    pipeline: object,
+    binding: _EmbeddingCheckpointBinding | None,
+    model: str | None = None,
+) -> None:
+    """Carry a pre-construction binding onto the resident pipeline once."""
+    try:
+        if model is not None:
+            setattr(pipeline, _EMBEDDING_MODEL_ATTR, model)
         setattr(pipeline, _EMBEDDING_BINDING_ATTR, binding)
     except (AttributeError, TypeError):
         log.warning("could not bind embedding checkpoint provenance to pipeline")
@@ -247,7 +363,11 @@ def _build_provenance(
     audio_profile: Mapping[str, object] | None,
     torch_version: str,
 ) -> dict[str, object]:
-    embedding_model = getattr(pipeline, "embedding", "unresolved")
+    embedding_model = getattr(
+        pipeline,
+        _EMBEDDING_MODEL_ATTR,
+        getattr(pipeline, "embedding", "unresolved"),
+    )
     if not isinstance(embedding_model, str) or not embedding_model:
         embedding_model = "unresolved"
     audio: dict[str, object] = (
@@ -379,8 +499,12 @@ def _ensure_torchaudio_compat() -> None:
         ta.list_audio_backends = list_audio_backends
 
 
-def _load_pipeline(pipeline_cls, token: str):
-    """Load the pyannote checkpoint under torch 2.11's weights_only default.
+def _call_pipeline_from_pretrained(
+    pipeline_cls,
+    token: str,
+    checkpoint_path: str | Path,
+):
+    """Call pyannote under torch 2.11's weights_only compatibility context.
 
     torch >= 2.6 loads with ``weights_only=True``, which rejects the plain Python
     objects pyannote pickles into its checkpoints ("Unsupported global"). We
@@ -391,8 +515,6 @@ def _load_pipeline(pipeline_cls, token: str):
     ``torch.serialization.safe_globals``. That context is a no-op on older torch
     that already defaults to ``weights_only=False``.
     """
-    _configure_pyannote_cache()
-
     import torch
     from pyannote.audio.core.task import (  # pyright: ignore[reportMissingImports]
         Problem,
@@ -405,12 +527,50 @@ def _load_pipeline(pipeline_cls, token: str):
     safe_globals = getattr(torch.serialization, "safe_globals", None)
     if safe_globals is None:  # torch < 2.4: weights_only already defaults to False
         return pipeline_cls.from_pretrained(
-            DIARIZE_MODEL, use_auth_token=token, cache_dir=config.AUDIO_CACHE
+            checkpoint_path,
+            use_auth_token=token,
+            cache_dir=config.AUDIO_CACHE,
         )
     with safe_globals(allow):
         return pipeline_cls.from_pretrained(
-            DIARIZE_MODEL, use_auth_token=token, cache_dir=config.AUDIO_CACHE
+            checkpoint_path,
+            use_auth_token=token,
+            cache_dir=config.AUDIO_CACHE,
         )
+
+
+def _load_pipeline(pipeline_cls, token: str):
+    """Construct a pipeline with loader-authoritative embedding provenance."""
+    _configure_pyannote_cache()
+    plan = _prepare_pipeline_load()
+    if plan.config_yaml is None:
+        pl = _call_pipeline_from_pretrained(pipeline_cls, token, DIARIZE_MODEL)
+    else:
+        with tempfile.TemporaryDirectory(prefix="voxweave-pyannote-") as temp_dir:
+            pinned_config = Path(temp_dir) / "config.yaml"
+            pinned_config.write_text(plan.config_yaml, encoding="utf-8")
+            pl = _call_pipeline_from_pretrained(pipeline_cls, token, pinned_config)
+    if pl is None:
+        return None
+
+    authority = plan.authority
+    if authority is not None and authority.local_path is not None:
+        try:
+            after = _sha256_file(authority.local_path)
+        except OSError as exc:
+            raise EmbeddingCheckpointChangedError(
+                "embedding checkpoint changed during pipeline construction"
+            ) from exc
+        if after != authority.binding.sha256:
+            raise EmbeddingCheckpointChangedError(
+                "embedding checkpoint changed during pipeline construction"
+            )
+    _store_embedding_checkpoint(
+        pl,
+        authority.binding if authority is not None else None,
+        authority.provenance_value if authority is not None else None,
+    )
+    return pl
 
 
 def _get_pipeline(token: str):
@@ -438,7 +598,6 @@ def _get_pipeline(token: str):
                 f"https://hf.co/{DIARIZE_MODEL} (and its segmentation model) and "
                 "set VOXWEAVE_HF_TOKEN / HF_TOKEN"
             )
-        _bind_embedding_checkpoint(pl)
         if torch.cuda.is_available():
             pl.to(torch.device("cuda"))
         _pipeline = pl

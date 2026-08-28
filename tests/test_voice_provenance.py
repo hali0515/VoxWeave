@@ -1,17 +1,22 @@
 import builtins
 import hashlib
+import json
 import os
 import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TypeVar
 
+import pytest
 import soundfile as sf
+import yaml
 
 from voxweave import backend, config, diarize, voicematch
 
 
 EMBEDDING_REPO = "pyannote/wespeaker-voxceleb-resnet34-LM"
+_PipelineT = TypeVar("_PipelineT")
 
 
 def _cache_hf_file(
@@ -45,9 +50,30 @@ def _real_shape_pipeline(repo_id: str = EMBEDDING_REPO) -> SimpleNamespace:
     )
 
 
-def _bind_pipeline(pipeline: SimpleNamespace) -> SimpleNamespace:
-    diarize._bind_embedding_checkpoint(pipeline)
+def _bind_pipeline(pipeline: _PipelineT) -> _PipelineT:
+    embedder = getattr(pipeline, "_embedding", None)
+    authority = diarize._embedding_load_authority(getattr(embedder, "embedding", None))
+    diarize._store_embedding_checkpoint(
+        pipeline,
+        authority.binding if authority is not None else None,
+    )
     return pipeline
+
+
+def _pipeline_config(tmp_path: Path, embedding: str | Path) -> Path:
+    path = tmp_path / "pipeline.yaml"
+    path.write_text(
+        json.dumps(
+            {
+                "pipeline": {
+                    "name": "example.Pipeline",
+                    "params": {"embedding": os.fspath(embedding)},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _capture_pyannote_cache(monkeypatch, cache_dir: Path | str | None) -> None:
@@ -258,7 +284,7 @@ def test_get_pipeline_defaults_pyannote_cache_before_import(tmp_path, monkeypatc
     assert import_observations == [expected_cache]
 
 
-def test_get_pipeline_stores_path_and_digest_at_construction(tmp_path, monkeypatch):
+def test_load_pipeline_pins_hub_revision_and_stores_digest(tmp_path, monkeypatch):
     audio_cache = tmp_path / "audio"
     pyannote_cache = audio_cache / diarize.PYANNOTE_CACHE_SUBDIR
     snapshot, digest = _cache_hf_file(
@@ -267,28 +293,148 @@ def test_get_pipeline_stores_path_and_digest_at_construction(tmp_path, monkeypat
         "pytorch_model.bin",
         b"construction-edge checkpoint",
     )
+    pipeline_config = _pipeline_config(tmp_path, EMBEDDING_REPO)
     monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
+    monkeypatch.setattr(diarize, "DIARIZE_MODEL", os.fspath(pipeline_config))
     monkeypatch.setenv(diarize.PYANNOTE_CACHE_ENV, str(pyannote_cache))
-    monkeypatch.setattr(diarize, "_pipeline", None)
-    monkeypatch.setattr(diarize, "_ensure_torchaudio_compat", lambda: None)
-
-    fake_package = types.ModuleType("pyannote")
-    fake_package.__path__ = []
-    fake_audio = types.ModuleType("pyannote.audio")
-    setattr(fake_audio, "Pipeline", object())
-    monkeypatch.setitem(sys.modules, "pyannote", fake_package)
-    monkeypatch.setitem(sys.modules, "pyannote.audio", fake_audio)
     _capture_pyannote_cache(monkeypatch, pyannote_cache)
 
-    loaded = _real_shape_pipeline()
-    loaded.to = lambda _device: None
-    monkeypatch.setattr(diarize, "_load_pipeline", lambda _cls, _token: loaded)
+    loaded = _MutatingPipeline(EMBEDDING_REPO, lambda _call: None)
+    seen_embedding: list[str] = []
 
-    assert diarize._get_pipeline("hf_test") is loaded
+    def construct(_cls, _token, checkpoint_path):
+        document = yaml.safe_load(Path(checkpoint_path).read_text(encoding="utf-8"))
+        seen_embedding.append(document["pipeline"]["params"]["embedding"])
+        return loaded
+
+    monkeypatch.setattr(diarize, "_call_pipeline_from_pretrained", construct)
+
+    assert diarize._load_pipeline(object, "hf_test") is loaded
+    assert seen_embedding == [os.fspath(snapshot.resolve(strict=True))]
     binding = getattr(loaded, diarize._EMBEDDING_BINDING_ATTR)
     assert binding.path == snapshot.resolve(strict=True)
     assert binding.sha256 == digest
     assert diarize._checkpoint_identity(loaded) == digest
+
+
+def test_load_pipeline_records_unresolved_when_hub_pin_is_unavailable(
+    tmp_path, monkeypatch
+):
+    empty_cache = tmp_path / "empty-pyannote-cache"
+    pipeline_config = _pipeline_config(tmp_path, EMBEDDING_REPO)
+    monkeypatch.setattr(diarize, "DIARIZE_MODEL", os.fspath(pipeline_config))
+    _capture_pyannote_cache(monkeypatch, empty_cache)
+
+    loaded = _MutatingPipeline(EMBEDDING_REPO, lambda _call: None)
+    seen_embedding: list[str] = []
+
+    def construct(_cls, _token, checkpoint_path):
+        document = yaml.safe_load(Path(checkpoint_path).read_text(encoding="utf-8"))
+        seen_embedding.append(document["pipeline"]["params"]["embedding"])
+        return loaded
+
+    monkeypatch.setattr(diarize, "_call_pipeline_from_pretrained", construct)
+
+    assert diarize._load_pipeline(object, "hf_test") is loaded
+    assert seen_embedding == [EMBEDDING_REPO]
+    assert diarize._checkpoint_identity(loaded) == "unresolved"
+
+
+def test_hub_ref_mutated_inside_construction_keeps_pinned_identity(
+    tmp_path, monkeypatch
+):
+    cache_root = tmp_path / "captured-pyannote"
+    snapshot_a, digest_a = _cache_hf_file(
+        cache_root,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"checkpoint consumed during construction",
+        revision="1" * 40,
+    )
+    _snapshot_b, digest_b = _cache_hf_file(
+        cache_root,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"checkpoint selected by the flipped ref",
+        revision="2" * 40,
+        ref_name=None,
+    )
+    repo_cache = cache_root / f"models--{EMBEDDING_REPO.replace('/', '--')}"
+    ref = repo_cache / "refs" / "main"
+    pipeline_config = _pipeline_config(tmp_path, EMBEDDING_REPO)
+    monkeypatch.setattr(diarize, "DIARIZE_MODEL", os.fspath(pipeline_config))
+    monkeypatch.setenv(diarize.PYANNOTE_CACHE_ENV, str(cache_root))
+    _capture_pyannote_cache(monkeypatch, cache_root)
+
+    consumed: list[str] = []
+
+    def construct(_cls, _token, checkpoint_path):
+        document = yaml.safe_load(Path(checkpoint_path).read_text(encoding="utf-8"))
+        pinned = document["pipeline"]["params"]["embedding"]
+        loaded_path = Path(pinned)
+        assert loaded_path == snapshot_a.resolve(strict=True)
+        consumed.append(hashlib.sha256(loaded_path.read_bytes()).hexdigest())
+        ref.write_text("2" * 40, encoding="utf-8")
+        return _MutatingPipeline(pinned, lambda _call: None)
+
+    monkeypatch.setattr(diarize, "_call_pipeline_from_pretrained", construct)
+    pipeline = diarize._load_pipeline(object, "hf_test")
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: pipeline)
+    wav = _silent_wav(tmp_path)
+
+    first = diarize.diarize_turns(wav, token="hf_test", want_embeddings=True)
+    second = diarize.diarize_turns(wav, token="hf_test", want_embeddings=True)
+
+    assert consumed == [digest_a]
+    assert digest_a != digest_b
+    assert ref.read_text(encoding="utf-8") == "2" * 40
+    assert first.provenance["embedding_model"] == EMBEDDING_REPO
+    assert first.provenance["embedding_checkpoint"] == digest_a
+    assert second.provenance["embedding_checkpoint"] == digest_a
+
+
+def test_local_checkpoint_mutated_inside_construction_refuses_capture(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "embedding.ckpt"
+    loaded_bytes = b"local checkpoint consumed during construction"
+    replacement = b"local checkpoint replaced before constructor returned"
+    checkpoint.write_bytes(loaded_bytes)
+    pipeline_config = _pipeline_config(tmp_path, checkpoint)
+    monkeypatch.setattr(diarize, "DIARIZE_MODEL", os.fspath(pipeline_config))
+
+    constructed: list[_MutatingPipeline] = []
+    consumed: list[str] = []
+
+    def construct(_cls, _token, checkpoint_path):
+        document = yaml.safe_load(Path(checkpoint_path).read_text(encoding="utf-8"))
+        configured = Path(document["pipeline"]["params"]["embedding"])
+        assert configured == checkpoint.resolve(strict=True)
+        consumed.append(hashlib.sha256(configured.read_bytes()).hexdigest())
+        configured.write_bytes(replacement)
+        loaded = _MutatingPipeline(configured, lambda _call: None)
+        constructed.append(loaded)
+        return loaded
+
+    monkeypatch.setattr(diarize, "_call_pipeline_from_pretrained", construct)
+    monkeypatch.setattr(
+        diarize,
+        "_get_pipeline",
+        lambda token: diarize._load_pipeline(object, token),
+    )
+
+    with pytest.raises(
+        diarize.EmbeddingCheckpointChangedError,
+        match="changed during pipeline construction",
+    ):
+        diarize.diarize_turns(
+            _silent_wav(tmp_path), token="hf_test", want_embeddings=True
+        )
+
+    assert consumed == [hashlib.sha256(loaded_bytes).hexdigest()]
+    assert checkpoint.read_bytes() == replacement
+    assert len(constructed) == 1
+    assert not hasattr(constructed[0], diarize._EMBEDDING_BINDING_ATTR)
 
 
 def test_hub_ref_mutated_during_inference_keeps_construction_identity(
@@ -317,7 +463,7 @@ def test_hub_ref_mutated_during_inference_keeps_construction_identity(
         ref.write_text("2" * 40, encoding="utf-8")
 
     pipeline = _MutatingPipeline(EMBEDDING_REPO, mutate_ref)
-    diarize._bind_embedding_checkpoint(pipeline)
+    _bind_pipeline(pipeline)
     monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: pipeline)
 
     result = diarize.diarize_turns(
@@ -340,7 +486,7 @@ def test_local_checkpoint_mutated_during_inference_keeps_construction_identity(
         checkpoint,
         lambda _call: checkpoint.write_bytes(replacement),
     )
-    diarize._bind_embedding_checkpoint(pipeline)
+    _bind_pipeline(pipeline)
     monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: pipeline)
 
     result = diarize.diarize_turns(
@@ -363,7 +509,7 @@ def test_construction_identity_survives_multiple_diarize_calls(tmp_path, monkeyp
         checkpoint.write_bytes(f"replacement {call}".encode())
 
     pipeline = _MutatingPipeline(checkpoint, mutate_each_call)
-    diarize._bind_embedding_checkpoint(pipeline)
+    _bind_pipeline(pipeline)
     monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: pipeline)
     wav = _silent_wav(tmp_path)
 
