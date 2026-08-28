@@ -1,5 +1,6 @@
 .PHONY: install reinstall uninstall dev test lint typecheck \
 	quality quality-segmentation quality-shadow-segmentation \
+	quality-shadow-segmentation-full \
 	quality-record-segmentation
 
 # Install as a global uv tool (end-user mode): puts the voxweave command on PATH.
@@ -122,17 +123,23 @@ quality-segmentation:
 # Deliberately NOT part of `quality`: the shadow ships nothing, so a v2 regression
 # during soak must not block a PR that changed neither engine.
 #
-# The perturbation flags are part of the frozen entry point on purpose. AD-2's
-# influence-cell FAIL is one of the three declared exits, and it is unreachable
-# without --perturb: a gate that only fires when a human remembers a flag is not
-# a gate. The slice is bounded so it stays affordable -- one magnitude (50 ms),
-# near-cliff gaps only, one case per language -- which costs roughly 9 extra
-# minutes on top of the base run and its ablation replays (measured: en-01 220
-# probes / 74 s, ja-01 279 / 37 s, zh-01 1052 / 423 s; every probe is two full
-# replays of the case). Widen it by hand when the question is worth the wall
-# clock: --perturb-case, --perturb-magnitude and dropping
-# --perturb-near-cliff-only all take the run back toward full AD-2 coverage.
+# The routine lane is an explicitly bounded smoke slice: base corpus + coarse
+# gates + two near-cliff probes in one case per language, with ablation skipped.
+# It keeps AD-2's exit driver live and is budgeted in minutes, not hours. The
+# exhaustive historical slice (1,551 probes plus 14 ablations) is retained below
+# as `quality-shadow-segmentation-full`; an independent frozen-entry-point run on
+# 2026-08-28 took 4 h 58 min, so it is never described as the routine lane.
 quality-shadow-segmentation:
+	uv run --extra $(VARIANT) python scripts/calib_segmentation.py shadow \
+	  --corpus $(SEG_CORPUS) \
+	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \
+	  --no-ablation \
+	  --perturb --perturb-mode single_gap --perturb-magnitude 50 \
+	  --perturb-near-cliff-only --perturb-max-probes 2 \
+	  --perturb-case en-01 --perturb-case ja-01 --perturb-case zh-01 \
+	  --json-out $(SEG_SHADOW_REPORT) --check
+
+quality-shadow-segmentation-full:
 	uv run --extra $(VARIANT) python scripts/calib_segmentation.py shadow \
 	  --corpus $(SEG_CORPUS) \
 	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \

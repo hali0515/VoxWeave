@@ -131,6 +131,16 @@ def _segment(case: dict, **kwargs) -> pipeline.SegmentationResult:
     )
 
 
+def _incomplete_diagnostic(artifact: dict) -> dict:
+    """Unwrap a deliberately non-schema-2 fail-open diagnostic in tests."""
+    assert artifact["kind"] == "segmentation-shadow-incomplete"
+    assert artifact["schema_version"] == 1
+    assert artifact["error"]["type"] == "IncompleteShadowArtifact"
+    diagnostic = artifact["diagnostic"]
+    assert isinstance(diagnostic, dict) and diagnostic["schema_version"] == 1
+    return diagnostic
+
+
 def _canonical(value: object) -> str:
     """Byte-stable JSON: sorted keys, so a dict's build order cannot leak in."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -184,6 +194,7 @@ V2_ONLY_MODULES = (
     "voxweave.core.authority",
     "voxweave.core.canonical_text",
     "voxweave.core.finalizer",
+    "voxweave.core.shadow_schema",
     "voxweave.core.speaker_evidence",
     "voxweave.core.subunit",
     "voxweave.core.partition_check",
@@ -425,6 +436,7 @@ def test_overlapping_fallbacks_are_flagged_as_unusable_conservation_evidence(
     monkeypatch.setattr(boundary_v2, "optimize_document", with_overlapping_fallbacks)
     artifact = _segment(_case_two_intervals()).shadow
     assert artifact is not None
+    artifact = _incomplete_diagnostic(artifact)
     coverage = artifact["coverage"]
     assert coverage["fallback_unit_ranges"][:2] == [[0, 7], [0, 7]]
     assert coverage["fallback_ranges_overlap"] is True
@@ -579,10 +591,11 @@ def test_an_invalid_profile_reports_itself_and_nothing_else(shadow_on):
         _case_plain(), thresholds={**gap_thresholds("en"), "clause_ms": 0.0}
     ).shadow
     assert artifact is not None
-    assert [v["key"] for v in artifact["invalid_profile"]] == ["clause_ms"]
-    assert artifact["invalid_profile"][0]["reason"] == "not-positive"
-    assert "lanes" not in artifact
-    assert "totals" not in artifact
+    diagnostic = _incomplete_diagnostic(artifact)
+    assert [v["key"] for v in diagnostic["invalid_profile"]] == ["clause_ms"]
+    assert diagnostic["invalid_profile"][0]["reason"] == "not-positive"
+    assert "lanes" not in diagnostic
+    assert "totals" not in diagnostic
     # The ledgers still ride along: the harness reads them to decide the exit.
     assert artifact["shadow_degraded"] == []
     assert artifact["production_degraded"] == []
@@ -647,8 +660,9 @@ def test_the_projection_cross_check_really_compares_two_derivations(
     monkeypatch.setattr(boundary_v2, "_document_partition", wrong)
     artifact = _segment(_case_two_intervals()).shadow
     assert artifact is not None
-    check = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v2"]["projection_cross_check"]
-    assert check["agrees"] is False
+    assert artifact["kind"] == "segmentation-shadow-error"
+    assert artifact["schema_version"] == 1
+    assert "projection_cross_check.agrees" in artifact["error"]["detail"]
 
 
 def test_a_held_chain_waiver_survives_into_the_core_and_overlay_stages(shadow_on):
@@ -713,6 +727,7 @@ def test_an_unprojectable_v1_stream_is_measured_without_a_v1_reference(
     )
     artifact = _segment(_case_plain()).shadow
     assert artifact is not None
+    artifact = _incomplete_diagnostic(artifact)
     assert artifact["v1_projection"]["unprojected"] is True
     assert artifact["v1_projection"]["cut_count"] is None
     assert artifact["coverage"]["v1_unprojected"] is True
@@ -755,6 +770,7 @@ def test_coverage_reports_the_coarse_granularity_class_separately(shadow_on):
         smart_split_kwargs={"max_line_length": 18, "max_lines": 2},
     ).shadow
     assert artifact is not None
+    artifact = _incomplete_diagnostic(artifact)
     coverage = artifact["coverage"]
     assert coverage["coarse_granularity_intervals"] >= 1
     assert coverage["fallback_intervals"] >= coverage["coarse_granularity_intervals"]

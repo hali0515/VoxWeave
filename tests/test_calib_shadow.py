@@ -24,6 +24,7 @@ because somebody recorded a new golden case.
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import platform
@@ -527,6 +528,37 @@ def test_ablation_reports_one_row_per_term(corpus_path: Path) -> None:
     assert migration["deltas"]["en"]["cue_count"] == 0
 
 
+def test_tracked_ablation_domain_is_fixed_recorded_and_three_language() -> None:
+    corpus = calib.load_corpus(calib.DEFAULT_CORPUS)
+    selected, record = calib.ablation_case_selection(
+        corpus.cases, tracked_registry=True
+    )
+    assert {row["case"] for row in record["excluded_cases"]} == {"ja-02", "ja-03"}
+    assert record["candidate_cases"] == [case.id for case in corpus.cases]
+    assert record["requested_cases"] == [case.id for case in selected]
+    assert {case.language for case in selected} == {"en", "ja", "zh"}
+    assert len(selected) == 18
+    custom, custom_record = calib.ablation_case_selection(
+        corpus.cases, tracked_registry=False
+    )
+    assert list(custom) == list(corpus.cases)
+    assert custom_record["excluded_cases"] == []
+
+
+def test_ablation_with_zero_requested_evidence_is_invalid() -> None:
+    table = calib.run_ablation([], {})
+    assert table["complete"] is False
+    assert len(table["unknown"]) == len(calib.ABLATION_TERMS)
+    assert all(row["complete"] is False for row in table["rows"])
+    assert all(row["coverage"]["requested_cases"] == [] for row in table["rows"])
+    assert calib.shadow_exit_code([], [], [], [], table["unknown"]) == cc.EXIT_INVALID
+
+
+def test_missing_n6_validator_block_is_invalid_not_zero() -> None:
+    with pytest.raises(cc.CalibrationError, match="missing validator block"):
+        calib._speech_truncation_count(None)
+
+
 # --------------------------------------------------------------------------- #
 # Perturbation
 # --------------------------------------------------------------------------- #
@@ -845,6 +877,67 @@ def test_perturbation_driver_shape(corpus_path: Path) -> None:
     )
 
 
+def test_perturbation_with_zero_evidence_is_nonexhaustive_and_invalid() -> None:
+    block = calib.run_perturbation(
+        [], modes=["single_gap"], magnitudes=[20], max_probes=0
+    )
+    assert block["exhaustive"] is False
+    assert block["classes"]["P1-unit-stability"] == {
+        "attempted": 0,
+        "failures": 0,
+        "status": "invalid",
+    }
+    assert block["unknown"]
+    assert calib.shadow_exit_code([], [], [], block["unknown"]) == cc.EXIT_INVALID
+
+
+def test_shadow_report_times_the_complete_command_phases(
+    corpus_path: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "shadow-timing.json"
+    assert (
+        _run_cli(
+            [
+                "shadow",
+                "--corpus",
+                str(corpus_path),
+                "--json-out",
+                str(out),
+                "--no-ablation",
+            ]
+        )
+        == cc.EXIT_OK
+    )
+    timing = json.loads(out.read_text(encoding="utf-8"))["timing"]
+    assert set(timing) == {
+        "ablation_wall_s",
+        "base_case_sum_s",
+        "base_wall_s",
+        "coarse_wall_s",
+        "other_wall_s",
+        "perturbation_wall_s",
+        "report_wall_s",
+        "slowest_case",
+        "slowest_wall_s",
+        "total_wall_s",
+    }
+    assert timing["total_wall_s"] >= timing["base_wall_s"]
+    assert (
+        timing["total_wall_s"]
+        >= sum(
+            timing[key]
+            for key in (
+                "base_wall_s",
+                "coarse_wall_s",
+                "ablation_wall_s",
+                "perturbation_wall_s",
+                "report_wall_s",
+            )
+        )
+        - 0.001
+    )
+
+
 # --------------------------------------------------------------------------- #
 # The adopted_v1 duplicate-cue annotation
 # --------------------------------------------------------------------------- #
@@ -979,59 +1072,20 @@ def _shadow_case_stub(case_id: str = "zh-01") -> Any:
     )
 
 
-def _measurable(artifact: dict) -> dict:
-    """Add the fields ``shadow_measurement_errors`` reads to a hand-built artifact."""
-    artifact["lanes"][calib.SHADOW_LANE_CORE]["v2"]["projection_cross_check"] = {
-        "agrees": True,
-        "mode": "surface-reconciled",
-    }
-    artifact["coverage"]["v1_unprojected"] = False
-    artifact["coverage"]["coarse_granularity_intervals"] = 0
-    artifact["v1_projection"] = {
-        "cut_count": 1,
-        "mode": "parent-surface-translated",
-        "unprojected": False,
-    }
-    for row in artifact["lanes"][calib.SHADOW_LANE_FINALIZER]["rows"].values():
-        row["finalizer"] = {
-            "stability_errors": [],
-            "trace_errors": [],
-            "valid": True,
-        }
-    finalizer_v2 = artifact["lanes"][calib.SHADOW_LANE_FINALIZER]["rows"]["v2"]
-    finalizer_v2["cues"] = [{"unit_range": [0, 8]}]
-    artifact["preview_fidelity"] = {
-        "checked_edges": 1,
-        "mismatches": [],
-        "scored_edges": 1,
-        "selected_rows": {
-            row_id: {"cue_count": 1, "edge_count": 1, "mismatches": []}
-            for row_id in ("v2", "v2-speaker-off")
-        },
-        "uncheckable_edges": 0,
-    }
-    zero = {
-        "buckets": {
-            "expressed": 0,
-            "policy_filtered": 0,
-            "survived_expressible_but_missed": 0,
-            "unattributed_loss": 0,
-            "unexpressible": 0,
-        },
-        "raw_in_speech_turn_changes": 0,
-    }
-    artifact["speaker_evidence"] = {
-        "measurement": dict(zero),
-        "measurement_refusal": None,
-        "off_row_measurement": dict(zero),
-        "projection": {
-            "cue_count": 1,
-            "named_multi_cues_unannotated": 0,
-            "range_count": 1,
-            "status": "verified",
-        },
-    }
-    return artifact
+_MEASURABLE_ARTIFACT: dict[str, Any] | None = None
+
+
+def _measurable(_artifact: dict) -> dict:
+    """Return a real closed schema-2 payload for one-field mutation tests."""
+    global _MEASURABLE_ARTIFACT
+    if _MEASURABLE_ARTIFACT is None:
+        from tests.test_shadow_hook import _case_plain, _segment
+
+        with calib._forced_shadow(True):
+            artifact = _segment(_case_plain()).shadow
+        assert isinstance(artifact, dict) and artifact["schema_version"] == 2
+        _MEASURABLE_ARTIFACT = artifact
+    return copy.deepcopy(_MEASURABLE_ARTIFACT)
 
 
 @pytest.mark.parametrize("stage", calib.SHADOW_REQUIRED_STAGES)
@@ -1065,7 +1119,10 @@ def test_a_forged_finalizer_trace_invalidates_the_measurement() -> None:
     ] = ["forged neighbour snapshot"]
     counts = calib.shadow_violation_counts(artifact)
     problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
-    assert any("trace_errors" in line and "'v1'" in line for line in problems)
+    assert any(
+        "delivery_finalizer.rows.v1" in line and "trace_errors" in line
+        for line in problems
+    )
 
 
 def test_a_preview_fidelity_mismatch_invalidates_the_measurement() -> None:
@@ -1073,7 +1130,7 @@ def test_a_preview_fidelity_mismatch_invalidates_the_measurement() -> None:
     artifact["preview_fidelity"]["mismatches"] = [{"edge_index": 0}]
     counts = calib.shadow_violation_counts(artifact)
     problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
-    assert any("N7 preview fidelity" in line for line in problems)
+    assert any("preview_fidelity.mismatches" in line for line in problems)
 
 
 def test_an_inconsistent_speaker_projection_invalidates_the_measurement() -> None:
@@ -1089,8 +1146,7 @@ def test_speaker_on_off_conservation_is_an_invalid_measurement_precondition() ->
     artifact["speaker_evidence"]["measurement"]["raw_in_speech_turn_changes"] = 1
     counts = calib.shadow_violation_counts(artifact)
     problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
-    assert any("does not conserve" in line for line in problems)
-    assert any("one raw denominator" in line for line in problems)
+    assert any("do not conserve" in line for line in problems)
 
 
 def test_a_disagreeing_projection_cross_check_invalidates_the_measurement() -> None:
@@ -1107,7 +1163,7 @@ def test_a_disagreeing_projection_cross_check_invalidates_the_measurement() -> N
     }
     counts = calib.shadow_violation_counts(artifact)
     problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
-    assert any("disagree" in line for line in problems)
+    assert any("projection_cross_check.agrees" in line for line in problems)
 
 
 def test_a_missing_projection_cross_check_invalidates_the_measurement() -> None:
@@ -1115,7 +1171,7 @@ def test_a_missing_projection_cross_check_invalidates_the_measurement() -> None:
     artifact["lanes"][calib.SHADOW_LANE_CORE]["v2"].pop("projection_cross_check")
     counts = calib.shadow_violation_counts(artifact)
     problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
-    assert any("cross-check" in line for line in problems)
+    assert any("projection_cross_check" in line for line in problems)
 
 
 def test_an_unprojected_v1_stream_invalidates_the_measurement() -> None:
@@ -1125,7 +1181,10 @@ def test_an_unprojected_v1_stream_invalidates_the_measurement() -> None:
     artifact["v1_projection"]["mode"] = "stream-ends-at-char-26-of-33"
     counts = calib.shadow_violation_counts(artifact)
     problems = calib.shadow_measurement_errors(_shadow_case_stub(), artifact, counts)
-    assert any("no v1 reference" in line for line in problems)
+    assert any(
+        "v1_unprojected" in line or "v1_projection.unprojected" in line
+        for line in problems
+    )
 
 
 def test_measurement_errors_outrank_a_failed_gate() -> None:
@@ -1246,9 +1305,13 @@ def test_the_frozen_shadow_target_arms_the_ad2_exit_driver() -> None:
     assert "--perturb-near-cliff-only" in target
     assert "--perturb-magnitude 50" in target
     assert "--perturb-mode single_gap" in target
+    assert "--perturb-max-probes 2" in target
+    assert "--no-ablation" in target
     for case in ("en-01", "ja-01", "zh-01"):
         assert f"--perturb-case {case}" in target
     assert "--check" in target
+    assert "quality-shadow-segmentation-full:" in makefile
+    assert "4 h 58 min" in makefile
 
 
 def test_exit_driving_stage_set_is_partition_checks_not_a_restated_literal() -> None:

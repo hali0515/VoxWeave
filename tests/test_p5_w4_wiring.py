@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
@@ -35,6 +36,142 @@ def test_live_artifact_is_complete_schema_two(monkeypatch) -> None:
     assert all(
         row["edge_count"] == row["cue_count"] and not row["mismatches"]
         for row in artifact["preview_fidelity"]["selected_rows"].values()
+    )
+
+
+def test_live_admission_refuses_a_premature_optimizer_schema_two(monkeypatch) -> None:
+    from voxweave.core import boundary_v2
+
+    monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
+    monkeypatch.setattr(boundary_v2, "SCHEMA_VERSION", 2)
+    artifact = _segment(_case_plain()).shadow
+    assert artifact is not None
+    assert artifact["schema_version"] == 1
+    assert artifact["kind"] == "segmentation-shadow-error"
+    assert "requires a schema-1 optimizer payload" in artifact["error"]["detail"]
+
+
+def test_live_post_assembly_validator_rejects_a_deleted_required_block(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
+    real_assembler = pipeline._shadow_v2_artifact
+
+    def omit_authorities(*args, **kwargs):
+        artifact = real_assembler(*args, **kwargs)
+        artifact.pop("authorities")
+        return artifact
+
+    monkeypatch.setattr(pipeline, "_shadow_v2_artifact", omit_authorities)
+    artifact = _segment(_case_plain()).shadow
+    assert artifact is not None
+    assert artifact["schema_version"] == 1
+    assert artifact["kind"] == "segmentation-shadow-error"
+    assert "artifact: missing keys authorities" in artifact["error"]["detail"]
+
+
+def test_required_schema_two_blocks_cannot_be_deleted(monkeypatch) -> None:
+    from voxweave.core.shadow_schema import validate_shadow_v2_payload
+
+    monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
+    original = _segment(_case_plain()).shadow
+    assert original is not None
+    for key in (
+        "subunit_split",
+        "delta_registry",
+        "margin_summary",
+        "diff_classification",
+        "authorities",
+        "refiner_comparison",
+    ):
+        artifact = dict(original)
+        artifact.pop(key)
+        errors = validate_shadow_v2_payload(artifact)
+        assert any(f"missing keys {key}" in error for error in errors), key
+        harness_errors = calib.shadow_measurement_errors(
+            cast(Any, SimpleNamespace(id="schema-mutation")), artifact, {}
+        )
+        assert any("schema-2 structural error" in error for error in harness_errors)
+
+
+def test_schema_two_nested_evidence_shapes_are_closed(monkeypatch) -> None:
+    from voxweave.core.shadow_schema import validate_shadow_v2_payload
+
+    monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
+    original = _segment(_case_speakers()).shadow
+    assert original is not None
+
+    mutations: list[tuple[dict[str, Any], str]] = []
+    dual_form = cast(dict[str, Any], copy.deepcopy(original))
+    dual_form["coverage"]["dual_form_unmeasured"] = 0
+    mutations.append((dual_form, "dual_form_unmeasured: expected boolean"))
+
+    legacy_margin = cast(dict[str, Any], copy.deepcopy(original))
+    legacy_margin["intervals"][0]["low_margin"] = True
+    mutations.append((legacy_margin, "legacy margin keys remain"))
+
+    invalid_margin = cast(dict[str, Any], copy.deepcopy(original))
+    invalid_margin["margin_summary"]["min"] = (
+        float(invalid_margin["margin_summary"]["p50"]) + 1.0
+    )
+    mutations.append((invalid_margin, "expected min <= p05 <= p50"))
+
+    invalid_diff = cast(dict[str, Any], copy.deepcopy(original))
+    invalid_diff["diff_classification"]["relation_failures"] = "zero"
+    mutations.append((invalid_diff, "relation_failures: expected non-negative integer"))
+
+    malformed_trigger = cast(dict[str, Any], copy.deepcopy(original))
+    malformed_trigger["diff_classification"]["independent_fired"] = [{}]
+    mutations.append((malformed_trigger, "independent_fired: expected strings"))
+
+    invalid_root = cast(dict[str, Any], copy.deepcopy(original))
+    invalid_root["authorities"]["events"][0].pop("input_kind")
+    mutations.append((invalid_root, "missing keys input_kind"))
+
+    invalid_policy = cast(dict[str, Any], copy.deepcopy(original))
+    invalid_policy["policy_deltas"] = []
+    mutations.append((invalid_policy, "differs from the live policy-2 declaration"))
+
+    for artifact, expected in mutations:
+        assert any(
+            expected in error for error in validate_shadow_v2_payload(artifact)
+        ), expected
+
+
+def test_report_alias_and_fallback_rechecks_are_closed_schema_invariants(
+    monkeypatch,
+) -> None:
+    from voxweave.core.shadow_schema import validate_shadow_v2_payload
+
+    monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
+    original = _segment(_case_plain()).shadow
+    assert original is not None
+
+    alias = cast(dict[str, Any], copy.deepcopy(original))
+    finalizer = alias["lanes"][pipeline.SHADOW_LANE_FINALIZER]["rows"]["v1"][
+        "finalizer"
+    ]
+    finalizer["entries"] = [
+        {"cue_index": 0, "evidence": {"side": "start"}, "kind": "fabricated-time"}
+    ]
+    assert any(
+        "entries/refusals report channels differ" in error
+        for error in validate_shadow_v2_payload(alias)
+    )
+
+    orphan = cast(dict[str, Any], copy.deepcopy(original))
+    orphan["canonical_fallback_rechecks"].append(
+        {
+            "cue_index": 0,
+            "reason": "granularity-unreconciled",
+            "row": "v1",
+            "with_owned_footprint": "word-data",
+            "with_owned_footprint_reason": None,
+        }
+    )
+    assert any(
+        "entries and independent rechecks do not match" in error
+        for error in validate_shadow_v2_payload(orphan)
     )
 
 
@@ -98,10 +235,9 @@ def test_n7_audits_every_scored_edge_against_phase_one(monkeypatch) -> None:
     artifact = _segment(_case_plain()).shadow
     assert artifact is not None
 
-    fidelity = artifact["preview_fidelity"]
-    assert fidelity["scored_edges"] == fidelity["checked_edges"] > 0
-    assert fidelity["uncheckable_edges"] == 0
-    assert fidelity["mismatches"]
+    assert artifact["schema_version"] == 1
+    assert artifact["kind"] == "segmentation-shadow-error"
+    assert "preview_fidelity.mismatches" in artifact["error"]["detail"]
 
 
 def test_speaker_measurement_uses_the_counterfactual_and_v2_ids(monkeypatch) -> None:
@@ -164,7 +300,11 @@ def test_live_speaker_snapshot_precedes_refinement_and_projects_by_origin(
     assert events[1][0] == "project"
     assert events[1][1] > 1
     assert set(events[1][2] or ()) == {0}
-    assert artifact["speaker_evidence"]["attribution"] == "parent-projected"
+    assert artifact["kind"] == "segmentation-shadow-incomplete"
+    assert artifact["schema_version"] == 1
+    assert artifact["diagnostic"]["speaker_evidence"]["attribution"] == (
+        "parent-projected"
+    )
 
 
 def test_margin_summary_replaces_interval_runner_up_fields(monkeypatch) -> None:
@@ -233,6 +373,74 @@ def test_n11_detects_a_missing_producer_trigger(monkeypatch) -> None:
     assert classification["trigger_mismatches"] == ["FD-4"]
     assert classification["independent_fired"] == ["FD-4"]
     assert classification["producer_fired"] == []
+
+
+def test_n11_recomputes_fd7_from_phase_one_not_the_serialized_alias() -> None:
+    from voxweave.core.finalizer import phase1_cue
+    from voxweave.core.segdoc import DisplayProfile
+
+    profile = DisplayProfile(
+        language="en",
+        max_line_length=42,
+        max_lines=2,
+        clause_ms=400.0,
+        vad_skip_ms=1000.0,
+        offline_ms=700.0,
+        min_cue_s=0.5,
+        max_cue_s=7.0,
+        glue_gap_s=0.3,
+        cps=17.0,
+        lag_out_s=0.25,
+        shot_snap_s=0.458,
+    )
+    seed = {
+        "text": "fallback",
+        "start": 0.0,
+        "end": 0.4,
+        "word_data": [{"text": "word", "start": 0.0, "end": 0.4}],
+        "speech_start": 0.0,
+        "speech_end": 0.4,
+    }
+    phase1 = phase1_cue(
+        seed,
+        profile=profile,
+        index=0,
+        expected_footprint="different",
+        unit_range=(0, 1),
+    )
+    assert phase1.reports
+    cue = {
+        "end": phase1.end,
+        "index": 0,
+        "lines": len(phase1.lines),
+        "lyric": False,
+        "speaker_ids": [],
+        "speech_end": phase1.speech_end,
+        "speech_start": phase1.speech_start,
+        "start": phase1.start,
+        "text": phase1.text,
+        "unit_range": [0, 1],
+    }
+    row = {
+        "cues": [cue],
+        "finalizer": {
+            "deltas_fired": [],
+            "entries": [],
+            "refusals": [],
+            "stability_errors": [],
+            "trace": {"cycle": None, "legs": [], "terminal": "fixed-point"},
+            "trace_errors": [],
+        },
+    }
+    classification = pipeline._shadow_diff_classification(
+        row,
+        {"cues": [dict(cue)]},
+        stream=SimpleNamespace(cues=(phase1,), profile=profile),
+        seed_cues=[seed],
+    )
+    assert classification["independent_fired"] == ["FD-7"]
+    assert classification["producer_fired"] == []
+    assert classification["trigger_mismatches"] == ["FD-7"]
 
 
 def test_n11_cross_checks_the_upstream_fd2_producer_fact(monkeypatch) -> None:
@@ -411,12 +619,29 @@ def test_n3b_exact_four_gate_golden_and_unreachable_target_stop() -> None:
     )
     rate = impossible["gates"][1]
     assert rate == {
+        "absolute_status": "stopped",
+        "comparison_status": "pass",
         "id": "N3b-expressed-rate",
         "possible_rate": 15 / 131,
         "status": "stopped",
         "target": 21 / 136,
         "value": 10 / 131,
     }
+
+    regressed = calib.speaker_gate_block(
+        [
+            _speaker_gate_case(
+                raw=131,
+                expressed=4,
+                missed=1,
+                off_expressed=5,
+                attributable=1,
+            )
+        ]
+    )["gates"][1]
+    assert regressed["absolute_status"] == "stopped"
+    assert regressed["comparison_status"] == "fail"
+    assert regressed["status"] == "fail"
 
 
 def test_coarse_derivation_registry_drives_every_n4c_case_gate() -> None:
@@ -435,3 +660,29 @@ def test_coarse_derivation_registry_drives_every_n4c_case_gate() -> None:
     assert all(all(row["checks"].values()) for row in block["cases"])
     assert block["trigger_classes_exercised"] == {"duration": True, "width": True}
     assert block["evidence_exercised"] == {"per-char": True, "whitespace": True}
+    duration = next(row for row in block["cases"] if row["variant"] == "duration")
+    assert duration["case"] == "coarse-duration-zh"
+    assert duration["refiner_comparison"]["materialized"] is True
+    assert duration["refiner_comparison"]["diffs_confined_to_coarse_caused"] is True
+
+
+def test_materialized_coarse_acceptance_regression_is_a_failure(monkeypatch) -> None:
+    real_replay = calib.replay_shadow
+
+    def replay_with_unconfined_duration(case):
+        result = real_replay(case)
+        if case.id == "coarse-duration-zh":
+            artifact = result.shadow
+            assert artifact["kind"] == "segmentation-shadow-incomplete"
+            comparison = artifact["diagnostic"]["refiner_comparison"]
+            assert comparison["materialized"] is True
+            comparison["diffs_confined_to_coarse_caused"] = False
+        return result
+
+    monkeypatch.setattr(calib, "replay_shadow", replay_with_unconfined_duration)
+    block = calib.run_coarse_gates(calib.load_corpus(calib.DEFAULT_CORPUS))
+    assert (
+        "coarse-duration-zh: refiner-off diff is not confined to a "
+        "coarse_caused interval"
+    ) in block["failures"]
+    assert not any("coarse-duration-zh" in stop for stop in block["stops"])

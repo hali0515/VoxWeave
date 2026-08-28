@@ -10,13 +10,13 @@
       "profile_overrides": {}
     },
     {
-      "id": "coarse-duration-ja",
+      "id": "coarse-duration-zh",
       "variant": "duration",
-      "source_case": "cases/ja-01.json",
+      "source_case": "cases/zh-04.json",
       "max_block_units": 40,
       "profile_overrides": {
-        "max_line_length": 100,
-        "max_cue_s": 4.0
+        "max_line_length": 200,
+        "max_cue_s": 6.479
       }
     },
     {

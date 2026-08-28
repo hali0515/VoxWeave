@@ -1819,7 +1819,45 @@ def _shadow_diff_classification(
                 "target_legs": target_legs,
                 "triggers": {field: sorted(ids) for field, ids in per_field.items()},
             }
-        if finalizer.get("refusals"):
+        # FD-7 is derived from the phase-1 stream, immutable seed, delivered
+        # state, and trace terminal -- never from either serialized report
+        # channel.  ``entries``/``refusals`` are producer output and are checked
+        # for exact equality by the shared schema validator; reading either here
+        # would let a serializer mutation erase both sides of the N11 check.
+        has_report = any(cue.reports for cue in stream.cues)
+        has_report = has_report or any(
+            float(left["end"]) > float(right["start"])
+            for left, right in zip(seed_cues, seed_cues[1:])
+        )
+        delivered = finalizer_row.get("cues") or ()
+        if len(delivered) == len(stream.cues):
+            for index, (row, cue) in enumerate(zip(delivered, stream.cues)):
+                start, end = float(row["start"]), float(row["end"])
+                if (
+                    stream.profile.min_cue_s > 0
+                    and end - start < stream.profile.min_cue_s - 1e-9
+                ):
+                    has_report = True
+                if index + 1 >= len(delivered):
+                    continue
+                next_start = float(delivered[index + 1]["start"])
+                if (
+                    next_start - end < TWO_FRAME_S - 1e-9
+                    and cue.speech_end is not None
+                    and next_start - TWO_FRAME_S < cue.speech_end <= next_start
+                ):
+                    has_report = True
+        trace = finalizer.get("trace") or {}
+        cycle = trace.get("cycle")
+        if isinstance(cycle, Mapping):
+            has_report = has_report or any(
+                len(set(row.get("values") or ())) > 1
+                for row in cycle.get("per_boundary_values") or ()
+                if isinstance(row, Mapping)
+            )
+        if trace.get("terminal") == "budget-exhausted":
+            has_report = True
+        if has_report:
             independent_fired.add("FD-7")
 
     left = {
@@ -2174,7 +2212,15 @@ def _shadow_v2_artifact(
         "unprojected": v1_partition is None,
     }
     if solution.invalid_profile:
-        return artifact
+        return {
+            "diagnostic": artifact,
+            "error": {
+                "detail": "optimizer profile preflight failed",
+                "type": "IncompleteShadowArtifact",
+            },
+            "kind": "segmentation-shadow-incomplete",
+            "schema_version": 1,
+        }
 
     unit_count = len(shadow_document.units)
     raw_partition = _document_partition(solution.solutions, unit_count)
@@ -2420,7 +2466,15 @@ def _shadow_v2_artifact(
             "optimizer-selection-unavailable"
         )
         artifact["preview_fidelity"] = preview.to_dict()
-        return artifact
+        return {
+            "diagnostic": artifact,
+            "error": {
+                "detail": "optimizer selection authority unavailable for one or more rows",
+                "type": "IncompleteShadowArtifact",
+            },
+            "kind": "segmentation-shadow-incomplete",
+            "schema_version": 1,
+        }
 
     v1_stream = phase1_from_v1_capture(
         capture,
@@ -2708,6 +2762,13 @@ def _shadow_v2_artifact(
         )
         rows["refiner-off"] = refiner_row
         expected[f"{SHADOW_LANE_FINALIZER}/refiner-off"] = "optimizer-selection"
+        canonical_fallback_rechecks.extend(
+            _shadow_fallback_rechecks(
+                refiner_stream,
+                owned_footprints(refiner_partition),
+                row_id="refiner-off",
+            )
+        )
 
     totals = artifact["totals"]
     artifact["coverage"] = {
@@ -2761,6 +2822,34 @@ def _shadow_v2_artifact(
     artifact["invalid_finalizer_rows"] = [
         name for name, row in rows.items() if not row["finalizer"]["valid"]
     ]
+    if v1_partition is None or (
+        split.refined_parent_count
+        and refiner_comparison.get("materialized") is not True
+    ):
+        reason = (
+            "v1 source partition could not be projected"
+            if v1_partition is None
+            else "refiner-off optimizer selection authority unavailable"
+        )
+        return {
+            "diagnostic": artifact,
+            "error": {"detail": reason, "type": "IncompleteShadowArtifact"},
+            "kind": "segmentation-shadow-incomplete",
+            "schema_version": 1,
+        }
+    # The optimizer artifact remains schema 1 until this exact completed
+    # payload passes the one shared live/harness contract.  Validation ignores
+    # only the version field for this pre-admission pass; every other top-level
+    # key, lane/row, evidence block, and cross-block cardinality is live.
+    from voxweave.core.shadow_schema import (
+        LIVE_SHADOW_SCHEMA_VERSION,
+        assert_shadow_v2_payload,
+    )
+
+    if artifact.get("schema_version") != 1:
+        raise ValueError("live shadow admission requires a schema-1 optimizer payload")
+    assert_shadow_v2_payload(artifact, require_version=False)
+    artifact["schema_version"] = LIVE_SHADOW_SCHEMA_VERSION
     return artifact
 
 
@@ -2792,16 +2881,22 @@ def _maybe_shadow_v2(
     with degradation_capture(quiet=True) as shadow_degraded:
         try:
             artifact = _shadow_v2_artifact(document, cues, thresholds)
+            # AD4-4: the shadow's own ledger, collected at hook time and
+            # deliberately kept out of the persisted manifest. Copied off the
+            # live list so a later capture cannot append to published evidence.
+            artifact["shadow_degraded"] = list(shadow_degraded)
+            if artifact.get("schema_version") == 2:
+                from voxweave.core.shadow_schema import assert_shadow_v2_payload
+
+                assert_shadow_v2_payload(artifact)
         except Exception as exc:  # noqa: BLE001 - a measurement never fails the run
             log.warning("v2 shadow lane failed; shipped output is unaffected (%s)", exc)
             artifact = {
                 "error": {"detail": str(exc), "type": type(exc).__name__},
-                "kind": "segmentation-shadow",
+                "kind": "segmentation-shadow-error",
+                "schema_version": 1,
+                "shadow_degraded": list(shadow_degraded),
             }
-    # AD4-4: the shadow's own ledger, collected at hook time and deliberately
-    # kept out of the persisted manifest. Copied off the live list so a later
-    # capture cannot append to something the artifact already published.
-    artifact["shadow_degraded"] = list(shadow_degraded)
     return artifact
 
 

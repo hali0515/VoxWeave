@@ -45,6 +45,7 @@ from .boundary_lattice import (
 )
 from .layout import (
     _line_budget_width,
+    _reading_chars,
     _two_line_break,
     _vis_width,
     _wrap_units,
@@ -661,7 +662,17 @@ def edge_cost(
     else:
         fragment = 0.0
 
-    need = cue_preview.reading_chars / profile.cps if profile.cps > 0 else 0.0
+    # Policy 1 priced the punctuation-stripped ``edge.display_text`` and its
+    # identity is frozen under the no-argument LegacyCleanupPreview seam.  The
+    # finalizer policy consumes its canonical preview load.  Keeping this split
+    # explicit prevents a preview plumbing change from silently changing the
+    # partition while still calling itself experimental_policy_1.
+    reading_chars = (
+        _reading_chars(edge.display_text)
+        if isinstance(preview, LegacyCleanupPreview)
+        else cue_preview.reading_chars
+    )
+    need = reading_chars / profile.cps if profile.cps > 0 else 0.0
     reading = W_READING * max(0.0, need - usable) / need if need > 0 else 0.0
     floor = profile.min_cue_s
     min_duration = (

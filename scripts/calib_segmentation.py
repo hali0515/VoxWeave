@@ -2675,6 +2675,17 @@ ABLATION_TERMS = (
     ABLATION_TERM_PAUSE,
     ABLATION_TERM_SPEAKER,
 )
+# Fixed metric-domain exclusions for the tracked ablation registry.  These are
+# input/counterfactual facts, not results filtered after a replay: with the
+# short-fragment term genuinely zero, the captured zero-time collapse in each
+# case becomes a standalone delivered cue, for which CPS has no finite value.
+# Keeping one common 18-case denominator across every OAT row makes deltas
+# comparable; the selection is serialized in the report and an empty selection
+# still fails completeness.
+ABLATION_TRACKED_EXCLUSIONS: dict[str, str] = {
+    "ja-02": "short_fragment=0 isolates zero-time cues; CPS is undefined",
+    "ja-03": "short_fragment=0 isolates a zero-time cue; CPS is undefined",
+}
 
 
 @contextlib.contextmanager
@@ -2735,6 +2746,14 @@ def shadow_artifact_of(case: Case, result: Any) -> dict[str, Any]:
                 f"{v.get('key')}={v.get('value')}: {v.get('reason')}"
                 for v in artifact["invalid_profile"]
             ],
+        )
+    from voxweave.core.shadow_schema import validate_shadow_v2_payload
+
+    schema_errors = validate_shadow_v2_payload(artifact)
+    if schema_errors:
+        raise cc.CalibrationError(
+            f"{case.relpath}: the live shadow artifact is not schema 2",
+            schema_errors,
         )
     return dict(artifact)
 
@@ -3121,6 +3140,14 @@ def shadow_measurement_errors(
     * N7's edge-by-edge preview audit or N19's selected speaker projection is
       incomplete or inconsistent.
     """
+    from voxweave.core.shadow_schema import validate_shadow_v2_payload
+
+    structural = validate_shadow_v2_payload(artifact)
+    if structural:
+        return [
+            f"{case.id}: schema-2 structural error: {error}" for error in structural
+        ]
+
     problems = [
         f"{case.id}: validator stage {name!r} did not run (AD-4 requires all of"
         f" {', '.join(SHADOW_REQUIRED_STAGES)})"
@@ -3508,12 +3535,25 @@ def speaker_gate_block(shadow_cases: Sequence[ShadowCase]) -> dict[str, Any]:
         if ja["raw_in_speech_turn_changes"] == 0
         else ja["eligible_ceiling"] / ja["raw_in_speech_turn_changes"]
     )
-    rate_status = (
+    comparison_status = (
+        "pass" if ja["expressed_rate"] >= ja["off_expressed_rate"] else "fail"
+    )
+    absolute_status = (
         "pass"
-        if ja["expressed_rate"] >= max(target, ja["off_expressed_rate"])
+        if ja["expressed_rate"] >= target
         else "stopped"
         if possible_rate < target
         else "fail"
+    )
+    # The frozen absolute ceiling can only adjudicate the absolute clause.  It
+    # has no authority to excuse a regression below the independently measured
+    # speaker-off row.
+    rate_status = (
+        "fail"
+        if comparison_status == "fail"
+        else "pass"
+        if absolute_status == "pass"
+        else absolute_status
     )
     gates = [
         {
@@ -3522,6 +3562,8 @@ def speaker_gate_block(shadow_cases: Sequence[ShadowCase]) -> dict[str, Any]:
             "value": ja["activation_cases"],
         },
         {
+            "absolute_status": absolute_status,
+            "comparison_status": comparison_status,
             "id": "N3b-expressed-rate",
             "possible_rate": possible_rate,
             "status": rate_status,
@@ -3555,7 +3597,10 @@ _SPEECH_TRUNCATION_KINDS = frozenset({"speech-truncated-start", "speech-truncate
 
 def _speech_truncation_count(block: Mapping[str, Any] | None) -> int:
     if not isinstance(block, Mapping):
-        return 0
+        raise cc.CalibrationError(
+            "N6 cannot measure a missing validator block",
+            ["speech-truncation absence is not zero evidence"],
+        )
     return sum(
         not bool(row.get("waived")) and str(row.get("kind")) in _SPEECH_TRUNCATION_KINDS
         for row in block.get("violations") or ()
@@ -3956,7 +4001,49 @@ def run_coarse_gates(
             )
         derived = _derived_coarse_case(source, fixture)
         result = replay_shadow(derived)
-        artifact = shadow_artifact_of(derived, result)
+        raw_artifact = getattr(result, "shadow", None)
+        raw_error = (
+            raw_artifact.get("error") if isinstance(raw_artifact, Mapping) else None
+        )
+        diagnostic = (
+            raw_artifact.get("diagnostic")
+            if isinstance(raw_artifact, Mapping)
+            else None
+        )
+        unavailable_comparison = (
+            diagnostic.get("refiner_comparison")
+            if isinstance(diagnostic, Mapping)
+            else None
+        )
+        frozen_projection_gap = (
+            isinstance(raw_error, Mapping)
+            and raw_error.get("detail") == "v1 source partition could not be projected"
+            and isinstance(unavailable_comparison, Mapping)
+            and unavailable_comparison.get("status") == "refined-counterfactual"
+            and isinstance(diagnostic, Mapping)
+            and (diagnostic.get("v1_projection") or {}).get("unprojected") is True
+        )
+        frozen_optimizer_gap = (
+            isinstance(raw_error, Mapping)
+            and raw_error.get("detail")
+            == "optimizer selection authority unavailable for one or more rows"
+            and isinstance(unavailable_comparison, Mapping)
+            and unavailable_comparison.get("status") == "unmaterialized"
+            and unavailable_comparison.get("reason")
+            == "optimizer-selection-unavailable"
+        )
+        incomplete = (
+            isinstance(raw_artifact, Mapping)
+            and raw_artifact.get("kind") == "segmentation-shadow-incomplete"
+            and raw_artifact.get("schema_version") == 1
+            and isinstance(raw_error, Mapping)
+            and raw_error.get("type") == "IncompleteShadowArtifact"
+            and isinstance(diagnostic, Mapping)
+            and (frozen_projection_gap or frozen_optimizer_gap)
+        )
+        artifact = (
+            dict(diagnostic) if incomplete else shadow_artifact_of(derived, result)
+        )
         final_row = artifact["lanes"][SHADOW_LANE_FINALIZER]["rows"].get("v2") or {}
         errors = _coarse_start_errors(source, final_row.get("cues") or ())
         ordered = sorted(errors)
@@ -4026,7 +4113,7 @@ def run_coarse_gates(
                 "because the frozen factory refuses adopted-v1 intervals"
             )
         elif comparison.get("diffs_confined_to_coarse_caused") is not True:
-            stops.append(
+            failures.append(
                 f"{fixture['id']}: refiner-off diff is not confined to a "
                 "coarse_caused interval"
             )
@@ -4108,6 +4195,25 @@ def _ablated_weight(term: str) -> Iterator[None]:
             se.W_SPEAKER_INTERIOR = speaker_saved
 
 
+def ablation_case_selection(
+    cases: Sequence[Case], *, tracked_registry: bool
+) -> tuple[list[Case], dict[str, Any]]:
+    """Return the fixed metric domain and its explicit exclusions."""
+    excluded = ABLATION_TRACKED_EXCLUSIONS if tracked_registry else {}
+    selected = [case for case in cases if case.id not in excluded]
+    present_exclusions = [
+        {"case": case.id, "reason": excluded[case.id]}
+        for case in cases
+        if case.id in excluded
+    ]
+    return selected, {
+        "candidate_cases": [case.id for case in cases],
+        "excluded_cases": present_exclusions,
+        "kind": "fixed-metric-domain",
+        "requested_cases": [case.id for case in selected],
+    }
+
+
 def run_ablation(
     cases: Sequence[Case], reference: Mapping[str, Mapping[str, Any]]
 ) -> dict[str, Any]:
@@ -4120,21 +4226,70 @@ def run_ablation(
     of them carry the whole result").
     """
     rows: list[dict[str, Any]] = []
+    unknown: list[str] = []
+    requested_groups = {GROUP_ALL: len(cases)}
+    for case in cases:
+        language = cc.canonical_language_or(case.language, case.language)
+        requested_groups[language] = requested_groups.get(language, 0) + 1
     for term in ABLATION_TERMS:
         started = time.perf_counter()
+        measured: list[CaseMeasurement] = []
+        measured_cases: list[str] = []
+        errors: list[dict[str, str]] = []
         with _ablated_weight(term):
-            measured = [
-                measure_lane(
-                    case,
-                    shadow_artifact_of(case, replay_shadow(case)),
-                    SHADOW_GATED_LANE,
-                    "v2",
-                )
-                for case in cases
-            ]
-        groups = aggregate([m.measurement for m in measured if m.measurement])
+            for case in cases:
+                try:
+                    lane = measure_lane(
+                        case,
+                        shadow_artifact_of(case, replay_shadow(case)),
+                        SHADOW_GATED_LANE,
+                        "v2",
+                    )
+                except cc.CalibrationError as exc:
+                    errors.append({"case": case.id, "error": exc.message})
+                    continue
+                if lane.measurement is None:
+                    errors.append(
+                        {
+                            "case": case.id,
+                            "error": lane.error or "gated lane produced no measurement",
+                        }
+                    )
+                    continue
+                measured.append(lane.measurement)
+                measured_cases.append(case.id)
+        groups = aggregate(measured)
+        group_counts = {
+            group: int((groups.get(group) or {}).get("case_count") or 0)
+            for group in sorted(requested_groups)
+        }
+        missing_groups = [
+            group
+            for group, requested in sorted(requested_groups.items())
+            if requested <= 0 or group_counts[group] != requested
+        ]
+        missing_cases = sorted({case.id for case in cases} - set(measured_cases))
+        complete = (
+            bool(cases) and not errors and not missing_cases and not missing_groups
+        )
+        if not complete:
+            unknown.append(
+                f"ablation/{term}: incomplete evidence "
+                f"({len(measured_cases)}/{len(cases)} cases; "
+                f"missing groups={','.join(missing_groups) or 'none'})"
+            )
         rows.append(
             {
+                "complete": complete,
+                "coverage": {
+                    "errors": errors,
+                    "group_case_counts": group_counts,
+                    "measured_cases": measured_cases,
+                    "missing_cases": missing_cases,
+                    "missing_groups": missing_groups,
+                    "requested_cases": [case.id for case in cases],
+                    "requested_groups": dict(sorted(requested_groups.items())),
+                },
                 "deltas": {
                     group: _metric_deltas(groups.get(group), reference.get(group))
                     for group in sorted(set(groups) | set(reference))
@@ -4151,6 +4306,7 @@ def run_ablation(
             }
         )
     return {
+        "complete": not unknown,
         "kind": "one-at-a-time",
         "note": (
             "each row re-solves the whole corpus with one term zeroed; deltas are"
@@ -4159,6 +4315,7 @@ def run_ablation(
         ),
         "rows": rows,
         "terms": list(ABLATION_TERMS),
+        "unknown": unknown,
     }
 
 
@@ -4506,17 +4663,28 @@ def run_single_gap_probes(
         for magnitude in sorted(sampled[index]):
             for sign in PERTURB_SIGNS:
                 plan.append((index, magnitude, sign))
+    full_plan = list(plan)
+    planned_by_magnitude = {
+        str(magnitude): sum(row[1] == magnitude for row in full_plan)
+        for magnitude in magnitudes
+    }
     truncated = bool(max_probes) and len(plan) > max_probes
     if truncated:
         plan = plan[:max_probes]
+    selected_by_magnitude = {
+        str(magnitude): sum(row[1] == magnitude for row in plan)
+        for magnitude in magnitudes
+    }
 
     probes: list[dict[str, Any]] = []
     skipped = 0
+    executed_by_magnitude = {str(magnitude): 0 for magnitude in magnitudes}
     for index, magnitude, sign in plan:
         units, applied = perturb_single_gap(case.units, index, sign * magnitude)
         if applied == 0.0:
             skipped += 1
             continue
+        executed_by_magnitude[str(magnitude)] += 1
         row: dict[str, Any] = {
             "applied_delta_ms": applied,
             "case": case.id,
@@ -4577,15 +4745,18 @@ def run_single_gap_probes(
     return {
         "coverage": {
             "candidate_gaps": scan["candidate_gaps"],
-            "exhaustive": not truncated,
+            "executed_by_magnitude": executed_by_magnitude,
+            "exhaustive": bool(full_plan) and not truncated,
             "knees": scan["knees"],
             "near_cliff": len(near),
             "near_cliff_by_state": scan["near_cliff_by_state"],
-            "planned_probes": len(plan),
+            "planned_by_magnitude": planned_by_magnitude,
+            "planned_probes": len(full_plan),
             "raw_knees": scan["raw_knees"],
             "sampled_gaps": len(sampled),
             "sample_rate": 0.0 if near_cliff_only else PERTURB_SAMPLE_RATE,
             "sampled_skipped": near_cliff_only,
+            "selected_by_magnitude": selected_by_magnitude,
             "skipped_clamped": skipped,
             "vad_state_denominators": scan["vad_state_denominators"],
         },
@@ -4745,7 +4916,19 @@ def run_global_jitter(
                     "unit_stable": True,
                 }
             )
-    return {"draws_per_magnitude": PERTURB_JITTER_DRAWS, "rows": rows}
+    return {
+        "coverage": {
+            "executed_by_magnitude": {
+                str(magnitude): sum(row["magnitude_ms"] == magnitude for row in rows)
+                for magnitude in magnitudes
+            },
+            "planned_by_magnitude": {
+                str(magnitude): PERTURB_JITTER_DRAWS for magnitude in magnitudes
+            },
+        },
+        "draws_per_magnitude": PERTURB_JITTER_DRAWS,
+        "rows": rows,
+    }
 
 
 def shot_cycle_probe() -> dict[str, Any]:
@@ -4835,6 +5018,19 @@ def run_perturbation(
     jitter: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     unknown: list[dict[str, Any]] = []
+    completeness_unknown: list[dict[str, Any]] = []
+    if not shadow_cases:
+        completeness_unknown.append(
+            {"error": "P1 selected no cases", "mode": "P1-completeness"}
+        )
+    if not modes:
+        completeness_unknown.append(
+            {"error": "P1 selected no modes", "mode": "P1-completeness"}
+        )
+    if not magnitudes:
+        completeness_unknown.append(
+            {"error": "P1 selected no magnitudes", "mode": "P1-completeness"}
+        )
     for shadow_case in shadow_cases:
         if "single_gap" in modes:
             block = run_single_gap_probes(
@@ -4847,6 +5043,22 @@ def run_perturbation(
             block["case"] = shadow_case.case.id
             block["language"] = shadow_case.case.language
             single.append(block)
+            for magnitude in magnitudes:
+                key = str(magnitude)
+                planned = int(block["coverage"]["planned_by_magnitude"][key])
+                executed = int(block["coverage"]["executed_by_magnitude"][key])
+                if planned <= 0 or executed <= 0:
+                    completeness_unknown.append(
+                        {
+                            "case": shadow_case.case.id,
+                            "error": (
+                                f"P1 single_gap/{magnitude}ms has "
+                                f"planned={planned}, executed={executed}"
+                            ),
+                            "magnitude_ms": magnitude,
+                            "mode": "single_gap",
+                        }
+                    )
             failures.extend(p for p in block["probes"] if _probe_failed(p))
             unknown.extend(
                 p for p in block["probes"] if not _probe_failed(p) and _probe_unknown(p)
@@ -4856,6 +5068,22 @@ def run_perturbation(
             block["case"] = shadow_case.case.id
             block["language"] = shadow_case.case.language
             jitter.append(block)
+            for magnitude in magnitudes:
+                key = str(magnitude)
+                planned = int(block["coverage"]["planned_by_magnitude"][key])
+                executed = int(block["coverage"]["executed_by_magnitude"][key])
+                if planned <= 0 or executed <= 0:
+                    completeness_unknown.append(
+                        {
+                            "case": shadow_case.case.id,
+                            "error": (
+                                f"P1 global_jitter/{magnitude}ms has "
+                                f"planned={planned}, executed={executed}"
+                            ),
+                            "magnitude_ms": magnitude,
+                            "mode": "global_jitter",
+                        }
+                    )
             unknown.extend(
                 {
                     "case": shadow_case.case.id,
@@ -4867,11 +5095,16 @@ def run_perturbation(
             )
     p2 = shot_cycle_probe()
     p3 = speaker_cliff_diagnostics()
-    unknown.extend({"error": failure, "mode": "P2"} for failure in p2["failures"])
-    unknown.extend({"error": failure, "mode": "P3"} for failure in p3["failures"])
     p1_attempted = sum(block["summary"]["probes"] for block in single) + sum(
         len(block["rows"]) for block in jitter
     )
+    if p1_attempted == 0 and not completeness_unknown:
+        completeness_unknown.append(
+            {"error": "P1 executed zero probes", "mode": "P1-completeness"}
+        )
+    unknown.extend({"error": failure, "mode": "P2"} for failure in p2["failures"])
+    unknown.extend({"error": failure, "mode": "P3"} for failure in p3["failures"])
+    unknown.extend(completeness_unknown)
     p1_failures = sum(
         int(row.get("unit_stable") is False)
         for block in jitter
@@ -4886,12 +5119,23 @@ def run_perturbation(
             "P1-unit-stability": {
                 "attempted": p1_attempted,
                 "failures": p1_failures,
-                "status": "pass" if p1_failures == 0 else "unknown",
+                "status": (
+                    "invalid"
+                    if completeness_unknown or p1_attempted == 0
+                    else "pass"
+                    if p1_failures == 0
+                    else "unknown"
+                ),
             },
             "P2-shot": p2,
             "P3-speaker-cliffs": p3,
         },
-        "exhaustive": all(block["coverage"]["exhaustive"] for block in single),
+        "exhaustive": bool(shadow_cases)
+        and (
+            "single_gap" not in modes
+            or bool(single)
+            and all(block["coverage"]["exhaustive"] for block in single)
+        ),
         "failures": failures,
         "global_jitter": jitter,
         "near_cliff_only": near_cliff_only,
@@ -5000,6 +5244,7 @@ def build_shadow_report(
     coarse_gates: Mapping[str, Any] | None = None,
     stop_items: Sequence[str] = (),
     warnings: Sequence[str] = (),
+    timing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the shadow report -- its own file, sharing no block with quality."""
     definition = metric_definition_block()
@@ -5162,9 +5407,10 @@ def build_shadow_report(
     }
     slowest = max(shadow_cases, key=lambda r: r.wall_time_s, default=None)
     report["timing"] = {
-        "total_wall_s": round(sum(r.wall_time_s for r in shadow_cases), 4),
+        "base_case_sum_s": round(sum(r.wall_time_s for r in shadow_cases), 4),
         "slowest_case": slowest.case.id if slowest else None,
         "slowest_wall_s": round(slowest.wall_time_s, 4) if slowest else None,
+        **({} if timing is None else dict(timing)),
     }
     return report
 
@@ -5285,6 +5531,7 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
 
 
 def cmd_shadow(args: argparse.Namespace) -> int:
+    command_started = time.perf_counter()
     corpus = load_corpus(args.corpus)
     cases = list(corpus.cases)
     partial = False
@@ -5325,7 +5572,9 @@ def cmd_shadow(args: argparse.Namespace) -> int:
                     ],
                 )
 
+    base_started = time.perf_counter()
     shadow_cases = [run_shadow_case(case) for case in cases]
+    base_wall_s = time.perf_counter() - base_started
 
     coverage_failures: list[str] = []
     measurement_errors: list[str] = []
@@ -5372,7 +5621,7 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             finalizer = (finalizer_rows.get(row_id) or {}).get("finalizer") or {}
             fallback_rows = [
                 entry
-                for entry in finalizer.get("refusals") or ()
+                for entry in finalizer.get("entries") or ()
                 if entry.get("kind") == "canonical-text-fallback"
             ]
             rechecks = [
@@ -5462,9 +5711,8 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         result["family"] = "N1-finalizer-v2-vs-tracked-baseline"
     n3a_results = [] if partial else finalizer_vs_legacy_gates(shadow_cases)
     gate_results = [*n1_results, *n3a_results]
-    tracked_full = (
-        not partial and Path(corpus.path).resolve() == DEFAULT_CORPUS.resolve()
-    )
+    tracked_registry = Path(corpus.path).resolve() == DEFAULT_CORPUS.resolve()
+    tracked_full = not partial and tracked_registry
     speaker_gates = speaker_gate_block(shadow_cases)
     speech_truncation = None if partial else speech_truncation_gates(shadow_cases)
     if speech_truncation is not None:
@@ -5485,7 +5733,9 @@ def cmd_shadow(args: argparse.Namespace) -> int:
     if partial:
         warnings.append("partial run (--case): non-inferiority gates skipped")
 
+    coarse_started = time.perf_counter()
     coarse_gates = run_coarse_gates(corpus) if tracked_full else None
+    coarse_wall_s = time.perf_counter() - coarse_started
     if coarse_gates is not None:
         coverage_failures.extend(coarse_gates["failures"])
         for coarse_stop in coarse_gates["stops"]:
@@ -5493,8 +5743,24 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             stop_items.append(item)
             warnings.append(item)
 
-    ablation = run_ablation(cases, gated) if args.ablation else None
+    ablation_started = time.perf_counter()
+    ablation = None
+    if args.ablation:
+        ablation_cases, ablation_selection = ablation_case_selection(
+            cases, tracked_registry=tracked_registry
+        )
+        selected_ids = {case.id for case in ablation_cases}
+        ablation_reference = lane_groups(
+            [row for row in shadow_cases if row.case.id in selected_ids],
+            SHADOW_GATED_LANE,
+            SHADOW_GATED_ROW,
+        )
+        ablation = run_ablation(ablation_cases, ablation_reference)
+        ablation["selection"] = ablation_selection
+    ablation_wall_s = time.perf_counter() - ablation_started
+    ablation_unknown = list(ablation["unknown"]) if ablation is not None else []
 
+    perturbation_started = time.perf_counter()
     perturbation = None
     if args.perturb:
         selected = shadow_cases
@@ -5524,7 +5790,9 @@ def cmd_shadow(args: argparse.Namespace) -> int:
                 " non-near-cliff gaps: a bounded AD-2 slice, not full coverage"
             )
         warnings.extend(perturbation["classes"]["P3-speaker-cliffs"]["warnings"])
+    perturbation_wall_s = time.perf_counter() - perturbation_started
 
+    report_started = time.perf_counter()
     report = build_shadow_report(
         corpus,
         shadow_cases,
@@ -5541,11 +5809,14 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         coarse_gates=coarse_gates,
         stop_items=stop_items,
         warnings=warnings,
+        timing={
+            "ablation_wall_s": round(ablation_wall_s, 4),
+            "base_wall_s": round(base_wall_s, 4),
+            "coarse_wall_s": round(coarse_wall_s, 4),
+            "perturbation_wall_s": round(perturbation_wall_s, 4),
+        },
     )
-
-    destination = "-"
-    if args.json_out:
-        destination = str(cc.write_json(args.json_out, report))
+    report_wall_s = time.perf_counter() - report_started
     print_shadow_summary(report)
 
     perturbation_failures = (
@@ -5562,6 +5833,7 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         coverage_failures,
         perturbation_failures,
         perturbation_unknown,
+        ablation_unknown,
     )
     code = verdict if args.check else cc.EXIT_OK
     failures = (
@@ -5571,6 +5843,7 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         + len(coverage_failures)
         + len(perturbation_failures)
         + len(perturbation_unknown)
+        + len(ablation_unknown)
     )
     warned = sum(
         1 for r in gate_results if r["mode"] == "warning" and r["status"] != "pass"
@@ -5580,6 +5853,24 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         cc.EXIT_GATE_FAILED: "fail",
         cc.EXIT_INVALID: "invalid",
     }[verdict]
+    total_wall_s = time.perf_counter() - command_started
+    accounted = (
+        base_wall_s
+        + coarse_wall_s
+        + ablation_wall_s
+        + perturbation_wall_s
+        + report_wall_s
+    )
+    report["timing"].update(
+        {
+            "other_wall_s": round(max(0.0, total_wall_s - accounted), 4),
+            "report_wall_s": round(report_wall_s, 4),
+            "total_wall_s": round(total_wall_s, 4),
+        }
+    )
+    destination = "-"
+    if args.json_out:
+        destination = str(cc.write_json(args.json_out, report))
     print(
         f"QUALITY segmentation-shadow status={status} cases={len(shadow_cases)}"
         f" failures={failures} warnings={warned} report={destination}"

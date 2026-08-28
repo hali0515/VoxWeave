@@ -507,9 +507,9 @@ def test_artifact_carries_the_declared_schema():
     art = solution.artifact
     assert art["kind"] == "segmentation-shadow"
     assert art["schema_version"] == SCHEMA_VERSION
-    # W4 is the sole schema-flip owner, after every staged block survives live
-    # assembly.
-    assert SCHEMA_VERSION == 2
+    # The standalone optimizer cannot claim W4's live row/authority contract;
+    # only the validated pipeline assembler stamps schema 2.
+    assert SCHEMA_VERSION == 1
     assert art["engine_v2"] == ENGINE_V2
     # Omitting both W3 arguments is the frozen pre-W3 solve seam.  Policy 2 is
     # named only by an explicit speaker/full or counterfactual solve.
@@ -582,8 +582,9 @@ def test_no_argument_artifact_retains_policy_one_with_only_w4_artifact_deltas():
     """The ordinary solve remains W3-off while W4 changes artifact structure.
 
     Cue bytes and edge serialization remain the ``a238e48`` seam. The artifact
-    hash deliberately moves once in W4 for schema 2 and the mandated margin
-    summary, while the policy stays 1 and no W3 candidate fields leak in.
+    hash deliberately moves in W4 for the mandated margin/preview audit fields,
+    while the standalone artifact remains schema 1, the policy stays 1, and no
+    W3 candidate fields leak in.
     """
     solution = optimize_document(document(timed(["the", "cat", "sat", "down"])))
     assert solution.solutions[0].partition_units == ()
@@ -610,8 +611,43 @@ def test_no_argument_artifact_retains_policy_one_with_only_w4_artifact_deltas():
         ensure_ascii=False,
     ).encode()
     assert hashlib.sha256(payload).hexdigest() == (
-        "1dc113c5ef9e298496366d0e959da8776bc168266fe75287a08407c9f2ae767e"
+        "3230ff075c358e6e3df015ab3699ab44fa4df1f14e6193063f19382f6421ad93"
     )
+
+
+def test_no_argument_policy_one_keeps_punctuation_partition_compatibility():
+    """The exact main@41ad35e differential that exposed raw-preview drift."""
+    doc = document(
+        [
+            ("?", 0.0, 0.371148),
+            ("word", 0.966930, 1.148467),
+            ("a", 1.482104, 1.869959),
+            ("x?", 2.042639, 2.290827),
+            ("ccc", 2.718158, 2.823989),
+            ("go!", 3.042334, 3.211104),
+            ("--", 3.269021, 3.365911),
+            (",", 3.368173, 3.746184),
+            ("word", 4.241745, 4.575443),
+            ("?", 5.098291, 5.242228),
+            (".", 5.738808, 6.020024),
+            ("x?", 6.233698, 6.595249),
+        ],
+        prof=profile(
+            max_line_length=10,
+            max_lines=2,
+            clause_ms=400.0,
+            vad_skip_ms=1000.0,
+            offline_ms=700.0,
+            min_cue_s=0.5,
+            max_cue_s=7.0,
+            glue_gap_s=0.3,
+            cps=4.6870204355038645,
+            lag_out_s=0.15,
+            shot_snap_s=0.458,
+        ),
+    )
+    solution = optimize_document(doc)
+    assert solution.solutions[0].partition_units == (4, 8)
 
 
 def test_an_invalid_profile_aborts_the_measurement_instead_of_degrading():
