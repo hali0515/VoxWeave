@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 from voxweave import asrfix as asrfix_mod
 from voxweave import backend, chunking, episode_transaction, fsio, realign, songdet
@@ -195,6 +195,22 @@ def _attach_json_decode_failure(exc: BaseException) -> None:
         detail = "sibling-json-syntax"
     else:
         detail = "sibling-top-level-shape"
+    _attach_canonical_failure(
+        exc,
+        kind="align-input-decode-invalid",
+        phase="decode",
+        detail_code=detail,
+    )
+
+
+def _attach_vtt_decode_failure(exc: BaseException) -> None:
+    cause = exc.__cause__
+    if isinstance(cause, UnicodeDecodeError):
+        detail = "vtt-encoding"
+    elif str(exc).startswith("no cues in "):
+        detail = "vtt-no-cues"
+    else:
+        detail = "vtt-format-mismatch"
     _attach_canonical_failure(
         exc,
         kind="align-input-decode-invalid",
@@ -4412,10 +4428,6 @@ def split(
     finally:
         _release_semantic_engine(semantic_engine)
     units, cues = segmented.units, segmented.cues
-    if episode_transaction.rat7_mapping_recheck_enabled():
-        raise RuntimeError(
-            "RAT-7 cannot be enabled without its governing S1 implementation"
-        )
     from voxweave import segmentation_orchestration
     from voxweave.align_snapshot import decode_sibling_json_snapshot
 
@@ -4479,6 +4491,8 @@ def split(
             vtt_bytes=selection.verified.vtt_bytes,
             cleanup_paths=tuple(cleanup),
             context=selection.context,
+            speaker_mapping_path=mapping_path,
+            expected_speaker_mapping=mapping_generation,
         )
     finally:
         segmentation_orchestration.retire_segmentation_selection(selection)
@@ -4673,8 +4687,8 @@ def _align_blocks(
     reporter: Reporter,
     tmp_chunks: list[Path],
     speech_spans: list[tuple[float, float]] | None = None,
-    raw_call_observer: Callable[[Sequence[Any], tuple[int, ...], float, bool], None]
-    | None = None,
+    raw_call_observer: Callable[..., None] | None = None,
+    qwen_invoker: Callable[..., Sequence[Any]] | None = None,
 ) -> list[list[dict]]:
     """Route blocks to the configured aligner and return per-block units.
 
@@ -4701,16 +4715,10 @@ def _align_blocks(
         reporter.task("full-file alignment (MMS)", 1)
         units = backend.align_blocks_full_mms(
             wav,
-            [b["text"] for b in blocks],
+            [b.get("alignment_text", b["text"]) for b in blocks],
             iso,
             bounds=bounds,
-            _raw_call_observer=(
-                None
-                if raw_call_observer is None
-                else lambda raw, sources, origin: raw_call_observer(
-                    raw, sources, origin, origin == 0.0
-                )
-            ),
+            _raw_call_observer=raw_call_observer,
         )
         reporter.advance(1)
         return units
@@ -4718,30 +4726,26 @@ def _align_blocks(
         reporter.task("full-file alignment (CTC)", 1)
         units = backend.align_blocks_full_ctc(
             wav,
-            [b["text"] for b in blocks],
+            [b.get("alignment_text", b["text"]) for b in blocks],
             iso,
             ctc_model,
             bounds=bounds,
             speech_spans=speech_spans,
-            _raw_call_observer=(
-                None
-                if raw_call_observer is None
-                else lambda raw, sources, origin: raw_call_observer(
-                    raw, sources, origin, origin == 0.0
-                )
-            ),
+            _raw_call_observer=raw_call_observer,
         )
         reporter.advance(1)
         return units
     reporter.task("per-cue alignment", len(blocks))
     block_units: list[list[dict]] = [[] for _ in blocks]
     for i, crop in enumerate(crops):
-        text = realign.join_block_texts([blocks[i]["text"]], iso)
+        text = realign.join_block_texts(
+            [blocks[i].get("alignment_text", blocks[i]["text"])], iso
+        )
         if crop is None or not text:  # insertion block or empty: skip
             reporter.advance(1)
             continue
         cs, ce = crop
-        physical_origin = cs
+        observed_geometry: tuple[int, int, int, int] | None = None
 
         def observe_sample_geometry(
             sample_start: int,
@@ -4749,23 +4753,15 @@ def _align_blocks(
             sample_rate: int,
             sample_count: int,
         ) -> None:
-            nonlocal physical_origin
-            from voxweave.align_acquisition import qwen_sample_geometry
-
-            try:
-                geometry = qwen_sample_geometry(
-                    nominal_start=cs,
-                    nominal_end=ce,
-                    sample_rate=sample_rate,
-                    sample_count=sample_count,
-                )
-            except Exception:
-                return
-            if (
-                geometry.sample_start == sample_start
-                and geometry.sample_end == sample_end
-            ):
-                physical_origin = geometry.physical_origin_seconds
+            nonlocal observed_geometry
+            if observed_geometry is not None:
+                raise RuntimeError("Qwen slice reported sample geometry twice")
+            observed_geometry = (
+                sample_start,
+                sample_end,
+                sample_rate,
+                sample_count,
+            )
 
         cwav = slice_wav(
             wav,
@@ -4774,9 +4770,23 @@ def _align_blocks(
             _sample_geometry_observer=observe_sample_geometry,
         )
         tmp_chunks.append(cwav)
-        raw_units = backend.align_text(cwav, text, iso)
-        if raw_call_observer is not None:
-            raw_call_observer(raw_units, (i,), physical_origin, False)
+        geometry = observed_geometry
+        if qwen_invoker is None:
+            raw_units = backend.align_text(cwav, text, iso)
+        else:
+            raw_units = cast(
+                list[dict[str, Any]],
+                qwen_invoker(
+                    lambda: backend.align_text(cwav, text, iso),
+                    i,
+                    float(cs),
+                    float(ce),
+                    audio_sample_start=None if geometry is None else geometry[0],
+                    audio_sample_end=None if geometry is None else geometry[1],
+                    sample_rate=None if geometry is None else geometry[2],
+                    sample_count=None if geometry is None else geometry[3],
+                ),
+            )
         block_units[i] = shift_units(raw_units, cs)
         reporter.advance(1)
     return block_units
@@ -4844,6 +4854,7 @@ def align(
     re-run; smart_split is not touched. All models run in-process (no network calls).
     """
     vtt_path = require_vtt(Path(vtt_path))  # align overwrites the input as VTT
+    explicit_media_requested = media_path is not None
     rep = reporter or Reporter()
     json_path = swap_ext(vtt_path, ".json")
     try:
@@ -4900,12 +4911,22 @@ def align(
     log.debug("re-timing %s (%s)", vtt_path.name, resolve_segmentation_manifest(data))
     word_segments = data.get("word_segments", [])
 
-    from voxweave.subformats import load_subtitle_blocks_bytes
-
-    blocks = load_subtitle_blocks_bytes(vtt_path, vtt_input_bytes)
-
     lang_name = lang_override or data.get("language") or "english"
     iso = to_iso_or(lang_name, "en")
+
+    from voxweave.align_snapshot import decode_align_snapshot
+
+    try:
+        input_snapshot = decode_align_snapshot(
+            vtt_path.name,
+            vtt_input_bytes,
+            json_input_bytes,
+            effective_iso=iso,
+            sibling_snapshot=sibling_snapshot,
+        )
+    except RuntimeError as exc:
+        _attach_vtt_decode_failure(exc)
+        raise
 
     media = Path(media_path) if media_path else _find_sibling_media(vtt_path)
     if media is None or not media.exists():
@@ -4945,6 +4966,32 @@ def align(
     mms = backend.uses_mms(iso)
     ctc_model = None if mms else align_model_for(iso)
     full_pass = mms or bool(ctc_model)
+    delivery_order = (
+        tuple(range(len(input_snapshot.blocks)))
+        if full_pass
+        else input_snapshot.qwen_delivery_order
+    )
+    bounds_by_source = {
+        bound.source_index: bound for bound in input_snapshot.route_bounds
+    }
+    blocks: list[dict[str, Any]] = []
+    for source_index in delivery_order:
+        content = input_snapshot.blocks[source_index]
+        bound = bounds_by_source[source_index]
+        blocks.append(
+            {
+                "text": content.text,
+                "alignment_text": content.alignment_text,
+                "start": bound.start,
+                "end": bound.end,
+                "lyric": content.lyric,
+                "speaker": content.speaker,
+                "speakers": (
+                    None if content.speakers is None else list(content.speakers)
+                ),
+                "source_index": content.source_index,
+            }
+        )
     crops: list[
         tuple[float, float] | None
     ] = []  # set + looped only on the per-cue (zh·yue) path
@@ -5028,6 +5075,7 @@ def align(
             segmentation=stored_manifest_value,
             strict_shot_changes=strict_shot_changes,
             strict_sing_spans=strict_sing_spans,
+            explicit_media=explicit_media_requested,
         )
         observation_input = {
             "context_content_digest": align_context.context_content_digest,
@@ -5039,42 +5087,94 @@ def align(
                 else hashlib.sha256(json_input_bytes).hexdigest()
             ),
             "media_fingerprint": media_input_fingerprint,
-            "media_logical_id": media.name,
+            "media_logical_id": (
+                f"explicit:{media.name}"
+                if explicit_media_requested
+                else f"sibling:{media.suffix.lower()}"
+            ),
             "effective_iso": iso,
             "route": route_kind,
             "block_count": len(blocks),
-            "block_content_sha256": hashlib.sha256(
-                json.dumps(
-                    [str(block["text"]) for block in blocks],
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest(),
+            "block_content_sha256": input_snapshot.block_content_sha256,
             "profile_source": (
                 "manifest-absent"
                 if not isinstance(stored_manifest_value, Mapping)
                 else "stored-or-default"
             ),
         }
-        raw_calls: list[align_orchestration.RawAlignmentCall] = []
+        from voxweave.align_acquisition import (
+            _fresh_alignment_call_observer,
+            _fresh_alignment_qwen_invoker,
+            begin_fresh_alignment,
+            seal_fresh_alignment,
+        )
 
-        def capture_raw_call(
-            raw_units: Sequence[Any],
-            source_indices: tuple[int, ...],
-            physical_origin: float,
-            identity: bool,
-        ) -> None:
-            raw_calls.append(
-                align_orchestration.capture_raw_alignment_call(
-                    source_indices=source_indices,
-                    alignment_texts=tuple(
-                        str(blocks[index]["text"]).strip() for index in source_indices
-                    ),
-                    raw_units=raw_units,
-                    physical_origin_seconds=physical_origin,
-                    identity_transform=identity,
-                )
-            )
+        try:
+            import soundfile as sf
+
+            prepared_info = sf.info(str(wav))
+            prepared_sample_rate = int(prepared_info.samplerate)
+            prepared_sample_count = int(prepared_info.frames)
+        except Exception:  # noqa: BLE001 - unavailable geometry is sealed as invalid
+            prepared_sample_rate = 16_000
+            prepared_sample_count = 0
+
+        model_facts = {
+            "route": route_kind,
+            "language": iso,
+            "backend": (
+                "mms"
+                if mms
+                else "ctc"
+                if ctc_model
+                else "mlx-qwen"
+                if backend._use_mlx()
+                else "qwen-asr"
+            ),
+            "model": (
+                "mms" if mms else ctc_model if ctc_model else backend.ALIGNER_MODEL
+            ),
+            "sample_rate": prepared_sample_rate,
+        }
+        route_facts = {
+            "route": route_kind,
+            "language": iso,
+            "blocks": [
+                {
+                    "source_index": block["source_index"],
+                    "alignment_text": block["alignment_text"],
+                    "start": block["start"],
+                    "end": block["end"],
+                }
+                for block in blocks
+            ],
+            "crops": crops,
+        }
+
+        def stable_fact_digest(value: object) -> str:
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return hashlib.sha256(encoded).hexdigest()
+
+        fresh_session = begin_fresh_alignment(
+            align_context,
+            alignment_texts=tuple(
+                str(block.get("alignment_text", block["text"])) for block in blocks
+            ),
+            source_indices=tuple(int(block["source_index"]) for block in blocks),
+            language=iso,
+            prepared_audio_sample_count=prepared_sample_count,
+            sample_rate=prepared_sample_rate,
+            backend_model_config_digest=stable_fact_digest(model_facts),
+            route_input_digest=stable_fact_digest(route_facts),
+        )
+        capture_raw_call = _fresh_alignment_call_observer(fresh_session)
+        invoke_qwen_call = _fresh_alignment_qwen_invoker(fresh_session)
 
         block_units = _align_blocks(
             wav,
@@ -5089,6 +5189,7 @@ def align(
             # full pass mask non-speech emissions; absent/empty -> no masking
             speech_spans=_spans_in(data.get("vad_speech")),
             raw_call_observer=capture_raw_call,
+            qwen_invoker=invoke_qwen_call,
         )
 
         # Tight cropping eliminates "last word drifts into inter-sentence silence", so
@@ -5096,6 +5197,7 @@ def align(
         final, all_units = realign.group_block_spans(block_units)
         if not all_units:
             raise RuntimeError(f"no aligned units for {media.name}")
+        acquisition = seal_fresh_alignment(fresh_session)
         # fill_insert -> enforce_min_duration -> rescue_tiny_cues (extend flash cues like
         # so/あ, overlap allowed with next-neighbor only) -> clamp.
         spans_filled = realign.clamp_spans(
@@ -5113,7 +5215,7 @@ def align(
         keep_vad = _spans_in(data.get("vad_speech"))
         keep_shots = [float(t) for t in data.get("shot_changes") or []] or None
         keep_sing = _spans_in(data.get("sing_spans"))
-        keep_turns = _turns_in(data.get("speaker_turns"))
+        keep_turns = sibling_snapshot.carrier("speaker_turns")
         # align never re-segments, so the segmentation manifest is preserved
         # verbatim (and stays absent when the document never had one).
         stored_manifest = data.get("segmentation")
@@ -5137,12 +5239,11 @@ def align(
         assert align_context is not None
         selection = align_orchestration.build_align_selection(
             context=align_context,
+            acquisition=acquisition,
             blocks=blocks,
-            alignment_texts=tuple(str(block["text"]).strip() for block in blocks),
             block_units=block_units,
             spans=spans_filled,
             all_units=all_units,
-            raw_calls=raw_calls,
             language=iso,
             vad_speech=keep_vad,
             shot_changes=keep_shots,
@@ -5162,11 +5263,7 @@ def align(
                 **observation_input,
                 "profile_source": selection.profile_status.source,
             }
-        cleanup: list[episode_transaction.ArtifactCleanup] = [
-            episode_transaction.ArtifactCleanup(
-                swap_ext(vtt_path, ".align-evidence.json"), "evidence-unlink"
-            )
-        ]
+        cleanup: list[episode_transaction.ArtifactCleanup] = []
         if pair_declared and not preserve_pair:
             cleanup.extend(
                 (
@@ -5183,6 +5280,12 @@ def align(
             )
 
         rep.stage("write VTT + JSON")
+        from voxweave.align_evidence import encode_align_evidence
+
+        evidence_artifact = episode_transaction.EvidencePublication(
+            swap_ext(vtt_path, ".align-evidence.json"),
+            encode_align_evidence(selection.evidence),
+        )
         episode_transaction.commit_primary_outputs(
             command="align",
             episode_path=vtt_path,
@@ -5196,6 +5299,7 @@ def align(
             context=selection.context,
             media_path=media,
             expected_media_fingerprint=media_input_fingerprint,
+            evidence_artifact=evidence_artifact,
         )
         completed_selection = selection
         aligned_cue_count = len(blocks)

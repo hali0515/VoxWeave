@@ -32,16 +32,32 @@ def _valid_job(
     )
     claims = (d.RouteClaim("call", 0, 0, 0),)
     route = (d.RouteExpectation(0, 0, "call", 0),)
-    return d.build_authority_distribution(
-        blocks=blocks,
-        delivery_route=route,
-        calls=calls,
-        skipped_blocks=(),
-        route_claims=claims,
-        iso=iso,
-        profile=profile,
-        _verifier_cut_mutator=verifier_mutator,
-    )
+
+    def build():
+        if verifier_mutator is not None:
+            return d._build_context_authority_distribution(
+                blocks=blocks,
+                delivery_route=route,
+                calls=calls,
+                skipped_blocks=(),
+                route_claims=claims,
+                iso=iso,
+                _limits=d.capture_authority_limit_profile(),
+                _verifier_cut_mutator=verifier_mutator,
+            )
+        return d.build_authority_distribution(
+            blocks=blocks,
+            delivery_route=route,
+            calls=calls,
+            skipped_blocks=(),
+            route_claims=claims,
+            iso=iso,
+        )
+
+    if profile is None:
+        return build()
+    with d._with_test_authority_limit_qualification(profile):
+        return build()
 
 
 def test_production_limits_and_profile_digest_are_closed():
@@ -380,7 +396,8 @@ def test_compound_route_skip_and_strict_reasons_are_registry_sorted():
 
 def test_atomic_denied_charge_records_call_scope_and_no_partial_counter_mutation():
     d = _module()
-    profile = d._test_authority_limit_profile(
+    profile = d._issue_test_authority_limit_qualification(
+        "atomic-denied-charge",
         call=d.CallWorkLimits(1, 20, 20, 100),
         job=d.JobWorkLimits(2, 20, 40, 20, 200),
     )
@@ -399,7 +416,8 @@ def test_atomic_denied_charge_records_call_scope_and_no_partial_counter_mutation
 
 def test_compound_interval_and_character_denial_is_one_event_in_counter_order():
     d = _module()
-    profile = d._test_authority_limit_profile(
+    profile = d._issue_test_authority_limit_qualification(
+        "compound-denial",
         call=d.CallWorkLimits(20, 20, 1, 2),
         job=d.JobWorkLimits(2, 40, 40, 20, 200),
     )

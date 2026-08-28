@@ -164,6 +164,7 @@ class _QualificationRecord:
 
 
 _QUALIFICATIONS: dict[str, _QualificationRecord] = {}
+_ISSUED_TEST_PROFILES: dict[int, AuthorityLimitProfile] = {}
 _ACTIVE_QUALIFICATION: contextvars.ContextVar[_AuthorityLimitQualification | None] = (
     contextvars.ContextVar("p6_authority_limit_qualification", default=None)
 )
@@ -243,16 +244,6 @@ def _with_test_authority_limit_qualification(
         _ACTIVE_QUALIFICATION.reset(context_token)
 
 
-def _test_authority_limit_profile(
-    *, call: CallWorkLimits, job: JobWorkLimits
-) -> AuthorityLimitProfile:
-    """Direct test receipt helper; production modules must not reference it."""
-    _validate_test_limits(call, job)
-    return AuthorityLimitProfile(
-        "test-only", call, job, _profile_digest("test-only", call, job)
-    )
-
-
 def capture_authority_limit_profile() -> AuthorityLimitProfile:
     qualification = _ACTIVE_QUALIFICATION.get()
     if qualification is None:
@@ -268,7 +259,47 @@ def capture_authority_limit_profile() -> AuthorityLimitProfile:
             "allocator-limit-profile", "test authority qualification cannot be consumed"
         )
     record.consumed = True
-    return _test_authority_limit_profile(call=qualification.call, job=qualification.job)
+    profile = AuthorityLimitProfile(
+        "test-only",
+        qualification.call,
+        qualification.job,
+        _profile_digest("test-only", qualification.call, qualification.job),
+    )
+    _ISSUED_TEST_PROFILES[id(profile)] = profile
+    return profile
+
+
+def validate_authority_limit_profile(
+    profile: AuthorityLimitProfile,
+) -> AuthorityLimitProfile:
+    """Reject a forged, increased, or digest-substituted effective profile."""
+    if not isinstance(profile, AuthorityLimitProfile):
+        raise AuthorityLimitProfileError(
+            "allocator-limit-profile", "authority limit profile is not issued"
+        )
+    if profile.kind == "production":
+        call, job = _production_values()
+        if profile.call != call or profile.job != job:
+            raise AuthorityLimitProfileError(
+                "allocator-limit-profile", "production authority limits changed"
+            )
+    elif profile.kind == "test-only":
+        _validate_test_limits(profile.call, profile.job)
+        if _ISSUED_TEST_PROFILES.get(id(profile)) is not profile:
+            raise AuthorityLimitProfileError(
+                "allocator-limit-profile",
+                "test authority profile lacks its one-use qualification",
+            )
+    else:  # pragma: no cover - the dataclass annotation is not runtime authority
+        raise AuthorityLimitProfileError(
+            "allocator-limit-profile", "unknown authority limit profile kind"
+        )
+    expected = _profile_digest(profile.kind, profile.call, profile.job)
+    if profile.profile_digest != expected:
+        raise AuthorityLimitProfileError(
+            "allocator-limit-profile", "authority limit profile digest changed"
+        )
+    return profile
 
 
 @dataclass(frozen=True)
@@ -1022,7 +1053,7 @@ def _job_receipt(
     )
 
 
-def build_authority_distribution(
+def _build_authority_distribution_impl(
     *,
     blocks: tuple[AuthorityBlock, ...],
     delivery_route: tuple[RouteExpectation, ...],
@@ -1030,11 +1061,11 @@ def build_authority_distribution(
     skipped_blocks: tuple[AuthoritySkippedBlockInput, ...],
     route_claims: tuple[RouteClaim, ...],
     iso: str,
-    profile: AuthorityLimitProfile | None = None,
+    profile: AuthorityLimitProfile,
     _verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None = None,
 ) -> AuthorityDistributionReceipt:
     """Run preflight, producer, and verifier under one sealed effective profile."""
-    effective_profile = profile or capture_authority_limit_profile()
+    effective_profile = validate_authority_limit_profile(profile)
     blocks_by_source = {block.source_index: block for block in blocks}
     if len(blocks_by_source) != len(blocks):
         raise ValueError("authority blocks must have unique source indices")
@@ -1257,6 +1288,51 @@ def build_authority_distribution(
     )
 
 
+def build_authority_distribution(
+    *,
+    blocks: tuple[AuthorityBlock, ...],
+    delivery_route: tuple[RouteExpectation, ...],
+    calls: tuple[AuthorityCallInput, ...],
+    skipped_blocks: tuple[AuthoritySkippedBlockInput, ...],
+    route_claims: tuple[RouteClaim, ...],
+    iso: str,
+) -> AuthorityDistributionReceipt:
+    """Build under the one effective profile captured in the current scope."""
+    return _build_authority_distribution_impl(
+        blocks=blocks,
+        delivery_route=delivery_route,
+        calls=calls,
+        skipped_blocks=skipped_blocks,
+        route_claims=route_claims,
+        iso=iso,
+        profile=capture_authority_limit_profile(),
+    )
+
+
+def _build_context_authority_distribution(
+    *,
+    blocks: tuple[AuthorityBlock, ...],
+    delivery_route: tuple[RouteExpectation, ...],
+    calls: tuple[AuthorityCallInput, ...],
+    skipped_blocks: tuple[AuthoritySkippedBlockInput, ...],
+    route_claims: tuple[RouteClaim, ...],
+    iso: str,
+    _limits: AuthorityLimitProfile,
+    _verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None = None,
+) -> AuthorityDistributionReceipt:
+    """Private context-bound path used only by the sole acquisition issuer."""
+    return _build_authority_distribution_impl(
+        blocks=blocks,
+        delivery_route=delivery_route,
+        calls=calls,
+        skipped_blocks=skipped_blocks,
+        route_claims=route_claims,
+        iso=iso,
+        profile=_limits,
+        _verifier_cut_mutator=_verifier_cut_mutator,
+    )
+
+
 def project_authority_failure(
     receipt: AuthorityDistributionReceipt,
 ) -> CanonicalFailure | None:
@@ -1351,10 +1427,20 @@ def legacy_distribute_before_shift(
     origin: float,
     identity: bool,
     raw_unit_ids: tuple[str, ...],
+    source_indices: tuple[int, ...] | None = None,
 ) -> LegacyDistributionResult:
     """Freeze count-only slices, then transform only their retained members."""
     if len(raw_unit_ids) != len(relative_flat):
         raise ValueError("raw unit ids must cover the complete flat result")
+    owner_sources = (
+        tuple(range(len(texts))) if source_indices is None else tuple(source_indices)
+    )
+    if (
+        len(owner_sources) != len(texts)
+        or len(set(owner_sources)) != len(owner_sources)
+        or any(type(index) is not int or index < 0 for index in owner_sources)
+    ):
+        raise ValueError("legacy source indices must be unique nonnegative integers")
     requested: list[tuple[int, int]] = []
     realized: list[tuple[int, int]] = []
     expected: list[int] = []
@@ -1363,7 +1449,7 @@ def legacy_distribute_before_shift(
     shortages: list[int] = []
     cursor = 0
     raw_count = len(relative_flat)
-    for source_index, text in enumerate(texts):
+    for delivery_index, text in enumerate(texts):
         count = _legacy_count(text, iso)
         lower, upper = cursor, cursor + count
         requested.append((lower, upper))
@@ -1374,7 +1460,7 @@ def legacy_distribute_before_shift(
         retained.append(relative_flat[lower:upper])
         owner_ids.append(raw_unit_ids[lower:upper])
         if realized_upper - realized_lower < count:
-            shortages.append(source_index)
+            shortages.append(owner_sources[delivery_index])
         cursor += count
     if identity:
         projected = tuple(tuple(group) for group in retained)
@@ -1382,7 +1468,7 @@ def legacy_distribute_before_shift(
         projected = tuple(tuple(shift_units(list(group), origin)) for group in retained)
     consumed = min(cursor, raw_count)
     receipt = LegacyCallDistributionReceipt(
-        owner_source_indices=tuple(range(len(texts))),
+        owner_source_indices=owner_sources,
         expected_counts=tuple(expected),
         requested_ranges=tuple(requested),
         realized_ranges=tuple(realized),

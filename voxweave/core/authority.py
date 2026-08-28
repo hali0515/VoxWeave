@@ -52,10 +52,14 @@ __all__ = [
     "seal_chain",
 ]
 
-AuthorityKind = Literal["v1-capture", "optimizer-selection"]
+AuthorityKind = Literal["fresh-alignment", "v1-capture", "optimizer-selection"]
 
 #: Closed and sorted: a row's seed chain must terminate in one of exactly these.
-AUTHORITY_KINDS: tuple[AuthorityKind, ...] = ("optimizer-selection", "v1-capture")
+AUTHORITY_KINDS: tuple[AuthorityKind, ...] = (
+    "fresh-alignment",
+    "optimizer-selection",
+    "v1-capture",
+)
 
 #: The N8b probe record, in the spec's own field order. Stated once so the probe
 #: and its tests cannot drift apart about which fields a lineage tuple carries.

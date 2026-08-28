@@ -117,6 +117,7 @@ class _ContextRecord:
     private_evaluation_id: str
     paths: tuple[str, str, str | None]
     stable_fields: FrozenObject
+    authority_limit_profile: object | None
     public_seal: tuple[object, ...]
     role_order: tuple[str, ...]
     roles: dict[str, _RoleRecord]
@@ -183,6 +184,7 @@ def _register(
     sibling_path: Path,
     media_path: Path | None,
     stable_fields: FrozenObject,
+    authority_limit_profile: object | None,
     role_order: tuple[str, ...],
     private_context_id: str,
     private_evaluation_id: str,
@@ -198,6 +200,7 @@ def _register(
             _canonical(media_path) if media_path is not None else None,
         ),
         stable_fields=stable_fields,
+        authority_limit_profile=authority_limit_profile,
         public_seal=_public_seal(context),
         role_order=role_order,
         roles={role: _RoleRecord() for role in role_order},
@@ -218,6 +221,9 @@ def issue_align_context(
 ) -> IssuedAlignContext:
     """Issue one align context with five independently terminal roles."""
     stable = _require_stable_fields(stable_fields)
+    from voxweave.align_distribution import capture_authority_limit_profile
+
+    authority_profile = capture_authority_limit_profile()
     iso = canonical_registry_iso(effective_iso)
     if iso is None:
         raise ContextAuthorityError(
@@ -233,6 +239,8 @@ def issue_align_context(
             (
                 FrozenString("align-context-v2"),
                 stable,
+                FrozenString(authority_profile.kind),
+                FrozenString(authority_profile.profile_digest),
                 FrozenString(iso),
                 FrozenString(route_kind),
                 FrozenString(family),
@@ -263,6 +271,7 @@ def issue_align_context(
         sibling_path=sibling_path,
         media_path=media_path,
         stable_fields=stable,
+        authority_limit_profile=authority_profile,
         role_order=ALIGN_ROLE_ORDER,
         private_context_id=private_context_id,
         private_evaluation_id=private_evaluation_id,
@@ -318,6 +327,7 @@ def issue_segmentation_context(
         sibling_path=sibling_path,
         media_path=None,
         stable_fields=stable,
+        authority_limit_profile=None,
         role_order=SEGMENTATION_ROLE_ORDER,
         private_context_id=private_context_id,
         private_evaluation_id=private_evaluation_id,
@@ -462,6 +472,26 @@ def verify_context_content(context: IssuedContext, stable_fields: FrozenObject) 
             raise ContextAuthorityError(
                 "context-binding", "stable context fields changed after issuance"
             )
+
+
+def _align_context_authority_profile(context: IssuedAlignContext) -> object:
+    """Return the AO-05 profile bound to a genuine align context."""
+    with _LOCK:
+        record = _record_for(context)
+        if record.kind != "align" or record.authority_limit_profile is None:
+            raise ContextAuthorityError(
+                "context-binding", "align authority profile is unavailable"
+            )
+        return record.authority_limit_profile
+
+
+def _align_context_stable_fields(context: IssuedAlignContext) -> FrozenObject:
+    """Return the immutable stable input projection to trusted leaf stages."""
+    with _LOCK:
+        record = _record_for(context)
+        if record.kind != "align":
+            raise ContextAuthorityError("context-binding", "context is not align")
+        return record.stable_fields
 
 
 def _private_context_subject(context: IssuedContext) -> tuple[str, str]:

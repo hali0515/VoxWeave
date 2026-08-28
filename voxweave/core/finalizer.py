@@ -77,6 +77,8 @@ from .timing import (
 from .timing_preview import CueCandidate, CuePreview
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never a runtime import
+    from voxweave.align_acquisition import VerifiedFreshAlignment
+
     from .boundary_lattice import Edge, LatticeAtom
     from .boundary_v2 import DocumentSolution, IntervalSolution
     from .segdoc import SegDocument, SourceUnit
@@ -111,6 +113,7 @@ __all__ = [
     "pack_state",
     "phase1_cue",
     "phase1_from_optimizer_selection",
+    "phase1_from_fresh_alignment",
     "phase1_from_v1_capture",
     "phase1_stream",
     "register_optimizer_selection",
@@ -1841,6 +1844,110 @@ def phase1_from_v1_capture(
         kind="v1-capture",
         issuer="voxweave.core.finalizer.phase1_from_v1_capture",
         input_seed_id=seal.authority_id,
+    )
+
+
+def phase1_from_fresh_alignment(
+    verified: VerifiedFreshAlignment,
+    *,
+    profile: DisplayProfile,
+    ledger: AuthorityLedger,
+    row_id: str,
+    evaluation_id: str,
+) -> Phase1CueStream:
+    """Mint W1 only from one genuine, context-bound admitted fresh receipt."""
+    from voxweave.align_acquisition import _consume_verified_fresh_alignment
+    from voxweave.core.align_seed import AlignSeedResult, materialize_seed_cues
+    from voxweave.core.segdoc import SourceUnit
+    from voxweave.core.speaker_evidence import (
+        lyric_for_evidence,
+        make_evidence_span,
+    )
+
+    seed_value, receipt_digest, admitted_sing_spans = _consume_verified_fresh_alignment(
+        verified, profile=profile
+    )
+    if not isinstance(seed_value, AlignSeedResult):
+        raise TypeError("verified fresh alignment did not carry an AlignSeedResult")
+    if seed_value.status != "valid" or seed_value.blocks is None:
+        raise ValueError("verified fresh alignment is not W1-admissible")
+    if profile.language == "" or profile.language is None:
+        raise ValueError("fresh alignment profile lacks its language")
+    materialized = materialize_seed_cues(seed_value)
+    evidence_units = tuple(
+        SourceUnit(
+            unit.unit_id,
+            unit.surface,
+            unit.start,
+            unit.end,
+            unit.provenance,
+            None,
+        )
+        for unit in seed_value.ordered_units
+    )
+    for block, cue in zip(seed_value.blocks, materialized, strict=True):
+        evidence_span = make_evidence_span(
+            evidence_units,
+            block.unit_range,
+            input_start=block.display_start,
+            input_end=block.display_end,
+        )
+        cue["lyric"] = (
+            True if lyric_for_evidence(evidence_span, admitted_sing_spans) else None
+        )
+    cues = cast("Sequence[Cue]", materialized)
+    footprints = tuple(block.footprint for block in seed_value.blocks)
+    unit_ranges = tuple(block.unit_range for block in seed_value.blocks)
+    upstream_payload = {
+        "receipt_digest": receipt_digest,
+        "sing_spans": [list(span) for span in admitted_sing_spans],
+        "blocks": [
+            {
+                "source_index": block.source_index,
+                "owner_unit_ids": list(block.owner_unit_ids),
+                "unit_range": list(block.unit_range),
+                "speech_start": block.speech_start,
+                "speech_end": block.speech_end,
+                "display_start": block.display_start,
+                "display_end": block.display_end,
+                "footprint": block.footprint,
+            }
+            for block in seed_value.blocks
+        ],
+        "units": [
+            [
+                unit.unit_id,
+                unit.surface,
+                unit.start,
+                unit.end,
+                unit.provenance,
+                unit.call_index,
+                unit.call_unit_index,
+            ]
+            for unit in seed_value.ordered_units
+        ],
+    }
+    upstream = ledger.issue(
+        issuer="voxweave.align_acquisition.FreshAlignmentIssuer",
+        kind="fresh-alignment",
+        payload=upstream_payload,
+    )
+    upstream_seal = upstream.consume(upstream_payload)
+    stream = phase1_stream(
+        cues,
+        profile=profile,
+        footprints=footprints,
+        unit_ranges=unit_ranges,
+    )
+    return _mint_stream(
+        stream,
+        profile=profile,
+        ledger=ledger,
+        row_id=row_id,
+        evaluation_id=evaluation_id,
+        kind="fresh-alignment",
+        issuer="voxweave.core.finalizer.phase1_from_fresh_alignment",
+        input_seed_id=upstream_seal.authority_id,
     )
 
 

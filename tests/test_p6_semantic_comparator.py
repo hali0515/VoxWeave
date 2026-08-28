@@ -104,7 +104,16 @@ def _semantic_facts(*, bad_text: bool = False, bad_leg: bool = False):
             ),
         )
     observation = SimpleNamespace(
-        semantic_root_lineage=(("align/delivery-finalizer/v2", "fresh-alignment"),),
+        semantic_root_lineage=(
+            (
+                "evaluation",
+                "align/delivery-finalizer/v2",
+                "call",
+                "fresh-seed",
+                "phase1",
+                None,
+            ),
+        ),
         phase1_seed=(phase1,),
         delivered=((start, v2_cue.end),),
         report=SimpleNamespace(terminal="fixed-point"),

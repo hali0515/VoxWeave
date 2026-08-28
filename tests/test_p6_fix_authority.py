@@ -426,14 +426,18 @@ def test_rat1_adds_only_the_fresh_authority_factory_and_adapter_result():
 def test_authority_profile_is_context_bound_and_rejects_loose_forged_input():
     from voxweave import align_acquisition, align_distribution
 
-    assert "profile" not in inspect.signature(
-        align_distribution.build_authority_distribution
-    ).parameters
+    assert (
+        "profile"
+        not in inspect.signature(
+            align_distribution.build_authority_distribution
+        ).parameters
+    )
     acquisition_source = inspect.getsource(align_acquisition)
     assert "build_authority_distribution(" not in acquisition_source or (
-        "profile=" not in acquisition_source.split(
-            "build_authority_distribution(", maxsplit=1
-        )[1].split(")", maxsplit=1)[0]
+        "profile="
+        not in acquisition_source.split("build_authority_distribution(", maxsplit=1)[
+            1
+        ].split(")", maxsplit=1)[0]
     )
 
     forged = align_distribution.AuthorityLimitProfile(
@@ -458,3 +462,152 @@ def test_authority_profile_is_context_bound_and_rejects_loose_forged_input():
         match="production authority limits|profile",
     ):
         align_distribution.validate_authority_limit_profile(forged)
+
+
+def test_original_source_indices_survive_delivery_permutation_end_to_end(tmp_path):
+    from voxweave.align_acquisition import (
+        _bind_fresh_adapter_payload,
+        _fresh_alignment_call_observer,
+        _fresh_core_inputs,
+        _fresh_record,
+        _fresh_seed,
+        begin_fresh_alignment,
+        seal_fresh_alignment,
+    )
+    from voxweave.align_adapter import (
+        AlignDelivery,
+        AlignDeliveryCue,
+        AlignProjectionInputs,
+        PersistedAlignUnit,
+        SourceBlockDecoration,
+        _adapter_record,
+        run_locked_align_adapter,
+    )
+    from voxweave.align_context import _align_context_stable_fields
+    from voxweave.align_evidence_core import build_evidence_core
+    from voxweave.align_inputs import (
+        LegacyAlignPolicy,
+        resolve_align_profile,
+        resolve_finalize_evidence,
+        validate_v2_policy,
+    )
+    from voxweave.align_orchestration import issue_public_align_context
+    from voxweave.align_snapshot import StrictInputStatus, thaw_json
+    from voxweave.episode_transaction import FileGeneration
+
+    prepared = tmp_path / "prepared.wav"
+    prepared.write_bytes(b"physical-audio")
+    blocks = (
+        {"source_index": 7, "text": "first", "alignment_text": "first"},
+        {"source_index": 2, "text": "second", "alignment_text": "second"},
+    )
+    context = issue_public_align_context(
+        target_path=tmp_path / "episode.vtt",
+        sibling_path=tmp_path / "episode.json",
+        media_path=tmp_path / "episode.wav",
+        prepared_audio_path=prepared,
+        expected_vtt=FileGeneration(True, b"WEBVTT\n"),
+        expected_json=FileGeneration(True, b"{}"),
+        expected_vtt_sha256=None,
+        media_fingerprint="m" * 64,
+        effective_iso="en",
+        route_kind="ctc-full",
+        blocks=blocks,
+        prepared_audio_sha256="a" * 64,
+        legacy_policy=LegacyAlignPolicy(0.0, 0.0, 0.0),
+        stored_language="en",
+        segmentation=None,
+        strict_shot_changes=None,
+        strict_sing_spans=None,
+    )
+    stable = thaw_json(_align_context_stable_fields(context))
+    assert tuple(row["source_index"] for row in stable["blocks"]) == (7, 2)
+
+    session = begin_fresh_alignment(
+        context,
+        alignment_texts=("first", "second"),
+        source_indices=(7, 2),
+        language="en",
+        prepared_audio_sample_count=32_000,
+    )
+    _fresh_alignment_call_observer(session)(
+        (
+            {"text": "first", "start": 0.0, "end": 1.0},
+            {"text": "second", "start": 1.0, "end": 2.0},
+        ),
+        None,
+        (0, 1),
+        0.0,
+    )
+    acquisition = seal_fresh_alignment(session)
+    record = _fresh_record(context, acquisition)
+    seed = _fresh_seed(context, acquisition)
+    assert acquisition.physical_calls[0].source_block_indices == (7, 2)
+    assert acquisition.distribution.owner_source_indices == (7, 2)
+    assert acquisition.distribution.work.calls[0].source_block_indices == (7, 2)
+    assert record.legacy_receipts[0].owner_source_indices == (7, 2)
+    assert tuple(block.source_index for block in seed.blocks) == (7, 2)
+
+    first = PersistedAlignUnit("first", 0.0, 1.0)
+    second = PersistedAlignUnit("second", 1.0, 2.0)
+    legacy = AlignDelivery(
+        context.context_content_digest,
+        acquisition.receipt_digest,
+        "legacy-v1",
+        "ctc-full",
+        (
+            AlignDeliveryCue(7, "first", 0.0, 1.0, None, ("r0",), (first,), 0.0, 1.0),
+            AlignDeliveryCue(2, "second", 1.0, 2.0, None, ("r1",), (second,), 1.0, 2.0),
+        ),
+        (first, second),
+    )
+    projection = AlignProjectionInputs(
+        "en",
+        (
+            SourceBlockDecoration(7, None, None),
+            SourceBlockDecoration(2, None, None),
+        ),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    _bind_fresh_adapter_payload(
+        context,
+        acquisition,
+        legacy_delivery=legacy,
+        projection_inputs=projection,
+        strict_input_status=StrictInputStatus("valid", None),
+        v2_policy_status=validate_v2_policy(LegacyAlignPolicy(0.0, 0.0, 0.0)),
+        profile_resolution=resolve_align_profile(None, effective_iso="en"),
+        evidence_resolution=resolve_finalize_evidence(
+            shot_changes=None, sing_spans=None
+        ),
+    )
+    adapter = run_locked_align_adapter(context, acquisition, shadow_enabled=True)
+    assert tuple(cue.source_index for cue in adapter.legacy.cues) == (7, 2)
+    assert adapter.v2 is not None
+    assert tuple(cue.source_index for cue in adapter.v2.cues) == (7, 2)
+    assert tuple(
+        item.source_index
+        for item in _adapter_record(context, adapter).projection_inputs.source_blocks
+    ) == (7, 2)
+
+    core_inputs = _fresh_core_inputs(context, acquisition)
+    core = build_evidence_core(
+        context_content_digest=context.context_content_digest,
+        blocks=core_inputs[0],
+        captures=core_inputs[1],
+        transforms=core_inputs[2],
+        distribution=core_inputs[3],
+        seed_status=core_inputs[4],
+        seed_reasons=core_inputs[5],
+        physical_calls=core_inputs[6],
+        receipt_digest=acquisition.receipt_digest,
+        language="en",
+    )
+    assert tuple(block.source_index for block in core.blocks) == (7, 2)
+    assert core.physical_calls[0].source_block_indices == (7, 2)
