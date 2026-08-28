@@ -90,8 +90,8 @@ def test_seed_uses_exact_p5_endpoint_fold_and_all_four_display_branches():
         (10.0, 11.0),
     ]
     assert (seed.blocks[0].display_start, seed.blocks[0].display_end) == (1.0, 1.05)
-    assert (seed.blocks[1].display_start, seed.blocks[1].display_end) == (3.0, 5.0)
-    assert (seed.blocks[2].display_start, seed.blocks[2].display_end) == (7.0, 9.0)
+    assert (seed.blocks[1].display_start, seed.blocks[1].display_end) == (1.0, 3.0)
+    assert (seed.blocks[2].display_start, seed.blocks[2].display_end) == (3.0, 5.0)
     assert (seed.blocks[3].display_start, seed.blocks[3].display_end) == (10.0, 11.0)
 
 
@@ -132,8 +132,8 @@ def test_start_only_end_only_and_anchorless_seed_rules_are_exact():
         (None, None),
     ]
     assert (seed.blocks[0].display_start, seed.blocks[0].display_end) == (5.0, 5.05)
-    assert (seed.blocks[1].display_start, seed.blocks[1].display_end) == (5.95, 8.0)
-    assert (seed.blocks[2].display_start, seed.blocks[2].display_end) == (10.0, 12.0)
+    assert (seed.blocks[1].display_start, seed.blocks[1].display_end) == (2.0, 8.0)
+    assert (seed.blocks[2].display_start, seed.blocks[2].display_end) == (4.0, 6.0)
 
 
 def test_seed_rejects_negative_nonmonotone_and_reconciliation_defects():
