@@ -979,6 +979,22 @@ def test_align_shadow_observer_runs_once_after_disposal(tmp_path, monkeypatch):
         artifact.selected["json_sha256"]
         == hashlib.sha256(json_path.read_bytes()).hexdigest()
     )
+    canonical = json.loads(artifact.to_canonical_bytes())
+    assert tuple(canonical) == (
+        "schema_version",
+        "artifact_kind",
+        "status",
+        "failure",
+        "input",
+        "fresh",
+        "legacy",
+        "v2",
+        "comparison",
+        "selected",
+    )
+    assert tuple(canonical["v2"]) == ("semantic", "validators")
+    assert canonical["v2"] == {"semantic": None, "validators": None}
+    assert canonical["comparison"] == {"result": None}
 
 
 def test_align_shadow_rich_failure_notifies_with_minimal_artifact(
