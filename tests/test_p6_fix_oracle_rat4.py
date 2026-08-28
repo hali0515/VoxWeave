@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -238,6 +239,55 @@ def test_p6_source_registry_and_dependency_gate_is_checked():
         "source-gates", "--manifest", str(ORACLE_MANIFEST), "--check"
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
+
+
+def test_p6_oracle_pytest_lane_is_hermetic_under_hostile_locale():
+    environment = dict(os.environ)
+    environment.update({"LANG": "zh_CN.UTF-8", "LC_ALL": "zh_CN.UTF-8"})
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--extra",
+            "cuda",
+            "pytest",
+            "-q",
+            str(Path(__file__).resolve()),
+            "-k",
+            (
+                "test_p6_oracle_runner_has_exact_exit_contract_and_read_only_compare "
+                "or test_p6_oracle_compare_writes_a_deterministic_closed_json_report "
+                "or test_p6_source_registry_and_dependency_gate_is_checked"
+            ),
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+
+def test_canonical_p6_oracle_gate_target_pins_hostile_locale(tmp_path):
+    environment = dict(os.environ)
+    environment.update({"LANG": "zh_CN.UTF-8", "LC_ALL": "zh_CN.UTF-8"})
+    report = tmp_path / "p6-oracle-report.json"
+    result = subprocess.run(
+        [
+            "make",
+            "quality-p6-oracle",
+            "VARIANT=cuda",
+            f"P6_ORACLE_REPORT={report}",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert json.loads(report.read_bytes())["status"] == "match"
 
 
 def test_align_has_one_exact_auditable_ao_phase_order():
