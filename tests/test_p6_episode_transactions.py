@@ -832,7 +832,10 @@ def test_align_shadow_rich_failure_notifies_with_minimal_artifact(
     assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
     assert len(observed) == 1
     assert observed[0].artifact_kind == "minimal-failure"
-    assert observed[0].failure.detail_code == "rich-artifact-construction"
+    assert observed[0].failure.detail_code == "w1-root-event"
+    assert observed[0].failure.secondary[-1].detail_code == (
+        "rich-artifact-construction"
+    )
 
 
 def test_align_shadow_observer_failure_cannot_change_selected_return(
