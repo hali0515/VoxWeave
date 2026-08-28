@@ -403,30 +403,6 @@ def _w1_delivery(
         evidence=finalizer_evidence,
         policy=policy,
     )
-    semantic_observation = _SemanticObservation(
-        semantic_root_lineage,
-        deepcopy(stream.cues),
-        deepcopy(finalized.cues),
-        deepcopy(finalized.report),
-        deepcopy(finalized.trace),
-        None,
-        None,
-        None,
-    )
-
-    def retain_observation() -> None:
-        if _observation_sink is not None:
-            _observation_sink[:] = [semantic_observation]
-
-    retain_observation()
-    root_errors = check_roots(
-        ledger,
-        expected={"align/delivery-finalizer/v2": "fresh-alignment"},
-    )
-    if root_errors:
-        raise AlignAdapterError(
-            CanonicalFailure("fresh-authority-invalid", "w1-admission", "w1-root-event")
-        )
     terminal = getattr(finalized.report, "terminal", None)
     trace_terminal = getattr(finalized.trace, "terminal", None)
     if terminal != trace_terminal:
@@ -454,6 +430,30 @@ def _w1_delivery(
             CanonicalFailure(
                 "finalizer-output-invalid", "w1-finalizer", "terminal-validity"
             )
+        )
+    semantic_observation = _SemanticObservation(
+        semantic_root_lineage,
+        deepcopy(stream.cues),
+        deepcopy(finalized.cues),
+        deepcopy(finalized.report),
+        deepcopy(finalized.trace),
+        None,
+        None,
+        None,
+    )
+
+    def retain_observation() -> None:
+        if _observation_sink is not None:
+            _observation_sink[:] = [semantic_observation]
+
+    retain_observation()
+    root_errors = check_roots(
+        ledger,
+        expected={"align/delivery-finalizer/v2": "fresh-alignment"},
+    )
+    if root_errors:
+        raise AlignAdapterError(
+            CanonicalFailure("fresh-authority-invalid", "w1-admission", "w1-root-event")
         )
     if any(
         getattr(report, "kind", None) == "canonical-text-fallback"

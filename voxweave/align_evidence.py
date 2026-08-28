@@ -2234,6 +2234,39 @@ def _media_integrity(
         return False
 
 
+def _w1_usable_audit(root: Mapping[str, Any]) -> bool:
+    """Return the unsigned section 9.3 usability audit conjunction."""
+    try:
+        history = root["input_history"]
+        authority = root["authority_distribution"]
+        work = authority["work"]
+        owner_ranges = authority["owner_unit_ids"]
+        raw_unit_count = root["raw_unit_count"]
+    except (KeyError, TypeError):
+        return False
+    if (
+        not isinstance(history, Mapping)
+        or not isinstance(authority, Mapping)
+        or not isinstance(work, Mapping)
+        or history.get("authority_limit_profile_kind") != "production"
+        or work.get("limit_profile_kind") != "production"
+        or root.get("v2_admission_status") != "valid"
+        or type(raw_unit_count) is not int
+        or raw_unit_count < 0
+        or not isinstance(owner_ranges, (list, tuple))
+        or not owner_ranges
+    ):
+        return False
+    flattened: list[str] = []
+    for owner_range in owner_ranges:
+        if not isinstance(owner_range, (list, tuple)) or not owner_range:
+            return False
+        if any(type(unit_id) is not str for unit_id in owner_range):
+            return False
+        flattened.extend(owner_range)
+    return len(flattened) == raw_unit_count and len(set(flattened)) == raw_unit_count
+
+
 def verify_align_evidence(
     vtt_path: Path,
     *,
@@ -2275,8 +2308,8 @@ def verify_align_evidence(
         return AlignEvidenceVerification(False, False, "selected-output-hash")
     if not _media_integrity(root, target, explicit_media_path, corpus_root):
         return AlignEvidenceVerification(False, False, "media-identity")
-    # The ratified sidecar is unsigned audit evidence and never remints W1.
-    return AlignEvidenceVerification(True, False, None)
+    # This audit result never remints or replaces a fresh W1 capability.
+    return AlignEvidenceVerification(True, _w1_usable_audit(root), None)
 
 
 __all__ = [

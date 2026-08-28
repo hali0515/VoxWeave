@@ -795,7 +795,9 @@ def _expected_lyrics(
 
 
 def _qwen_origin_relation(
-    physical_calls: tuple[object, ...], authority_blocks: tuple[object, ...]
+    physical_calls: tuple[object, ...],
+    authority_blocks: tuple[object, ...],
+    legacy_cues: tuple[object, ...],
 ) -> tuple[bool, bool]:
     triggered = any(
         not _same_float(
@@ -805,7 +807,13 @@ def _qwen_origin_relation(
         for call in physical_calls
     )
     calls = {getattr(call, "call_index", None): call for call in physical_calls}
-    passed = bool(physical_calls)
+    legacy_by_source = {getattr(cue, "source_index", None): cue for cue in legacy_cues}
+    passed = (
+        bool(physical_calls)
+        and len(calls) == len(physical_calls)
+        and len(legacy_by_source) == len(legacy_cues)
+        and len(authority_blocks) == len(legacy_cues)
+    )
     for call in physical_calls:
         sample_start = getattr(call, "sample_start", None)
         sample_end = getattr(call, "sample_end", None)
@@ -823,32 +831,48 @@ def _qwen_origin_relation(
             and getattr(call, "legacy_origin_kind", None) == "nominal-route"
         )
     for block in authority_blocks:
-        for word in tuple(getattr(block, "word_data", None) or ()):
+        source_index = getattr(block, "source_index", None)
+        legacy_cue = legacy_by_source.get(source_index)
+        authority_ids = getattr(block, "authority_unit_ids", None)
+        legacy_ids = getattr(legacy_cue, "unit_ids", None)
+        authority_words = tuple(getattr(block, "word_data", None) or ())
+        legacy_words = tuple(getattr(legacy_cue, "word_data", None) or ())
+        passed = passed and (
+            legacy_cue is not None
+            and isinstance(authority_ids, tuple)
+            and legacy_ids == authority_ids
+            and len(authority_words) == len(authority_ids)
+            and len(legacy_words) == len(authority_ids)
+        )
+        for word, legacy_word in zip(authority_words, legacy_words):
             call = calls.get(getattr(word, "call_index", None))
             if call is None:
                 passed = False
                 continue
-            origin = getattr(call, "physical_origin_seconds", None)
-            relative_start = getattr(word, "relative_start", None)
-            relative_end = getattr(word, "relative_end", None)
-            start = getattr(word, "start", None)
-            end = getattr(word, "end", None)
-            if relative_start is None:
-                passed = passed and start is None
-            else:
-                passed = (
-                    passed
-                    and _finite_float(origin)
-                    and _same_float(start, relative_start + origin)
+            physical = getattr(call, "physical_origin_seconds", None)
+            nominal = getattr(call, "legacy_origin_seconds", None)
+            passed = passed and _finite_float(physical) and _finite_float(nominal)
+            if not (_finite_float(physical) and _finite_float(nominal)):
+                continue
+            origin_delta = physical - nominal
+            passed = passed and _finite_float(origin_delta)
+            for side in ("start", "end"):
+                relative = getattr(word, f"relative_{side}", None)
+                authority_bound = getattr(word, side, None)
+                legacy_bound = getattr(legacy_word, side, None)
+                if relative is None:
+                    passed = passed and authority_bound is None and legacy_bound is None
+                    continue
+                if not _finite_float(relative):
+                    passed = False
+                    continue
+                expected_legacy = relative + nominal
+                expected_authority = relative + physical
+                passed = passed and (
+                    _same_float(legacy_bound, expected_legacy)
+                    and _same_float(authority_bound, expected_authority)
                 )
-            if relative_end is None:
-                passed = passed and end is None
-            else:
-                passed = (
-                    passed
-                    and _finite_float(origin)
-                    and _same_float(end, relative_end + origin)
-                )
+            passed = passed and (getattr(legacy_word, "text", None) == _word_text(word))
     return triggered, passed
 
 
@@ -905,7 +929,7 @@ def compare_semantic_deltas(
 
     if route_kind == "qwen-crop":
         ald0_triggered, ald0_relation = _qwen_origin_relation(
-            physical_calls, authority_blocks
+            physical_calls, authority_blocks, legacy_cues
         )
     else:
         ald0_triggered = False

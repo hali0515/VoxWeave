@@ -70,6 +70,7 @@ def _semantic_facts(
         start=legacy_word.start,
         end=legacy_word.end,
         lyric=None,
+        unit_ids=("r0",),
         word_data=(legacy_word,),
     )
     v2_cue = SimpleNamespace(
