@@ -531,7 +531,7 @@ def build_rich_align_shadow_artifact(
     result = selection.result
     verified = selection.verified
     core = result.evidence_core
-    failure = result.v2_status.failure
+    failure = selection.observation_failure or result.v2_status.failure
     status: Literal["valid", "invalid"] = "invalid" if failure is not None else "valid"
     distribution_value = dataclasses.asdict(selection.distribution)
     evidence_sha256 = hashlib.sha256(
@@ -561,7 +561,9 @@ def build_rich_align_shadow_artifact(
                 "profile_status": selection.profile_status.kind,
                 "evidence_status": selection.evidence_status.kind,
                 "v2_admission_status": (
-                    "valid"
+                    "invalid"
+                    if selection.observation_failure is not None
+                    else "valid"
                     if result.v2_status.kind == "valid"
                     else result.v2_status.kind
                 ),

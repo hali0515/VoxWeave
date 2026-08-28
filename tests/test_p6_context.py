@@ -4,9 +4,9 @@ import pytest
 
 
 def _stable_fields():
-    from voxweave.align_snapshot import freeze_json
+    from voxweave.align_snapshot import FrozenObject, freeze_json
 
-    return freeze_json(
+    stable_fields = freeze_json(
         {
             "vtt_sha256": "a" * 64,
             "sibling_json_sha256": "b" * 64,
@@ -14,6 +14,8 @@ def _stable_fields():
             "prepared_audio_sha256": "d" * 64,
         }
     )
+    assert isinstance(stable_fields, FrozenObject)
+    return stable_fields
 
 
 def _issue(tmp_path: Path):
@@ -162,3 +164,44 @@ def test_segmentation_context_has_only_adapter_encoder_commit_roles(tmp_path):
     consume_context_role(context, "adapter", consumer="run_locked_segmentation_adapter")
     retire_live_context_roles(context)
     assert role_vector(context) == ("C", "R", "R")
+
+
+def test_context_closure_classifies_unused_roles_and_expected_vtt_generation(
+    tmp_path,
+):
+    from voxweave.align_context import (
+        ContextAuthorityError,
+        issue_align_context,
+        verify_context_expected_vtt_generation,
+        verify_context_roles_terminal,
+    )
+    from voxweave.align_snapshot import FrozenObject, freeze_json
+
+    stable_fields = freeze_json(
+        {
+            "expected_vtt_sha256": "a" * 64,
+            "vtt_generation": {"sha256": "b" * 64},
+        }
+    )
+    assert isinstance(stable_fields, FrozenObject)
+    context = issue_align_context(
+        stable_fields=stable_fields,
+        target_path=tmp_path / "episode.vtt",
+        sibling_path=tmp_path / "episode.json",
+        media_path=tmp_path / "episode.mkv",
+        effective_iso="en",
+        route_kind="ctc-full",
+    )
+
+    with pytest.raises(ContextAuthorityError) as unused:
+        verify_context_roles_terminal(context)
+    assert unused.value.failure.kind == "context-authority-invalid"
+    assert unused.value.failure.detail_code == "context-unused-role"
+
+    with pytest.raises(ContextAuthorityError) as generation:
+        verify_context_expected_vtt_generation(
+            context,
+            observed_vtt_sha256="b" * 64,
+        )
+    assert generation.value.failure.kind == "context-authority-invalid"
+    assert generation.value.failure.detail_code == "expected-vtt-generation"

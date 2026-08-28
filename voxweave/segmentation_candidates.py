@@ -7,6 +7,7 @@ import hashlib
 import secrets
 import threading
 from dataclasses import dataclass, field
+from typing import Literal
 
 from voxweave.align_context import IssuedSegmentationContext, consume_context_role
 from voxweave.align_failures import CanonicalFailure
@@ -31,7 +32,10 @@ from voxweave.segmentation_adapter import (
     _adapter_record,
     segmentation_delivery_digest,
 )
-from voxweave.segmentation_projector import project_segmentation_delivery
+from voxweave.segmentation_projector import (
+    SegmentationProjectionEncodeError,
+    project_segmentation_delivery,
+)
 
 
 @dataclass(frozen=True)
@@ -154,9 +158,21 @@ def _encode_family(
     return candidate
 
 
-def _encoder_failure() -> CandidateFailure:
+def _encoder_failure(
+    detail_code: Literal["main-json-encode", "vtt-encode"] = "main-json-encode",
+) -> CandidateFailure:
     return CandidateFailure(
-        CanonicalFailure("preencode-failed", "encoder", "main-json-encode")
+        CanonicalFailure("preencode-failed", "encoder", detail_code)
+    )
+
+
+def _renderer_stage_failure() -> CandidateFailure:
+    return CandidateFailure(
+        CanonicalFailure(
+            "shadow-internal-error",
+            "renderer-stage",
+            "renderer-stage",
+        )
     )
 
 
@@ -179,6 +195,8 @@ def encode_segmentation_candidates(
             result.legacy,
             record.projection_inputs,
         )
+    except SegmentationProjectionEncodeError as exc:
+        legacy = _encoder_failure(exc.detail_code)
     except Exception:
         legacy = _encoder_failure()
     outcomes.append(("legacy-v1", legacy))
@@ -198,8 +216,10 @@ def encode_segmentation_candidates(
                 result.v2,
                 record.projection_inputs,
             )
+        except SegmentationProjectionEncodeError as exc:
+            boundary = _encoder_failure(exc.detail_code)
         except Exception:
-            boundary = _encoder_failure()
+            boundary = _renderer_stage_failure()
     outcomes.append(("boundary-v2", boundary))
     return _issue_candidate_set(context, result, tuple(outcomes))
 

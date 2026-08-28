@@ -6,11 +6,13 @@ import fcntl
 import hashlib
 import os
 import stat
+import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from voxweave.align_failures import CanonicalFailure
 from voxweave.voicebase import (
     CACHE_COMPANION_MAX_BYTES,
     MAX_PROVENANCE_STRING_BYTES,
@@ -33,6 +35,29 @@ class CacheCompanionError(Phase2DataError):
 
 class CacheCompanionMismatch(CacheCompanionError):
     """A well-formed companion does not describe the requested cache pair."""
+
+
+def _classify_cache_failure(
+    exc: BaseException,
+    *,
+    kind: str,
+    detail_code: str,
+) -> None:
+    if not isinstance(getattr(exc, "failure", None), CanonicalFailure):
+        exc.failure = CanonicalFailure(  # type: ignore[attr-defined]
+            kind,
+            "vocals-cache",
+            detail_code,
+        )
+
+
+def classify_cache_decode_failure(exc: BaseException) -> None:
+    """Attach the cache-decode terminal while preserving the public exception."""
+    _classify_cache_failure(
+        exc,
+        kind="cache-operation-failed",
+        detail_code="cache-decode",
+    )
 
 
 @dataclass(frozen=True)
@@ -140,10 +165,21 @@ def validate_cache_companion(value: object) -> ValidatedCacheCompanion:
             minimum=0,
         )
         cache_hash = require_sha256(root.get("cache_sha256"), "cache_sha256")
-    except CacheCompanionError:
+    except CacheCompanionError as exc:
+        _classify_cache_failure(
+            exc,
+            kind="cache-companion-invalid",
+            detail_code="companion-schema",
+        )
         raise
     except Phase2DataError as exc:
-        raise CacheCompanionError(str(exc)) from exc
+        failure = CacheCompanionError(str(exc))
+        _classify_cache_failure(
+            failure,
+            kind="cache-companion-invalid",
+            detail_code="companion-schema",
+        )
+        raise failure from exc
     return ValidatedCacheCompanion(
         media_fingerprint=media_fingerprint,
         separator=separator,
@@ -214,7 +250,11 @@ def build_cache_companion(
 def load_cache_companion(
     path: Path,
 ) -> tuple[dict[str, object], ValidatedCacheCompanion]:
-    raw = load_json_object(path, max_bytes=CACHE_COMPANION_MAX_BYTES)
+    try:
+        raw = load_json_object(path, max_bytes=CACHE_COMPANION_MAX_BYTES)
+    except (OSError, Phase2DataError) as exc:
+        classify_cache_decode_failure(exc)
+        raise
     return raw, validate_cache_companion(raw)
 
 
@@ -234,19 +274,54 @@ def validate_cache_pair(
         else validate_separator_identity(separator)
     )
     if validated.media_fingerprint != expected_media:
-        raise CacheCompanionMismatch("cache companion media fingerprint differs")
+        failure = CacheCompanionMismatch("cache companion media fingerprint differs")
+        _classify_cache_failure(
+            failure,
+            kind="cache-companion-invalid",
+            detail_code="companion-media",
+        )
+        raise failure
     if validated.separator != expected_separator:
-        raise CacheCompanionMismatch("cache companion separator identity differs")
+        failure = CacheCompanionMismatch("cache companion separator identity differs")
+        _classify_cache_failure(
+            failure,
+            kind="cache-companion-invalid",
+            detail_code="companion-media",
+        )
+        raise failure
     try:
         actual_size, actual_hash = file_size_sha256(cache_path)
-    except CacheCompanionError:
+    except CacheCompanionError as exc:
+        _classify_cache_failure(
+            exc,
+            kind="cache-companion-invalid",
+            detail_code="companion-hash",
+        )
         raise
     except OSError as exc:
-        raise CacheCompanionMismatch(f"cannot read vocals cache: {exc}") from exc
+        failure = CacheCompanionMismatch(f"cannot read vocals cache: {exc}")
+        _classify_cache_failure(
+            failure,
+            kind="cache-companion-invalid",
+            detail_code="companion-hash",
+        )
+        raise failure from exc
     if validated.cache_size != actual_size:
-        raise CacheCompanionMismatch("cache companion size differs from FLAC")
+        failure = CacheCompanionMismatch("cache companion size differs from FLAC")
+        _classify_cache_failure(
+            failure,
+            kind="cache-companion-invalid",
+            detail_code="companion-size",
+        )
+        raise failure
     if validated.cache_sha256 != actual_hash:
-        raise CacheCompanionMismatch("cache companion SHA-256 differs from FLAC")
+        failure = CacheCompanionMismatch("cache companion SHA-256 differs from FLAC")
+        _classify_cache_failure(
+            failure,
+            kind="cache-companion-invalid",
+            detail_code="companion-hash",
+        )
+        raise failure
     return validated
 
 
@@ -271,7 +346,15 @@ def cache_pair_valid(
 
 def write_cache_companion(path: Path, value: Mapping[str, object]) -> None:
     validate_cache_companion(value)
-    write_json_object(path, value, max_bytes=CACHE_COMPANION_MAX_BYTES)
+    try:
+        write_json_object(path, value, max_bytes=CACHE_COMPANION_MAX_BYTES)
+    except OSError as exc:
+        _classify_cache_failure(
+            exc,
+            kind="cache-operation-failed",
+            detail_code="companion-replace",
+        )
+        raise
 
 
 def publish_cache_companion(
@@ -307,20 +390,40 @@ def delete_cache_companion_first(
         if companion_path is None
         else Path(companion_path)
     )
-    destination.unlink(missing_ok=True)
+    try:
+        destination.unlink(missing_ok=True)
+    except OSError as exc:
+        _classify_cache_failure(
+            exc,
+            kind="cache-operation-failed",
+            detail_code="companion-unlink",
+        )
+        raise
     return destination
 
 
 @contextmanager
 def cache_lock(cache_path: Path) -> Iterator[CacheLockHandle]:
     """Serialize every cache reader/writer through the canonical realpath lock."""
-    resolved = canonical_cache_path(cache_path)
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    lock = Path(f"{resolved}.lock")
-    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor: int | None = None
     try:
+        resolved = canonical_cache_path(cache_path)
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        lock = Path(f"{resolved}.lock")
+        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        _classify_cache_failure(
+            exc,
+            kind="cache-lock-failed",
+            detail_code="cache-lock-acquire",
+        )
+        raise
+    assert descriptor is not None
+    try:
         yield CacheLockHandle(
             cache_path=resolved,
             companion_path=Path(f"{resolved}.meta.json"),
@@ -337,8 +440,56 @@ def cache_lock(cache_path: Path) -> Iterator[CacheLockHandle]:
 def cache_write_window(cache_path: Path) -> Iterator[CacheLockHandle]:
     """Take the cache lock and enforce delete-companion-before-write ordering."""
     with cache_lock(cache_path) as handle:
-        handle.companion_path.unlink(missing_ok=True)
+        delete_cache_companion_first(
+            handle.cache_path,
+            companion_path=handle.companion_path,
+        )
         yield handle
+
+
+@contextmanager
+def cache_publish_path(cache_path: Path) -> Iterator[Path]:
+    """Stage and atomically replace one cache file with exact edge terminals."""
+    destination = canonical_cache_path(cache_path)
+    temporary: Path | None = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(
+            dir=destination.parent,
+            prefix=f".{destination.stem}.",
+            suffix=f".part{destination.suffix}",
+        )
+        os.close(descriptor)
+        temporary = Path(name)
+        try:
+            yield temporary
+        except BaseException as exc:
+            _classify_cache_failure(
+                exc,
+                kind="cache-operation-failed",
+                detail_code="cache-stage",
+            )
+            raise
+        try:
+            os.replace(temporary, destination)
+        except BaseException as exc:
+            _classify_cache_failure(
+                exc,
+                kind="cache-operation-failed",
+                detail_code="cache-replace",
+            )
+            raise
+    except BaseException as exc:
+        if temporary is None:
+            _classify_cache_failure(
+                exc,
+                kind="cache-operation-failed",
+                detail_code="cache-stage",
+            )
+        raise
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 __all__ = [
@@ -353,8 +504,10 @@ __all__ = [
     "cache_lock",
     "cache_lock_path",
     "cache_pair_valid",
+    "cache_publish_path",
     "cache_write_window",
     "canonical_cache_path",
+    "classify_cache_decode_failure",
     "delete_cache_companion_first",
     "file_size_sha256",
     "load_cache_companion",

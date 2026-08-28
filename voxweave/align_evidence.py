@@ -883,15 +883,16 @@ def bind_align_evidence(
         or engine_family != context.engine_family
         or not _is_sha256(vtt_sha256)
         or not _is_sha256(main_json_sha256)
-        or not _verified_hash_binding(
-            context,
-            evidence_core,
-            engine_family,
-            vtt_sha256,
-            main_json_sha256,
-        )
     ):
         raise _binding_failure()
+    if not _verified_hash_binding(
+        context,
+        evidence_core,
+        engine_family,
+        vtt_sha256,
+        main_json_sha256,
+    ):
+        raise _binding_failure("selected-hash-link")
     consume_context_role(context, "evidence-bind", consumer="bind_align_evidence")
     try:
         projection = _core_value(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, cast
 
 from voxweave import realign
 from voxweave.align_adapter import AlignDelivery, AlignProjectionInputs
@@ -23,13 +23,19 @@ class AlignPrimaryProjection:
     main_json_bytes: bytes
 
 
+class AlignProjectionEncodeError(RuntimeError):
+    def __init__(self, detail_code: Literal["main-json-encode", "vtt-encode"]):
+        super().__init__(detail_code)
+        self.detail_code: Literal["main-json-encode", "vtt-encode"] = detail_code
+
+
 def _source_block(inputs: AlignProjectionInputs, source_index: int) -> dict[str, Any]:
-    item = next(
-        (block for block in inputs.source_blocks if block.source_index == source_index),
-        None,
+    matches = tuple(
+        block for block in inputs.source_blocks if block.source_index == source_index
     )
-    if item is None:
-        raise ValueError("delivery cue lacks its sealed source decoration")
+    if len(matches) != 1:
+        raise ValueError("delivery cue source decoration is missing or duplicated")
+    item = matches[0]
     block: dict[str, Any] = {}
     if item.speaker is not None:
         block["speaker"] = item.speaker
@@ -51,7 +57,10 @@ def _speaker_turns_value(
     if turns is None:
         return False, None
     return True, freeze_json(
-        [[float(start), float(end), str(label)] for start, end, label in turns]
+        [
+            [float(start), float(end), str(label)]
+            for start, end, label in cast(Any, turns)
+        ]
     )
 
 
@@ -95,23 +104,57 @@ def _main_value(delivery: AlignDelivery, inputs: AlignProjectionInputs) -> Froze
     return frozen
 
 
+def project_align_vtt_bytes(
+    delivery: AlignDelivery,
+    inputs: AlignProjectionInputs,
+) -> bytes:
+    """Render only the VTT member of one candidate family."""
+    rows = []
+    for cue in delivery.cues:
+        text = f"♪ {cue.text} ♪" if cue.lyric is True else cue.text
+        text = voice_text_for_block(text, _source_block(inputs, cue.source_index))
+        rows.append((cue.start, cue.end, text))
+    return realign.render_cues(rows).encode("utf-8")
+
+
+def project_align_main_json_bytes(
+    delivery: AlignDelivery,
+    inputs: AlignProjectionInputs,
+    *,
+    strict: bool,
+) -> bytes:
+    """Encode only the main-JSON member of one candidate family."""
+    return encode_frozen_json_document(
+        _main_value(delivery, inputs),
+        allow_nan=not strict,
+    )
+
+
 def project_align_delivery(
     delivery: AlignDelivery,
     inputs: AlignProjectionInputs,
     *,
     strict: bool,
 ) -> AlignPrimaryProjection:
-    rows = []
-    for cue in delivery.cues:
-        text = f"♪ {cue.text} ♪" if cue.lyric is True else cue.text
-        text = voice_text_for_block(text, _source_block(inputs, cue.source_index))
-        rows.append((cue.start, cue.end, text))
-    vtt_bytes = realign.render_cues(rows).encode("utf-8")
-    main_json_bytes = encode_frozen_json_document(
-        _main_value(delivery, inputs),
-        allow_nan=not strict,
-    )
+    try:
+        vtt_bytes = project_align_vtt_bytes(delivery, inputs)
+    except Exception as exc:
+        raise AlignProjectionEncodeError("vtt-encode") from exc
+    try:
+        main_json_bytes = project_align_main_json_bytes(
+            delivery,
+            inputs,
+            strict=strict,
+        )
+    except Exception as exc:
+        raise AlignProjectionEncodeError("main-json-encode") from exc
     return AlignPrimaryProjection(vtt_bytes, main_json_bytes)
 
 
-__all__ = ["AlignPrimaryProjection", "project_align_delivery"]
+__all__ = [
+    "AlignPrimaryProjection",
+    "AlignProjectionEncodeError",
+    "project_align_delivery",
+    "project_align_main_json_bytes",
+    "project_align_vtt_bytes",
+]

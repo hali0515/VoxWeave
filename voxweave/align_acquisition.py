@@ -16,11 +16,12 @@ import secrets
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from voxweave.align_context import (
     IssuedAlignContext,
     _align_context_authority_profile,
+    _align_context_stable_fields,
     _private_context_subject,
     consume_context_role,
     role_vector,
@@ -147,6 +148,21 @@ class SampleGeometryError(ValueError):
         self.detail_code = detail_code
 
 
+def _attach_canonical_failure(
+    exc: BaseException,
+    *,
+    kind: str,
+    phase: str,
+    detail_code: str,
+) -> None:
+    """Classify an unchanged historical exception boundary."""
+    try:
+        if not isinstance(getattr(exc, "failure", None), CanonicalFailure):
+            setattr(exc, "failure", CanonicalFailure(kind, phase, detail_code))
+    except Exception:
+        pass
+
+
 def _exact_index(value: Any, *, name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be an exact nonnegative integer")
@@ -251,14 +267,28 @@ def capture_strict_units(
     try:
         raw_count = len(raw_units)
     except Exception as exc:  # pragma: no cover - defensive API boundary
-        raise TypeError("raw_units must be a sized sequence") from exc
+        classified = TypeError("raw_units must be a sized sequence")
+        _attach_canonical_failure(
+            classified,
+            kind="fresh-backend-output-invalid",
+            phase="backend-output",
+            detail_code="backend-call-shape",
+        )
+        raise classified from exc
     observed_ids = tuple(raw_unit_ids)
     if len(observed_ids) != raw_count or any(
         type(unit_id) is not str or not unit_id for unit_id in observed_ids
     ):
         raise ValueError("raw_unit_ids must assign one exact string to every raw node")
     if original_units is not None and len(original_units) != raw_count:
-        raise ValueError("original_units must match the current raw result length")
+        exc = ValueError("original_units must match the current raw result length")
+        _attach_canonical_failure(
+            exc,
+            kind="fresh-backend-output-invalid",
+            phase="relative-normalization",
+            detail_code="relative-normalization",
+        )
+        raise exc
 
     captured: list[StrictCapturedUnit] = []
     raw_values: list[FrozenJSON] = []
@@ -614,6 +644,17 @@ class _AdapterPayload:
     evidence_resolution: object
 
 
+@dataclass(frozen=True)
+class _FreshSeals:
+    context: str
+    raw: str
+    relative: str
+    legacy_slice: str
+    authority: str
+    distribution: str
+    phase1: str
+
+
 @dataclass
 class _FreshRecord:
     context: IssuedAlignContext
@@ -630,6 +671,7 @@ class _FreshRecord:
     adapter_payload: _AdapterPayload | None = None
     verified: VerifiedFreshAlignment | None = None
     transfer_terminal: Literal["live", "consumed", "retired"] = "live"
+    seals: _FreshSeals | None = None
 
 
 @dataclass
@@ -687,6 +729,228 @@ def _stable_value(value: Any) -> Any:
 
 def _stable_digest(value: Any) -> str:
     return frozen_json_digest(freeze_json(_stable_value(value)))
+
+
+def _physical_projection(
+    calls: tuple[PhysicalCallReceipt, ...], names: tuple[str, ...]
+) -> tuple[tuple[object, ...], ...]:
+    return tuple(tuple(getattr(call, name) for name in names) for call in calls)
+
+
+def _context_seal_digest(record: _FreshRecord) -> str:
+    stable = _align_context_stable_fields(record.context)
+    context = record.context
+    return _stable_digest(
+        (
+            context.context_content_digest,
+            context.context_binding_digest,
+            context.engine_family,
+            context.effective_iso,
+            context.route_kind,
+            context._issuance_nonce,
+            record.issued.context_content_digest,
+            stable,
+        )
+    )
+
+
+def _raw_seal_digest(record: _FreshRecord) -> str:
+    captures = tuple(
+        (
+            capture.call_index,
+            capture.status,
+            capture.raw_units_digest,
+            capture.failure,
+            capture.observed_unit_ids,
+            None
+            if capture.units is None
+            else tuple((unit.unit_id, unit.raw) for unit in capture.units),
+        )
+        for capture in record.captures
+    )
+    names = (
+        "call_index",
+        "strict_unit_status",
+        "strict_failure",
+        "raw_units_digest",
+        "raw_unit_ids",
+    )
+    return _stable_digest(
+        (
+            captures,
+            _physical_projection(record.physical_calls, names),
+            _physical_projection(record.issued.physical_calls, names),
+        )
+    )
+
+
+def _relative_seal_digest(record: _FreshRecord) -> str:
+    captures = tuple(
+        (
+            capture.call_index,
+            capture.status,
+            capture.normalized_relative_digest,
+            None
+            if capture.units is None
+            else tuple(
+                (
+                    unit.unit_id,
+                    unit.call_index,
+                    unit.call_unit_index,
+                    unit.surface,
+                    unit.relative_start,
+                    unit.relative_end,
+                    unit.provenance,
+                    unit.original_relative_start,
+                    unit.original_relative_end,
+                )
+                for unit in capture.units
+            ),
+        )
+        for capture in record.captures
+    )
+    names = ("call_index", "normalized_relative_digest")
+    return _stable_digest(
+        (
+            captures,
+            _physical_projection(record.physical_calls, names),
+            _physical_projection(record.issued.physical_calls, names),
+        )
+    )
+
+
+def _legacy_slice_seal_digest(record: _FreshRecord) -> str:
+    names = ("call_index", "legacy_slice_digest", "legacy_absolute_digest")
+    return _stable_digest(
+        (
+            record.legacy_receipts,
+            record.legacy_block_units,
+            _physical_projection(record.physical_calls, names),
+            _physical_projection(record.issued.physical_calls, names),
+        )
+    )
+
+
+def _authority_seal_digest(record: _FreshRecord) -> str:
+    transforms = tuple(
+        (
+            transform.call_index,
+            transform.status,
+            transform.authority_absolute_digest,
+            transform.failure,
+            None
+            if transform.units is None
+            else tuple(
+                (
+                    unit.unit_id,
+                    unit.call_index,
+                    unit.call_unit_index,
+                    unit.surface,
+                    unit.relative_start,
+                    unit.relative_end,
+                    unit.physical_origin_seconds,
+                    unit.start,
+                    unit.end,
+                    unit.provenance,
+                    unit.original_relative_start,
+                    unit.original_relative_end,
+                )
+                for unit in transform.units
+            ),
+        )
+        for transform in record.transforms
+    )
+    names = (
+        "call_index",
+        "source_block_indices",
+        "audio_sample_start",
+        "audio_sample_end",
+        "sample_rate",
+        "physical_origin_seconds",
+        "legacy_origin_seconds",
+        "legacy_origin_kind",
+        "authority_origin_seconds",
+        "backend_model_config_digest",
+        "route_input_digest",
+        "authority_transform_status",
+        "authority_absolute_digest",
+    )
+    return _stable_digest(
+        (
+            transforms,
+            _physical_projection(record.physical_calls, names),
+            _physical_projection(record.issued.physical_calls, names),
+        )
+    )
+
+
+def _distribution_seal_digest(record: _FreshRecord) -> str:
+    return _stable_digest((record.distribution, record.issued.distribution))
+
+
+def _phase1_seal_digest(record: _FreshRecord) -> str:
+    return _stable_digest(
+        (
+            record.seed,
+            record.issued.seed_status,
+            record.issued.seed_reasons,
+        )
+    )
+
+
+def _fresh_seals(record: _FreshRecord) -> _FreshSeals:
+    return _FreshSeals(
+        _context_seal_digest(record),
+        _raw_seal_digest(record),
+        _relative_seal_digest(record),
+        _legacy_slice_seal_digest(record),
+        _authority_seal_digest(record),
+        _distribution_seal_digest(record),
+        _phase1_seal_digest(record),
+    )
+
+
+_SEAL_PHASES = {
+    "context-seal": "context",
+    "raw-seal": "strict-capture",
+    "relative-seal": "relative-normalization",
+    "legacy-slice-seal": "legacy-distribution",
+    "authority-seal": "authority-transform",
+    "distribution-seal": "authority-distribution",
+    "phase1-seal": "w1-admission",
+}
+
+
+def _raise_component_seal(detail_code: str) -> NoReturn:
+    raise FreshSealBroken(
+        CanonicalFailure(
+            "fresh-seal-broken",
+            _SEAL_PHASES[detail_code],
+            detail_code,
+        )
+    )
+
+
+def _verify_fresh_seals(record: _FreshRecord) -> None:
+    expected = record.seals
+    if expected is None:
+        _raise_component_seal("context-seal")
+    checks = (
+        ("context-seal", expected.context, _context_seal_digest),
+        ("raw-seal", expected.raw, _raw_seal_digest),
+        ("relative-seal", expected.relative, _relative_seal_digest),
+        ("legacy-slice-seal", expected.legacy_slice, _legacy_slice_seal_digest),
+        ("authority-seal", expected.authority, _authority_seal_digest),
+        ("distribution-seal", expected.distribution, _distribution_seal_digest),
+        ("phase1-seal", expected.phase1, _phase1_seal_digest),
+    )
+    for detail_code, sealed, projector in checks:
+        try:
+            current = projector(record)
+        except Exception:
+            _raise_component_seal(detail_code)
+        if current != sealed:
+            _raise_component_seal(detail_code)
 
 
 def _invalid_capture(
@@ -791,12 +1055,26 @@ class FreshAlignmentIssuer:
         try:
             raw_count = len(post_units)
         except Exception as exc:
-            raise TypeError("backend result must be one sized sequence") from exc
+            classified = TypeError("backend result must be one sized sequence")
+            _attach_canonical_failure(
+                classified,
+                kind="fresh-backend-output-invalid",
+                phase="backend-output",
+                detail_code="backend-call-shape",
+            )
+            raise classified from exc
         if original_units is not None:
             try:
                 len(original_units)
             except Exception as exc:
-                raise TypeError("original backend result must be sized") from exc
+                classified = TypeError("original backend result must be sized")
+                _attach_canonical_failure(
+                    classified,
+                    kind="fresh-backend-output-invalid",
+                    phase="backend-output",
+                    detail_code="backend-call-shape",
+                )
+                raise classified from exc
         source_positions = tuple(source_indices)
         if (
             not source_positions
@@ -932,6 +1210,21 @@ class FreshAlignmentIssuer:
             )
         )
 
+    def _invoke_backend_call(self, backend_call: Callable[[], Any]) -> Any:
+        """Preserve a backend exception while attaching its closed classification."""
+        if not callable(backend_call):
+            raise TypeError("backend call must be callable")
+        try:
+            return backend_call()
+        except Exception as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="fresh-backend-output-invalid",
+                phase="backend-call",
+                detail_code="backend-raised",
+            )
+            raise
+
     def _invoke_qwen_physical_call(
         self,
         backend_call: Callable[[], Sequence[Any]],
@@ -949,7 +1242,7 @@ class FreshAlignmentIssuer:
             raise ValueError("Qwen invocation is unavailable for this route")
         if not callable(backend_call):
             raise TypeError("Qwen backend call must be callable")
-        raw_units = backend_call()
+        raw_units = self._invoke_backend_call(backend_call)
         self._observe_physical_call(
             raw_units,
             None,
@@ -1038,6 +1331,14 @@ def _fresh_alignment_qwen_invoker(
     return issuer._invoke_qwen_physical_call
 
 
+def _fresh_alignment_backend_invoker(
+    session: FreshAlignmentSession,
+) -> Callable[[Callable[[], Any]], Any]:
+    """Return the issuer-owned wrapper for one configured backend attempt."""
+    issuer = _fresh_session_record(session).issuer
+    return issuer._invoke_backend_call
+
+
 def _call_capture(
     issuer: FreshAlignmentIssuer,
     call: _ObservedPhysicalCall,
@@ -1053,15 +1354,31 @@ def _call_capture(
     texts = tuple(
         blocks_by_source[index].alignment_text for index in call.source_block_indices
     )
-    legacy = legacy_distribute_before_shift(
-        call.post_units,
-        texts=texts,
-        iso=issuer.language,
-        origin=call.legacy_origin_seconds,
-        identity=call.legacy_origin_kind == "identity",
-        raw_unit_ids=call.raw_unit_ids,
-        source_indices=call.source_block_indices,
-    )
+    try:
+        legacy = legacy_distribute_before_shift(
+            call.post_units,
+            texts=texts,
+            iso=issuer.language,
+            origin=call.legacy_origin_seconds,
+            identity=call.legacy_origin_kind == "identity",
+            raw_unit_ids=call.raw_unit_ids,
+            source_indices=call.source_block_indices,
+        )
+    except Exception as exc:
+        missing_key = exc.args[0] if isinstance(exc, KeyError) and exc.args else None
+        retained_field = missing_key if type(missing_key) is str else ""
+        detail_code = {
+            "text": "retained-unit-text",
+            "start": "retained-unit-start",
+            "end": "retained-unit-end",
+        }.get(retained_field, "retained-unit-operand")
+        _attach_canonical_failure(
+            exc,
+            kind="legacy-time-transform-failed",
+            phase="legacy-time-transform",
+            detail_code=detail_code,
+        )
+        raise
     try:
         capture = capture_strict_units(
             call.post_units,
@@ -1069,7 +1386,9 @@ def _call_capture(
             call_index=call.call_index,
             raw_unit_ids=call.raw_unit_ids,
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        if isinstance(getattr(exc, "failure", None), CanonicalFailure):
+            raise
         capture = _invalid_capture(call.call_index, call.raw_unit_ids)
     retained_count = len(legacy.receipt.consumed_prefix_unit_ids)
     if call.geometry_failure is not None:
@@ -1301,6 +1620,7 @@ def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment
         copy.deepcopy(legacy_block_units),
     )
     record.public_snapshot = _issued_public_snapshot(issued)
+    record.seals = _fresh_seals(record)
     with _FRESH_LOCK:
         _FRESH[id(issued)] = record
     issuer._dispose()
@@ -1316,7 +1636,11 @@ def _fresh_record(
             record is None
             or record.context is not context
             or record.issued is not acquisition
-            or acquisition.context_content_digest != context.context_content_digest
+        ):
+            raise ValueError("fresh alignment is unissued, changed, or cross-context")
+        _verify_fresh_seals(record)
+        if (
+            acquisition.context_content_digest != context.context_content_digest
             or _issued_public_snapshot(acquisition) != record.public_snapshot
         ):
             raise ValueError("fresh alignment is unissued, changed, or cross-context")

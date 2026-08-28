@@ -22,6 +22,7 @@ from voxweave.align_common import (
     _dp_chunked_pass,
     _load_mono,
     _mask_emissions_outside_speech,
+    _preflight_over_budget_hints,
     _strip_trailing_punct,
     interp_missing,
     mute_spans_in_wav,
@@ -42,6 +43,10 @@ _ctc_lang = None  # iso of the loaded CTC singleton (reloaded on language change
 # self-attention so the full-file CTC pass survives long audio (full-file xlsr OOMs at 23min).
 CTC_EMIT_WINDOW_S = float(os.environ.get("VOXWEAVE_CTC_WINDOW_S", "30"))
 CTC_EMIT_CONTEXT_S = float(os.environ.get("VOXWEAVE_CTC_CONTEXT_S", "2"))
+# Every supported wav2vec2 CTC model consumes 16 kHz audio.  Loading the prepared
+# waveform at that physical rate lets RAT-4 validate unsafe over-budget hints before
+# `_get_ctc_aligner` can download or initialize a model.
+CTC_AUDIO_SR = 16000
 
 
 def _get_ctc_aligner(iso: str, model_name: str):
@@ -196,7 +201,16 @@ def _ctc_emit_full(al, wav):
     return torch.cat(parts, dim=0)
 
 
-def _ctc_align_logp(al, logp, toks, meta, words, nospace, total_samples):
+def _ctc_align_logp(
+    al,
+    logp,
+    toks,
+    meta,
+    words,
+    nospace,
+    total_samples,
+    pre_interpolation_observer: Callable[[list[dict] | None], None] | None = None,
+):
     """[T,V] log-probs + tokens -> word/char units. Shared by per-cue and full-file CTC.
 
     Appends a wildcard column for OOV tokens (WhisperX technique), runs forced_align + merge,
@@ -226,8 +240,14 @@ def _ctc_align_logp(al, logp, toks, meta, words, nospace, total_samples):
     spans = AF.merge_tokens(aligned[0], scores[0], blank=al.blank)
     ratio = total_samples / logp.shape[0] / al.sr
     units = _ctc_words_from_spans(spans, meta, words, ratio)
+    original_units: list[dict] | None = None
     if nospace:  # last-resort span fill; never drops a character
+        # A shallow list snapshot preserves the backend dictionaries exactly as they
+        # existed before interpolation.  No recursive AO-07 traversal occurs here.
+        original_units = list(units)
         units = interp_missing(units)
+    if pre_interpolation_observer is not None:
+        pre_interpolation_observer(original_units)
     return units
 
 
@@ -303,6 +323,8 @@ def _ctc_full_pass(
     speech_spans: list[tuple[float, float]] | None = None,
     *,
     _raw_result_observer: Callable[[list[dict]], None] | None = None,
+    _raw_original_observer: Callable[[list[dict] | None], None] | None = None,
+    _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """One windowed-emission + global forced_align over `wav` for cue texts `norm`.
 
@@ -313,12 +335,25 @@ def _ctc_full_pass(
     toks, meta, words = _ctc_build_tokens(norm, nospace, al)
     if not words:
         return [[] for _ in norm]
-    logp = _ctc_emit_full(al, wav)
+    logp = (
+        _ctc_emit_full(al, wav)
+        if _backend_invoker is None
+        else _backend_invoker(lambda: _ctc_emit_full(al, wav))
+    )
     if speech_spans:
         logp = _mask_emissions_outside_speech(
             logp, speech_spans, wav.shape[-1], al.sr, al.blank
         )
-    units = _ctc_align_logp(al, logp, toks, meta, words, nospace, wav.shape[-1])
+    units = _ctc_align_logp(
+        al,
+        logp,
+        toks,
+        meta,
+        words,
+        nospace,
+        wav.shape[-1],
+        _raw_original_observer,
+    )
     if _raw_result_observer is not None:
         _raw_result_observer(units)
     return _distribute_units(units, norm, iso)
@@ -333,8 +368,8 @@ def align_blocks_full_ctc(
     speech_spans: list[tuple[float, float]] | None = None,
     crop_to_envelope: bool = False,
     mute_spans: Sequence[tuple[float, float]] | None = None,
-    _raw_call_observer: Callable[[list[dict], tuple[int, ...], float], None]
-    | None = None,
+    _raw_call_observer: Callable[..., None] | None = None,
+    _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
 
@@ -352,10 +387,20 @@ def align_blocks_full_ctc(
 
     if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() != "1":
         speech_spans = None
-    al = _get_ctc_aligner(iso, model_name)
-    nospace = iso in NO_SPACE_LANGS
     norm = [(t or "").strip() for t in texts]
-    wav = _load_mono(wav_path, al.sr)
+    wav = _load_mono(wav_path, CTC_AUDIO_SR)
+    _preflight_over_budget_hints(wav, CTC_AUDIO_SR, norm, bounds)
+    al = (
+        _get_ctc_aligner(iso, model_name)
+        if _backend_invoker is None
+        else _backend_invoker(lambda: _get_ctc_aligner(iso, model_name))
+    )
+    nospace = iso in NO_SPACE_LANGS
+    if al.sr != CTC_AUDIO_SR:
+        # Defensive support for a future non-16k model.  Its exact resampled geometry
+        # receives the same preflight before any encoder forward.
+        wav = _load_mono(wav_path, al.sr)
+        _preflight_over_budget_hints(wav, al.sr, norm, bounds)
     if mute_spans:
         # excised song intervals (see align_blocks_full_mms): no transcript belongs there,
         # muting only removes the acoustic bait that smears neighbouring sentences.
@@ -363,7 +408,15 @@ def align_blocks_full_ctc(
 
     source_cursor = 0
 
-    def _pass(w, sub: list[str], offset_s: float = 0.0) -> list[list[dict]]:
+    def _pass(
+        w,
+        sub: list[str],
+        offset_s: float = 0.0,
+        *,
+        audio_sample_start: int,
+        audio_sample_end: int,
+        sample_count: int,
+    ) -> list[list[dict]]:
         nonlocal source_cursor
         source_indices = tuple(range(source_cursor, source_cursor + len(sub)))
         source_cursor += len(sub)
@@ -376,10 +429,15 @@ def align_blocks_full_ctc(
                 if e > offset_s and s < end_s
             ]
         raw_result: list[dict] | None = None
+        original_result: list[dict] | None = None
 
         def capture_raw(value: list[dict]) -> None:
             nonlocal raw_result
             raw_result = value
+
+        def capture_original(value: list[dict] | None) -> None:
+            nonlocal original_result
+            original_result = value
 
         out = _ctc_full_pass(
             al,
@@ -391,14 +449,35 @@ def align_blocks_full_ctc(
             _raw_result_observer=capture_raw
             if _raw_call_observer is not None
             else None,
+            _raw_original_observer=capture_original
+            if _raw_call_observer is not None
+            else None,
+            _backend_invoker=_backend_invoker,
         )
         if _raw_call_observer is not None:
-            _raw_call_observer(raw_result or [], source_indices, offset_s)
+            _raw_call_observer(
+                raw_result if raw_result is not None else [],
+                original_result,
+                source_indices,
+                offset_s,
+                audio_sample_start=audio_sample_start,
+                audio_sample_end=audio_sample_end,
+                sample_rate=al.sr,
+                sample_count=sample_count,
+                nominal_end_seconds=None,
+            )
         _empty_cache()
         return out
 
     return _dp_chunked_pass(
-        wav, al.sr, norm, bounds, _pass, "CTC", crop_to_envelope=crop_to_envelope
+        wav,
+        al.sr,
+        norm,
+        bounds,
+        _pass,
+        "CTC",
+        crop_to_envelope=crop_to_envelope,
+        pass_physical_geometry=True,
     )
 
 

@@ -21,9 +21,15 @@ from voxweave.align_context import (
     consume_context_role,
 )
 from voxweave.align_failures import CanonicalFailure
-from voxweave.align_projector import project_align_delivery
+from voxweave.align_projector import (
+    AlignProjectionEncodeError,
+    project_align_delivery,
+)
 from voxweave.engine_registry import EngineFamily
-from voxweave.reference_projector import reference_align_projection
+from voxweave.reference_projector import (
+    ReferenceAlignProjectionError,
+    reference_align_projection,
+)
 
 
 @dataclass(frozen=True)
@@ -160,9 +166,21 @@ def _encode_family(
     return candidate
 
 
-def _encoder_failure() -> CandidateFailure:
+def _encoder_failure(
+    detail_code: Literal["main-json-encode", "vtt-encode"] = "main-json-encode",
+) -> CandidateFailure:
     return CandidateFailure(
-        CanonicalFailure("preencode-failed", "encoder", "main-json-encode")
+        CanonicalFailure("preencode-failed", "encoder", detail_code)
+    )
+
+
+def _renderer_stage_failure() -> CandidateFailure:
+    return CandidateFailure(
+        CanonicalFailure(
+            "shadow-internal-error",
+            "renderer-stage",
+            "renderer-stage",
+        )
     )
 
 
@@ -183,6 +201,8 @@ def encode_align_candidates(
             result.legacy,
             record.projection_inputs,
         )
+    except AlignProjectionEncodeError as exc:
+        legacy = _encoder_failure(exc.detail_code)
     except Exception:
         legacy = _encoder_failure()
     outcomes.append(("legacy-v1", legacy))
@@ -206,8 +226,10 @@ def encode_align_candidates(
                 result.v2,
                 record.projection_inputs,
             )
+        except AlignProjectionEncodeError as exc:
+            boundary = _encoder_failure(exc.detail_code)
         except Exception:
-            boundary = _encoder_failure()
+            boundary = _renderer_stage_failure()
     outcomes.append(("boundary-v2", boundary))
 
     return _issue_candidate_set(context, result, tuple(outcomes))
@@ -284,9 +306,18 @@ def _select_candidate(
     return outcome
 
 
-def _render_failure() -> SelectedRenderError:
+def _render_failure(
+    detail_code: Literal[
+        "candidate-family-manifest",
+        "cue-source-map",
+        "derived-hash",
+        "json-projection",
+        "unit-coverage",
+        "vtt-projection",
+    ] = "derived-hash",
+) -> SelectedRenderError:
     return SelectedRenderError(
-        CanonicalFailure("selected-render-invalid", "renderer", "derived-hash")
+        CanonicalFailure("selected-render-invalid", "renderer", detail_code)
     )
 
 
@@ -299,12 +330,16 @@ def verify_selected_align_projection(
     _evaluated_record(context, result)
     with _LOCK:
         encoded = _ENCODED.get(id(candidate))
+    if encoded is not None and (
+        candidate.engine_family != context.engine_family
+        or candidate.engine_family != encoded.delivery.engine_family
+    ):
+        raise _render_failure("candidate-family-manifest")
     if (
         encoded is None
         or encoded.candidate is not candidate
         or encoded.context is not context
         or encoded.result is not result
-        or candidate.engine_family != context.engine_family
         or candidate.context_content_digest != context.context_content_digest
     ):
         raise _render_failure()
@@ -314,14 +349,18 @@ def verify_selected_align_projection(
             encoded.projection_inputs,
             strict=candidate.engine_family == "boundary-v2",
         )
+    except ReferenceAlignProjectionError as exc:
+        raise _render_failure(exc.detail_code) from exc
     except Exception as exc:
         raise _render_failure() from exc
     reference_vtt_hash = _digest(reference.vtt_bytes)
     reference_json_hash = _digest(reference.main_json_bytes)
+    if candidate.vtt_bytes != reference.vtt_bytes:
+        raise _render_failure("vtt-projection")
+    if candidate.main_json_bytes != reference.main_json_bytes:
+        raise _render_failure("json-projection")
     if (
-        candidate.vtt_bytes != reference.vtt_bytes
-        or candidate.main_json_bytes != reference.main_json_bytes
-        or candidate.delivery_digest != encoded.delivery.receipt_digest
+        candidate.delivery_digest != encoded.delivery.receipt_digest
         or candidate.vtt_sha256 != reference_vtt_hash
         or candidate.main_json_sha256 != reference_json_hash
         or _digest(candidate.vtt_bytes) != candidate.vtt_sha256

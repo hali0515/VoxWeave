@@ -17,6 +17,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Literal
 
+from voxweave.align_failures import CanonicalFailure
 from voxweave.voicebase import Phase2DataError, media_fingerprint_from_fd
 
 SNAPSHOT_MAX_AGE_SECONDS = 60 * 60
@@ -33,6 +34,19 @@ log = logging.getLogger("voxweave")
 
 class SnapshotUnavailable(RuntimeError):
     """A private, verified snapshot could not be created or retained."""
+
+
+class _SnapshotVerificationFailed(SnapshotUnavailable):
+    """The copied bytes could not be proved identical to the open source."""
+
+
+def _classify_snapshot_failure(exc: BaseException, detail_code: str) -> None:
+    if not isinstance(getattr(exc, "failure", None), CanonicalFailure):
+        exc.failure = CanonicalFailure(  # type: ignore[attr-defined]
+            "media-snapshot-unavailable",
+            "media-snapshot",
+            detail_code,
+        )
 
 
 def default_cache_root() -> Path:
@@ -191,9 +205,13 @@ def _verify_private_copy(
     source_stat = os.fstat(source_fd)
     destination_stat = os.fstat(destination_fd)
     if source_stat.st_size != expected_size:
-        raise SnapshotUnavailable("media size changed while creating its snapshot")
+        raise _SnapshotVerificationFailed(
+            "media size changed while creating its snapshot"
+        )
     if destination_stat.st_size != expected_size:
-        raise SnapshotUnavailable("snapshot size does not match its media source")
+        raise _SnapshotVerificationFailed(
+            "snapshot size does not match its media source"
+        )
     try:
         source_fingerprint = media_fingerprint_from_fd(
             source_fd,
@@ -204,9 +222,11 @@ def _verify_private_copy(
             size=expected_size,
         )
     except (OSError, Phase2DataError) as exc:
-        raise SnapshotUnavailable(f"cannot verify media snapshot: {exc}") from exc
+        raise _SnapshotVerificationFailed(
+            f"cannot verify media snapshot: {exc}"
+        ) from exc
     if source_fingerprint != destination_fingerprint:
-        raise SnapshotUnavailable(
+        raise _SnapshotVerificationFailed(
             "snapshot sampled identity differs from its media source"
         )
     return destination_fingerprint
@@ -380,10 +400,19 @@ class MediaSnapshot:
                         self._size,
                     )
                 except (OSError, SnapshotUnavailable, Phase2DataError) as copy_error:
-                    raise SnapshotUnavailable(
+                    failure = SnapshotUnavailable(
                         "cannot create a verified private media snapshot: "
                         f"clone failed ({clone_error}); copy failed ({copy_error})"
-                    ) from copy_error
+                    )
+                    _classify_snapshot_failure(
+                        failure,
+                        (
+                            "snapshot-verification-failed"
+                            if isinstance(copy_error, _SnapshotVerificationFailed)
+                            else "reflink-and-copy-failed"
+                        ),
+                    )
+                    raise failure from copy_error
                 self.copy_method = "copy"
             self._entered = True
             return self

@@ -366,5 +366,9 @@ def slice_wav(
         sf.write(str(out), data, sr)
     except Exception as exc:
         classify(exc, "sample-write")
+        try:
+            out.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
     return out

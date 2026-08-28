@@ -31,6 +31,8 @@ from voxweave.align_context import (
     IssuedAlignContext,
     issue_align_context,
     retire_live_context_roles,
+    verify_context_expected_vtt_generation,
+    verify_context_roles_terminal,
 )
 from voxweave.align_distribution import AuthorityDistributionReceipt
 from voxweave.align_evidence import FinalAlignEvidence, bind_align_evidence
@@ -39,6 +41,7 @@ from voxweave.align_evidence_core import (
     evaluate_ald6,
     project_evidence_core,
 )
+from voxweave.align_failures import CanonicalFailure
 from voxweave.align_inputs import (
     EvidenceStatus,
     LegacyAlignPolicy,
@@ -97,6 +100,25 @@ class AlignSelection:
     v2_policy_status: V2PolicyStatus
     profile_status: ProfileStatus
     evidence_status: EvidenceStatus
+    observation_failure: CanonicalFailure | None
+
+
+@dataclass(frozen=True)
+class _FailedProfileResolution:
+    profile: None
+    status: ProfileStatus
+    unexpected_failure: CanonicalFailure
+
+
+def _classify_unchanged_exception(
+    exc: BaseException,
+    failure: CanonicalFailure,
+) -> None:
+    try:
+        if not isinstance(getattr(exc, "failure", None), CanonicalFailure):
+            setattr(exc, "failure", failure)
+    except Exception:
+        pass
 
 
 def file_sha256(path: Path) -> str:
@@ -129,6 +151,24 @@ def _original_source_indices(
     return tuple(sources)
 
 
+def _media_logical_identity(media: Path, *, explicit_media: bool) -> str:
+    name = unicodedata.normalize("NFC", media.name)
+    suffix = unicodedata.normalize("NFC", media.suffix.lower())
+    if (explicit_media and not name) or (not explicit_media and not suffix):
+        exc = ValueError("media logical identity is unavailable")
+        setattr(
+            exc,
+            "failure",
+            CanonicalFailure(
+                "media-identity-invalid",
+                "media",
+                "media-logical-id",
+            ),
+        )
+        raise exc
+    return f"explicit:{name}" if explicit_media else f"sibling:{suffix}"
+
+
 def issue_public_align_context(
     *,
     target_path: Path,
@@ -157,13 +197,8 @@ def issue_public_align_context(
     prepared = Path(prepared_audio_path)
     media = Path(media_path)
     source_indices = _original_source_indices(blocks)
-    normalized_media_name = unicodedata.normalize("NFC", media.name)
     normalized_target_name = unicodedata.normalize("NFC", Path(target_path).name)
-    media_logical_id = (
-        f"explicit:{normalized_media_name}"
-        if explicit_media
-        else f"sibling:{media.suffix.lower()}"
-    )
+    media_logical_id = _media_logical_identity(media, explicit_media=explicit_media)
     stable_blocks = [
         {
             "source_index": source_index,
@@ -242,6 +277,10 @@ def issue_public_align_context(
         effective_iso=effective_iso,
         route_kind=route_kind,  # type: ignore[arg-type]
     )
+    verify_context_expected_vtt_generation(
+        context,
+        observed_vtt_sha256=expected_vtt.sha256,
+    )
     return context
 
 
@@ -302,11 +341,30 @@ def build_align_selection(
 
     source_indices = _original_source_indices(blocks)
     v2_policy_status = align_inputs.validate_v2_policy(legacy_policy)
-    profile = align_inputs.resolve_align_profile(
-        manifest,
-        effective_iso=language,
-        stored_iso=stored_language if isinstance(stored_language, str) else None,
-    )
+    try:
+        profile = align_inputs.resolve_align_profile(
+            manifest,
+            effective_iso=language,
+            stored_iso=stored_language if isinstance(stored_language, str) else None,
+        )
+    except Exception as exc:
+        profile_failure = CanonicalFailure(
+            "shadow-internal-error",
+            "profile-stage",
+            "profile-stage",
+        )
+        if context.engine_family == "boundary-v2":
+            _classify_unchanged_exception(exc, profile_failure)
+            raise
+        profile = _FailedProfileResolution(
+            None,
+            ProfileStatus(
+                "invalid",
+                "manifest-absent" if manifest is None else "stored-profile",
+                "profile-shape",
+            ),
+            profile_failure,
+        )
     evidence_resolution = align_inputs.resolve_finalize_evidence(
         shot_changes=strict_shot_changes,  # type: ignore[arg-type]
         sing_spans=strict_sing_spans,  # type: ignore[arg-type]
@@ -420,16 +478,27 @@ def build_align_selection(
         if profile.profile is None:
             raise RuntimeError("valid adapter result lacks its display profile")
 
-        comparison = compare_semantic_deltas(
-            route_kind=context.route_kind,
-            physical_calls=producer_core.physical_calls,
-            authority_blocks=producer_core.blocks,
-            legacy=adapter_result.legacy,
-            v2=adapter_result.v2,
-            semantic_observation=semantic_observation,
-            profile=profile.profile,
-            evidence=evidence_resolution,
-        )
+        try:
+            comparison = compare_semantic_deltas(
+                route_kind=context.route_kind,
+                physical_calls=producer_core.physical_calls,
+                authority_blocks=producer_core.blocks,
+                legacy=adapter_result.legacy,
+                v2=adapter_result.v2,
+                semantic_observation=semantic_observation,
+                profile=profile.profile,
+                evidence=evidence_resolution,
+            )
+        except Exception as exc:
+            comparator_failure = CanonicalFailure(
+                "shadow-internal-error",
+                "comparator-stage",
+                "comparator-stage",
+            )
+            if context.engine_family == "boundary-v2":
+                _classify_unchanged_exception(exc, comparator_failure)
+                raise
+            comparison = comparator_failure
     result = issue_align_evaluated_result(
         context,
         adapter_result,
@@ -443,6 +512,16 @@ def build_align_selection(
     selected = candidate_encoder.select_align_candidate(context, candidates)
     verified = candidate_encoder.verify_selected_align_projection(
         context, result, selected
+    )
+    boundary_candidate = candidates.outcome_for("boundary-v2")
+    observation_failure = (
+        boundary_candidate.failure
+        if (
+            context.engine_family == "legacy-v1"
+            and result.v2_status.kind == "valid"
+            and isinstance(boundary_candidate, candidate_encoder.CandidateFailure)
+        )
+        else None
     )
     bound_evidence = bind_align_evidence(
         context,
@@ -468,6 +547,7 @@ def build_align_selection(
         v2_policy_status,
         profile.status,
         evidence_resolution.status,
+        observation_failure,
     )
 
 
@@ -476,6 +556,7 @@ def retire_align_selection(selection: AlignSelection | IssuedAlignContext) -> No
         selection if isinstance(selection, IssuedAlignContext) else selection.context
     )
     retire_live_context_roles(context)
+    verify_context_roles_terminal(context)
 
 
 __all__ = [

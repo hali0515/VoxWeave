@@ -147,9 +147,10 @@ def test_enospc_partial_copy_is_cleaned_and_typed(tmp_path, monkeypatch):
     source = tmp_path / "episode.mp4"
     source.write_bytes(b"A" * 1024)
     cache = tmp_path / "cache"
-    with pytest.raises(mediasnapshot.SnapshotUnavailable, match="copy failed"):
+    with pytest.raises(mediasnapshot.SnapshotUnavailable, match="copy failed") as error:
         with mediasnapshot.MediaSnapshot(source, cache_root=cache):
             pass
+    assert error.value.failure.detail_code == "reflink-and-copy-failed"
     assert list((cache / "snapshots").iterdir()) == []
 
 
@@ -249,9 +250,12 @@ def test_torn_copy_with_different_sampled_identity_is_rejected(tmp_path, monkeyp
         os.ftruncate(destination_fd, size)
 
     monkeypatch.setattr(mediasnapshot, "_copy_sequential", torn_copy)
-    with pytest.raises(mediasnapshot.SnapshotUnavailable, match="sampled identity"):
+    with pytest.raises(
+        mediasnapshot.SnapshotUnavailable, match="sampled identity"
+    ) as error:
         with mediasnapshot.MediaSnapshot(source, cache_root=cache):
             pass
+    assert error.value.failure.detail_code == "snapshot-verification-failed"
     assert list((cache / "snapshots").iterdir()) == []
 
 

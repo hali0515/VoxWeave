@@ -265,7 +265,11 @@ def test_align_publishes_json_before_vtt_after_final_media_recheck(
     pipeline.align(vtt_path)
 
     replayed = json.loads(json_path.read_text(encoding="utf-8"))
-    assert order == ["episode.json", "episode.vtt"]
+    assert order == [
+        "episode.json",
+        "episode.vtt",
+        "episode.align-evidence.json",
+    ]
     assert replayed["voiceprint_capture"] == CAPTURE
     assert replayed["voiceprint_media"] == fingerprint
     assert all(path.read_text(encoding="utf-8") == "sensitive" for path in artifacts)

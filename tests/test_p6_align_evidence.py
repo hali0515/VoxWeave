@@ -185,7 +185,7 @@ def test_evidence_bind_rejects_unverified_hash_substitution(tmp_path):
             vtt_sha256="0" * 64,
             main_json_sha256=verified.main_json_sha256,
         )
-    assert error.value.failure.detail_code == "evidence-binding"
+    assert error.value.failure.detail_code == "selected-hash-link"
 
 
 def test_rat2_exposes_only_the_path_bound_durable_verifier():

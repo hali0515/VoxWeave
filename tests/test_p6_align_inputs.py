@@ -132,8 +132,12 @@ def test_finalizer_evidence_is_strict_sorted_and_closed():
     assert valid.shots == (1.5, 2.0, 3.0)
     assert valid.sing_spans == ((1.0, 2.0), (4.0, 5.0))
 
-    for shots, sings in [([True], None), (None, [[2.0, 1.0]]), ([float("nan")], [])]:
+    for shots, sings, detail_code in [
+        ([True], None, "shot-shape"),
+        (None, [[2.0, 1.0]], "evidence-domain"),
+        ([float("nan")], [], "evidence-domain"),
+    ]:
         invalid = resolve_finalize_evidence(shot_changes=shots, sing_spans=sings)
         assert invalid.status.kind == "invalid"
-        assert invalid.status.detail_code == "evidence-domain"
+        assert invalid.status.detail_code == detail_code
         assert invalid.shots is None and invalid.sing_spans is None

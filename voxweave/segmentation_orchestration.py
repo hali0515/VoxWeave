@@ -13,6 +13,7 @@ from voxweave.align_context import (
     IssuedSegmentationContext,
     issue_segmentation_context,
     retire_live_context_roles,
+    verify_context_roles_terminal,
 )
 from voxweave.align_snapshot import (
     FrozenArray,
@@ -259,6 +260,7 @@ def build_segmentation_selection(
     if command == "split":
         if mapping_generation is None:
             retire_live_context_roles(context)
+            verify_context_roles_terminal(context)
             raise ValueError("split selection requires its S0 mapping generation")
         bind_split_speaker_mapping_generation(
             context,
@@ -267,6 +269,7 @@ def build_segmentation_selection(
         )
     elif mapping_generation is not None:
         retire_live_context_roles(context)
+        verify_context_roles_terminal(context)
         raise ValueError("process selection cannot bind a speaker mapping generation")
     try:
         ranges = _partition(document, cues)
@@ -318,6 +321,7 @@ def build_segmentation_selection(
     except BaseException:
         release_split_speaker_mapping_generation(context)
         retire_live_context_roles(context)
+        verify_context_roles_terminal(context)
         raise
     return SegmentationSelection(context, result, verified, sdh_dialogue)
 
@@ -325,6 +329,7 @@ def build_segmentation_selection(
 def retire_segmentation_selection(selection: SegmentationSelection) -> None:
     release_split_speaker_mapping_generation(selection.context)
     retire_live_context_roles(selection.context)
+    verify_context_roles_terminal(selection.context)
 
 
 __all__ = [

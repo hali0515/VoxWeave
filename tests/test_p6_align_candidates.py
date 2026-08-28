@@ -248,6 +248,28 @@ def test_selected_failure_has_no_fallback(tmp_path, monkeypatch):
     assert error.value.failure.detail_code == "selected-candidate-missing"
 
 
+def test_vtt_encode_failure_is_classified_before_main_json_encode(
+    tmp_path, monkeypatch
+):
+    from voxweave import candidate_encoder
+    from voxweave import realign
+
+    context, result = _evaluated(tmp_path, shadow_requested=True)
+    monkeypatch.setattr(
+        realign,
+        "render_cues",
+        lambda _rows: (_ for _ in ()).throw(UnicodeError("vtt encode failed exactly")),
+    )
+
+    candidates = candidate_encoder.encode_align_candidates(context, result)
+    legacy = candidates.outcome_for("legacy-v1")
+
+    assert isinstance(legacy, candidate_encoder.CandidateFailure)
+    assert legacy.failure.kind == "preencode-failed"
+    assert legacy.failure.phase == "encoder"
+    assert legacy.failure.detail_code == "vtt-encode"
+
+
 def test_independent_projection_rejects_candidate_byte_corruption(tmp_path):
     from voxweave.candidate_encoder import (
         SelectedRenderError,

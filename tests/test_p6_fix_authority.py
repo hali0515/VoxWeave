@@ -365,7 +365,7 @@ def test_seal_mismatch_lifecycle_is_called_by_the_production_issuer(tmp_path):
 def test_ao15_adapter_finishes_before_ao16_evidence_and_ald6():
     from voxweave import align_orchestration
 
-    assert align_orchestration.ALIGN_AO_ORDER == tuple(
+    assert align_orchestration.ALIGN_AO_PHASE_ORDER == tuple(
         f"AO-{index:02d}" for index in range(1, 26)
     )
     source = inspect.getsource(align_orchestration)
@@ -376,6 +376,27 @@ def test_ao15_adapter_finishes_before_ao16_evidence_and_ald6():
     assert adapter < evidence < ald6
     assert source.count("project_evidence_core(") == 1
     assert source.count("evaluate_ald6(") == 1
+
+
+def test_media_logical_id_is_class_specific_normalized_and_fail_closed():
+    from pathlib import Path
+
+    from voxweave.align_orchestration import _media_logical_identity
+
+    assert (
+        _media_logical_identity(
+            Path("cafe\N{COMBINING ACUTE ACCENT}.WAV"), explicit_media=True
+        )
+        == "explicit:caf\N{LATIN SMALL LETTER E WITH ACUTE}.WAV"
+    )
+    assert (
+        _media_logical_identity(Path("episode.WAV"), explicit_media=False)
+        == "sibling:.wav"
+    )
+    with pytest.raises(ValueError, match="logical identity") as error:
+        _media_logical_identity(Path("episode"), explicit_media=False)
+    assert error.value.failure.kind == "media-identity-invalid"
+    assert error.value.failure.detail_code == "media-logical-id"
 
 
 def test_rat1_adds_only_the_fresh_authority_factory_and_adapter_result():

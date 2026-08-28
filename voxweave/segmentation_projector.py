@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from voxweave import realign
 from voxweave.align_snapshot import (
@@ -23,6 +23,12 @@ from voxweave.speakers import voice_text_for_ids
 class SegmentationPrimaryProjection:
     vtt_bytes: bytes
     main_json_bytes: bytes
+
+
+class SegmentationProjectionEncodeError(RuntimeError):
+    def __init__(self, detail_code: Literal["main-json-encode", "vtt-encode"]):
+        super().__init__(detail_code)
+        self.detail_code: Literal["main-json-encode", "vtt-encode"] = detail_code
 
 
 def _main_value(delivery: SegmentationDelivery) -> FrozenObject:
@@ -69,12 +75,10 @@ def _main_value(delivery: SegmentationDelivery) -> FrozenObject:
     return frozen
 
 
-def project_segmentation_delivery(
+def project_segmentation_vtt_bytes(
     delivery: SegmentationDelivery,
     inputs: SegmentationProjectionInputs,
-    *,
-    strict: bool,
-) -> SegmentationPrimaryProjection:
+) -> bytes:
     names = dict(inputs.speaker_names)
     rows: list[tuple[float | None, float | None, str]] = []
     for cue in delivery.cues:
@@ -88,10 +92,44 @@ def project_segmentation_delivery(
                 text,
             )
         )
+    return realign.render_cues(rows).encode("utf-8")
+
+
+def project_segmentation_main_json_bytes(
+    delivery: SegmentationDelivery,
+    *,
+    strict: bool,
+) -> bytes:
+    return encode_frozen_json_document(_main_value(delivery), allow_nan=not strict)
+
+
+def project_segmentation_delivery(
+    delivery: SegmentationDelivery,
+    inputs: SegmentationProjectionInputs,
+    *,
+    strict: bool,
+) -> SegmentationPrimaryProjection:
+    try:
+        vtt_bytes = project_segmentation_vtt_bytes(delivery, inputs)
+    except Exception as exc:
+        raise SegmentationProjectionEncodeError("vtt-encode") from exc
+    try:
+        main_json_bytes = project_segmentation_main_json_bytes(
+            delivery,
+            strict=strict,
+        )
+    except Exception as exc:
+        raise SegmentationProjectionEncodeError("main-json-encode") from exc
     return SegmentationPrimaryProjection(
-        realign.render_cues(rows).encode("utf-8"),
-        encode_frozen_json_document(_main_value(delivery), allow_nan=not strict),
+        vtt_bytes,
+        main_json_bytes,
     )
 
 
-__all__ = ["SegmentationPrimaryProjection", "project_segmentation_delivery"]
+__all__ = [
+    "SegmentationPrimaryProjection",
+    "SegmentationProjectionEncodeError",
+    "project_segmentation_delivery",
+    "project_segmentation_main_json_bytes",
+    "project_segmentation_vtt_bytes",
+]

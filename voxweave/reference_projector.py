@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import struct
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, cast
 
 from voxweave.align_adapter import AlignDelivery, AlignProjectionInputs
 from voxweave.align_snapshot import (
@@ -39,6 +39,33 @@ class ReferenceAlignProjection:
 class ReferenceSegmentationProjection:
     vtt_bytes: bytes
     main_json_bytes: bytes
+
+
+class ReferenceAlignProjectionError(ValueError):
+    def __init__(
+        self,
+        detail_code: Literal["cue-source-map", "unit-coverage"],
+    ) -> None:
+        super().__init__(detail_code)
+        self.detail_code: Literal["cue-source-map", "unit-coverage"] = detail_code
+
+
+def _validate_align_projection_domain(
+    delivery: AlignDelivery,
+    inputs: AlignProjectionInputs,
+) -> None:
+    source_indices = tuple(item.source_index for item in inputs.source_blocks)
+    cue_indices = tuple(cue.source_index for cue in delivery.cues)
+    if (
+        len(set(source_indices)) != len(source_indices)
+        or len(set(cue_indices)) != len(cue_indices)
+        or len(source_indices) != len(cue_indices)
+        or set(source_indices) != set(cue_indices)
+    ):
+        raise ReferenceAlignProjectionError("cue-source-map")
+    covered_units = tuple(unit for cue in delivery.cues for unit in cue.word_data)
+    if covered_units != delivery.word_segments:
+        raise ReferenceAlignProjectionError("unit-coverage")
 
 
 def _reference_json_bytes(value: FrozenJSON, *, allow_nan: bool) -> bytes:
@@ -139,7 +166,10 @@ def _reference_speaker_turns_value(
     if turns is None:
         return False, None
     return True, freeze_json(
-        [[float(start), float(end), str(label)] for start, end, label in turns]
+        [
+            [float(start), float(end), str(label)]
+            for start, end, label in cast(Any, turns)
+        ]
     )
 
 
@@ -187,6 +217,7 @@ def reference_align_projection(
     *,
     strict: bool,
 ) -> ReferenceAlignProjection:
+    _validate_align_projection_domain(delivery, inputs)
     return ReferenceAlignProjection(
         _vtt(delivery, inputs),
         _reference_json_bytes(_main(delivery, inputs), allow_nan=not strict),
@@ -265,6 +296,7 @@ def reference_segmentation_projection(
 
 __all__ = [
     "ReferenceAlignProjection",
+    "ReferenceAlignProjectionError",
     "ReferenceSegmentationProjection",
     "reference_align_projection",
     "reference_segmentation_projection",

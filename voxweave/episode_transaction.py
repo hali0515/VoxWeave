@@ -584,6 +584,27 @@ def require_media_generation(path: Path, expected_fingerprint: str) -> None:
         )
 
 
+def require_media_pair_decision(
+    path: Path,
+    *,
+    voiceprint_media_fingerprint: str,
+    expected_decision: bool,
+) -> None:
+    """Recheck the snapshot-backed P11 pair decision under the episode lock."""
+    try:
+        observed = media_fingerprint(Path(path))
+    except OSError as exc:
+        raise MediaStaleError(
+            "pair-decision",
+            "selected media pair decision changed during processing; re-run",
+        ) from exc
+    if (observed == voiceprint_media_fingerprint) is not expected_decision:
+        raise MediaStaleError(
+            "pair-decision",
+            "selected media pair decision changed during processing; re-run",
+        )
+
+
 def _consume_commit_role(
     context: IssuedAlignContext | IssuedSegmentationContext | None,
     *,
@@ -629,6 +650,8 @@ def commit_primary_outputs(
     context: IssuedAlignContext | IssuedSegmentationContext | None = None,
     media_path: Path | None = None,
     expected_media_fingerprint: str | None = None,
+    expected_voiceprint_media_fingerprint: str | None = None,
+    expected_pair_decision: bool | None = None,
     machine_artifact: MachineArtifactPublication | None = None,
     evidence_artifact: EvidencePublication | None = None,
     speaker_mapping_path: Path | None = None,
@@ -643,6 +666,16 @@ def commit_primary_outputs(
         raise ValueError("split mapping CAS requires both path and S0 generation")
     if speaker_mapping_path is not None and command != "split":
         raise ValueError("only split may recheck a speaker mapping generation")
+    if (expected_voiceprint_media_fingerprint is None) != (
+        expected_pair_decision is None
+    ):
+        raise ValueError("pair decision recheck requires its fingerprint and decision")
+    if expected_pair_decision is not None and type(expected_pair_decision) is not bool:
+        raise TypeError("expected pair decision must be an exact bool")
+    if expected_pair_decision is not None and (
+        command != "align" or media_path is None or expected_media_fingerprint is None
+    ):
+        raise ValueError("pair decision recheck requires an align media generation")
     json_target, vtt_target = Path(json_path), Path(vtt_path)
     stages: list[_OwnedStage] = []
     landed: list[Path] = []
@@ -678,6 +711,16 @@ def commit_primary_outputs(
                 if media_path is None:
                     raise ValueError("media generation requires a media path")
                 require_media_generation(media_path, expected_media_fingerprint)
+            if expected_pair_decision is not None:
+                assert media_path is not None
+                assert expected_voiceprint_media_fingerprint is not None
+                require_media_pair_decision(
+                    media_path,
+                    voiceprint_media_fingerprint=(
+                        expected_voiceprint_media_fingerprint
+                    ),
+                    expected_decision=expected_pair_decision,
+                )
             if speaker_mapping_path is not None:
                 assert expected_speaker_mapping is not None
                 segmentation_context = (

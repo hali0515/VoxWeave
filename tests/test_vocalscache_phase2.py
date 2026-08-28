@@ -388,3 +388,106 @@ def test_companion_writer_preflight_preserves_existing_target(tmp_path):
     with pytest.raises(voicebase.Phase2DataError, match="encoded JSON exceeds"):
         vocalscache.write_cache_companion(path, companion)
     assert path.read_text(encoding="utf-8") == "old"
+
+
+def test_p6_cache_registry_classifies_every_live_operation(tmp_path, monkeypatch):
+    cache = _cache(tmp_path, b"A" * 32)
+    companion = vocalscache.build_cache_companion(
+        cache,
+        media_fingerprint="a" * 64,
+        separator=_separator(),
+    )
+
+    malformed = dict(companion)
+    malformed["version"] = 2
+    with pytest.raises(vocalscache.CacheCompanionError) as schema_error:
+        vocalscache.validate_cache_companion(malformed)
+    assert schema_error.value.failure.detail_code == "companion-schema"
+
+    with pytest.raises(vocalscache.CacheCompanionMismatch) as media_error:
+        vocalscache.validate_cache_pair(
+            companion,
+            cache,
+            media_fingerprint="b" * 64,
+            separator=_separator(),
+        )
+    assert media_error.value.failure.detail_code == "companion-media"
+
+    cache.write_bytes(cache.read_bytes() + b"x")
+    with pytest.raises(vocalscache.CacheCompanionMismatch) as size_error:
+        vocalscache.validate_cache_pair(
+            companion,
+            cache,
+            media_fingerprint="a" * 64,
+            separator=_separator(),
+        )
+    assert size_error.value.failure.detail_code == "companion-size"
+
+    cache.write_bytes(b"B" * 32)
+    with pytest.raises(vocalscache.CacheCompanionMismatch) as hash_error:
+        vocalscache.validate_cache_pair(
+            companion,
+            cache,
+            media_fingerprint="a" * 64,
+            separator=_separator(),
+        )
+    assert hash_error.value.failure.detail_code == "companion-hash"
+
+    invalid_json = tmp_path / "invalid.meta.json"
+    invalid_json.write_text("{", encoding="utf-8")
+    with pytest.raises(voicebase.Phase2DataError) as decode_error:
+        vocalscache.load_cache_companion(invalid_json)
+    assert decode_error.value.failure.detail_code == "cache-decode"
+
+    original_open = vocalscache.os.open
+
+    def refuse_lock(path, flags, mode=0o777):
+        if str(path).endswith(".lock"):
+            raise PermissionError("lock denied")
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(vocalscache.os, "open", refuse_lock)
+    with pytest.raises(PermissionError) as lock_error:
+        with vocalscache.cache_lock(cache):
+            pass
+    assert lock_error.value.failure.detail_code == "cache-lock-acquire"
+    monkeypatch.setattr(vocalscache.os, "open", original_open)
+
+    companion_path = vocalscache.cache_companion_path(cache)
+    companion_path.write_text("old", encoding="utf-8")
+    original_unlink = Path.unlink
+
+    def refuse_companion_unlink(path, *args, **kwargs):
+        if path == companion_path:
+            raise PermissionError("unlink denied")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_companion_unlink)
+    with pytest.raises(PermissionError) as unlink_error:
+        vocalscache.delete_cache_companion_first(cache)
+    assert unlink_error.value.failure.detail_code == "companion-unlink"
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+
+    def refuse_companion_replace(*_args, **_kwargs):
+        raise PermissionError("companion replace denied")
+
+    monkeypatch.setattr(vocalscache, "write_json_object", refuse_companion_replace)
+    with pytest.raises(PermissionError) as companion_replace_error:
+        vocalscache.write_cache_companion(companion_path, companion)
+    assert companion_replace_error.value.failure.detail_code == "companion-replace"
+
+    with pytest.raises(RuntimeError, match="encode failed") as stage_error:
+        with vocalscache.cache_publish_path(cache):
+            raise RuntimeError("encode failed")
+    assert stage_error.value.failure.detail_code == "cache-stage"
+
+    monkeypatch.setattr(vocalscache, "write_json_object", voicebase.write_json_object)
+    monkeypatch.setattr(
+        vocalscache.os,
+        "replace",
+        lambda *_args: (_ for _ in ()).throw(PermissionError("replace denied")),
+    )
+    with pytest.raises(PermissionError) as replace_error:
+        with vocalscache.cache_publish_path(cache) as staged:
+            staged.write_bytes(b"new cache")
+    assert replace_error.value.failure.detail_code == "cache-replace"

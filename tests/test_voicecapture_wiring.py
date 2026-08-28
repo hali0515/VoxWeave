@@ -382,11 +382,17 @@ def test_process_sidecar_write_failure_names_landed_primary_outputs(
 
     monkeypatch.setattr(episode_transaction, "_replace_stage", fail_sidecar_replace)
 
-    with pytest.raises(
-        RuntimeError,
-        match="primary JSON/VTT outputs landed.*could not write.*voiceprints",
-    ):
+    with pytest.raises(episode_transaction.TransactionOperationError) as caught:
         pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+
+    assert caught.value.failure.kind == "commit-failed"
+    assert caught.value.failure.detail_code == "machine-artifact-replace"
+    assert caught.value.landed == (
+        tmp_path / "episode.json",
+        tmp_path / "episode.vtt",
+    )
+    assert caught.value.machine_landed == ()
+    assert caught.value.leftovers == ()
 
     assert (tmp_path / "episode.json").exists()
     assert (tmp_path / "episode.vtt").exists()

@@ -15,12 +15,14 @@ import os
 from collections import namedtuple
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 from voxweave import config
 from voxweave.align_common import (
     _distribute_units,
     _dp_chunked_pass,
     _load_mono,
+    _preflight_over_budget_hints,
     _strip_trailing_punct,
     mute_spans_in_wav,
 )
@@ -179,10 +181,15 @@ def _mms_full_pass(
     iso: str,
     *,
     _raw_result_observer: Callable[[list[dict]], None] | None = None,
+    _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """One routing-free MMS call with the AO-07 pre-distribution seam."""
     full = " ".join(text for text in norm if text)
-    flat = _mms_emit_units(wav, full, iso)
+    flat = (
+        _mms_emit_units(wav, full, iso)
+        if _backend_invoker is None
+        else _backend_invoker(lambda: _mms_emit_units(wav, full, iso))
+    )
     if _raw_result_observer is not None:
         _raw_result_observer(flat)
     _empty_cache()
@@ -196,8 +203,8 @@ def align_blocks_full_mms(
     bounds: Sequence[tuple[float, float] | None] | None = None,
     crop_to_envelope: bool = False,
     mute_spans: Sequence[tuple[float, float]] | None = None,
-    _raw_call_observer: Callable[[list[dict], tuple[int, ...], float], None]
-    | None = None,
+    _raw_call_observer: Callable[..., None] | None = None,
+    _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass MMS alignment (equivalent to whisperx align_ctc).
 
@@ -225,12 +232,21 @@ def align_blocks_full_mms(
         # songs survive the envelope crop). Transcribe-path only (fresh spans of this run).
         wav = mute_spans_in_wav(wav, MMS_SR, mute_spans)
     norm = [(t or "").strip() for t in texts]
+    _preflight_over_budget_hints(wav, MMS_SR, norm, bounds)
 
     # offset_s is part of the _dp_chunked_pass pass_fn contract (used by the CTC
     # path's emission masking); MMS does not mask yet, pending ja truth validation.
     source_cursor = 0
 
-    def _pass(w, sub: list[str], offset_s: float = 0.0) -> list[list[dict]]:
+    def _pass(
+        w,
+        sub: list[str],
+        offset_s: float = 0.0,
+        *,
+        audio_sample_start: int,
+        audio_sample_end: int,
+        sample_count: int,
+    ) -> list[list[dict]]:
         nonlocal source_cursor
         source_indices = tuple(range(source_cursor, source_cursor + len(sub)))
         source_cursor += len(sub)
@@ -247,13 +263,31 @@ def align_blocks_full_mms(
             _raw_result_observer=capture_raw
             if _raw_call_observer is not None
             else None,
+            _backend_invoker=_backend_invoker,
         )
         if _raw_call_observer is not None:
-            _raw_call_observer(raw_result or [], source_indices, offset_s)
+            _raw_call_observer(
+                raw_result if raw_result is not None else [],
+                None,
+                source_indices,
+                offset_s,
+                audio_sample_start=audio_sample_start,
+                audio_sample_end=audio_sample_end,
+                sample_rate=MMS_SR,
+                sample_count=sample_count,
+                nominal_end_seconds=None,
+            )
         return out
 
     return _dp_chunked_pass(
-        wav, MMS_SR, norm, bounds, _pass, "MMS", crop_to_envelope=crop_to_envelope
+        wav,
+        MMS_SR,
+        norm,
+        bounds,
+        _pass,
+        "MMS",
+        crop_to_envelope=crop_to_envelope,
+        pass_physical_geometry=True,
     )
 
 

@@ -174,6 +174,9 @@ def _pre_w1_failure(context: IssuedAlignContext, acquisition: object, payload: o
     policy = getattr(payload, "v2_policy_status", None)
     profile = getattr(payload, "profile_resolution", None)
     evidence = getattr(payload, "evidence_resolution", None)
+    unexpected_profile_failure = getattr(profile, "unexpected_failure", None)
+    if isinstance(unexpected_profile_failure, CanonicalFailure):
+        return unexpected_profile_failure
     if not isinstance(strict, StrictInputStatus):
         return CanonicalFailure(
             "v2-input-invalid", "strict-input", "strict-carrier-domain"
@@ -424,10 +427,45 @@ def _w1_delivery(
         raise AlignAdapterError(
             CanonicalFailure("fresh-authority-invalid", "w1-admission", "w1-root-event")
         )
-    if not finalized.valid:
+    terminal = getattr(finalized.report, "terminal", None)
+    trace_terminal = getattr(finalized.trace, "terminal", None)
+    if terminal != trace_terminal:
+        raise AlignAdapterError(
+            CanonicalFailure(
+                "finalizer-output-invalid", "w1-finalizer", "terminal-validity"
+            )
+        )
+    if terminal == "budget-exhausted":
+        if finalized.valid is not False:
+            raise AlignAdapterError(
+                CanonicalFailure(
+                    "finalizer-output-invalid",
+                    "w1-finalizer",
+                    "terminal-validity",
+                )
+            )
         raise AlignAdapterError(
             CanonicalFailure(
                 "finalizer-budget-exhausted", "w1-finalizer", "sweep-budget"
+            )
+        )
+    if terminal not in ("fixed-point", "cycle-adoption") or finalized.valid is not True:
+        raise AlignAdapterError(
+            CanonicalFailure(
+                "finalizer-output-invalid", "w1-finalizer", "terminal-validity"
+            )
+        )
+    if any(
+        getattr(report, "kind", None) == "canonical-text-fallback"
+        for cue in seed_cues
+        for report in getattr(cue, "reports", ())
+    ) or any(
+        getattr(cue, "unit_range", None) != block.unit_range
+        for block, cue in zip(seed_blocks, seed_cues, strict=True)
+    ):
+        raise AlignAdapterError(
+            CanonicalFailure(
+                "finalizer-output-invalid", "w1-finalizer", "footprint-fallback"
             )
         )
     ordered_units = tuple(getattr(seed, "ordered_units", ()))
@@ -702,12 +740,32 @@ def issue_align_evaluated_result(
         raise ValueError("evaluated evidence is not bound to the adapter receipt")
 
     status = adapter_result.v2_status
-    if status.kind == "valid":
+    if isinstance(comparison, CanonicalFailure):
+        if (
+            status.kind != "valid"
+            or comparison.kind != "shadow-internal-error"
+            or comparison.phase != "comparator-stage"
+            or comparison.detail_code != "comparator-stage"
+        ):
+            raise ValueError("unexpected comparator terminal is not closed")
+        status = V2Status("invalid", comparison)
+        comparison = None
+    elif status.kind == "valid":
+        from voxweave.align_delta_registry import ALIGN_DELTA_REGISTRY_SHA256
         from voxweave.core.align_compare import AlignComparison
 
         if adapter_result.v2 is None or not isinstance(comparison, AlignComparison):
             raise ValueError("valid v2 delivery requires semantic comparison")
-        if comparison.violations:
+        if comparison.registry_sha256 != ALIGN_DELTA_REGISTRY_SHA256:
+            status = V2Status(
+                "invalid",
+                CanonicalFailure(
+                    "align-delta-invalid",
+                    "semantic-comparison",
+                    "registry-digest",
+                ),
+            )
+        elif comparison.violations:
             status = V2Status(
                 "invalid",
                 CanonicalFailure(

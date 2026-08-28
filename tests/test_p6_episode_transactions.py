@@ -1034,7 +1034,9 @@ def _stub_public_shadow_align(tmp_path, monkeypatch):
                 geometry.sample_rate,
                 geometry.sample_count,
             )
-        return media
+        crop = tmp_path / "qwen-crop.wav"
+        crop.write_bytes(media.read_bytes())
+        return crop
 
     monkeypatch.setattr(pipeline, "slice_wav", fake_slice)
     monkeypatch.setattr(
@@ -1290,4 +1292,9 @@ def test_align_shadow_observer_failure_cannot_change_selected_return(
         assert pipeline.align(vtt_path, _shadow_observer=fail_observer) == vtt_path
 
     assert json_path.exists() and vtt_path.exists()
-    assert any("align shadow observer failed" in row.message for row in caplog.records)
+    record = next(
+        row for row in caplog.records if "align shadow observer failed" in row.message
+    )
+    assert record.failure.kind == "observer-failed"
+    assert record.failure.phase == "observer"
+    assert record.failure.detail_code == "observer-callback"

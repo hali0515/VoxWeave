@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from voxweave.config import gap_thresholds
+from voxweave.align_failures import CanonicalFailure
 from voxweave.core.boundary_lattice import preflight_profile
 from voxweave.core.layout import default_max_line_length, default_max_lines
 from voxweave.core.segdoc import THRESHOLD_KEYS, DisplayProfile
@@ -61,7 +62,15 @@ class ProfileResolution:
 @dataclass(frozen=True)
 class EvidenceStatus:
     kind: Literal["valid", "invalid"]
-    detail_code: Literal["evidence-domain"] | None
+    detail_code: Literal["shot-shape", "sing-shape", "evidence-domain"] | None
+
+    @property
+    def failure(self) -> CanonicalFailure | None:
+        if self.kind != "invalid" or self.detail_code is None:
+            return None
+        return CanonicalFailure(
+            "evidence-invalid", "finalizer-evidence", self.detail_code
+        )
 
 
 @dataclass(frozen=True)
@@ -183,39 +192,73 @@ def resolve_align_profile(
 def _number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    projected = float(value)
-    if not math.isfinite(projected) or projected < 0.0:
+    try:
+        projected = float(value)
+    except (OverflowError, ValueError):
         return None
     return projected
 
 
+def _invalid_evidence(
+    detail_code: Literal["shot-shape", "sing-shape", "evidence-domain"],
+) -> FinalizerEvidenceResolution:
+    return FinalizerEvidenceResolution(
+        None,
+        None,
+        EvidenceStatus("invalid", detail_code),
+    )
+
+
 def resolve_finalize_evidence(
     *,
-    shot_changes: Sequence[Any] | None,
-    sing_spans: Sequence[Any] | None,
+    shot_changes: object,
+    sing_spans: object,
 ) -> FinalizerEvidenceResolution:
     """Strictly project only sorted shots and sing spans."""
     shots: list[float] = []
     spans: list[tuple[float, float]] = []
-    try:
-        for raw in shot_changes or ():
+    if shot_changes is not None:
+        if isinstance(shot_changes, (str, bytes)) or not isinstance(
+            shot_changes, Sequence
+        ):
+            return _invalid_evidence("shot-shape")
+        try:
+            shot_values = tuple(shot_changes)
+        except (TypeError, ValueError):
+            return _invalid_evidence("shot-shape")
+        for raw in shot_values:
             value = _number(raw)
             if value is None:
-                raise ValueError
+                return _invalid_evidence("shot-shape")
+            if not math.isfinite(value) or value < 0.0:
+                return _invalid_evidence("evidence-domain")
             shots.append(value)
-        for raw in sing_spans or ():
+    if sing_spans is not None:
+        if isinstance(sing_spans, (str, bytes)) or not isinstance(sing_spans, Sequence):
+            return _invalid_evidence("sing-shape")
+        try:
+            span_values = tuple(sing_spans)
+        except (TypeError, ValueError):
+            return _invalid_evidence("sing-shape")
+        for raw in span_values:
             if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
-                raise ValueError
-            if len(raw) != 2:
-                raise ValueError
-            start, end = _number(raw[0]), _number(raw[1])
-            if start is None or end is None or end < start:
-                raise ValueError
+                return _invalid_evidence("sing-shape")
+            try:
+                if len(raw) != 2:
+                    return _invalid_evidence("sing-shape")
+                start, end = _number(raw[0]), _number(raw[1])
+            except (IndexError, TypeError, ValueError):
+                return _invalid_evidence("sing-shape")
+            if start is None or end is None:
+                return _invalid_evidence("sing-shape")
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or start < 0.0
+                or end < start
+            ):
+                return _invalid_evidence("evidence-domain")
             spans.append((start, end))
-    except (TypeError, ValueError):
-        return FinalizerEvidenceResolution(
-            None, None, EvidenceStatus("invalid", "evidence-domain")
-        )
     return FinalizerEvidenceResolution(
         tuple(sorted(shots)),
         tuple(sorted(spans)),

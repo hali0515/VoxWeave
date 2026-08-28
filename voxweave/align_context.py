@@ -16,11 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from voxweave.align_failures import CanonicalFailure
 from voxweave.align_snapshot import (
     FrozenArray,
     FrozenObject,
     FrozenString,
     frozen_json_digest,
+    thaw_json,
 )
 from voxweave.engine_registry import (
     EngineFamily,
@@ -71,6 +73,9 @@ class ContextAuthorityError(RuntimeError):
     def __init__(self, detail_code: str, message: str):
         super().__init__(message)
         self.detail_code = detail_code
+        self.failure = CanonicalFailure(
+            "context-authority-invalid", "context", detail_code
+        )
 
 
 @dataclass(frozen=True, init=False)
@@ -441,6 +446,38 @@ def role_vector(context: IssuedContext) -> tuple[Literal["C", "R", "L"], ...]:
             else:
                 out.append("L")
         return tuple(out)
+
+
+def verify_context_roles_terminal(context: IssuedContext) -> None:
+    """Reject a top-level exit while any issued role remains live."""
+    with _LOCK:
+        record = _record_for(context)
+        if any(role.terminal is None for role in record.roles.values()):
+            raise ContextAuthorityError(
+                "context-unused-role",
+                "issued context has an unused live role at top-level exit",
+            )
+
+
+def verify_context_expected_vtt_generation(
+    context: IssuedAlignContext,
+    *,
+    observed_vtt_sha256: str | None,
+) -> None:
+    """Bind the private correct/apply handoff to the AO-01 VTT generation."""
+    with _LOCK:
+        record = _record_for(context)
+        if record.kind != "align":
+            raise ContextAuthorityError("context-binding", "context is not align")
+        stable = thaw_json(record.stable_fields)
+        expected = stable.get("expected_vtt_sha256")
+        if expected is None:
+            return
+        if expected != observed_vtt_sha256:
+            raise ContextAuthorityError(
+                "expected-vtt-generation",
+                "expected VTT generation does not match the snapped input",
+            )
 
 
 def verify_context_binding(

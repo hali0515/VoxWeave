@@ -71,7 +71,9 @@ from voxweave.voicebase import (
 )
 from voxweave.vocalscache import (
     cache_lock,
+    cache_publish_path,
     cache_write_window,
+    classify_cache_decode_failure,
     load_cache_companion,
     publish_cache_companion,
     validate_cache_pair,
@@ -185,6 +187,70 @@ def _attach_canonical_failure(
             setattr(exc, "failure", CanonicalFailure(kind, phase, detail_code))
     except Exception:
         pass
+
+
+def _append_secondary_terminal(
+    primary: BaseException,
+    secondary_exception: BaseException,
+    *,
+    kind: str,
+    phase: str,
+    detail_code: str,
+) -> None:
+    """Append one later closed terminal without replacing the first exception."""
+    secondary = SecondaryFailure(kind, phase, detail_code)
+    failure = getattr(primary, "failure", None)
+    if isinstance(failure, CanonicalFailure):
+        try:
+            setattr(
+                primary,
+                "failure",
+                CanonicalFailure(
+                    failure.kind,
+                    failure.phase,
+                    failure.detail_code,
+                    failure.secondary + (secondary,),
+                ),
+            )
+        except Exception:
+            pass
+    try:
+        current = tuple(getattr(primary, "secondary_failures", ()))
+        setattr(primary, "secondary_failures", current + (secondary,))
+        exceptions = tuple(getattr(primary, "secondary_exceptions", ()))
+        setattr(
+            primary,
+            "secondary_exceptions",
+            exceptions + (secondary_exception,),
+        )
+    except Exception:
+        pass
+
+
+def _record_disposal_failure(
+    production_failure: BaseException | None,
+    disposal_failure: BaseException | None,
+    exc: BaseException,
+    *,
+    detail_code: str,
+) -> BaseException:
+    primary = production_failure or disposal_failure
+    if primary is None:
+        _attach_canonical_failure(
+            exc,
+            kind="snapshot-dispose-failed",
+            phase="dispose",
+            detail_code=detail_code,
+        )
+        return exc
+    _append_secondary_terminal(
+        primary,
+        exc,
+        kind="snapshot-dispose-failed",
+        phase="dispose",
+        detail_code=detail_code,
+    )
+    return disposal_failure or exc
 
 
 def _attach_json_decode_failure(exc: BaseException) -> None:
@@ -404,7 +470,7 @@ def _encode_flac(src_wav: Path, dst_flac: Path) -> None:
     path — every later run would treat it as a cache hit and fail obscurely.
     """
     dst_flac.parent.mkdir(parents=True, exist_ok=True)
-    with fsio.atomic_path(dst_flac) as tmp:
+    with cache_publish_path(dst_flac) as tmp:
         subprocess.run(
             ["ffmpeg", "-nostdin", "-y", "-i", str(src_wav), "-c:a", "flac", str(tmp)],
             check=True,
@@ -822,9 +888,13 @@ def transcribe(
                         rep.stage("vocals cache (32k)")
                         log.info("reuse cached vocals %s", cache_path)
                         voc32 = cache_path
-                        wav = decode_to_wav(
-                            voc32, audio_filter=af
-                        )  # 32k flac -> 16k mono
+                        try:
+                            wav = decode_to_wav(
+                                voc32, audio_filter=af
+                            )  # 32k flac -> 16k mono
+                        except BaseException as exc:
+                            classify_cache_decode_failure(exc)
+                            raise
             if cache_hit:
                 # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
                 pass
@@ -4554,10 +4624,14 @@ def _prepare_16k_for_align(
             if cache_hit:
                 reporter.stage("vocals cache (32k)")
                 log.info("reuse cached vocals %s", cache_handle.cache_path)
-                wav = decode_to_wav(
-                    cache_handle.cache_path,
-                    audio_filter=af,
-                )  # 32k flac -> 16k
+                try:
+                    wav = decode_to_wav(
+                        cache_handle.cache_path,
+                        audio_filter=af,
+                    )  # 32k flac -> 16k
+                except BaseException as exc:
+                    classify_cache_decode_failure(exc)
+                    raise
                 tmp.append(wav)
                 return wav
         if not bound:
@@ -4569,7 +4643,14 @@ def _prepare_16k_for_align(
                 ):
                     reporter.stage("vocals cache (16k legacy)")
                     log.info("reuse legacy 16k vocals %s", legacy_handle.cache_path)
-                    wav = decode_to_wav(legacy_handle.cache_path, audio_filter=af)
+                    try:
+                        wav = decode_to_wav(
+                            legacy_handle.cache_path,
+                            audio_filter=af,
+                        )
+                    except BaseException as exc:
+                        classify_cache_decode_failure(exc)
+                        raise
                     tmp.append(wav)
                     return wav
         fullband, vocals, wav, voc32 = _separate_to_16k_32k(
@@ -4689,6 +4770,7 @@ def _align_blocks(
     speech_spans: list[tuple[float, float]] | None = None,
     raw_call_observer: Callable[..., None] | None = None,
     qwen_invoker: Callable[..., Sequence[Any]] | None = None,
+    backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """Route blocks to the configured aligner and return per-block units.
 
@@ -4719,6 +4801,7 @@ def _align_blocks(
             iso,
             bounds=bounds,
             _raw_call_observer=raw_call_observer,
+            _backend_invoker=backend_invoker,
         )
         reporter.advance(1)
         return units
@@ -4732,6 +4815,7 @@ def _align_blocks(
             bounds=bounds,
             speech_spans=speech_spans,
             _raw_call_observer=raw_call_observer,
+            _backend_invoker=backend_invoker,
         )
         reporter.advance(1)
         return units
@@ -4826,15 +4910,35 @@ def _notify_align_shadow_observer(
                 vtt_sha256=selection.verified.vtt_sha256,
                 json_sha256=selection.verified.main_json_sha256,
                 evidence_sha256=evidence_sha256,
-                prior_failure=selection.result.v2_status.failure,
+                prior_failure=(
+                    selection.observation_failure or selection.result.v2_status.failure
+                ),
             )
         except Exception as minimal_error:
-            log.warning("align shadow artifact unavailable: %s", minimal_error)
+            failure = CanonicalFailure(
+                "shadow-artifact-unavailable",
+                "minimal-artifact",
+                "minimal-artifact-construction",
+            )
+            log.warning(
+                "align shadow artifact unavailable: %s",
+                minimal_error,
+                extra={"failure": failure},
+            )
             return
     try:
         observer(artifact)
     except Exception as exc:
-        log.warning("align shadow observer failed: %s", exc)
+        failure = CanonicalFailure(
+            "observer-failed",
+            "observer",
+            "observer-callback",
+        )
+        log.warning(
+            "align shadow observer failed: %s",
+            exc,
+            extra={"failure": failure},
+        )
 
 
 def align(
@@ -5052,6 +5156,7 @@ def align(
     aligned_cue_count = 0
     aligned_unit_count = 0
     acquisition_media = media
+    production_failure: BaseException | None = None
     if voiceprint_pair is not None:
         try:
             selected_snapshot = snapshots.enter_context(MediaSnapshot(media))
@@ -5120,10 +5225,9 @@ def align(
                 else hashlib.sha256(json_input_bytes).hexdigest()
             ),
             "media_fingerprint": media_input_fingerprint,
-            "media_logical_id": (
-                f"explicit:{media.name}"
-                if explicit_media_requested
-                else f"sibling:{media.suffix.lower()}"
+            "media_logical_id": align_orchestration._media_logical_identity(
+                media,
+                explicit_media=explicit_media_requested,
             ),
             "effective_iso": iso,
             "route": route_kind,
@@ -5136,6 +5240,7 @@ def align(
             ),
         }
         from voxweave.align_acquisition import (
+            _fresh_alignment_backend_invoker,
             _fresh_alignment_call_observer,
             _fresh_alignment_qwen_invoker,
             begin_fresh_alignment,
@@ -5176,8 +5281,12 @@ def align(
                 {
                     "source_index": block["source_index"],
                     "alignment_text": block["alignment_text"],
-                    "start": block["start"],
-                    "end": block["end"],
+                    "start": (
+                        None if block["start"] is None else float(block["start"]).hex()
+                    ),
+                    "end": (
+                        None if block["end"] is None else float(block["end"]).hex()
+                    ),
                 }
                 for block in blocks
             ],
@@ -5210,6 +5319,7 @@ def align(
             route_input_digest=stable_fact_digest(route_facts),
         )
         capture_raw_call = _fresh_alignment_call_observer(fresh_session)
+        invoke_backend_call = _fresh_alignment_backend_invoker(fresh_session)
         invoke_qwen_call = _fresh_alignment_qwen_invoker(fresh_session)
 
         block_units = _align_blocks(
@@ -5226,6 +5336,7 @@ def align(
             speech_spans=_spans_in(data.get("vad_speech")),
             raw_call_observer=capture_raw_call,
             qwen_invoker=invoke_qwen_call,
+            backend_invoker=invoke_backend_call,
         )
 
         # Tight cropping eliminates "last word drifts into inter-sentence silence", so
@@ -5325,9 +5436,19 @@ def align(
         rep.stage("write VTT + JSON")
         from voxweave.align_evidence import encode_align_evidence
 
+        try:
+            evidence_bytes = encode_align_evidence(selection.evidence)
+        except BaseException as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="preencode-failed",
+                phase="preencode",
+                detail_code="evidence-encode",
+            )
+            raise
         evidence_artifact = episode_transaction.EvidencePublication(
             swap_ext(vtt_path, ".align-evidence.json"),
-            encode_align_evidence(selection.evidence),
+            evidence_bytes,
         )
         episode_transaction.commit_primary_outputs(
             command="align",
@@ -5342,23 +5463,63 @@ def align(
             context=selection.context,
             media_path=media,
             expected_media_fingerprint=media_input_fingerprint,
+            expected_voiceprint_media_fingerprint=(
+                voiceprint_pair[1]
+                if voiceprint_pair is not None and selected_snapshot is not None
+                else None
+            ),
+            expected_pair_decision=(
+                preserve_pair
+                if voiceprint_pair is not None and selected_snapshot is not None
+                else None
+            ),
             evidence_artifact=evidence_artifact,
         )
         completed_selection = selection
         aligned_cue_count = len(blocks)
         aligned_unit_count = len(all_units)
+    except BaseException as exc:
+        production_failure = exc
+        raise
     finally:
         # Release aligner singleton VRAM (separation self-releases earlier).
-        snapshots.close()
+        disposal_failure: BaseException | None = None
+        try:
+            snapshots.close()
+        except BaseException as exc:
+            disposal_failure = _record_disposal_failure(
+                production_failure,
+                disposal_failure,
+                exc,
+                detail_code="media-snapshot-residue",
+            )
         backend.release()
         for p in tmp:
-            p.unlink(missing_ok=True)
+            try:
+                p.unlink(missing_ok=True)
+            except BaseException as exc:
+                disposal_failure = _record_disposal_failure(
+                    production_failure,
+                    disposal_failure,
+                    exc,
+                    detail_code="audio-temp-residue",
+                )
         for c in tmp_chunks:
-            c.unlink(missing_ok=True)
+            try:
+                c.unlink(missing_ok=True)
+            except BaseException as exc:
+                disposal_failure = _record_disposal_failure(
+                    production_failure,
+                    disposal_failure,
+                    exc,
+                    detail_code="audio-temp-residue",
+                )
         if align_context is not None:
             from voxweave import align_orchestration
 
             align_orchestration.retire_align_selection(align_context)
+        if production_failure is None and disposal_failure is not None:
+            raise disposal_failure
     if (
         os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1"
         and _shadow_observer is not None

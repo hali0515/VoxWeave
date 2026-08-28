@@ -14,6 +14,10 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from voxweave import config
+from voxweave.align_dp_safety import (
+    validate_over_budget_hints,
+    validate_over_budget_plans,
+)
 
 log = logging.getLogger("voxweave")
 
@@ -209,8 +213,16 @@ def _dp_chunked_pass(
     label: str,
     *,
     crop_to_envelope: bool = False,
+    pass_physical_geometry: bool = False,
 ) -> list[list[dict]]:
-    """Run `pass_fn(wav_slice, texts, offset_s) -> per-block units` under the global-DP memory budget.
+    """Run one geometry-aware alignment pass under the global-DP memory budget.
+
+    The historical three-argument ``pass_fn(wav_slice, texts, offset_s)`` contract
+    remains the default for low-level callers.  CTC/MMS opt into
+    ``pass_physical_geometry``; their pass function additionally receives the exact
+    keyword-only ``audio_sample_start``, ``audio_sample_end``, and ``sample_count``
+    values for the physical crop.  This does not change the legacy offset or selected
+    units.
 
     Shared by the wav2vec2 and MMS full-pass aligners: both end in a single forced-align
     trellis that is O(T*L) and overflows on movie-length audio. Within budget the whole wav
@@ -224,6 +236,27 @@ def _dp_chunked_pass(
     """
     from voxweave.chunking import plan_dp_chunks
     from voxweave.timestamps import shift_units
+
+    sample_count = int(wav.shape[-1])
+
+    def run_pass(
+        wav_slice,
+        texts: list[str],
+        offset_s: float,
+        *,
+        audio_sample_start: int,
+        audio_sample_end: int,
+    ):
+        if pass_physical_geometry:
+            return pass_fn(
+                wav_slice,
+                texts,
+                offset_s,
+                audio_sample_start=audio_sample_start,
+                audio_sample_end=audio_sample_end,
+                sample_count=sample_count,
+            )
+        return pass_fn(wav_slice, texts, offset_s)
 
     frames = wav.shape[-1] / _CTC_STRIDE
     if frames <= CTC_MAX_DP_FRAMES:
@@ -242,19 +275,47 @@ def _dp_chunked_pass(
             hi = min(total_sec, max(ends) + CTC_ENVELOPE_PAD_SEC)
             a, b = int(lo * sr), int(hi * sr)
             if a < b and (a > 0 or b < wav.shape[-1]):
-                return [shift_units(u, lo) for u in pass_fn(wav[a:b], norm, lo)]
-        return pass_fn(wav, norm, 0.0)
-
-    if not bounds or len(bounds) != len(norm):
-        raise RuntimeError(
-            f"audio ~{frames / 3000:.0f}min exceeds single-pass CTC DP budget "
-            f"(~{CTC_MAX_DP_FRAMES / 3000:.0f}min) and cue timestamps are unavailable for "
-            f"silence-anchored DP-chunking (raise VOXWEAVE_CTC_MAX_DP_FRAMES to override)"
+                return [
+                    shift_units(u, lo)
+                    for u in run_pass(
+                        wav[a:b],
+                        norm,
+                        lo,
+                        audio_sample_start=a,
+                        audio_sample_end=b,
+                    )
+                ]
+        return run_pass(
+            wav,
+            norm,
+            0.0,
+            audio_sample_start=0,
+            audio_sample_end=sample_count,
         )
 
     total_sec = wav.shape[-1] / sr
     budget_sec = CTC_MAX_DP_FRAMES * _CTC_STRIDE / sr * CTC_DP_CHUNK_FRAC
+    validate_over_budget_hints(
+        bounds,
+        block_count=len(norm),
+        audio_end=total_sec,
+        sample_rate=sr,
+        max_dp_frames=CTC_MAX_DP_FRAMES,
+        frame_stride=_CTC_STRIDE,
+        chunk_fraction=CTC_DP_CHUNK_FRAC,
+    )
+    assert bounds is not None  # narrowed by the fail-closed validator above
     plans = plan_dp_chunks(bounds, max_sec=budget_sec, audio_end=total_sec)
+    validate_over_budget_plans(
+        plans,
+        block_count=len(norm),
+        audio_end=total_sec,
+        sample_count=wav.shape[-1],
+        sample_rate=sr,
+        max_dp_frames=CTC_MAX_DP_FRAMES,
+        frame_stride=_CTC_STRIDE,
+        chunk_fraction=CTC_DP_CHUNK_FRAC,
+    )
     log.info(
         "%s DP-chunking %.0fmin audio into %d silence-anchored chunks (budget ~%.0fmin)",
         label,
@@ -265,8 +326,36 @@ def _dp_chunked_pass(
     out: list[list[dict]] = []
     for p in plans:
         a = max(0, int(p["start"] * sr))
-        b = min(wav.shape[-1], int(p["end"] * sr))
+        b = min(sample_count, int(p["end"] * sr))
         offset = a / sr
-        sub = pass_fn(wav[a:b], norm[p["lo"] : p["hi"]], offset)
+        sub = run_pass(
+            wav[a:b],
+            norm[p["lo"] : p["hi"]],
+            offset,
+            audio_sample_start=a,
+            audio_sample_end=b,
+        )
         out.extend(shift_units(u, offset) for u in sub)
     return out
+
+
+def _preflight_over_budget_hints(
+    wav,
+    sr: int,
+    norm: Sequence[str],
+    bounds: Sequence[tuple[float, float] | None] | None,
+) -> None:
+    """Reject unsafe over-budget hints without loading or invoking an aligner model."""
+
+    frames = wav.shape[-1] / _CTC_STRIDE
+    if frames <= CTC_MAX_DP_FRAMES:
+        return
+    validate_over_budget_hints(
+        bounds,
+        block_count=len(norm),
+        audio_end=wav.shape[-1] / sr,
+        sample_rate=sr,
+        max_dp_frames=CTC_MAX_DP_FRAMES,
+        frame_stride=_CTC_STRIDE,
+        chunk_fraction=CTC_DP_CHUNK_FRAC,
+    )
