@@ -112,6 +112,49 @@ def test_rat2_durable_verifier_recomputes_physical_call_claims(
     assert verified.detail_code == "evidence-schema"
 
 
+def test_rat2_default_source_facts_downgrade_production_w1_audit(
+    tmp_path, monkeypatch
+):
+    from tests.test_p6_episode_transactions import _stub_public_shadow_align
+    from voxweave import align_evidence
+
+    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    assert pipeline.align(vtt_path) == vtt_path
+    evidence_path = tmp_path / "episode.align-evidence.json"
+    evidence = json.loads(evidence_path.read_bytes())
+    model_facts = {
+        "kind": "default",
+        "route": evidence["route"],
+        "language": evidence["language"],
+    }
+    route_facts = {
+        "kind": "default",
+        "context_content_digest": evidence["context_content_digest"],
+        "route": evidence["route"],
+    }
+    evidence["source_facts"] = {
+        "backend_model_config": model_facts,
+        "route_input": route_facts,
+    }
+    model_digest = align_evidence._durable_fact_digest(model_facts)
+    route_digest = align_evidence._durable_fact_digest(route_facts)
+    for call in evidence["physical_calls"]:
+        call["backend_model_config_sha256"] = model_digest
+        call["route_input_sha256"] = route_digest
+    evidence["receipt_digest"] = align_evidence._receipt_digest(evidence)
+    evidence_path.write_bytes(
+        (
+            json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+        ).encode("utf-8")
+    )
+
+    verified = align_evidence.verify_align_evidence(vtt_path)
+
+    assert verified.integrity is True
+    assert verified.w1_usable is False
+    assert verified.detail_code is None
+
+
 def test_rat2_legacy_absolute_digest_is_reprojected_from_relative_retained_units(
     tmp_path, monkeypatch
 ):
