@@ -4036,6 +4036,62 @@ def _n14_units(value: Any) -> list[Any]:
     return units
 
 
+def _n14_work_replay(
+    units: Sequence[Any], profile: Any
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Instrument fresh canonical work from serialized facts and the live profile."""
+    from voxweave.core.boundary_lattice import (
+        COARSE_GRANULARITY,
+        build_document_lattice,
+    )
+    from voxweave.core.layout import _join
+    from voxweave.core.segdoc import SegDocument
+
+    document = SegDocument(
+        language=profile.language,
+        units=list(units),
+        profile=profile,
+        vad_speech=None,
+        shot_changes=None,
+        sing_spans=None,
+        speaker_turns=None,
+        manifest={},
+        text=_join([unit.surface for unit in units], profile.language),
+    )
+    built = build_document_lattice(
+        document,
+        cache_speaker_evidence=False,
+        canonical_spaced=True,
+    )
+    measurements: list[dict[str, Any]] = []
+    errors: list[str] = []
+    cursor = 0
+    for index, lattice in enumerate(built.lattices):
+        low = lattice.interval.unit_start
+        high = lattice.interval.unit_end
+        if low != cursor or not low < high <= len(units):
+            errors.append(
+                f"interval {index} replay range {[low, high]!r} does not tile units"
+            )
+        cursor = high
+        reason = None if lattice.infeasible is None else lattice.infeasible.reason
+        scanned = (
+            bool(lattice.atoms)
+            and not lattice.all_invisible
+            and reason != COARSE_GRANULARITY
+        )
+        measurements.append(
+            {
+                "canonical_chars": lattice.canonical_chars,
+                "scanned": scanned,
+                "unit_range": [low, high],
+            }
+        )
+    if cursor != len(units):
+        errors.append(f"replay ranges stop at {cursor}/{len(units)} units")
+    return measurements, errors
+
+
 def _n14_oracle(
     units: Sequence[Any],
     profile: Any,
@@ -4151,10 +4207,20 @@ def n14_artifact_evidence(
             "unknown": [f"{case_id}: {exc}"],
         }
 
+    replayed_work, replay_errors = _n14_work_replay(units, profile)
+    unknown.extend(
+        f"{case_id}: independent work replay: {detail}" for detail in replay_errors
+    )
+
     intervals = artifact.get("intervals")
     if not isinstance(intervals, list) or not intervals:
         unknown.append(f"{case_id}: interval work evidence is missing")
     else:
+        if len(intervals) != len(replayed_work):
+            unknown.append(
+                f"{case_id}: independent work measurement has "
+                f"{len(replayed_work)} intervals for {len(intervals)} emitted rows"
+            )
         cursor = 0
         for index, raw in enumerate(intervals):
             if not isinstance(raw, Mapping):
@@ -4185,19 +4251,48 @@ def n14_artifact_evidence(
             interval_ranges.append((low, high))
             raw_chars = sum(len(unit.surface) for unit in units[low:high])
             bound = CANONICAL_PASS_FACTOR * raw_chars * (band_atoms(profile) + 2) ** 2
-            passed = actual <= bound
-            if not passed:
+            replay = replayed_work[index] if index < len(replayed_work) else None
+            if replay is None:
+                unknown.append(
+                    f"{case_id}: interval {index} independent work measurement is absent"
+                )
+                continue
+            verified = replay["canonical_chars"]
+            range_agrees = replay["unit_range"] == unit_range
+            if not range_agrees:
+                unknown.append(
+                    f"{case_id}: interval {index} work measurement range "
+                    f"{replay['unit_range']!r} disagrees with emitted {unit_range!r}"
+                )
+            positive = not replay["scanned"] or verified > 0
+            if not positive:
+                unknown.append(
+                    f"{case_id}: interval {index} independent work measurement is "
+                    "zero for a nonempty canonical scan"
+                )
+            measurement_agrees = actual == verified
+            if not measurement_agrees:
+                unknown.append(
+                    f"{case_id}: interval {index} work measurement disagrees: "
+                    f"emitted {actual}, independently replayed {verified}"
+                )
+            within_bound = verified <= bound
+            passed = range_agrees and positive and measurement_agrees and within_bound
+            if range_agrees and positive and measurement_agrees and not within_bound:
                 failures.append(
-                    f"{case_id}: interval {index} canonical_chars {actual} exceeds "
+                    f"{case_id}: interval {index} canonical_chars {verified} exceeds "
                     f"independent bound {bound}"
                 )
             work_rows.append(
                 {
                     "bound": bound,
-                    "canonical_chars": actual,
+                    "canonical_chars": verified,
+                    "emitted_canonical_chars": actual,
                     "interval": index,
+                    "measurement_agrees": measurement_agrees,
                     "passed": passed,
                     "raw_chars": raw_chars,
+                    "scanned": replay["scanned"],
                     "unit_range": [low, high],
                 }
             )
@@ -4210,13 +4305,13 @@ def n14_artifact_evidence(
     reported_total = (
         totals.get("canonical_chars") if isinstance(totals, Mapping) else None
     )
-    recomputed_total = sum(row["canonical_chars"] for row in work_rows)
+    recomputed_total = sum(row["canonical_chars"] for row in replayed_work)
     if isinstance(reported_total, bool) or not isinstance(reported_total, int):
         unknown.append(f"{case_id}: totals.canonical_chars is missing or malformed")
     elif reported_total != recomputed_total:
-        failures.append(
+        unknown.append(
             f"{case_id}: totals.canonical_chars {reported_total} disagrees with "
-            f"interval sum {recomputed_total}"
+            f"independently replayed interval sum {recomputed_total}"
         )
 
     lanes = artifact.get("lanes")

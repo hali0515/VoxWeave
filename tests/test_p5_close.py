@@ -263,7 +263,9 @@ def test_document_node_mapping_scale_ratio_is_subquadratic() -> None:
     assert ratios[0] * ratios[1] < 8.0, (elapsed, ratios)
 
 
-def test_n14_rejects_impossible_work_and_organic_fd9(monkeypatch) -> None:
+def test_n14_marks_work_disagreement_invalid_even_with_organic_fd9(
+    monkeypatch,
+) -> None:
     artifact = copy.deepcopy(_live_speaker_artifact(monkeypatch))
     artifact["totals"]["canonical_chars"] = 10**18
     row = artifact["lanes"][pipeline.SHADOW_LANE_FINALIZER]["rows"]["v2"]
@@ -279,12 +281,12 @@ def test_n14_rejects_impossible_work_and_organic_fd9(monkeypatch) -> None:
     evidence = calib.n14_artifact_evidence(
         artifact, case_id="mutated", corpus="tracked"
     )
-    assert evidence["failures"]
-    assert evidence["unknown"] == []
-    assert calib.n14_exit_code([evidence]) == cc.EXIT_GATE_FAILED
+    assert any("organic FD-9" in item for item in evidence["failures"])
+    assert any("totals.canonical_chars" in item for item in evidence["unknown"])
+    assert calib.n14_exit_code([evidence]) == cc.EXIT_INVALID
 
 
-def test_n14_cli_rejects_live_impossible_work_and_organic_fd9(
+def test_n14_cli_marks_live_work_disagreement_invalid_with_organic_fd9(
     tmp_path, monkeypatch
 ) -> None:
     real = calib.shadow_artifact_of
@@ -319,9 +321,107 @@ def test_n14_cli_rejects_live_impossible_work_and_organic_fd9(
         ]
     )
     report = json.loads(output.read_text(encoding="utf-8"))
-    assert code == cc.EXIT_GATE_FAILED
-    assert any("canonical_chars" in item for item in report["n14"]["failures"])
+    assert code == cc.EXIT_INVALID
+    assert any("canonical_chars" in item for item in report["n14"]["unknown"])
     assert any("organic FD-9" in item for item in report["n14"]["failures"])
+
+
+def test_n14_verified_work_above_bound_is_a_gate_failure(monkeypatch) -> None:
+    artifact = copy.deepcopy(_live_speaker_artifact(monkeypatch))
+    units = calib._n14_units(artifact["units"])
+    profile = calib._n14_profile(artifact["profile"])
+    replayed, errors = calib._n14_work_replay(units, profile)
+    assert errors == []
+    replayed[0]["canonical_chars"] = 10**18
+    artifact["intervals"][0]["canonical_chars"] = 10**18
+    artifact["totals"]["canonical_chars"] = sum(
+        row["canonical_chars"] for row in replayed
+    )
+    monkeypatch.setattr(
+        calib,
+        "_n14_work_replay",
+        lambda _units, _profile: (copy.deepcopy(replayed), []),
+    )
+
+    evidence = calib.n14_artifact_evidence(
+        artifact, case_id="verified-excess", corpus="tracked"
+    )
+    assert evidence["unknown"] == []
+    assert any("exceeds independent bound" in item for item in evidence["failures"])
+    assert calib.n14_exit_code([evidence]) == cc.EXIT_GATE_FAILED
+
+
+def test_n14_nonempty_scan_requires_positive_independent_work(monkeypatch) -> None:
+    artifact = copy.deepcopy(_live_speaker_artifact(monkeypatch))
+    units = calib._n14_units(artifact["units"])
+    profile = calib._n14_profile(artifact["profile"])
+    replayed, errors = calib._n14_work_replay(units, profile)
+    assert errors == []
+    index = next(index for index, row in enumerate(replayed) if row["scanned"])
+    replayed[index]["canonical_chars"] = 0
+    artifact["intervals"][index]["canonical_chars"] = 0
+    artifact["totals"]["canonical_chars"] = sum(
+        row["canonical_chars"] for row in replayed
+    )
+    monkeypatch.setattr(
+        calib,
+        "_n14_work_replay",
+        lambda _units, _profile: (copy.deepcopy(replayed), []),
+    )
+
+    evidence = calib.n14_artifact_evidence(
+        artifact, case_id="vacuous-work", corpus="tracked"
+    )
+    assert any(
+        "zero for a nonempty canonical scan" in item for item in evidence["unknown"]
+    )
+    assert calib.n14_exit_code([evidence]) == cc.EXIT_INVALID
+
+
+def test_n14_cli_rejects_live_all_zero_work_complete_matrix(
+    tmp_path, monkeypatch
+) -> None:
+    real = pipeline._shadow_v2_artifact
+    observed = {"artifacts": 0, "canonical_chars": 0, "intervals": 0}
+
+    def zeroed(*args, **kwargs):
+        payload = real(*args, **kwargs)
+        artifact = (
+            payload.get("diagnostic") if payload.get("schema_version") == 1 else payload
+        )
+        assert isinstance(artifact, dict)
+        intervals = artifact["intervals"]
+        observed["artifacts"] += 1
+        observed["intervals"] += len(intervals)
+        for interval in intervals:
+            observed["canonical_chars"] += interval["canonical_chars"]
+            interval["canonical_chars"] = 0
+        artifact["totals"]["canonical_chars"] = 0
+        return payload
+
+    monkeypatch.setattr(pipeline, "_shadow_v2_artifact", zeroed)
+    output = tmp_path / "zero-work-shadow.json"
+    argv = [
+        "shadow",
+        "--corpus",
+        str(calib.DEFAULT_CORPUS),
+        "--json-out",
+        str(output),
+        "--no-ablation",
+        "--check",
+    ]
+    with pytest.raises(SystemExit) as raised:
+        cc.run_cli(lambda: calib.main(argv))
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert observed == {
+        "artifacts": 25,
+        "canonical_chars": 16_103_785,
+        "intervals": 282,
+    }
+    assert raised.value.code == cc.EXIT_INVALID
+    assert report["n14"]["status"] == "invalid"
+    assert any("work measurement" in item for item in report["n14"]["unknown"])
 
 
 def test_n14_missing_oracle_evidence_is_invalid() -> None:
