@@ -297,9 +297,12 @@ def test_align_omit_unlink_failure_names_landed_outputs_and_leftover(
     with pytest.raises(
         RuntimeError,
         match=r"primary JSON/VTT outputs landed.*could not delete .*voiceprints",
-    ):
+    ) as caught:
         pipeline.align(vtt_path)
 
+    assert caught.value.failure.kind == "artifact-cleanup-failed"
+    assert caught.value.failure.detail_code == "voiceprints-unlink"
+    assert caught.value.landed == (json_path, vtt_path)
     replayed = json.loads(json_path.read_text(encoding="utf-8"))
     assert "voiceprint_capture" not in replayed
     assert "voiceprint_media" not in replayed
