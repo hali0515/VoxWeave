@@ -21,6 +21,19 @@ PUBLIC_CASE_IDS = (
     "selected-v2-segmentation",
     "combined-ratified-align",
 )
+PUBLIC_ARTIFACTS = (
+    ("historical-selected-legacy", "vtt"),
+    ("post-p11-speaker-turns", "main-json"),
+    ("rat4-lexical-direct", "route-evidence"),
+    ("selected-v2-align", "vtt"),
+    ("selected-v2-align", "main-json"),
+    ("selected-v2-align", "align-evidence"),
+    ("selected-v2-segmentation", "vtt"),
+    ("selected-v2-segmentation", "main-json"),
+    ("combined-ratified-align", "vtt"),
+    ("combined-ratified-align", "main-json"),
+    ("combined-ratified-align", "align-evidence"),
+)
 
 
 def _load_oracle_runner() -> Any:
@@ -44,41 +57,46 @@ def _pinned_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("VOXWEAVE_CONFIG", raising=False)
 
 
-def test_every_oracle_case_executes_its_recorded_public_command_in_a_clean_root(
-    monkeypatch: pytest.MonkeyPatch,
-):
+@pytest.fixture(scope="module")
+def public_authority_run() -> dict[str, Any]:
+    monkeypatch = pytest.MonkeyPatch()
     _pinned_environment(monkeypatch)
-    oracle = _load_oracle_runner()
-    manifest = oracle._load_checked_manifest(ORACLE_MANIFEST)
-    oracle_root = ORACLE_MANIFEST.parent
+    try:
+        oracle = _load_oracle_runner()
+        manifest = oracle._load_checked_manifest(ORACLE_MANIFEST)
+        oracle_root = ORACLE_MANIFEST.parent
+        results = {}
+        projections = {}
+        for case in manifest["cases"]:
+            results[case["id"]] = oracle._execute_public_case(
+                case,
+                manifest_path=ORACLE_MANIFEST,
+            )
+            projections[case["id"]] = oracle._project_case(case, oracle_root)
+        return {
+            "manifest": manifest,
+            "projections": projections,
+            "results": results,
+        }
+    finally:
+        monkeypatch.undo()
+
+
+def test_every_oracle_case_executes_its_recorded_public_command_in_a_clean_root(
+    public_authority_run: dict[str, Any],
+):
+    manifest = public_authority_run["manifest"]
+    results = public_authority_run["results"]
     source_roots: set[Path] = set()
     episode_roots: set[Path] = set()
 
     for case in manifest["cases"]:
-        result = oracle._execute_public_case(
-            case,
-            manifest_path=ORACLE_MANIFEST,
-        )
+        result = results[case["id"]]
         assert result.case_id == case["id"]
         assert result.command == case["command"]
-        detached = oracle._project_case(case, oracle_root)
-        public_expected = {
-            output["artifact"]: output
-            for output in case["public_runtime"]["expected_paths"]
-        }
-        assert set(detached) == {
+        assert set(result.artifacts) == {
             output["artifact"] for output in case["expected_paths"]
         }
-        assert set(result.artifacts) == set(public_expected) == set(detached)
-        for output in case["expected_paths"]:
-            artifact = output["artifact"]
-            expected = (oracle_root / output["expected_path"]).read_bytes()
-            assert detached[artifact] == expected
-            public_output = public_expected[artifact]
-            public_bytes = (oracle_root / public_output["expected_path"]).read_bytes()
-            assert result.artifacts[artifact] == public_bytes
-            assert len(public_bytes) == public_output["size"]
-            assert hashlib.sha256(public_bytes).hexdigest() == public_output["sha256"]
         if case["command"] == "align" and case["reference_set"] != "6e6033f":
             assert result.evidence_verification["detail_code"] is None
             assert result.evidence_verification["integrity"] is True
@@ -98,6 +116,22 @@ def test_every_oracle_case_executes_its_recorded_public_command_in_a_clean_root(
     assert tuple(case["id"] for case in manifest["cases"]) == PUBLIC_CASE_IDS
 
 
+@pytest.mark.parametrize(
+    ("case_id", "artifact"),
+    PUBLIC_ARTIFACTS,
+    ids=(f"{case_id}-{artifact}" for case_id, artifact in PUBLIC_ARTIFACTS),
+)
+def test_public_command_artifact_matches_the_standalone_projector_authority(
+    case_id: str,
+    artifact: str,
+    public_authority_run: dict[str, Any],
+):
+    result = public_authority_run["results"][case_id]
+    projection = public_authority_run["projections"][case_id]
+
+    assert result.artifacts[artifact] == projection[artifact]
+
+
 def test_public_command_environment_rejects_ambient_feature_flags(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -110,11 +144,7 @@ def test_public_command_environment_rejects_ambient_feature_flags(
     )
 
     result = oracle._execute_public_case(case, manifest_path=ORACLE_MANIFEST)
-    for expected in case["public_runtime"]["expected_paths"]:
-        assert (
-            result.artifacts[expected["artifact"]]
-            == (ORACLE_MANIFEST.parent / expected["expected_path"]).read_bytes()
-        )
+    assert result.artifacts == oracle._project_case(case, ORACLE_MANIFEST.parent)
 
 
 def test_align_public_cases_expose_production_owned_runtime_phase_traces(
@@ -269,19 +299,11 @@ def test_manifest_public_runtime_contract_is_closed_and_non_declarative():
         assert set(runtime) == {
             "fixture",
             "expected_family",
-            "expected_paths",
             "expected_trace",
             "expected_w1_usable",
         }
         assert runtime["fixture"].startswith("inputs/")
         assert runtime["expected_family"] in {"legacy-v1", "boundary-v2"}
-        assert {output["artifact"] for output in runtime["expected_paths"]} == {
-            output["artifact"] for output in case["expected_paths"]
-        }
-        assert all(
-            output["expected_path"].startswith("expected/")
-            for output in runtime["expected_paths"]
-        )
         if case["command"] == "align" and case["reference_set"] != "6e6033f":
             assert runtime["expected_trace"]
             assert type(runtime["expected_w1_usable"]) is bool

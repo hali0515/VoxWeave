@@ -16,6 +16,18 @@ class _StrictCaptureFailure(RuntimeError):
     pass
 
 
+class _LegacyDistributionFailure(RuntimeError):
+    pass
+
+
+class _LegacyShiftFailure(RuntimeError):
+    pass
+
+
+class _SyntheticWave:
+    shape = (32_000,)
+
+
 def test_runtime_capture_is_invocation_scoped_and_retains_failed_activity() -> None:
     from voxweave.align_runtime import (
         align_runtime_activity,
@@ -212,6 +224,73 @@ def _activity_count(
     )
 
 
+def _failed_activities(trace: object) -> list[tuple[str, str]]:
+    return [
+        (event.phase, event.activity)
+        for event in trace.events  # type: ignore[attr-defined]
+        if event.state == "failed"
+    ]
+
+
+def _assert_no_phase_after(trace: object, phase: int) -> None:
+    assert not [
+        event
+        for event in trace.events  # type: ignore[attr-defined]
+        if int(event.phase.removeprefix("AO-")) > phase
+    ]
+
+
+def _stub_public_full_route_before_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    route: str,
+    media_path: Path,
+) -> None:
+    from voxweave import align_ctc, align_mms, backend, config, pipeline
+
+    monkeypatch.setattr(
+        pipeline,
+        "_prepare_16k_for_align",
+        lambda *_args, **_kwargs: media_path,
+    )
+    monkeypatch.setattr(backend, "release", lambda: None)
+    monkeypatch.setattr(backend, "uses_mms", lambda _iso: route == "mms-full")
+    monkeypatch.setattr(
+        config,
+        "align_model_for",
+        lambda _iso: "synthetic-ctc" if route == "ctc-full" else None,
+    )
+
+    if route == "ctc-full":
+        aligner = align_ctc.CtcAligner(
+            "synthetic",
+            object(),
+            16_000,
+            0,
+            -1,
+            {character: index + 1 for index, character in enumerate("HELO")},
+            None,
+        )
+        monkeypatch.setattr(align_ctc, "_load_mono", lambda *_args: _SyntheticWave())
+        monkeypatch.setattr(align_ctc, "_get_ctc_aligner", lambda *_args: aligner)
+        monkeypatch.setattr(align_ctc, "_ctc_emit_full", lambda *_args: object())
+        monkeypatch.setattr(
+            align_ctc,
+            "_ctc_align_logp",
+            lambda *_args: [{"text": "hello", "start": 0.0, "end": 1.0}],
+        )
+        monkeypatch.setattr(align_ctc, "_empty_cache", lambda: None)
+        return
+
+    monkeypatch.setattr(align_mms, "_read_wav_16k", lambda *_args: _SyntheticWave())
+    monkeypatch.setattr(
+        align_mms,
+        "_mms_emit_units",
+        lambda *_args: [{"text": "あ", "start": 0.0, "end": 1.0}],
+    )
+    monkeypatch.setattr(align_mms, "_empty_cache", lambda: None)
+
+
 @pytest.mark.parametrize("route", ("ctc-full", "mms-full", "qwen-crop"))
 def test_public_align_runtime_trace_records_real_route_and_ao10_before_ao11(
     route: str,
@@ -387,3 +466,68 @@ def test_multicall_qwen_completes_all_ao11_captures_before_any_ao12_transform(
         ("AO-12", "physical-origin-transform"),
         ("AO-12", "physical-origin-transform"),
     ]
+
+
+@pytest.mark.parametrize("route", ("ctc-full", "mms-full"))
+def test_public_full_route_real_distribution_failure_is_ao08_and_stops_downstream(
+    route: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from voxweave import align_ctc, align_mms, pipeline
+    from voxweave.align_runtime import capture_align_runtime_trace
+
+    vtt_path, media_path = _write_public_align_episode(tmp_path, route=route)
+    _stub_public_full_route_before_distribution(
+        monkeypatch,
+        route=route,
+        media_path=media_path,
+    )
+
+    def fail_distribution(*_args: Any, **_kwargs: Any) -> Any:
+        raise _LegacyDistributionFailure("injected real legacy distribution failure")
+
+    route_module = align_ctc if route == "ctc-full" else align_mms
+    monkeypatch.setattr(route_module, "_distribute_units", fail_distribution)
+
+    with capture_align_runtime_trace() as capture:
+        with pytest.raises(
+            _LegacyDistributionFailure,
+            match="real legacy distribution failure",
+        ):
+            pipeline.align(vtt_path, media_path=media_path, separate=False)
+    trace = capture.snapshot()
+
+    assert _failed_activities(trace) == [("AO-08", "legacy-owner-slice")]
+    assert _activity_count(trace, "AO-08", "legacy-owner-slice", "started") == 1
+    _assert_no_phase_after(trace, 8)
+
+
+def test_public_qwen_real_shift_failure_is_ao09_and_stops_downstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from voxweave import pipeline
+    from voxweave.align_runtime import capture_align_runtime_trace
+
+    vtt_path, media_path = _write_public_align_episode(tmp_path, route="qwen-crop")
+    _stub_public_route(
+        monkeypatch,
+        tmp_path,
+        route="qwen-crop",
+        media_path=media_path,
+    )
+
+    def fail_shift(*_args: Any, **_kwargs: Any) -> Any:
+        raise _LegacyShiftFailure("injected real legacy shift failure")
+
+    monkeypatch.setattr(pipeline, "shift_units", fail_shift)
+
+    with capture_align_runtime_trace() as capture:
+        with pytest.raises(_LegacyShiftFailure, match="real legacy shift failure"):
+            pipeline.align(vtt_path, media_path=media_path, separate=False)
+    trace = capture.snapshot()
+
+    assert _failed_activities(trace) == [("AO-09", "legacy-time-transform")]
+    assert _activity_count(trace, "AO-09", "legacy-time-transform", "started") == 1
+    _assert_no_phase_after(trace, 9)

@@ -79,6 +79,41 @@ def test_rat2_public_align_publishes_and_verifies_evidence_last(tmp_path, monkey
 
 
 @pytest.mark.parametrize(
+    "field",
+    (
+        "legacy_slice_sha256",
+        "legacy_absolute_sha256",
+        "backend_model_config_sha256",
+        "route_input_sha256",
+    ),
+)
+def test_rat2_durable_verifier_recomputes_physical_call_claims(
+    field, tmp_path, monkeypatch
+):
+    from tests.test_p6_episode_transactions import _stub_public_shadow_align
+    from voxweave import align_evidence
+
+    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    assert pipeline.align(vtt_path) == vtt_path
+    evidence_path = tmp_path / "episode.align-evidence.json"
+    evidence = json.loads(evidence_path.read_bytes())
+    evidence["physical_calls"][0][field] = "d" * 64
+    evidence["receipt_digest"] = align_evidence._receipt_digest(evidence)
+    evidence_path.write_bytes(
+        (
+            json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+    )
+
+    verified = align_evidence.verify_align_evidence(vtt_path)
+
+    assert verified.integrity is False
+    assert verified.w1_usable is False
+    assert verified.detail_code == "evidence-schema"
+
+
+@pytest.mark.parametrize(
     (
         "profile_kind",
         "admission",
