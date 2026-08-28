@@ -6,8 +6,6 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
-from huggingface_hub import constants as hf_constants
-
 from voxweave import backend, config, diarize, voicematch
 
 
@@ -21,15 +19,17 @@ def _cache_hf_file(
     payload: bytes,
     *,
     revision: str = "1" * 40,
+    ref_name: str | None = "main",
 ) -> tuple[Path, str]:
     repo_cache = cache_root / f"models--{repo_id.replace('/', '--')}"
     blob_name = hashlib.sha256(payload).hexdigest()
     blob_path = repo_cache / "blobs" / blob_name
     blob_path.parent.mkdir(parents=True, exist_ok=True)
     blob_path.write_bytes(payload)
-    refs = repo_cache / "refs"
-    refs.mkdir(parents=True, exist_ok=True)
-    (refs / "main").write_text(revision, encoding="utf-8")
+    if ref_name is not None:
+        ref_path = repo_cache / "refs" / ref_name
+        ref_path.parent.mkdir(parents=True, exist_ok=True)
+        ref_path.write_text(revision, encoding="utf-8")
     snapshot_path = repo_cache / "snapshots" / revision / filename
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     snapshot_path.symlink_to(os.path.relpath(blob_path, snapshot_path.parent))
@@ -43,21 +43,10 @@ def _real_shape_pipeline(repo_id: str = EMBEDDING_REPO) -> SimpleNamespace:
     )
 
 
-def _isolated_embedding_caches(tmp_path, monkeypatch):
-    audio_cache = tmp_path / "audio"
-    user_cache = tmp_path / "user-pyannote"
-    legacy_cache = tmp_path / "legacy-pyannote"
-    hf_cache = tmp_path / "huggingface"
-    monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
-    monkeypatch.setenv(diarize.PYANNOTE_CACHE_ENV, str(user_cache))
-    monkeypatch.setattr(diarize, "_legacy_pyannote_cache", lambda: legacy_cache)
-    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(hf_cache))
-    return (
-        audio_cache / diarize.PYANNOTE_CACHE_SUBDIR,
-        user_cache,
-        legacy_cache,
-        hf_cache,
-    )
+def _capture_pyannote_cache(monkeypatch, cache_dir: Path | str | None) -> None:
+    model_module = types.ModuleType("pyannote.audio.core.model")
+    setattr(model_module, "CACHE_DIR", cache_dir)
+    monkeypatch.setitem(sys.modules, "pyannote.audio.core.model", model_module)
 
 
 def test_checkpoint_identity_resolves_real_pyannote_hub_id_shape(tmp_path, monkeypatch):
@@ -69,30 +58,107 @@ def test_checkpoint_identity_resolves_real_pyannote_hub_id_shape(tmp_path, monke
         b"real-shaped wespeaker checkpoint",
     )
     monkeypatch.setattr(config, "AUDIO_CACHE", str(cache_root))
+    _capture_pyannote_cache(monkeypatch, cache_root / diarize.PYANNOTE_CACHE_SUBDIR)
 
     assert diarize._checkpoint_identity(_real_shape_pipeline()) == blob_name
 
 
-def test_checkpoint_identity_searches_current_and_legacy_caches_in_order(
+def test_checkpoint_identity_uses_captured_cache_when_private_and_user_conflict(
     tmp_path, monkeypatch
 ):
-    cache_dirs = _isolated_embedding_caches(tmp_path, monkeypatch)
-    snapshots: list[Path] = []
-    blob_names: list[str] = []
-    for index, cache_dir in enumerate(cache_dirs):
-        snapshot, blob_name = _cache_hf_file(
-            cache_dir,
-            EMBEDDING_REPO,
-            "pytorch_model.bin",
-            f"checkpoint from cache {index}".encode(),
-        )
-        snapshots.append(snapshot)
-        blob_names.append(blob_name)
+    audio_cache = tmp_path / "audio"
+    private_cache = audio_cache / diarize.PYANNOTE_CACHE_SUBDIR
+    user_cache = tmp_path / "user-pyannote"
+    _private_snapshot, private_digest = _cache_hf_file(
+        private_cache,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"unused private checkpoint",
+    )
+    _user_snapshot, user_digest = _cache_hf_file(
+        user_cache,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"checkpoint selected by pyannote",
+    )
+    monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
+    monkeypatch.setenv(diarize.PYANNOTE_CACHE_ENV, str(user_cache))
+    _capture_pyannote_cache(monkeypatch, user_cache)
 
-    for index, blob_name in enumerate(blob_names):
-        assert diarize._checkpoint_identity(_real_shape_pipeline()) == blob_name
-        snapshots[index].unlink()
-    assert diarize._checkpoint_identity(_real_shape_pipeline()) == "unresolved"
+    resolved = diarize._checkpoint_identity(_real_shape_pipeline())
+    assert resolved == user_digest
+    assert resolved != private_digest
+
+
+def test_unused_private_cache_appearance_does_not_change_loaded_identity(
+    tmp_path, monkeypatch
+):
+    audio_cache = tmp_path / "audio"
+    private_cache = audio_cache / diarize.PYANNOTE_CACHE_SUBDIR
+    user_cache = tmp_path / "user-pyannote"
+    _snapshot, user_digest = _cache_hf_file(
+        user_cache,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"stable loaded checkpoint",
+    )
+    monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
+    _capture_pyannote_cache(monkeypatch, user_cache)
+
+    before = diarize._checkpoint_identity(_real_shape_pipeline())
+    _cache_hf_file(
+        private_cache,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"new but unused private checkpoint",
+    )
+    after = diarize._checkpoint_identity(_real_shape_pipeline())
+
+    assert before == after == user_digest
+
+
+def test_checkpoint_identity_honors_cache_captured_before_voxweave_configures_env(
+    tmp_path, monkeypatch
+):
+    audio_cache = tmp_path / "audio"
+    private_cache = audio_cache / diarize.PYANNOTE_CACHE_SUBDIR
+    legacy_cache = tmp_path / "legacy-pyannote"
+    _cache_hf_file(
+        private_cache,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"unused private checkpoint",
+    )
+    _snapshot, legacy_digest = _cache_hf_file(
+        legacy_cache,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"checkpoint loaded before voxweave import",
+    )
+    monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
+    monkeypatch.delenv(diarize.PYANNOTE_CACHE_ENV, raising=False)
+    _capture_pyannote_cache(monkeypatch, legacy_cache)
+
+    diarize._configure_pyannote_cache()
+
+    assert os.environ[diarize.PYANNOTE_CACHE_ENV] == str(private_cache)
+    assert diarize._checkpoint_identity(_real_shape_pipeline()) == legacy_digest
+
+
+def test_checkpoint_identity_resolves_named_pinned_revision(tmp_path, monkeypatch):
+    cache_root = tmp_path / "captured-pyannote"
+    _snapshot, digest = _cache_hf_file(
+        cache_root,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"pinned checkpoint",
+        revision="2" * 40,
+        ref_name="release-2026",
+    )
+    _capture_pyannote_cache(monkeypatch, cache_root)
+
+    pipeline = _real_shape_pipeline(f"{EMBEDDING_REPO}@release-2026")
+    assert diarize._checkpoint_identity(pipeline) == digest
 
 
 def test_pyannote_cache_defaults_under_audio_cache_when_unset(tmp_path, monkeypatch):
@@ -148,25 +214,47 @@ def test_get_pipeline_defaults_pyannote_cache_before_import(tmp_path, monkeypatc
     assert import_observations == [expected_cache]
 
 
-def test_checkpoint_identity_keeps_blob_path_branch_and_rejects_mutable_path(
+def test_checkpoint_identity_hashes_resolved_bytes_not_blob_basename(
     tmp_path,
 ):
     blob_path = tmp_path / "blobs" / ("a" * 64)
     blob_path.parent.mkdir()
-    blob_path.write_bytes(b"cached")
+    blob_payload = b"bytes that do not match the claimed blob name"
+    blob_path.write_bytes(blob_payload)
     cached = SimpleNamespace(_embedding=SimpleNamespace(embedding=blob_path))
-    assert diarize._checkpoint_identity(cached) == blob_path.name
+    resolved = diarize._checkpoint_identity(cached)
+    assert resolved == hashlib.sha256(blob_payload).hexdigest()
+    assert resolved != blob_path.name
 
     local_path = tmp_path / "pytorch_model.bin"
-    local_path.write_bytes(b"mutable local model")
+    local_payload = b"explicit local model"
+    local_path.write_bytes(local_payload)
     local = SimpleNamespace(_embedding=SimpleNamespace(embedding=local_path))
-    assert diarize._checkpoint_identity(local) == "unresolved"
+    assert (
+        diarize._checkpoint_identity(local) == hashlib.sha256(local_payload).hexdigest()
+    )
 
 
 def test_checkpoint_identity_is_unresolved_when_hub_checkpoint_is_not_cached(
     tmp_path, monkeypatch
 ):
-    _isolated_embedding_caches(tmp_path, monkeypatch)
+    _capture_pyannote_cache(monkeypatch, tmp_path / "empty-pyannote-cache")
+    assert diarize._checkpoint_identity(_real_shape_pipeline()) == "unresolved"
+
+
+def test_checkpoint_identity_refuses_to_guess_without_captured_loader_cache(
+    tmp_path, monkeypatch
+):
+    audio_cache = tmp_path / "audio"
+    _cache_hf_file(
+        audio_cache / diarize.PYANNOTE_CACHE_SUBDIR,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"present but not tied to the loader",
+    )
+    monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
+    monkeypatch.delitem(sys.modules, "pyannote.audio.core.model", raising=False)
+
     assert diarize._checkpoint_identity(_real_shape_pipeline()) == "unresolved"
 
 
@@ -202,6 +290,19 @@ def test_separator_identity_uses_hf_blob_or_explicit_local_digest(
         == hashlib.sha256(local_payload).hexdigest()
     )
 
+    mismatched_blob = tmp_path / "blobs" / ("f" * 64)
+    mismatched_payload = b"not the digest named by this path"
+    mismatched_blob.parent.mkdir(exist_ok=True)
+    mismatched_blob.write_bytes(mismatched_payload)
+    monkeypatch.setattr(
+        backend,
+        "_resolve_separator_files",
+        lambda: (mismatched_blob, separator_config),
+    )
+    resolved = backend.separator_identity()["checkpoint"]
+    assert resolved == hashlib.sha256(mismatched_payload).hexdigest()
+    assert resolved != mismatched_blob.name
+
 
 def test_real_shape_capture_provenance_builds_known_compatibility(
     tmp_path, monkeypatch
@@ -229,6 +330,7 @@ def test_real_shape_capture_provenance_builds_known_compatibility(
     separator_config = tmp_path / "separator.yaml"
     separator_config.write_bytes(b"model: {}\n")
     monkeypatch.setattr(config, "AUDIO_CACHE", str(cache_root))
+    _capture_pyannote_cache(monkeypatch, cache_root / diarize.PYANNOTE_CACHE_SUBDIR)
     monkeypatch.setattr(
         diarize,
         "DIARIZE_MODEL",

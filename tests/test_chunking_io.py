@@ -217,8 +217,8 @@ def test_songdet_release_model_is_safe_when_nothing_is_loaded(monkeypatch):
 # --- separator TF32: on by default on cuda, opt-out via VOXWEAVE_TF32 ---
 
 
-def _fake_separator_env(monkeypatch, *, device: str):
-    """Patch _load_separator's whole world; returns the matmul-precision call list."""
+def _fake_separator_env(monkeypatch, tmp_path, *, device: str):
+    """Patch _load_separator's model/runtime dependencies around real temp files."""
     precisions: list[str] = []
 
     torch_stub = types.ModuleType("torch")
@@ -244,32 +244,60 @@ def _fake_separator_env(monkeypatch, *, device: str):
     roformer.MelBandRoformer = _FakeRoformer  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "voxweave.vendor.mel_band_roformer", roformer)
 
+    checkpoint = tmp_path / "separator.ckpt"
+    checkpoint.write_bytes(b"stable separator checkpoint")
+    separator_config = tmp_path / "separator.yaml"
+    separator_config.write_text("model: {}\n", encoding="utf-8")
     monkeypatch.setattr(
-        backend, "_resolve_separator_files", lambda: ("/fake/ckpt", "/fake/conf.yaml")
+        backend,
+        "_resolve_separator_files",
+        lambda: (checkpoint, separator_config),
     )
-    monkeypatch.setattr(backend, "_load_yaml", lambda p: {"model": {}})
     monkeypatch.setattr(backend, "get_device", lambda: device)
-    return precisions
+    return precisions, checkpoint, torch_stub
 
 
-def test_load_separator_enables_tf32_on_cuda(monkeypatch):
+def test_load_separator_enables_tf32_on_cuda(monkeypatch, tmp_path):
     monkeypatch.delenv("VOXWEAVE_TF32", raising=False)
-    precisions = _fake_separator_env(monkeypatch, device="cuda")
+    precisions, _checkpoint, _torch_stub = _fake_separator_env(
+        monkeypatch, tmp_path, device="cuda"
+    )
     backend._load_separator()
     assert precisions == ["high"]
 
 
 @pytest.mark.parametrize("value", ["0", "false", "off", "FALSE", "Off"])
-def test_load_separator_tf32_opt_out(monkeypatch, value):
+def test_load_separator_tf32_opt_out(monkeypatch, tmp_path, value):
     # env is read at call time, not import time, so operators can flip it per run
     monkeypatch.setenv("VOXWEAVE_TF32", value)
-    precisions = _fake_separator_env(monkeypatch, device="cuda")
+    precisions, _checkpoint, _torch_stub = _fake_separator_env(
+        monkeypatch, tmp_path, device="cuda"
+    )
     backend._load_separator()
     assert precisions == []
 
 
-def test_load_separator_leaves_tf32_alone_off_cuda(monkeypatch):
+def test_load_separator_leaves_tf32_alone_off_cuda(monkeypatch, tmp_path):
     monkeypatch.delenv("VOXWEAVE_TF32", raising=False)
-    precisions = _fake_separator_env(monkeypatch, device="cpu")
+    precisions, _checkpoint, _torch_stub = _fake_separator_env(
+        monkeypatch, tmp_path, device="cpu"
+    )
     backend._load_separator()
     assert precisions == []
+
+
+def test_load_separator_refuses_checkpoint_mutation_during_load(monkeypatch, tmp_path):
+    _precisions, checkpoint, torch_stub = _fake_separator_env(
+        monkeypatch, tmp_path, device="cpu"
+    )
+
+    def mutate_while_loading(stream, **_kwargs):
+        checkpoint.write_bytes(b"replacement separator checkpoint")
+        stream.seek(0)
+        stream.read()
+        return {}
+
+    torch_stub.load = mutate_while_loading  # type: ignore[attr-defined]
+
+    with pytest.raises(RuntimeError, match="checkpoint changed while loading"):
+        backend._load_separator()

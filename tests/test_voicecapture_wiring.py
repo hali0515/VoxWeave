@@ -576,22 +576,32 @@ def test_capture_cache_mismatch_reseparates_and_rebinds(tmp_path, monkeypatch):
     for path in (fullband, vocals, voc32):
         path.write_bytes(path.name.encode())
     separated_from: list[Path] = []
+    loaded_separator = {**SEPARATOR, "checkpoint": "d" * 64}
+    captured_audio_profiles: list[dict[str, object]] = []
 
-    def fake_separate(source, **_kwargs):
+    def fake_separate(source, **kwargs):
+        assert kwargs["return_separator_identity"] is True
         separated_from.append(Path(source))
-        return fullband, vocals, wav, voc32
+        return fullband, vocals, wav, voc32, dict(loaded_separator)
 
     def fake_encode(_source, destination):
         Path(destination).write_bytes(b"new bound flac")
+
+    def fake_diarize(_wav, **kwargs):
+        captured_audio_profiles.append(dict(kwargs["audio_profile"]))
+        return diarize.DiarizationResult(turns=[], centroids=None, provenance={})
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
     monkeypatch.setattr(pipeline, "_separate_to_16k_32k", fake_separate)
     monkeypatch.setattr(pipeline, "_encode_flac", fake_encode)
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(diarize, "diarize_turns", fake_diarize)
+    monkeypatch.setattr(diarize, "release", lambda: None)
 
     pipeline.transcribe(
         media,
         separate=True,
+        diarize=True,
         voiceprints=True,
         source_fingerprint=fingerprint,
         cache_vocals=cache,
@@ -602,9 +612,17 @@ def test_capture_cache_mismatch_reseparates_and_rebinds(tmp_path, monkeypatch):
         companion,
         cache,
         media_fingerprint=fingerprint,
-        separator=SEPARATOR,
+        separator=loaded_separator,
     )
     assert separated_from == [media]
+    assert captured_audio_profiles == [
+        {
+            "separated": True,
+            "normalized": False,
+            "sample_rate": 16000,
+            "separator": loaded_separator,
+        }
+    ]
 
 
 def test_episode_lock_canonicalizes_parent_symlink(tmp_path):

@@ -9,6 +9,7 @@ import tempfile
 from collections.abc import Sequence
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import BinaryIO, Literal, overload
 
 from voxweave import config
 from voxweave.align_common import interp_missing as interp_missing  # re-export
@@ -26,8 +27,9 @@ from voxweave.runtime import (
     _empty_cache,
     _hf_download,
     _hf_snapshot,
-    _load_yaml,
+    _load_yaml as _load_yaml,  # re-export for compatibility/tests
     _model_dtype,
+    _parse_yaml,
     _require,
     _use_mlx,
     get_device,
@@ -171,12 +173,16 @@ def _strip_state_dict(sd: dict) -> dict:
     return sd
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_stream(stream: BinaryIO) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
+    while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    with path.open("rb") as stream:
+        return _sha256_stream(stream)
 
 
 def _resolve_separator_files() -> tuple[Path, Path]:
@@ -210,20 +216,15 @@ def _resolve_separator_files() -> tuple[Path, Path]:
 
 
 def separator_identity() -> dict[str, object]:
-    """Describe the exact separator weights/config used by this runtime."""
+    """Hash the currently configured separator bytes for cache validation."""
     checkpoint, config_path = _resolve_separator_files()
     resolved_checkpoint = checkpoint.resolve(strict=True)
-    checkpoint_identity = (
-        resolved_checkpoint.name
-        if resolved_checkpoint.parent.name == "blobs"
-        else _sha256_file(resolved_checkpoint)
-    )
-    config_digest = _sha256_file(config_path)
+    resolved_config = config_path.resolve(strict=True)
     return {
         "repo": SEPARATOR_REPO,
         "file": SEPARATOR_REPO_FILE,
-        "checkpoint": checkpoint_identity,
-        "config_sha256": config_digest,
+        "checkpoint": _sha256_file(resolved_checkpoint),
+        "config_sha256": _sha256_file(resolved_config),
     }
 
 
@@ -238,11 +239,12 @@ def _tf32_enabled() -> bool:
 
 
 def _load_separator():
-    """Instantiate MelBandRoformer (not cached; caller del's it after separation to free VRAM).
+    """Instantiate MelBandRoformer and return its load-bound content identity.
 
-    Uses the frozen copy from voxweave.vendor: the latest PyPI bs-roformer has diverged in
-    architecture and can no longer load community ckpts. Extra yaml keys are filtered against
-    __init__ signature so unknown fields don't crash.
+    The model is not cached; the caller deletes it after separation to free VRAM.
+    Uses the frozen copy from voxweave.vendor: the latest PyPI bs-roformer has
+    diverged in architecture and can no longer load community ckpts. Extra yaml
+    keys are filtered against __init__ signature so unknown fields don't crash.
     """
     try:
         import torch
@@ -252,7 +254,11 @@ def _load_separator():
         raise _require(e.name or "torch") from e
 
     ckpt, conf = _resolve_separator_files()
-    cfg = _load_yaml(conf)
+    resolved_checkpoint = Path(ckpt).resolve(strict=True)
+    resolved_config = Path(conf).resolve(strict=True)
+    config_bytes = resolved_config.read_bytes()
+    config_digest = hashlib.sha256(config_bytes).hexdigest()
+    cfg = _parse_yaml(config_bytes.decode("utf-8"))
     model_cfg = dict(cfg["model"])
     sig = inspect.signature(MelBandRoformer.__init__)
     kwargs = {k: v for k, v in model_cfg.items() if k in sig.parameters}
@@ -263,8 +269,21 @@ def _load_separator():
             sorted(dropped),
         )
     model = MelBandRoformer(**kwargs)
-    # weights_only=True: disables arbitrary-object deserialization (prevents pickle RCE)
-    sd = _strip_state_dict(torch.load(ckpt, map_location="cpu", weights_only=True))
+    # Keep one descriptor across hash/load/re-hash. Atomic pathname replacement
+    # cannot redirect torch.load, while in-place mutation is detected before any
+    # state is installed. weights_only=True prevents pickle RCE.
+    with resolved_checkpoint.open("rb") as checkpoint_stream:
+        checkpoint_digest = _sha256_stream(checkpoint_stream)
+        checkpoint_stream.seek(0)
+        loaded = torch.load(
+            checkpoint_stream,
+            map_location="cpu",
+            weights_only=True,
+        )
+        checkpoint_stream.seek(0)
+        if _sha256_stream(checkpoint_stream) != checkpoint_digest:
+            raise RuntimeError("separator checkpoint changed while loading")
+    sd = _strip_state_dict(loaded)
     model.load_state_dict(sd)
     dev = get_device()
     if dev.startswith("cuda") and _tf32_enabled():
@@ -273,8 +292,14 @@ def _load_separator():
         # of the downstream 16k ASR. VOXWEAVE_TF32=0 restores strict fp32 matmuls.
         torch.set_float32_matmul_precision("high")
     model.to(dev).eval()
-    log.info("loaded separator ckpt=%s on %s", ckpt, dev)
-    return model, cfg
+    log.info("loaded separator ckpt=%s on %s", resolved_checkpoint, dev)
+    separator_identity: dict[str, object] = {
+        "repo": SEPARATOR_REPO,
+        "file": SEPARATOR_REPO_FILE,
+        "checkpoint": checkpoint_digest,
+        "config_sha256": config_digest,
+    }
+    return model, cfg, separator_identity
 
 
 def _demix(model, mix, cfg, progress=None, batch=None):
@@ -326,12 +351,37 @@ def _demix(model, mix, cfg, progress=None, batch=None):
     return result / weight.clamp_min(1e-8)
 
 
-def separate_vocals(audio_path: Path, *, progress=None) -> Path:
-    """Separate vocals locally; returns a FLAC temp file (caller deletes).
+@overload
+def separate_vocals(
+    audio_path: Path,
+    *,
+    progress=None,
+    return_identity: Literal[False] = False,
+) -> Path: ...
+
+
+@overload
+def separate_vocals(
+    audio_path: Path,
+    *,
+    progress=None,
+    return_identity: Literal[True],
+) -> tuple[Path, dict[str, object]]: ...
+
+
+def separate_vocals(
+    audio_path: Path,
+    *,
+    progress=None,
+    return_identity: bool = False,
+) -> Path | tuple[Path, dict[str, object]]:
+    """Separate vocals locally; return a FLAC temp file (caller deletes).
 
     Input must be full-band 44.1k stereo -- Roformer was trained at 44.1k; feeding 16k degrades quality badly.
     Model is loaded and freed within this function so it doesn't co-occupy VRAM with ASR/alignment.
     progress(done, total) called per demix window if provided.
+    ``return_identity=True`` also returns the identity produced at the model load
+    edge, for capture provenance.
     """
     try:
         import numpy as np
@@ -345,7 +395,7 @@ def separate_vocals(audio_path: Path, *, progress=None) -> Path:
     if mix.shape[0] == 1:  # mono -> duplicate to stereo for the stereo model
         mix = mix.repeat(2, 1)
 
-    model, cfg = _load_separator()
+    model, cfg, separator_identity = _load_separator()
     try:
         vocals = _demix(model, mix, cfg, progress=progress)  # [ch, t]
     finally:
@@ -356,6 +406,8 @@ def separate_vocals(audio_path: Path, *, progress=None) -> Path:
     os.close(fd)
     out = Path(dst)
     sf.write(str(out), np.asarray(vocals.T), sr, format="FLAC")  # [t, ch]
+    if return_identity:
+        return out, separator_identity
     return out
 
 

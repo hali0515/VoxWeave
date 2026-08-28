@@ -21,6 +21,7 @@ import importlib.metadata
 import logging
 import math
 import os
+import sys
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -139,42 +140,14 @@ def _private_pyannote_cache() -> Path:
     return Path(config.AUDIO_CACHE) / PYANNOTE_CACHE_SUBDIR
 
 
-def _legacy_pyannote_cache() -> Path:
-    """Return pyannote.audio 3.x's cache location when its env var is unset."""
-    return Path.home() / ".cache" / "torch" / "pyannote"
-
-
 def _configure_pyannote_cache() -> None:
     """Keep pyannote's non-propagated nested downloads in VoxWeave's cache."""
     if PYANNOTE_CACHE_ENV not in os.environ:
         os.environ[PYANNOTE_CACHE_ENV] = os.fspath(_private_pyannote_cache())
 
 
-def _embedding_cache_dirs() -> tuple[str | None, ...]:
-    """Return current and legacy embedding caches in lookup priority order."""
-    candidates: tuple[str | None, ...] = (
-        os.fspath(_private_pyannote_cache()),
-        os.environ.get(PYANNOTE_CACHE_ENV),
-        os.fspath(_legacy_pyannote_cache()),
-        None,
-    )
-    ordered: list[str | None] = []
-    seen: set[str | None] = set()
-    for candidate in candidates:
-        key = (
-            None
-            if candidate is None
-            else os.path.normcase(os.path.abspath(os.path.expanduser(candidate)))
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        ordered.append(candidate)
-    return tuple(ordered)
-
-
 def _checkpoint_identity(pipeline: object) -> str:
-    """Return a content-addressed HF blob name, never a mutable local filename."""
+    """Hash the checkpoint bytes from pyannote's actual loader authority."""
     embedder = getattr(pipeline, "_embedding", None)
     raw_path = getattr(embedder, "embedding", None)
     if not isinstance(raw_path, (str, os.PathLike)):
@@ -184,7 +157,10 @@ def _checkpoint_identity(pipeline: object) -> str:
     except OSError:
         pass
     else:
-        return resolved.name if resolved.parent.name == "blobs" else "unresolved"
+        try:
+            return _sha256_file(resolved)
+        except OSError:
+            return "unresolved"
 
     if not isinstance(raw_path, str):
         return "unresolved"
@@ -196,20 +172,25 @@ def _checkpoint_identity(pipeline: object) -> str:
         from huggingface_hub import try_to_load_from_cache
     except ImportError:
         return "unresolved"
-    for cache_dir in _embedding_cache_dirs():
-        try:
-            cached = try_to_load_from_cache(
-                model_id,
-                EMBEDDING_CHECKPOINT_FILE,
-                revision=revision,
-                cache_dir=cache_dir,
-            )
-            if isinstance(cached, str):
-                resolved = Path(cached).resolve(strict=True)
-                if resolved.parent.name == "blobs":
-                    return resolved.name
-        except (OSError, ValueError):
-            continue
+    model_module = sys.modules.get("pyannote.audio.core.model")
+    if model_module is None or not hasattr(model_module, "CACHE_DIR"):
+        return "unresolved"
+    cache_dir = getattr(model_module, "CACHE_DIR")
+    if cache_dir is not None and not isinstance(cache_dir, (str, os.PathLike)):
+        return "unresolved"
+    if cache_dir is not None:
+        cache_dir = os.fspath(cache_dir)
+    try:
+        cached = try_to_load_from_cache(
+            model_id,
+            EMBEDDING_CHECKPOINT_FILE,
+            revision=revision,
+            cache_dir=cache_dir,
+        )
+        if isinstance(cached, str):
+            return _sha256_file(Path(cached).resolve(strict=True))
+    except (OSError, ValueError):
+        pass
     return "unresolved"
 
 

@@ -118,8 +118,8 @@ def _hf_error(repo: str, err: Exception) -> RuntimeError:
     )
 
 
-def _load_yaml(path: Path) -> dict:
-    """SafeLoader + !!python/tuple support (used by window sizes in MSST-style configs)."""
+def _parse_yaml(text: str) -> dict:
+    """Parse YAML text with the bounded extensions used by model configs."""
     import yaml
 
     class _Loader(yaml.SafeLoader):
@@ -129,7 +129,12 @@ def _load_yaml(path: Path) -> dict:
         "tag:yaml.org,2002:python/tuple",
         lambda loader, node: tuple(loader.construct_sequence(node)),  # pyright: ignore[reportArgumentType]
     )
-    return yaml.load(path.read_text(), Loader=_Loader)
+    return yaml.load(text, Loader=_Loader)
+
+
+def _load_yaml(path: Path) -> dict:
+    """SafeLoader + !!python/tuple support (used by window sizes in MSST-style configs)."""
+    return _parse_yaml(path.read_text())
 
 
 # Reporter receiving byte progress for HF downloads, installed by the CLI for the lifetime of its

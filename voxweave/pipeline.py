@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from voxweave import asrfix as asrfix_mod
 from voxweave import backend, chunking, fsio, realign, songdet
@@ -358,11 +358,36 @@ def _find_sibling_media(ref: Path) -> Path | None:
     return matches[0][1]
 
 
+@overload
 def _separate_to_16k_32k(
-    media: Path, *, reporter: Reporter, normalize: bool
-) -> tuple[Path, Path, Path, Path]:
+    media: Path,
+    *,
+    reporter: Reporter,
+    normalize: bool,
+    return_separator_identity: Literal[False] = False,
+) -> tuple[Path, Path, Path, Path]: ...
+
+
+@overload
+def _separate_to_16k_32k(
+    media: Path,
+    *,
+    reporter: Reporter,
+    normalize: bool,
+    return_separator_identity: Literal[True],
+) -> tuple[Path, Path, Path, Path, dict[str, object]]: ...
+
+
+def _separate_to_16k_32k(
+    media: Path,
+    *,
+    reporter: Reporter,
+    normalize: bool,
+    return_separator_identity: bool = False,
+) -> tuple[Path, Path, Path, Path] | tuple[Path, Path, Path, Path, dict[str, object]]:
     """Decode full-band 44.1k stereo -> Roformer separate -> resample, returning
-    ``(fullband, vocals, wav_16k, voc32_32k)``.
+    ``(fullband, vocals, wav_16k, voc32_32k)`` and, when requested, the
+    load-bound separator identity as a fifth item.
 
     The full-band 44.1k stereo feed is a hard constraint (Roformer is trained at 44.1k);
     downsampling to 16k/32k happens only after separation. Callers own temp bookkeeping,
@@ -380,10 +405,17 @@ def _separate_to_16k_32k(
         fullband = decode_to_wav(media, sample_rate=44100, mono=False)
         created.append(fullband)
         reporter.stage("vocal separation (Roformer)")
-        vocals = backend.separate_vocals(
-            fullband,
-            progress=_progress_bridge(reporter, "vocal separation (Roformer)"),
-        )
+        if return_separator_identity:
+            vocals, separator_identity = backend.separate_vocals(
+                fullband,
+                progress=_progress_bridge(reporter, "vocal separation (Roformer)"),
+                return_identity=True,
+            )
+        else:
+            vocals = backend.separate_vocals(
+                fullband,
+                progress=_progress_bridge(reporter, "vocal separation (Roformer)"),
+            )
         created.append(vocals)
         reporter.stage("resample 16k")
         wav = decode_to_wav(vocals, audio_filter=af)
@@ -391,6 +423,8 @@ def _separate_to_16k_32k(
         voc32 = decode_to_wav(
             vocals, sample_rate=SONGDET_SR
         )  # 32k mono: PANNs + cache source
+        if return_separator_identity:
+            return fullband, vocals, wav, voc32, separator_identity
         return fullband, vocals, wav, voc32
     except Exception:
         for p in created:
@@ -641,7 +675,6 @@ def transcribe(
         voc32: Path | None = None  # 32k mono vocals: PANNs input + cache source
         separator_identity: dict[str, object] | None = None
         if separate and voiceprints:
-            separator_identity = backend.separator_identity()
             require_sha256(source_fingerprint, "capture media fingerprint")
         if separate:
             cache_hit = False
@@ -654,12 +687,14 @@ def transcribe(
                                 companion, _validated = load_cache_companion(
                                     cache_handle.companion_path
                                 )
-                                validate_cache_pair(
+                                current_separator = backend.separator_identity()
+                                validated = validate_cache_pair(
                                     companion,
                                     cache_path,
                                     media_fingerprint=source_fingerprint or "",
-                                    separator=separator_identity or {},
+                                    separator=current_separator,
                                 )
+                                separator_identity = validated.separator.as_mapping()
                                 cache_hit = True
                             except (OSError, Phase2DataError):
                                 log.info(
@@ -681,9 +716,23 @@ def transcribe(
                 # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
                 pass
             else:
-                fullband, vocals, wav, voc32 = _separate_to_16k_32k(
-                    media_path, reporter=rep, normalize=normalize
-                )
+                if voiceprints:
+                    (
+                        fullband,
+                        vocals,
+                        wav,
+                        voc32,
+                        separator_identity,
+                    ) = _separate_to_16k_32k(
+                        media_path,
+                        reporter=rep,
+                        normalize=normalize,
+                        return_separator_identity=True,
+                    )
+                else:
+                    fullband, vocals, wav, voc32 = _separate_to_16k_32k(
+                        media_path, reporter=rep, normalize=normalize
+                    )
                 tmp.append(fullband)
                 dbg.audio("00_fullband_44k.wav", fullband)
                 tmp.append(vocals)
