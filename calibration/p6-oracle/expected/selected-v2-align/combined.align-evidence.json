@@ -1,0 +1,334 @@
+{
+  "schema_version": 8,
+  "kind": "fresh-alignment",
+  "context_content_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+  "receipt_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+  "language": "en",
+  "route": "ctc-full",
+  "input_history": {
+    "vtt_present": true,
+    "vtt_size": 82,
+    "vtt_sha256": "abab68452707bfbab149aae3c3b14f4af298016c4f3121ea23e1ef65f86c35f2",
+    "sibling_json_present": true,
+    "sibling_json_size": 99,
+    "sibling_json_sha256": "4cc95ff2d35a1e2010d6032bd44ef6bb464178df98b530b4671e5e2463b4c0fa",
+    "block_content_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+    "registry_family": "boundary-v2",
+    "media_fingerprint": "7777777777777777777777777777777777777777777777777777777777777777",
+    "media_logical_id": "explicit:episode.wav",
+    "media_display_name": "episode.wav",
+    "prepared_audio_size": 7680044,
+    "prepared_audio_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+    "profile_input_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+    "evidence_carriers_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "authority_limit_profile_kind": "production",
+    "authority_limit_profile_digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+    "legacy_policy_binary64": {
+      "min_cue_sec": "0000000000000000",
+      "tiny_cue_sec": "3fc999999999999a",
+      "tiny_cue_target": "3fe0000000000000"
+    },
+    "target_logical_id": "episode.vtt",
+    "expected_vtt_sha256": null
+  },
+  "route_plan": {
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "entries": [
+      {
+        "delivery_index": 0,
+        "source_index": 0,
+        "route_start": 100.0,
+        "route_end": 101.0,
+        "action": "full-pass-member",
+        "call_index": 0,
+        "skip_reason": null
+      },
+      {
+        "delivery_index": 1,
+        "source_index": 1,
+        "route_start": 0.0,
+        "route_end": 1.0,
+        "action": "full-pass-member",
+        "call_index": 0,
+        "skip_reason": null
+      }
+    ]
+  },
+  "physical_calls": [
+    {
+      "call_index": 0,
+      "source_block_indices": [
+        0,
+        1
+      ],
+      "sample_start": 0,
+      "sample_end": 1920000,
+      "sample_rate": 16000,
+      "physical_origin_seconds": 0.0,
+      "legacy_origin_seconds": 0.0,
+      "legacy_origin_kind": "identity",
+      "authority_origin_seconds": 0.0,
+      "backend_model_config_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "route_input_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "strict_unit_status": "valid",
+      "strict_failure": null,
+      "raw_units_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "relative_units_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "legacy_slice_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "legacy_absolute_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "authority_transform_status": "valid",
+      "authority_absolute_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "raw_unit_ids": [
+        "c0",
+        "c1"
+      ]
+    }
+  ],
+  "legacy_distribution": {
+    "digest": "1010101010101010101010101010101010101010101010101010101010101010",
+    "calls": [
+      {
+        "call_index": 0,
+        "owner_source_indices": [
+          0,
+          1
+        ],
+        "expected_counts": [
+          1,
+          1
+        ],
+        "requested_ranges": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            2
+          ]
+        ],
+        "realized_ranges": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            2
+          ]
+        ],
+        "owner_unit_ids": [
+          [
+            "c0"
+          ],
+          [
+            "c1"
+          ]
+        ],
+        "final_cursor": 2,
+        "consumed_prefix_unit_ids": [
+          "c0",
+          "c1"
+        ],
+        "shortage_source_indices": [],
+        "leftover_unit_ids": []
+      }
+    ]
+  },
+  "authority_distribution": {
+    "status": "valid",
+    "digest": "2020202020202020202020202020202020202020202020202020202020202020",
+    "owner_source_indices": [
+      0,
+      1
+    ],
+    "expected_counts": [
+      1,
+      1
+    ],
+    "owner_unit_ids": [
+      [
+        "c0"
+      ],
+      [
+        "c1"
+      ]
+    ],
+    "consumed_count": 2,
+    "leftover_unit_ids": [],
+    "reasons": [],
+    "work": {
+      "status": "complete",
+      "route_status": "valid",
+      "route_mismatch": null,
+      "route_claims": [
+        {
+          "owner_kind": "call",
+          "owner_index": 0,
+          "delivery_index": 0,
+          "source_index": 0
+        },
+        {
+          "owner_kind": "call",
+          "owner_index": 0,
+          "delivery_index": 1,
+          "source_index": 1
+        }
+      ],
+      "declared_delivery_block_count": 2,
+      "declared_call_count": 1,
+      "declared_skip_count": 0,
+      "declared_raw_node_count": 2,
+      "charged_call_count": 1,
+      "limit_profile_kind": "production",
+      "limit_profile_digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+      "limits": {
+        "call_limit": 4096,
+        "state_limit": 4000000,
+        "edge_limit": 16000000,
+        "interval_limit": 4000000,
+        "normalize_char_limit": 256000000
+      },
+      "totals": {
+        "states": 8,
+        "edges": 4,
+        "intervals": 4,
+        "normalize_chars": 22
+      },
+      "terminal_call_index": null,
+      "denied_charge": null,
+      "calls": [
+        {
+          "call_index": 0,
+          "route_claim_positions": [
+            0,
+            1
+          ],
+          "source_block_indices": [
+            0,
+            1
+          ],
+          "raw_node_range": [
+            0,
+            2
+          ],
+          "block_count": 2,
+          "raw_node_count": 2,
+          "typed_unit_count": 2,
+          "surface_chars": 22,
+          "strict_preflight_status": "valid",
+          "strict_failure": null,
+          "limits": {
+            "state_limit": 1000000,
+            "edge_limit": 4000000,
+            "interval_limit": 1000000,
+            "normalize_char_limit": 64000000
+          },
+          "allocator": {
+            "status": "complete",
+            "states": 4,
+            "edges": 2,
+            "intervals": 2,
+            "normalize_chars": 11,
+            "terminal_detail_code": null
+          },
+          "verifier": {
+            "status": "complete",
+            "states": 4,
+            "edges": 2,
+            "intervals": 2,
+            "normalize_chars": 11,
+            "terminal_detail_code": null
+          }
+        }
+      ],
+      "skipped_blocks": []
+    }
+  },
+  "blocks": [
+    {
+      "source_index": 0,
+      "legacy_unit_ids": [
+        "c0"
+      ],
+      "authority_unit_ids": [
+        "c0"
+      ],
+      "word_data": [
+        {
+          "unit_id": "c0",
+          "call_index": 0,
+          "call_unit_index": 0,
+          "text": "FIRST",
+          "relative_start": 0.2,
+          "relative_end": 0.9,
+          "physical_origin_seconds": 0.0,
+          "start": 0.2,
+          "end": 0.9,
+          "provenance": "aligner",
+          "original_relative_start": 0.2,
+          "original_relative_end": 0.9
+        }
+      ],
+      "speech_start": 0.2,
+      "speech_end": 0.9
+    },
+    {
+      "source_index": 1,
+      "legacy_unit_ids": [
+        "c1"
+      ],
+      "authority_unit_ids": [
+        "c1"
+      ],
+      "word_data": [
+        {
+          "unit_id": "c1",
+          "call_index": 0,
+          "call_unit_index": 1,
+          "text": "SECOND",
+          "relative_start": 1.1,
+          "relative_end": 1.8,
+          "physical_origin_seconds": 0.0,
+          "start": 1.1,
+          "end": 1.8,
+          "provenance": "aligner",
+          "original_relative_start": 1.1,
+          "original_relative_end": 1.8
+        }
+      ],
+      "speech_start": 1.1,
+      "speech_end": 1.8
+    }
+  ],
+  "raw_unit_count": 2,
+  "strict_input_status": {
+    "kind": "valid",
+    "detail_code": null
+  },
+  "seed_status": {
+    "kind": "valid",
+    "reasons": []
+  },
+  "v2_policy_status": {
+    "kind": "valid",
+    "detail_code": null
+  },
+  "profile_status": {
+    "kind": "valid",
+    "source": "manifest-absent",
+    "detail_code": null
+  },
+  "evidence_status": {
+    "kind": "valid",
+    "detail_code": null
+  },
+  "v2_admission_status": "valid",
+  "selected_outputs": {
+    "engine_family": "boundary-v2",
+    "vtt_present": true,
+    "vtt_sha256": "86f3d91bd9cbfc19b510fe87eeca281a5685d62a3de21454c8b2b9b93067bacf",
+    "json_present": true,
+    "json_sha256": "8c508592b8bc5dae8c9b77f79842f41258cbad2cfcded4113c1ed0c99398af1f"
+  }
+}

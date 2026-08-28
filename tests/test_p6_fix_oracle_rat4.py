@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import json
 import math
@@ -197,6 +198,38 @@ def test_p6_oracle_runner_has_exact_exit_contract_and_read_only_compare(tmp_path
         if path.is_file()
     }
     assert after == before
+
+
+def test_p6_oracle_compare_writes_a_deterministic_closed_json_report(tmp_path):
+    manifest = _load_manifest()
+    first_report = tmp_path / "first" / "p6-oracle-report.json"
+    second_report = tmp_path / "second" / "p6-oracle-report.json"
+
+    for report_path in (first_report, second_report):
+        compared = _oracle_command(
+            "compare",
+            "--manifest",
+            str(ORACLE_MANIFEST),
+            "--check",
+            "--json-out",
+            str(report_path),
+        )
+        assert compared.returncode == 0, (compared.stdout, compared.stderr)
+
+    assert first_report.read_bytes() == second_report.read_bytes()
+    assert json.loads(first_report.read_bytes()) == {
+        "artifact_count": sum(
+            len(case["expected_paths"]) for case in manifest["cases"]
+        ),
+        "case_count": len(manifest["cases"]),
+        "command": "compare",
+        "failure_count": 0,
+        "failures": [],
+        "manifest_sha256": hashlib.sha256(ORACLE_MANIFEST.read_bytes()).hexdigest(),
+        "runner_version": manifest["runner_version"],
+        "schema_version": manifest["schema_version"],
+        "status": "match",
+    }
 
 
 def test_p6_source_registry_and_dependency_gate_is_checked():

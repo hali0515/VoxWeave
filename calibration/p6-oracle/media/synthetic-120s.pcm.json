@@ -1,0 +1,6 @@
+{
+  "format": "signed-16le-mono",
+  "sample_rate": 16000,
+  "sample_count": 1920000,
+  "generator": "all-zero deterministic PCM"
+}

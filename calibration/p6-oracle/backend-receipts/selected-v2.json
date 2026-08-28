@@ -1,0 +1,6 @@
+{
+  "receipt_version": 1,
+  "optimizer": "detached-reference-projector",
+  "profile_digest": "cfdb8d1bb94df42a2c27d9b878fefb61e63491296b972b081a0e81c6e657d5d8",
+  "terminal": "fixed-point"
+}

@@ -1,0 +1,446 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxweave.local/schemas/p6-oracle.schema.json",
+  "title": "voxweave P6 detached oracle manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "runner_version",
+    "reference_commits",
+    "execution",
+    "registry_digests",
+    "gates",
+    "source_checks",
+    "failure_registry_coverage",
+    "matrices",
+    "injections",
+    "cases"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "runner_version": {"const": 1},
+    "reference_commits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["historical", "post_p11", "p6_lexical"],
+      "properties": {
+        "historical": {"$ref": "#/$defs/sha1"},
+        "post_p11": {"$ref": "#/$defs/sha1"},
+        "p6_lexical": {"$ref": "#/$defs/sha1"}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "interpreter",
+        "platform",
+        "container_digest",
+        "locale",
+        "timezone",
+        "hash_seed",
+        "dependency_lock_sha256"
+      ],
+      "properties": {
+        "interpreter": {"type": "string", "minLength": 1},
+        "platform": {"type": "string", "minLength": 1},
+        "container_digest": {"$ref": "#/$defs/sha256"},
+        "locale": {"type": "string", "minLength": 1},
+        "timezone": {"type": "string", "minLength": 1},
+        "hash_seed": {"type": "string", "minLength": 1},
+        "dependency_lock_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "registry_digests": {
+      "type": "object",
+      "minProperties": 4,
+      "additionalProperties": {"$ref": "#/$defs/sha256"},
+      "propertyNames": {"pattern": "^[a-z0-9][a-z0-9._-]+$"}
+    },
+    "gates": {
+      "type": "object",
+      "minProperties": 18,
+      "additionalProperties": {"$ref": "#/$defs/gate"},
+      "propertyNames": {"pattern": "^G-[A-Z0-9/-]+$"}
+    },
+    "source_checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/sourceCheck"}
+    },
+    "failure_registry_coverage": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^[a-z0-9][a-z0-9-]+$"},
+      "additionalProperties": {
+        "type": "object",
+        "minProperties": 1,
+        "propertyNames": {"pattern": "^[a-z0-9][a-z0-9-]+$"},
+        "additionalProperties": {"$ref": "#/$defs/failureCoverage"}
+      }
+    },
+    "matrices": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format-and-order",
+        "dp-budget",
+        "qwen-window",
+        "authority-and-footprint",
+        "typed-json-and-policy",
+        "media-and-source",
+        "encoder-evidence-cutover",
+        "transactions-terminals",
+        "sdh-correction"
+      ],
+      "properties": {
+        "format-and-order": {"$ref": "#/$defs/matrix"},
+        "dp-budget": {"$ref": "#/$defs/matrix"},
+        "qwen-window": {"$ref": "#/$defs/matrix"},
+        "authority-and-footprint": {"$ref": "#/$defs/matrix"},
+        "typed-json-and-policy": {"$ref": "#/$defs/matrix"},
+        "media-and-source": {"$ref": "#/$defs/matrix"},
+        "encoder-evidence-cutover": {"$ref": "#/$defs/matrix"},
+        "transactions-terminals": {"$ref": "#/$defs/matrix"},
+        "sdh-correction": {"$ref": "#/$defs/matrix"}
+      }
+    },
+    "injections": {
+      "type": "array",
+      "minItems": 12,
+      "items": {"$ref": "#/$defs/injection"}
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 6,
+      "items": {"$ref": "#/$defs/case"}
+    }
+  },
+  "$defs": {
+    "sha1": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "fileFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "present", "size", "sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/path"},
+        "present": {"type": "boolean"},
+        "size": {"type": ["integer", "null"], "minimum": 0},
+        "sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"present": {"const": true}}},
+          "then": {
+            "properties": {
+              "size": {"type": "integer", "minimum": 0},
+              "sha256": {"$ref": "#/$defs/sha256"}
+            }
+          },
+          "else": {
+            "properties": {
+              "size": {"type": "null"},
+              "sha256": {"type": "null"}
+            }
+          }
+        }
+      ]
+    },
+    "outputFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "artifact", "expected_path", "size", "sha256"],
+      "properties": {
+        "kind": {"enum": ["primary", "evidence", "error"]},
+        "artifact": {
+          "enum": ["vtt", "main-json", "align-evidence", "route-evidence"]
+        },
+        "expected_path": {"$ref": "#/$defs/path"},
+        "size": {"type": "integer", "minimum": 0},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^[A-Z][A-Z0-9_]*$"},
+      "additionalProperties": {"type": ["string", "null"]}
+    },
+    "limitProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "values", "digest", "test_case_id"],
+      "properties": {
+        "kind": {"enum": ["production", "test-qualified"]},
+        "values": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        },
+        "digest": {"$ref": "#/$defs/sha256"},
+        "test_case_id": {"type": ["string", "null"]}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "case_ids", "description"],
+      "properties": {
+        "status": {"const": "active"},
+        "case_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "description": {"type": "string", "minLength": 1},
+        "phase_order": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^AO-[0-9]{2}$"},
+          "minItems": 25,
+          "maxItems": 25
+        },
+        "runtime_routes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["ctc-full", "mms-full", "qwen-crop"]}
+        },
+        "selected_families": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["legacy-v1", "boundary-v2"]}
+        },
+        "failure_cases": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "sourceCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]+$"},
+        "path": {"$ref": "#/$defs/path"},
+        "must_contain": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "must_not_contain": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "ordered": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "exact_count": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        }
+      },
+      "anyOf": [
+        {"required": ["must_contain"]},
+        {"required": ["must_not_contain"]},
+        {"required": ["ordered"]},
+        {"required": ["exact_count"]}
+      ]
+    },
+    "testEvidence": {
+      "type": "string",
+      "pattern": "^tests/[a-z0-9_]+\\.py::test_[a-z0-9_]+$"
+    },
+    "failureCoverageEvidence": {
+      "type": "string",
+      "anyOf": [
+        {"$ref": "#/$defs/testEvidence"},
+        {"pattern": "^source:voxweave/[a-z0-9_/]+\\.py$"}
+      ]
+    },
+    "failureCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "evidence"],
+      "properties": {
+        "status": {"enum": ["reachable", "structural-reserve"]},
+        "evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/failureCoverageEvidence"}
+        },
+        "rationale": {"type": "string", "minLength": 12}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "structural-reserve"}}},
+          "then": {"required": ["rationale"]},
+          "else": {"not": {"required": ["rationale"]}}
+        }
+      ]
+    },
+    "matrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dimensions", "vectors"],
+      "properties": {
+        "dimensions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "vectors": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/matrixVector"}
+        }
+      }
+    },
+    "matrixVector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "assertion", "evidence"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]+$"},
+        "assertion": {"type": "string", "minLength": 12},
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/testEvidence"}
+        }
+      }
+    },
+    "injection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "section",
+        "operation",
+        "edge",
+        "expected_kind",
+        "expected_phase",
+        "expected_detail",
+        "public_exception",
+        "landed",
+        "leftovers",
+        "lock_released",
+        "roles",
+        "evidence"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]+$"},
+        "section": {"enum": ["14.5", "14.6"]},
+        "operation": {"type": "string", "minLength": 1},
+        "edge": {"enum": ["before", "after", "paired", "success"]},
+        "expected_kind": {"type": ["string", "null"]},
+        "expected_phase": {"type": ["string", "null"]},
+        "expected_detail": {"type": ["string", "null"]},
+        "public_exception": {"type": ["string", "null"]},
+        "landed": {"type": "array", "items": {"type": "string"}},
+        "leftovers": {"type": "array", "items": {"type": "string"}},
+        "lock_released": {"type": "boolean"},
+        "roles": {
+          "type": "array",
+          "items": {"enum": ["C", "R", "T"]}
+        },
+        "evidence": {"$ref": "#/$defs/testEvidence"}
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "command",
+        "route",
+        "arguments",
+        "logical_target",
+        "source_mode",
+        "logical_media",
+        "input_files",
+        "backend_receipt",
+        "optimizer_receipt",
+        "environment",
+        "expected_paths",
+        "authority_limit_profile",
+        "reference_set",
+        "ratified_deltas",
+        "coverage",
+        "projector"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$"},
+        "command": {"enum": ["align", "process", "split", "correct"]},
+        "route": {"enum": ["ctc-full", "mms-full", "qwen-crop", "media-free"]},
+        "arguments": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "logical_target": {"type": "string", "minLength": 1},
+        "source_mode": {"enum": ["sibling", "explicit", "injected-words"]},
+        "logical_media": {"type": ["string", "null"]},
+        "input_files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/fileFact"}
+        },
+        "backend_receipt": {"$ref": "#/$defs/fileFact"},
+        "optimizer_receipt": {
+          "anyOf": [{"$ref": "#/$defs/fileFact"}, {"type": "null"}]
+        },
+        "environment": {"$ref": "#/$defs/environment"},
+        "expected_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/outputFact"}
+        },
+        "authority_limit_profile": {"$ref": "#/$defs/limitProfile"},
+        "reference_set": {
+          "enum": [
+            "6e6033f",
+            "post-p11",
+            "p6-lexical",
+            "selected-v2-align",
+            "selected-v2-segmentation"
+          ]
+        },
+        "ratified_deltas": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["RAT-1", "RAT-2", "RAT-3", "RAT-4", "RAT-5", "RAT-7"]}
+        },
+        "coverage": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "projector": {
+          "enum": [
+            "historical-vtt-time-order",
+            "post-p11-speaker-turns",
+            "p6-lexical-call",
+            "selected-v2-align",
+            "combined-ratified-align",
+            "selected-v2-segmentation"
+          ]
+        }
+      }
+    }
+  }
+}

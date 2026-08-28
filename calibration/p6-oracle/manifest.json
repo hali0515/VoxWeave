@@ -1,0 +1,2875 @@
+{
+  "schema_version": 1,
+  "runner_version": 1,
+  "reference_commits": {
+    "historical": "6e6033fa3930b263133f02c1332ae4d79a490f8b",
+    "post_p11": "b6d3b76dd518f943d922dc31cde227745892933d",
+    "p6_lexical": "14c9fd5f0388804803323bb768e05b54d91941ba"
+  },
+  "execution": {
+    "interpreter": "CPython 3.13.12",
+    "platform": "Linux x86_64",
+    "container_digest": "c981c4bd6fa4da42c70c382711db6e24c752a4f971ed3168d01594582ff78ede",
+    "locale": "C.UTF-8",
+    "timezone": "unset",
+    "hash_seed": "unset",
+    "dependency_lock_sha256": "63c30bb7b2dea08b0b6488374c704c045fe6b23a3868e3867545847e1c6b4fdb"
+  },
+  "registry_digests": {
+    "align-delta-registry": "267bdf609013b7f2a37abef1a14b0a5fa6e9770fea0da958b5d92d64ce36f931",
+    "align-failure-registry": "69471bfcc890ef4d59b2f8cc36e37c48a5e971202527f13bf4e1b9b9cccdc9cd",
+    "engine-registry": "1f9e2da1257cdd5e4c9a956ba9505a0c4122f6e964e23a17d6f788f4dc8be140",
+    "p6-oracle-schema": "bd25eee37ff9238eedcfc875c60b024f40c38cdae07febec6e9552d5323481e4"
+  },
+  "gates": {
+    "G-CONTEXT": {
+      "status": "active",
+      "case_ids": [
+        "selected-v2-align",
+        "combined-ratified-align"
+      ],
+      "description": "Context, acquisition, profile, role, and cross-swap authority mutations."
+    },
+    "G-TIME-ORDER": {
+      "status": "active",
+      "case_ids": [
+        "historical-selected-legacy",
+        "rat4-lexical-direct",
+        "combined-ratified-align"
+      ],
+      "description": "Exact legacy success or exception parity and distribute-before-shift ordering."
+    },
+    "G-QWEN-ORIGIN": {
+      "status": "active",
+      "case_ids": [
+        "selected-v2-align"
+      ],
+      "description": "Independent nominal and physical sample-origin projection under RAT-5."
+    },
+    "G-QWEN-WINDOW": {
+      "status": "active",
+      "case_ids": [
+        "selected-v2-align"
+      ],
+      "description": "Window arithmetic, crop, sample, backend, and cleanup behavior."
+    },
+    "G-PROVENANCE": {
+      "status": "active",
+      "case_ids": [
+        "selected-v2-align"
+      ],
+      "description": "Exact first and last aligner endpoint provenance fold."
+    },
+    "G-ORDER": {
+      "status": "active",
+      "case_ids": [
+        "rat4-lexical-direct",
+        "combined-ratified-align"
+      ],
+      "description": "Lexical direct full-pass order and fail-closed over-budget route planning."
+    },
+    "G-LEGACY-DISTRIBUTION": {
+      "status": "active",
+      "case_ids": [
+        "historical-selected-legacy"
+      ],
+      "description": "Legacy owner slicing, surplus behavior, shifting, and leftovers."
+    },
+    "G-ALIGN-AO": {
+      "status": "active",
+      "case_ids": [
+        "historical-selected-legacy",
+        "selected-v2-align",
+        "combined-ratified-align"
+      ],
+      "description": "The sole complete AO-01 through AO-25 align state-machine order.",
+      "phase_order": [
+        "AO-01",
+        "AO-02",
+        "AO-03",
+        "AO-04",
+        "AO-05",
+        "AO-06",
+        "AO-07",
+        "AO-08",
+        "AO-09",
+        "AO-10",
+        "AO-11",
+        "AO-12",
+        "AO-13",
+        "AO-14",
+        "AO-15",
+        "AO-16",
+        "AO-17",
+        "AO-18",
+        "AO-19",
+        "AO-20",
+        "AO-21",
+        "AO-22",
+        "AO-23",
+        "AO-24",
+        "AO-25"
+      ],
+      "runtime_routes": [
+        "ctc-full",
+        "mms-full",
+        "qwen-crop"
+      ],
+      "selected_families": [
+        "legacy-v1",
+        "boundary-v2"
+      ],
+      "failure_cases": [
+        "all-skip",
+        "ao15-uncontained",
+        "ao15-isolated-then-ao16"
+      ]
+    },
+    "G-AUTHORITY-DISTRIBUTION": {
+      "status": "active",
+      "case_ids": [
+        "selected-v2-align",
+        "combined-ratified-align"
+      ],
+      "description": "Independent event-machine replay, ownership tiling, work limits, and seal behavior."
+    },
+    "G-FROZEN-JSON": {
+      "status": "active",
+      "case_ids": [
+        "post-p11-speaker-turns",
+        "selected-v2-align",
+        "combined-ratified-align"
+      ],
+      "description": "Typed, ordered, duplicate, nonfinite, and mutation-safe JSON facts."
+    },
+    "G-POLICY": {
+      "status": "active",
+      "case_ids": [
+        "historical-selected-legacy",
+        "selected-v2-align",
+        "combined-ratified-align"
+      ],
+      "description": "Exact binary64 legacy policy and strict-v2 policy-domain separation."
+    },
+    "G-EMPTY/FOOTPRINT": {
+      "status": "active",
+      "case_ids": [
+        "selected-v2-align",
+        "selected-v2-segmentation",
+        "combined-ratified-align"
+      ],
+      "description": "All-empty, partial ownership, reconciliation, and no-partial-authority cases."
+    },
+    "G-MEDIA-TRUST": {
+      "status": "active",
+      "case_ids": [
+        "rat4-lexical-direct",
+        "selected-v2-align",
+        "combined-ratified-align"
+      ],
+      "description": "Media resolver class, logical identity, fingerprint, relocation, and ambiguity."
+    },
+    "G-PROCESS-SOURCE": {
+      "status": "active",
+      "case_ids": [
+        "selected-v2-segmentation"
+      ],
+      "description": "Transcribed-media M0 binding and injected-word media-free behavior."
+    },
+    "G-SPEAKER-MAP-P11": {
+      "status": "active",
+      "case_ids": [
+        "post-p11-speaker-turns"
+      ],
+      "description": "Historical tolerant speaker-map probe and raw speaker-turn preservation."
+    },
+    "G-SPEAKER-MAP-CAS": {
+      "status": "active",
+      "case_ids": [
+        "selected-v2-segmentation"
+      ],
+      "description": "Ratified RAT-7 speaker-map S0 generation and optimistic CAS transitions."
+    },
+    "G-COMMAND-ORDER": {
+      "status": "active",
+      "case_ids": [
+        "historical-selected-legacy",
+        "selected-v2-segmentation"
+      ],
+      "description": "Per-command first-failure order, cleanup, and ownership vectors."
+    },
+    "G-SDH-SELECTED": {
+      "status": "active",
+      "case_ids": [
+        "selected-v2-segmentation"
+      ],
+      "description": "Selected-delivery SDH bytes, auxiliary failure isolation, and release ownership."
+    }
+  },
+  "source_checks": [
+    {
+      "id": "dp-canonical-boundary",
+      "path": "voxweave/align_dp_safety.py",
+      "must_contain": [
+        "class DpRouteHintsInvalid(RuntimeError):",
+        "CanonicalFailure(\n            \"dp-route-hints-invalid\", \"route-plan\", detail_code"
+      ],
+      "must_not_contain": [
+        "from voxweave import pipeline",
+        "import torch"
+      ]
+    },
+    {
+      "id": "dp-independent-planner-check",
+      "path": "voxweave/align_common.py",
+      "ordered": [
+        "    validate_over_budget_hints(\n        bounds,",
+        "    plans = plan_dp_chunks(bounds, max_sec=budget_sec, audio_end=total_sec)",
+        "    validate_over_budget_plans(\n        plans,"
+      ]
+    },
+    {
+      "id": "ctc-preflight-before-model",
+      "path": "voxweave/align_ctc.py",
+      "ordered": [
+        "    _preflight_over_budget_hints(wav, CTC_AUDIO_SR, norm, bounds)",
+        "    al = _get_ctc_aligner(iso, model_name)"
+      ]
+    },
+    {
+      "id": "mms-preflight-before-model",
+      "path": "voxweave/align_mms.py",
+      "ordered": [
+        "    _preflight_over_budget_hints(wav, MMS_SR, norm, bounds)",
+        "        out = _mms_full_pass("
+      ]
+    },
+    {
+      "id": "ctc-physical-call-geometry",
+      "path": "voxweave/align_ctc.py",
+      "ordered": [
+        "            _raw_call_observer(",
+        "                raw_result if raw_result is not None else [],",
+        "                original_result,",
+        "                source_indices,",
+        "                offset_s,",
+        "                audio_sample_start=audio_sample_start,",
+        "                audio_sample_end=audio_sample_end,",
+        "                sample_rate=al.sr,",
+        "                sample_count=sample_count,",
+        "                nominal_end_seconds=None,"
+      ],
+      "must_contain": [
+        "original_units = list(units)",
+        "units = interp_missing(units)",
+        "pass_physical_geometry=True"
+      ]
+    },
+    {
+      "id": "mms-physical-call-geometry",
+      "path": "voxweave/align_mms.py",
+      "ordered": [
+        "            _raw_call_observer(",
+        "                raw_result if raw_result is not None else [],",
+        "                None,",
+        "                source_indices,",
+        "                offset_s,",
+        "                audio_sample_start=audio_sample_start,",
+        "                audio_sample_end=audio_sample_end,",
+        "                sample_rate=MMS_SR,",
+        "                sample_count=sample_count,",
+        "                nominal_end_seconds=None,"
+      ],
+      "must_contain": [
+        "pass_physical_geometry=True"
+      ]
+    },
+    {
+      "id": "registered-rat4-details",
+      "path": "voxweave/align_failures.py",
+      "must_contain": [
+        "\"hint-shape\"",
+        "\"hint-nonfinite\"",
+        "\"hint-nonmonotone\"",
+        "\"plan-nontiling\"",
+        "\"crop-geometry\"",
+        "\"crop-over-budget\""
+      ]
+    },
+    {
+      "id": "oracle-has-no-update-path",
+      "path": "scripts/p6_oracle.py",
+      "must_not_contain": [
+        "--update",
+        "os.replace",
+        "write_bytes",
+        "write_text"
+      ]
+    }
+  ],
+  "failure_registry_coverage": {
+    "subtitle-snapshot-failed": {
+      "vtt-read": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      },
+      "sibling-read": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      }
+    },
+    "align-input-decode-invalid": {
+      "vtt-encoding": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      },
+      "vtt-format-mismatch": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      },
+      "vtt-no-cues": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      },
+      "sibling-json-encoding": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      },
+      "sibling-json-syntax": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      },
+      "sibling-top-level-shape": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      }
+    },
+    "v2-input-invalid": {
+      "sibling-json-duplicate-key": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_snapshot.py"
+        ]
+      },
+      "sibling-json-nonfinite": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_snapshot.py"
+        ]
+      },
+      "strict-carrier-domain": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "carrier-extraction-failed": {
+      "unsupported-selected-json-node": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_snapshot.py"
+        ]
+      },
+      "non-string-selected-object-key": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_snapshot.py"
+        ]
+      },
+      "selected-json-cycle": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_snapshot.py"
+        ]
+      }
+    },
+    "media-identity-invalid": {
+      "media-not-found": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      },
+      "media-fingerprint": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      },
+      "media-logical-id": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_fix_authority.py::test_media_logical_id_is_class_specific_normalized_and_fail_closed"
+        ]
+      }
+    },
+    "media-snapshot-unavailable": {
+      "reflink-and-copy-failed": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_mediasnapshot.py::test_enospc_partial_copy_is_cleaned_and_typed"
+        ]
+      },
+      "snapshot-verification-failed": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_mediasnapshot.py::test_torn_copy_with_different_sampled_identity_is_rejected"
+        ]
+      }
+    },
+    "semantic-backend-unavailable": {
+      "endpoint-not-configured": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      }
+    },
+    "qwen-route-invalid": {
+      "no-route-source": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_no_route_source_is_canonical_and_pre_backend",
+          "tests/test_p6_oracle_vectors.py::test_qwen_special_route_bound_matrix_preserves_real_statement_order"
+        ]
+      },
+      "all-crops-none": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_all_crops_none_is_canonical_and_pre_backend"
+        ]
+      }
+    },
+    "qwen-window-operation-failed": {
+      "route-bound-access": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_special_route_bound_matrix_preserves_real_statement_order"
+        ]
+      },
+      "route-bound-arithmetic": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_special_route_bound_matrix_preserves_real_statement_order"
+        ]
+      },
+      "sample-start-index": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_nonfinite_route_bounds_from_both_sources_are_canonical_pre_model",
+          "tests/test_p6_oracle_vectors.py::test_qwen_special_route_bound_matrix_preserves_real_statement_order"
+        ]
+      },
+      "sample-end-index": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_nonfinite_route_bounds_from_both_sources_are_canonical_pre_model",
+          "tests/test_p6_oracle_vectors.py::test_qwen_special_route_bound_matrix_preserves_real_statement_order"
+        ]
+      },
+      "sample-open": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_window_io_failures_are_canonical_pre_model_and_cleanup_owned_files"
+        ]
+      },
+      "sample-seek-read": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_window_io_failures_are_canonical_pre_model_and_cleanup_owned_files"
+        ]
+      },
+      "sample-temp-create": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_window_io_failures_are_canonical_pre_model_and_cleanup_owned_files"
+        ]
+      },
+      "sample-write": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_window_io_failures_are_canonical_pre_model_and_cleanup_owned_files"
+        ]
+      }
+    },
+    "dp-route-hints-invalid": {
+      "hint-shape": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_dp_safety.py"
+        ]
+      },
+      "hint-nonfinite": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_dp_safety.py"
+        ]
+      },
+      "hint-nonmonotone": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_dp_safety.py"
+        ]
+      },
+      "plan-nontiling": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_dp_safety.py"
+        ]
+      },
+      "crop-geometry": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_dp_safety.py"
+        ]
+      },
+      "crop-over-budget": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_dp_safety.py"
+        ]
+      }
+    },
+    "cache-lock-failed": {
+      "cache-lock-acquire": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      }
+    },
+    "cache-companion-invalid": {
+      "companion-schema": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      },
+      "companion-media": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      },
+      "companion-size": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      },
+      "companion-hash": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      }
+    },
+    "cache-operation-failed": {
+      "cache-decode": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      },
+      "cache-stage": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      },
+      "cache-replace": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      },
+      "companion-unlink": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      },
+      "companion-replace": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_vocalscache_phase2.py::test_p6_cache_registry_classifies_every_live_operation"
+        ]
+      }
+    },
+    "context-authority-invalid": {
+      "context-unissued": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_context.py"
+        ]
+      },
+      "context-role": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_context.py"
+        ]
+      },
+      "context-binding": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_context.py"
+        ]
+      },
+      "context-consumed": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_context.py"
+        ]
+      },
+      "context-unused-role": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_context.py::test_context_closure_classifies_unused_roles_and_expected_vtt_generation"
+        ]
+      },
+      "expected-vtt-generation": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_context.py::test_context_closure_classifies_unused_roles_and_expected_vtt_generation"
+        ]
+      },
+      "allocator-limit-profile": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_distribution.py"
+        ]
+      }
+    },
+    "legacy-time-transform-failed": {
+      "retained-unit-text": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_legacy_time_transform_preserves_exception_and_attaches_exact_failure"
+        ]
+      },
+      "retained-unit-start": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_legacy_time_transform_preserves_exception_and_attaches_exact_failure"
+        ]
+      },
+      "retained-unit-end": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_legacy_time_transform_preserves_exception_and_attaches_exact_failure"
+        ]
+      },
+      "retained-unit-operand": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_legacy_time_transform_preserves_exception_and_attaches_exact_failure"
+        ]
+      }
+    },
+    "fresh-backend-output-invalid": {
+      "backend-call-shape": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_fresh_backend_output_preserves_exception_and_attaches_exact_failure"
+        ]
+      },
+      "backend-raised": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_fresh_backend_output_preserves_exception_and_attaches_exact_failure"
+        ]
+      },
+      "relative-normalization": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_fresh_backend_output_preserves_exception_and_attaches_exact_failure"
+        ]
+      }
+    },
+    "fresh-time-transform-invalid": {
+      "strict-raw-node": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_acquisition.py"
+        ]
+      },
+      "sample-geometry": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_acquisition.py"
+        ]
+      },
+      "physical-origin-mismatch": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_acquisition.py"
+        ]
+      },
+      "authority-recompute": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_acquisition.py"
+        ]
+      },
+      "surplus-transform": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_acquisition.py"
+        ]
+      }
+    },
+    "fresh-distribution-invalid": {
+      "route-owner-mismatch": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_distribution.py"
+        ]
+      },
+      "partial-empty-ownership": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_distribution.py"
+        ]
+      },
+      "punctuation-only-block": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_distribution.py"
+        ]
+      },
+      "allocation-no-tiling": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_distribution.py"
+        ]
+      },
+      "allocation-ambiguous": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_distribution.py"
+        ]
+      },
+      "allocation-budget": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_distribution.py"
+        ]
+      }
+    },
+    "fresh-reconciliation-invalid": {
+      "footprint-reconciliation": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "fresh-seed-invalid": {
+      "seed-admission": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "v2-policy-invalid": {
+      "nonfinite-policy": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      },
+      "negative-policy": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_inputs.py"
+        ]
+      }
+    },
+    "fresh-authority-invalid": {
+      "acquisition-unissued": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_acquisition.py"
+        ]
+      },
+      "receipt-context": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      },
+      "root-transfer": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      },
+      "w1-root-event": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "fresh-seal-broken": {
+      "context-seal": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_fresh_acquisition_component_seals_fail_with_exact_detail"
+        ]
+      },
+      "raw-seal": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_fresh_acquisition_component_seals_fail_with_exact_detail"
+        ]
+      },
+      "relative-seal": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_fresh_acquisition_component_seals_fail_with_exact_detail"
+        ]
+      },
+      "legacy-slice-seal": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_fresh_acquisition_component_seals_fail_with_exact_detail"
+        ]
+      },
+      "authority-seal": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_fresh_acquisition_component_seals_fail_with_exact_detail"
+        ]
+      },
+      "distribution-seal": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_acquisition.py"
+        ]
+      },
+      "phase1-seal": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_acquisition.py::test_fresh_acquisition_component_seals_fail_with_exact_detail"
+        ]
+      }
+    },
+    "profile-invalid": {
+      "profile-shape": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      },
+      "profile-language": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_inputs.py"
+        ]
+      },
+      "profile-domain": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_inputs.py"
+        ]
+      },
+      "resolved-default-domain": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_inputs.py"
+        ]
+      }
+    },
+    "evidence-invalid": {
+      "shot-shape": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_finalizer_evidence_shape_failures_keep_their_exact_domain"
+        ]
+      },
+      "sing-shape": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_finalizer_evidence_shape_failures_keep_their_exact_domain"
+        ]
+      },
+      "evidence-domain": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "segmentation-v2-invalid": {
+      "semantic-selector-unmodelled": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/segmentation_adapter.py"
+        ]
+      },
+      "named-multi-unattributed": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/segmentation_adapter.py"
+        ]
+      },
+      "p7-prerequisite-open": {
+        "status": "structural-reserve",
+        "evidence": [],
+        "rationale": "RAT-6 option B leaves the selected segmentation cutover closed until the P7 qualification window."
+      },
+      "delivery-unit-range": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/segmentation_adapter.py"
+        ]
+      }
+    },
+    "finalizer-budget-exhausted": {
+      "sweep-budget": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "finalizer-output-invalid": {
+      "terminal-validity": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_finalizer_terminal_validity_precedes_generic_invalidity"
+        ]
+      },
+      "cue-schema": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      },
+      "footprint-fallback": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_finalizer_canonical_text_fallback_is_a_footprint_failure"
+        ]
+      },
+      "phase1-fidelity": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "finalizer-partition-failed": {
+      "finalizer-partition": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "finalizer-trace-failed": {
+      "trace-replay": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "finalizer-stability-failed": {
+      "stability-check": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "align-delta-invalid": {
+      "registry-digest": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_semantic_registry_digest_corruption_is_typed_before_primitive_relations"
+        ]
+      },
+      "trigger-set": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/segmentation_adapter.py"
+        ]
+      },
+      "primitive-relation": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      }
+    },
+    "no-aligned-units": {
+      "all-block-units-empty": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_qwen_all_aligned_lists_empty_is_canonical_before_projection"
+        ]
+      }
+    },
+    "selected-render-invalid": {
+      "selected-candidate-missing": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/candidate_encoder.py"
+        ]
+      },
+      "cue-source-map": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_selected_projection_failures_keep_their_exact_domain"
+        ]
+      },
+      "unit-coverage": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_selected_projection_failures_keep_their_exact_domain"
+        ]
+      },
+      "vtt-projection": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_selected_projection_failures_keep_their_exact_domain"
+        ]
+      },
+      "json-projection": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_selected_projection_failures_keep_their_exact_domain"
+        ]
+      },
+      "derived-hash": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/candidate_encoder.py"
+        ]
+      },
+      "candidate-family-manifest": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_selected_projection_failures_keep_their_exact_domain"
+        ]
+      }
+    },
+    "final-evidence-invalid": {
+      "evidence-binding": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_evidence.py"
+        ]
+      },
+      "selected-hash-link": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_align_evidence.py::test_evidence_bind_rejects_unverified_hash_substitution"
+        ]
+      },
+      "closed-schema": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_final_evidence_bind_classifies_closed_schema_failure"
+        ]
+      },
+      "independent-projection": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_oracle_vectors.py::test_final_evidence_bind_classifies_independent_projection_mismatch"
+        ]
+      }
+    },
+    "shadow-internal-error": {
+      "profile-stage": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_registry_live_closure.py::test_shadow_profile_exception_is_typed_and_selected_commit_is_contained"
+        ]
+      },
+      "evidence-stage": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "w1-stage": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_adapter.py"
+        ]
+      },
+      "comparator-stage": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_registry_live_closure.py::test_shadow_comparator_exception_is_typed_and_selected_commit_is_contained"
+        ]
+      },
+      "renderer-stage": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_registry_live_closure.py::test_shadow_renderer_exception_is_typed_and_selected_commit_is_contained"
+        ]
+      },
+      "rich-artifact-construction": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_shadow_minimal.py"
+        ]
+      }
+    },
+    "shadow-artifact-unavailable": {
+      "minimal-artifact-construction": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_registry_live_closure.py::test_minimal_shadow_failure_is_classified_without_callback_or_rollback"
+        ]
+      }
+    },
+    "preencode-failed": {
+      "main-json-encode": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/candidate_encoder.py"
+        ]
+      },
+      "vtt-encode": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_align_candidates.py::test_vtt_encode_failure_is_classified_before_main_json_encode"
+        ]
+      },
+      "evidence-encode": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_registry_live_closure.py::test_evidence_encode_failure_preserves_public_exception_and_prewrite_bytes"
+        ]
+      }
+    },
+    "stage-failed": {
+      "main-json-stage": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "vtt-stage": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "evidence-stage": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "machine-artifact-stage": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      }
+    },
+    "episode-lock-failed": {
+      "episode-lock-acquire": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      }
+    },
+    "input-stale": {
+      "vtt-generation": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "sibling-generation": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "speaker-mapping-generation": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "correct-generation": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "process-output-generation": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      }
+    },
+    "media-stale": {
+      "media-generation": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "pair-decision": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_registry_live_closure.py::test_pair_decision_recheck_is_typed_and_precedes_primary_replacement"
+        ]
+      }
+    },
+    "commit-failed": {
+      "main-json-replace": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "vtt-replace": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "evidence-replace": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "machine-artifact-replace": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      }
+    },
+    "artifact-cleanup-failed": {
+      "voiceprints-unlink": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "suggest-unlink": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "html-unlink": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      },
+      "evidence-unlink": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/episode_transaction.py"
+        ]
+      }
+    },
+    "model-release-failed": {
+      "panns-release": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/pipeline.py"
+        ]
+      }
+    },
+    "observer-failed": {
+      "observer-callback": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_episode_transactions.py::test_align_shadow_observer_failure_cannot_change_selected_return"
+        ]
+      }
+    },
+    "snapshot-dispose-failed": {
+      "media-snapshot-residue": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_registry_live_closure.py::test_media_snapshot_disposal_preserves_public_exception_after_selected_commit"
+        ]
+      },
+      "audio-temp-residue": {
+        "status": "reachable",
+        "evidence": [
+          "tests/test_p6_registry_live_closure.py::test_audio_temp_disposal_preserves_public_exception_after_selected_commit"
+        ]
+      },
+      "stage-residue": {
+        "status": "reachable",
+        "evidence": [
+          "source:voxweave/align_acquisition.py"
+        ]
+      }
+    }
+  },
+  "matrices": {
+    "format-and-order": {
+      "dimensions": [
+        "route",
+        "subtitle-format",
+        "decode-mode",
+        "cue-order"
+      ],
+      "vectors": [
+        {
+          "id": "en-ctc-timed-and-untimed",
+          "assertion": "Executable gate coverage pins en ctc timed and untimed as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_direct_full_pass_uses_lexical_vtt_order",
+            "tests/test_p6_oracle_vectors.py::test_public_direct_full_pass_accepts_untimed_vtt_in_lexical_order"
+          ]
+        },
+        {
+          "id": "ja-mms-timed-and-untimed",
+          "assertion": "Executable gate coverage pins ja mms timed and untimed as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_direct_full_pass_uses_lexical_vtt_order",
+            "tests/test_backend.py::test_align_blocks_full_mms_distributes_by_alnum",
+            "tests/test_p6_oracle_vectors.py::test_public_direct_full_pass_accepts_untimed_vtt_in_lexical_order"
+          ]
+        },
+        {
+          "id": "whole-file-identity-without-plus-zero",
+          "assertion": "Executable gate coverage pins whole file identity without plus zero as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_whole_file_identity_performs_no_addition_and_preserves_unit_shape"
+          ]
+        },
+        {
+          "id": "first-at-100-second-at-0",
+          "assertion": "Executable gate coverage pins first at 100 second at 0 as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_vtt_content_stays_lexical_while_qwen_route_is_separate",
+            "tests/test_p6_fix_oracle_rat4.py::test_public_direct_full_pass_uses_lexical_vtt_order"
+          ]
+        },
+        {
+          "id": "reversed-bounds",
+          "assertion": "Executable gate coverage pins reversed bounds as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_route_view_swaps_reversed_bounds_without_mutating_content"
+          ]
+        },
+        {
+          "id": "renamed-ass",
+          "assertion": "Executable gate coverage pins renamed ass as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_snapshot_rejects_renamed_ass_and_empty_vtt_with_historical_messages"
+          ]
+        },
+        {
+          "id": "empty-and-note-only-vtt",
+          "assertion": "Executable gate coverage pins empty and note only vtt as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_snapshot_rejects_renamed_ass_and_empty_vtt_with_historical_messages"
+          ]
+        },
+        {
+          "id": "utf8-utf16-utf32-bom",
+          "assertion": "Executable gate coverage pins utf8 utf16 utf32 bom as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_snapshot_uses_existing_bom_and_fallback_decoder",
+            "tests/test_p6_oracle_vectors.py::test_snapshot_decodes_utf32_bom_without_a_phantom_header"
+          ]
+        },
+        {
+          "id": "gb18030-and-cp1252-fallback",
+          "assertion": "Executable gate coverage pins gb18030 and cp1252 fallback as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_snapshot_uses_existing_bom_and_fallback_decoder",
+            "tests/test_subformats.py::test_load_srt_gbk_fallback"
+          ]
+        },
+        {
+          "id": "invalid-encoding-pre-model-diagnostic",
+          "assertion": "Executable gate coverage pins invalid encoding pre model diagnostic as a closed matrix vector.",
+          "evidence": [
+            "tests/test_subformats.py::test_load_srt_undecodable_raises_readable_error"
+          ]
+        }
+      ]
+    },
+    "dp-budget": {
+      "dimensions": [
+        "route",
+        "budget-side",
+        "hint-shape",
+        "planner-mutation",
+        "chunk-index"
+      ],
+      "vectors": [
+        {
+          "id": "ctc-below-and-over-budget",
+          "assertion": "Executable gate coverage pins ctc below and over budget as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_direct_full_pass_uses_lexical_vtt_order",
+            "tests/test_p6_fix_oracle_rat4.py::test_public_over_budget_rejects_unsafe_planner_output_before_model_work",
+            "tests/test_p6_oracle_vectors.py::test_ctc_safe_over_budget_uses_real_planner_and_exact_physical_chunks"
+          ]
+        },
+        {
+          "id": "mms-below-and-over-budget",
+          "assertion": "Executable gate coverage pins mms below and over budget as a closed matrix vector.",
+          "evidence": [
+            "tests/test_backend.py::test_align_blocks_full_mms_distributes_by_alnum",
+            "tests/test_backend.py::test_align_blocks_full_mms_dp_chunks_over_budget"
+          ]
+        },
+        {
+          "id": "second-and-later-physical-chunk",
+          "assertion": "Executable gate coverage pins second and later physical chunk as a closed matrix vector.",
+          "evidence": [
+            "tests/test_backend.py::test_align_blocks_full_mms_dp_chunks_over_budget",
+            "tests/test_p6_oracle_vectors.py::test_ctc_safe_over_budget_uses_real_planner_and_exact_physical_chunks"
+          ]
+        },
+        {
+          "id": "missing-bounds",
+          "assertion": "Executable gate coverage pins missing bounds as a closed matrix vector.",
+          "evidence": [
+            "tests/test_backend.py::test_align_blocks_full_mms_over_budget_without_bounds_raises"
+          ]
+        },
+        {
+          "id": "nonfinite-bounds",
+          "assertion": "Executable gate coverage pins nonfinite bounds as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_over_budget_nonchronological_hints_refuse_before_model_work"
+          ]
+        },
+        {
+          "id": "nonchronological-starts-and-ends",
+          "assertion": "Executable gate coverage pins nonchronological starts and ends as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_over_budget_nonchronological_hints_refuse_before_model_work"
+          ]
+        },
+        {
+          "id": "reversed-bound",
+          "assertion": "Executable gate coverage pins reversed bound as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_over_budget_nonchronological_hints_refuse_before_model_work"
+          ]
+        },
+        {
+          "id": "one-overlong-cue",
+          "assertion": "Executable gate coverage pins one overlong cue as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_over_budget_rejects_unsafe_planner_output_before_model_work",
+            "tests/test_p6_oracle_vectors.py::test_one_overlong_mms_cue_is_refused_before_model_work"
+          ]
+        },
+        {
+          "id": "empty-and-nontiling-plan",
+          "assertion": "Executable gate coverage pins empty and nontiling plan as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_over_budget_rejects_unsafe_planner_output_before_model_work"
+          ]
+        },
+        {
+          "id": "nonfinite-and-overlapping-crop",
+          "assertion": "Executable gate coverage pins nonfinite and overlapping crop as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_over_budget_rejects_unsafe_planner_output_before_model_work",
+            "tests/test_p6_oracle_vectors.py::test_overlapping_planner_crops_are_refused_before_model_work"
+          ]
+        },
+        {
+          "id": "integer-sample-clamp",
+          "assertion": "Executable gate coverage pins integer sample clamp as a closed matrix vector.",
+          "evidence": [
+            "tests/test_backend.py::test_align_blocks_full_mms_dp_chunks_over_budget",
+            "tests/test_p6_acquisition.py::test_qwen_geometry_clamps_negative_start_and_media_end"
+          ]
+        },
+        {
+          "id": "physical-crop-over-budget",
+          "assertion": "Executable gate coverage pins physical crop over budget as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_oracle_rat4.py::test_public_over_budget_rejects_unsafe_planner_output_before_model_work"
+          ]
+        }
+      ]
+    },
+    "qwen-window": {
+      "dimensions": [
+        "grid",
+        "clamp",
+        "route-source",
+        "skip-kind",
+        "selected-family"
+      ],
+      "vectors": [
+        {
+          "id": "exact-grid-start",
+          "assertion": "Executable gate coverage pins exact grid start as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_acquisition.py::test_qwen_nominal_and_sample_origins_remain_distinct"
+          ]
+        },
+        {
+          "id": "non-grid-start",
+          "assertion": "Executable gate coverage pins non grid start as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_acquisition.py::test_qwen_nominal_and_sample_origins_remain_distinct",
+            "tests/test_p6_episode_transactions.py::test_qwen_align_block_keeps_nominal_legacy_and_observes_sample_origin"
+          ]
+        },
+        {
+          "id": "negative-start-clamp",
+          "assertion": "Executable gate coverage pins negative start clamp as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_acquisition.py::test_qwen_geometry_clamps_negative_start_and_media_end"
+          ]
+        },
+        {
+          "id": "end-clamp",
+          "assertion": "Executable gate coverage pins end clamp as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_acquisition.py::test_qwen_geometry_clamps_negative_start_and_media_end"
+          ]
+        },
+        {
+          "id": "route-permutation",
+          "assertion": "Executable gate coverage pins route permutation as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_vtt_content_stays_lexical_while_qwen_route_is_separate"
+          ]
+        },
+        {
+          "id": "insertion",
+          "assertion": "Executable gate coverage pins insertion as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_route_view_swaps_reversed_bounds_without_mutating_content"
+          ]
+        },
+        {
+          "id": "voice-tag-only-skip",
+          "assertion": "Executable gate coverage pins voice tag only skip as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_qwen_skip_is_one_zero_work_row_and_invalidates_authority"
+          ]
+        },
+        {
+          "id": "whitespace-skip",
+          "assertion": "Executable gate coverage pins whitespace skip as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_qwen_skip_is_one_zero_work_row_and_invalidates_authority"
+          ]
+        },
+        {
+          "id": "missing-crop-skip-then-success",
+          "assertion": "Executable gate coverage pins missing crop skip then success as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_qwen_skip_is_one_zero_work_row_and_invalidates_authority"
+          ]
+        },
+        {
+          "id": "no-route-source",
+          "assertion": "Executable gate coverage pins no route source as a closed matrix vector.",
+          "evidence": [
+            "tests/test_align.py::test_align_no_routing_anchor_raises",
+            "tests/test_p6_oracle_vectors.py::test_qwen_no_route_source_is_canonical_and_pre_backend"
+          ]
+        },
+        {
+          "id": "all-crops-none",
+          "assertion": "Executable gate coverage pins all crops none as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_authority.py::test_qwen_mismatch_is_typed_and_rat5_semantics_are_live",
+            "tests/test_p6_oracle_vectors.py::test_qwen_all_crops_none_is_canonical_and_pre_backend"
+          ]
+        },
+        {
+          "id": "all-aligned-lists-empty",
+          "assertion": "Executable gate coverage pins all aligned lists empty as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_authority.py::test_qwen_mismatch_is_typed_and_rat5_semantics_are_live",
+            "tests/test_p6_oracle_vectors.py::test_qwen_all_aligned_lists_empty_is_canonical_before_projection"
+          ]
+        },
+        {
+          "id": "invalid-route-bound-types-and-nonfinite",
+          "assertion": "Executable gate coverage pins invalid route bound types and nonfinite as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_authority.py::test_qwen_mismatch_is_typed_and_rat5_semantics_are_live",
+            "tests/test_p6_oracle_vectors.py::test_qwen_nonfinite_route_bounds_from_both_sources_are_canonical_pre_model",
+            "tests/test_p6_oracle_vectors.py::test_qwen_special_route_bound_matrix_preserves_real_statement_order"
+          ]
+        },
+        {
+          "id": "rat5-physical-origin-projection",
+          "assertion": "Executable gate coverage pins rat5 physical origin projection as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_acquisition.py::test_qwen_nominal_and_sample_origins_remain_distinct",
+            "tests/test_p6_fix_authority.py::test_qwen_mismatch_is_typed_and_rat5_semantics_are_live"
+          ]
+        }
+      ]
+    },
+    "authority-and-footprint": {
+      "dimensions": [
+        "ownership",
+        "allocation",
+        "route-claim",
+        "work-limit",
+        "provenance"
+      ],
+      "vectors": [
+        {
+          "id": "shortage-surplus-and-hostile-tail",
+          "assertion": "Executable gate coverage pins shortage surplus and hostile tail as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_authority.py::test_hostile_surplus_is_touched_only_after_legacy_selection_closes",
+            "tests/test_p6_distribution.py::test_legacy_distribution_slices_before_shift_and_never_reads_surplus"
+          ]
+        },
+        {
+          "id": "decimal-versus-boundary-punctuation",
+          "assertion": "Executable gate coverage pins decimal versus boundary punctuation as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_boundary_local_decimal_and_punctuation_allocation"
+          ]
+        },
+        {
+          "id": "true-decimal-single-owner",
+          "assertion": "Executable gate coverage pins true decimal single owner as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_true_decimal_can_own_two_units_under_no_space_join"
+          ]
+        },
+        {
+          "id": "zero-and-multiple-tilings",
+          "assertion": "Executable gate coverage pins zero and multiple tilings as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_allocator_closed_invalid_terminals",
+            "tests/test_p6_distribution.py::test_allocator_reports_two_exact_tilings_as_ambiguous"
+          ]
+        },
+        {
+          "id": "repeated-and-coarse-units",
+          "assertion": "Executable gate coverage pins repeated and coarse units as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_allocator_reports_two_exact_tilings_as_ambiguous"
+          ]
+        },
+        {
+          "id": "cross-block-unit",
+          "assertion": "Executable gate coverage pins cross block unit as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_allocator_closed_invalid_terminals"
+          ]
+        },
+        {
+          "id": "no-space-and-punctuation-only",
+          "assertion": "Executable gate coverage pins no space and punctuation only as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_true_decimal_can_own_two_units_under_no_space_join",
+            "tests/test_p6_distribution.py::test_allocator_closed_invalid_terminals"
+          ]
+        },
+        {
+          "id": "gap-overlap-reorder-and-owner-crosslink",
+          "assertion": "Executable gate coverage pins gap overlap reorder and owner crosslink as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_route_mismatch_projection_is_lossless_and_precedence_ordered"
+          ]
+        },
+        {
+          "id": "mixed-strict-call-order",
+          "assertion": "Executable gate coverage pins mixed strict call order as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_multi_call_strict_failures_collect_all_locators_and_choose_canonical_first"
+          ]
+        },
+        {
+          "id": "codepoint-surface-combining-nonbmp-whitespace",
+          "assertion": "Executable gate coverage pins codepoint surface combining nonbmp whitespace as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_surface_chars_count_exact_python_codepoints_without_normalization"
+          ]
+        },
+        {
+          "id": "compound-counter-denial",
+          "assertion": "Executable gate coverage pins compound counter denial as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_distribution.py::test_atomic_denied_charge_records_call_scope_and_no_partial_counter_mutation",
+            "tests/test_p6_distribution.py::test_compound_interval_and_character_denial_is_one_event_in_counter_order"
+          ]
+        },
+        {
+          "id": "seal-disagreement-private-terminal",
+          "assertion": "Executable gate coverage pins seal disagreement private terminal as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_authority.py::test_seal_mismatch_lifecycle_is_called_by_the_production_issuer"
+          ]
+        },
+        {
+          "id": "endpoint-interpolated-and-ghost-folds",
+          "assertion": "Executable gate coverage pins endpoint interpolated and ghost folds as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_acquisition.py::test_strict_capture_preserves_original_bounds_and_interpolation_provenance",
+            "tests/test_p6_fix_authority.py::test_ctc_production_seam_preserves_pre_and_post_interpolation_values"
+          ]
+        }
+      ]
+    },
+    "typed-json-and-policy": {
+      "dimensions": [
+        "presence",
+        "node-type",
+        "duplicate-order",
+        "float-class",
+        "policy-domain"
+      ],
+      "vectors": [
+        {
+          "id": "absent-versus-present-null",
+          "assertion": "Executable gate coverage pins absent versus present null as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_absent_sibling_is_distinct_from_present_empty_object",
+            "tests/test_p6_snapshot.py::test_frozen_json_encoding_is_injective"
+          ]
+        },
+        {
+          "id": "object-array-bool-int-float",
+          "assertion": "Executable gate coverage pins object array bool int float as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_frozen_json_encoding_is_injective",
+            "tests/test_p6_snapshot.py::test_float_freeze_preserves_type_bits_signed_zero_and_nonfinite_class"
+          ]
+        },
+        {
+          "id": "duplicate-occurrence-and-order",
+          "assertion": "Executable gate coverage pins duplicate occurrence and order as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_dual_json_projection_retains_duplicates_and_legacy_last_key_wins"
+          ]
+        },
+        {
+          "id": "signed-zero",
+          "assertion": "Executable gate coverage pins signed zero as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_float_freeze_preserves_type_bits_signed_zero_and_nonfinite_class"
+          ]
+        },
+        {
+          "id": "nan-and-infinities",
+          "assertion": "Executable gate coverage pins nan and infinities as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_nonfinite_is_the_strict_status_when_no_duplicate_precedes_it",
+            "tests/test_p6_snapshot.py::test_float_freeze_preserves_type_bits_signed_zero_and_nonfinite_class"
+          ]
+        },
+        {
+          "id": "nested-raw-carriers",
+          "assertion": "Executable gate coverage pins nested raw carriers as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_writer_transaction.py::test_rat3_segmentation_writer_preserves_nested_duplicate_key_order"
+          ]
+        },
+        {
+          "id": "legacy-last-key-wins",
+          "assertion": "Executable gate coverage pins legacy last key wins as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_dual_json_projection_retains_duplicates_and_legacy_last_key_wins"
+          ]
+        },
+        {
+          "id": "strict-v2-invalidity",
+          "assertion": "Executable gate coverage pins strict v2 invalidity as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_snapshot.py::test_dual_json_projection_retains_duplicates_and_legacy_last_key_wins",
+            "tests/test_p6_snapshot.py::test_nonfinite_is_the_strict_status_when_no_duplicate_precedes_it"
+          ]
+        },
+        {
+          "id": "legacy-policy-negative-and-nonfinite",
+          "assertion": "Executable gate coverage pins legacy policy negative and nonfinite as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_align_inputs.py::test_legacy_policy_is_sealed_verbatim_but_v2_validation_is_strict"
+          ]
+        },
+        {
+          "id": "environment-mutation-after-import",
+          "assertion": "Executable gate coverage pins environment mutation after import as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_align_inputs.py::test_legacy_policy_is_sealed_verbatim_but_v2_validation_is_strict"
+          ]
+        }
+      ]
+    },
+    "media-and-source": {
+      "dimensions": [
+        "media-mode",
+        "relocation",
+        "source-generation",
+        "speaker-map-state"
+      ],
+      "vectors": [
+        {
+          "id": "explicit-media-relocation",
+          "assertion": "Executable gate coverage pins explicit media relocation as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_context.py::test_private_path_binding_rejects_target_swap_but_stable_digest_relocates",
+            "tests/test_p6_oracle_vectors.py::test_explicit_media_wins_over_a_same_stem_sibling_and_survives_relocation"
+          ]
+        },
+        {
+          "id": "same-basename-different-content",
+          "assertion": "Executable gate coverage pins same basename different content as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_context.py::test_hand_built_context_and_cross_context_binding_are_unissued",
+            "tests/test_p6_oracle_vectors.py::test_explicit_media_wins_over_a_same_stem_sibling_and_survives_relocation"
+          ]
+        },
+        {
+          "id": "renamed-same-content",
+          "assertion": "Executable gate coverage pins renamed same content as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_context.py::test_private_path_binding_rejects_target_swap_but_stable_digest_relocates",
+            "tests/test_p6_oracle_vectors.py::test_explicit_media_wins_over_a_same_stem_sibling_and_survives_relocation"
+          ]
+        },
+        {
+          "id": "missing-explicit-argument",
+          "assertion": "Executable gate coverage pins missing explicit argument as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_context.py::test_hand_built_context_and_cross_context_binding_are_unissued",
+            "tests/test_p6_oracle_vectors.py::test_missing_explicit_media_is_a_canonical_pre_backend_failure"
+          ]
+        },
+        {
+          "id": "sibling-shadowing",
+          "assertion": "Executable gate coverage pins sibling shadowing as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_context.py::test_hand_built_context_and_cross_context_binding_are_unissued",
+            "tests/test_p6_oracle_vectors.py::test_sibling_media_shadowing_uses_closed_extension_precedence"
+          ]
+        },
+        {
+          "id": "transcribed-media-m0-binding",
+          "assertion": "Executable gate coverage pins transcribed media m0 binding as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_public_segmentation_requires_independent_selected_projection"
+          ]
+        },
+        {
+          "id": "injected-words-null-m0",
+          "assertion": "Executable gate coverage pins injected words null m0 as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_process_injected_words_is_media_free_with_absent_nominal_path"
+          ]
+        },
+        {
+          "id": "speaker-map-absent-readable-malformed-directory-permission",
+          "assertion": "Executable gate coverage pins speaker map absent readable malformed directory permission as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_tolerant_mapping_observation_is_exact_and_rat7_recheck_is_active",
+            "tests/test_p6_episode_transactions.py::test_tolerant_mapping_distinguishes_absence_from_broken_symlink"
+          ]
+        },
+        {
+          "id": "rat7-absent-create-change-delete-recovery",
+          "assertion": "Executable gate coverage pins rat7 absent create change delete recovery as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_tolerant_mapping_observation_is_exact_and_rat7_recheck_is_active",
+            "tests/test_p6_fix_writer_transaction.py::test_rat7_split_mapping_change_stale_aborts_before_mutation"
+          ]
+        }
+      ]
+    },
+    "encoder-evidence-cutover": {
+      "dimensions": [
+        "family",
+        "encoder-edge",
+        "evidence-edge",
+        "selection"
+      ],
+      "vectors": [
+        {
+          "id": "no-shadow-shadow-and-selected-v2",
+          "assertion": "Executable gate coverage pins no shadow shadow and selected v2 as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_align_candidates.py::test_composite_encoder_returns_fixed_family_order_and_exact_legacy_bytes",
+            "tests/test_p6_segmentation_candidates.py::test_simulated_row_qualification_selects_and_verifies_real_boundary_bytes"
+          ]
+        },
+        {
+          "id": "first-and-second-family-failure",
+          "assertion": "Executable gate coverage pins first and second family failure as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_align_candidates.py::test_selected_failure_has_no_fallback",
+            "tests/test_p6_segmentation_candidates.py::test_composite_segmentation_encoder_preserves_exact_legacy_projection"
+          ]
+        },
+        {
+          "id": "binding-failure",
+          "assertion": "Executable gate coverage pins binding failure as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_align_evidence.py::test_evidence_bind_rejects_unverified_hash_substitution"
+          ]
+        },
+        {
+          "id": "single-use-role-retirement",
+          "assertion": "Executable gate coverage pins single use role retirement as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_align_candidates.py::test_candidate_set_is_issuer_only_and_encoder_role_is_single_use"
+          ]
+        },
+        {
+          "id": "ald6-independent-reference-corruption",
+          "assertion": "Executable gate coverage pins ald6 independent reference corruption as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_fix_authority.py::test_ald6_rejects_the_same_evidence_core_object",
+            "tests/test_p6_fix_authority.py::test_evidence_reference_replays_and_rejects_corrupt_allocator_receipts"
+          ]
+        },
+        {
+          "id": "standalone-align-projector",
+          "assertion": "Executable gate coverage pins standalone align projector as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_align_candidates.py::test_independent_projection_rejects_candidate_byte_corruption"
+          ]
+        },
+        {
+          "id": "standalone-segmentation-projector",
+          "assertion": "Executable gate coverage pins standalone segmentation projector as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_segmentation_candidates.py::test_independent_segmentation_projection_rejects_byte_corruption"
+          ]
+        },
+        {
+          "id": "selected-primary-hash-mismatch",
+          "assertion": "Executable gate coverage pins selected primary hash mismatch as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_align_candidates.py::test_independent_projection_rejects_candidate_byte_corruption",
+            "tests/test_p6_segmentation_candidates.py::test_independent_segmentation_projection_rejects_byte_corruption"
+          ]
+        },
+        {
+          "id": "final-evidence-schema-and-crosslink",
+          "assertion": "Executable gate coverage pins final evidence schema and crosslink as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_durable_evidence_schema.py::test_rat2_public_evidence_uses_the_closed_v10_schema",
+            "tests/test_p6_durable_evidence_schema.py::test_rat2_verifier_rejects_uncovered_internal_mutation"
+          ]
+        },
+        {
+          "id": "simulated-row-flip",
+          "assertion": "Executable gate coverage pins simulated row flip as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_segmentation_candidates.py::test_simulated_row_qualification_selects_and_verifies_real_boundary_bytes",
+            "tests/test_p6_episode_transactions.py::test_public_align_publishes_preencoded_primaries_through_transaction"
+          ]
+        }
+      ]
+    },
+    "transactions-terminals": {
+      "dimensions": [
+        "operation",
+        "edge",
+        "interleaving",
+        "primary-secondary",
+        "cleanup"
+      ],
+      "vectors": [
+        {
+          "id": "preencode-stage-lock-recheck-commit-cleanup-dispose",
+          "assertion": "Executable gate coverage pins preencode stage lock recheck commit cleanup dispose as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_align_transaction_stages_then_publishes_json_before_vtt"
+          ]
+        },
+        {
+          "id": "before-and-after-each-machine-operation",
+          "assertion": "Executable gate coverage pins before and after each machine operation as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_primary_stage_failure_is_canonical_and_mutates_nothing",
+            "tests/test_p6_episode_transactions.py::test_vtt_replace_failure_reports_json_as_the_only_landed_primary",
+            "tests/test_p6_fix_writer_transaction.py::test_machine_artifact_stage_failure_is_canonical_and_mutates_nothing",
+            "tests/test_p6_fix_writer_transaction.py::test_machine_artifact_replace_failure_is_canonical_after_primaries_land"
+          ]
+        },
+        {
+          "id": "vtt-json-media-and-speaker-map-replacement",
+          "assertion": "Executable gate coverage pins vtt json media and speaker map replacement as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_vtt_replace_failure_reports_json_as_the_only_landed_primary",
+            "tests/test_p6_fix_writer_transaction.py::test_rat7_split_mapping_change_stale_aborts_before_mutation"
+          ]
+        },
+        {
+          "id": "aba-and-cooperating-writer",
+          "assertion": "Executable gate coverage pins aba and cooperating writer as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_correct_apply_stale_generation_mutates_nothing",
+            "tests/test_p6_oracle_vectors.py::test_primary_byte_generation_defines_same_byte_aba_as_the_same_generation",
+            "tests/test_p6_oracle_vectors.py::test_cooperating_writer_after_recheck_waits_and_then_stale_aborts"
+          ]
+        },
+        {
+          "id": "nonparticipating-editor",
+          "assertion": "Executable gate coverage pins nonparticipating editor as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_correct_apply_stale_generation_mutates_nothing",
+            "tests/test_p6_oracle_vectors.py::test_nonparticipating_editor_after_recheck_is_replaced_by_the_atomic_commit"
+          ]
+        },
+        {
+          "id": "two-temp-roots-and-dotted-filenames",
+          "assertion": "Executable gate coverage pins two temp roots and dotted filenames as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_align_transaction_stages_then_publishes_json_before_vtt",
+            "tests/test_p6_oracle_vectors.py::test_transaction_stages_dotted_targets_in_each_target_directory"
+          ]
+        },
+        {
+          "id": "partial-landed-subset-no-rollback",
+          "assertion": "Executable gate coverage pins partial landed subset no rollback as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_vtt_replace_failure_reports_json_as_the_only_landed_primary",
+            "tests/test_p6_fix_writer_transaction.py::test_machine_artifact_replace_failure_is_canonical_after_primaries_land"
+          ]
+        },
+        {
+          "id": "commit-then-disposal-failure",
+          "assertion": "Executable gate coverage pins commit then disposal failure as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_process_panns_release_failure_preserves_exception_and_landed_accounting",
+            "tests/test_p6_episode_transactions.py::test_process_panns_release_failure_is_secondary_to_earlier_failure"
+          ]
+        },
+        {
+          "id": "panns-before-after-handoff-and-throwing-release",
+          "assertion": "Executable gate coverage pins panns before after handoff and throwing release as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_process_panns_release_failure_preserves_exception_and_landed_accounting",
+            "tests/test_p6_episode_transactions.py::test_process_panns_release_failure_is_secondary_to_earlier_failure"
+          ]
+        },
+        {
+          "id": "observer-after-disposal",
+          "assertion": "Executable gate coverage pins observer after disposal as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_align_shadow_observer_runs_once_after_disposal"
+          ]
+        }
+      ]
+    },
+    "sdh-correction": {
+      "dimensions": [
+        "selected-family",
+        "sdh-mode",
+        "correction-mode",
+        "release-edge"
+      ],
+      "vectors": [
+        {
+          "id": "legacy-and-v2-dialogue",
+          "assertion": "Executable gate coverage pins legacy and v2 dialogue as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_segmentation_candidates.py::test_selected_sdh_dialogue_uses_intrinsic_delivery_times_when_vtt_is_plain"
+          ]
+        },
+        {
+          "id": "timestamps-off",
+          "assertion": "Executable gate coverage pins timestamps off as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_segmentation_candidates.py::test_selected_sdh_dialogue_uses_intrinsic_delivery_times_when_vtt_is_plain"
+          ]
+        },
+        {
+          "id": "lyric-and-speaker-delivery",
+          "assertion": "Executable gate coverage pins lyric and speaker delivery as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_segmentation_candidates.py::test_selected_sdh_dialogue_uses_intrinsic_delivery_times_when_vtt_is_plain"
+          ]
+        },
+        {
+          "id": "detection-success-empty-dependency-and-exception",
+          "assertion": "Executable gate coverage pins detection success empty dependency and exception as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_sdh_generation_change_retains_existing_auxiliary",
+            "tests/test_p6_oracle_vectors.py::test_sdh_success_and_empty_detection_commit_selected_sidecar",
+            "tests/test_p6_oracle_vectors.py::test_sdh_missing_dependency_and_detector_exception_retain_preexisting_sidecar"
+          ]
+        },
+        {
+          "id": "selected-primary-stale-recheck",
+          "assertion": "Executable gate coverage pins selected primary stale recheck as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_sdh_generation_change_retains_existing_auxiliary"
+          ]
+        },
+        {
+          "id": "atomic-write-failure-and-preexisting-retention",
+          "assertion": "Executable gate coverage pins atomic write failure and preexisting retention as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_sdh_generation_change_retains_existing_auxiliary",
+            "tests/test_p6_oracle_vectors.py::test_sdh_atomic_replace_failure_retains_preexisting_sidecar_and_no_stage"
+          ]
+        },
+        {
+          "id": "review-apply-no-align-and-align",
+          "assertion": "Executable gate coverage pins review apply no align and align as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_correct_real_fix_hands_exact_committed_hash_to_align"
+          ]
+        },
+        {
+          "id": "real-empty-all-rejected-and-byte-identical-diff",
+          "assertion": "Executable gate coverage pins real empty all rejected and byte identical diff as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_correct_all_rejected_canonical_rewrite_deletes_stale_evidence",
+            "tests/test_p6_episode_transactions.py::test_correct_byte_identical_rewrite_retains_evidence"
+          ]
+        },
+        {
+          "id": "exact-seven-key-return",
+          "assertion": "Executable gate coverage pins exact seven key return as a closed matrix vector.",
+          "evidence": [
+            "tests/test_p6_episode_transactions.py::test_correct_real_fix_hands_exact_committed_hash_to_align"
+          ]
+        }
+      ]
+    }
+  },
+  "injections": [
+    {
+      "id": "ald6-reference-corruption",
+      "section": "14.5",
+      "operation": "independent EvidenceCore reference replay",
+      "edge": "paired",
+      "expected_kind": null,
+      "expected_phase": null,
+      "expected_detail": null,
+      "public_exception": "EvidenceCoreProjectionError",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_fix_authority.py::test_evidence_reference_replays_and_rejects_corrupt_allocator_receipts"
+    },
+    {
+      "id": "selected-render-corruption",
+      "section": "14.5",
+      "operation": "independent selected projection",
+      "edge": "after",
+      "expected_kind": "selected-render-invalid",
+      "expected_phase": "renderer",
+      "expected_detail": "derived-hash",
+      "public_exception": "CandidateVerificationError",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [
+        "C",
+        "C",
+        "C",
+        "R"
+      ],
+      "evidence": "tests/test_p6_align_candidates.py::test_independent_projection_rejects_candidate_byte_corruption"
+    },
+    {
+      "id": "final-evidence-hash-substitution",
+      "section": "14.5",
+      "operation": "final evidence bind",
+      "edge": "before",
+      "expected_kind": "final-evidence-invalid",
+      "expected_phase": "evidence-bind",
+      "expected_detail": "evidence-binding",
+      "public_exception": "EvidenceBindingError",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_align_evidence.py::test_evidence_bind_rejects_unverified_hash_substitution"
+    },
+    {
+      "id": "distribution-seal-mismatch",
+      "section": "14.5",
+      "operation": "acquisition distribution seal",
+      "edge": "before",
+      "expected_kind": "fresh-seal-broken",
+      "expected_phase": "authority-distribution",
+      "expected_detail": "distribution-seal",
+      "public_exception": "FreshSealBroken",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [
+        "C",
+        "R",
+        "R",
+        "R",
+        "R"
+      ],
+      "evidence": "tests/test_p6_fix_authority.py::test_seal_mismatch_lifecycle_is_called_by_the_production_issuer"
+    },
+    {
+      "id": "align-vtt-generation",
+      "section": "14.6",
+      "operation": "align input generation recheck",
+      "edge": "before",
+      "expected_kind": "input-stale",
+      "expected_phase": "recheck",
+      "expected_detail": "vtt-generation",
+      "public_exception": "InputStaleError",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_episode_transactions.py::test_align_expected_generation_rejects_before_media_or_backend"
+    },
+    {
+      "id": "correct-generation",
+      "section": "14.6",
+      "operation": "correct optimistic recheck",
+      "edge": "after",
+      "expected_kind": "input-stale",
+      "expected_phase": "recheck",
+      "expected_detail": "correct-generation",
+      "public_exception": "InputStaleError",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_episode_transactions.py::test_correct_apply_stale_generation_mutates_nothing"
+    },
+    {
+      "id": "primary-stage",
+      "section": "14.6",
+      "operation": "main JSON stage",
+      "edge": "before",
+      "expected_kind": "stage-failed",
+      "expected_phase": "stage",
+      "expected_detail": "main-json-stage",
+      "public_exception": "TransactionOperationError",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_episode_transactions.py::test_primary_stage_failure_is_canonical_and_mutates_nothing"
+    },
+    {
+      "id": "vtt-replace",
+      "section": "14.6",
+      "operation": "VTT primary replace",
+      "edge": "after",
+      "expected_kind": "commit-failed",
+      "expected_phase": "commit",
+      "expected_detail": "vtt-replace",
+      "public_exception": "TransactionOperationError",
+      "landed": [
+        "main-json"
+      ],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_episode_transactions.py::test_vtt_replace_failure_reports_json_as_the_only_landed_primary"
+    },
+    {
+      "id": "episode-lock",
+      "section": "14.6",
+      "operation": "episode lock acquire",
+      "edge": "before",
+      "expected_kind": "episode-lock-failed",
+      "expected_phase": "lock",
+      "expected_detail": "episode-lock-acquire",
+      "public_exception": "TransactionOperationError",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_episode_transactions.py::test_episode_lock_failure_is_canonical_and_discards_stages"
+    },
+    {
+      "id": "speaker-map-generation",
+      "section": "14.6",
+      "operation": "split speaker-map S0 recheck",
+      "edge": "after",
+      "expected_kind": "input-stale",
+      "expected_phase": "recheck",
+      "expected_detail": "speaker-mapping-generation",
+      "public_exception": "InputStaleError",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_fix_writer_transaction.py::test_rat7_split_mapping_change_stale_aborts_before_mutation"
+    },
+    {
+      "id": "panns-release",
+      "section": "14.6",
+      "operation": "deferred PANNs release after handoff",
+      "edge": "after",
+      "expected_kind": "model-release-failed",
+      "expected_phase": "dispose",
+      "expected_detail": "panns-release",
+      "public_exception": "RuntimeError",
+      "landed": [
+        "main-json",
+        "vtt"
+      ],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_episode_transactions.py::test_process_panns_release_failure_preserves_exception_and_landed_accounting"
+    },
+    {
+      "id": "observer-after-disposal",
+      "section": "14.6",
+      "operation": "align shadow observer callback",
+      "edge": "after",
+      "expected_kind": "observer-failed",
+      "expected_phase": "observer",
+      "expected_detail": "observer-callback",
+      "public_exception": null,
+      "landed": [
+        "main-json",
+        "vtt"
+      ],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [
+        "C",
+        "C",
+        "C",
+        "C",
+        "C"
+      ],
+      "evidence": "tests/test_p6_episode_transactions.py::test_align_shadow_observer_failure_cannot_change_selected_return"
+    },
+    {
+      "id": "machine-artifact-stage",
+      "section": "14.6",
+      "operation": "machine artifact stage",
+      "edge": "before",
+      "expected_kind": "stage-failed",
+      "expected_phase": "stage",
+      "expected_detail": "machine-artifact-stage",
+      "public_exception": "TransactionOperationError",
+      "landed": [],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_fix_writer_transaction.py::test_machine_artifact_stage_failure_is_canonical_and_mutates_nothing"
+    },
+    {
+      "id": "machine-artifact-replace",
+      "section": "14.6",
+      "operation": "machine artifact replace",
+      "edge": "after",
+      "expected_kind": "commit-failed",
+      "expected_phase": "commit",
+      "expected_detail": "machine-artifact-replace",
+      "public_exception": "TransactionOperationError",
+      "landed": [
+        "main-json",
+        "vtt"
+      ],
+      "leftovers": [],
+      "lock_released": true,
+      "roles": [],
+      "evidence": "tests/test_p6_fix_writer_transaction.py::test_machine_artifact_replace_failure_is_canonical_after_primaries_land"
+    }
+  ],
+  "cases": [
+    {
+      "id": "historical-selected-legacy",
+      "command": "align",
+      "route": "ctc-full",
+      "arguments": [
+        "align",
+        "episode.vtt",
+        "--media",
+        "episode.wav"
+      ],
+      "logical_target": "episode.vtt",
+      "source_mode": "explicit",
+      "logical_media": "episode.wav",
+      "input_files": [
+        {
+          "path": "inputs/lexical-poison.vtt",
+          "present": true,
+          "size": 82,
+          "sha256": "abab68452707bfbab149aae3c3b14f4af298016c4f3121ea23e1ef65f86c35f2"
+        }
+      ],
+      "backend_receipt": {
+        "path": "backend-receipts/direct-full-pass.json",
+        "present": true,
+        "size": 303,
+        "sha256": "62fbd2fd439bc246be7aa8b4ba404e16bcc3197b8ab74a2cf3f90cefad2aa3b7"
+      },
+      "optimizer_receipt": null,
+      "environment": {
+        "LANG": "zh_CN.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONHASHSEED": null,
+        "TZ": null,
+        "VOXWEAVE_CONFIG": null
+      },
+      "expected_paths": [
+        {
+          "kind": "primary",
+          "expected_path": "expected/6e6033f/legacy.vtt",
+          "size": 82,
+          "sha256": "5d80b36871aa6fb22a0cd6ef49d71d1c872980f19e698f3b030f53b990fc5bd9",
+          "artifact": "vtt"
+        }
+      ],
+      "authority_limit_profile": {
+        "kind": "production",
+        "values": {
+          "max_allocator_states": 200000,
+          "max_calls": 4096,
+          "max_surface_chars": 1000000
+        },
+        "digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+        "test_case_id": null
+      },
+      "reference_set": "6e6033f",
+      "ratified_deltas": [],
+      "coverage": [
+        "historical-primary-bytes",
+        "selected-legacy-distribution",
+        "success-or-exception-parity"
+      ],
+      "projector": "historical-vtt-time-order"
+    },
+    {
+      "id": "post-p11-speaker-turns",
+      "command": "correct",
+      "route": "ctc-full",
+      "arguments": [
+        "correct",
+        "episode.vtt",
+        "--apply",
+        "--no-align"
+      ],
+      "logical_target": "episode.vtt",
+      "source_mode": "sibling",
+      "logical_media": "episode.wav",
+      "input_files": [
+        {
+          "path": "inputs/lexical-poison.json",
+          "present": true,
+          "size": 99,
+          "sha256": "4cc95ff2d35a1e2010d6032bd44ef6bb464178df98b530b4671e5e2463b4c0fa"
+        }
+      ],
+      "backend_receipt": {
+        "path": "backend-receipts/direct-full-pass.json",
+        "present": true,
+        "size": 303,
+        "sha256": "62fbd2fd439bc246be7aa8b4ba404e16bcc3197b8ab74a2cf3f90cefad2aa3b7"
+      },
+      "optimizer_receipt": null,
+      "environment": {
+        "LANG": "zh_CN.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONHASHSEED": null,
+        "TZ": null,
+        "VOXWEAVE_CONFIG": null
+      },
+      "expected_paths": [
+        {
+          "kind": "primary",
+          "expected_path": "expected/post-p11/speaker-turns.json",
+          "size": 63,
+          "sha256": "0a7c63b14c0f2a966dddd0b2819c462737828bb124f208da83a3870c67ebbc75",
+          "artifact": "main-json"
+        }
+      ],
+      "authority_limit_profile": {
+        "kind": "production",
+        "values": {
+          "max_allocator_states": 200000,
+          "max_calls": 4096,
+          "max_surface_chars": 1000000
+        },
+        "digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+        "test_case_id": null
+      },
+      "reference_set": "post-p11",
+      "ratified_deltas": [
+        "RAT-3"
+      ],
+      "coverage": [
+        "duplicate-last-occurrence",
+        "raw-speaker-turns",
+        "correction-no-align"
+      ],
+      "projector": "post-p11-speaker-turns"
+    },
+    {
+      "id": "rat4-lexical-direct",
+      "command": "align",
+      "route": "ctc-full",
+      "arguments": [
+        "align",
+        "episode.vtt",
+        "--media",
+        "episode.wav"
+      ],
+      "logical_target": "episode.vtt",
+      "source_mode": "explicit",
+      "logical_media": "episode.wav",
+      "input_files": [
+        {
+          "path": "inputs/lexical-poison.vtt",
+          "present": true,
+          "size": 82,
+          "sha256": "abab68452707bfbab149aae3c3b14f4af298016c4f3121ea23e1ef65f86c35f2"
+        },
+        {
+          "path": "media/synthetic-120s.pcm.json",
+          "present": true,
+          "size": 131,
+          "sha256": "82764e35eae9f5a5924fbbd38da3dcf40dc77e6ee8dab1b954d6c18b1524a456"
+        }
+      ],
+      "backend_receipt": {
+        "path": "backend-receipts/direct-full-pass.json",
+        "present": true,
+        "size": 303,
+        "sha256": "62fbd2fd439bc246be7aa8b4ba404e16bcc3197b8ab74a2cf3f90cefad2aa3b7"
+      },
+      "optimizer_receipt": null,
+      "environment": {
+        "LANG": "zh_CN.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONHASHSEED": null,
+        "TZ": null,
+        "VOXWEAVE_CONFIG": null
+      },
+      "expected_paths": [
+        {
+          "kind": "evidence",
+          "expected_path": "expected/p6-lexical/lexical-call.json",
+          "size": 83,
+          "sha256": "880d8551335a03ec915a4c28e018ba7d14be97598558a956ee5c38c84e9c60f8",
+          "artifact": "route-evidence"
+        }
+      ],
+      "authority_limit_profile": {
+        "kind": "production",
+        "values": {
+          "max_allocator_states": 200000,
+          "max_calls": 4096,
+          "max_surface_chars": 1000000
+        },
+        "digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+        "test_case_id": null
+      },
+      "reference_set": "p6-lexical",
+      "ratified_deltas": [
+        "RAT-4"
+      ],
+      "coverage": [
+        "first-at-100-second-at-0",
+        "ctc-and-mms-lexical-order",
+        "over-budget-hint-refusal",
+        "planner-tiling-and-crop-budget"
+      ],
+      "projector": "p6-lexical-call"
+    },
+    {
+      "id": "selected-v2-align",
+      "command": "align",
+      "route": "qwen-crop",
+      "arguments": [
+        "align",
+        "episode.vtt",
+        "--media",
+        "episode.wav"
+      ],
+      "logical_target": "episode.vtt",
+      "source_mode": "explicit",
+      "logical_media": "episode.wav",
+      "input_files": [
+        {
+          "path": "inputs/selected-v2-align-delivery.json",
+          "present": true,
+          "size": 16232,
+          "sha256": "05367b9f6883f999835ed93b8b163f7032b209701c506ea193dc858417cb151d"
+        }
+      ],
+      "backend_receipt": {
+        "path": "backend-receipts/direct-full-pass.json",
+        "present": true,
+        "size": 303,
+        "sha256": "62fbd2fd439bc246be7aa8b4ba404e16bcc3197b8ab74a2cf3f90cefad2aa3b7"
+      },
+      "optimizer_receipt": {
+        "path": "backend-receipts/selected-v2.json",
+        "present": true,
+        "size": 191,
+        "sha256": "e8a7762598c806bd187fa2a0e5a7eaf4d4ed0c23f8f3a809ff89dfd0dfcd7da0"
+      },
+      "environment": {
+        "LANG": "zh_CN.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONHASHSEED": null,
+        "TZ": null,
+        "VOXWEAVE_CONFIG": null
+      },
+      "expected_paths": [
+        {
+          "kind": "primary",
+          "artifact": "vtt",
+          "expected_path": "expected/selected-v2-align/qwen.vtt",
+          "size": 193,
+          "sha256": "2da0e4719c6146ba8a8667de5de945ed18bd536aaf7beaadb1d485fc4d3fdbf0"
+        },
+        {
+          "kind": "primary",
+          "artifact": "main-json",
+          "expected_path": "expected/selected-v2-align/qwen.json",
+          "size": 1413,
+          "sha256": "227bd0a7b4b9268c16ec5aed2a18afcbe6391b71f036a5e79681478afe7d2aee"
+        },
+        {
+          "kind": "evidence",
+          "artifact": "align-evidence",
+          "expected_path": "expected/selected-v2-align/qwen.align-evidence.json",
+          "size": 17012,
+          "sha256": "6eb3a40048f21001ee36e265d9559af1e3c4141a23892a34883ed71c1a45701f"
+        }
+      ],
+      "authority_limit_profile": {
+        "kind": "production",
+        "values": {
+          "max_allocator_states": 200000,
+          "max_calls": 4096,
+          "max_surface_chars": 1000000
+        },
+        "digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+        "test_case_id": null
+      },
+      "reference_set": "selected-v2-align",
+      "ratified_deltas": [
+        "RAT-1",
+        "RAT-2",
+        "RAT-3",
+        "RAT-5"
+      ],
+      "coverage": [
+        "full-standalone-vtt",
+        "full-standalone-main-json",
+        "full-rat2-evidence",
+        "fresh-alignment-authority",
+        "physical-qwen-origin",
+        "raw-speaker-turns",
+        "voice-lyric-unit-and-carrier-order"
+      ],
+      "projector": "selected-v2-align"
+    },
+    {
+      "id": "selected-v2-segmentation",
+      "command": "split",
+      "route": "media-free",
+      "arguments": [
+        "split",
+        "episode.json"
+      ],
+      "logical_target": "episode.json",
+      "source_mode": "injected-words",
+      "logical_media": null,
+      "input_files": [
+        {
+          "path": "inputs/selected-v2-segmentation-delivery.json",
+          "present": true,
+          "size": 2388,
+          "sha256": "0d59093d7e6ceb11c7651108de747113b11ac31bcf4b225909e2a9f07ef368f1"
+        }
+      ],
+      "backend_receipt": {
+        "path": "backend-receipts/selected-v2.json",
+        "present": true,
+        "size": 191,
+        "sha256": "e8a7762598c806bd187fa2a0e5a7eaf4d4ed0c23f8f3a809ff89dfd0dfcd7da0"
+      },
+      "optimizer_receipt": {
+        "path": "backend-receipts/selected-v2.json",
+        "present": true,
+        "size": 191,
+        "sha256": "e8a7762598c806bd187fa2a0e5a7eaf4d4ed0c23f8f3a809ff89dfd0dfcd7da0"
+      },
+      "environment": {
+        "LANG": "zh_CN.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONHASHSEED": null,
+        "TZ": null,
+        "VOXWEAVE_CONFIG": null
+      },
+      "expected_paths": [
+        {
+          "kind": "primary",
+          "artifact": "vtt",
+          "expected_path": "expected/selected-v2-segmentation/episode.vtt",
+          "size": 183,
+          "sha256": "7f2bf62a67e5fbea0552b3674780d27717009dd7aa95c166af3d04481a40ba33"
+        },
+        {
+          "kind": "primary",
+          "artifact": "main-json",
+          "expected_path": "expected/selected-v2-segmentation/episode.json",
+          "size": 1981,
+          "sha256": "aec03ad5159cea6165cee8e7e3144703095ae2d169737ea2168b7ef00474f45f"
+        }
+      ],
+      "authority_limit_profile": {
+        "kind": "production",
+        "values": {
+          "max_allocator_states": 200000,
+          "max_calls": 4096,
+          "max_surface_chars": 1000000
+        },
+        "digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+        "test_case_id": null
+      },
+      "reference_set": "selected-v2-segmentation",
+      "ratified_deltas": [
+        "RAT-1",
+        "RAT-3",
+        "RAT-7"
+      ],
+      "coverage": [
+        "full-selected-vtt",
+        "full-selected-main-json",
+        "timeline-finalizer-delivery",
+        "media-free-injected-words",
+        "speaker-map-generation-cas",
+        "selected-delivery-sdh",
+        "raw-speaker-turns"
+      ],
+      "projector": "selected-v2-segmentation"
+    },
+    {
+      "id": "combined-ratified-align",
+      "command": "align",
+      "route": "ctc-full",
+      "arguments": [
+        "align",
+        "episode.vtt",
+        "--media",
+        "episode.wav"
+      ],
+      "logical_target": "episode.vtt",
+      "source_mode": "explicit",
+      "logical_media": "episode.wav",
+      "input_files": [
+        {
+          "path": "inputs/combined-ratified-align-delivery.json",
+          "present": true,
+          "size": 8959,
+          "sha256": "69e7ab3385ed7bf86983ab7001784df0e8a077286a931aefeea110ebe4016936"
+        }
+      ],
+      "backend_receipt": {
+        "path": "backend-receipts/direct-full-pass.json",
+        "present": true,
+        "size": 303,
+        "sha256": "62fbd2fd439bc246be7aa8b4ba404e16bcc3197b8ab74a2cf3f90cefad2aa3b7"
+      },
+      "optimizer_receipt": {
+        "path": "backend-receipts/selected-v2.json",
+        "present": true,
+        "size": 191,
+        "sha256": "e8a7762598c806bd187fa2a0e5a7eaf4d4ed0c23f8f3a809ff89dfd0dfcd7da0"
+      },
+      "environment": {
+        "LANG": "zh_CN.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONHASHSEED": null,
+        "TZ": null,
+        "VOXWEAVE_CONFIG": null
+      },
+      "expected_paths": [
+        {
+          "kind": "primary",
+          "artifact": "vtt",
+          "expected_path": "expected/selected-v2-align/combined.vtt",
+          "size": 82,
+          "sha256": "86f3d91bd9cbfc19b510fe87eeca281a5685d62a3de21454c8b2b9b93067bacf"
+        },
+        {
+          "kind": "primary",
+          "artifact": "main-json",
+          "expected_path": "expected/selected-v2-align/combined.json",
+          "size": 578,
+          "sha256": "8c508592b8bc5dae8c9b77f79842f41258cbad2cfcded4113c1ed0c99398af1f"
+        },
+        {
+          "kind": "evidence",
+          "artifact": "align-evidence",
+          "expected_path": "expected/selected-v2-align/combined.align-evidence.json",
+          "size": 9023,
+          "sha256": "25ffca5059bb8a36894b4f7b1077653849aa1bfbf229093858c850af689da94a"
+        }
+      ],
+      "authority_limit_profile": {
+        "kind": "production",
+        "values": {
+          "max_allocator_states": 200000,
+          "max_calls": 4096,
+          "max_surface_chars": 1000000
+        },
+        "digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+        "test_case_id": null
+      },
+      "reference_set": "selected-v2-align",
+      "ratified_deltas": [
+        "RAT-1",
+        "RAT-2",
+        "RAT-3",
+        "RAT-4"
+      ],
+      "coverage": [
+        "full-combined-golden",
+        "lexical-source-order",
+        "fresh-alignment-finalizer",
+        "raw-null-speaker-turns",
+        "rat2-selected-hash-crosslinks",
+        "whole-file-identity-sample-geometry"
+      ],
+      "projector": "combined-ratified-align"
+    }
+  ]
+}

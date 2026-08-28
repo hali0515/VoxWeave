@@ -1,0 +1,13 @@
+{
+  "receipt_version": 1,
+  "backend": "detached-synthetic-ctc",
+  "model_digest": "955c060162c22f3e41d488d3c2cc999a1a8c5a11fa13c3d3209f81948b8edc47",
+  "calls": [
+    {
+      "source_indices": [0, 1],
+      "texts": ["FIRST", "SECOND"],
+      "sample_start": 0,
+      "sample_end": 1920000
+    }
+  ]
+}

@@ -1,0 +1,324 @@
+{
+  "delivery": {
+    "context_content_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "receipt_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "engine_family": "boundary-v2",
+    "route_kind": "qwen-crop",
+    "cues": [
+      {
+        "source_index": 0,
+        "text": "First line",
+        "start": 0.125,
+        "end": 1.25,
+        "lyric": false,
+        "unit_ids": ["q0", "q1"],
+        "word_data": [
+          {"text": "First", "start": 0.125, "end": 0.6},
+          {"text": "line", "start": 0.7, "end": 1.25}
+        ],
+        "speech_start": 0.125,
+        "speech_end": 1.25
+      },
+      {
+        "source_index": 1,
+        "text": "Second line",
+        "start": 1.5,
+        "end": 2.75,
+        "lyric": true,
+        "unit_ids": ["q2", "q3"],
+        "word_data": [
+          {"text": "Second", "start": 1.5, "end": 2.1},
+          {"text": "line", "start": 2.2, "end": 2.75}
+        ],
+        "speech_start": 1.5,
+        "speech_end": 2.75
+      },
+      {
+        "source_index": 2,
+        "text": "Call\nresponse",
+        "start": 3.0,
+        "end": 4.25,
+        "lyric": false,
+        "unit_ids": ["q4", "q5"],
+        "word_data": [
+          {"text": "Call", "start": 3.0, "end": 3.45},
+          {"text": "response", "start": 3.55, "end": 4.25}
+        ],
+        "speech_start": 3.0,
+        "speech_end": 4.25
+      }
+    ],
+    "word_segments": [
+      {"text": "First", "start": 0.125, "end": 0.6},
+      {"text": "line", "start": 0.7, "end": 1.25},
+      {"text": "Second", "start": 1.5, "end": 2.1},
+      {"text": "line", "start": 2.2, "end": 2.75},
+      {"text": "Call", "start": 3.0, "end": 3.45},
+      {"text": "response", "start": 3.55, "end": 4.25}
+    ]
+  },
+  "projection_inputs": {
+    "language": "en",
+    "source_blocks": [
+      {"source_index": 0, "speaker": "Alice", "speakers": null},
+      {"source_index": 1, "speaker": "Bob", "speakers": null},
+      {
+        "source_index": 2,
+        "speaker": null,
+        "speakers": [["Alice", "Call"], ["Bob", "response"]]
+      }
+    ],
+    "vad_speech": [[0.1, 1.3], [1.45, 2.8], [2.95, 4.3]],
+    "shot_changes": [1.4, 2.9],
+    "sing_spans": [[1.45, 2.8]],
+    "speaker_turns": {
+      "present": true,
+      "value": [[0.1, 1.3, "SPEAKER_00"], [1.45, 2.8, "SPEAKER_01"]]
+    },
+    "voiceprint_capture": "capture-selected-v2",
+    "voiceprint_media": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "segmentation": {
+      "engine": "p5-boundary-v2",
+      "degraded": [],
+      "providers": {"boundary": "fresh-alignment"}
+    }
+  },
+  "evidence_core": {
+    "schema_version": 8,
+    "context_content_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "receipt_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "language": "en",
+    "route": "qwen-crop",
+    "input_history": {
+      "vtt_present": true,
+      "vtt_size": 148,
+      "vtt_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "sibling_json_present": true,
+      "sibling_json_size": 376,
+      "sibling_json_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "block_content_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "registry_family": "boundary-v2",
+      "media_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "media_logical_id": "explicit:episode.wav",
+      "media_display_name": "episode.wav",
+      "prepared_audio_size": 1280044,
+      "prepared_audio_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "profile_input_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "evidence_carriers_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "authority_limit_profile_kind": "production",
+      "authority_limit_profile_digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+      "legacy_policy_binary64": {
+        "min_cue_sec": "0000000000000000",
+        "tiny_cue_sec": "3fc999999999999a",
+        "tiny_cue_target": "3fe0000000000000"
+      },
+      "target_logical_id": "episode.vtt",
+      "expected_vtt_sha256": null
+    },
+    "route_plan": {
+      "digest": "1010101010101010101010101010101010101010101010101010101010101010",
+      "entries": [
+        {"delivery_index": 0, "source_index": 0, "route_start": 0.1234, "route_end": 1.3, "action": "qwen-call", "call_index": 0, "skip_reason": null},
+        {"delivery_index": 1, "source_index": 1, "route_start": 1.5, "route_end": 2.8, "action": "qwen-call", "call_index": 1, "skip_reason": null},
+        {"delivery_index": 2, "source_index": 2, "route_start": 2.9999, "route_end": 4.3, "action": "qwen-call", "call_index": 2, "skip_reason": null}
+      ]
+    },
+    "physical_calls": [
+      {
+        "call_index": 0,
+        "source_block_indices": [0],
+        "sample_start": 2000,
+        "sample_end": 20800,
+        "sample_rate": 16000,
+        "physical_origin_seconds": 0.125,
+        "legacy_origin_seconds": 0.1234,
+        "legacy_origin_kind": "nominal-route",
+        "authority_origin_seconds": 0.125,
+        "backend_model_config_sha256": "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000",
+        "route_input_sha256": "0000ffffeeeeddddccccbbbbaaaa999988887777666655554444333322221111",
+        "strict_unit_status": "valid",
+        "strict_failure": null,
+        "raw_units_sha256": "1212121212121212121212121212121212121212121212121212121212121212",
+        "relative_units_sha256": "1313131313131313131313131313131313131313131313131313131313131313",
+        "legacy_slice_sha256": "1414141414141414141414141414141414141414141414141414141414141414",
+        "legacy_absolute_sha256": "1515151515151515151515151515151515151515151515151515151515151515",
+        "authority_transform_status": "valid",
+        "authority_absolute_sha256": "1616161616161616161616161616161616161616161616161616161616161616",
+        "raw_unit_ids": ["q0", "q1"]
+      },
+      {
+        "call_index": 1,
+        "source_block_indices": [1],
+        "sample_start": 24000,
+        "sample_end": 44800,
+        "sample_rate": 16000,
+        "physical_origin_seconds": 1.5,
+        "legacy_origin_seconds": 1.5,
+        "legacy_origin_kind": "nominal-route",
+        "authority_origin_seconds": 1.5,
+        "backend_model_config_sha256": "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000",
+        "route_input_sha256": "1717171717171717171717171717171717171717171717171717171717171717",
+        "strict_unit_status": "valid",
+        "strict_failure": null,
+        "raw_units_sha256": "1818181818181818181818181818181818181818181818181818181818181818",
+        "relative_units_sha256": "1919191919191919191919191919191919191919191919191919191919191919",
+        "legacy_slice_sha256": "2020202020202020202020202020202020202020202020202020202020202020",
+        "legacy_absolute_sha256": "2121212121212121212121212121212121212121212121212121212121212121",
+        "authority_transform_status": "valid",
+        "authority_absolute_sha256": "2323232323232323232323232323232323232323232323232323232323232323",
+        "raw_unit_ids": ["q2", "q3"]
+      },
+      {
+        "call_index": 2,
+        "source_block_indices": [2],
+        "sample_start": 48000,
+        "sample_end": 68800,
+        "sample_rate": 16000,
+        "physical_origin_seconds": 3.0,
+        "legacy_origin_seconds": 2.9999,
+        "legacy_origin_kind": "nominal-route",
+        "authority_origin_seconds": 3.0,
+        "backend_model_config_sha256": "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000",
+        "route_input_sha256": "2424242424242424242424242424242424242424242424242424242424242424",
+        "strict_unit_status": "valid",
+        "strict_failure": null,
+        "raw_units_sha256": "2525252525252525252525252525252525252525252525252525252525252525",
+        "relative_units_sha256": "2626262626262626262626262626262626262626262626262626262626262626",
+        "legacy_slice_sha256": "2727272727272727272727272727272727272727272727272727272727272727",
+        "legacy_absolute_sha256": "2828282828282828282828282828282828282828282828282828282828282828",
+        "authority_transform_status": "valid",
+        "authority_absolute_sha256": "2929292929292929292929292929292929292929292929292929292929292929",
+        "raw_unit_ids": ["q4", "q5"]
+      }
+    ],
+    "legacy_distribution": {
+      "digest": "3030303030303030303030303030303030303030303030303030303030303030",
+      "calls": [
+        {"call_index": 0, "owner_source_indices": [0], "expected_counts": [2], "requested_ranges": [[0, 2]], "realized_ranges": [[0, 2]], "owner_unit_ids": [["q0", "q1"]], "final_cursor": 2, "consumed_prefix_unit_ids": ["q0", "q1"], "shortage_source_indices": [], "leftover_unit_ids": []},
+        {"call_index": 1, "owner_source_indices": [1], "expected_counts": [2], "requested_ranges": [[0, 2]], "realized_ranges": [[0, 2]], "owner_unit_ids": [["q2", "q3"]], "final_cursor": 2, "consumed_prefix_unit_ids": ["q2", "q3"], "shortage_source_indices": [], "leftover_unit_ids": []},
+        {"call_index": 2, "owner_source_indices": [2], "expected_counts": [2], "requested_ranges": [[0, 2]], "realized_ranges": [[0, 2]], "owner_unit_ids": [["q4", "q5"]], "final_cursor": 2, "consumed_prefix_unit_ids": ["q4", "q5"], "shortage_source_indices": [], "leftover_unit_ids": []}
+      ]
+    },
+    "authority_distribution": {
+      "status": "valid",
+      "digest": "3131313131313131313131313131313131313131313131313131313131313131",
+      "owner_source_indices": [0, 1, 2],
+      "expected_counts": [2, 2, 2],
+      "owner_unit_ids": [["q0", "q1"], ["q2", "q3"], ["q4", "q5"]],
+      "consumed_count": 6,
+      "leftover_unit_ids": [],
+      "reasons": [],
+      "work": {
+        "status": "complete",
+        "route_status": "valid",
+        "route_mismatch": null,
+        "route_claims": [
+          {"owner_kind": "call", "owner_index": 0, "delivery_index": 0, "source_index": 0},
+          {"owner_kind": "call", "owner_index": 1, "delivery_index": 1, "source_index": 1},
+          {"owner_kind": "call", "owner_index": 2, "delivery_index": 2, "source_index": 2}
+        ],
+        "declared_delivery_block_count": 3,
+        "declared_call_count": 3,
+        "declared_skip_count": 0,
+        "declared_raw_node_count": 6,
+        "charged_call_count": 3,
+        "limit_profile_kind": "production",
+        "limit_profile_digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+        "limits": {"call_limit": 4096, "state_limit": 4000000, "edge_limit": 16000000, "interval_limit": 4000000, "normalize_char_limit": 256000000},
+        "totals": {"states": 24, "edges": 12, "intervals": 12, "normalize_chars": 82},
+        "terminal_call_index": null,
+        "denied_charge": null,
+        "calls": [
+          {
+            "call_index": 0,
+            "route_claim_positions": [0],
+            "source_block_indices": [0],
+            "raw_node_range": [0, 2],
+            "block_count": 1,
+            "raw_node_count": 2,
+            "typed_unit_count": 2,
+            "surface_chars": 18,
+            "strict_preflight_status": "valid",
+            "strict_failure": null,
+            "limits": {"state_limit": 1000000, "edge_limit": 4000000, "interval_limit": 1000000, "normalize_char_limit": 64000000},
+            "allocator": {"status": "complete", "states": 4, "edges": 2, "intervals": 2, "normalize_chars": 9, "terminal_detail_code": null},
+            "verifier": {"status": "complete", "states": 4, "edges": 2, "intervals": 2, "normalize_chars": 9, "terminal_detail_code": null}
+          },
+          {
+            "call_index": 1,
+            "route_claim_positions": [1],
+            "source_block_indices": [1],
+            "raw_node_range": [2, 4],
+            "block_count": 1,
+            "raw_node_count": 2,
+            "typed_unit_count": 2,
+            "surface_chars": 20,
+            "strict_preflight_status": "valid",
+            "strict_failure": null,
+            "limits": {"state_limit": 1000000, "edge_limit": 4000000, "interval_limit": 1000000, "normalize_char_limit": 64000000},
+            "allocator": {"status": "complete", "states": 4, "edges": 2, "intervals": 2, "normalize_chars": 10, "terminal_detail_code": null},
+            "verifier": {"status": "complete", "states": 4, "edges": 2, "intervals": 2, "normalize_chars": 10, "terminal_detail_code": null}
+          },
+          {
+            "call_index": 2,
+            "route_claim_positions": [2],
+            "source_block_indices": [2],
+            "raw_node_range": [4, 6],
+            "block_count": 1,
+            "raw_node_count": 2,
+            "typed_unit_count": 2,
+            "surface_chars": 44,
+            "strict_preflight_status": "valid",
+            "strict_failure": null,
+            "limits": {"state_limit": 1000000, "edge_limit": 4000000, "interval_limit": 1000000, "normalize_char_limit": 64000000},
+            "allocator": {"status": "complete", "states": 4, "edges": 2, "intervals": 2, "normalize_chars": 22, "terminal_detail_code": null},
+            "verifier": {"status": "complete", "states": 4, "edges": 2, "intervals": 2, "normalize_chars": 22, "terminal_detail_code": null}
+          }
+        ],
+        "skipped_blocks": []
+      }
+    },
+    "blocks": [
+      {
+        "source_index": 0,
+        "legacy_unit_ids": ["q0", "q1"],
+        "authority_unit_ids": ["q0", "q1"],
+        "word_data": [
+          {"unit_id": "q0", "call_index": 0, "call_unit_index": 0, "text": "First", "relative_start": 0.0, "relative_end": 0.475, "physical_origin_seconds": 0.125, "start": 0.125, "end": 0.6, "provenance": "aligner", "original_relative_start": 0.0, "original_relative_end": 0.475},
+          {"unit_id": "q1", "call_index": 0, "call_unit_index": 1, "text": "line", "relative_start": 0.575, "relative_end": 1.125, "physical_origin_seconds": 0.125, "start": 0.7, "end": 1.25, "provenance": "aligner", "original_relative_start": 0.575, "original_relative_end": 1.125}
+        ],
+        "speech_start": 0.125,
+        "speech_end": 1.25
+      },
+      {
+        "source_index": 1,
+        "legacy_unit_ids": ["q2", "q3"],
+        "authority_unit_ids": ["q2", "q3"],
+        "word_data": [
+          {"unit_id": "q2", "call_index": 1, "call_unit_index": 0, "text": "Second", "relative_start": 0.0, "relative_end": 0.6, "physical_origin_seconds": 1.5, "start": 1.5, "end": 2.1, "provenance": "aligner", "original_relative_start": 0.0, "original_relative_end": 0.6},
+          {"unit_id": "q3", "call_index": 1, "call_unit_index": 1, "text": "line", "relative_start": 0.7, "relative_end": 1.25, "physical_origin_seconds": 1.5, "start": 2.2, "end": 2.75, "provenance": "aligner", "original_relative_start": 0.7, "original_relative_end": 1.25}
+        ],
+        "speech_start": 1.5,
+        "speech_end": 2.75
+      },
+      {
+        "source_index": 2,
+        "legacy_unit_ids": ["q4", "q5"],
+        "authority_unit_ids": ["q4", "q5"],
+        "word_data": [
+          {"unit_id": "q4", "call_index": 2, "call_unit_index": 0, "text": "Call", "relative_start": 0.0, "relative_end": 0.45, "physical_origin_seconds": 3.0, "start": 3.0, "end": 3.45, "provenance": "aligner", "original_relative_start": 0.0, "original_relative_end": 0.45},
+          {"unit_id": "q5", "call_index": 2, "call_unit_index": 1, "text": "response", "relative_start": 0.55, "relative_end": 1.25, "physical_origin_seconds": 3.0, "start": 3.55, "end": 4.25, "provenance": "aligner", "original_relative_start": 0.55, "original_relative_end": 1.25}
+        ],
+        "speech_start": 3.0,
+        "speech_end": 4.25
+      }
+    ],
+    "raw_unit_count": 6,
+    "strict_input_status": {"kind": "valid", "detail_code": null},
+    "seed_status": {"kind": "valid", "reasons": []},
+    "v2_policy_status": {"kind": "valid", "detail_code": null},
+    "profile_status": {"kind": "valid", "source": "manifest-absent", "detail_code": null},
+    "evidence_status": {"kind": "valid", "detail_code": null},
+    "v2_admission_status": "valid"
+  }
+}

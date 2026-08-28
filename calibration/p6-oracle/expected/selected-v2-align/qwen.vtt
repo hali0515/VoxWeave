@@ -1,0 +1,11 @@
+WEBVTT
+
+00:00:00.125 --> 00:00:01.250
+<v Alice>First line</v>
+
+00:00:01.500 --> 00:00:02.750
+<v Bob>♪ Second line ♪</v>
+
+00:00:03.000 --> 00:00:04.250
+<v Alice>Call</v>
+<v Bob>response</v>

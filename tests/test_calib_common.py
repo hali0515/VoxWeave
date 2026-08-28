@@ -21,12 +21,17 @@ jsonschema = pytest.importorskip("jsonschema")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_DIR = REPO_ROOT / "calibration" / "schemas"
 SCHEMA_NAMES = (
+    "align-evidence",
+    "align-shadow-artifact",
+    "align-shadow-manifest",
+    "align-shadow-report",
     "alignment-manifest",
     "alignment-reference",
     "alignment-report",
     "segmentation-case",
     "segmentation-corpus",
     "segmentation-baseline",
+    "p6-oracle",
 )
 
 
