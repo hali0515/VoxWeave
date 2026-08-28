@@ -29,6 +29,8 @@ from voxweave.episode_transaction import (
     FileGeneration,
     ProcessSourceMode,
     SpeakerMappingGeneration,
+    bind_split_speaker_mapping_generation,
+    release_split_speaker_mapping_generation,
 )
 from voxweave.segmentation_adapter import (
     SegmentationAdapterResult,
@@ -42,6 +44,13 @@ from voxweave.segmentation_adapter import (
 
 
 SegmentationCommand = Literal["process", "split"]
+
+
+def _swap_ext(path: Path, new_ext: str) -> Path:
+    target = Path(path)
+    if target.suffix:
+        return target.with_name(target.name[: -len(target.suffix)] + new_ext)
+    return target.with_name(target.name + new_ext)
 
 
 @dataclass(frozen=True)
@@ -247,6 +256,18 @@ def build_segmentation_selection(
         sibling_path=sibling_path,
         effective_iso=language,
     )
+    if command == "split":
+        if mapping_generation is None:
+            retire_live_context_roles(context)
+            raise ValueError("split selection requires its S0 mapping generation")
+        bind_split_speaker_mapping_generation(
+            context,
+            _swap_ext(sibling_path, ".speakers.json"),
+            mapping_generation,
+        )
+    elif mapping_generation is not None:
+        retire_live_context_roles(context)
+        raise ValueError("process selection cannot bind a speaker mapping generation")
     try:
         ranges = _partition(document, cues)
         delivery = SegmentationDelivery(
@@ -295,12 +316,14 @@ def build_segmentation_selection(
             context, result, verified
         )
     except BaseException:
+        release_split_speaker_mapping_generation(context)
         retire_live_context_roles(context)
         raise
     return SegmentationSelection(context, result, verified, sdh_dialogue)
 
 
 def retire_segmentation_selection(selection: SegmentationSelection) -> None:
+    release_split_speaker_mapping_generation(selection.context)
     retire_live_context_roles(selection.context)
 
 

@@ -1,8 +1,8 @@
-"""Closed pending-decision defaults for the P6 implementation program.
+"""Closed ratification record for the P6 implementation program.
 
-These are shipped law defaults, not feature flags.  Enabling any deferred
-operation requires an approved governing amendment and a source change; no
-environment, configuration, CLI, or plugin input can ratify a decision.
+These values are source-law constants, not runtime feature flags.  The law
+owner approved RAT-1 through RAT-7 on 2026-08-28; RAT-6 selected option B and
+is discharged by the later P7 cutover window.
 """
 
 from __future__ import annotations
@@ -13,74 +13,81 @@ from typing import Literal
 
 
 @dataclass(frozen=True)
-class PendingRatification:
+class RatificationDecision:
     decision: str
-    status: Literal["pending"]
+    status: Literal["approved"]
     default: str
     approval_unlocks: str
-    enabled_operation: None = None
+    enabled_operation: str
 
 
-_DEFAULTS = {
-    "RAT-1": PendingRatification(
+_DECISIONS = {
+    "RAT-1": RatificationDecision(
         "RAT-1",
-        "pending",
+        "approved",
         "acquisition-evidence-only",
         "fresh-alignment W1 authority and factory",
+        "fresh-alignment",
     ),
-    "RAT-2": PendingRatification(
+    "RAT-2": RatificationDecision(
         "RAT-2",
-        "pending",
+        "approved",
         "persistence-scaffold-only",
         "durable transactional align-anchor evidence",
+        "durable-align-evidence",
     ),
-    "RAT-3": PendingRatification(
+    "RAT-3": RatificationDecision(
         "RAT-3",
-        "pending",
+        "approved",
         "current-selected-writer",
         "raw last-occurrence speaker_turns carriage",
+        "raw-speaker-turns-writer",
     ),
-    "RAT-4": PendingRatification(
+    "RAT-4": RatificationDecision(
         "RAT-4",
-        "pending",
+        "approved",
         "current-full-pass-order-and-budget-behavior",
         "lexical full-pass order and unsafe-hint refusal",
+        "lexical-full-pass",
     ),
-    "RAT-5": PendingRatification(
+    "RAT-5": RatificationDecision(
         "RAT-5",
-        "pending",
+        "approved",
         "qwen-selected-legacy-nominal-origin",
         "selected Qwen v2 physical-origin delta",
+        "qwen-physical-origin",
     ),
-    "RAT-6": PendingRatification(
+    "RAT-6": RatificationDecision(
         "RAT-6",
-        "pending",
+        "approved",
         "current-endpoint-semantic-mode",
         "one approved semantic authority model for P7-C",
+        "p7-remove-semantic-mode",
     ),
-    "RAT-7": PendingRatification(
+    "RAT-7": RatificationDecision(
         "RAT-7",
-        "pending",
+        "approved",
         "j0-only",
         "split (J0,S0) commit generation recheck",
+        "split-j0-s0-cas",
     ),
 }
 
-RATIFICATION_DEFAULTS = MappingProxyType(_DEFAULTS)
+RATIFICATION_DEFAULTS = MappingProxyType(_DECISIONS)
 
-FRESH_ALIGNMENT_W1_ENABLED = False
-DURABLE_ALIGN_EVIDENCE_ENABLED = False
-QWEN_SELECTED_V2_ENABLED = False
-RAW_SPEAKER_TURNS_WRITER_ENABLED = False
-LEXICAL_FULL_PASS_DELTA_ENABLED = False
-SPEAKER_MAPPING_CAS_ENABLED = False
+FRESH_ALIGNMENT_W1_ENABLED = True
+DURABLE_ALIGN_EVIDENCE_ENABLED = True
+QWEN_SELECTED_V2_ENABLED = True
+RAW_SPEAKER_TURNS_WRITER_ENABLED = True
+LEXICAL_FULL_PASS_DELTA_ENABLED = True
+SPEAKER_MAPPING_CAS_ENABLED = True
 
 
 __all__ = [
     "DURABLE_ALIGN_EVIDENCE_ENABLED",
     "FRESH_ALIGNMENT_W1_ENABLED",
     "LEXICAL_FULL_PASS_DELTA_ENABLED",
-    "PendingRatification",
+    "RatificationDecision",
     "QWEN_SELECTED_V2_ENABLED",
     "RATIFICATION_DEFAULTS",
     "RAW_SPEAKER_TURNS_WRITER_ENABLED",

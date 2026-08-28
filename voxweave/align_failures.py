@@ -236,7 +236,12 @@ _OUTCOME_DETAILS = {
         "vtt-encode",
         "evidence-encode",
     ),
-    "stage-failed": ("main-json-stage", "vtt-stage", "evidence-stage"),
+    "stage-failed": (
+        "main-json-stage",
+        "vtt-stage",
+        "evidence-stage",
+        "machine-artifact-stage",
+    ),
     "episode-lock-failed": ("episode-lock-acquire",),
     "input-stale": (
         "vtt-generation",
@@ -250,6 +255,7 @@ _OUTCOME_DETAILS = {
         "main-json-replace",
         "vtt-replace",
         "evidence-replace",
+        "machine-artifact-replace",
     ),
     "artifact-cleanup-failed": (
         "voiceprints-unlink",
@@ -289,10 +295,7 @@ SEED_REASON_ORDER = AUTHORITY_REASON_ORDER + (
     "footprint-reconciliation",
 )
 
-# RAT-7 is deliberately represented but unreachable until a governing approval
-# enables the S1 operation.  A source-coverage gate can distinguish dormant law
-# from an accidentally untested active edge.
-RATIFICATION_DORMANT_DETAILS = (("input-stale", "speaker-mapping-generation", "RAT-7"),)
+RATIFICATION_DORMANT_DETAILS: tuple[tuple[str, str, str], ...] = ()
 
 
 class FailureRegistryError(ValueError):

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
 from voxweave import realign
-from voxweave.align_snapshot import RawJSONCarrier, thaw_json
-from voxweave.core.segdoc import normalize_speaker_turn_bounds
-from voxweave.p6_ratifications import RAW_SPEAKER_TURNS_WRITER_ENABLED
+from voxweave.align_snapshot import (
+    FrozenObject,
+    encode_frozen_json_document,
+    freeze_json,
+    thaw_json,
+)
 from voxweave.segmentation_adapter import (
     SegmentationDelivery,
     SegmentationProjectionInputs,
@@ -23,36 +25,7 @@ class SegmentationPrimaryProjection:
     main_json_bytes: bytes
 
 
-def _legacy_turns(carrier: RawJSONCarrier) -> list[list[object]] | None:
-    if not carrier.present or carrier.value is None:
-        return None
-    raw = thaw_json(carrier.value)
-    if not raw:
-        return None
-    try:
-        values = iter(raw)
-    except TypeError:
-        return None
-    rows: list[list[object]] = []
-    for value in values:
-        try:
-            start_value, end_value, label = value
-            start, end = normalize_speaker_turn_bounds(
-                float(start_value), float(end_value)
-            )
-        except (TypeError, ValueError):
-            continue
-        rows.append([start, end, str(label)])
-    return rows or None
-
-
-def _turns(carrier: RawJSONCarrier) -> Any | None:
-    if RAW_SPEAKER_TURNS_WRITER_ENABLED:
-        return None if carrier.value is None else thaw_json(carrier.value)
-    return _legacy_turns(carrier)
-
-
-def _main_value(delivery: SegmentationDelivery) -> dict[str, Any]:
+def _main_value(delivery: SegmentationDelivery) -> FrozenObject:
     segments: list[dict[str, Any]] = []
     for cue in delivery.cues:
         value: dict[str, Any] = {
@@ -78,17 +51,22 @@ def _main_value(delivery: SegmentationDelivery) -> dict[str, Any]:
         data["sing_spans"] = [
             thaw_json(value) for value in delivery.carriers.sing_spans
         ]
-    turns = _turns(delivery.carriers.speaker_turns)
-    if turns is not None:
-        data["speaker_turns"] = turns
+    turns = delivery.carriers.speaker_turns
+    if turns.present:
+        if turns.value is None:
+            raise ValueError("present speaker_turns carrier lacks a value")
+        data["speaker_turns"] = turns.value
     if (
         delivery.carriers.voiceprint_capture is not None
         and delivery.carriers.voiceprint_media is not None
     ):
         data["voiceprint_capture"] = delivery.carriers.voiceprint_capture
         data["voiceprint_media"] = delivery.carriers.voiceprint_media
-    data["segmentation"] = thaw_json(delivery.manifest)
-    return data
+    data["segmentation"] = delivery.manifest
+    frozen = freeze_json(data)
+    if not isinstance(frozen, FrozenObject):  # pragma: no cover - mapping invariant
+        raise TypeError("segmentation main projection is not an object")
+    return frozen
 
 
 def project_segmentation_delivery(
@@ -112,12 +90,7 @@ def project_segmentation_delivery(
         )
     return SegmentationPrimaryProjection(
         realign.render_cues(rows).encode("utf-8"),
-        json.dumps(
-            _main_value(delivery),
-            ensure_ascii=False,
-            indent=2,
-            allow_nan=not strict,
-        ).encode("utf-8"),
+        encode_frozen_json_document(_main_value(delivery), allow_nan=not strict),
     )
 
 

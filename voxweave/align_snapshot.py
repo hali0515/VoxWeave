@@ -258,6 +258,75 @@ def thaw_json(value: FrozenJSON) -> Any:
     )
 
 
+def encode_frozen_json_document(
+    value: FrozenJSON,
+    *,
+    allow_nan: bool,
+) -> bytes:
+    """Encode a frozen JSON tree with the selected-writer two-space layout.
+
+    Unlike ``json.dumps(thaw_json(value))``, this projection retains every
+    ``FrozenObject`` pair, including nested duplicate names and their order.
+    Scalar rendering delegates to the standard encoder so finite binary64
+    values, signed zero, and the legacy nonfinite spellings keep the historical
+    selected-writer representation.
+    """
+
+    def scalar(node: FrozenJSON) -> str:
+        if isinstance(node, FrozenAbsent):
+            raise FrozenJSONDomainError(
+                "unsupported-selected-json-node",
+                "absent has no JSON document representation",
+            )
+        if isinstance(node, FrozenNull):
+            projected: Any = None
+        elif isinstance(node, FrozenBool):
+            projected = node.value
+        elif isinstance(node, FrozenInt):
+            projected = node.value
+        elif isinstance(node, FrozenFloat):
+            projected = struct.unpack(">d", bytes.fromhex(node.binary64_hex))[0]
+        elif isinstance(node, FrozenString):
+            projected = node.value
+        else:
+            raise FrozenJSONDomainError(
+                "unsupported-selected-json-node",
+                "compound JSON value reached scalar projection",
+            )
+        return json.dumps(
+            projected,
+            ensure_ascii=False,
+            allow_nan=allow_nan,
+        )
+
+    def render(node: FrozenJSON, depth: int) -> str:
+        if isinstance(node, FrozenArray):
+            if not node.items:
+                return "[]"
+            member_indent = " " * (2 * (depth + 1))
+            close_indent = " " * (2 * depth)
+            members = [
+                member_indent + render(member, depth + 1) for member in node.items
+            ]
+            return "[\n" + ",\n".join(members) + "\n" + close_indent + "]"
+        if isinstance(node, FrozenObject):
+            if not node.items:
+                return "{}"
+            member_indent = " " * (2 * (depth + 1))
+            close_indent = " " * (2 * depth)
+            members = [
+                member_indent
+                + json.dumps(key, ensure_ascii=False)
+                + ": "
+                + render(member, depth + 1)
+                for key, member in node.items
+            ]
+            return "{\n" + ",\n".join(members) + "\n" + close_indent + "}"
+        return scalar(node)
+
+    return render(value, 0).encode("utf-8")
+
+
 @dataclass(frozen=True)
 class _LexInt:
     token: str
@@ -606,11 +675,28 @@ def decode_align_snapshot(
     sibling_json_bytes: bytes | None,
     *,
     effective_iso: str,
+    sibling_snapshot: SiblingJSONSnapshot | None = None,
 ) -> AlignSnapshot:
     """Build immutable content and disjoint route views from exact V0/J0."""
     subtitle = decode_subtitle_snapshot(vtt_name, vtt_bytes)
     sibling_name = f"{Path(vtt_name).stem}.json"
-    sibling = decode_sibling_json_snapshot(sibling_name, sibling_json_bytes)
+    if sibling_snapshot is None:
+        sibling = decode_sibling_json_snapshot(sibling_name, sibling_json_bytes)
+    else:
+        expected_sha256 = (
+            None
+            if sibling_json_bytes is None
+            else hashlib.sha256(sibling_json_bytes).hexdigest()
+        )
+        if (
+            sibling_snapshot.name != sibling_name
+            or sibling_snapshot.present != (sibling_json_bytes is not None)
+            or sibling_snapshot.size
+            != (None if sibling_json_bytes is None else len(sibling_json_bytes))
+            or sibling_snapshot.sha256 != expected_sha256
+        ):
+            raise ValueError("predecoded sibling snapshot does not match exact J0")
+        sibling = sibling_snapshot
     separator = "" if effective_iso in realign.NO_SPACE_LANGS else " "
     contents: list[AlignBlockContent] = []
     block_values: list[FrozenJSON] = []
