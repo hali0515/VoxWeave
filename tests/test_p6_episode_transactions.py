@@ -312,6 +312,95 @@ def test_transaction_module_has_no_model_renderer_or_pipeline_dependency():
         assert forbidden not in source
 
 
+def test_align_transaction_stages_then_publishes_json_before_vtt(tmp_path, monkeypatch):
+    from voxweave import episode_transaction
+
+    json_path = tmp_path / "episode.json"
+    vtt_path = tmp_path / "episode.vtt"
+    cleanup = tmp_path / "episode.voiceprints.json"
+    json_path.write_bytes(b"old json")
+    vtt_path.write_bytes(b"old vtt")
+    cleanup.write_bytes(b"old machine artifact")
+    expected_json = episode_transaction.capture_file_generation(json_path)
+    expected_vtt = episode_transaction.capture_file_generation(vtt_path)
+    order: list[str] = []
+    real_replace = episode_transaction._replace_stage
+
+    def observed_replace(stage):
+        order.append(stage.target.name)
+        real_replace(stage)
+
+    monkeypatch.setattr(episode_transaction, "_replace_stage", observed_replace)
+    receipt = episode_transaction.commit_primary_outputs(
+        command="align",
+        episode_path=vtt_path,
+        json_path=json_path,
+        vtt_path=vtt_path,
+        expected_json=expected_json,
+        expected_vtt=expected_vtt,
+        main_json_bytes=b"new json",
+        vtt_bytes=b"new vtt",
+        cleanup_paths=(
+            episode_transaction.ArtifactCleanup(cleanup, "voiceprints-unlink"),
+        ),
+    )
+
+    assert order == ["episode.json", "episode.vtt"]
+    assert receipt.landed == (json_path, vtt_path)
+    assert not cleanup.exists()
+    assert not tuple(tmp_path.glob("*.part*"))
+
+
+def test_segmentation_transaction_consumes_commit_only_after_recheck(tmp_path):
+    from voxweave.align_context import (
+        consume_context_role,
+        issue_segmentation_context,
+        role_vector,
+    )
+    from voxweave.align_snapshot import FrozenObject, freeze_json
+    from voxweave.episode_transaction import (
+        capture_file_generation,
+        commit_primary_outputs,
+    )
+
+    stable = freeze_json({"case": "transaction"})
+    assert isinstance(stable, FrozenObject)
+    json_path = tmp_path / "episode.json"
+    vtt_path = tmp_path / "episode.vtt"
+    context = issue_segmentation_context(
+        stable_fields=stable,
+        target_path=vtt_path,
+        sibling_path=json_path,
+        effective_iso="en",
+    )
+    consume_context_role(
+        context,
+        "adapter",
+        consumer="run_locked_segmentation_adapter",
+    )
+    consume_context_role(
+        context,
+        "encoder",
+        consumer="encode_segmentation_candidates",
+    )
+    expected_json = capture_file_generation(json_path)
+    expected_vtt = capture_file_generation(vtt_path)
+
+    commit_primary_outputs(
+        command="process",
+        episode_path=vtt_path,
+        json_path=json_path,
+        vtt_path=vtt_path,
+        expected_json=expected_json,
+        expected_vtt=expected_vtt,
+        main_json_bytes=b"{}",
+        vtt_bytes=b"WEBVTT\n",
+        context=context,
+    )
+
+    assert role_vector(context) == ("C", "C", "C")
+
+
 def test_split_mapping_change_does_not_reprobe_before_rat7(tmp_path, monkeypatch):
     json_path = tmp_path / "episode.json"
     json_path.write_text(
