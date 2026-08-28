@@ -196,6 +196,8 @@ def align_blocks_full_mms(
     bounds: Sequence[tuple[float, float] | None] | None = None,
     crop_to_envelope: bool = False,
     mute_spans: Sequence[tuple[float, float]] | None = None,
+    _raw_call_observer: Callable[[list[dict], tuple[int, ...], float], None]
+    | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass MMS alignment (equivalent to whisperx align_ctc).
 
@@ -226,8 +228,29 @@ def align_blocks_full_mms(
 
     # offset_s is part of the _dp_chunked_pass pass_fn contract (used by the CTC
     # path's emission masking); MMS does not mask yet, pending ja truth validation.
+    source_cursor = 0
+
     def _pass(w, sub: list[str], offset_s: float = 0.0) -> list[list[dict]]:
-        return _mms_full_pass(w, sub, iso)
+        nonlocal source_cursor
+        source_indices = tuple(range(source_cursor, source_cursor + len(sub)))
+        source_cursor += len(sub)
+        raw_result: list[dict] | None = None
+
+        def capture_raw(value: list[dict]) -> None:
+            nonlocal raw_result
+            raw_result = value
+
+        out = _mms_full_pass(
+            w,
+            sub,
+            iso,
+            _raw_result_observer=capture_raw
+            if _raw_call_observer is not None
+            else None,
+        )
+        if _raw_call_observer is not None:
+            _raw_call_observer(raw_result or [], source_indices, offset_s)
+        return out
 
     return _dp_chunked_pass(
         wav, MMS_SR, norm, bounds, _pass, "MMS", crop_to_envelope=crop_to_envelope

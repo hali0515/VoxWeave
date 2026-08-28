@@ -333,6 +333,8 @@ def align_blocks_full_ctc(
     speech_spans: list[tuple[float, float]] | None = None,
     crop_to_envelope: bool = False,
     mute_spans: Sequence[tuple[float, float]] | None = None,
+    _raw_call_observer: Callable[[list[dict], tuple[int, ...], float], None]
+    | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
 
@@ -359,7 +361,12 @@ def align_blocks_full_ctc(
         # muting only removes the acoustic bait that smears neighbouring sentences.
         wav = mute_spans_in_wav(wav, al.sr, mute_spans)
 
+    source_cursor = 0
+
     def _pass(w, sub: list[str], offset_s: float = 0.0) -> list[list[dict]]:
+        nonlocal source_cursor
+        source_indices = tuple(range(source_cursor, source_cursor + len(sub)))
+        source_cursor += len(sub)
         spans_rel = None
         if speech_spans:
             end_s = offset_s + w.shape[-1] / al.sr
@@ -368,7 +375,25 @@ def align_blocks_full_ctc(
                 for s, e in speech_spans
                 if e > offset_s and s < end_s
             ]
-        out = _ctc_full_pass(al, w, sub, nospace, iso, speech_spans=spans_rel)
+        raw_result: list[dict] | None = None
+
+        def capture_raw(value: list[dict]) -> None:
+            nonlocal raw_result
+            raw_result = value
+
+        out = _ctc_full_pass(
+            al,
+            w,
+            sub,
+            nospace,
+            iso,
+            speech_spans=spans_rel,
+            _raw_result_observer=capture_raw
+            if _raw_call_observer is not None
+            else None,
+        )
+        if _raw_call_observer is not None:
+            _raw_call_observer(raw_result or [], source_indices, offset_s)
         _empty_cache()
         return out
 

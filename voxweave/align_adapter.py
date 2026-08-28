@@ -124,6 +124,7 @@ def issue_legacy_align_evaluated_result(
     projection_inputs: AlignProjectionInputs,
     evidence_core: EvidenceCore,
     shadow_requested: bool,
+    v2_failure: CanonicalFailure | None = None,
 ) -> AlignEvaluatedResult:
     """Issue the honest no-W1 evaluated result while RAT-1 remains pending."""
     if type(shadow_requested) is not bool:
@@ -157,7 +158,8 @@ def issue_legacy_align_evaluated_result(
     status = (
         V2Status(
             "invalid",
-            CanonicalFailure(
+            v2_failure
+            or CanonicalFailure(
                 "fresh-authority-invalid", "w1-admission", "w1-root-event"
             ),
         )

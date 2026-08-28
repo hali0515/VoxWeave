@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import soundfile as sf
@@ -291,7 +291,13 @@ def silence_gaps(
     return gaps
 
 
-def slice_wav(wav_path: Path, start: float, end: float) -> Path:
+def slice_wav(
+    wav_path: Path,
+    start: float,
+    end: float,
+    *,
+    _sample_geometry_observer: Callable[[int, int, int, int], None] | None = None,
+) -> Path:
     """Slice the [start,end] segment from a 16k wav, write to a temp wav, return path (caller deletes).
 
     Reads only the requested frame range (seek + read) rather than decoding the whole file:
@@ -305,6 +311,8 @@ def slice_wav(wav_path: Path, start: float, end: float) -> Path:
         frames = len(f)
         a = min(max(0, int(start * sr)), frames)
         b = min(frames, int(end * sr))
+        if _sample_geometry_observer is not None:
+            _sample_geometry_observer(a, b, sr, frames)
         f.seek(a)
         data = f.read(max(0, b - a), dtype="float32")
     fd, path = tempfile.mkstemp(suffix=".wav", prefix="voxweave_chunk_")

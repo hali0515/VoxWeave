@@ -6,7 +6,8 @@ import copy
 import secrets
 import threading
 from dataclasses import dataclass, field
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
 from voxweave.align_adapter import V2Status
 from voxweave.align_context import IssuedSegmentationContext, consume_context_role
 from voxweave.align_failures import CanonicalFailure
@@ -19,31 +20,11 @@ from voxweave.align_snapshot import (
     frozen_json_digest,
     thaw_json,
 )
-from voxweave.core.authority import AuthorityLedger, check_roots
-from voxweave.core.boundary_v2 import optimize_document
-from voxweave.core.finalizer import (
-    FinalizeEvidence,
-    FinalizePolicy,
-    FinalizerPreview,
-    finalize,
-    phase1_from_optimizer_selection,
-    register_optimizer_selection,
-)
-from voxweave.core.partition_check import check_partition, owned_unit_ids
-from voxweave.core.policy_delta import DELTA_REGISTRY
-from voxweave.core.providers import degradation_capture, provider_snapshot
 from voxweave.core.schema import Cue
-from voxweave.core.segdoc import SegDocument
-from voxweave.core.speaker_evidence import (
-    W_SPEAKER_INTERIOR,
-    annotate_speaker_ids,
-    named_multi_cues_unannotated,
-    project_speaker_evidence,
-    speaker_evidence,
-)
-from voxweave.core.subunit import refine_document
-from voxweave.core.trace_validator import replay_trace, stability_check
 from voxweave.engine_registry import EngineFamily, MANIFEST_ENGINE_BY_FAMILY
+
+if TYPE_CHECKING:
+    from voxweave.core.segdoc import SegDocument
 
 
 @dataclass(frozen=True)
@@ -247,13 +228,20 @@ def _validate_delivery(
         raise ValueError("segmentation top-level stream cardinality changed")
     for frozen, unit in zip(delivery.top_level_word_segments, document.units):
         value = thaw_json(frozen)
-        if not isinstance(value, dict) or (
-            value.get("text", value.get("word", "")),
-            value.get("start"),
-            value.get("end"),
-        ) != (unit.surface, unit.start, unit.end):
-            raise ValueError("segmentation top-level stream changed")
-    _validate_ranges(delivery, len(document.units))
+        # The persisted top-level stream is the snapped source evidence. The
+        # SegDocument intentionally carries the separately repaired timing view
+        # consumed by cue formation, so only cardinality and surface identity
+        # are common authority here.
+        if (
+            not isinstance(value, dict)
+            or value.get("text", value.get("word", "")) != unit.surface
+        ):
+            raise ValueError("segmentation top-level surface stream changed")
+    # The historical delivery may contain proportional coarse-unit cues whose
+    # word-data footprint cannot name a source-unit partition. Only a v2
+    # delivery claims the increasing contiguous unit-range authority.
+    if delivery.engine_family == "boundary-v2":
+        _validate_ranges(delivery, len(document.units))
 
 
 def issue_legacy_segmentation(
@@ -352,6 +340,29 @@ def _freeze_cue(cue: Cue, unit_range: tuple[int, int]) -> SegmentationDeliveryCu
 
 
 def _build_boundary_delivery(record: _LegacyRecord) -> SegmentationDelivery:
+    from voxweave.core.authority import AuthorityLedger, check_roots
+    from voxweave.core.boundary_v2 import optimize_document
+    from voxweave.core.finalizer import (
+        FinalizeEvidence,
+        FinalizePolicy,
+        FinalizerPreview,
+        finalize,
+        phase1_from_optimizer_selection,
+        register_optimizer_selection,
+    )
+    from voxweave.core.partition_check import check_partition, owned_unit_ids
+    from voxweave.core.policy_delta import DELTA_REGISTRY
+    from voxweave.core.providers import degradation_capture, provider_snapshot
+    from voxweave.core.speaker_evidence import (
+        W_SPEAKER_INTERIOR,
+        annotate_speaker_ids,
+        named_multi_cues_unannotated,
+        project_speaker_evidence,
+        speaker_evidence,
+    )
+    from voxweave.core.subunit import refine_document
+    from voxweave.core.trace_validator import replay_trace, stability_check
+
     document = copy.deepcopy(record.document)
     parent_speakers = speaker_evidence(document)
     with degradation_capture(quiet=True) as degraded:

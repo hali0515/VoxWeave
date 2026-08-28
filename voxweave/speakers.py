@@ -470,7 +470,17 @@ def load_speaker_mapping(
     effectively empty.
     """
     path = Path(path)
-    speakers = _mapping_entries(path)
+    return load_speaker_mapping_bytes(path.read_bytes(), known_ids, source=path.name)
+
+
+def load_speaker_mapping_bytes(
+    raw_bytes: bytes,
+    known_ids: Sequence[str] | set[str],
+    *,
+    source: str,
+) -> dict[str, str]:
+    """Project names from one exact mapping-byte observation."""
+    speakers = _mapping_entries_bytes(raw_bytes, source=source)
 
     known = set(known_ids)
     unknown: list[str] = []
@@ -486,7 +496,7 @@ def load_speaker_mapping(
     if unknown:
         log.warning(
             "%s: ignoring unknown speaker id(s): %s",
-            path.name,
+            source,
             ", ".join(sorted(unknown)),
         )
     return names
@@ -1501,6 +1511,7 @@ __all__ = [
     "extract_clip",
     "load_speaker_display_names",
     "load_speaker_mapping",
+    "load_speaker_mapping_bytes",
     "purge_voiceprints",
     "run_clip_command",
     "sanitize_ass_speaker_name",
