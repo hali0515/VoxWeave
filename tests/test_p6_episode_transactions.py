@@ -521,6 +521,7 @@ def test_vtt_replace_failure_reports_json_as_the_only_landed_primary(
     assert caught.value.failure.phase == "commit"
     assert caught.value.failure.detail_code == "vtt-replace"
     assert caught.value.landed == (json_path,)
+    assert caught.value.leftovers == ()
     assert json_path.read_bytes() == b"new json"
     assert vtt_path.read_bytes() == b"old vtt"
     assert not tuple(tmp_path.glob("*.part*"))
@@ -553,6 +554,7 @@ def test_episode_lock_failure_is_canonical_and_discards_stages(tmp_path, monkeyp
     assert caught.value.failure.phase == "episode-lock"
     assert caught.value.failure.detail_code == "episode-lock-acquire"
     assert caught.value.landed == ()
+    assert caught.value.leftovers == ()
     assert json_path.read_bytes() == b"old json"
     assert vtt_path.read_bytes() == b"old vtt"
     assert not tuple(tmp_path.glob("*.part*"))
