@@ -24,6 +24,10 @@ class _LegacyShiftFailure(RuntimeError):
     pass
 
 
+class _PreDistributionFailure(RuntimeError):
+    pass
+
+
 class _SyntheticWave:
     shape = (32_000,)
 
@@ -593,3 +597,35 @@ def test_public_route_real_shift_failure_is_ao09_and_stops_downstream(
     assert _failed_activities(trace) == [("AO-09", "legacy-time-transform")]
     assert _activity_count(trace, "AO-09", "legacy-time-transform", "started") == 1
     _assert_no_phase_after(trace, 9)
+
+
+def test_public_ctc_pre_distribution_failure_is_ao07_and_stops_downstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from voxweave import align_ctc, pipeline
+    from voxweave.align_runtime import capture_align_runtime_trace
+
+    vtt_path, media_path = _write_public_align_episode(tmp_path, route="ctc-full")
+    _stub_public_full_route_before_distribution(
+        monkeypatch,
+        route="ctc-full",
+        media_path=media_path,
+    )
+
+    def fail_pre_distribution(*_args: Any, **_kwargs: Any) -> Any:
+        raise _PreDistributionFailure("injected CTC pre-distribution failure")
+
+    monkeypatch.setattr(align_ctc, "_ctc_align_logp", fail_pre_distribution)
+
+    with capture_align_runtime_trace() as capture:
+        with pytest.raises(
+            _PreDistributionFailure,
+            match="CTC pre-distribution failure",
+        ):
+            pipeline.align(vtt_path, media_path=media_path, separate=False)
+    trace = capture.snapshot()
+
+    assert _failed_activities(trace) == [("AO-07", "backend-call")]
+    assert _activity_count(trace, "AO-07", "backend-call", "failed") == 1
+    _assert_no_phase_after(trace, 7)
