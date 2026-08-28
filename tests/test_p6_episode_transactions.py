@@ -200,6 +200,31 @@ def test_process_output_generation_change_stale_aborts_without_overwrite(
     assert vtt_path.read_bytes() == concurrent_vtt
 
 
+def test_process_json_only_generation_change_stale_aborts(tmp_path, monkeypatch):
+    from voxweave.episode_transaction import InputStaleError
+
+    nominal = tmp_path / "episode.mkv"
+    json_path = tmp_path / "episode.json"
+    vtt_path = tmp_path / "episode.vtt"
+    json_path.write_bytes(b'{"old":true}')
+    vtt_path.write_bytes(b"old vtt")
+    concurrent_json = b'{"concurrent":true}'
+    real_segment = pipeline.segment_document
+
+    def concurrent_segment(**kwargs):
+        result = real_segment(**kwargs)
+        json_path.write_bytes(concurrent_json)
+        return result
+
+    monkeypatch.setattr(pipeline, "segment_document", concurrent_segment)
+    with pytest.raises(InputStaleError) as caught:
+        pipeline.process(nominal, word_segments=("en", _units()))
+
+    assert caught.value.failure.detail_code == "process-output-generation"
+    assert json_path.read_bytes() == concurrent_json
+    assert vtt_path.read_bytes() == b"old vtt"
+
+
 def test_process_releases_panns_after_handoff_when_segmentation_fails(
     tmp_path, monkeypatch
 ):
