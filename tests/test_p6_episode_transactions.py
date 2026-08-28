@@ -523,3 +523,52 @@ def test_split_invalid_declared_pair_cleans_full_machine_artifact_set(tmp_path, 
         "dropping invalid voiceprint replay pair" in row.message
         for row in caplog.records
     )
+
+
+def test_public_align_publishes_preencoded_primaries_through_transaction(
+    tmp_path, monkeypatch
+):
+    from voxweave import backend, episode_transaction
+
+    media = tmp_path / "episode.wav"
+    media.write_bytes(b"media")
+    json_path = tmp_path / "episode.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "language": "zh",
+                "word_segments": [
+                    {"text": "你", "start": 0.0, "end": 0.5},
+                    {"text": "好", "start": 0.5, "end": 1.0},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    vtt_path = tmp_path / "episode.vtt"
+    vtt_path.write_text("WEBVTT\n\n你好\n", encoding="utf-8")
+    monkeypatch.setattr(
+        pipeline, "_prepare_16k_for_align", lambda *_args, **_kwargs: media
+    )
+    monkeypatch.setattr(pipeline, "slice_wav", lambda *_args, **_kwargs: media)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda _wav, text, _iso: [
+            {"text": value, "start": float(index), "end": float(index) + 0.5}
+            for index, value in enumerate(text)
+        ],
+    )
+    real_commit = episode_transaction.commit_primary_outputs
+    seen: dict[str, object] = {}
+
+    def observed_commit(**kwargs):
+        seen.update(kwargs)
+        return real_commit(**kwargs)
+
+    monkeypatch.setattr(episode_transaction, "commit_primary_outputs", observed_commit)
+    assert pipeline.align(vtt_path) == vtt_path
+    assert seen["command"] == "align"
+    assert seen["main_json_bytes"] == json_path.read_bytes()
+    assert seen["vtt_bytes"] == vtt_path.read_bytes()
