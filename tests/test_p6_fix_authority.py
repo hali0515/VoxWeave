@@ -421,3 +421,40 @@ def test_rat1_adds_only_the_fresh_authority_factory_and_adapter_result():
         "shadow_enabled",
     )
     assert align_acquisition.VerifiedFreshAlignment is not None
+
+
+def test_authority_profile_is_context_bound_and_rejects_loose_forged_input():
+    from voxweave import align_acquisition, align_distribution
+
+    assert "profile" not in inspect.signature(
+        align_distribution.build_authority_distribution
+    ).parameters
+    acquisition_source = inspect.getsource(align_acquisition)
+    assert "build_authority_distribution(" not in acquisition_source or (
+        "profile=" not in acquisition_source.split(
+            "build_authority_distribution(", maxsplit=1
+        )[1].split(")", maxsplit=1)[0]
+    )
+
+    forged = align_distribution.AuthorityLimitProfile(
+        "production",
+        align_distribution.CallWorkLimits(
+            9_000_000,
+            9_000_000,
+            9_000_000,
+            9_000_000,
+        ),
+        align_distribution.JobWorkLimits(
+            9_000,
+            9_000_000,
+            9_000_000,
+            9_000_000,
+            9_000_000,
+        ),
+        "f" * 64,
+    )
+    with pytest.raises(
+        align_distribution.AuthorityLimitProfileError,
+        match="production authority limits|profile",
+    ):
+        align_distribution.validate_authority_limit_profile(forged)
