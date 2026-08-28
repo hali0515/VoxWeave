@@ -731,6 +731,27 @@ def test_process_semantic_configuration_precedes_voiceprint_snapshot(
     assert events == ["semantic-config"]
 
 
+def test_process_output_snapshot_precedes_voiceprint_media_snapshot(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    (tmp_path / "episode.json").mkdir()
+    events: list[str] = []
+
+    class ForbiddenSnapshot:
+        def __init__(self, _path):
+            events.append("media-snapshot")
+            raise AssertionError("media snapshot ran before output snapshot")
+
+    monkeypatch.setattr(pipeline, "MediaSnapshot", ForbiddenSnapshot)
+
+    with pytest.raises(IsADirectoryError):
+        pipeline.process(media, diarize=True, voiceprints=True)
+
+    assert events == []
+
+
 def test_process_voiceprint_candidate_uses_the_same_context_bound_transaction(
     tmp_path, monkeypatch
 ):
