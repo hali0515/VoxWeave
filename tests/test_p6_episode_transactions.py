@@ -353,7 +353,7 @@ def test_sdh_generation_change_retains_existing_auxiliary(
     assert any("stale SDH" in record.message for record in caplog.records)
 
 
-def test_tolerant_mapping_observation_is_exact_and_rat7_recheck_is_dormant(
+def test_tolerant_mapping_observation_is_exact_and_rat7_recheck_is_active(
     tmp_path,
 ):
     from voxweave.episode_transaction import (
@@ -393,7 +393,7 @@ def test_tolerant_mapping_observation_is_exact_and_rat7_recheck_is_dormant(
     assert first.private_observation.lstat_value is not None
     assert same_speaker_mapping_generation(first, second)
     assert len(warnings) == 1
-    assert SPEAKER_MAPPING_CAS_ENABLED is False
+    assert SPEAKER_MAPPING_CAS_ENABLED is True
 
 
 def test_tolerant_mapping_distinguishes_absence_from_broken_symlink(tmp_path):
