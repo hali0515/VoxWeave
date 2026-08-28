@@ -15,7 +15,11 @@ from voxweave.align_adapter import (
     AlignProjectionInputs,
     _evaluated_record,
 )
-from voxweave.align_context import IssuedAlignContext, consume_context_role
+from voxweave.align_context import (
+    IssuedAlignContext,
+    IssuedContext,
+    consume_context_role,
+)
 from voxweave.align_failures import CanonicalFailure
 from voxweave.align_projector import project_align_delivery
 from voxweave.engine_registry import EngineFamily
@@ -77,8 +81,8 @@ class VerifiedEncodedCandidate:
 
 @dataclass(frozen=True)
 class _CandidateRecord:
-    context: IssuedAlignContext
-    result: AlignEvaluatedResult
+    context: IssuedContext
+    result: object
     candidate_set: CandidateSet
     outcomes: tuple[tuple[EngineFamily, CandidateOutcome], ...]
     outcome_snapshot: tuple[tuple[EngineFamily, CandidateOutcome], ...]
@@ -206,11 +210,24 @@ def encode_align_candidates(
             boundary = _encoder_failure()
     outcomes.append(("boundary-v2", boundary))
 
+    return _issue_candidate_set(context, result, tuple(outcomes))
+
+
+def _issue_candidate_set(
+    context: IssuedContext,
+    result: object,
+    outcomes: tuple[tuple[EngineFamily, CandidateOutcome], ...],
+) -> CandidateSet:
+    if tuple(family for family, _outcome in outcomes) != (
+        "legacy-v1",
+        "boundary-v2",
+    ):
+        raise ValueError("candidate outcomes are not in fixed family order")
     candidate_set = object.__new__(CandidateSet)
     object.__setattr__(
         candidate_set, "context_content_digest", context.context_content_digest
     )
-    object.__setattr__(candidate_set, "outcomes", tuple(outcomes))
+    object.__setattr__(candidate_set, "outcomes", outcomes)
     object.__setattr__(candidate_set, "_binding", secrets.token_hex(32))
     with _LOCK:
         _SETS[id(candidate_set)] = _CandidateRecord(
@@ -225,7 +242,7 @@ def encode_align_candidates(
 
 
 def _candidate_set_record(
-    context: IssuedAlignContext, candidate_set: CandidateSet
+    context: IssuedContext, candidate_set: CandidateSet
 ) -> _CandidateRecord:
     with _LOCK:
         record = _SETS.get(id(candidate_set))
@@ -246,8 +263,16 @@ def select_align_candidate(
     context: IssuedAlignContext, candidate_set: CandidateSet
 ) -> EncodedCandidate:
     """Select the registry family without rendering or fallback."""
+    return _select_candidate(context, candidate_set, context.engine_family)
+
+
+def _select_candidate(
+    context: IssuedContext,
+    candidate_set: CandidateSet,
+    family: EngineFamily,
+) -> EncodedCandidate:
     _candidate_set_record(context, candidate_set)
-    outcome = candidate_set.outcome_for(context.engine_family)
+    outcome = candidate_set.outcome_for(family)
     if not isinstance(outcome, EncodedCandidate):
         raise SelectedCandidateError(
             CanonicalFailure(

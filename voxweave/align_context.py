@@ -117,6 +117,7 @@ class _ContextRecord:
     private_evaluation_id: str
     paths: tuple[str, str, str | None]
     stable_fields: FrozenObject
+    public_seal: tuple[object, ...]
     role_order: tuple[str, ...]
     roles: dict[str, _RoleRecord]
     events: list[ContextRoleEvent]
@@ -124,6 +125,18 @@ class _ContextRecord:
 
 _ISSUED: dict[int, _ContextRecord] = {}
 _LOCK = threading.RLock()
+
+
+def _public_seal(context: IssuedContext) -> tuple[object, ...]:
+    common: tuple[object, ...] = (
+        context.context_content_digest,
+        context.context_binding_digest,
+        context.engine_family,
+        context.effective_iso,
+    )
+    if isinstance(context, IssuedAlignContext):
+        return (*common, context.route_kind, context._issuance_nonce)
+    return (*common, context._issuance_nonce)
 
 
 def _canonical(path: Path) -> str:
@@ -185,6 +198,7 @@ def _register(
             _canonical(media_path) if media_path is not None else None,
         ),
         stable_fields=stable_fields,
+        public_seal=_public_seal(context),
         role_order=role_order,
         roles={role: _RoleRecord() for role in role_order},
         events=[],
@@ -321,6 +335,10 @@ def _record_for(context: IssuedContext) -> _ContextRecord:
         nonce = getattr(context, "_issuance_nonce", None)
         if type(nonce) is not str or not nonce:
             raise ContextAuthorityError("context-unissued", "context seal is absent")
+        if _public_seal(context) != record.public_seal:
+            raise ContextAuthorityError(
+                "context-binding", "issued context public fields changed"
+            )
         return record
 
 
