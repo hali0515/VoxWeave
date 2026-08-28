@@ -1053,6 +1053,28 @@ def test_align_shadow_rich_failure_notifies_with_minimal_artifact(
     )
 
 
+def test_align_shadow_reports_strict_j0_failure_before_pending_w1(
+    tmp_path, monkeypatch
+):
+    _media, json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    json_path.write_text(
+        '{"language":"zh","language":"zh","word_segments":'
+        '[{"text":"你","start":0.0,"end":0.5},'
+        '{"text":"好","start":0.5,"end":1.0}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
+    observed: list[object] = []
+
+    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
+
+    assert len(observed) == 1
+    artifact = observed[0]
+    assert artifact.failure.kind == "v2-input-invalid"
+    assert artifact.failure.detail_code == "sibling-json-duplicate-key"
+    assert artifact.fresh["strict_input_status"] == "invalid"
+
+
 def test_align_shadow_observer_failure_cannot_change_selected_return(
     tmp_path, monkeypatch, caplog
 ):
