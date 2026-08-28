@@ -1058,6 +1058,18 @@ def test_align_shadow_observer_runs_once_after_disposal(tmp_path, monkeypatch):
     assert canonical["comparison"] == {"result": None}
 
 
+def test_align_shadow_observer_presence_is_inert_when_flag_is_off(
+    tmp_path, monkeypatch
+):
+    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    monkeypatch.delenv("VOXWEAVE_SEG_V2_SHADOW", raising=False)
+    observed: list[object] = []
+
+    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
+
+    assert observed == []
+
+
 def test_align_shadow_rich_failure_notifies_with_minimal_artifact(
     tmp_path, monkeypatch
 ):
