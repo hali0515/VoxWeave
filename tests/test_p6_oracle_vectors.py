@@ -718,6 +718,38 @@ def test_qwen_all_aligned_lists_empty_is_canonical_before_projection(
     assert caught.value.failure.detail_code == "all-block-units-empty"
 
 
+def _assert_qwen_window_failure_runtime_trace(trace: object) -> None:
+    events = trace.events  # type: ignore[attr-defined]
+    assert [
+        (event.phase, event.activity)
+        for event in events
+        if event.state == "failed"
+    ] == [("AO-06", "physical-call-preparation")]
+    assert sum(
+        event.phase == "AO-06"
+        and event.activity == "physical-call-preparation"
+        and event.state == "started"
+        for event in events
+    ) == 1
+    assert not [
+        event
+        for event in events
+        if event.phase == "AO-06" and event.state == "completed"
+    ]
+    assert not [
+        event
+        for event in events
+        if 7 <= int(event.phase.removeprefix("AO-")) <= 23
+        or event.phase == "AO-25"
+    ]
+    assert any(
+        event.phase == "AO-24"
+        and event.activity == "backend-and-audio-temp-disposal"
+        and event.state == "completed"
+        for event in events
+    )
+
+
 @pytest.mark.parametrize("source_mode", ("vtt", "word-segments"))
 @pytest.mark.parametrize(
     ("crop", "exception_type", "detail_code"),
@@ -736,6 +768,7 @@ def test_qwen_nonfinite_route_bounds_from_both_sources_are_canonical_pre_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from voxweave.align_runtime import capture_align_runtime_trace
     from voxweave import backend, pipeline, realign
 
     words = (
@@ -757,10 +790,12 @@ def test_qwen_nonfinite_route_bounds_from_both_sources_are_canonical_pre_model(
         lambda *_args, **_kwargs: pytest.fail("invalid route bound reached model work"),
     )
     monkeypatch.setattr(backend, "release", lambda: None)
-    with pytest.raises(exception_type) as caught:
-        pipeline.align(vtt_path, media_path=media_path, separate=False)
+    with capture_align_runtime_trace() as capture:
+        with pytest.raises(exception_type) as caught:
+            pipeline.align(vtt_path, media_path=media_path, separate=False)
     assert caught.value.failure.kind == "qwen-window-operation-failed"
     assert caught.value.failure.detail_code == detail_code
+    _assert_qwen_window_failure_runtime_trace(capture.snapshot())
 
 
 @pytest.mark.parametrize("source_mode", ("timestamp", "word-segments"))
@@ -988,6 +1023,7 @@ def test_qwen_window_io_failures_are_canonical_pre_model_and_cleanup_owned_files
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from voxweave.align_runtime import capture_align_runtime_trace
     from voxweave import backend, chunking, pipeline
 
     vtt_path, media_path = _qwen_episode(tmp_path, timed=True, word_segments=None)
@@ -1063,8 +1099,9 @@ def test_qwen_window_io_failures_are_canonical_pre_model_and_cleanup_owned_files
             lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failed")),
         )
 
-    with pytest.raises(OSError) as caught:
-        pipeline.align(vtt_path, media_path=media_path, separate=False)
+    with capture_align_runtime_trace() as capture:
+        with pytest.raises(OSError) as caught:
+            pipeline.align(vtt_path, media_path=media_path, separate=False)
     assert str(caught.value) == f"{edge} failed"
     assert caught.value.failure.kind == "qwen-window-operation-failed"
     assert caught.value.failure.phase == "qwen-window"
@@ -1072,6 +1109,7 @@ def test_qwen_window_io_failures_are_canonical_pre_model_and_cleanup_owned_files
     assert backend_calls == 0
     assert closed is (edge != "open")
     assert not list(tmp_path.glob("voxweave_chunk_*"))
+    _assert_qwen_window_failure_runtime_trace(capture.snapshot())
 
 
 def test_final_evidence_bind_classifies_independent_projection_mismatch(
