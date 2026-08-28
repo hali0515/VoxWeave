@@ -192,3 +192,25 @@ def test_seed_materialization_returns_independent_mutable_w1_copies():
     first[0]["word_data"][0]["text"] = "mutated"
     assert second[0]["word_data"][0]["text"] == "word"
     assert seed.blocks is not None and seed.blocks[0].footprint == "word"
+
+
+def test_seed_retains_exact_source_text_as_w1_fallback():
+    from voxweave.align_distribution import AuthorityBlock
+    from voxweave.core.align_seed import build_align_seed, materialize_seed_cues
+
+    _, distribution = _distribution(("Call response",), ("Call", "response"))
+    blocks = (AuthorityBlock(0, "Call response", "Call\nresponse"),)
+    units = (
+        _unit("r0", "Call", 0.1, 0.5),
+        _unit("r1", "response", 0.6, 1.0, call_unit_index=1),
+    )
+
+    seed = build_align_seed(
+        blocks=blocks, units=units, distribution=distribution, iso="en"
+    )
+
+    assert seed.status == "valid"
+    assert seed.blocks is not None
+    assert seed.blocks[0].text == "Call\nresponse"
+    assert seed.blocks[0].footprint == "Call\nresponse"
+    assert materialize_seed_cues(seed)[0]["text"] == "Call\nresponse"
