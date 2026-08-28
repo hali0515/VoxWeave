@@ -398,6 +398,18 @@ def test_tolerant_mapping_distinguishes_absence_from_broken_symlink(tmp_path):
     assert len(warnings) == 1
 
 
+def test_file_generation_distinguishes_absence_from_broken_symlink(tmp_path):
+    from voxweave.episode_transaction import capture_file_generation
+
+    absent = tmp_path / "absent.json"
+    assert capture_file_generation(absent).present is False
+
+    broken = tmp_path / "episode.json"
+    broken.symlink_to(tmp_path / "missing-target.json")
+    with pytest.raises(FileNotFoundError):
+        capture_file_generation(broken)
+
+
 def test_transaction_module_has_no_model_renderer_or_pipeline_dependency():
     source = inspect.getsource(
         __import__("voxweave.episode_transaction", fromlist=["*"])
