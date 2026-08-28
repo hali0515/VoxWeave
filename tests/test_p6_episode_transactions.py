@@ -982,10 +982,17 @@ def test_public_align_requires_independent_selected_projection(tmp_path, monkeyp
 
 
 def _stub_public_shadow_align(tmp_path, monkeypatch):
+    import wave
+
     from voxweave import backend
+    from voxweave.align_acquisition import qwen_sample_geometry
 
     media = tmp_path / "episode.wav"
-    media.write_bytes(b"media")
+    with wave.open(str(media), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(16_000)
+        stream.writeframes(b"\x00\x00" * 32_000)
     json_path = tmp_path / "episode.json"
     json_path.write_text(
         json.dumps(
@@ -1005,7 +1012,31 @@ def _stub_public_shadow_align(tmp_path, monkeypatch):
     monkeypatch.setattr(
         pipeline, "_prepare_16k_for_align", lambda *_args, **_kwargs: media
     )
-    monkeypatch.setattr(pipeline, "slice_wav", lambda *_args, **_kwargs: media)
+
+    def fake_slice(
+        _wav,
+        start,
+        end,
+        *,
+        _sample_geometry_observer=None,
+        **_kwargs,
+    ):
+        geometry = qwen_sample_geometry(
+            nominal_start=float(start),
+            nominal_end=float(end),
+            sample_rate=16_000,
+            sample_count=32_000,
+        )
+        if _sample_geometry_observer is not None:
+            _sample_geometry_observer(
+                geometry.sample_start,
+                geometry.sample_end,
+                geometry.sample_rate,
+                geometry.sample_count,
+            )
+        return media
+
+    monkeypatch.setattr(pipeline, "slice_wav", fake_slice)
     monkeypatch.setattr(
         backend,
         "align_text",
@@ -1034,8 +1065,8 @@ def test_align_shadow_observer_runs_once_after_disposal(tmp_path, monkeypatch):
     assert len(observed) == 1
     artifact = observed[0]
     assert artifact.artifact_kind == "rich"
-    assert artifact.status == "invalid"
-    assert artifact.failure.detail_code == "w1-root-event"
+    assert artifact.status == "valid"
+    assert artifact.failure is None
     assert (
         artifact.selected["vtt_sha256"]
         == hashlib.sha256(vtt_path.read_bytes()).hexdigest()
@@ -1058,8 +1089,10 @@ def test_align_shadow_observer_runs_once_after_disposal(tmp_path, monkeypatch):
         "selected",
     )
     assert tuple(canonical["v2"]) == ("semantic", "validators")
-    assert canonical["v2"] == {"semantic": None, "validators": None}
-    assert canonical["comparison"] == {"result": None}
+    assert canonical["v2"]["semantic"] is not None
+    assert canonical["v2"]["validators"] is not None
+    assert canonical["comparison"]["result"]["active_classes"] == ["ALD-2"]
+    assert canonical["comparison"]["result"]["violations"] == []
 
 
 def test_align_shadow_observer_presence_is_inert_when_flag_is_off(
@@ -1091,10 +1124,9 @@ def test_align_shadow_rich_failure_notifies_with_minimal_artifact(
     assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
     assert len(observed) == 1
     assert observed[0].artifact_kind == "minimal-failure"
-    assert observed[0].failure.detail_code == "w1-root-event"
-    assert observed[0].failure.secondary[-1].detail_code == (
-        "rich-artifact-construction"
-    )
+    assert observed[0].failure.kind == "shadow-internal-error"
+    assert observed[0].failure.detail_code == "rich-artifact-construction"
+    assert observed[0].failure.secondary == ()
 
 
 def test_align_shadow_reports_strict_j0_failure_before_pending_w1(
@@ -1215,6 +1247,16 @@ def test_qwen_align_block_keeps_nominal_legacy_and_observes_sample_origin(
     chunks: list = []
     origins: list[float] = []
 
+    def invoke_qwen(
+        backend_call,
+        _source_position,
+        _legacy_origin,
+        _nominal_end,
+        **geometry,
+    ):
+        origins.append(geometry["audio_sample_start"] / geometry["sample_rate"])
+        return backend_call()
+
     delivered = pipeline._align_blocks(
         wav,
         [{"text": "x", "start": 0.10001, "end": 0.5}],
@@ -1224,9 +1266,7 @@ def test_qwen_align_block_keeps_nominal_legacy_and_observes_sample_origin(
         crops=[(0.10001, 0.5)],
         reporter=pipeline.Reporter(),
         tmp_chunks=chunks,
-        raw_call_observer=lambda _raw, _sources, origin, _identity: origins.append(
-            origin
-        ),
+        qwen_invoker=invoke_qwen,
     )
     try:
         assert delivered[0][0]["start"] == 0.10001

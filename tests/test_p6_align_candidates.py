@@ -4,13 +4,40 @@ import json
 import pytest
 
 
-def _context(tmp_path):
-    from voxweave.align_context import consume_context_role, issue_align_context
-    from voxweave.align_snapshot import FrozenObject, freeze_json
+def _evaluated(tmp_path, *, shadow_requested=False):
+    from voxweave.align_acquisition import (
+        _bind_fresh_adapter_payload,
+        _fresh_alignment_call_observer,
+        _fresh_core_inputs,
+        begin_fresh_alignment,
+        seal_fresh_alignment,
+    )
+    from voxweave.align_adapter import (
+        AlignDelivery,
+        AlignDeliveryCue,
+        AlignProjectionInputs,
+        PersistedAlignUnit,
+        SourceBlockDecoration,
+        _adapter_semantic_observation,
+        issue_align_evaluated_result,
+        run_locked_align_adapter,
+    )
+    from voxweave.align_context import issue_align_context
+    from voxweave.align_evidence_core import build_evidence_core
+    from voxweave.align_inputs import (
+        LegacyAlignPolicy,
+        resolve_align_profile,
+        resolve_finalize_evidence,
+        validate_v2_policy,
+    )
+    from voxweave.align_snapshot import (
+        FrozenObject,
+        StrictInputStatus,
+        freeze_json,
+    )
 
     stable_fields = freeze_json({"case": "candidate"})
     assert isinstance(stable_fields, FrozenObject)
-
     context = issue_align_context(
         stable_fields=stable_fields,
         target_path=tmp_path / "episode.vtt",
@@ -19,63 +46,17 @@ def _context(tmp_path):
         effective_iso="en",
         route_kind="ctc-full",
     )
-    consume_context_role(context, "acquisition", consumer="FreshAlignmentIssuer")
-    return context
-
-
-def _core(context):
-    from voxweave.align_acquisition import capture_strict_units, transform_strict_units
-    from voxweave.align_distribution import (
-        AuthorityBlock,
-        AuthorityCallInput,
-        RouteClaim,
-        RouteExpectation,
-        build_authority_distribution,
+    session = begin_fresh_alignment(
+        context,
+        alignment_texts=("hello",),
+        source_indices=(0,),
+        language="en",
+        prepared_audio_sample_count=48_000,
     )
-    from voxweave.align_evidence_core import project_evidence_core
+    raw_units = ({"text": "hello", "start": 1.0, "end": 2.0},)
+    _fresh_alignment_call_observer(session)(raw_units, raw_units, (0,), 0.0)
+    acquisition = seal_fresh_alignment(session)
 
-    blocks = (AuthorityBlock(0, "hello"),)
-    capture = capture_strict_units(
-        ({"text": "hello", "start": 1.0, "end": 2.0},),
-        call_index=0,
-        raw_unit_ids=("r0",),
-    )
-    transform = transform_strict_units(
-        capture, physical_origin_seconds=0.0, identity=True
-    )
-    distribution = build_authority_distribution(
-        blocks=blocks,
-        delivery_route=(RouteExpectation(0, 0, "call", 0),),
-        calls=(
-            AuthorityCallInput(0, (0,), (0, 1), ("r0",), ("hello",), "valid", None),
-        ),
-        skipped_blocks=(),
-        route_claims=(RouteClaim("call", 0, 0, 0),),
-        iso="en",
-    )
-    return project_evidence_core(
-        context_content_digest=context.context_content_digest,
-        blocks=blocks,
-        captures=(capture,),
-        transforms=(transform,),
-        distribution=distribution,
-        seed_status="valid",
-        seed_reasons=(),
-    )
-
-
-def _evaluated(tmp_path, *, shadow_requested=False):
-    from voxweave.align_adapter import (
-        AlignDelivery,
-        AlignDeliveryCue,
-        AlignProjectionInputs,
-        PersistedAlignUnit,
-        SourceBlockDecoration,
-        issue_legacy_align_evaluated_result,
-    )
-    from voxweave.align_snapshot import FrozenObject, freeze_json
-
-    context = _context(tmp_path)
     unit = PersistedAlignUnit("hello", 1.0, 2.0)
     cue = AlignDeliveryCue(
         source_index=0,
@@ -88,10 +69,9 @@ def _evaluated(tmp_path, *, shadow_requested=False):
         speech_start=1.0,
         speech_end=2.0,
     )
-    evidence_core = _core(context)
     delivery = AlignDelivery(
         context.context_content_digest,
-        evidence_core.core_digest,
+        acquisition.receipt_digest,
         "legacy-v1",
         "ctc-full",
         (cue,),
@@ -110,12 +90,78 @@ def _evaluated(tmp_path, *, shadow_requested=False):
         voiceprint_media=None,
         segmentation=segmentation,
     )
-    result = issue_legacy_align_evaluated_result(
+    policy = LegacyAlignPolicy(0.0, 0.0, 0.0)
+    profile_manifest = {
+        "manifest_version": 1,
+        "engine": "legacy-v1",
+        "language": "en",
+        "profile": {
+            "max_line_length": 42,
+            "max_lines": 2,
+            "clause_ms": 400,
+            "vad_skip_ms": 1000,
+            "offline_ms": 700,
+            "min_cue_s": 0,
+            "max_cue_s": 0,
+            "glue_gap_s": 0,
+            "cps": 0,
+            "lag_out_s": 0,
+            "shot_snap_s": 0,
+        },
+    }
+    profile = resolve_align_profile(profile_manifest, effective_iso="en")
+    evidence_resolution = resolve_finalize_evidence(
+        shot_changes=(1.5,), sing_spans=((1.0, 2.0),)
+    )
+    _bind_fresh_adapter_payload(
         context,
-        delivery=delivery,
+        acquisition,
+        legacy_delivery=delivery,
         projection_inputs=inputs,
+        strict_input_status=StrictInputStatus("valid", None),
+        v2_policy_status=validate_v2_policy(policy),
+        profile_resolution=profile,
+        evidence_resolution=evidence_resolution,
+    )
+    adapter_result = run_locked_align_adapter(
+        context, acquisition, shadow_enabled=shadow_requested
+    )
+    core_inputs = _fresh_core_inputs(context, acquisition)
+    evidence_core = build_evidence_core(
+        context_content_digest=context.context_content_digest,
+        blocks=core_inputs[0],
+        captures=core_inputs[1],
+        transforms=core_inputs[2],
+        distribution=core_inputs[3],
+        seed_status=core_inputs[4],
+        seed_reasons=core_inputs[5],
+        physical_calls=core_inputs[6],
+        receipt_digest=acquisition.receipt_digest,
+        language="en",
+    )
+    comparison = None
+    if adapter_result.v2_status.kind == "valid":
+        from voxweave.core.align_compare import compare_semantic_deltas
+
+        assert adapter_result.v2 is not None
+        assert profile.profile is not None
+        observation = _adapter_semantic_observation(context, adapter_result)
+        assert observation is not None
+        comparison = compare_semantic_deltas(
+            route_kind=context.route_kind,
+            physical_calls=evidence_core.physical_calls,
+            authority_blocks=evidence_core.blocks,
+            legacy=adapter_result.legacy,
+            v2=adapter_result.v2,
+            semantic_observation=observation,
+            profile=profile.profile,
+            evidence=evidence_resolution,
+        )
+    result = issue_align_evaluated_result(
+        context,
+        adapter_result,
         evidence_core=evidence_core,
-        shadow_requested=shadow_requested,
+        comparison=comparison,
     )
     return context, result
 
@@ -170,9 +216,8 @@ def test_candidate_set_is_issuer_only_and_encoder_role_is_single_use(tmp_path):
     assert getattr(error.value, "detail_code", None) == "context-consumed"
 
 
-def test_shadow_typed_failure_survives_without_affecting_selected_legacy(tmp_path):
+def test_ratified_shadow_candidate_does_not_change_selected_legacy(tmp_path):
     from voxweave.candidate_encoder import (
-        CandidateFailure,
         EncodedCandidate,
         encode_align_candidates,
         select_align_candidate,
@@ -182,8 +227,7 @@ def test_shadow_typed_failure_survives_without_affecting_selected_legacy(tmp_pat
     candidates = encode_align_candidates(context, result)
     assert isinstance(candidates.outcome_for("legacy-v1"), EncodedCandidate)
     boundary = candidates.outcome_for("boundary-v2")
-    assert isinstance(boundary, CandidateFailure)
-    assert boundary.failure.detail_code == "w1-root-event"
+    assert isinstance(boundary, EncodedCandidate)
     selected = select_align_candidate(context, candidates)
     assert selected.engine_family == "legacy-v1"
 

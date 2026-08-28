@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from voxweave.align_delta_registry import ALIGN_DELTA_REGISTRY
 from voxweave.align_acquisition import (
     AuthorityTransformResult,
     FreshUnit,
@@ -717,6 +718,11 @@ def project_evidence_core(
 
 
 def evaluate_ald6(producer: EvidenceCore, reference: EvidenceCore) -> ALD6Outcome:
+    definition = ALIGN_DELTA_REGISTRY.get("ALD-6")
+    if definition is None or definition.phase != "mandatory-core":
+        raise EvidenceCoreProjectionError(
+            "mandatory ALD-6 registry entry is unavailable"
+        )
     if not isinstance(producer, EvidenceCore) or not isinstance(
         reference, EvidenceCore
     ):

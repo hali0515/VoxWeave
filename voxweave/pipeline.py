@@ -4768,6 +4768,7 @@ def _align_blocks(
             cs,
             ce,
             _sample_geometry_observer=observe_sample_geometry,
+            _canonical_qwen_failures=True,
         )
         tmp_chunks.append(cwav)
         geometry = observed_geometry
@@ -4998,16 +4999,47 @@ def align(
     if not full_pass:
         has_ts = all(b["start"] is not None and b["end"] is not None for b in blocks)
         if not has_ts and not word_segments:
-            raise RuntimeError(
+            exc = RuntimeError(
                 f"{json_path.name} has no word_segments and VTT has no timestamps; "
                 f"cannot route audio windows"
             )
-        spans = realign.route_blocks(blocks, word_segments)
-        crops = realign.crop_blocks(spans)
+            _attach_canonical_failure(
+                exc,
+                kind="qwen-route-invalid",
+                phase="route-plan",
+                detail_code="no-route-source",
+            )
+            raise exc
+        try:
+            spans = realign.route_blocks(blocks, word_segments)
+            crops = realign.crop_blocks(spans)
+        except (IndexError, KeyError) as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="qwen-window-operation-failed",
+                phase="route-plan",
+                detail_code="route-bound-access",
+            )
+            raise
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="qwen-window-operation-failed",
+                phase="route-plan",
+                detail_code="route-bound-arithmetic",
+            )
+            raise
         if all(c is None for c in crops):
-            raise RuntimeError(
+            exc = RuntimeError(
                 "routing failed: no alignable blocks (text completely mismatches word_segments?)"
             )
+            _attach_canonical_failure(
+                exc,
+                kind="qwen-route-invalid",
+                phase="route-plan",
+                detail_code="all-crops-none",
+            )
+            raise exc
 
     tmp: list[Path] = []
     tmp_chunks: list[Path] = []
@@ -5076,6 +5108,7 @@ def align(
             strict_shot_changes=strict_shot_changes,
             strict_sing_spans=strict_sing_spans,
             explicit_media=explicit_media_requested,
+            block_content_sha256=input_snapshot.block_content_sha256,
         )
         observation_input = {
             "context_content_digest": align_context.context_content_digest,
@@ -5148,7 +5181,10 @@ def align(
                 }
                 for block in blocks
             ],
-            "crops": crops,
+            "crops": [
+                None if crop is None else [float(crop[0]).hex(), float(crop[1]).hex()]
+                for crop in crops
+            ],
         }
 
         def stable_fact_digest(value: object) -> str:
@@ -5196,7 +5232,14 @@ def align(
         # position_units_with_vad is not needed here (unlike the transcribe path).
         final, all_units = realign.group_block_spans(block_units)
         if not all_units:
-            raise RuntimeError(f"no aligned units for {media.name}")
+            exc = RuntimeError(f"no aligned units for {media.name}")
+            _attach_canonical_failure(
+                exc,
+                kind="no-aligned-units",
+                phase="fresh-acquisition",
+                detail_code="all-block-units-empty",
+            )
+            raise exc
         acquisition = seal_fresh_alignment(fresh_session)
         # fill_insert -> enforce_min_duration -> rescue_tiny_cues (extend flash cues like
         # so/あ, overlap allowed with next-neighbor only) -> clamp.

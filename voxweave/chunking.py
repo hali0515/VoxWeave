@@ -8,6 +8,8 @@ from pathlib import Path
 
 import soundfile as sf
 
+from voxweave.align_failures import CanonicalFailure
+
 SAMPLE_RATE = 16000
 # Raised from silero default 100ms to 300ms: 200ms chops natural mid-sentence pauses.
 VAD_MIN_SILENCE_MS = int(os.environ.get("VOXWEAVE_VAD_MIN_SILENCE_MS", "300"))
@@ -297,6 +299,7 @@ def slice_wav(
     end: float,
     *,
     _sample_geometry_observer: Callable[[int, int, int, int], None] | None = None,
+    _canonical_qwen_failures: bool = False,
 ) -> Path:
     """Slice the [start,end] segment from a 16k wav, write to a temp wav, return path (caller deletes).
 
@@ -306,17 +309,62 @@ def slice_wav(
     Frame arithmetic and clamping mirror the previous full-read-then-slice exactly, so the
     output is sample-identical.
     """
-    with sf.SoundFile(str(wav_path)) as f:
+
+    def classify(exc: BaseException, detail_code: str) -> None:
+        if not _canonical_qwen_failures:
+            return
+        try:
+            if not isinstance(getattr(exc, "failure", None), CanonicalFailure):
+                setattr(
+                    exc,
+                    "failure",
+                    CanonicalFailure(
+                        "qwen-window-operation-failed",
+                        "qwen-window",
+                        detail_code,
+                    ),
+                )
+        except Exception:
+            pass
+
+    try:
+        f = sf.SoundFile(str(wav_path))
+    except Exception as exc:
+        classify(exc, "sample-open")
+        raise
+    try:
         sr = f.samplerate
         frames = len(f)
-        a = min(max(0, int(start * sr)), frames)
-        b = min(frames, int(end * sr))
+        try:
+            a = min(max(0, int(start * sr)), frames)
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            classify(exc, "sample-start-index")
+            raise
+        try:
+            b = min(frames, int(end * sr))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            classify(exc, "sample-end-index")
+            raise
         if _sample_geometry_observer is not None:
             _sample_geometry_observer(a, b, sr, frames)
-        f.seek(a)
-        data = f.read(max(0, b - a), dtype="float32")
-    fd, path = tempfile.mkstemp(suffix=".wav", prefix="voxweave_chunk_")
-    os.close(fd)
+        try:
+            f.seek(a)
+            data = f.read(max(0, b - a), dtype="float32")
+        except Exception as exc:
+            classify(exc, "sample-seek-read")
+            raise
+    finally:
+        f.close()
+    try:
+        fd, path = tempfile.mkstemp(suffix=".wav", prefix="voxweave_chunk_")
+        os.close(fd)
+    except Exception as exc:
+        classify(exc, "sample-temp-create")
+        raise
     out = Path(path)
-    sf.write(str(out), data, sr)
+    try:
+        sf.write(str(out), data, sr)
+    except Exception as exc:
+        classify(exc, "sample-write")
+        raise
     return out

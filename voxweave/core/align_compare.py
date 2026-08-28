@@ -673,6 +673,15 @@ def _trace_relation(
                 _finite_float(start) and _finite_float(end) for start, end in projected
             ):
                 observed_delivery = projected
+        elif all(
+            _finite_float(getattr(row, "start", None))
+            and _finite_float(getattr(row, "end", None))
+            for row in observed_delivery_raw
+        ):
+            observed_delivery = tuple(
+                (getattr(row, "start"), getattr(row, "end"))
+                for row in observed_delivery_raw
+            )
     v2_delivery = tuple(
         (getattr(cue, "start", None), getattr(cue, "end", None)) for cue in v2_cues
     )
@@ -846,6 +855,7 @@ def _qwen_origin_relation(
 def _common_observation_relation(observation: object) -> bool:
     lineage = getattr(observation, "semantic_root_lineage", None)
     partition = getattr(observation, "partition_result", None)
+    exit_driving = getattr(partition, "exit_driving", None)
     return (
         isinstance(lineage, tuple)
         and any(
@@ -856,7 +866,7 @@ def _common_observation_relation(observation: object) -> bool:
             and row[5] is None
             for row in lineage
         )
-        and getattr(partition, "exit_driving", None) is False
+        and (exit_driving is False or exit_driving == ())
         and getattr(observation, "trace_problems", None) == ()
         and getattr(observation, "stability_problems", None) == ()
     )

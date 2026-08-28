@@ -115,7 +115,7 @@ def _semantic_facts(*, bad_text: bool = False, bad_leg: bool = False):
             ),
         ),
         phase1_seed=(phase1,),
-        delivered=((start, v2_cue.end),),
+        delivered=(v2_cue,),
         report=SimpleNamespace(terminal="fixed-point"),
         trace=SimpleNamespace(
             legs=legs,
@@ -123,7 +123,7 @@ def _semantic_facts(*, bad_text: bool = False, bad_leg: bool = False):
             cycle=None,
             sweeps=1,
         ),
-        partition_result=SimpleNamespace(exit_driving=False),
+        partition_result=SimpleNamespace(exit_driving=()),
         trace_problems=(),
         stability_problems=(),
     )
