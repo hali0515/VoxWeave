@@ -656,6 +656,7 @@ def test_public_align_publishes_preencoded_primaries_through_transaction(
     tmp_path, monkeypatch
 ):
     from voxweave import backend, episode_transaction
+    from voxweave.align_context import IssuedAlignContext
 
     media = tmp_path / "episode.wav"
     media.write_bytes(b"media")
@@ -697,5 +698,53 @@ def test_public_align_publishes_preencoded_primaries_through_transaction(
     monkeypatch.setattr(episode_transaction, "commit_primary_outputs", observed_commit)
     assert pipeline.align(vtt_path) == vtt_path
     assert seen["command"] == "align"
+    assert isinstance(seen["context"], IssuedAlignContext)
     assert seen["main_json_bytes"] == json_path.read_bytes()
     assert seen["vtt_bytes"] == vtt_path.read_bytes()
+
+
+def test_public_align_requires_independent_selected_projection(tmp_path, monkeypatch):
+    from voxweave import backend, candidate_encoder
+
+    media = tmp_path / "episode.wav"
+    media.write_bytes(b"media")
+    json_path = tmp_path / "episode.json"
+    original_json = json.dumps(
+        {
+            "language": "zh",
+            "word_segments": [
+                {"text": "你", "start": 0.0, "end": 0.5},
+                {"text": "好", "start": 0.5, "end": 1.0},
+            ],
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    json_path.write_bytes(original_json)
+    vtt_path = tmp_path / "episode.vtt"
+    original_vtt = "WEBVTT\n\n你好\n".encode()
+    vtt_path.write_bytes(original_vtt)
+    monkeypatch.setattr(
+        pipeline, "_prepare_16k_for_align", lambda *_args, **_kwargs: media
+    )
+    monkeypatch.setattr(pipeline, "slice_wav", lambda *_args, **_kwargs: media)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda _wav, text, _iso: [
+            {"text": value, "start": float(index), "end": float(index) + 0.5}
+            for index, value in enumerate(text)
+        ],
+    )
+    monkeypatch.setattr(
+        candidate_encoder,
+        "verify_selected_align_projection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("independent align projection rejected")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="independent align projection rejected"):
+        pipeline.align(vtt_path)
+
+    assert json_path.read_bytes() == original_json
+    assert vtt_path.read_bytes() == original_vtt
