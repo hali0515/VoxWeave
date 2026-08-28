@@ -1410,6 +1410,7 @@ class LegacyCallDistributionReceipt:
 class LegacyDistributionResult:
     block_units: tuple[tuple[Any, ...], ...]
     receipt: LegacyCallDistributionReceipt
+    relative_block_units: tuple[tuple[Any, ...], ...]
 
 
 def _legacy_count(text: str, iso: str) -> int:
@@ -1462,10 +1463,25 @@ def legacy_distribute_before_shift(
         if realized_upper - realized_lower < count:
             shortages.append(owner_sources[delivery_index])
         cursor += count
+    relative_projected = tuple(
+        tuple(
+            {
+                "text": unit["text"],
+                "start": unit["start"],
+                "end": unit["end"],
+            }
+            for unit in group
+        )
+        for group in retained
+    )
     if identity:
-        projected = tuple(tuple(group) for group in retained)
+        projected = tuple(
+            tuple(dict(unit) for unit in group) for group in relative_projected
+        )
     else:
-        projected = tuple(tuple(shift_units(list(group), origin)) for group in retained)
+        projected = tuple(
+            tuple(shift_units(list(group), origin)) for group in relative_projected
+        )
     consumed = min(cursor, raw_count)
     receipt = LegacyCallDistributionReceipt(
         owner_source_indices=owner_sources,
@@ -1478,4 +1494,4 @@ def legacy_distribute_before_shift(
         shortage_source_indices=tuple(shortages),
         leftover_unit_ids=raw_unit_ids[consumed:],
     )
-    return LegacyDistributionResult(projected, receipt)
+    return LegacyDistributionResult(projected, receipt, relative_projected)

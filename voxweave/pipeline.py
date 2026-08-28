@@ -4768,30 +4768,10 @@ class _SelectedLegacyAlignResult:
     all_units: tuple[Mapping[str, Any], ...]
 
 
-def _seal_legacy_owner_slices(
-    block_units: Sequence[Sequence[Mapping[str, Any]]],
-) -> tuple[tuple[Mapping[str, Any], ...], ...]:
-    """Retain only the already-distributed legacy owners, without surplus access."""
+def _retain_qwen_owner_slice(raw_units: Sequence[dict]) -> list[dict]:
+    """Assign one physical Qwen result to its single historical cue owner."""
 
-    return tuple(tuple(owner) for owner in block_units)
-
-
-def _seal_legacy_absolute_times(
-    block_units: Sequence[Sequence[Mapping[str, Any]]],
-) -> list[list[dict[str, Any]]]:
-    """Read and seal the exact historical text/start/end projection."""
-
-    return [
-        [
-            {
-                "text": unit["text"],
-                "start": unit["start"],
-                "end": unit["end"],
-            }
-            for unit in owner
-        ]
-        for owner in block_units
-    ]
+    return list(raw_units)
 
 
 def _seal_selected_legacy_align_result(
@@ -4829,6 +4809,8 @@ def _align_blocks(
     raw_call_observer: Callable[..., None] | None = None,
     qwen_invoker: Callable[..., Sequence[Any]] | None = None,
     backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """Route blocks to the configured aligner and return per-block units.
 
@@ -4840,6 +4822,9 @@ def _align_blocks(
 
     Per-cue slices are appended to ``tmp_chunks`` for the caller's ``finally`` to clean up.
     """
+    if (legacy_distribution_invoker is None) != (legacy_shift_invoker is None):
+        raise ValueError("legacy projection phase invokers must be supplied together")
+
     # cue (start,end) bounds are used ONLY as silence anchors to split movie-length audio
     # into memory-sized chunks when it overflows the single-pass DP budget — NOT to crop/route
     # per cue. align is routing-free because the input VTT timestamps are exactly what may be
@@ -4860,6 +4845,8 @@ def _align_blocks(
             bounds=bounds,
             _raw_call_observer=raw_call_observer,
             _backend_invoker=backend_invoker,
+            _legacy_distribution_invoker=legacy_distribution_invoker,
+            _legacy_shift_invoker=legacy_shift_invoker,
         )
         reporter.advance(1)
         return units
@@ -4874,11 +4861,14 @@ def _align_blocks(
             speech_spans=speech_spans,
             _raw_call_observer=raw_call_observer,
             _backend_invoker=backend_invoker,
+            _legacy_distribution_invoker=legacy_distribution_invoker,
+            _legacy_shift_invoker=legacy_shift_invoker,
         )
         reporter.advance(1)
         return units
     reporter.task("per-cue alignment", len(blocks))
     block_units: list[list[dict]] = [[] for _ in blocks]
+    pending_qwen: list[tuple[int, list[dict], float]] = []
     for i, crop in enumerate(crops):
         text = realign.join_block_texts(
             [blocks[i].get("alignment_text", blocks[i]["text"])], iso
@@ -4930,7 +4920,39 @@ def _align_blocks(
                     sample_count=None if geometry is None else geometry[3],
                 ),
             )
-        block_units[i] = shift_units(raw_units, cs)
+
+        pending_qwen.append((i, raw_units, cs))
+
+    if not pending_qwen:
+        with align_runtime_activity("AO-07", "no-physical-calls"):
+            pass
+
+    def retain_owners() -> list[tuple[int, list[dict], float]]:
+        return [
+            (index, _retain_qwen_owner_slice(raw_units), origin)
+            for index, raw_units, origin in pending_qwen
+        ]
+
+    retained_owners = (
+        retain_owners()
+        if legacy_distribution_invoker is None
+        else cast(
+            list[tuple[int, list[dict], float]],
+            legacy_distribution_invoker(retain_owners),
+        )
+    )
+
+    def shift_owners() -> list[list[dict]]:
+        for index, owner_units, origin in retained_owners:
+            block_units[index] = shift_units(owner_units, origin)
+        return block_units
+
+    block_units = (
+        shift_owners()
+        if legacy_shift_invoker is None
+        else cast(list[list[dict]], legacy_shift_invoker(shift_owners))
+    )
+    for _pending in pending_qwen:
         reporter.advance(1)
     return block_units
 
@@ -5400,27 +5422,32 @@ def align(
             invoke_backend_call = _fresh_alignment_backend_invoker(fresh_session)
             invoke_qwen_call = _fresh_alignment_qwen_invoker(fresh_session)
 
-        with align_runtime_activity("AO-07", "physical-backend-and-opaque-observation"):
-            block_units = _align_blocks(
-                wav,
-                blocks,
-                iso,
-                mms=mms,
-                ctc_model=ctc_model,
-                crops=crops,
-                reporter=rep,
-                tmp_chunks=tmp_chunks,
-                # vad_speech persisted by transcribe (same media timeline): lets the CTC
-                # full pass mask non-speech emissions; absent/empty -> no masking
-                speech_spans=_spans_in(data.get("vad_speech")),
-                raw_call_observer=capture_raw_call,
-                qwen_invoker=invoke_qwen_call,
-                backend_invoker=invoke_backend_call,
-            )
-        with align_runtime_activity("AO-08", "legacy-owner-slice"):
-            legacy_owner_slices = _seal_legacy_owner_slices(block_units)
-        with align_runtime_activity("AO-09", "legacy-time-transform"):
-            block_units = _seal_legacy_absolute_times(legacy_owner_slices)
+        def invoke_legacy_distribution(operation: Callable[[], Any]) -> Any:
+            with align_runtime_activity("AO-08", "legacy-owner-slice"):
+                return operation()
+
+        def invoke_legacy_shift(operation: Callable[[], Any]) -> Any:
+            with align_runtime_activity("AO-09", "legacy-time-transform"):
+                return operation()
+
+        block_units = _align_blocks(
+            wav,
+            blocks,
+            iso,
+            mms=mms,
+            ctc_model=ctc_model,
+            crops=crops,
+            reporter=rep,
+            tmp_chunks=tmp_chunks,
+            # vad_speech persisted by transcribe (same media timeline): lets the CTC
+            # full pass mask non-speech emissions; absent/empty -> no masking
+            speech_spans=_spans_in(data.get("vad_speech")),
+            raw_call_observer=capture_raw_call,
+            qwen_invoker=invoke_qwen_call,
+            backend_invoker=invoke_backend_call,
+            legacy_distribution_invoker=invoke_legacy_distribution,
+            legacy_shift_invoker=invoke_legacy_shift,
+        )
 
         # Tight cropping eliminates "last word drifts into inter-sentence silence", so
         # position_units_with_vad is not needed here (unlike the transcribe path).

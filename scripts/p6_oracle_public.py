@@ -90,8 +90,12 @@ def _install_align_seams(
             bounds: Any = None,
             _raw_call_observer: Any = None,
             _backend_invoker: Any = None,
+            _legacy_distribution_invoker: Any = None,
+            _legacy_shift_invoker: Any = None,
             **_kwargs: Any,
         ) -> list[list[dict[str, Any]]]:
+            from voxweave.align_common import _distribute_units
+
             groups = deepcopy(block_units)
             remaining = list(groups)
             ordered: list[list[dict[str, Any]]] = []
@@ -129,7 +133,42 @@ def _install_align_seams(
                 route_evidence_path,
                 {"bounds": bounds, "route": route, "texts": texts},
             )
-            return groups
+            if _legacy_distribution_invoker is None and _legacy_shift_invoker is None:
+                return groups
+            if (_legacy_distribution_invoker is None) != (
+                _legacy_shift_invoker is None
+            ):
+                raise ValueError(
+                    "legacy projection phase invokers must be supplied together"
+                )
+
+            def distribute() -> list[list[dict[str, Any]]]:
+                return _distribute_units(raw, texts, _iso)
+
+            distributed = (
+                distribute()
+                if _legacy_distribution_invoker is None
+                else _legacy_distribution_invoker(distribute)
+            )
+
+            def shift() -> list[list[dict[str, Any]]]:
+                return [
+                    [
+                        {
+                            "text": unit["text"],
+                            "start": unit["start"],
+                            "end": unit["end"],
+                        }
+                        for unit in owner
+                    ]
+                    for owner in distributed
+                ]
+
+            return (
+                shift()
+                if _legacy_shift_invoker is None
+                else _legacy_shift_invoker(shift)
+            )
 
         if route == "ctc-full":
             backend.align_blocks_full_ctc = full_pass

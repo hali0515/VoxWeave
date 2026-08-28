@@ -19,6 +19,7 @@ def test_rat2_public_evidence_uses_the_closed_v10_schema(tmp_path, monkeypatch):
         "receipt_digest",
         "language",
         "route",
+        "source_facts",
         "input_history",
         "route_plan",
         "physical_calls",
@@ -57,6 +58,23 @@ def test_rat2_public_evidence_uses_the_closed_v10_schema(tmp_path, monkeypatch):
         "expected_vtt_sha256",
     )
     assert evidence["input_history"]["media_logical_id"] == "sibling:.wav"
+    assert tuple(evidence["source_facts"]) == (
+        "backend_model_config",
+        "route_input",
+    )
+    assert tuple(evidence["source_facts"]["backend_model_config"]) == (
+        "route",
+        "language",
+        "backend",
+        "model",
+        "sample_rate",
+    )
+    assert tuple(evidence["source_facts"]["route_input"]) == (
+        "route",
+        "language",
+        "blocks",
+        "crops",
+    )
     assert tuple(evidence["route_plan"]) == ("digest", "entries")
     assert tuple(evidence["physical_calls"][0]) == (
         "call_index",
@@ -74,6 +92,7 @@ def test_rat2_public_evidence_uses_the_closed_v10_schema(tmp_path, monkeypatch):
         "strict_failure",
         "raw_units_sha256",
         "relative_units_sha256",
+        "legacy_retained_units",
         "legacy_slice_sha256",
         "legacy_absolute_sha256",
         "authority_transform_status",
@@ -81,6 +100,11 @@ def test_rat2_public_evidence_uses_the_closed_v10_schema(tmp_path, monkeypatch):
         "raw_unit_ids",
     )
     assert tuple(evidence["legacy_distribution"]) == ("digest", "calls")
+    assert tuple(evidence["physical_calls"][0]["legacy_retained_units"][0][0]) == (
+        "text",
+        "start",
+        "end",
+    )
     assert tuple(evidence["authority_distribution"])[0:3] == (
         "status",
         "digest",

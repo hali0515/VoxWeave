@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from voxweave import config
 from voxweave.align_dp_safety import (
@@ -20,6 +22,35 @@ from voxweave.align_dp_safety import (
 )
 
 log = logging.getLogger("voxweave")
+
+
+@dataclass(frozen=True)
+class _DeferredLegacyProjection:
+    """One flat physical result awaiting the global AO-08/AO-09 cut."""
+
+    distribute: Callable[[], list[list[dict]]]
+    origin_seconds: float
+
+
+def _project_legacy_owner(
+    owner: Sequence[dict],
+    origin_seconds: float,
+) -> list[dict]:
+    """Apply the exact route-origin projection after owner slicing."""
+
+    if origin_seconds == 0.0:
+        return [
+            {
+                "text": unit["text"],
+                "start": unit["start"],
+                "end": unit["end"],
+            }
+            for unit in owner
+        ]
+    from voxweave.timestamps import shift_units
+
+    return shift_units(list(owner), origin_seconds)
+
 
 _CTC_STRIDE = 320  # wav2vec2 @16k downsamples 320x -> 50fps (20ms/frame)
 # Single global forced-align DP is O(T*L); cap audio length so it stays in memory. Movies past
@@ -214,6 +245,8 @@ def _dp_chunked_pass(
     *,
     crop_to_envelope: bool = False,
     pass_physical_geometry: bool = False,
+    legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """Run one geometry-aware alignment pass under the global-DP memory budget.
 
@@ -258,6 +291,30 @@ def _dp_chunked_pass(
             )
         return pass_fn(wav_slice, texts, offset_s)
 
+    def complete_deferred(
+        calls: list[_DeferredLegacyProjection],
+    ) -> list[list[dict]]:
+        if legacy_distribution_invoker is None or legacy_shift_invoker is None:
+            raise RuntimeError(
+                "deferred legacy projection requires both phase invokers"
+            )
+
+        def distribute_all() -> list[list[list[dict]]]:
+            return [call.distribute() for call in calls]
+
+        distributed = legacy_distribution_invoker(distribute_all)
+
+        def shift_all() -> list[list[dict]]:
+            projected: list[list[dict]] = []
+            for call, owners in zip(calls, distributed, strict=True):
+                projected.extend(
+                    _project_legacy_owner(owner, call.origin_seconds)
+                    for owner in owners
+                )
+            return projected
+
+        return legacy_shift_invoker(shift_all)
+
     frames = wav.shape[-1] / _CTC_STRIDE
     if frames <= CTC_MAX_DP_FRAMES:
         # Crop the single global pass to the transcribed cue envelope so a leading/trailing
@@ -275,23 +332,26 @@ def _dp_chunked_pass(
             hi = min(total_sec, max(ends) + CTC_ENVELOPE_PAD_SEC)
             a, b = int(lo * sr), int(hi * sr)
             if a < b and (a > 0 or b < wav.shape[-1]):
-                return [
-                    shift_units(u, lo)
-                    for u in run_pass(
-                        wav[a:b],
-                        norm,
-                        lo,
-                        audio_sample_start=a,
-                        audio_sample_end=b,
-                    )
-                ]
-        return run_pass(
+                result = run_pass(
+                    wav[a:b],
+                    norm,
+                    lo,
+                    audio_sample_start=a,
+                    audio_sample_end=b,
+                )
+                if isinstance(result, _DeferredLegacyProjection):
+                    return complete_deferred([result])
+                return [shift_units(units, lo) for units in result]
+        result = run_pass(
             wav,
             norm,
             0.0,
             audio_sample_start=0,
             audio_sample_end=sample_count,
         )
+        if isinstance(result, _DeferredLegacyProjection):
+            return complete_deferred([result])
+        return result
 
     total_sec = wav.shape[-1] / sr
     budget_sec = CTC_MAX_DP_FRAMES * _CTC_STRIDE / sr * CTC_DP_CHUNK_FRAC
@@ -324,6 +384,7 @@ def _dp_chunked_pass(
         budget_sec / 60,
     )
     out: list[list[dict]] = []
+    deferred: list[_DeferredLegacyProjection] = []
     for p in plans:
         a = max(0, int(p["start"] * sr))
         b = min(sample_count, int(p["end"] * sr))
@@ -335,7 +396,16 @@ def _dp_chunked_pass(
             audio_sample_start=a,
             audio_sample_end=b,
         )
-        out.extend(shift_units(u, offset) for u in sub)
+        if isinstance(sub, _DeferredLegacyProjection):
+            deferred.append(sub)
+        elif deferred:
+            raise RuntimeError("legacy projection mode changed between physical calls")
+        else:
+            out.extend(shift_units(units, offset) for units in sub)
+    if deferred:
+        if out or len(deferred) != len(plans):
+            raise RuntimeError("legacy projection mode changed between physical calls")
+        return complete_deferred(deferred)
     return out
 
 

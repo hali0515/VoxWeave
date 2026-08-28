@@ -694,6 +694,7 @@ class _FreshRecord:
     physical_calls: tuple[PhysicalCallReceipt, ...]
     legacy_receipts: tuple[LegacyCallDistributionReceipt, ...]
     legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
+    legacy_relative_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
     reference_calls: tuple[ReferencePhysicalCallFacts, ...]
     backend_model_config_facts: FrozenJSON
     route_input_facts: FrozenJSON
@@ -742,6 +743,9 @@ class EvidenceCoreProducerInputs:
     physical_calls: tuple[PhysicalCallReceipt, ...]
     legacy_receipts: tuple[LegacyCallDistributionReceipt, ...]
     legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
+    legacy_relative_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
+    backend_model_config_facts: FrozenJSON
+    route_input_facts: FrozenJSON
     strict_input_status: object
     v2_policy_status: object
     profile_status: object
@@ -768,6 +772,7 @@ class EvidenceCoreReferenceInputs:
     claimed_physical_calls: tuple[PhysicalCallReceipt, ...]
     legacy_receipts: tuple[LegacyCallDistributionReceipt, ...]
     legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
+    legacy_relative_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
     reference_calls: tuple[ReferencePhysicalCallFacts, ...]
     backend_model_config_facts: FrozenJSON
     route_input_facts: FrozenJSON
@@ -943,6 +948,7 @@ def _legacy_slice_seal_digest(record: _FreshRecord) -> str:
         (
             record.legacy_receipts,
             record.legacy_block_units,
+            record.legacy_relative_block_units,
             _physical_projection(record.physical_calls, names),
             _physical_projection(record.issued.physical_calls, names),
         )
@@ -1595,6 +1601,7 @@ def _assemble_call_capture(
     PhysicalCallReceipt,
     LegacyCallDistributionReceipt,
     tuple[tuple[Mapping[str, Any], ...], ...],
+    tuple[tuple[Mapping[str, Any], ...], ...],
 ]:
     if capture.status != "valid":
         preflight_status: Literal["valid", "capture-invalid", "transform-invalid"] = (
@@ -1653,6 +1660,7 @@ def _assemble_call_capture(
         physical,
         legacy.receipt,
         tuple(tuple(unit for unit in owner) for owner in legacy.block_units),
+        tuple(tuple(unit for unit in owner) for owner in legacy.relative_block_units),
     )
 
 
@@ -1787,6 +1795,13 @@ def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment
     legacy_block_units = tuple(
         legacy_by_source.get(block.source_index, ()) for block in issuer.blocks
     )
+    legacy_relative_by_source: dict[int, tuple[Mapping[str, Any], ...]] = {}
+    for call, row in zip(observed, rows, strict=True):
+        for source_index, owner in zip(call.source_block_indices, row[6], strict=True):
+            legacy_relative_by_source[source_index] = owner
+    legacy_relative_block_units = tuple(
+        legacy_relative_by_source.get(block.source_index, ()) for block in issuer.blocks
+    )
     with align_runtime_activity("AO-13", "route-topology-preflight"):
         route, skipped, claims = _route_inputs(issuer, call_inputs)
         profile = _align_context_authority_profile(issuer.context)
@@ -1857,6 +1872,7 @@ def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment
         copy.deepcopy(physical_calls),
         copy.deepcopy(legacy_receipts),
         copy.deepcopy(legacy_block_units),
+        copy.deepcopy(legacy_relative_block_units),
         reference_calls,
         copy.deepcopy(issuer.backend_model_config_facts),
         copy.deepcopy(issuer.route_input_facts),
@@ -2110,6 +2126,9 @@ def _fresh_producer_core_inputs(
         copy.deepcopy(record.physical_calls),
         copy.deepcopy(record.legacy_receipts),
         copy.deepcopy(record.legacy_block_units),
+        copy.deepcopy(record.legacy_relative_block_units),
+        copy.deepcopy(record.backend_model_config_facts),
+        copy.deepcopy(record.route_input_facts),
         copy.deepcopy(strict_input_status),
         copy.deepcopy(v2_policy_status),
         copy.deepcopy(profile_status),
@@ -2149,6 +2168,7 @@ def _fresh_reference_core_inputs(
         copy.deepcopy(record.physical_calls),
         copy.deepcopy(record.legacy_receipts),
         copy.deepcopy(record.legacy_block_units),
+        copy.deepcopy(record.legacy_relative_block_units),
         copy.deepcopy(record.reference_calls),
         copy.deepcopy(record.backend_model_config_facts),
         copy.deepcopy(record.route_input_facts),

@@ -101,8 +101,7 @@ def test_rat2_durable_verifier_recomputes_physical_call_claims(
     evidence["receipt_digest"] = align_evidence._receipt_digest(evidence)
     evidence_path.write_bytes(
         (
-            json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False)
-            + "\n"
+            json.dumps(evidence, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
         ).encode("utf-8")
     )
 
@@ -111,6 +110,40 @@ def test_rat2_durable_verifier_recomputes_physical_call_claims(
     assert verified.integrity is False
     assert verified.w1_usable is False
     assert verified.detail_code == "evidence-schema"
+
+
+def test_rat2_legacy_absolute_digest_is_reprojected_from_relative_retained_units(
+    tmp_path, monkeypatch
+):
+    from tests.test_p6_episode_transactions import _stub_public_shadow_align
+    from voxweave.align_snapshot import freeze_json, frozen_json_digest
+
+    _media, json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    source = json.loads(json_path.read_bytes())
+    for unit in source["word_segments"]:
+        unit["start"] += 0.5
+        unit["end"] += 0.5
+    json_path.write_text(json.dumps(source, ensure_ascii=False), encoding="utf-8")
+
+    assert pipeline.align(vtt_path) == vtt_path
+    evidence = json.loads((tmp_path / "episode.align-evidence.json").read_bytes())
+    call = evidence["physical_calls"][0]
+    assert call["legacy_origin_kind"] == "nominal-route"
+    assert call["legacy_origin_seconds"] != 0.0
+    relative = call["legacy_retained_units"]
+    absolute = [
+        [
+            {
+                "text": unit["text"],
+                "start": unit["start"] + call["legacy_origin_seconds"],
+                "end": unit["end"] + call["legacy_origin_seconds"],
+            }
+            for unit in owner
+        ]
+        for owner in relative
+    ]
+    assert frozen_json_digest(freeze_json(absolute)) == call["legacy_absolute_sha256"]
+    assert frozen_json_digest(freeze_json(relative)) != call["legacy_absolute_sha256"]
 
 
 @pytest.mark.parametrize(

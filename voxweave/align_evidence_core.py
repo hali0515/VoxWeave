@@ -357,6 +357,14 @@ def _p_history(facts: EvidenceCoreProducerInputs) -> dict[str, Any]:
     }
 
 
+def _p_source_facts(facts: EvidenceCoreProducerInputs) -> dict[str, Any]:
+    model = thaw_json(facts.backend_model_config_facts)
+    route = thaw_json(facts.route_input_facts)
+    if not isinstance(model, dict) or not isinstance(route, dict):
+        raise EvidenceCoreProjectionError("producer durable source facts are invalid")
+    return {"backend_model_config": model, "route_input": route}
+
+
 def _p_call(receipt: PhysicalCallReceipt) -> EvidenceCorePhysicalCall:
     for digest in (
         receipt.backend_model_config_digest,
@@ -598,7 +606,14 @@ def _p_block_values(blocks: tuple[EvidenceCoreBlock, ...]) -> list[dict[str, Any
 
 def _p_physical_values(
     calls: tuple[EvidenceCorePhysicalCall, ...],
+    facts: EvidenceCoreProducerInputs,
 ) -> list[dict[str, Any]]:
+    legacy_by_source = {
+        block.source_index: units
+        for block, units in zip(
+            facts.blocks, facts.legacy_relative_block_units, strict=True
+        )
+    }
     return [
         {
             "call_index": row.call_index,
@@ -616,6 +631,10 @@ def _p_physical_values(
             "strict_failure": _p_failure(row.strict_failure),
             "raw_units_sha256": row.raw_units_sha256,
             "relative_units_sha256": row.relative_units_sha256,
+            "legacy_retained_units": [
+                _p_stable_value(legacy_by_source.get(source, ()))
+                for source in row.source_block_indices
+            ],
             "legacy_slice_sha256": row.legacy_slice_sha256,
             "legacy_absolute_sha256": row.legacy_absolute_sha256,
             "authority_transform_status": row.authority_transform_status,
@@ -681,9 +700,10 @@ def build_evidence_core(facts: EvidenceCoreProducerInputs) -> EvidenceCore:
         "receipt_digest": facts.receipt_digest,
         "language": facts.language,
         "route": facts.route_kind,
+        "source_facts": _p_source_facts(facts),
         "input_history": history_value,
         "route_plan": route_value,
-        "physical_calls": _p_physical_values(calls),
+        "physical_calls": _p_physical_values(calls, facts),
         "legacy_distribution": legacy_value,
         "authority_distribution": authority_value,
         "blocks": _p_block_values(blocks),
@@ -986,6 +1006,14 @@ def _r_history(facts: EvidenceCoreReferenceInputs) -> dict[str, Any]:
     }
 
 
+def _r_source_facts(facts: EvidenceCoreReferenceInputs) -> dict[str, Any]:
+    model = thaw_json(facts.backend_model_config_facts)
+    route = thaw_json(facts.route_input_facts)
+    if not isinstance(model, dict) or not isinstance(route, dict):
+        raise EvidenceCoreProjectionError("reference durable source facts are invalid")
+    return {"backend_model_config": model, "route_input": route}
+
+
 def _r_optional_float(value: object) -> float | None:
     if value is None:
         return None
@@ -1115,12 +1143,17 @@ def _r_legacy_call(
     call: ReferencePhysicalCallFacts,
     blocks: Mapping[int, AuthorityBlock],
     language: str,
-) -> tuple[LegacyCallDistributionReceipt, tuple[tuple[Mapping[str, Any], ...], ...]]:
+) -> tuple[
+    LegacyCallDistributionReceipt,
+    tuple[tuple[Mapping[str, Any], ...], ...],
+    tuple[tuple[Mapping[str, Any], ...], ...],
+]:
     expected: list[int] = []
     requested: list[tuple[int, int]] = []
     realized: list[tuple[int, int]] = []
     owner_ids: list[tuple[str, ...]] = []
     owners: list[tuple[Mapping[str, Any], ...]] = []
+    relative_owners: list[tuple[Mapping[str, Any], ...]] = []
     shortages: list[int] = []
     cursor = 0
     raw_count = len(call.raw_nodes)
@@ -1137,6 +1170,7 @@ def _r_legacy_call(
         if high_clamp - low_clamp < count:
             shortages.append(source)
         projected: list[Mapping[str, Any]] = []
+        relative_projected: list[Mapping[str, Any]] = []
         for node in call.raw_nodes[lower:upper]:
             if not isinstance(node, Mapping):
                 raise EvidenceCoreProjectionError(
@@ -1146,6 +1180,7 @@ def _r_legacy_call(
                 text = node["text"]
                 start = node["start"]
                 end = node["end"]
+                relative_projected.append({"text": text, "start": start, "end": end})
                 if call.legacy_origin_kind != "identity":
                     start = start + call.legacy_origin_seconds
                     end = end + call.legacy_origin_seconds
@@ -1155,6 +1190,7 @@ def _r_legacy_call(
                     "reference retained legacy projection failed"
                 ) from exc
         owners.append(tuple(projected))
+        relative_owners.append(tuple(relative_projected))
         cursor = upper
     consumed = min(cursor, raw_count)
     receipt = LegacyCallDistributionReceipt(
@@ -1168,7 +1204,7 @@ def _r_legacy_call(
         tuple(shortages),
         call.raw_unit_ids[consumed:],
     )
-    return receipt, tuple(owners)
+    return receipt, tuple(owners), tuple(relative_owners)
 
 
 def _r_transform(
@@ -1320,6 +1356,7 @@ def _r_rebuild_calls(
     tuple[AuthorityTransformResult, ...],
     tuple[LegacyCallDistributionReceipt, ...],
     tuple[tuple[Mapping[str, Any], ...], ...],
+    tuple[tuple[Mapping[str, Any], ...], ...],
     tuple[PhysicalCallReceipt, ...],
 ]:
     count = len(facts.reference_calls)
@@ -1344,6 +1381,7 @@ def _r_rebuild_calls(
     receipts: list[LegacyCallDistributionReceipt] = []
     expected_physical: list[PhysicalCallReceipt] = []
     ordered_legacy: dict[int, tuple[Mapping[str, Any], ...]] = {}
+    ordered_relative_legacy: dict[int, tuple[Mapping[str, Any], ...]] = {}
     for index, raw_call in enumerate(facts.reference_calls):
         if raw_call.call_index != index:
             raise EvidenceCoreProjectionError("reference call order is invalid")
@@ -1378,7 +1416,7 @@ def _r_rebuild_calls(
         elif raw_call.legacy_origin_kind != "nominal-route":
             raise EvidenceCoreProjectionError("reference origin kind is invalid")
         capture = _r_capture(raw_call)
-        legacy_receipt, call_legacy = _r_legacy_call(
+        legacy_receipt, call_legacy, call_relative_legacy = _r_legacy_call(
             raw_call, blocks_by_source, facts.language
         )
         retained_count = len(legacy_receipt.consumed_prefix_unit_ids)
@@ -1403,6 +1441,10 @@ def _r_rebuild_calls(
                     "reference legacy block cross-link mismatch"
                 )
             ordered_legacy[source] = owner
+        for source, owner in zip(
+            raw_call.source_block_indices, call_relative_legacy, strict=True
+        ):
+            ordered_relative_legacy[source] = owner
         legacy_slice_digest = _r_stable_digest(legacy_receipt)
         legacy_absolute_digest = _r_stable_digest(call_legacy)
         physical = PhysicalCallReceipt(
@@ -1464,12 +1506,20 @@ def _r_rebuild_calls(
     )
     if legacy_blocks != facts.legacy_block_units:
         raise EvidenceCoreProjectionError("reference legacy block inventory mismatch")
+    relative_legacy_blocks = tuple(
+        ordered_relative_legacy.get(block.source_index, ()) for block in facts.blocks
+    )
+    if relative_legacy_blocks != facts.legacy_relative_block_units:
+        raise EvidenceCoreProjectionError(
+            "reference relative legacy block inventory mismatch"
+        )
     return (
         tuple(evidence_calls),
         tuple(captures),
         tuple(transforms),
         tuple(receipts),
         legacy_blocks,
+        relative_legacy_blocks,
         tuple(expected_physical),
     )
 
@@ -1820,7 +1870,13 @@ def _r_block_values(blocks: tuple[EvidenceCoreBlock, ...]) -> list[dict[str, Any
 
 def _r_physical_values(
     calls: tuple[EvidenceCorePhysicalCall, ...],
+    blocks: tuple[EvidenceCoreBlock, ...],
+    legacy_blocks: tuple[tuple[Mapping[str, Any], ...], ...],
 ) -> list[dict[str, Any]]:
+    legacy_by_source = {
+        block.source_index: units
+        for block, units in zip(blocks, legacy_blocks, strict=True)
+    }
     values: list[dict[str, Any]] = []
     for row in calls:
         values.append(
@@ -1840,6 +1896,10 @@ def _r_physical_values(
                 "strict_failure": _r_failure(row.strict_failure),
                 "raw_units_sha256": row.raw_units_sha256,
                 "relative_units_sha256": row.relative_units_sha256,
+                "legacy_retained_units": [
+                    _r_stable_value(legacy_by_source.get(source, ()))
+                    for source in row.source_block_indices
+                ],
                 "legacy_slice_sha256": row.legacy_slice_sha256,
                 "legacy_absolute_sha256": row.legacy_absolute_sha256,
                 "authority_transform_status": row.authority_transform_status,
@@ -1884,7 +1944,8 @@ def project_evidence_core(facts: EvidenceCoreReferenceInputs) -> EvidenceCore:
         captures,
         transforms,
         legacy_receipts,
-        _legacy_blocks,
+        legacy_blocks,
+        relative_legacy_blocks,
         physical_receipts,
     ) = _r_rebuild_calls(facts)
     authority_reasons = _r_replay_distribution(facts, captures, transforms)
@@ -1928,9 +1989,10 @@ def project_evidence_core(facts: EvidenceCoreReferenceInputs) -> EvidenceCore:
         "receipt_digest": receipt_digest,
         "language": facts.language,
         "route": facts.route_kind,
+        "source_facts": _r_source_facts(facts),
         "input_history": history_value,
         "route_plan": route_value,
-        "physical_calls": _r_physical_values(calls),
+        "physical_calls": _r_physical_values(calls, blocks, relative_legacy_blocks),
         "legacy_distribution": legacy_value,
         "authority_distribution": authority_value,
         "blocks": _r_block_values(blocks),

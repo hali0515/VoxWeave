@@ -476,7 +476,7 @@ def test_legacy_distribution_slices_before_shift_and_never_reads_surplus():
     assert result.receipt.leftover_unit_ids == ("r1",)
 
 
-def test_whole_file_identity_performs_no_addition_and_preserves_unit_shape():
+def test_whole_file_identity_performs_no_addition_and_drops_extra_fields():
     d = _module()
     unit = {"text": "kept", "start": -0.0, "end": 2.0, "extra": 7}
     result = d.legacy_distribute_before_shift(
@@ -487,5 +487,6 @@ def test_whole_file_identity_performs_no_addition_and_preserves_unit_shape():
         identity=True,
         raw_unit_ids=("r0",),
     )
-    assert result.block_units == ((unit,),)
+    assert result.block_units == (({"text": "kept", "start": -0.0, "end": 2.0},),)
+    assert result.relative_block_units == result.block_units
     assert math.copysign(1.0, result.block_units[0][0]["start"]) == -1.0

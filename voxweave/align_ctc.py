@@ -18,6 +18,7 @@ from typing import Any, cast
 
 from voxweave import config
 from voxweave.align_common import (
+    _DeferredLegacyProjection,
     _distribute_units,
     _dp_chunked_pass,
     _load_mono,
@@ -314,6 +315,48 @@ def _ctc_build_tokens(norm: list[str], nospace: bool, al):
     return toks, meta, words
 
 
+def _ctc_flat_pass(
+    al,
+    wav,
+    norm: list[str],
+    nospace: bool,
+    iso: str,
+    speech_spans: list[tuple[float, float]] | None = None,
+    *,
+    _raw_result_observer: Callable[[list[dict]], None] | None = None,
+    _raw_original_observer: Callable[[list[dict] | None], None] | None = None,
+    _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+) -> list[dict]:
+    """Return one flat normalized result before any owner distribution."""
+
+    toks, meta, words = _ctc_build_tokens(norm, nospace, al)
+    if not words:
+        units: list[dict] = []
+    else:
+        logp = (
+            _ctc_emit_full(al, wav)
+            if _backend_invoker is None
+            else _backend_invoker(lambda: _ctc_emit_full(al, wav))
+        )
+        if speech_spans:
+            logp = _mask_emissions_outside_speech(
+                logp, speech_spans, wav.shape[-1], al.sr, al.blank
+            )
+        units = _ctc_align_logp(
+            al,
+            logp,
+            toks,
+            meta,
+            words,
+            nospace,
+            wav.shape[-1],
+            _raw_original_observer,
+        )
+    if _raw_result_observer is not None:
+        _raw_result_observer(units)
+    return units
+
+
 def _ctc_full_pass(
     al,
     wav,
@@ -325,38 +368,28 @@ def _ctc_full_pass(
     _raw_result_observer: Callable[[list[dict]], None] | None = None,
     _raw_original_observer: Callable[[list[dict] | None], None] | None = None,
     _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    _legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
-    """One windowed-emission + global forced_align over `wav` for cue texts `norm`.
+    """Run one flat CTC pass and distribute its retained legacy owners."""
 
-    Times are relative to the start of `wav` (caller offsets when `wav` is a chunk). Returns
-    per-cue units in `norm` order; empty/wordless cues get []. The single DP is O(T*L).
-    ``speech_spans`` (seconds, wav-relative) soft-mask non-speech emissions before the DP.
-    """
-    toks, meta, words = _ctc_build_tokens(norm, nospace, al)
-    if not words:
-        return [[] for _ in norm]
-    logp = (
-        _ctc_emit_full(al, wav)
-        if _backend_invoker is None
-        else _backend_invoker(lambda: _ctc_emit_full(al, wav))
-    )
-    if speech_spans:
-        logp = _mask_emissions_outside_speech(
-            logp, speech_spans, wav.shape[-1], al.sr, al.blank
-        )
-    units = _ctc_align_logp(
+    units = _ctc_flat_pass(
         al,
-        logp,
-        toks,
-        meta,
-        words,
+        wav,
+        norm,
         nospace,
-        wav.shape[-1],
-        _raw_original_observer,
+        iso,
+        speech_spans,
+        _raw_result_observer=_raw_result_observer,
+        _raw_original_observer=_raw_original_observer,
+        _backend_invoker=_backend_invoker,
     )
-    if _raw_result_observer is not None:
-        _raw_result_observer(units)
-    return _distribute_units(units, norm, iso)
+
+    def distribute() -> list[list[dict]]:
+        return _distribute_units(units, norm, iso)
+
+    if _legacy_distribution_invoker is None:
+        return distribute()
+    return _legacy_distribution_invoker(distribute)
 
 
 def align_blocks_full_ctc(
@@ -370,6 +403,8 @@ def align_blocks_full_ctc(
     mute_spans: Sequence[tuple[float, float]] | None = None,
     _raw_call_observer: Callable[..., None] | None = None,
     _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    _legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    _legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
 
@@ -384,6 +419,9 @@ def align_blocks_full_ctc(
     VOXWEAVE_VAD_EMISSION_MASK=1 (see _mask_emissions_outside_speech for why).
     """
     from voxweave.realign import NO_SPACE_LANGS
+
+    if (_legacy_distribution_invoker is None) != (_legacy_shift_invoker is None):
+        raise ValueError("legacy projection phase invokers must be supplied together")
 
     if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() != "1":
         speech_spans = None
@@ -416,7 +454,7 @@ def align_blocks_full_ctc(
         audio_sample_start: int,
         audio_sample_end: int,
         sample_count: int,
-    ) -> list[list[dict]]:
+    ) -> list[list[dict]] | _DeferredLegacyProjection:
         nonlocal source_cursor
         source_indices = tuple(range(source_cursor, source_cursor + len(sub)))
         source_cursor += len(sub)
@@ -434,38 +472,56 @@ def align_blocks_full_ctc(
         def capture_raw(value: list[dict]) -> None:
             nonlocal raw_result
             raw_result = value
+            if _raw_call_observer is not None:
+                _raw_call_observer(
+                    raw_result if raw_result is not None else [],
+                    original_result,
+                    source_indices,
+                    offset_s,
+                    audio_sample_start=audio_sample_start,
+                    audio_sample_end=audio_sample_end,
+                    sample_rate=al.sr,
+                    sample_count=sample_count,
+                    nominal_end_seconds=None,
+                )
 
         def capture_original(value: list[dict] | None) -> None:
             nonlocal original_result
             original_result = value
 
-        out = _ctc_full_pass(
-            al,
-            w,
-            sub,
-            nospace,
-            iso,
-            speech_spans=spans_rel,
-            _raw_result_observer=capture_raw
-            if _raw_call_observer is not None
-            else None,
-            _raw_original_observer=capture_original
-            if _raw_call_observer is not None
-            else None,
-            _backend_invoker=_backend_invoker,
-        )
-        if _raw_call_observer is not None:
-            _raw_call_observer(
-                raw_result if raw_result is not None else [],
-                original_result,
-                source_indices,
-                offset_s,
-                audio_sample_start=audio_sample_start,
-                audio_sample_end=audio_sample_end,
-                sample_rate=al.sr,
-                sample_count=sample_count,
-                nominal_end_seconds=None,
+        flat_observer = capture_raw if _raw_call_observer is not None else None
+        original_observer = capture_original if _raw_call_observer is not None else None
+        if _legacy_distribution_invoker is None:
+            out: list[list[dict]] | _DeferredLegacyProjection = _ctc_full_pass(
+                al,
+                w,
+                sub,
+                nospace,
+                iso,
+                speech_spans=spans_rel,
+                _raw_result_observer=flat_observer,
+                _raw_original_observer=original_observer,
+                _backend_invoker=_backend_invoker,
             )
+        else:
+            flat = _ctc_flat_pass(
+                al,
+                w,
+                sub,
+                nospace,
+                iso,
+                speech_spans=spans_rel,
+                _raw_result_observer=flat_observer,
+                _raw_original_observer=original_observer,
+                _backend_invoker=_backend_invoker,
+            )
+
+            def distribute() -> list[list[dict]]:
+                return _distribute_units(flat, sub, iso)
+
+            out = _DeferredLegacyProjection(distribute, offset_s)
+        if _raw_call_observer is not None and raw_result is None:
+            raise RuntimeError("CTC flat result was not observed before distribution")
         _empty_cache()
         return out
 
@@ -478,6 +534,8 @@ def align_blocks_full_ctc(
         "CTC",
         crop_to_envelope=crop_to_envelope,
         pass_physical_geometry=True,
+        legacy_distribution_invoker=_legacy_distribution_invoker,
+        legacy_shift_invoker=_legacy_shift_invoker,
     )
 
 

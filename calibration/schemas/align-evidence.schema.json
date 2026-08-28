@@ -11,6 +11,7 @@
     "receipt_digest",
     "language",
     "route",
+    "source_facts",
     "input_history",
     "route_plan",
     "physical_calls",
@@ -33,6 +34,7 @@
     "receipt_digest": { "$ref": "#/$defs/sha256" },
     "language": { "type": "string", "minLength": 1 },
     "route": { "enum": ["ctc-full", "mms-full", "qwen-crop"] },
+    "source_facts": { "$ref": "#/$defs/sourceFacts" },
     "input_history": { "$ref": "#/$defs/inputHistory" },
     "route_plan": { "$ref": "#/$defs/routePlan" },
     "physical_calls": {
@@ -72,6 +74,103 @@
       "items": { "$ref": "#/$defs/nonnegativeInteger" }
     },
     "binary64": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+    "sourceFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend_model_config", "route_input"],
+      "properties": {
+        "backend_model_config": {
+          "oneOf": [
+            { "$ref": "#/$defs/productionModelFacts" },
+            { "$ref": "#/$defs/defaultModelFacts" }
+          ]
+        },
+        "route_input": {
+          "oneOf": [
+            { "$ref": "#/$defs/productionRouteFacts" },
+            { "$ref": "#/$defs/defaultRouteFacts" }
+          ]
+        }
+      }
+    },
+    "productionModelFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "language", "backend", "model", "sample_rate"],
+      "properties": {
+        "route": { "enum": ["ctc-full", "mms-full", "qwen-crop"] },
+        "language": { "type": "string", "minLength": 1 },
+        "backend": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
+        "sample_rate": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "defaultModelFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "route", "language"],
+      "properties": {
+        "kind": { "const": "default" },
+        "route": { "enum": ["ctc-full", "mms-full", "qwen-crop"] },
+        "language": { "type": "string", "minLength": 1 }
+      }
+    },
+    "productionRouteFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "language", "blocks", "crops"],
+      "properties": {
+        "route": { "enum": ["ctc-full", "mms-full", "qwen-crop"] },
+        "language": { "type": "string", "minLength": 1 },
+        "blocks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/routeFactBlock" }
+        },
+        "crops": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "array",
+                "prefixItems": [
+                  { "type": "string", "minLength": 1 },
+                  { "type": "string", "minLength": 1 }
+                ],
+                "items": false,
+                "minItems": 2,
+                "maxItems": 2
+              },
+              { "type": "null" }
+            ]
+          }
+        }
+      }
+    },
+    "routeFactBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_index", "alignment_text", "start", "end"],
+      "properties": {
+        "source_index": { "$ref": "#/$defs/nonnegativeInteger" },
+        "alignment_text": { "type": "string" },
+        "start": {
+          "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+        },
+        "end": {
+          "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }]
+        }
+      }
+    },
+    "defaultRouteFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "context_content_digest", "route"],
+      "properties": {
+        "kind": { "const": "default" },
+        "context_content_digest": { "$ref": "#/$defs/sha256" },
+        "route": { "enum": ["ctc-full", "mms-full", "qwen-crop"] }
+      }
+    },
     "inputHistory": {
       "type": "object",
       "additionalProperties": false,
@@ -166,7 +265,7 @@
         "legacy_origin_kind", "authority_origin_seconds",
         "backend_model_config_sha256", "route_input_sha256",
         "strict_unit_status", "strict_failure", "raw_units_sha256",
-        "relative_units_sha256", "legacy_slice_sha256",
+        "relative_units_sha256", "legacy_retained_units", "legacy_slice_sha256",
         "legacy_absolute_sha256", "authority_transform_status",
         "authority_absolute_sha256", "raw_unit_ids"
       ],
@@ -188,11 +287,28 @@
         },
         "raw_units_sha256": { "$ref": "#/$defs/shaOrNull" },
         "relative_units_sha256": { "$ref": "#/$defs/shaOrNull" },
+        "legacy_retained_units": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/legacyRetainedUnit" }
+          }
+        },
         "legacy_slice_sha256": { "$ref": "#/$defs/shaOrNull" },
         "legacy_absolute_sha256": { "$ref": "#/$defs/shaOrNull" },
         "authority_transform_status": { "enum": ["valid", "invalid"] },
         "authority_absolute_sha256": { "$ref": "#/$defs/shaOrNull" },
         "raw_unit_ids": { "$ref": "#/$defs/stringArray" }
+      }
+    },
+    "legacyRetainedUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "start", "end"],
+      "properties": {
+        "text": { "type": "string" },
+        "start": { "type": "number" },
+        "end": { "type": "number" }
       }
     },
     "legacyDistribution": {

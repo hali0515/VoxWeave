@@ -19,6 +19,7 @@ from typing import Any
 
 from voxweave import config
 from voxweave.align_common import (
+    _DeferredLegacyProjection,
     _distribute_units,
     _dp_chunked_pass,
     _load_mono,
@@ -175,15 +176,15 @@ def align_text_mms(wav_path: Path, text: str, iso: str) -> list[dict]:
     return units
 
 
-def _mms_full_pass(
+def _mms_flat_pass(
     wav,
     norm: list[str],
     iso: str,
     *,
     _raw_result_observer: Callable[[list[dict]], None] | None = None,
     _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-) -> list[list[dict]]:
-    """One routing-free MMS call with the AO-07 pre-distribution seam."""
+) -> list[dict]:
+    """Return one flat MMS result before any owner distribution."""
     full = " ".join(text for text in norm if text)
     flat = (
         _mms_emit_units(wav, full, iso)
@@ -193,7 +194,34 @@ def _mms_full_pass(
     if _raw_result_observer is not None:
         _raw_result_observer(flat)
     _empty_cache()
-    return _distribute_units(flat, norm, iso)
+    return flat
+
+
+def _mms_full_pass(
+    wav,
+    norm: list[str],
+    iso: str,
+    *,
+    _raw_result_observer: Callable[[list[dict]], None] | None = None,
+    _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    _legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+) -> list[list[dict]]:
+    """Run one flat MMS pass and distribute its retained legacy owners."""
+
+    flat = _mms_flat_pass(
+        wav,
+        norm,
+        iso,
+        _raw_result_observer=_raw_result_observer,
+        _backend_invoker=_backend_invoker,
+    )
+
+    def distribute() -> list[list[dict]]:
+        return _distribute_units(flat, norm, iso)
+
+    if _legacy_distribution_invoker is None:
+        return distribute()
+    return _legacy_distribution_invoker(distribute)
 
 
 def align_blocks_full_mms(
@@ -205,6 +233,8 @@ def align_blocks_full_mms(
     mute_spans: Sequence[tuple[float, float]] | None = None,
     _raw_call_observer: Callable[..., None] | None = None,
     _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    _legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    _legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass MMS alignment (equivalent to whisperx align_ctc).
 
@@ -225,6 +255,9 @@ def align_blocks_full_mms(
     (see _dp_chunked_pass). The handful of resulting large ONNX calls stays far below the
     ~180-call heap-corruption regime.
     """
+    if (_legacy_distribution_invoker is None) != (_legacy_shift_invoker is None):
+        raise ValueError("legacy projection phase invokers must be supplied together")
+
     wav = _read_wav_16k(wav_path)
     if mute_spans:
         # excised song intervals: no transcript belongs there by construction, so zeroing
@@ -246,7 +279,7 @@ def align_blocks_full_mms(
         audio_sample_start: int,
         audio_sample_end: int,
         sample_count: int,
-    ) -> list[list[dict]]:
+    ) -> list[list[dict]] | _DeferredLegacyProjection:
         nonlocal source_cursor
         source_indices = tuple(range(source_cursor, source_cursor + len(sub)))
         source_cursor += len(sub)
@@ -255,28 +288,44 @@ def align_blocks_full_mms(
         def capture_raw(value: list[dict]) -> None:
             nonlocal raw_result
             raw_result = value
+            if _raw_call_observer is not None:
+                _raw_call_observer(
+                    raw_result if raw_result is not None else [],
+                    None,
+                    source_indices,
+                    offset_s,
+                    audio_sample_start=audio_sample_start,
+                    audio_sample_end=audio_sample_end,
+                    sample_rate=MMS_SR,
+                    sample_count=sample_count,
+                    nominal_end_seconds=None,
+                )
 
-        out = _mms_full_pass(
-            w,
-            sub,
-            iso,
-            _raw_result_observer=capture_raw
-            if _raw_call_observer is not None
-            else None,
-            _backend_invoker=_backend_invoker,
-        )
-        if _raw_call_observer is not None:
-            _raw_call_observer(
-                raw_result if raw_result is not None else [],
-                None,
-                source_indices,
-                offset_s,
-                audio_sample_start=audio_sample_start,
-                audio_sample_end=audio_sample_end,
-                sample_rate=MMS_SR,
-                sample_count=sample_count,
-                nominal_end_seconds=None,
+        flat_observer = capture_raw if _raw_call_observer is not None else None
+        out: list[list[dict]] | _DeferredLegacyProjection
+        if _legacy_distribution_invoker is None:
+            out = _mms_full_pass(
+                w,
+                sub,
+                iso,
+                _raw_result_observer=flat_observer,
+                _backend_invoker=_backend_invoker,
             )
+        else:
+            flat = _mms_flat_pass(
+                w,
+                sub,
+                iso,
+                _raw_result_observer=flat_observer,
+                _backend_invoker=_backend_invoker,
+            )
+
+            def distribute() -> list[list[dict]]:
+                return _distribute_units(flat, sub, iso)
+
+            out = _DeferredLegacyProjection(distribute, offset_s)
+        if _raw_call_observer is not None and raw_result is None:
+            raise RuntimeError("MMS flat result was not observed before distribution")
         return out
 
     return _dp_chunked_pass(
@@ -288,6 +337,8 @@ def align_blocks_full_mms(
         "MMS",
         crop_to_envelope=crop_to_envelope,
         pass_physical_geometry=True,
+        legacy_distribution_invoker=_legacy_distribution_invoker,
+        legacy_shift_invoker=_legacy_shift_invoker,
     )
 
 

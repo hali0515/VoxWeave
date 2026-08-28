@@ -70,6 +70,7 @@ _TOP_LEVEL_KEYS = (
     "receipt_digest",
     "language",
     "route",
+    "source_facts",
     "input_history",
     "route_plan",
     "physical_calls",
@@ -84,6 +85,17 @@ _TOP_LEVEL_KEYS = (
     "evidence_status",
     "v2_admission_status",
     "selected_outputs",
+)
+_SOURCE_FACT_KEYS = ("backend_model_config", "route_input")
+_MODEL_FACT_KEYS = ("route", "language", "backend", "model", "sample_rate")
+_DEFAULT_MODEL_FACT_KEYS = ("kind", "route", "language")
+_ROUTE_FACT_KEYS = ("route", "language", "blocks", "crops")
+_DEFAULT_ROUTE_FACT_KEYS = ("kind", "context_content_digest", "route")
+_ROUTE_FACT_BLOCK_KEYS = (
+    "source_index",
+    "alignment_text",
+    "start",
+    "end",
 )
 _INPUT_HISTORY_KEYS = (
     "vtt_present",
@@ -134,6 +146,7 @@ _PHYSICAL_CALL_KEYS = (
     "strict_failure",
     "raw_units_sha256",
     "relative_units_sha256",
+    "legacy_retained_units",
     "legacy_slice_sha256",
     "legacy_absolute_sha256",
     "authority_transform_status",
@@ -1090,6 +1103,118 @@ def _validate_history(value: object) -> dict[str, Any]:
     return history
 
 
+def _durable_fact_digest(value: object) -> str:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _EvidenceInvalid("durable source facts are outside stable JSON") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _fact_hex_float(value: object, label: str) -> float | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        _invalid(f"{label} is not canonical binary64 text")
+    try:
+        decoded = float.fromhex(value)
+    except ValueError as exc:
+        raise _EvidenceInvalid(f"{label} is not canonical binary64 text") from exc
+    if not math.isfinite(decoded) or decoded.hex() != value:
+        _invalid(f"{label} is not canonical finite binary64 text")
+    return decoded
+
+
+def _validate_source_facts(
+    value: object,
+    *,
+    context_digest: str,
+    language: str,
+    route: str,
+) -> tuple[dict[str, Any], str, str]:
+    facts = _closed_mapping(value, _SOURCE_FACT_KEYS, "source_facts")
+    model = facts["backend_model_config"]
+    if not isinstance(model, dict):
+        _invalid("backend model/config source facts are not an object")
+    if tuple(model) == _MODEL_FACT_KEYS:
+        if model["route"] != route or model["language"] != language:
+            _invalid("backend model/config facts disagree with evidence identity")
+        if (
+            type(model["backend"]) is not str
+            or not model["backend"]
+            or type(model["model"]) is not str
+            or not model["model"]
+        ):
+            _invalid("backend model/config identity is invalid")
+        _exact_int(model["sample_rate"], "model/config sample rate", minimum=1)
+    elif tuple(model) == _DEFAULT_MODEL_FACT_KEYS:
+        if (
+            model["kind"] != "default"
+            or model["route"] != route
+            or model["language"] != language
+        ):
+            _invalid("default model/config facts disagree with evidence identity")
+    else:
+        _invalid("backend model/config source facts are not closed")
+
+    route_facts = facts["route_input"]
+    if not isinstance(route_facts, dict):
+        _invalid("route input source facts are not an object")
+    if tuple(route_facts) == _ROUTE_FACT_KEYS:
+        if route_facts["route"] != route or route_facts["language"] != language:
+            _invalid("route input facts disagree with evidence identity")
+        blocks = _list(route_facts["blocks"], "route fact blocks")
+        observed_sources: list[int] = []
+        for member in blocks:
+            block = _closed_mapping(member, _ROUTE_FACT_BLOCK_KEYS, "route fact block")
+            observed_sources.append(
+                _exact_int(block["source_index"], "route fact source index")
+            )
+            if type(block["alignment_text"]) is not str:
+                _invalid("route fact alignment text is not an exact string")
+            _fact_hex_float(block["start"], "route fact block start")
+            _fact_hex_float(block["end"], "route fact block end")
+        if len(observed_sources) != len(set(observed_sources)):
+            _invalid("route fact source index is duplicated")
+        crops = _list(route_facts["crops"], "route fact crops")
+        if route in ("ctc-full", "mms-full"):
+            if crops:
+                _invalid("full-pass route facts carry crop windows")
+        elif len(crops) != len(blocks):
+            _invalid("Qwen route fact crop/block cardinality differs")
+        for member in crops:
+            if member is None:
+                continue
+            pair = _list(member, "route fact crop")
+            if len(pair) != 2:
+                _invalid("route fact crop is not one pair")
+            start = _fact_hex_float(pair[0], "route fact crop start")
+            end = _fact_hex_float(pair[1], "route fact crop end")
+            assert start is not None and end is not None
+            if start > end:
+                _invalid("route fact crop is reversed")
+    elif tuple(route_facts) == _DEFAULT_ROUTE_FACT_KEYS:
+        if (
+            route_facts["kind"] != "default"
+            or route_facts["context_content_digest"] != context_digest
+            or route_facts["route"] != route
+        ):
+            _invalid("default route facts disagree with evidence identity")
+    else:
+        _invalid("route input source facts are not closed")
+    return (
+        facts,
+        _durable_fact_digest(model),
+        _durable_fact_digest(route_facts),
+    )
+
+
 def _validate_route_plan(
     value: object, route: str
 ) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
@@ -1158,6 +1283,8 @@ def _validate_physical_calls(
     value: object,
     route: str,
     route_by_source: Mapping[int, Mapping[str, Any]],
+    model_digest: str,
+    route_digest: str,
 ) -> list[dict[str, Any]]:
     calls = _list(value, "physical_calls")
     global_ids: set[str] = set()
@@ -1199,9 +1326,10 @@ def _validate_physical_calls(
                 _invalid("Qwen legacy origin does not match nominal route")
         else:
             _invalid("legacy origin kind is invalid")
-        for name in ("backend_model_config_sha256", "route_input_sha256"):
-            if not _is_sha256(row[name]):
-                _invalid(f"physical call {name} is invalid")
+        if row["backend_model_config_sha256"] != model_digest:
+            _invalid("physical call model/config digest does not match source facts")
+        if row["route_input_sha256"] != route_digest:
+            _invalid("physical call route digest does not match source facts")
         failure = _validate_strict_failure(row["strict_failure"], "strict failure")
         raw_digest = _sha_or_none(row["raw_units_sha256"], "raw units digest")
         relative_digest = _sha_or_none(
@@ -1218,7 +1346,63 @@ def _validate_physical_calls(
         else:
             _invalid("strict unit status is invalid")
         _sha_or_none(row["legacy_slice_sha256"], "legacy slice digest")
-        _sha_or_none(row["legacy_absolute_sha256"], "legacy absolute digest")
+        relative_legacy_groups = _list(
+            row["legacy_retained_units"], "legacy retained unit groups"
+        )
+        if len(relative_legacy_groups) != len(sources):
+            _invalid("legacy retained groups disagree with physical sources")
+        absolute_legacy_groups: list[list[dict[str, Any]]] = []
+        for owner_index, owner_value in enumerate(relative_legacy_groups):
+            owner = _list(owner_value, "legacy retained unit group")
+            absolute_owner: list[dict[str, Any]] = []
+            for unit_index, unit_value in enumerate(owner):
+                unit = _closed_mapping(
+                    unit_value,
+                    ("text", "start", "end"),
+                    "legacy retained unit",
+                )
+                if type(unit["text"]) is not str:
+                    _invalid("legacy retained unit text is not an exact string")
+                start = unit["start"]
+                end = unit["end"]
+                if (
+                    type(start) not in (int, float)
+                    or type(end) not in (int, float)
+                    or not math.isfinite(start)
+                    or not math.isfinite(end)
+                ):
+                    _invalid("legacy retained unit bounds are not finite numbers")
+                if start > end:
+                    _invalid(
+                        f"legacy retained unit {owner_index}:{unit_index} is reversed"
+                    )
+                if kind == "identity":
+                    absolute_start, absolute_end = start, end
+                else:
+                    absolute_start = start + legacy
+                    absolute_end = end + legacy
+                if (
+                    type(absolute_start) not in (int, float)
+                    or type(absolute_end) not in (int, float)
+                    or not math.isfinite(absolute_start)
+                    or not math.isfinite(absolute_end)
+                    or absolute_start > absolute_end
+                ):
+                    _invalid("legacy absolute unit projection is invalid")
+                absolute_owner.append(
+                    {
+                        "text": unit["text"],
+                        "start": absolute_start,
+                        "end": absolute_end,
+                    }
+                )
+            absolute_legacy_groups.append(absolute_owner)
+        legacy_absolute = _sha_or_none(
+            row["legacy_absolute_sha256"], "legacy absolute digest"
+        )
+        recomputed_absolute = frozen_json_digest(freeze_json(absolute_legacy_groups))
+        if legacy_absolute != recomputed_absolute:
+            _invalid("legacy absolute digest does not match retained projections")
         authority_digest = _sha_or_none(
             row["authority_absolute_sha256"], "authority absolute digest"
         )
@@ -1239,6 +1423,53 @@ def _validate_physical_calls(
             _invalid("global raw unit ID is duplicated")
         global_ids.update(raw_ids)
     return calls
+
+
+def _crosslink_source_facts(
+    facts: Mapping[str, Any],
+    route_plan: Mapping[str, Any],
+    physical_calls: Sequence[Mapping[str, Any]],
+) -> None:
+    model = facts["backend_model_config"]
+    if tuple(model) == _MODEL_FACT_KEYS:
+        sample_rate = model["sample_rate"]
+        if any(call["sample_rate"] != sample_rate for call in physical_calls):
+            _invalid("model/config sample rate disagrees with physical calls")
+
+    route_facts = facts["route_input"]
+    if tuple(route_facts) != _ROUTE_FACT_KEYS:
+        return
+    blocks = route_facts["blocks"]
+    crops = route_facts["crops"]
+    entries = route_plan["entries"]
+    if len(blocks) != len(entries):
+        _invalid("route source facts disagree with route-plan cardinality")
+    for index, (block, entry) in enumerate(zip(blocks, entries, strict=True)):
+        if block["source_index"] != entry["source_index"]:
+            _invalid("route source facts disagree with delivery source order")
+        block_start = _fact_hex_float(block["start"], "route fact block start")
+        block_end = _fact_hex_float(block["end"], "route fact block end")
+        if route_facts["route"] in ("ctc-full", "mms-full"):
+            if not _same_optional_float(block_start, entry["route_start"]):
+                _invalid("full-pass route start disagrees with source facts")
+            if not _same_optional_float(block_end, entry["route_end"]):
+                _invalid("full-pass route end disagrees with source facts")
+            continue
+        crop = crops[index]
+        if entry["action"] == "qwen-call":
+            if not isinstance(crop, list):
+                _invalid("Qwen call lacks its durable crop facts")
+            crop_start = _fact_hex_float(crop[0], "route fact crop start")
+            if not _same_optional_float(crop_start, entry["route_start"]):
+                _invalid("Qwen route start disagrees with crop facts")
+        elif crop is not None:
+            _invalid("Qwen skip carries durable crop facts")
+        elif not _same_optional_float(block_start, entry["route_start"]):
+            _invalid("Qwen skipped route start disagrees with block facts")
+        if block_end is not None and not _same_optional_float(
+            block_end, entry["route_end"]
+        ):
+            _invalid("Qwen route end disagrees with block facts")
 
 
 def _validate_legacy(
@@ -1310,6 +1541,18 @@ def _validate_legacy(
             != leftovers
         ):
             _invalid("legacy leftover projection mismatch")
+        retained_groups = physical["legacy_retained_units"]
+        if any(
+            len(group) != len(owner)
+            for group, owner in zip(retained_groups, owners, strict=True)
+        ):
+            _invalid("legacy retained unit cardinality disagrees with owner IDs")
+        slice_value = {
+            key: row[key] for key in _LEGACY_CALL_KEYS if key != "call_index"
+        }
+        recomputed_slice = frozen_json_digest(freeze_json(slice_value))
+        if physical["legacy_slice_sha256"] != recomputed_slice:
+            _invalid("legacy slice digest does not match durable receipt")
     if not _is_sha256(legacy["digest"]) or legacy["digest"] != _digest_projection(
         "p6-legacy-distribution-v1", calls
     ):
@@ -2089,13 +2332,24 @@ def _validate_evidence_value(value: object) -> dict[str, Any]:
         _invalid("align evidence language is invalid")
     if root["route"] not in ("ctc-full", "mms-full", "qwen-crop"):
         _invalid("align evidence route is invalid")
+    _source_facts, model_digest, route_digest = _validate_source_facts(
+        root["source_facts"],
+        context_digest=root["context_content_digest"],
+        language=root["language"],
+        route=root["route"],
+    )
     history = _validate_history(root["input_history"])
     route_plan, route_by_source = _validate_route_plan(
         root["route_plan"], root["route"]
     )
     physical_calls = _validate_physical_calls(
-        root["physical_calls"], root["route"], route_by_source
+        root["physical_calls"],
+        root["route"],
+        route_by_source,
+        model_digest,
+        route_digest,
     )
+    _crosslink_source_facts(_source_facts, route_plan, physical_calls)
     raw_ids = [unit_id for call in physical_calls for unit_id in call["raw_unit_ids"]]
     if root["raw_unit_count"] != len(raw_ids):
         _invalid("raw unit count mismatch")

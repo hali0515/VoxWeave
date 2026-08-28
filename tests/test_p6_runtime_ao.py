@@ -145,6 +145,8 @@ def _stub_public_route(
             *_args: Any,
             _raw_call_observer=None,
             _backend_invoker=None,
+            _legacy_distribution_invoker=None,
+            _legacy_shift_invoker=None,
             **_kwargs: Any,
         ) -> list[list[dict[str, Any]]]:
             raw = [
@@ -164,7 +166,24 @@ def _stub_public_route(
                     sample_count=32_000,
                     nominal_end_seconds=None,
                 )
-            return [raw]
+
+            def distribute() -> list[list[dict[str, Any]]]:
+                return [raw]
+
+            distributed = (
+                distribute()
+                if _legacy_distribution_invoker is None
+                else _legacy_distribution_invoker(distribute)
+            )
+
+            def shift() -> list[list[dict[str, Any]]]:
+                return [list(owner) for owner in distributed]
+
+            return (
+                shift()
+                if _legacy_shift_invoker is None
+                else _legacy_shift_invoker(shift)
+            )
 
         monkeypatch.setattr(backend, target, fake_full_pass)
         return
@@ -237,6 +256,7 @@ def _assert_no_phase_after(trace: object, phase: int) -> None:
         event
         for event in trace.events  # type: ignore[attr-defined]
         if int(event.phase.removeprefix("AO-")) > phase
+        and event.phase != "AO-24"  # required failure-path disposal
     ]
 
 
@@ -321,6 +341,12 @@ def test_public_align_runtime_trace_records_real_route_and_ao10_before_ao11(
     events = cast(list[dict[str, object]], record["events"])
     assert [event["ordinal"] for event in events] == list(range(len(events)))
     completed = _completed(trace)
+    ao789 = [
+        phase for phase, _activity in completed if phase in {"AO-07", "AO-08", "AO-09"}
+    ]
+    assert ao789 == sorted(ao789)
+    assert ao789.count("AO-08") == 1
+    assert ao789.count("AO-09") == 1
     ao10 = (
         ("AO-10", "group-block-spans"),
         ("AO-10", "common-all-empty-decision"),
@@ -466,10 +492,18 @@ def test_multicall_qwen_completes_all_ao11_captures_before_any_ao12_transform(
         ("AO-12", "physical-origin-transform"),
         ("AO-12", "physical-origin-transform"),
     ]
+    ao789 = [
+        phase
+        for phase, _activity in _completed(capture.snapshot())
+        if phase in {"AO-07", "AO-08", "AO-09"}
+    ]
+    assert ao789 == sorted(ao789)
+    assert ao789.count("AO-08") == 1
+    assert ao789.count("AO-09") == 1
 
 
-@pytest.mark.parametrize("route", ("ctc-full", "mms-full"))
-def test_public_full_route_real_distribution_failure_is_ao08_and_stops_downstream(
+@pytest.mark.parametrize("route", ("ctc-full", "mms-full", "qwen-crop"))
+def test_public_route_real_distribution_failure_is_ao08_and_stops_downstream(
     route: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -478,17 +512,33 @@ def test_public_full_route_real_distribution_failure_is_ao08_and_stops_downstrea
     from voxweave.align_runtime import capture_align_runtime_trace
 
     vtt_path, media_path = _write_public_align_episode(tmp_path, route=route)
-    _stub_public_full_route_before_distribution(
-        monkeypatch,
-        route=route,
-        media_path=media_path,
-    )
+    if route == "qwen-crop":
+        _stub_public_route(
+            monkeypatch,
+            tmp_path,
+            route=route,
+            media_path=media_path,
+        )
+    else:
+        _stub_public_full_route_before_distribution(
+            monkeypatch,
+            route=route,
+            media_path=media_path,
+        )
 
     def fail_distribution(*_args: Any, **_kwargs: Any) -> Any:
         raise _LegacyDistributionFailure("injected real legacy distribution failure")
 
-    route_module = align_ctc if route == "ctc-full" else align_mms
-    monkeypatch.setattr(route_module, "_distribute_units", fail_distribution)
+    if route == "ctc-full":
+        monkeypatch.setattr(align_ctc, "_distribute_units", fail_distribution)
+    elif route == "mms-full":
+        monkeypatch.setattr(align_mms, "_distribute_units", fail_distribution)
+    else:
+        monkeypatch.setattr(
+            pipeline,
+            "_retain_qwen_owner_slice",
+            fail_distribution,
+        )
 
     with capture_align_runtime_trace() as capture:
         with pytest.raises(
@@ -503,25 +553,37 @@ def test_public_full_route_real_distribution_failure_is_ao08_and_stops_downstrea
     _assert_no_phase_after(trace, 8)
 
 
-def test_public_qwen_real_shift_failure_is_ao09_and_stops_downstream(
+@pytest.mark.parametrize("route", ("ctc-full", "mms-full", "qwen-crop"))
+def test_public_route_real_shift_failure_is_ao09_and_stops_downstream(
+    route: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from voxweave import pipeline
+    from voxweave import align_common, pipeline
     from voxweave.align_runtime import capture_align_runtime_trace
 
-    vtt_path, media_path = _write_public_align_episode(tmp_path, route="qwen-crop")
-    _stub_public_route(
-        monkeypatch,
-        tmp_path,
-        route="qwen-crop",
-        media_path=media_path,
-    )
+    vtt_path, media_path = _write_public_align_episode(tmp_path, route=route)
+    if route == "qwen-crop":
+        _stub_public_route(
+            monkeypatch,
+            tmp_path,
+            route=route,
+            media_path=media_path,
+        )
+    else:
+        _stub_public_full_route_before_distribution(
+            monkeypatch,
+            route=route,
+            media_path=media_path,
+        )
 
     def fail_shift(*_args: Any, **_kwargs: Any) -> Any:
         raise _LegacyShiftFailure("injected real legacy shift failure")
 
-    monkeypatch.setattr(pipeline, "shift_units", fail_shift)
+    if route == "qwen-crop":
+        monkeypatch.setattr(pipeline, "shift_units", fail_shift)
+    else:
+        monkeypatch.setattr(align_common, "_project_legacy_owner", fail_shift)
 
     with capture_align_runtime_trace() as capture:
         with pytest.raises(_LegacyShiftFailure, match="real legacy shift failure"):
