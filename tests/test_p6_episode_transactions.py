@@ -371,6 +371,33 @@ def test_tolerant_mapping_observation_is_exact_and_rat7_recheck_is_dormant(
     assert SPEAKER_MAPPING_CAS_ENABLED is False
 
 
+def test_tolerant_mapping_distinguishes_absence_from_broken_symlink(tmp_path):
+    from voxweave.episode_transaction import capture_speaker_mapping
+
+    absent_warnings: list[str] = []
+    absent = capture_speaker_mapping(
+        tmp_path / "absent.speakers.json",
+        known_ids={"S0"},
+        warn=absent_warnings.append,
+    )
+    assert absent.kind == "absent"
+    assert absent_warnings == []
+
+    mapping = tmp_path / "episode.speakers.json"
+    mapping.symlink_to(tmp_path / "missing-target.json")
+    warnings: list[str] = []
+    broken = capture_speaker_mapping(
+        mapping,
+        known_ids={"S0"},
+        warn=warnings.append,
+    )
+    assert broken.kind == "tolerated-unreadable"
+    assert broken.private_observation is not None
+    assert broken.private_observation.read_exception_class is FileNotFoundError
+    assert broken.private_observation.lstat_value is not None
+    assert len(warnings) == 1
+
+
 def test_transaction_module_has_no_model_renderer_or_pipeline_dependency():
     source = inspect.getsource(
         __import__("voxweave.episode_transaction", fromlist=["*"])
