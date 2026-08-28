@@ -15,15 +15,18 @@ import os
 from collections import namedtuple
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from voxweave import config
 from voxweave.align_common import (
     _DeferredLegacyProjection,
+    _PreparedDpCall,
     _distribute_units,
     _dp_chunked_pass,
+    _execute_dp_calls,
     _load_mono,
     _preflight_over_budget_hints,
+    _prepare_dp_calls,
     _strip_trailing_punct,
     mute_spans_in_wav,
 )
@@ -193,7 +196,10 @@ def _mms_flat_pass(
     )
     if _raw_result_observer is not None:
         _raw_result_observer(flat)
-    _empty_cache()
+    if _backend_invoker is None:
+        _empty_cache()
+    else:
+        _backend_invoker(_empty_cache)
     return flat
 
 
@@ -231,6 +237,7 @@ def align_blocks_full_mms(
     bounds: Sequence[tuple[float, float] | None] | None = None,
     crop_to_envelope: bool = False,
     mute_spans: Sequence[tuple[float, float]] | None = None,
+    _preparation_invoker: Callable[[Callable[[], Any]], Any] | None = None,
     _raw_call_observer: Callable[..., None] | None = None,
     _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
     _legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
@@ -258,14 +265,47 @@ def align_blocks_full_mms(
     if (_legacy_distribution_invoker is None) != (_legacy_shift_invoker is None):
         raise ValueError("legacy projection phase invokers must be supplied together")
 
-    wav = _read_wav_16k(wav_path)
-    if mute_spans:
-        # excised song intervals: no transcript belongs there by construction, so zeroing
-        # them only removes the acoustic bait that smears neighbouring sentences (mid-file
-        # songs survive the envelope crop). Transcribe-path only (fresh spans of this run).
-        wav = mute_spans_in_wav(wav, MMS_SR, mute_spans)
-    norm = [(t or "").strip() for t in texts]
-    _preflight_over_budget_hints(wav, MMS_SR, norm, bounds)
+    prepared_calls: list[_PreparedDpCall] | None = None
+    if _preparation_invoker is None:
+        wav = _read_wav_16k(wav_path)
+        if mute_spans:
+            # excised song intervals: no transcript belongs there by construction, so zeroing
+            # them only removes the acoustic bait that smears neighbouring sentences (mid-file
+            # songs survive the envelope crop). Transcribe-path only (fresh spans of this run).
+            wav = mute_spans_in_wav(wav, MMS_SR, mute_spans)
+        norm = [(t or "").strip() for t in texts]
+        _preflight_over_budget_hints(wav, MMS_SR, norm, bounds)
+    else:
+
+        def prepare_full_pass() -> tuple[list[str], Any, list[_PreparedDpCall]]:
+            prepared_wav = _read_wav_16k(wav_path)
+            if mute_spans:
+                prepared_wav = mute_spans_in_wav(
+                    prepared_wav,
+                    MMS_SR,
+                    mute_spans,
+                )
+            prepared_norm = [(text or "").strip() for text in texts]
+            _preflight_over_budget_hints(
+                prepared_wav,
+                MMS_SR,
+                prepared_norm,
+                bounds,
+            )
+            calls = _prepare_dp_calls(
+                prepared_wav,
+                MMS_SR,
+                prepared_norm,
+                bounds,
+                "MMS",
+                crop_to_envelope=crop_to_envelope,
+            )
+            return prepared_norm, prepared_wav, calls
+
+        norm, wav, prepared_calls = cast(
+            tuple[list[str], Any, list[_PreparedDpCall]],
+            _preparation_invoker(prepare_full_pass),
+        )
 
     # offset_s is part of the _dp_chunked_pass pass_fn contract (used by the CTC
     # path's emission masking); MMS does not mask yet, pending ja truth validation.
@@ -328,14 +368,22 @@ def align_blocks_full_mms(
             raise RuntimeError("MMS flat result was not observed before distribution")
         return out
 
-    return _dp_chunked_pass(
-        wav,
-        MMS_SR,
-        norm,
-        bounds,
+    if prepared_calls is None:
+        return _dp_chunked_pass(
+            wav,
+            MMS_SR,
+            norm,
+            bounds,
+            _pass,
+            "MMS",
+            crop_to_envelope=crop_to_envelope,
+            pass_physical_geometry=True,
+            legacy_distribution_invoker=_legacy_distribution_invoker,
+            legacy_shift_invoker=_legacy_shift_invoker,
+        )
+    return _execute_dp_calls(
+        prepared_calls,
         _pass,
-        "MMS",
-        crop_to_envelope=crop_to_envelope,
         pass_physical_geometry=True,
         legacy_distribution_invoker=_legacy_distribution_invoker,
         legacy_shift_invoker=_legacy_shift_invoker,

@@ -32,6 +32,19 @@ class _DeferredLegacyProjection:
     origin_seconds: float
 
 
+@dataclass(frozen=True)
+class _PreparedDpCall:
+    """One fully materialized full-pass physical call awaiting AO-07."""
+
+    wav_slice: Any
+    texts: list[str]
+    offset_seconds: float
+    audio_sample_start: int
+    audio_sample_end: int
+    sample_count: int
+    identity_projection: bool
+
+
 def _project_legacy_owner(
     owner: Sequence[dict],
     origin_seconds: float,
@@ -235,86 +248,19 @@ def _mask_emissions_outside_speech(logp, speech_spans, total_samples, sr, blank)
     return masked
 
 
-def _dp_chunked_pass(
+def _prepare_dp_calls(
     wav,
     sr: int,
     norm: list[str],
     bounds: Sequence[tuple[float, float] | None] | None,
-    pass_fn,
     label: str,
     *,
     crop_to_envelope: bool = False,
-    pass_physical_geometry: bool = False,
-    legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-    legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-) -> list[list[dict]]:
-    """Run one geometry-aware alignment pass under the global-DP memory budget.
-
-    The historical three-argument ``pass_fn(wav_slice, texts, offset_s)`` contract
-    remains the default for low-level callers.  CTC/MMS opt into
-    ``pass_physical_geometry``; their pass function additionally receives the exact
-    keyword-only ``audio_sample_start``, ``audio_sample_end``, and ``sample_count``
-    values for the physical crop.  This does not change the legacy offset or selected
-    units.
-
-    Shared by the wav2vec2 and MMS full-pass aligners: both end in a single forced-align
-    trellis that is O(T*L) and overflows on movie-length audio. Within budget the whole wav
-    goes through one pass. Past CTC_MAX_DP_FRAMES, cue `bounds` (per-cue (start,end), aligned
-    with `norm`) are used as silence anchors to split the audio (plan_dp_chunks): each chunk
-    re-runs the full pass over its own crop (within-chunk routing-free, so drift-immunity
-    holds) and units are offset back to absolute time. Boundaries land in inter-cue silence,
-    so no word crosses them. Without bounds an over-budget file is rejected (raise
-    VOXWEAVE_CTC_MAX_DP_FRAMES to force a single pass). `wav` may be a torch tensor or a
-    numpy array; only 1D slicing and shape[-1] are used.
-    """
+) -> list[_PreparedDpCall]:
+    """Validate and materialize every full-pass call without backend work."""
     from voxweave.chunking import plan_dp_chunks
-    from voxweave.timestamps import shift_units
 
     sample_count = int(wav.shape[-1])
-
-    def run_pass(
-        wav_slice,
-        texts: list[str],
-        offset_s: float,
-        *,
-        audio_sample_start: int,
-        audio_sample_end: int,
-    ):
-        if pass_physical_geometry:
-            return pass_fn(
-                wav_slice,
-                texts,
-                offset_s,
-                audio_sample_start=audio_sample_start,
-                audio_sample_end=audio_sample_end,
-                sample_count=sample_count,
-            )
-        return pass_fn(wav_slice, texts, offset_s)
-
-    def complete_deferred(
-        calls: list[_DeferredLegacyProjection],
-    ) -> list[list[dict]]:
-        if legacy_distribution_invoker is None or legacy_shift_invoker is None:
-            raise RuntimeError(
-                "deferred legacy projection requires both phase invokers"
-            )
-
-        def distribute_all() -> list[list[list[dict]]]:
-            return [call.distribute() for call in calls]
-
-        distributed = legacy_distribution_invoker(distribute_all)
-
-        def shift_all() -> list[list[dict]]:
-            projected: list[list[dict]] = []
-            for call, owners in zip(calls, distributed, strict=True):
-                projected.extend(
-                    _project_legacy_owner(owner, call.origin_seconds)
-                    for owner in owners
-                )
-            return projected
-
-        return legacy_shift_invoker(shift_all)
-
     frames = wav.shape[-1] / _CTC_STRIDE
     if frames <= CTC_MAX_DP_FRAMES:
         # Crop the single global pass to the transcribed cue envelope so a leading/trailing
@@ -332,26 +278,28 @@ def _dp_chunked_pass(
             hi = min(total_sec, max(ends) + CTC_ENVELOPE_PAD_SEC)
             a, b = int(lo * sr), int(hi * sr)
             if a < b and (a > 0 or b < wav.shape[-1]):
-                result = run_pass(
-                    wav[a:b],
-                    norm,
-                    lo,
-                    audio_sample_start=a,
-                    audio_sample_end=b,
-                )
-                if isinstance(result, _DeferredLegacyProjection):
-                    return complete_deferred([result])
-                return [shift_units(units, lo) for units in result]
-        result = run_pass(
-            wav,
-            norm,
-            0.0,
-            audio_sample_start=0,
-            audio_sample_end=sample_count,
-        )
-        if isinstance(result, _DeferredLegacyProjection):
-            return complete_deferred([result])
-        return result
+                return [
+                    _PreparedDpCall(
+                        wav[a:b],
+                        norm,
+                        lo,
+                        a,
+                        b,
+                        sample_count,
+                        False,
+                    )
+                ]
+        return [
+            _PreparedDpCall(
+                wav,
+                norm,
+                0.0,
+                0,
+                sample_count,
+                sample_count,
+                True,
+            )
+        ]
 
     total_sec = wav.shape[-1] / sr
     budget_sec = CTC_MAX_DP_FRAMES * _CTC_STRIDE / sr * CTC_DP_CHUNK_FRAC
@@ -383,30 +331,131 @@ def _dp_chunked_pass(
         len(plans),
         budget_sec / 60,
     )
-    out: list[list[dict]] = []
-    deferred: list[_DeferredLegacyProjection] = []
+    calls: list[_PreparedDpCall] = []
     for p in plans:
         a = max(0, int(p["start"] * sr))
         b = min(sample_count, int(p["end"] * sr))
         offset = a / sr
-        sub = run_pass(
-            wav[a:b],
-            norm[p["lo"] : p["hi"]],
-            offset,
-            audio_sample_start=a,
-            audio_sample_end=b,
+        calls.append(
+            _PreparedDpCall(
+                wav[a:b],
+                norm[p["lo"] : p["hi"]],
+                offset,
+                a,
+                b,
+                sample_count,
+                False,
+            )
         )
-        if isinstance(sub, _DeferredLegacyProjection):
-            deferred.append(sub)
+    return calls
+
+
+def _execute_dp_calls(
+    calls: Sequence[_PreparedDpCall],
+    pass_fn,
+    *,
+    pass_physical_geometry: bool = False,
+    legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+) -> list[list[dict]]:
+    """Execute prepared calls, then perform only the deferred AO-08/AO-09 work."""
+    from voxweave.timestamps import shift_units
+
+    def run_pass(call: _PreparedDpCall):
+        if pass_physical_geometry:
+            return pass_fn(
+                call.wav_slice,
+                call.texts,
+                call.offset_seconds,
+                audio_sample_start=call.audio_sample_start,
+                audio_sample_end=call.audio_sample_end,
+                sample_count=call.sample_count,
+            )
+        return pass_fn(call.wav_slice, call.texts, call.offset_seconds)
+
+    def complete_deferred(
+        deferred_calls: list[_DeferredLegacyProjection],
+    ) -> list[list[dict]]:
+        if legacy_distribution_invoker is None or legacy_shift_invoker is None:
+            raise RuntimeError(
+                "deferred legacy projection requires both phase invokers"
+            )
+
+        def distribute_all() -> list[list[list[dict]]]:
+            return [call.distribute() for call in deferred_calls]
+
+        distributed = legacy_distribution_invoker(distribute_all)
+
+        def shift_all() -> list[list[dict]]:
+            projected: list[list[dict]] = []
+            for call, owners in zip(deferred_calls, distributed, strict=True):
+                projected.extend(
+                    _project_legacy_owner(owner, call.origin_seconds)
+                    for owner in owners
+                )
+            return projected
+
+        return legacy_shift_invoker(shift_all)
+
+    if len(calls) == 1 and calls[0].identity_projection:
+        result = run_pass(calls[0])
+        if isinstance(result, _DeferredLegacyProjection):
+            return complete_deferred([result])
+        return result
+
+    out: list[list[dict]] = []
+    deferred: list[_DeferredLegacyProjection] = []
+    for call in calls:
+        result = run_pass(call)
+        if isinstance(result, _DeferredLegacyProjection):
+            deferred.append(result)
         elif deferred:
             raise RuntimeError("legacy projection mode changed between physical calls")
         else:
-            out.extend(shift_units(units, offset) for units in sub)
+            out.extend(shift_units(units, call.offset_seconds) for units in result)
     if deferred:
-        if out or len(deferred) != len(plans):
+        if out or len(deferred) != len(calls):
             raise RuntimeError("legacy projection mode changed between physical calls")
         return complete_deferred(deferred)
     return out
+
+
+def _dp_chunked_pass(
+    wav,
+    sr: int,
+    norm: list[str],
+    bounds: Sequence[tuple[float, float] | None] | None,
+    pass_fn,
+    label: str,
+    *,
+    crop_to_envelope: bool = False,
+    pass_physical_geometry: bool = False,
+    legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+) -> list[list[dict]]:
+    """Run one geometry-aware alignment pass under the global-DP memory budget.
+
+    The historical three-argument ``pass_fn(wav_slice, texts, offset_s)`` contract
+    remains the default for low-level callers. CTC/MMS opt into physical geometry.
+    Full-pass public callers may separately run :func:`_prepare_dp_calls` under
+    AO-06 and then call :func:`_execute_dp_calls`, keeping backend and legacy
+    projection work outside that preparation owner.
+    """
+    calls = _prepare_dp_calls(
+        wav,
+        sr,
+        norm,
+        bounds,
+        label,
+        crop_to_envelope=crop_to_envelope,
+    )
+    return _execute_dp_calls(
+        calls,
+        pass_fn,
+        pass_physical_geometry=pass_physical_geometry,
+        legacy_distribution_invoker=legacy_distribution_invoker,
+        legacy_shift_invoker=legacy_shift_invoker,
+    )
 
 
 def _preflight_over_budget_hints(

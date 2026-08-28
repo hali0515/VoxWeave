@@ -19,11 +19,14 @@ from typing import Any, cast
 from voxweave import config
 from voxweave.align_common import (
     _DeferredLegacyProjection,
+    _PreparedDpCall,
     _distribute_units,
     _dp_chunked_pass,
+    _execute_dp_calls,
     _load_mono,
     _mask_emissions_outside_speech,
     _preflight_over_budget_hints,
+    _prepare_dp_calls,
     _strip_trailing_punct,
     interp_missing,
     mute_spans_in_wav,
@@ -405,6 +408,7 @@ def align_blocks_full_ctc(
     speech_spans: list[tuple[float, float]] | None = None,
     crop_to_envelope: bool = False,
     mute_spans: Sequence[tuple[float, float]] | None = None,
+    _preparation_invoker: Callable[[Callable[[], Any]], Any] | None = None,
     _raw_call_observer: Callable[..., None] | None = None,
     _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
     _legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
@@ -427,23 +431,83 @@ def align_blocks_full_ctc(
     if (_legacy_distribution_invoker is None) != (_legacy_shift_invoker is None):
         raise ValueError("legacy projection phase invokers must be supplied together")
 
-    if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() != "1":
-        speech_spans = None
-    norm = [(t or "").strip() for t in texts]
-    wav = _load_mono(wav_path, CTC_AUDIO_SR)
-    _preflight_over_budget_hints(wav, CTC_AUDIO_SR, norm, bounds)
-    al = (
-        _get_ctc_aligner(iso, model_name)
-        if _backend_invoker is None
-        else _backend_invoker(lambda: _get_ctc_aligner(iso, model_name))
-    )
+    prepared_calls: list[_PreparedDpCall] | None = None
+    if _preparation_invoker is None:
+        if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() != "1":
+            speech_spans = None
+        norm = [(t or "").strip() for t in texts]
+        wav = _load_mono(wav_path, CTC_AUDIO_SR)
+        _preflight_over_budget_hints(wav, CTC_AUDIO_SR, norm, bounds)
+        al = (
+            _get_ctc_aligner(iso, model_name)
+            if _backend_invoker is None
+            else _backend_invoker(lambda: _get_ctc_aligner(iso, model_name))
+        )
+    else:
+
+        def prepare_full_pass() -> tuple[
+            list[str],
+            Any,
+            list[_PreparedDpCall],
+            list[tuple[float, float]] | None,
+        ]:
+            prepared_speech_spans = speech_spans
+            if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() != "1":
+                prepared_speech_spans = None
+            prepared_norm = [(text or "").strip() for text in texts]
+            prepared_wav = _load_mono(wav_path, CTC_AUDIO_SR)
+            _preflight_over_budget_hints(
+                prepared_wav,
+                CTC_AUDIO_SR,
+                prepared_norm,
+                bounds,
+            )
+            if mute_spans:
+                prepared_wav = mute_spans_in_wav(
+                    prepared_wav,
+                    CTC_AUDIO_SR,
+                    mute_spans,
+                )
+            calls = _prepare_dp_calls(
+                prepared_wav,
+                CTC_AUDIO_SR,
+                prepared_norm,
+                bounds,
+                "CTC",
+                crop_to_envelope=crop_to_envelope,
+            )
+            return prepared_norm, prepared_wav, calls, prepared_speech_spans
+
+        norm, wav, prepared_calls, speech_spans = cast(
+            tuple[
+                list[str],
+                Any,
+                list[_PreparedDpCall],
+                list[tuple[float, float]] | None,
+            ],
+            _preparation_invoker(prepare_full_pass),
+        )
+
+        def load_fixed_rate_aligner():
+            loaded = _get_ctc_aligner(iso, model_name)
+            if loaded.sr != CTC_AUDIO_SR:
+                raise RuntimeError(
+                    "configured CTC aligner sample rate differs from prepared call rate"
+                )
+            return loaded
+
+        al = (
+            load_fixed_rate_aligner()
+            if _backend_invoker is None
+            else _backend_invoker(load_fixed_rate_aligner)
+        )
     nospace = iso in NO_SPACE_LANGS
-    if al.sr != CTC_AUDIO_SR:
+    if _preparation_invoker is None and al.sr != CTC_AUDIO_SR:
         # Defensive support for a future non-16k model.  Its exact resampled geometry
         # receives the same preflight before any encoder forward.
         wav = _load_mono(wav_path, al.sr)
         _preflight_over_budget_hints(wav, al.sr, norm, bounds)
-    if mute_spans:
+    if _preparation_invoker is None and mute_spans:
         # excised song intervals (see align_blocks_full_mms): no transcript belongs there,
         # muting only removes the acoustic bait that smears neighbouring sentences.
         wav = mute_spans_in_wav(wav, al.sr, mute_spans)
@@ -526,17 +590,28 @@ def align_blocks_full_ctc(
             out = _DeferredLegacyProjection(distribute, offset_s)
         if _raw_call_observer is not None and raw_result is None:
             raise RuntimeError("CTC flat result was not observed before distribution")
-        _empty_cache()
+        if _backend_invoker is None:
+            _empty_cache()
+        else:
+            _backend_invoker(_empty_cache)
         return out
 
-    return _dp_chunked_pass(
-        wav,
-        al.sr,
-        norm,
-        bounds,
+    if prepared_calls is None:
+        return _dp_chunked_pass(
+            wav,
+            al.sr,
+            norm,
+            bounds,
+            _pass,
+            "CTC",
+            crop_to_envelope=crop_to_envelope,
+            pass_physical_geometry=True,
+            legacy_distribution_invoker=_legacy_distribution_invoker,
+            legacy_shift_invoker=_legacy_shift_invoker,
+        )
+    return _execute_dp_calls(
+        prepared_calls,
         _pass,
-        "CTC",
-        crop_to_envelope=crop_to_envelope,
         pass_physical_geometry=True,
         legacy_distribution_invoker=_legacy_distribution_invoker,
         legacy_shift_invoker=_legacy_shift_invoker,
