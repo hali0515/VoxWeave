@@ -1075,6 +1075,32 @@ def test_align_shadow_reports_strict_j0_failure_before_pending_w1(
     assert artifact.fresh["strict_input_status"] == "invalid"
 
 
+def test_align_shadow_reports_strict_raw_failure_before_pending_w1(
+    tmp_path, monkeypatch
+):
+    from voxweave import backend
+
+    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda _wav, text, _iso: [
+            {"text": value, "start": index, "end": index + 1}
+            for index, value in enumerate(text)
+        ],
+    )
+    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
+    observed: list[object] = []
+
+    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
+
+    artifact = observed[0]
+    assert artifact.failure.kind == "fresh-time-transform-invalid"
+    assert artifact.failure.phase == "strict-capture"
+    assert artifact.failure.detail_code == "strict-raw-node"
+    assert artifact.fresh["authority_distribution_status"] == "invalid"
+
+
 def test_align_shadow_observer_failure_cannot_change_selected_return(
     tmp_path, monkeypatch, caplog
 ):
