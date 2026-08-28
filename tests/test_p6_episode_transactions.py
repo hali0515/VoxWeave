@@ -1101,6 +1101,33 @@ def test_align_shadow_reports_strict_raw_failure_before_pending_w1(
     assert artifact.fresh["authority_distribution_status"] == "invalid"
 
 
+def test_align_shadow_runs_seed_reconciliation_before_pending_w1(
+    tmp_path, monkeypatch
+):
+    from voxweave.core import align_seed
+
+    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
+    monkeypatch.setattr(
+        align_seed,
+        "build_align_seed",
+        lambda **_kwargs: align_seed.AlignSeedResult(
+            "invalid",
+            ("footprint-reconciliation",),
+            None,
+            (),
+        ),
+    )
+    observed: list[object] = []
+
+    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
+
+    artifact = observed[0]
+    assert artifact.failure.kind == "fresh-reconciliation-invalid"
+    assert artifact.failure.detail_code == "footprint-reconciliation"
+    assert artifact.fresh["seed_status"] == "invalid"
+
+
 def test_align_shadow_observer_failure_cannot_change_selected_return(
     tmp_path, monkeypatch, caplog
 ):
