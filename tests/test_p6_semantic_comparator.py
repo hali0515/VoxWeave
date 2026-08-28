@@ -14,11 +14,17 @@ def _profile():
     )
 
 
-def _semantic_facts(*, bad_text: bool = False, bad_leg: bool = False):
+def _semantic_facts(
+    *,
+    bad_text: bool = False,
+    bad_leg: bool = False,
+    wrong_legacy_origin: bool = False,
+    origin_delta: bool = True,
+):
     relative_start = 0.2
     relative_end = 0.8
     physical_origin = 1601 / 16_000
-    legacy_origin = 0.10001
+    legacy_origin = 0.10001 if origin_delta else physical_origin
     start = relative_start + physical_origin
     end = relative_end + physical_origin
     word = SimpleNamespace(
@@ -52,12 +58,19 @@ def _semantic_facts(*, bad_text: bool = False, bad_leg: bool = False):
         speech_start=start,
         speech_end=end,
     )
+    legacy_word_origin = physical_origin if wrong_legacy_origin else legacy_origin
+    legacy_word = SimpleNamespace(
+        text="word",
+        start=relative_start + legacy_word_origin,
+        end=relative_end + legacy_word_origin,
+    )
     legacy_cue = SimpleNamespace(
         source_index=0,
         text="legacy",
-        start=relative_start + legacy_origin,
-        end=relative_end + legacy_origin,
+        start=legacy_word.start,
+        end=legacy_word.end,
         lyric=None,
+        word_data=(legacy_word,),
     )
     v2_cue = SimpleNamespace(
         source_index=0,
@@ -154,6 +167,32 @@ def test_semantic_oracle_accepts_only_its_independently_derived_relations():
         "lyric",
     }
     assert all(outcome.passed for outcome in outcomes.values())
+
+
+def test_qwen_origin_relation_is_inactive_when_origins_match_exactly():
+    from voxweave.core.align_compare import compare_semantic_deltas
+
+    comparison = compare_semantic_deltas(**_semantic_facts(origin_delta=False))
+    outcome = next(
+        outcome for outcome in comparison.outcomes if outcome.delta_id == "ALD-0"
+    )
+
+    assert outcome.triggered is False
+    assert outcome.passed is True
+    assert "ALD-0" not in comparison.violations
+
+
+def test_qwen_origin_relation_rejects_legacy_bounds_shifted_by_physical_origin():
+    from voxweave.core.align_compare import compare_semantic_deltas
+
+    comparison = compare_semantic_deltas(**_semantic_facts(wrong_legacy_origin=True))
+    outcome = next(
+        outcome for outcome in comparison.outcomes if outcome.delta_id == "ALD-0"
+    )
+
+    assert outcome.triggered is True
+    assert outcome.passed is False
+    assert "ALD-0" in comparison.violations
 
 
 def test_semantic_oracle_rejects_wrong_v2_text_even_when_its_shape_is_valid():

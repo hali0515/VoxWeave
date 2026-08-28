@@ -69,27 +69,137 @@ def test_finalizer_evidence_shape_failures_keep_their_exact_domain(
     assert resolution.status.detail_code == detail_code
 
 
-def test_finalizer_terminal_validity_precedes_generic_invalidity(
+@pytest.mark.parametrize(
+    ("terminal", "valid", "root_error"),
+    tuple(
+        (terminal, valid, root_error)
+        for terminal in (
+            "fixed-point",
+            "cycle-adoption",
+            "budget-exhausted",
+            "unknown-terminal",
+        )
+        for valid in (False, True)
+        for root_error in (False, True)
+    ),
+)
+def test_finalizer_terminal_table_precedes_root_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+    valid: bool,
+    root_error: bool,
 ) -> None:
     from tests.test_p6_align_candidates import _evaluated
-    from voxweave.core import finalizer
+    from voxweave.core import authority, finalizer
 
     original_finalize = finalizer.finalize
+    root_calls = 0
 
-    def corrupt_validity(*args: Any, **kwargs: Any) -> Any:
+    def inject_terminal(*args: Any, **kwargs: Any) -> Any:
         result = original_finalize(*args, **kwargs)
-        assert result.report.terminal in ("fixed-point", "cycle-adoption")
-        return replace(result, valid=False)
+        return replace(
+            result,
+            report=replace(result.report, terminal=terminal),
+            trace=replace(result.trace, terminal=terminal),
+            valid=valid,
+        )
 
-    monkeypatch.setattr(finalizer, "finalize", corrupt_validity)
+    def observed_roots(*args: Any, **kwargs: Any) -> tuple[str, ...]:
+        nonlocal root_calls
+        root_calls += 1
+        return ("injected-root-error",) if root_error else ()
+
+    monkeypatch.setattr(finalizer, "finalize", inject_terminal)
+    monkeypatch.setattr(authority, "check_roots", observed_roots)
     _context, result = _evaluated(tmp_path, shadow_requested=True)
+
+    if terminal in ("fixed-point", "cycle-adoption") and valid:
+        assert root_calls == 1
+        if root_error:
+            assert result.v2_status.kind == "invalid"
+            assert result.v2_status.failure is not None
+            assert (
+                result.v2_status.failure.kind,
+                result.v2_status.failure.phase,
+                result.v2_status.failure.detail_code,
+            ) == (
+                "fresh-authority-invalid",
+                "w1-admission",
+                "w1-root-event",
+            )
+        elif terminal == "fixed-point":
+            assert result.v2_status.kind == "valid"
+            assert result.v2_status.failure is None
+        return
+
+    assert root_calls == 0
     assert result.v2_status.kind == "invalid"
     assert result.v2_status.failure is not None
-    assert result.v2_status.failure.kind == "finalizer-output-invalid"
-    assert result.v2_status.failure.phase == "w1-finalizer"
-    assert result.v2_status.failure.detail_code == "terminal-validity"
+    if terminal == "budget-exhausted" and valid is False:
+        assert (
+            result.v2_status.failure.kind,
+            result.v2_status.failure.phase,
+            result.v2_status.failure.detail_code,
+        ) == (
+            "finalizer-budget-exhausted",
+            "w1-finalizer",
+            "sweep-budget",
+        )
+    else:
+        assert (
+            result.v2_status.failure.kind,
+            result.v2_status.failure.phase,
+            result.v2_status.failure.detail_code,
+        ) == (
+            "finalizer-output-invalid",
+            "w1-finalizer",
+            "terminal-validity",
+        )
+
+
+@pytest.mark.parametrize("root_error", (False, True))
+def test_finalizer_terminal_disagreement_stops_before_root_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_error: bool,
+) -> None:
+    from tests.test_p6_align_candidates import _evaluated
+    from voxweave.core import authority, finalizer
+
+    original_finalize = finalizer.finalize
+    root_calls = 0
+
+    def inject_disagreement(*args: Any, **kwargs: Any) -> Any:
+        result = original_finalize(*args, **kwargs)
+        return replace(
+            result,
+            report=replace(result.report, terminal="fixed-point"),
+            trace=replace(result.trace, terminal="cycle-adoption"),
+            valid=True,
+        )
+
+    def observed_roots(*args: Any, **kwargs: Any) -> tuple[str, ...]:
+        nonlocal root_calls
+        root_calls += 1
+        return ("injected-root-error",) if root_error else ()
+
+    monkeypatch.setattr(finalizer, "finalize", inject_disagreement)
+    monkeypatch.setattr(authority, "check_roots", observed_roots)
+    _context, result = _evaluated(tmp_path, shadow_requested=True)
+
+    assert root_calls == 0
+    assert result.v2_status.kind == "invalid"
+    assert result.v2_status.failure is not None
+    assert (
+        result.v2_status.failure.kind,
+        result.v2_status.failure.phase,
+        result.v2_status.failure.detail_code,
+    ) == (
+        "finalizer-output-invalid",
+        "w1-finalizer",
+        "terminal-validity",
+    )
 
 
 def test_finalizer_canonical_text_fallback_is_a_footprint_failure(

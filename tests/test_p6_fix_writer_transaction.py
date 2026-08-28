@@ -75,7 +75,48 @@ def test_rat2_public_align_publishes_and_verifies_evidence_last(tmp_path, monkey
 
     verified = align_evidence.verify_align_evidence(vtt_path)
     assert verified.integrity is True
-    assert verified.w1_usable is False
+    assert verified.w1_usable is True
+
+
+@pytest.mark.parametrize(
+    (
+        "profile_kind",
+        "admission",
+        "owner_ranges",
+        "raw_unit_count",
+        "expected",
+    ),
+    (
+        ("production", "valid", (("r0", "r1"), ("r2",)), 3, True),
+        ("test-only", "valid", (("r0", "r1"), ("r2",)), 3, False),
+        ("production", "invalid", (("r0", "r1"), ("r2",)), 3, False),
+        ("production", "valid", None, 3, False),
+        ("production", "valid", (("r0", "r1"), ()), 2, False),
+        ("production", "valid", (("r0", "r1"), ("r1", "r2")), 3, False),
+        ("production", "valid", (("r0",), ("r1",)), 3, False),
+        ("production", "valid", (("r0", "r1"), ("r2",)), 2, False),
+    ),
+)
+def test_rat2_w1_usability_is_the_exact_section_9_3_conjunction(
+    profile_kind,
+    admission,
+    owner_ranges,
+    raw_unit_count,
+    expected,
+):
+    from voxweave.align_evidence import _w1_usable_audit
+
+    evidence = {
+        "input_history": {"authority_limit_profile_kind": profile_kind},
+        "authority_distribution": {
+            "owner_unit_ids": owner_ranges,
+            "work": {"limit_profile_kind": profile_kind},
+        },
+        "v2_admission_status": admission,
+        "raw_unit_count": raw_unit_count,
+    }
+
+    assert _w1_usable_audit(evidence) is expected
 
 
 def test_rat3_segmentation_writer_preserves_present_null(tmp_path):
