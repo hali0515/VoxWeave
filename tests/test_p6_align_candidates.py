@@ -6,10 +6,13 @@ import pytest
 
 def _context(tmp_path):
     from voxweave.align_context import consume_context_role, issue_align_context
-    from voxweave.align_snapshot import freeze_json
+    from voxweave.align_snapshot import FrozenObject, freeze_json
+
+    stable_fields = freeze_json({"case": "candidate"})
+    assert isinstance(stable_fields, FrozenObject)
 
     context = issue_align_context(
-        stable_fields=freeze_json({"case": "candidate"}),
+        stable_fields=stable_fields,
         target_path=tmp_path / "episode.vtt",
         sibling_path=tmp_path / "episode.json",
         media_path=tmp_path / "episode.mkv",
@@ -70,7 +73,7 @@ def _evaluated(tmp_path, *, shadow_requested=False):
         SourceBlockDecoration,
         issue_legacy_align_evaluated_result,
     )
-    from voxweave.align_snapshot import freeze_json
+    from voxweave.align_snapshot import FrozenObject, freeze_json
 
     context = _context(tmp_path)
     unit = PersistedAlignUnit("hello", 1.0, 2.0)
@@ -94,6 +97,8 @@ def _evaluated(tmp_path, *, shadow_requested=False):
         (cue,),
         (unit,),
     )
+    segmentation = freeze_json({"manifest_version": 1})
+    assert isinstance(segmentation, FrozenObject)
     inputs = AlignProjectionInputs(
         language="en",
         source_blocks=(SourceBlockDecoration(0, "Alice", None),),
@@ -103,7 +108,7 @@ def _evaluated(tmp_path, *, shadow_requested=False):
         speaker_turns=((0.0, 3.0, "SPEAKER_00"),),
         voiceprint_capture=None,
         voiceprint_media=None,
-        segmentation=freeze_json({"manifest_version": 1}),
+        segmentation=segmentation,
     )
     result = issue_legacy_align_evaluated_result(
         context,
