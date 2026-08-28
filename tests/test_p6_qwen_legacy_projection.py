@@ -8,11 +8,7 @@ from typing import Any
 import pytest
 
 
-EXPECTED_VTT = (
-    "WEBVTT\n\n"
-    "00:00:00.000 --> 00:00:01.000\n"
-    "你！\n"
-).encode("utf-8")
+EXPECTED_VTT = ("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n你！\n").encode("utf-8")
 
 EXPECTED_JSON = json.dumps(
     {
@@ -40,9 +36,7 @@ def _write_qwen_episode(tmp_path: Path) -> tuple[Path, Path, Path]:
         json.dumps(
             {
                 "language": "zh",
-                "word_segments": [
-                    {"text": "你！", "start": 0.0, "end": 1.0}
-                ],
+                "word_segments": [{"text": "你！", "start": 0.0, "end": 1.0}],
             },
             ensure_ascii=False,
         ),

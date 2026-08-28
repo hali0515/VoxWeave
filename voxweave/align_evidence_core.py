@@ -1143,6 +1143,7 @@ def _r_legacy_call(
     call: ReferencePhysicalCallFacts,
     blocks: Mapping[int, AuthorityBlock],
     language: str,
+    route_kind: str,
 ) -> tuple[
     LegacyCallDistributionReceipt,
     tuple[tuple[Mapping[str, Any], ...], ...],
@@ -1160,7 +1161,14 @@ def _r_legacy_call(
     for source in call.source_block_indices:
         if source not in blocks:
             raise EvidenceCoreProjectionError("reference legacy owner is unknown")
-        count = _r_legacy_count(blocks[source].alignment_text, language)
+        if route_kind == "qwen-crop":
+            if len(call.source_block_indices) != 1:
+                raise EvidenceCoreProjectionError(
+                    "reference Qwen call must have one source owner"
+                )
+            count = raw_count
+        else:
+            count = _r_legacy_count(blocks[source].alignment_text, language)
         lower, upper = cursor, cursor + count
         low_clamp, high_clamp = min(lower, raw_count), min(upper, raw_count)
         expected.append(count)
@@ -1417,7 +1425,7 @@ def _r_rebuild_calls(
             raise EvidenceCoreProjectionError("reference origin kind is invalid")
         capture = _r_capture(raw_call)
         legacy_receipt, call_legacy, call_relative_legacy = _r_legacy_call(
-            raw_call, blocks_by_source, facts.language
+            raw_call, blocks_by_source, facts.language, facts.route_kind
         )
         retained_count = len(legacy_receipt.consumed_prefix_unit_ids)
         transform = _r_transform(raw_call, capture, retained_count)

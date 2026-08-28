@@ -40,6 +40,7 @@ from voxweave.align_distribution import (
     StrictFailureLocator,
     _build_context_authority_distribution,
     legacy_distribute_before_shift,
+    legacy_retain_qwen_before_shift,
 )
 from voxweave.align_failures import CanonicalFailure, SecondaryFailure
 from voxweave.align_runtime import align_runtime_activity
@@ -1522,15 +1523,24 @@ def _legacy_call_projection(
         blocks_by_source[index].alignment_text for index in call.source_block_indices
     )
     try:
-        legacy = legacy_distribute_before_shift(
-            call.post_units,
-            texts=texts,
-            iso=issuer.language,
-            origin=call.legacy_origin_seconds,
-            identity=call.legacy_origin_kind == "identity",
-            raw_unit_ids=call.raw_unit_ids,
-            source_indices=call.source_block_indices,
-        )
+        if issuer.context.route_kind == "qwen-crop":
+            legacy = legacy_retain_qwen_before_shift(
+                call.post_units,
+                origin=call.legacy_origin_seconds,
+                identity=call.legacy_origin_kind == "identity",
+                raw_unit_ids=call.raw_unit_ids,
+                source_indices=call.source_block_indices,
+            )
+        else:
+            legacy = legacy_distribute_before_shift(
+                call.post_units,
+                texts=texts,
+                iso=issuer.language,
+                origin=call.legacy_origin_seconds,
+                identity=call.legacy_origin_kind == "identity",
+                raw_unit_ids=call.raw_unit_ids,
+                source_indices=call.source_block_indices,
+            )
     except Exception as exc:
         missing_key = exc.args[0] if isinstance(exc, KeyError) and exc.args else None
         retained_field = missing_key if type(missing_key) is str else ""

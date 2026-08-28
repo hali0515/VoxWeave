@@ -1496,3 +1496,47 @@ def legacy_distribute_before_shift(
         leftover_unit_ids=raw_unit_ids[consumed:],
     )
     return LegacyDistributionResult(projected, receipt, relative_projected)
+
+
+def legacy_retain_qwen_before_shift(
+    relative_flat: Sequence[Any],
+    *,
+    origin: float,
+    identity: bool,
+    raw_unit_ids: tuple[str, ...],
+    source_indices: tuple[int, ...],
+) -> LegacyDistributionResult:
+    """Assign one Qwen call's complete raw result to its sole cue owner."""
+    if len(raw_unit_ids) != len(relative_flat):
+        raise ValueError("raw unit ids must cover the complete flat result")
+    if (
+        len(source_indices) != 1
+        or type(source_indices[0]) is not int
+        or source_indices[0] < 0
+    ):
+        raise ValueError("a Qwen call must have one nonnegative source owner")
+    relative_owner = tuple(
+        {
+            "text": unit["text"],
+            "start": unit["start"],
+            "end": unit["end"],
+        }
+        for unit in relative_flat
+    )
+    if identity:
+        owner = tuple(dict(unit) for unit in relative_owner)
+    else:
+        owner = tuple(shift_units(list(relative_owner), origin))
+    raw_count = len(relative_flat)
+    receipt = LegacyCallDistributionReceipt(
+        owner_source_indices=source_indices,
+        expected_counts=(raw_count,),
+        requested_ranges=((0, raw_count),),
+        realized_ranges=((0, raw_count),),
+        owner_unit_ids=(raw_unit_ids,),
+        final_cursor=raw_count,
+        consumed_prefix_unit_ids=raw_unit_ids,
+        shortage_source_indices=(),
+        leftover_unit_ids=(),
+    )
+    return LegacyDistributionResult((owner,), receipt, (relative_owner,))

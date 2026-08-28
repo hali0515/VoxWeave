@@ -1473,7 +1473,9 @@ def _crosslink_source_facts(
 
 
 def _validate_legacy(
-    value: object, physical_calls: Sequence[Mapping[str, Any]]
+    value: object,
+    physical_calls: Sequence[Mapping[str, Any]],
+    route: str,
 ) -> tuple[dict[str, Any], dict[int, list[str]]]:
     legacy = _closed_mapping(value, _LEGACY_DISTRIBUTION_KEYS, "legacy_distribution")
     calls = _list(legacy["calls"], "legacy calls")
@@ -1502,6 +1504,8 @@ def _validate_legacy(
         ):
             _invalid("legacy slice vectors disagree in length")
         raw_ids = physical["raw_unit_ids"]
+        if route == "qwen-crop" and (len(sources) != 1 or expected != [len(raw_ids)]):
+            _invalid("Qwen legacy receipt does not retain its complete raw result")
         cursor = 0
         shortages: list[int] = []
         for source, count, requested_pair, realized_pair, owner_value in zip(
@@ -2354,7 +2358,7 @@ def _validate_evidence_value(value: object) -> dict[str, Any]:
     if root["raw_unit_count"] != len(raw_ids):
         _invalid("raw unit count mismatch")
     _legacy, legacy_by_source = _validate_legacy(
-        root["legacy_distribution"], physical_calls
+        root["legacy_distribution"], physical_calls, root["route"]
     )
     authority, authority_by_source = _validate_authority(
         root["authority_distribution"],
