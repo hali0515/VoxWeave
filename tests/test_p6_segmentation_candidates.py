@@ -20,6 +20,12 @@ def _frozen_array(value):
     return frozen
 
 
+def _frozen_value(value):
+    from voxweave.align_snapshot import freeze_json
+
+    return freeze_json(value)
+
+
 def _profile():
     from voxweave.core.segdoc import DisplayProfile
 
@@ -112,7 +118,7 @@ def _issued(tmp_path, *, timestamps=True):
     )
     carriers = SegmentationCarriers(
         vad_speech=(_frozen_array([0.0, 1.0]),),
-        shot_changes=(_frozen_array([0.45]),),
+        shot_changes=(_frozen_value(0.45),),
         sing_spans=(_frozen_array([0.0, 0.4]),),
         speaker_turns=RawJSONCarrier(
             True, _frozen_array([[0.0, 1.1, "S0"]])
