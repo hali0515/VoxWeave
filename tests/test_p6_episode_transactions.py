@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
-from pathlib import Path
 
 import pytest
 
@@ -425,3 +424,102 @@ def test_split_mapping_change_does_not_reprobe_before_rat7(tmp_path, monkeypatch
     monkeypatch.setattr(pipeline, "segment_document", change_mapping)
     out = pipeline.split(json_path)
     assert "<v Alice>" in out.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("command", ["process", "split"])
+def test_public_segmentation_requires_independent_selected_projection(
+    command, tmp_path, monkeypatch
+):
+    from voxweave import segmentation_candidates
+
+    json_path = tmp_path / "episode.json"
+    if command == "split":
+        json_path.write_text(
+            json.dumps({"language": "en", "word_segments": _units()}),
+            encoding="utf-8",
+        )
+
+    def reject_projection(*_args, **_kwargs):
+        raise RuntimeError("independent projection rejected")
+
+    monkeypatch.setattr(
+        segmentation_candidates,
+        "verify_selected_segmentation_projection",
+        reject_projection,
+    )
+    with pytest.raises(RuntimeError, match="independent projection rejected"):
+        if command == "process":
+            pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
+        else:
+            pipeline.split(json_path)
+    assert not (tmp_path / "episode.vtt").exists()
+    if command == "process":
+        assert not json_path.exists()
+
+
+def test_process_selected_candidate_enters_context_bound_transaction(
+    tmp_path, monkeypatch
+):
+    from voxweave import episode_transaction
+    from voxweave.align_context import IssuedSegmentationContext
+
+    real_commit = episode_transaction.commit_primary_outputs
+    seen: dict[str, object] = {}
+
+    def observed_commit(**kwargs):
+        seen.update(kwargs)
+        return real_commit(**kwargs)
+
+    monkeypatch.setattr(episode_transaction, "commit_primary_outputs", observed_commit)
+    out = pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
+    assert out.exists()
+    assert seen["command"] == "process"
+    assert isinstance(seen["context"], IssuedSegmentationContext)
+    assert seen["main_json_bytes"] == (tmp_path / "episode.json").read_bytes()
+    assert seen["vtt_bytes"] == out.read_bytes()
+
+
+@pytest.mark.parametrize("command", ["process", "split"])
+def test_successful_segmentation_retires_stale_align_evidence(command, tmp_path):
+    evidence = tmp_path / "episode.align-evidence.json"
+    evidence.write_text("stale", encoding="utf-8")
+    if command == "process":
+        pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
+    else:
+        json_path = tmp_path / "episode.json"
+        json_path.write_text(
+            json.dumps({"language": "en", "word_segments": _units()}),
+            encoding="utf-8",
+        )
+        pipeline.split(json_path)
+    assert not evidence.exists()
+
+
+def test_split_invalid_declared_pair_cleans_full_machine_artifact_set(tmp_path, caplog):
+    json_path = tmp_path / "episode.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "language": "en",
+                "word_segments": _units(),
+                "voiceprint_capture": "c" + "1" * 32,
+            }
+        ),
+        encoding="utf-8",
+    )
+    artifacts = (
+        tmp_path / "episode.voiceprints.json",
+        tmp_path / "episode.speakers.suggest.json",
+        tmp_path / "episode.speakers.html",
+    )
+    for artifact in artifacts:
+        artifact.write_text("stale", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        pipeline.split(json_path)
+
+    assert not any(artifact.exists() for artifact in artifacts)
+    assert any(
+        "dropping invalid voiceprint replay pair" in row.message
+        for row in caplog.records
+    )
