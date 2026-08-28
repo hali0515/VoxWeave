@@ -99,6 +99,17 @@ class DiarizationResult:
     provenance: dict[str, object]
 
 
+@dataclass(frozen=True)
+class _EmbeddingCheckpointBinding:
+    """Exact checkpoint path and content identity observed at construction."""
+
+    path: Path
+    sha256: str
+
+
+_EMBEDDING_BINDING_ATTR = "_voxweave_embedding_checkpoint_binding"
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -146,24 +157,29 @@ def _configure_pyannote_cache() -> None:
         os.environ[PYANNOTE_CACHE_ENV] = os.fspath(_private_pyannote_cache())
 
 
-def _checkpoint_identity(pipeline: object) -> str:
-    """Hash the checkpoint bytes from pyannote's actual loader authority."""
+def _resolve_embedding_checkpoint(
+    pipeline: object,
+) -> _EmbeddingCheckpointBinding | None:
+    """Resolve and hash the embedding checkpoint at pipeline construction."""
     embedder = getattr(pipeline, "_embedding", None)
     raw_path = getattr(embedder, "embedding", None)
     if not isinstance(raw_path, (str, os.PathLike)):
-        return "unresolved"
+        return None
     try:
         resolved = Path(raw_path).resolve(strict=True)
     except OSError:
         pass
     else:
         try:
-            return _sha256_file(resolved)
+            return _EmbeddingCheckpointBinding(
+                path=resolved,
+                sha256=_sha256_file(resolved),
+            )
         except OSError:
-            return "unresolved"
+            return None
 
     if not isinstance(raw_path, str):
-        return "unresolved"
+        return None
     if "@" in raw_path:
         model_id, revision = raw_path.rsplit("@", 1)
     else:
@@ -171,13 +187,13 @@ def _checkpoint_identity(pipeline: object) -> str:
     try:
         from huggingface_hub import try_to_load_from_cache
     except ImportError:
-        return "unresolved"
+        return None
     model_module = sys.modules.get("pyannote.audio.core.model")
     if model_module is None or not hasattr(model_module, "CACHE_DIR"):
-        return "unresolved"
+        return None
     cache_dir = getattr(model_module, "CACHE_DIR")
     if cache_dir is not None and not isinstance(cache_dir, (str, os.PathLike)):
-        return "unresolved"
+        return None
     if cache_dir is not None:
         cache_dir = os.fspath(cache_dir)
     try:
@@ -188,9 +204,32 @@ def _checkpoint_identity(pipeline: object) -> str:
             cache_dir=cache_dir,
         )
         if isinstance(cached, str):
-            return _sha256_file(Path(cached).resolve(strict=True))
+            resolved = Path(cached).resolve(strict=True)
+            return _EmbeddingCheckpointBinding(
+                path=resolved,
+                sha256=_sha256_file(resolved),
+            )
     except (OSError, ValueError):
         pass
+    return None
+
+
+def _bind_embedding_checkpoint(pipeline: object) -> None:
+    """Store one construction-edge observation; never refresh it later."""
+    if hasattr(pipeline, _EMBEDDING_BINDING_ATTR):
+        return
+    binding = _resolve_embedding_checkpoint(pipeline)
+    try:
+        setattr(pipeline, _EMBEDDING_BINDING_ATTR, binding)
+    except (AttributeError, TypeError):
+        log.warning("could not bind embedding checkpoint provenance to pipeline")
+
+
+def _checkpoint_identity(pipeline: object) -> str:
+    """Return only the checkpoint identity stored during construction."""
+    binding = getattr(pipeline, _EMBEDDING_BINDING_ATTR, None)
+    if isinstance(binding, _EmbeddingCheckpointBinding):
+        return binding.sha256
     return "unresolved"
 
 
@@ -399,6 +438,7 @@ def _get_pipeline(token: str):
                 f"https://hf.co/{DIARIZE_MODEL} (and its segmentation model) and "
                 "set VOXWEAVE_HF_TOKEN / HF_TOKEN"
             )
+        _bind_embedding_checkpoint(pl)
         if torch.cuda.is_available():
             pl.to(torch.device("cuda"))
         _pipeline = pl

@@ -6,6 +6,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import soundfile as sf
+
 from voxweave import backend, config, diarize, voicematch
 
 
@@ -43,10 +45,48 @@ def _real_shape_pipeline(repo_id: str = EMBEDDING_REPO) -> SimpleNamespace:
     )
 
 
+def _bind_pipeline(pipeline: SimpleNamespace) -> SimpleNamespace:
+    diarize._bind_embedding_checkpoint(pipeline)
+    return pipeline
+
+
 def _capture_pyannote_cache(monkeypatch, cache_dir: Path | str | None) -> None:
     model_module = types.ModuleType("pyannote.audio.core.model")
     setattr(model_module, "CACHE_DIR", cache_dir)
     monkeypatch.setitem(sys.modules, "pyannote.audio.core.model", model_module)
+
+
+class _Segment:
+    start = 0.0
+    end = 1.0
+
+
+class _Annotation:
+    def itertracks(self, *, yield_label=False):
+        row = (_Segment(), "track", "SPEAKER_00")
+        yield row if yield_label else row[:2]
+
+    def labels(self):
+        return ["SPEAKER_00"]
+
+
+class _MutatingPipeline:
+    def __init__(self, embedding: str | Path, mutate) -> None:
+        self.embedding = os.fspath(embedding)
+        self._embedding = SimpleNamespace(embedding=embedding)
+        self._mutate = mutate
+        self.calls = 0
+
+    def __call__(self, _file, **_kwargs):
+        self.calls += 1
+        self._mutate(self.calls)
+        return _Annotation(), [[1.0, *([0.0] * 15)]]
+
+
+def _silent_wav(tmp_path: Path) -> Path:
+    path = tmp_path / "silence.wav"
+    sf.write(str(path), [0.0] * 1600, 16000)
+    return path
 
 
 def test_checkpoint_identity_resolves_real_pyannote_hub_id_shape(tmp_path, monkeypatch):
@@ -60,7 +100,8 @@ def test_checkpoint_identity_resolves_real_pyannote_hub_id_shape(tmp_path, monke
     monkeypatch.setattr(config, "AUDIO_CACHE", str(cache_root))
     _capture_pyannote_cache(monkeypatch, cache_root / diarize.PYANNOTE_CACHE_SUBDIR)
 
-    assert diarize._checkpoint_identity(_real_shape_pipeline()) == blob_name
+    pipeline = _bind_pipeline(_real_shape_pipeline())
+    assert diarize._checkpoint_identity(pipeline) == blob_name
 
 
 def test_checkpoint_identity_uses_captured_cache_when_private_and_user_conflict(
@@ -85,7 +126,8 @@ def test_checkpoint_identity_uses_captured_cache_when_private_and_user_conflict(
     monkeypatch.setenv(diarize.PYANNOTE_CACHE_ENV, str(user_cache))
     _capture_pyannote_cache(monkeypatch, user_cache)
 
-    resolved = diarize._checkpoint_identity(_real_shape_pipeline())
+    pipeline = _bind_pipeline(_real_shape_pipeline())
+    resolved = diarize._checkpoint_identity(pipeline)
     assert resolved == user_digest
     assert resolved != private_digest
 
@@ -105,14 +147,15 @@ def test_unused_private_cache_appearance_does_not_change_loaded_identity(
     monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
     _capture_pyannote_cache(monkeypatch, user_cache)
 
-    before = diarize._checkpoint_identity(_real_shape_pipeline())
+    pipeline = _bind_pipeline(_real_shape_pipeline())
+    before = diarize._checkpoint_identity(pipeline)
     _cache_hf_file(
         private_cache,
         EMBEDDING_REPO,
         "pytorch_model.bin",
         b"new but unused private checkpoint",
     )
-    after = diarize._checkpoint_identity(_real_shape_pipeline())
+    after = diarize._checkpoint_identity(pipeline)
 
     assert before == after == user_digest
 
@@ -142,7 +185,8 @@ def test_checkpoint_identity_honors_cache_captured_before_voxweave_configures_en
     diarize._configure_pyannote_cache()
 
     assert os.environ[diarize.PYANNOTE_CACHE_ENV] == str(private_cache)
-    assert diarize._checkpoint_identity(_real_shape_pipeline()) == legacy_digest
+    pipeline = _bind_pipeline(_real_shape_pipeline())
+    assert diarize._checkpoint_identity(pipeline) == legacy_digest
 
 
 def test_checkpoint_identity_resolves_named_pinned_revision(tmp_path, monkeypatch):
@@ -157,7 +201,7 @@ def test_checkpoint_identity_resolves_named_pinned_revision(tmp_path, monkeypatc
     )
     _capture_pyannote_cache(monkeypatch, cache_root)
 
-    pipeline = _real_shape_pipeline(f"{EMBEDDING_REPO}@release-2026")
+    pipeline = _bind_pipeline(_real_shape_pipeline(f"{EMBEDDING_REPO}@release-2026"))
     assert diarize._checkpoint_identity(pipeline) == digest
 
 
@@ -214,6 +258,125 @@ def test_get_pipeline_defaults_pyannote_cache_before_import(tmp_path, monkeypatc
     assert import_observations == [expected_cache]
 
 
+def test_get_pipeline_stores_path_and_digest_at_construction(tmp_path, monkeypatch):
+    audio_cache = tmp_path / "audio"
+    pyannote_cache = audio_cache / diarize.PYANNOTE_CACHE_SUBDIR
+    snapshot, digest = _cache_hf_file(
+        pyannote_cache,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"construction-edge checkpoint",
+    )
+    monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
+    monkeypatch.setenv(diarize.PYANNOTE_CACHE_ENV, str(pyannote_cache))
+    monkeypatch.setattr(diarize, "_pipeline", None)
+    monkeypatch.setattr(diarize, "_ensure_torchaudio_compat", lambda: None)
+
+    fake_package = types.ModuleType("pyannote")
+    fake_package.__path__ = []
+    fake_audio = types.ModuleType("pyannote.audio")
+    setattr(fake_audio, "Pipeline", object())
+    monkeypatch.setitem(sys.modules, "pyannote", fake_package)
+    monkeypatch.setitem(sys.modules, "pyannote.audio", fake_audio)
+    _capture_pyannote_cache(monkeypatch, pyannote_cache)
+
+    loaded = _real_shape_pipeline()
+    loaded.to = lambda _device: None
+    monkeypatch.setattr(diarize, "_load_pipeline", lambda _cls, _token: loaded)
+
+    assert diarize._get_pipeline("hf_test") is loaded
+    binding = getattr(loaded, diarize._EMBEDDING_BINDING_ATTR)
+    assert binding.path == snapshot.resolve(strict=True)
+    assert binding.sha256 == digest
+    assert diarize._checkpoint_identity(loaded) == digest
+
+
+def test_hub_ref_mutated_during_inference_keeps_construction_identity(
+    tmp_path, monkeypatch
+):
+    cache_root = tmp_path / "captured-pyannote"
+    _snapshot_a, digest_a = _cache_hf_file(
+        cache_root,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"checkpoint loaded into resident model",
+        revision="1" * 40,
+    )
+    _snapshot_b, digest_b = _cache_hf_file(
+        cache_root,
+        EMBEDDING_REPO,
+        "pytorch_model.bin",
+        b"checkpoint selected during inference",
+        revision="2" * 40,
+        ref_name=None,
+    )
+    ref = cache_root / f"models--{EMBEDDING_REPO.replace('/', '--')}" / "refs" / "main"
+    _capture_pyannote_cache(monkeypatch, cache_root)
+
+    def mutate_ref(_call):
+        ref.write_text("2" * 40, encoding="utf-8")
+
+    pipeline = _MutatingPipeline(EMBEDDING_REPO, mutate_ref)
+    diarize._bind_embedding_checkpoint(pipeline)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: pipeline)
+
+    result = diarize.diarize_turns(
+        _silent_wav(tmp_path), token="hf_test", want_embeddings=True
+    )
+
+    assert ref.read_text(encoding="utf-8") == "2" * 40
+    assert digest_a != digest_b
+    assert result.provenance["embedding_checkpoint"] == digest_a
+
+
+def test_local_checkpoint_mutated_during_inference_keeps_construction_identity(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "embedding.ckpt"
+    loaded_bytes = b"local checkpoint loaded into resident model"
+    replacement = b"local checkpoint replaced during inference"
+    checkpoint.write_bytes(loaded_bytes)
+    pipeline = _MutatingPipeline(
+        checkpoint,
+        lambda _call: checkpoint.write_bytes(replacement),
+    )
+    diarize._bind_embedding_checkpoint(pipeline)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: pipeline)
+
+    result = diarize.diarize_turns(
+        _silent_wav(tmp_path), token="hf_test", want_embeddings=True
+    )
+
+    assert checkpoint.read_bytes() == replacement
+    assert (
+        result.provenance["embedding_checkpoint"]
+        == hashlib.sha256(loaded_bytes).hexdigest()
+    )
+
+
+def test_construction_identity_survives_multiple_diarize_calls(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "embedding.ckpt"
+    loaded_bytes = b"one construction-edge checkpoint"
+    checkpoint.write_bytes(loaded_bytes)
+
+    def mutate_each_call(call: int) -> None:
+        checkpoint.write_bytes(f"replacement {call}".encode())
+
+    pipeline = _MutatingPipeline(checkpoint, mutate_each_call)
+    diarize._bind_embedding_checkpoint(pipeline)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: pipeline)
+    wav = _silent_wav(tmp_path)
+
+    first = diarize.diarize_turns(wav, token="hf_test", want_embeddings=True)
+    second = diarize.diarize_turns(wav, token="hf_test", want_embeddings=True)
+
+    digest = hashlib.sha256(loaded_bytes).hexdigest()
+    assert pipeline.calls == 2
+    assert first.provenance["embedding_checkpoint"] == digest
+    assert second.provenance["embedding_checkpoint"] == digest
+    assert diarize._checkpoint_identity(pipeline) == digest
+
+
 def test_checkpoint_identity_hashes_resolved_bytes_not_blob_basename(
     tmp_path,
 ):
@@ -221,7 +384,9 @@ def test_checkpoint_identity_hashes_resolved_bytes_not_blob_basename(
     blob_path.parent.mkdir()
     blob_payload = b"bytes that do not match the claimed blob name"
     blob_path.write_bytes(blob_payload)
-    cached = SimpleNamespace(_embedding=SimpleNamespace(embedding=blob_path))
+    cached = _bind_pipeline(
+        SimpleNamespace(_embedding=SimpleNamespace(embedding=blob_path))
+    )
     resolved = diarize._checkpoint_identity(cached)
     assert resolved == hashlib.sha256(blob_payload).hexdigest()
     assert resolved != blob_path.name
@@ -229,7 +394,9 @@ def test_checkpoint_identity_hashes_resolved_bytes_not_blob_basename(
     local_path = tmp_path / "pytorch_model.bin"
     local_payload = b"explicit local model"
     local_path.write_bytes(local_payload)
-    local = SimpleNamespace(_embedding=SimpleNamespace(embedding=local_path))
+    local = _bind_pipeline(
+        SimpleNamespace(_embedding=SimpleNamespace(embedding=local_path))
+    )
     assert (
         diarize._checkpoint_identity(local) == hashlib.sha256(local_payload).hexdigest()
     )
@@ -239,7 +406,8 @@ def test_checkpoint_identity_is_unresolved_when_hub_checkpoint_is_not_cached(
     tmp_path, monkeypatch
 ):
     _capture_pyannote_cache(monkeypatch, tmp_path / "empty-pyannote-cache")
-    assert diarize._checkpoint_identity(_real_shape_pipeline()) == "unresolved"
+    pipeline = _bind_pipeline(_real_shape_pipeline())
+    assert diarize._checkpoint_identity(pipeline) == "unresolved"
 
 
 def test_checkpoint_identity_refuses_to_guess_without_captured_loader_cache(
@@ -255,7 +423,8 @@ def test_checkpoint_identity_refuses_to_guess_without_captured_loader_cache(
     monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
     monkeypatch.delitem(sys.modules, "pyannote.audio.core.model", raising=False)
 
-    assert diarize._checkpoint_identity(_real_shape_pipeline()) == "unresolved"
+    pipeline = _bind_pipeline(_real_shape_pipeline())
+    assert diarize._checkpoint_identity(pipeline) == "unresolved"
 
 
 def test_separator_identity_uses_hf_blob_or_explicit_local_digest(
@@ -344,8 +513,9 @@ def test_real_shape_capture_provenance_builds_known_compatibility(
     )
 
     separator = backend.separator_identity()
+    pipeline = _bind_pipeline(_real_shape_pipeline())
     provenance = diarize._build_provenance(
-        _real_shape_pipeline(),
+        pipeline,
         embedding_dim=256,
         audio_profile={
             "separated": True,
