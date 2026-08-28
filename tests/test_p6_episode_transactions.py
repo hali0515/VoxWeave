@@ -553,6 +553,59 @@ def test_process_selected_candidate_enters_context_bound_transaction(
     assert seen["vtt_bytes"] == out.read_bytes()
 
 
+def test_process_voiceprint_candidate_uses_the_same_context_bound_transaction(
+    tmp_path, monkeypatch
+):
+    from voxweave import episode_transaction
+    from voxweave.align_context import IssuedSegmentationContext
+
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    turns = [(0.0, 1.0, "SPEAKER_00")]
+    capture = pipeline.VoiceprintCapture(
+        centroids={"SPEAKER_00": [1.0, *([0.0] * 15)]},
+        provenance={
+            "diarization_model": "example/diarizer",
+            "outer_config_sha256": "d" * 64,
+            "embedding_model": "example/embedder",
+            "embedding_checkpoint": "e" * 64,
+            "embedding_dim": 16,
+            "audio": {
+                "separated": False,
+                "normalized": False,
+                "sample_rate": 16000,
+            },
+            "pyannote_version": "3.4.0",
+            "torch_version": "test",
+        },
+        turns=turns,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "transcribe",
+        lambda *_args, **_kwargs: ("en", _units(), None, [], turns, capture),
+    )
+    real_commit = episode_transaction.commit_primary_outputs
+    seen: dict[str, object] = {}
+
+    def observed_commit(**kwargs):
+        seen.update(kwargs)
+        return real_commit(**kwargs)
+
+    monkeypatch.setattr(episode_transaction, "commit_primary_outputs", observed_commit)
+    out = pipeline.process(
+        media,
+        diarize=True,
+        voiceprints=True,
+        shot_snap=False,
+    )
+
+    assert isinstance(seen["context"], IssuedSegmentationContext)
+    assert seen["main_json_bytes"] == (tmp_path / "episode.json").read_bytes()
+    assert seen["vtt_bytes"] == out.read_bytes()
+    assert seen["machine_artifact"].path == tmp_path / "episode.voiceprints.json"
+
+
 @pytest.mark.parametrize("command", ["process", "split"])
 def test_successful_segmentation_retires_stale_align_evidence(command, tmp_path):
     evidence = tmp_path / "episode.align-evidence.json"
