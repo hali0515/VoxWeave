@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from voxweave import pipeline, speakers
+from voxweave import episode_transaction, pipeline, speakers
 from voxweave.voicebase import (
     canonical_turns_digest,
     media_fingerprint,
@@ -226,7 +226,7 @@ def test_process_commit_and_purge_serialize_as_one_episode_set(tmp_path, monkeyp
     write_entered = threading.Event()
     write_release = threading.Event()
     purge_started = threading.Event()
-    original_write = pipeline._write_siblings
+    original_replace = episode_transaction._replace_stage
     turns = [(0.0, 1.0, "SPEAKER_00")]
 
     def fake_transcribe(_source, **_kwargs):
@@ -243,18 +243,19 @@ def test_process_commit_and_purge_serialize_as_one_episode_set(tmp_path, monkeyp
             ),
         )
 
-    def blocking_write(*args, **kwargs):
-        write_entered.set()
-        if not write_release.wait(timeout=5):
-            raise RuntimeError("test coordination timed out")
-        return original_write(*args, **kwargs)
+    def blocking_replace(stage):
+        if stage.target == tmp_path / "episode.json":
+            write_entered.set()
+            if not write_release.wait(timeout=5):
+                raise RuntimeError("test coordination timed out")
+        return original_replace(stage)
 
     def run_purge():
         purge_started.set()
         return speakers.purge_voiceprints(media)
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
-    monkeypatch.setattr(pipeline, "_write_siblings", blocking_write)
+    monkeypatch.setattr(episode_transaction, "_replace_stage", blocking_replace)
     with ThreadPoolExecutor(max_workers=2) as pool:
         processing = pool.submit(
             pipeline.process,
