@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from voxweave import backend, pipeline
+from voxweave import backend, episode_transaction, pipeline
 from voxweave.cli import cli
 from voxweave.mediasnapshot import SnapshotUnavailable
 from voxweave.voicebase import media_fingerprint
@@ -198,7 +198,9 @@ def test_align_same_content_alternate_media_preserves_pair_and_snapshot_source(
     assert seen_snapshot and not seen_snapshot[0].exists()
 
 
-def test_align_live_change_after_snapshot_omits_pair_and_cleans(tmp_path, monkeypatch):
+def test_align_live_change_after_snapshot_stale_aborts_without_cleanup(
+    tmp_path, monkeypatch
+):
     media, vtt_path, json_path, _vtt, _json = _write_align_input(tmp_path)
     fingerprint = media_fingerprint(media)
     json_path.write_text(
@@ -212,6 +214,8 @@ def test_align_live_change_after_snapshot_omits_pair_and_cleans(tmp_path, monkey
     ]
     for artifact in artifacts:
         artifact.write_text("sensitive", encoding="utf-8")
+    original_vtt = vtt_path.read_bytes()
+    original_json = json_path.read_bytes()
 
     def inspect_prepare(source: Path, _kwargs: dict) -> None:
         assert source != media
@@ -220,15 +224,16 @@ def test_align_live_change_after_snapshot_omits_pair_and_cleans(tmp_path, monkey
 
     _stub_align(tmp_path, monkeypatch, inspect_prepare=inspect_prepare)
 
-    pipeline.align(vtt_path)
+    with pytest.raises(episode_transaction.MediaStaleError) as caught:
+        pipeline.align(vtt_path)
 
-    replayed = json.loads(json_path.read_text(encoding="utf-8"))
-    assert "voiceprint_capture" not in replayed
-    assert "voiceprint_media" not in replayed
-    assert not any(path.exists() for path in artifacts)
+    assert caught.value.failure.detail_code == "media-generation"
+    assert vtt_path.read_bytes() == original_vtt
+    assert json_path.read_bytes() == original_json
+    assert all(path.read_text(encoding="utf-8") == "sensitive" for path in artifacts)
 
 
-def test_align_final_json_replace_recheck_observes_change_after_vtt(
+def test_align_publishes_json_before_vtt_after_final_media_recheck(
     tmp_path, monkeypatch
 ):
     media, vtt_path, json_path, _vtt, _json = _write_align_input(
@@ -248,25 +253,22 @@ def test_align_final_json_replace_recheck_observes_change_after_vtt(
     for artifact in artifacts:
         artifact.write_text("sensitive", encoding="utf-8")
     _stub_align(tmp_path, monkeypatch)
-    original_write = pipeline.fsio.atomic_write_text
-    changed = []
+    real_replace = episode_transaction._replace_stage
+    order: list[str] = []
 
-    def mutate_after_vtt_write(path, content, **kwargs):
-        result = original_write(path, content, **kwargs)
-        if Path(path) == vtt_path:
-            media.write_bytes(b"B" * 64)
-            changed.append(True)
-        return result
+    def observed_replace(stage):
+        order.append(stage.target.name)
+        real_replace(stage)
 
-    monkeypatch.setattr(pipeline.fsio, "atomic_write_text", mutate_after_vtt_write)
+    monkeypatch.setattr(episode_transaction, "_replace_stage", observed_replace)
 
     pipeline.align(vtt_path)
 
     replayed = json.loads(json_path.read_text(encoding="utf-8"))
-    assert changed == [True]
-    assert "voiceprint_capture" not in replayed
-    assert "voiceprint_media" not in replayed
-    assert not any(path.exists() for path in artifacts)
+    assert order == ["episode.json", "episode.vtt"]
+    assert replayed["voiceprint_capture"] == CAPTURE
+    assert replayed["voiceprint_media"] == fingerprint
+    assert all(path.read_text(encoding="utf-8") == "sensitive" for path in artifacts)
 
 
 def test_align_omit_unlink_failure_names_landed_outputs_and_leftover(
