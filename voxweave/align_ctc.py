@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import namedtuple
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -301,6 +301,8 @@ def _ctc_full_pass(
     nospace: bool,
     iso: str,
     speech_spans: list[tuple[float, float]] | None = None,
+    *,
+    _raw_result_observer: Callable[[list[dict]], None] | None = None,
 ) -> list[list[dict]]:
     """One windowed-emission + global forced_align over `wav` for cue texts `norm`.
 
@@ -317,6 +319,8 @@ def _ctc_full_pass(
             logp, speech_spans, wav.shape[-1], al.sr, al.blank
         )
     units = _ctc_align_logp(al, logp, toks, meta, words, nospace, wav.shape[-1])
+    if _raw_result_observer is not None:
+        _raw_result_observer(units)
     return _distribute_units(units, norm, iso)
 
 

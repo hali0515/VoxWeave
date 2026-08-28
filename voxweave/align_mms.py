@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import namedtuple
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from voxweave import config
@@ -173,6 +173,22 @@ def align_text_mms(wav_path: Path, text: str, iso: str) -> list[dict]:
     return units
 
 
+def _mms_full_pass(
+    wav,
+    norm: list[str],
+    iso: str,
+    *,
+    _raw_result_observer: Callable[[list[dict]], None] | None = None,
+) -> list[list[dict]]:
+    """One routing-free MMS call with the AO-07 pre-distribution seam."""
+    full = " ".join(text for text in norm if text)
+    flat = _mms_emit_units(wav, full, iso)
+    if _raw_result_observer is not None:
+        _raw_result_observer(flat)
+    _empty_cache()
+    return _distribute_units(flat, norm, iso)
+
+
 def align_blocks_full_mms(
     wav_path: Path,
     texts: list[str],
@@ -211,10 +227,7 @@ def align_blocks_full_mms(
     # offset_s is part of the _dp_chunked_pass pass_fn contract (used by the CTC
     # path's emission masking); MMS does not mask yet, pending ja truth validation.
     def _pass(w, sub: list[str], offset_s: float = 0.0) -> list[list[dict]]:
-        full = " ".join(t for t in sub if t)
-        flat = _mms_emit_units(w, full, iso)
-        _empty_cache()
-        return _distribute_units(flat, sub, iso)
+        return _mms_full_pass(w, sub, iso)
 
     return _dp_chunked_pass(
         wav, MMS_SR, norm, bounds, _pass, "MMS", crop_to_envelope=crop_to_envelope

@@ -141,7 +141,6 @@ def test_true_decimal_can_own_two_units_under_no_space_join():
     ("block_text", "surfaces", "detail"),
     [
         ("target", ("other",), "allocation-no-tiling"),
-        ("a", ("a", "", "a"), "allocation-ambiguous"),
         ("", ("a",), "partial-empty-ownership"),
         ("...", ("a",), "punctuation-only-block"),
     ],
@@ -158,19 +157,62 @@ def test_allocator_closed_invalid_terminals(block_text, surfaces, detail):
     assert receipt.reasons == (detail,)
 
 
+def test_allocator_reports_two_exact_tilings_as_ambiguous():
+    d = _module()
+    receipt = d.build_authority_distribution(
+        blocks=(d.AuthorityBlock(0, "a"), d.AuthorityBlock(1, "a")),
+        delivery_route=(
+            d.RouteExpectation(0, 0, "call", 0),
+            d.RouteExpectation(1, 1, "call", 0),
+        ),
+        calls=(
+            d.AuthorityCallInput(
+                0,
+                (0, 1),
+                (0, 3),
+                ("r0", "r1", "r2"),
+                ("a", "", "a"),
+                "valid",
+                None,
+            ),
+        ),
+        skipped_blocks=(),
+        route_claims=(
+            d.RouteClaim("call", 0, 0, 0),
+            d.RouteClaim("call", 0, 1, 1),
+        ),
+        iso="en",
+    )
+    assert receipt.status == "invalid"
+    assert receipt.work.calls[0].allocator.terminal_detail_code == (
+        "allocation-ambiguous"
+    )
+    assert receipt.reasons == ("allocation-ambiguous",)
+
+
 @pytest.mark.parametrize(
     ("claims", "kind", "observation", "expected", "observed"),
     [
         ((("call", 0, 0, 0), ("call", 0, 2, 2)), "gap", None, 1, None),
         (
-            (("call", 0, 0, 0), ("call", 0, 1, 1), ("call", 0, 1, 1)),
+            (
+                ("call", 0, 0, 0),
+                ("call", 0, 1, 1),
+                ("call", 0, 1, 1),
+                ("call", 0, 2, 2),
+            ),
             "overlap",
             2,
             2,
             1,
         ),
         (
-            (("call", 0, 0, 0), ("call", 0, 1, 1), ("call", 0, 9, 2)),
+            (
+                ("call", 0, 0, 0),
+                ("call", 0, 1, 1),
+                ("call", 0, 9, 2),
+                ("call", 0, 2, 2),
+            ),
             "unexpected-index",
             2,
             2,
