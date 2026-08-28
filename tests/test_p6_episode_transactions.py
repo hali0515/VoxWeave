@@ -746,10 +746,13 @@ def test_process_output_snapshot_precedes_voiceprint_media_snapshot(
 
     monkeypatch.setattr(pipeline, "MediaSnapshot", ForbiddenSnapshot)
 
-    with pytest.raises(IsADirectoryError):
+    with pytest.raises(IsADirectoryError) as caught:
         pipeline.process(media, diarize=True, voiceprints=True)
 
     assert events == []
+    assert caught.value.failure.kind == "subtitle-snapshot-failed"
+    assert caught.value.failure.phase == "snapshot"
+    assert caught.value.failure.detail_code == "sibling-read"
 
 
 def test_process_voiceprint_candidate_uses_the_same_context_bound_transaction(
@@ -1101,9 +1104,7 @@ def test_align_shadow_reports_strict_raw_failure_before_pending_w1(
     assert artifact.fresh["authority_distribution_status"] == "invalid"
 
 
-def test_align_shadow_runs_seed_reconciliation_before_pending_w1(
-    tmp_path, monkeypatch
-):
+def test_align_shadow_runs_seed_reconciliation_before_pending_w1(tmp_path, monkeypatch):
     from voxweave.core import align_seed
 
     _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
@@ -1128,9 +1129,7 @@ def test_align_shadow_runs_seed_reconciliation_before_pending_w1(
     assert artifact.fresh["seed_status"] == "invalid"
 
 
-def test_align_shadow_runs_profile_admission_before_pending_w1(
-    tmp_path, monkeypatch
-):
+def test_align_shadow_runs_profile_admission_before_pending_w1(tmp_path, monkeypatch):
     from voxweave import align_inputs
 
     _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
