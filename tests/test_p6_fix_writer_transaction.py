@@ -112,9 +112,7 @@ def test_rat2_durable_verifier_recomputes_physical_call_claims(
     assert verified.detail_code == "evidence-schema"
 
 
-def test_rat2_default_source_facts_downgrade_production_w1_audit(
-    tmp_path, monkeypatch
-):
+def test_rat2_default_source_facts_downgrade_production_w1_audit(tmp_path, monkeypatch):
     from tests.test_p6_episode_transactions import _stub_public_shadow_align
     from voxweave import align_evidence
 
