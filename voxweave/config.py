@@ -21,11 +21,6 @@ DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 # 0.6B emits no punctuation, so fusion must use 1.7B.
 DEFAULT_FUSION_WHISPER = "large-v3"
 DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
-# Optional semantic subtitle boundary selector.  Kept separate from the ASR
-# model: behind --semantic-split this id is only the model name requested from a
-# user-run OpenAI-compatible server (VOXWEAVE_SEMANTIC_BASE_URL); VoxWeave loads
-# no model itself.  The configured id is deliberately not size/version allow-listed.
-DEFAULT_SEMANTIC_MODEL = "Qwen/Qwen3.5-0.8B"
 # Per-language aligner defaults. Unlisted languages fall back to Qwen3-ForcedAligner.
 #
 # en: facebook/wav2vec2-large-960h-lv60-self loaded via HF (same LV60K-self weights as
@@ -105,17 +100,6 @@ _TEMPLATE = """\
 # timestamps = true    # word-level timestamps in the VTT (--timestamps/--no-timestamps)
 # shot_snap = true     # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
 # vad_mask = false     # suppress CTC emissions outside speech spans (--vad-mask/--no-vad-mask)
-# semantic_split = false # Qwen semantic boundary selection; needs VOXWEAVE_SEMANTIC_BASE_URL
-
-# Optional semantic cue-boundary model.  It never rewrites transcript text or
-# timestamps; it only chooses among host-validated word/phrase boundaries.
-# This is just the model name sent to the OpenAI-compatible server named by
-# VOXWEAVE_SEMANTIC_BASE_URL (VoxWeave bundles no semantic model runtime), so
-# any id that server serves is accepted as written.
-[semantic]
-# model = "Qwen/Qwen3.5-0.8B"
-# model = "Qwen/Qwen3.5-2B"
-# model = "Qwen/Qwen3.6-27B-FP8"
 
 # Per-language forced-alignment models; unlisted languages use Qwen3-ForcedAligner (built-in default).
 # Values: "mms" (MMS-300m + uroman, full-file single pass; bundled in core) |
@@ -147,7 +131,6 @@ _KNOWN_KEYS = frozenset(
         "batch",
         "align",
         "defaults",
-        "semantic",
     }
 )
 
@@ -218,32 +201,6 @@ def conf_asr_model() -> str | None:
         )
         return None
     return _nonempty_str(v)
-
-
-def conf_semantic_model() -> str:
-    """Semantic boundary model.
-
-    Precedence: ``VOXWEAVE_SEMANTIC_MODEL`` > ``[semantic].model`` > the default
-    multilingual Qwen3.5 id.  The value is the model name requested from the
-    configured OpenAI-compatible server and is not restricted by a size/version
-    allow-list.  Resolving this string never imports a model runtime, downloads
-    weights, or contacts the server.
-    """
-    env = _nonempty_str(os.environ.get("VOXWEAVE_SEMANTIC_MODEL"))
-    if env:
-        return env
-    semantic = _load().get("semantic")
-    if isinstance(semantic, dict):
-        value = semantic.get("model")
-        if value is not None and not isinstance(value, str):
-            log.warning(
-                "config [semantic].model has wrong type (expected string), using default"
-            )
-        else:
-            configured = _nonempty_str(value)
-            if configured:
-                return configured
-    return DEFAULT_SEMANTIC_MODEL
 
 
 def _conf_fusion(key: str) -> str | None:

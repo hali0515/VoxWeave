@@ -235,12 +235,10 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
 | `--vad-mask/--no-vad-mask`     | Suppress CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                    |
-| `--semantic-split`             | Optional Qwen3.5/Qwen3.6 boundary selection for more natural clauses, with no glossary or per-video prompt required. The model can only choose host-approved word/phrase cuts; visual width, maximum duration, real pauses, text, and timestamps remain hard constraints, while timing/readability scores prevent a semantic choice from becoming materially worse than the deterministic path. Disabled by default; every request failure returns the normal deterministic result. Needs an OpenAI-compatible server of your own (`VOXWEAVE_SEMANTIC_BASE_URL`) — VoxWeave bundles no semantic model, and errors at startup when the endpoint is unset. |
-| `--semantic-model`             | Model id requested from that server, used only with `--semantic-split`; there is no size allow-list (default `Qwen/Qwen3.5-0.8B`). |
 | `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`.                                                                                                                                                                                                  |
 
 The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--voiceprints`, `--timestamps`,
-`--shot-snap`, `--vad-mask`, `--semantic-split`) can have their defaults set persistently via the `[defaults]`
+`--shot-snap`, `--vad-mask`) can have their defaults set persistently via the `[defaults]`
 section of `~/.config/voxweave.conf` — an explicit CLI flag always wins for that run.
 
 </details>
@@ -330,35 +328,13 @@ voxweave align episode.vtt --no-separate   # align on the original audio (clean 
 
 ### Re-layout offline
 
-`voxweave split <json>` — re-run smart_split from `<stem>.json` without any models by default
-(adjust line width / sentence breaks instantly). Add `--semantic-split` to opt into the semantic
-boundary selector; model failure leaves the deterministic output unchanged.
+`voxweave split <json>` — re-run deterministic layout from `<stem>.json` without any models
+(adjust line width / sentence breaks instantly).
 
 ```bash
 voxweave split episode.json --max-line-length 14 --max-lines 1
 voxweave split episode.json --no-timestamps   # plain-text editing draft
-voxweave split episode.json --semantic-split  # optional semantic boundary pass
 ```
-
-`--semantic-split` requires an OpenAI-compatible server of your own: point
-`VOXWEAVE_SEMANTIC_BASE_URL` at it (for example `http://127.0.0.1:8000/v1`, plus
-`VOXWEAVE_SEMANTIC_API_KEY` if it needs one). VoxWeave ships no semantic model
-runtime, so without that endpoint the run stops immediately at startup rather
-than transcribing first and degrading later. `[semantic].model`,
-`--semantic-model`, or `VOXWEAVE_SEMANTIC_MODEL` name the model to request from
-that server (default `Qwen/Qwen3.5-0.8B`, no size allow-list); the server owns
-model loading, precision, device choice, and its weight cache.
-
-The model never rewrites subtitles: it may only pick among host-approved
-layouts, while text, timestamps, line width, maximum duration, real pauses, and
-the timing/readability guards stay deterministic and host-enforced. A connection
-error, timeout, malformed response, or host validation failure leaves the
-ordinary deterministic subtitles unchanged.
-
-**Removed:** the bundled local FP8 worker, deprecated in 0.12, has been deleted.
-Its pairwise preference signal measured at the FP8 quantization noise floor, so
-it shipped a second Torch/CUDA runtime for no measured subtitle-quality gain.
-The endpoint route above and the deterministic default splitter are unaffected.
 
 ### ASR correction
 
@@ -525,8 +501,6 @@ default config is written on first run (migrated automatically from a pre-rename
 **Models**
 
 - `VOXWEAVE_ASR_MODEL` (default `Qwen/Qwen3-ASR-0.6B`; same as `--model`)
-- `VOXWEAVE_SEMANTIC_MODEL` (default `Qwen/Qwen3.5-0.8B`; only read with `--semantic-split`)
-- `VOXWEAVE_SEMANTIC_BASE_URL` / `VOXWEAVE_SEMANTIC_API_KEY` (user-run OpenAI-compatible server; **required** by `--semantic-split`, which errors at startup when unset)
 - `VOXWEAVE_ALIGNER_MODEL` (default `Qwen/Qwen3-ForcedAligner-0.6B`)
 - `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)
 - `VOXWEAVE_BACKEND` (`mlx` | `torch`; default: `mlx` on mps, else `torch`) — picks the ASR/alignment backend
@@ -617,13 +591,6 @@ voiceprints = false                      # opt-in biometric centroid capture; re
 timestamps = true                        # word-level timestamps in the VTT (--timestamps/--no-timestamps)
 shot_snap  = true                        # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
 vad_mask   = false                       # suppress CTC emissions outside speech (--vad-mask/--no-vad-mask)
-semantic_split = false                  # optional Qwen semantic boundaries; needs VOXWEAVE_SEMANTIC_BASE_URL
-
-# Model name requested from the OpenAI-compatible server; VoxWeave loads nothing itself.
-[semantic]
-model = "Qwen/Qwen3.5-0.8B"
-# model = "Qwen/Qwen3.5-2B"
-# model = "Qwen/Qwen3.6-27B-FP8"
 
 # dual-ASR fusion sub-models — only consulted when running with --hybrid.
 [fusion]

@@ -132,47 +132,42 @@ def test_split_passes_kwargs(tmp_path):
     assert m.call_args.kwargs == {
         "max_lines": 2,
         "timestamps": True,
-        "semantic_split": False,
-        "semantic_model": "Qwen/Qwen3.5-0.8B",
     }
 
 
-def test_process_semantic_split_is_optional_and_selects_default_model(tmp_path):
+@pytest.mark.parametrize("flag", ["--semantic-split", "--no-semantic-split"])
+def test_process_semantic_split_flag_is_removed(tmp_path, flag):
     media, out = _media(tmp_path)
     with patch("voxweave.pipeline.process", return_value=out) as m:
-        r = CliRunner().invoke(cli, ["--semantic-split", str(media)])
-    assert r.exit_code == 0, r.output
-    assert m.call_args.kwargs["semantic_split"] is True
-    assert m.call_args.kwargs["semantic_model"] == "Qwen/Qwen3.5-0.8B"
+        r = CliRunner().invoke(cli, [flag, str(media)])
+    assert r.exit_code == 2
+    assert not m.called
 
 
-def test_process_semantic_model_override_does_not_enable_feature(tmp_path):
+def test_process_semantic_model_flag_is_removed(tmp_path):
     media, out = _media(tmp_path)
     with patch("voxweave.pipeline.process", return_value=out) as m:
         r = CliRunner().invoke(cli, ["--semantic-model", "local/custom", str(media)])
-    assert r.exit_code == 0, r.output
-    assert m.call_args.kwargs["semantic_split"] is False
-    assert m.call_args.kwargs["semantic_model"] == "local/custom"
+    assert r.exit_code == 2
+    assert not m.called
 
 
-def test_split_semantic_flags_pass_through(tmp_path):
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--semantic-split"],
+        ["--no-semantic-split"],
+        ["--semantic-model", "local/custom"],
+    ],
+)
+def test_split_semantic_flags_are_removed(tmp_path, args):
     j = tmp_path / "a.json"
     j.write_text("{}", encoding="utf-8")
     out = tmp_path / "a.vtt"
     with patch("voxweave.pipeline.split", return_value=out) as m:
-        r = CliRunner().invoke(
-            cli,
-            [
-                "split",
-                str(j),
-                "--semantic-split",
-                "--semantic-model",
-                "local/custom",
-            ],
-        )
-    assert r.exit_code == 0, r.output
-    assert m.call_args.kwargs["semantic_split"] is True
-    assert m.call_args.kwargs["semantic_model"] == "local/custom"
+        r = CliRunner().invoke(cli, ["split", str(j), *args])
+    assert r.exit_code == 2
+    assert not m.called
 
 
 def test_process_error_renders_panel_and_exits(tmp_path):
@@ -302,18 +297,14 @@ def test_process_conf_default_normalize_on(tmp_path):
     assert m.call_args.kwargs["normalize"] is True
 
 
-def test_process_conf_default_semantic_split_on_and_cli_can_disable(tmp_path):
+def test_process_ignores_retired_semantic_split_config(tmp_path):
     _write_conf(tmp_path, "[defaults]\nsemantic_split = true\n")
     media, out = _media(tmp_path)
     with patch("voxweave.pipeline.process", return_value=out) as m:
         r = CliRunner().invoke(cli, [str(media)])
     assert r.exit_code == 0, r.output
-    assert m.call_args.kwargs["semantic_split"] is True
-
-    with patch("voxweave.pipeline.process", return_value=out) as m:
-        r = CliRunner().invoke(cli, ["--no-semantic-split", str(media)])
-    assert r.exit_code == 0, r.output
-    assert m.call_args.kwargs["semantic_split"] is False
+    assert "semantic_split" not in m.call_args.kwargs
+    assert "semantic_model" not in m.call_args.kwargs
 
 
 def test_process_no_normalize_beats_conf_default(tmp_path):
