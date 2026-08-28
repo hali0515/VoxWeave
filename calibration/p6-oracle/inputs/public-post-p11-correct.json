@@ -1,0 +1,7 @@
+{
+  "target": "episode.vtt",
+  "language": "en",
+  "route": "ctc-full",
+  "vtt": "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFIRST\n",
+  "json": "{\"language\":\"en\",\"speaker_turns\":[[100.0,101.0,\"SPEAKER_00\"]]}\n"
+}

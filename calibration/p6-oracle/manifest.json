@@ -19,7 +19,7 @@
     "align-delta-registry": "267bdf609013b7f2a37abef1a14b0a5fa6e9770fea0da958b5d92d64ce36f931",
     "align-failure-registry": "69471bfcc890ef4d59b2f8cc36e37c48a5e971202527f13bf4e1b9b9cccdc9cd",
     "engine-registry": "1f9e2da1257cdd5e4c9a956ba9505a0c4122f6e964e23a17d6f788f4dc8be140",
-    "p6-oracle-schema": "bd25eee37ff9238eedcfc875c60b024f40c38cdae07febec6e9552d5323481e4"
+    "p6-oracle-schema": "ede06a5405828bd17d06d2b16ed9114c23400cbd0719fd16aadff9c26f1ac838"
   },
   "gates": {
     "G-CONTEXT": {
@@ -123,6 +123,106 @@
         "all-skip",
         "ao15-uncontained",
         "ao15-isolated-then-ao16"
+      ],
+      "runtime_scenarios": [
+        {
+          "id": "mms-legacy-happy",
+          "fixture": {
+            "path": "inputs/public-mms-align.json",
+            "present": true,
+            "size": 526,
+            "sha256": "9e8828e92d4a84db987edca49e8d770a4a9de8d73f957e330f987dc518bc7d06"
+          },
+          "route": "mms-full",
+          "expected_family": "legacy-v1",
+          "shadow_requested": false,
+          "injections": [],
+          "expect_failure": false
+        },
+        {
+          "id": "qwen-all-skip-legacy",
+          "fixture": {
+            "path": "inputs/public-all-skip-align.json",
+            "present": true,
+            "size": 431,
+            "sha256": "59ac07dc88fc5d4cf67f9efa6d19c36e284e38c7038108ee27639215382c0403"
+          },
+          "route": "qwen-crop",
+          "expected_family": "legacy-v1",
+          "shadow_requested": false,
+          "injections": [],
+          "expect_failure": true
+        },
+        {
+          "id": "qwen-all-skip-boundary",
+          "fixture": {
+            "path": "inputs/public-all-skip-align.json",
+            "present": true,
+            "size": 431,
+            "sha256": "59ac07dc88fc5d4cf67f9efa6d19c36e284e38c7038108ee27639215382c0403"
+          },
+          "route": "qwen-crop",
+          "expected_family": "boundary-v2",
+          "shadow_requested": false,
+          "injections": [],
+          "expect_failure": true
+        },
+        {
+          "id": "ao15-uncontained-boundary",
+          "fixture": {
+            "path": "inputs/public-combined-align.json",
+            "present": true,
+            "size": 657,
+            "sha256": "dd9f8019421c5cc197f413e2834fb36cae8675096c21273caf1125224296cd9c"
+          },
+          "route": "ctc-full",
+          "expected_family": "boundary-v2",
+          "shadow_requested": false,
+          "injections": ["ao15-w1"],
+          "expect_failure": true
+        },
+        {
+          "id": "ao15-isolated-then-ao16-legacy",
+          "fixture": {
+            "path": "inputs/public-combined-align.json",
+            "present": true,
+            "size": 657,
+            "sha256": "dd9f8019421c5cc197f413e2834fb36cae8675096c21273caf1125224296cd9c"
+          },
+          "route": "ctc-full",
+          "expected_family": "legacy-v1",
+          "shadow_requested": true,
+          "injections": ["ao15-w1"],
+          "expect_failure": false
+        },
+        {
+          "id": "paired-ao15-ao16-boundary",
+          "fixture": {
+            "path": "inputs/public-combined-align.json",
+            "present": true,
+            "size": 657,
+            "sha256": "dd9f8019421c5cc197f413e2834fb36cae8675096c21273caf1125224296cd9c"
+          },
+          "route": "ctc-full",
+          "expected_family": "boundary-v2",
+          "shadow_requested": false,
+          "injections": ["ao15-w1", "ao16-core"],
+          "expect_failure": true
+        },
+        {
+          "id": "paired-ao15-ao16-legacy",
+          "fixture": {
+            "path": "inputs/public-combined-align.json",
+            "present": true,
+            "size": 657,
+            "sha256": "dd9f8019421c5cc197f413e2834fb36cae8675096c21273caf1125224296cd9c"
+          },
+          "route": "ctc-full",
+          "expected_family": "legacy-v1",
+          "shadow_requested": true,
+          "injections": ["ao15-w1", "ao16-core"],
+          "expect_failure": true
+        }
       ]
     },
     "G-AUTHORITY-DISTRIBUTION": {
@@ -956,7 +1056,7 @@
       "terminal-validity": {
         "status": "reachable",
         "evidence": [
-          "tests/test_p6_oracle_vectors.py::test_finalizer_terminal_validity_precedes_generic_invalidity"
+          "tests/test_p6_oracle_vectors.py::test_finalizer_terminal_table_precedes_root_validation"
         ]
       },
       "cue-schema": {
@@ -2428,6 +2528,12 @@
           "present": true,
           "size": 82,
           "sha256": "abab68452707bfbab149aae3c3b14f4af298016c4f3121ea23e1ef65f86c35f2"
+        },
+        {
+          "path": "inputs/public-historical-align.json",
+          "present": true,
+          "size": 402,
+          "sha256": "90a2f532a2a77512904cc5f082679bd0eb689f2a30bd8abe9b60bf041b606596"
         }
       ],
       "backend_receipt": {
@@ -2470,7 +2576,22 @@
         "selected-legacy-distribution",
         "success-or-exception-parity"
       ],
-      "projector": "historical-vtt-time-order"
+      "projector": "historical-vtt-time-order",
+      "public_runtime": {
+        "fixture": "inputs/public-historical-align.json",
+        "expected_family": "legacy-v1",
+        "expected_paths": [
+          {
+            "kind": "primary",
+            "expected_path": "expected/6e6033f/legacy.vtt",
+            "size": 82,
+            "sha256": "5d80b36871aa6fb22a0cd6ef49d71d1c872980f19e698f3b030f53b990fc5bd9",
+            "artifact": "vtt"
+          }
+        ],
+        "expected_trace": null,
+        "expected_w1_usable": null
+      }
     },
     {
       "id": "post-p11-speaker-turns",
@@ -2480,7 +2601,9 @@
         "correct",
         "episode.vtt",
         "--apply",
-        "--no-align"
+        "--no-align",
+        "--api-key-env",
+        "P6_ORACLE_API_KEY"
       ],
       "logical_target": "episode.vtt",
       "source_mode": "sibling",
@@ -2491,6 +2614,12 @@
           "present": true,
           "size": 99,
           "sha256": "4cc95ff2d35a1e2010d6032bd44ef6bb464178df98b530b4671e5e2463b4c0fa"
+        },
+        {
+          "path": "inputs/public-post-p11-correct.json",
+          "present": true,
+          "size": 220,
+          "sha256": "5c69eeb764f682d17d3c136fceb3389496223d7488973bb62b7331366c25a37c"
         }
       ],
       "backend_receipt": {
@@ -2535,7 +2664,22 @@
         "raw-speaker-turns",
         "correction-no-align"
       ],
-      "projector": "post-p11-speaker-turns"
+      "projector": "post-p11-speaker-turns",
+      "public_runtime": {
+        "fixture": "inputs/public-post-p11-correct.json",
+        "expected_family": "legacy-v1",
+        "expected_paths": [
+          {
+            "kind": "primary",
+            "expected_path": "expected/post-p11/speaker-turns.json",
+            "size": 63,
+            "sha256": "0a7c63b14c0f2a966dddd0b2819c462737828bb124f208da83a3870c67ebbc75",
+            "artifact": "main-json"
+          }
+        ],
+        "expected_trace": null,
+        "expected_w1_usable": null
+      }
     },
     {
       "id": "rat4-lexical-direct",
@@ -2562,6 +2706,12 @@
           "present": true,
           "size": 131,
           "sha256": "82764e35eae9f5a5924fbbd38da3dcf40dc77e6ee8dab1b954d6c18b1524a456"
+        },
+        {
+          "path": "inputs/public-rat4-align.json",
+          "present": true,
+          "size": 402,
+          "sha256": "90a2f532a2a77512904cc5f082679bd0eb689f2a30bd8abe9b60bf041b606596"
         }
       ],
       "backend_receipt": {
@@ -2607,7 +2757,46 @@
         "over-budget-hint-refusal",
         "planner-tiling-and-crop-budget"
       ],
-      "projector": "p6-lexical-call"
+      "projector": "p6-lexical-call",
+      "public_runtime": {
+        "fixture": "inputs/public-rat4-align.json",
+        "expected_family": "legacy-v1",
+        "expected_paths": [
+          {
+            "kind": "evidence",
+            "expected_path": "expected/p6-lexical/lexical-call.json",
+            "size": 83,
+            "sha256": "880d8551335a03ec915a4c28e018ba7d14be97598558a956ee5c38c84e9c60f8",
+            "artifact": "route-evidence"
+          }
+        ],
+        "expected_trace": [
+          {"phase": "AO-01", "activity": "vtt-generation-snapshot"},
+          {"phase": "AO-02", "activity": "sibling-decode-and-raw-carriers"},
+          {"phase": "AO-03", "activity": "selected-media-identity"},
+          {"phase": "AO-04", "activity": "prepared-audio-and-cache"},
+          {"phase": "AO-05", "activity": "context-and-limit-profile-issuance"},
+          {"phase": "AO-06", "activity": "physical-call-preparation"},
+          {"phase": "AO-07", "activity": "backend-call"},
+          {"phase": "AO-08", "activity": "legacy-owner-slice"},
+          {"phase": "AO-09", "activity": "legacy-time-transform"},
+          {"phase": "AO-10", "activity": "group-block-spans"},
+          {"phase": "AO-11", "activity": "strict-capture"},
+          {"phase": "AO-12", "activity": "physical-origin-transform"},
+          {"phase": "AO-13", "activity": "route-topology-preflight"},
+          {"phase": "AO-14", "activity": "adapter-binding-and-admission"},
+          {"phase": "AO-16", "activity": "mandatory-evidence-core-and-ald6"},
+          {"phase": "AO-18", "activity": "selected-v2-admissibility"},
+          {"phase": "AO-19", "activity": "composite-candidate-encode"},
+          {"phase": "AO-20", "activity": "selector-and-independent-projection"},
+          {"phase": "AO-21", "activity": "selected-hashes-and-evidence-bind"},
+          {"phase": "AO-22", "activity": "selected-evidence-preencode"},
+          {"phase": "AO-23", "activity": "episode-lock-acquire"},
+          {"phase": "AO-24", "activity": "commit-and-required-cleanup"},
+          {"phase": "AO-25", "activity": "artifact-and-observer-dispatch"}
+        ],
+        "expected_w1_usable": false
+      }
     },
     {
       "id": "selected-v2-align",
@@ -2628,6 +2817,12 @@
           "present": true,
           "size": 16232,
           "sha256": "05367b9f6883f999835ed93b8b163f7032b209701c506ea193dc858417cb151d"
+        },
+        {
+          "path": "inputs/public-selected-v2-align.json",
+          "present": true,
+          "size": 1502,
+          "sha256": "a863aedd0eac1b9c7af8ad11de9678bf24fd3a39c1db7b6af24c7ce08509b69b"
         }
       ],
       "backend_receipt": {
@@ -2698,7 +2893,62 @@
         "raw-speaker-turns",
         "voice-lyric-unit-and-carrier-order"
       ],
-      "projector": "selected-v2-align"
+      "projector": "selected-v2-align",
+      "public_runtime": {
+        "fixture": "inputs/public-selected-v2-align.json",
+        "expected_family": "boundary-v2",
+        "expected_paths": [
+          {
+            "kind": "primary",
+            "artifact": "vtt",
+            "expected_path": "expected/public-command/selected-v2-align/episode.vtt",
+            "size": 169,
+            "sha256": "aae397b3fc14bfbf99e7c1b8ccf786740a5b822bbe3e897ae2275d3531a2c91c"
+          },
+          {
+            "kind": "primary",
+            "artifact": "main-json",
+            "expected_path": "expected/public-command/selected-v2-align/episode.json",
+            "size": 1359,
+            "sha256": "a27ae53cd43798337a87845c69864c399728d550024ce64b7c37261c24f6713a"
+          },
+          {
+            "kind": "evidence",
+            "artifact": "align-evidence",
+            "expected_path": "expected/public-command/selected-v2-align/episode.align-evidence.json",
+            "size": 17131,
+            "sha256": "f222dc51e57ca83cac2a53886d4b80abd81c60769f797de2d1eac3eb47e300ab"
+          }
+        ],
+        "expected_trace": [
+          {"phase": "AO-01", "activity": "vtt-generation-snapshot"},
+          {"phase": "AO-02", "activity": "sibling-decode-and-raw-carriers"},
+          {"phase": "AO-03", "activity": "selected-media-identity"},
+          {"phase": "AO-04", "activity": "prepared-audio-and-cache"},
+          {"phase": "AO-05", "activity": "context-and-limit-profile-issuance"},
+          {"phase": "AO-06", "activity": "physical-call-preparation"},
+          {"phase": "AO-07", "activity": "backend-call"},
+          {"phase": "AO-08", "activity": "legacy-owner-slice"},
+          {"phase": "AO-09", "activity": "legacy-time-transform"},
+          {"phase": "AO-10", "activity": "group-block-spans"},
+          {"phase": "AO-11", "activity": "strict-capture"},
+          {"phase": "AO-12", "activity": "physical-origin-transform"},
+          {"phase": "AO-13", "activity": "route-topology-preflight"},
+          {"phase": "AO-14", "activity": "adapter-binding-and-admission"},
+          {"phase": "AO-15", "activity": "fresh-w1-finalizer-and-validation"},
+          {"phase": "AO-16", "activity": "mandatory-evidence-core-and-ald6"},
+          {"phase": "AO-17", "activity": "semantic-comparison"},
+          {"phase": "AO-18", "activity": "selected-v2-admissibility"},
+          {"phase": "AO-19", "activity": "composite-candidate-encode"},
+          {"phase": "AO-20", "activity": "selector-and-independent-projection"},
+          {"phase": "AO-21", "activity": "selected-hashes-and-evidence-bind"},
+          {"phase": "AO-22", "activity": "selected-evidence-preencode"},
+          {"phase": "AO-23", "activity": "episode-lock-acquire"},
+          {"phase": "AO-24", "activity": "commit-and-required-cleanup"},
+          {"phase": "AO-25", "activity": "artifact-and-observer-dispatch"}
+        ],
+        "expected_w1_usable": true
+      }
     },
     {
       "id": "selected-v2-segmentation",
@@ -2717,6 +2967,12 @@
           "present": true,
           "size": 2388,
           "sha256": "0d59093d7e6ceb11c7651108de747113b11ac31bcf4b225909e2a9f07ef368f1"
+        },
+        {
+          "path": "inputs/public-selected-v2-segmentation.json",
+          "present": true,
+          "size": 786,
+          "sha256": "54956fea38bd9946a5440e9a636ce572297af3965963eb0d85d84f31c2d2489d"
         }
       ],
       "backend_receipt": {
@@ -2779,7 +3035,29 @@
         "selected-delivery-sdh",
         "raw-speaker-turns"
       ],
-      "projector": "selected-v2-segmentation"
+      "projector": "selected-v2-segmentation",
+      "public_runtime": {
+        "fixture": "inputs/public-selected-v2-segmentation.json",
+        "expected_family": "boundary-v2",
+        "expected_paths": [
+          {
+            "kind": "primary",
+            "artifact": "vtt",
+            "expected_path": "expected/public-command/selected-v2-segmentation/episode.vtt",
+            "size": 77,
+            "sha256": "cd49ba3039521b5aebd878d96d2db37365294aa3ca06cd42766b2c836cbcf196"
+          },
+          {
+            "kind": "primary",
+            "artifact": "main-json",
+            "expected_path": "expected/public-command/selected-v2-segmentation/episode.json",
+            "size": 2619,
+            "sha256": "26499aa5170f3087398556349acd1a2f97bd948f76c1e5c15ab488625bce3ffa"
+          }
+        ],
+        "expected_trace": null,
+        "expected_w1_usable": null
+      }
     },
     {
       "id": "combined-ratified-align",
@@ -2800,6 +3078,12 @@
           "present": true,
           "size": 8959,
           "sha256": "69e7ab3385ed7bf86983ab7001784df0e8a077286a931aefeea110ebe4016936"
+        },
+        {
+          "path": "inputs/public-combined-align.json",
+          "present": true,
+          "size": 657,
+          "sha256": "dd9f8019421c5cc197f413e2834fb36cae8675096c21273caf1125224296cd9c"
         }
       ],
       "backend_receipt": {
@@ -2869,7 +3153,62 @@
         "rat2-selected-hash-crosslinks",
         "whole-file-identity-sample-geometry"
       ],
-      "projector": "combined-ratified-align"
+      "projector": "combined-ratified-align",
+      "public_runtime": {
+        "fixture": "inputs/public-combined-align.json",
+        "expected_family": "boundary-v2",
+        "expected_paths": [
+          {
+            "kind": "primary",
+            "artifact": "vtt",
+            "expected_path": "expected/public-command/combined-ratified-align/episode.vtt",
+            "size": 82,
+            "sha256": "bbaab61d7ceca53339f7861a0045e631591e3a589f033f6021ec804c7c125ed8"
+          },
+          {
+            "kind": "primary",
+            "artifact": "main-json",
+            "expected_path": "expected/public-command/combined-ratified-align/episode.json",
+            "size": 593,
+            "sha256": "16c389329361c3398e1efcb0d1612e5234e0fd69da87fa470b8790dc1fb8ba1b"
+          },
+          {
+            "kind": "evidence",
+            "artifact": "align-evidence",
+            "expected_path": "expected/public-command/combined-ratified-align/episode.align-evidence.json",
+            "size": 9021,
+            "sha256": "9c43343f5eb7441be4e364535c54f47c84338ad7d64c644d1a86adf74310982b"
+          }
+        ],
+        "expected_trace": [
+          {"phase": "AO-01", "activity": "vtt-generation-snapshot"},
+          {"phase": "AO-02", "activity": "sibling-decode-and-raw-carriers"},
+          {"phase": "AO-03", "activity": "selected-media-identity"},
+          {"phase": "AO-04", "activity": "prepared-audio-and-cache"},
+          {"phase": "AO-05", "activity": "context-and-limit-profile-issuance"},
+          {"phase": "AO-06", "activity": "physical-call-preparation"},
+          {"phase": "AO-07", "activity": "backend-call"},
+          {"phase": "AO-08", "activity": "legacy-owner-slice"},
+          {"phase": "AO-09", "activity": "legacy-time-transform"},
+          {"phase": "AO-10", "activity": "group-block-spans"},
+          {"phase": "AO-11", "activity": "strict-capture"},
+          {"phase": "AO-12", "activity": "physical-origin-transform"},
+          {"phase": "AO-13", "activity": "route-topology-preflight"},
+          {"phase": "AO-14", "activity": "adapter-binding-and-admission"},
+          {"phase": "AO-15", "activity": "fresh-w1-finalizer-and-validation"},
+          {"phase": "AO-16", "activity": "mandatory-evidence-core-and-ald6"},
+          {"phase": "AO-17", "activity": "semantic-comparison"},
+          {"phase": "AO-18", "activity": "selected-v2-admissibility"},
+          {"phase": "AO-19", "activity": "composite-candidate-encode"},
+          {"phase": "AO-20", "activity": "selector-and-independent-projection"},
+          {"phase": "AO-21", "activity": "selected-hashes-and-evidence-bind"},
+          {"phase": "AO-22", "activity": "selected-evidence-preencode"},
+          {"phase": "AO-23", "activity": "episode-lock-acquire"},
+          {"phase": "AO-24", "activity": "commit-and-required-cleanup"},
+          {"phase": "AO-25", "activity": "artifact-and-observer-dispatch"}
+        ],
+        "expected_w1_usable": true
+      }
     }
   ]
 }

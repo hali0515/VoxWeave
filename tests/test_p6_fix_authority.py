@@ -9,62 +9,12 @@ import inspect
 import pytest
 
 
-def _evidence_facts():
-    from voxweave.align_acquisition import capture_strict_units, transform_strict_units
-    from voxweave.align_distribution import (
-        AuthorityBlock,
-        AuthorityCallInput,
-        RouteClaim,
-        RouteExpectation,
-        build_authority_distribution,
-    )
-
-    blocks = (AuthorityBlock(0, "word"),)
-    capture = capture_strict_units(
-        ({"text": "word", "start": 0.2, "end": 0.8},),
-        call_index=0,
-        raw_unit_ids=("r0",),
-    )
-    transform = transform_strict_units(
-        capture,
-        physical_origin_seconds=100.0,
-        identity=False,
-    )
-    distribution = build_authority_distribution(
-        blocks=blocks,
-        delivery_route=(RouteExpectation(0, 0, "call", 0),),
-        calls=(
-            AuthorityCallInput(
-                0,
-                (0,),
-                (0, 1),
-                ("r0",),
-                ("word",),
-                "valid",
-                None,
-            ),
-        ),
-        skipped_blocks=(),
-        route_claims=(RouteClaim("call", 0, 0, 0),),
-        iso="en",
-    )
-    return blocks, capture, transform, distribution
-
-
-def _project_core():
+def _project_core(tmp_path):
+    from tests.test_p6_ald6_independence import _issued_facts
     from voxweave.align_evidence_core import project_evidence_core
 
-    blocks, capture, transform, distribution = _evidence_facts()
-    core = project_evidence_core(
-        context_content_digest="a" * 64,
-        blocks=blocks,
-        captures=(capture,),
-        transforms=(transform,),
-        distribution=distribution,
-        seed_status="valid",
-        seed_reasons=(),
-    )
-    return core, (blocks, capture, transform, distribution)
+    _producer, reference = _issued_facts(tmp_path)
+    return project_evidence_core(reference), reference
 
 
 def _call_count(module: object, function_name: str) -> int:
@@ -82,22 +32,23 @@ def _call_count(module: object, function_name: str) -> int:
     )
 
 
-def test_ald6_rejects_the_same_evidence_core_object():
+def test_ald6_rejects_the_same_evidence_core_object(tmp_path):
     from voxweave.align_evidence_core import evaluate_ald6
 
-    core, _facts = _project_core()
+    core, _facts = _project_core(tmp_path)
     with pytest.raises((TypeError, ValueError), match="independent|distinct|same"):
         evaluate_ald6(core, core)
 
 
-def test_evidence_reference_replays_and_rejects_corrupt_allocator_receipts():
+def test_evidence_reference_replays_and_rejects_corrupt_allocator_receipts(tmp_path):
     from voxweave.align_distribution import WorkCounters
     from voxweave.align_evidence_core import (
         EvidenceCoreProjectionError,
         project_evidence_core,
     )
 
-    _core, (blocks, capture, transform, distribution) = _project_core()
+    _core, facts = _project_core(tmp_path)
+    distribution = facts.distribution
     corrupt_counters = WorkCounters(123_456, 234_567, 345_678, 456_789)
     row = distribution.work.calls[0]
     corrupt_row = dataclasses.replace(
@@ -117,13 +68,7 @@ def test_evidence_reference_replays_and_rejects_corrupt_allocator_receipts():
         match="allocator|counter|profile|receipt|replay",
     ):
         project_evidence_core(
-            context_content_digest="a" * 64,
-            blocks=blocks,
-            captures=(capture,),
-            transforms=(transform,),
-            distribution=corrupt_distribution,
-            seed_status="valid",
-            seed_reasons=(),
+            dataclasses.replace(facts, distribution=corrupt_distribution)
         )
 
 
@@ -489,7 +434,7 @@ def test_original_source_indices_survive_delivery_permutation_end_to_end(tmp_pat
     from voxweave.align_acquisition import (
         _bind_fresh_adapter_payload,
         _fresh_alignment_call_observer,
-        _fresh_core_inputs,
+        _fresh_producer_core_inputs,
         _fresh_record,
         _fresh_seed,
         begin_fresh_alignment,
@@ -617,18 +562,17 @@ def test_original_source_indices_survive_delivery_permutation_end_to_end(tmp_pat
         for item in _adapter_record(context, adapter).projection_inputs.source_blocks
     ) == (7, 2)
 
-    core_inputs = _fresh_core_inputs(context, acquisition)
     core = build_evidence_core(
-        context_content_digest=context.context_content_digest,
-        blocks=core_inputs[0],
-        captures=core_inputs[1],
-        transforms=core_inputs[2],
-        distribution=core_inputs[3],
-        seed_status=core_inputs[4],
-        seed_reasons=core_inputs[5],
-        physical_calls=core_inputs[6],
-        receipt_digest=acquisition.receipt_digest,
-        language="en",
+        _fresh_producer_core_inputs(
+            context,
+            acquisition,
+            strict_input_status=StrictInputStatus("valid", None),
+            v2_policy_status=validate_v2_policy(LegacyAlignPolicy(0.0, 0.0, 0.0)),
+            profile_status=resolve_align_profile(None, effective_iso="en").status,
+            evidence_status=resolve_finalize_evidence(
+                shot_changes=None, sing_spans=None
+            ).status,
+        )
     )
     assert tuple(block.source_index for block in core.blocks) == (7, 2)
     assert core.physical_calls[0].source_block_indices == (7, 2)

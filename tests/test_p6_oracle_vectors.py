@@ -1076,19 +1076,12 @@ def test_qwen_window_io_failures_are_canonical_pre_model_and_cleanup_owned_files
 
 def test_final_evidence_bind_classifies_independent_projection_mismatch(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from tests.test_p6_align_evidence import _verified
     from voxweave import align_evidence
 
     context, result, verified, acquisition, strict, policy, profile, evidence_status = (
         _verified(tmp_path)
-    )
-    frozen_inputs = align_evidence._fresh_evidence_inputs(context, acquisition)
-    monkeypatch.setattr(
-        align_evidence,
-        "_fresh_evidence_inputs",
-        lambda *_args, **_kwargs: frozen_inputs,
     )
     object.__setattr__(acquisition, "receipt_digest", "0" * 64)
     with pytest.raises(align_evidence.EvidenceBindingError) as caught:

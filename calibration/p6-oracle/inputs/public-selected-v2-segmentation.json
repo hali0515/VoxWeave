@@ -1,0 +1,7 @@
+{
+  "target": "episode.json",
+  "language": "ja",
+  "route": "media-free",
+  "json": "{\"language\":\"ja\",\"word_segments\":[{\"text\":\"第一\",\"start\":0.1,\"end\":0.7},{\"text\":\"声\",\"start\":0.8,\"end\":1.4},{\"text\":\"問い\",\"start\":1.7,\"end\":2.3},{\"text\":\"答え\",\"start\":2.5,\"end\":3.2},{\"text\":\"余韻\",\"start\":3.5,\"end\":4.4}],\"vad_speech\":[[0.05,1.45],[1.65,3.25],[3.45,4.45]],\"shot_changes\":[1.6,3.4],\"sing_spans\":[[3.45,4.45]],\"speaker_turns\":[[0.05,4.45,\"SPEAKER_00\"]],\"segmentation\":{\"engine\":\"p5-boundary-v2\",\"terminal\":\"fixed-point\",\"degraded\":[],\"providers\":{\"boundary\":\"issued-optimizer-selection\",\"semantic\":\"disabled\"}}}\n",
+  "speaker_mapping": "{\"version\":1,\"speakers\":{\"SPEAKER_00\":\"Aoi\"}}\n"
+}

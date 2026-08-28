@@ -1,0 +1,43 @@
+{
+  "language": "en",
+  "segments": [
+    {
+      "text": "FIRST",
+      "start": 0.2,
+      "end": 1.0166666666666668
+    },
+    {
+      "text": "SECOND",
+      "start": 1.1,
+      "end": 2.05
+    }
+  ],
+  "word_segments": [
+    {
+      "text": "FIRST",
+      "start": 0.2,
+      "end": 0.9
+    },
+    {
+      "text": "SECOND",
+      "start": 1.1,
+      "end": 1.8
+    }
+  ],
+  "vad_speech": [
+    [
+      0.15,
+      0.95
+    ],
+    [
+      1.05,
+      1.85
+    ]
+  ],
+  "speaker_turns": null,
+  "segmentation": {
+    "engine": "p5-boundary-v2",
+    "degraded": [],
+    "providers": {}
+  }
+}

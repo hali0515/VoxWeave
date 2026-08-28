@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import hashlib
+import json
 import math
 import secrets
 import threading
@@ -33,6 +34,7 @@ from voxweave.align_distribution import (
     AuthorityLimitProfile,
     AuthoritySkippedBlockInput,
     LegacyCallDistributionReceipt,
+    LegacyDistributionResult,
     RouteClaim,
     RouteExpectation,
     StrictFailureLocator,
@@ -40,10 +42,12 @@ from voxweave.align_distribution import (
     legacy_distribute_before_shift,
 )
 from voxweave.align_failures import CanonicalFailure, SecondaryFailure
+from voxweave.align_runtime import align_runtime_activity
 from voxweave.align_snapshot import (
     FROZEN_NULL,
     FrozenArray,
     FrozenJSON,
+    FrozenObject,
     freeze_json,
     frozen_json_digest,
 )
@@ -625,12 +629,34 @@ class _ObservedPhysicalCall:
     audio_sample_start: int
     audio_sample_end: int
     sample_rate: int
+    sample_count: int
     physical_origin_seconds: float
     legacy_origin_seconds: float
     legacy_origin_kind: Literal["identity", "sample-origin", "nominal-route"]
     authority_origin_seconds: float
     backend_model_config_digest: str
     route_input_digest: str
+    geometry_failure: StrictFailureLocator | None
+
+
+@dataclass(frozen=True)
+class ReferencePhysicalCallFacts:
+    """Issuer-time call facts retained independently from its public receipt."""
+
+    call_index: int
+    source_block_indices: tuple[int, ...]
+    raw_nodes: tuple[Any, ...]
+    original_nodes: tuple[Any, ...] | None
+    raw_unit_ids: tuple[str, ...]
+    raw_node_range: tuple[int, int]
+    audio_sample_start: int
+    audio_sample_end: int
+    sample_rate: int
+    sample_count: int
+    physical_origin_seconds: float
+    legacy_origin_seconds: float
+    legacy_origin_kind: Literal["identity", "sample-origin", "nominal-route"]
+    authority_origin_seconds: float
     geometry_failure: StrictFailureLocator | None
 
 
@@ -668,6 +694,9 @@ class _FreshRecord:
     physical_calls: tuple[PhysicalCallReceipt, ...]
     legacy_receipts: tuple[LegacyCallDistributionReceipt, ...]
     legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
+    reference_calls: tuple[ReferencePhysicalCallFacts, ...]
+    backend_model_config_facts: FrozenJSON
+    route_input_facts: FrozenJSON
     adapter_payload: _AdapterPayload | None = None
     verified: VerifiedFreshAlignment | None = None
     transfer_terminal: Literal["live", "consumed", "retired"] = "live"
@@ -693,6 +722,61 @@ class _SessionRecord:
     sealed: bool = False
 
 
+@dataclass(frozen=True)
+class EvidenceCoreProducerInputs:
+    """One producer-side thaw of every pre-selected-output EvidenceCore fact."""
+
+    context_content_digest: str
+    receipt_digest: str
+    engine_family: str
+    language: str
+    route_kind: str
+    stable_fields: FrozenObject
+    authority_profile: AuthorityLimitProfile
+    blocks: tuple[AuthorityBlock, ...]
+    captures: tuple[StrictCaptureResult, ...]
+    transforms: tuple[AuthorityTransformResult, ...]
+    distribution: AuthorityDistributionReceipt
+    seed_status: Literal["valid", "invalid"]
+    seed_reasons: tuple[str, ...]
+    physical_calls: tuple[PhysicalCallReceipt, ...]
+    legacy_receipts: tuple[LegacyCallDistributionReceipt, ...]
+    legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
+    strict_input_status: object
+    v2_policy_status: object
+    profile_status: object
+    evidence_status: object
+
+
+@dataclass(frozen=True)
+class EvidenceCoreReferenceInputs:
+    """Independent issuer/context thaws used only by projector C."""
+
+    claimed_context_content_digest: str
+    claimed_receipt_digest: str
+    engine_family: str
+    language: str
+    route_kind: str
+    stable_fields: FrozenObject
+    authority_profile: AuthorityLimitProfile
+    blocks: tuple[AuthorityBlock, ...]
+    captures: tuple[StrictCaptureResult, ...]
+    transforms: tuple[AuthorityTransformResult, ...]
+    distribution: AuthorityDistributionReceipt
+    seed_status: Literal["valid", "invalid"]
+    seed_reasons: tuple[str, ...]
+    claimed_physical_calls: tuple[PhysicalCallReceipt, ...]
+    legacy_receipts: tuple[LegacyCallDistributionReceipt, ...]
+    legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
+    reference_calls: tuple[ReferencePhysicalCallFacts, ...]
+    backend_model_config_facts: FrozenJSON
+    route_input_facts: FrozenJSON
+    strict_input_status: object
+    v2_policy_status: object
+    profile_status: object
+    evidence_status: object
+
+
 _FRESH: dict[int, _FreshRecord] = {}
 _VERIFIED_FRESH: dict[int, _VerifiedRecord] = {}
 _FRESH_SESSIONS: dict[int, _SessionRecord] = {}
@@ -710,6 +794,40 @@ def _is_sha256(value: object) -> bool:
 
 def _default_digest(label: str, value: str) -> str:
     return hashlib.sha256(f"{label}\0{value}".encode()).hexdigest()
+
+
+def _stable_fact_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _capture_digest_facts(
+    facts: object | None,
+    claimed_digest: str | None,
+    *,
+    label: str,
+    default_facts: object,
+) -> tuple[FrozenJSON, str]:
+    if facts is None:
+        if claimed_digest is not None:
+            raise ValueError(f"{label} facts are required with an explicit digest")
+        value = default_facts
+    else:
+        value = facts
+    try:
+        digest = _stable_fact_digest(value)
+        frozen = freeze_json(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} facts are outside the stable JSON domain") from exc
+    if claimed_digest is not None and claimed_digest != digest:
+        raise ValueError(f"{label} digest does not match its stable facts")
+    return frozen, digest
 
 
 def _stable_value(value: Any) -> Any:
@@ -880,6 +998,26 @@ def _authority_seal_digest(record: _FreshRecord) -> str:
             transforms,
             _physical_projection(record.physical_calls, names),
             _physical_projection(record.issued.physical_calls, names),
+            record.backend_model_config_facts,
+            record.route_input_facts,
+            tuple(
+                (
+                    call.call_index,
+                    call.source_block_indices,
+                    call.raw_unit_ids,
+                    call.raw_node_range,
+                    call.audio_sample_start,
+                    call.audio_sample_end,
+                    call.sample_rate,
+                    call.sample_count,
+                    call.physical_origin_seconds,
+                    call.legacy_origin_seconds,
+                    call.legacy_origin_kind,
+                    call.authority_origin_seconds,
+                    call.geometry_failure,
+                )
+                for call in record.reference_calls
+            ),
         )
     )
 
@@ -985,6 +1123,8 @@ class FreshAlignmentIssuer:
         sample_rate: int,
         backend_model_config_digest: str | None,
         route_input_digest: str | None,
+        backend_model_config_facts: object | None,
+        route_input_facts: object | None,
         ledger: AcquisitionAdmissionLedger | None,
         verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None,
     ) -> None:
@@ -1018,15 +1158,28 @@ class FreshAlignmentIssuer:
         self.language = language
         self.prepared_audio_sample_count = prepared_audio_sample_count
         self.sample_rate = sample_rate
-        self.backend_model_config_digest = (
-            backend_model_config_digest
-            if _is_sha256(backend_model_config_digest)
-            else _default_digest("backend-model", context.route_kind)
+        (
+            self.backend_model_config_facts,
+            self.backend_model_config_digest,
+        ) = _capture_digest_facts(
+            backend_model_config_facts,
+            backend_model_config_digest,
+            label="backend model/config",
+            default_facts={
+                "kind": "default",
+                "route": context.route_kind,
+                "language": language,
+            },
         )
-        self.route_input_digest = (
-            route_input_digest
-            if _is_sha256(route_input_digest)
-            else _default_digest("route-input", context.context_content_digest)
+        self.route_input_facts, self.route_input_digest = _capture_digest_facts(
+            route_input_facts,
+            route_input_digest,
+            label="route input",
+            default_facts={
+                "kind": "default",
+                "context_content_digest": context.context_content_digest,
+                "route": context.route_kind,
+            },
         )
         self.ledger = ledger or AcquisitionAdmissionLedger()
         self.verifier_cut_mutator = verifier_cut_mutator
@@ -1189,41 +1342,44 @@ class FreshAlignmentIssuer:
             input_digest = self.route_input_digest
         assert isinstance(model_digest, str)
         assert isinstance(input_digest, str)
-        self.observed.append(
-            _ObservedPhysicalCall(
-                call_index,
-                sources,
-                post_units,
-                original_units,
-                raw_ids,
-                (raw_start, raw_start + raw_count),
-                start,
-                end,
-                rate,
-                physical_origin,
-                legacy_origin,
-                legacy_kind,
-                physical_origin,
-                model_digest,
-                input_digest,
-                geometry_failure,
+        with align_runtime_activity("AO-07", "raw-id-and-call-observation"):
+            self.observed.append(
+                _ObservedPhysicalCall(
+                    call_index,
+                    sources,
+                    post_units,
+                    original_units,
+                    raw_ids,
+                    (raw_start, raw_start + raw_count),
+                    start,
+                    end,
+                    rate,
+                    count,
+                    physical_origin,
+                    legacy_origin,
+                    legacy_kind,
+                    physical_origin,
+                    model_digest,
+                    input_digest,
+                    geometry_failure,
+                )
             )
-        )
 
     def _invoke_backend_call(self, backend_call: Callable[[], Any]) -> Any:
         """Preserve a backend exception while attaching its closed classification."""
         if not callable(backend_call):
             raise TypeError("backend call must be callable")
-        try:
-            return backend_call()
-        except Exception as exc:
-            _attach_canonical_failure(
-                exc,
-                kind="fresh-backend-output-invalid",
-                phase="backend-call",
-                detail_code="backend-raised",
-            )
-            raise
+        with align_runtime_activity("AO-07", "backend-call"):
+            try:
+                return backend_call()
+            except Exception as exc:
+                _attach_canonical_failure(
+                    exc,
+                    kind="fresh-backend-output-invalid",
+                    phase="backend-call",
+                    detail_code="backend-raised",
+                )
+                raise
 
     def _invoke_qwen_physical_call(
         self,
@@ -1270,6 +1426,8 @@ def begin_fresh_alignment(
     sample_rate: int = 16_000,
     backend_model_config_digest: str | None = None,
     route_input_digest: str | None = None,
+    backend_model_config_facts: object | None = None,
+    route_input_facts: object | None = None,
     ledger: AcquisitionAdmissionLedger | None = None,
     _verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None = None,
 ) -> FreshAlignmentSession:
@@ -1284,6 +1442,8 @@ def begin_fresh_alignment(
         sample_rate=sample_rate,
         backend_model_config_digest=backend_model_config_digest,
         route_input_digest=route_input_digest,
+        backend_model_config_facts=backend_model_config_facts,
+        route_input_facts=route_input_facts,
         ledger=ledger,
         verifier_cut_mutator=_verifier_cut_mutator,
     )
@@ -1339,17 +1499,10 @@ def _fresh_alignment_backend_invoker(
     return issuer._invoke_backend_call
 
 
-def _call_capture(
+def _legacy_call_projection(
     issuer: FreshAlignmentIssuer,
     call: _ObservedPhysicalCall,
-) -> tuple[
-    StrictCaptureResult,
-    AuthorityTransformResult,
-    AuthorityCallInput,
-    PhysicalCallReceipt,
-    LegacyCallDistributionReceipt,
-    tuple[tuple[Mapping[str, Any], ...], ...],
-]:
+) -> LegacyDistributionResult:
     blocks_by_source = {block.source_index: block for block in issuer.blocks}
     texts = tuple(
         blocks_by_source[index].alignment_text for index in call.source_block_indices
@@ -1379,34 +1532,70 @@ def _call_capture(
             detail_code=detail_code,
         )
         raise
-    try:
-        capture = capture_strict_units(
-            call.post_units,
-            original_units=call.original_units,
-            call_index=call.call_index,
-            raw_unit_ids=call.raw_unit_ids,
-        )
-    except (TypeError, ValueError) as exc:
-        if isinstance(getattr(exc, "failure", None), CanonicalFailure):
-            raise
-        capture = _invalid_capture(call.call_index, call.raw_unit_ids)
-    retained_count = len(legacy.receipt.consumed_prefix_unit_ids)
-    if call.geometry_failure is not None:
-        transform = AuthorityTransformResult(
+    return legacy
+
+
+def _strict_call_capture(call: _ObservedPhysicalCall) -> StrictCaptureResult:
+    with align_runtime_activity("AO-11", "strict-capture"):
+        try:
+            return capture_strict_units(
+                call.post_units,
+                original_units=call.original_units,
+                call_index=call.call_index,
+                raw_unit_ids=call.raw_unit_ids,
+            )
+        except (TypeError, ValueError) as exc:
+            if isinstance(getattr(exc, "failure", None), CanonicalFailure):
+                raise
+            return _invalid_capture(call.call_index, call.raw_unit_ids)
+
+
+def _authority_call_transform(
+    call: _ObservedPhysicalCall,
+    capture: StrictCaptureResult,
+    legacy: LegacyDistributionResult,
+) -> AuthorityTransformResult:
+    if capture.status != "valid":
+        return AuthorityTransformResult(
             call.call_index,
             "invalid",
             capture,
             None,
             None,
-            call.geometry_failure,
+            capture.failure,
         )
-    else:
-        transform = transform_strict_units(
+    retained_count = len(legacy.receipt.consumed_prefix_unit_ids)
+    with align_runtime_activity("AO-12", "physical-origin-transform"):
+        if call.geometry_failure is not None:
+            return AuthorityTransformResult(
+                call.call_index,
+                "invalid",
+                capture,
+                None,
+                None,
+                call.geometry_failure,
+            )
+        return transform_strict_units(
             capture,
             physical_origin_seconds=call.authority_origin_seconds,
             identity=call.legacy_origin_kind == "identity",
             retained_unit_count=retained_count,
         )
+
+
+def _assemble_call_capture(
+    call: _ObservedPhysicalCall,
+    capture: StrictCaptureResult,
+    transform: AuthorityTransformResult,
+    legacy: LegacyDistributionResult,
+) -> tuple[
+    StrictCaptureResult,
+    AuthorityTransformResult,
+    AuthorityCallInput,
+    PhysicalCallReceipt,
+    LegacyCallDistributionReceipt,
+    tuple[tuple[Mapping[str, Any], ...], ...],
+]:
     if capture.status != "valid":
         preflight_status: Literal["valid", "capture-invalid", "transform-invalid"] = (
             "capture-invalid"
@@ -1436,26 +1625,26 @@ def _call_capture(
     except Exception:
         legacy_absolute_digest = None
     physical = PhysicalCallReceipt(
-        call.call_index,
-        call.source_block_indices,
-        call.audio_sample_start,
-        call.audio_sample_end,
-        call.sample_rate,
-        call.physical_origin_seconds,
-        call.legacy_origin_seconds,
-        call.legacy_origin_kind,
-        call.authority_origin_seconds,
-        call.backend_model_config_digest,
-        call.route_input_digest,
-        capture.status,
-        transform.failure,
-        capture.raw_units_digest,
-        capture.normalized_relative_digest,
-        legacy_slice_digest,
-        legacy_absolute_digest,
-        transform.status,
-        transform.authority_absolute_digest,
-        call.raw_unit_ids,
+        call_index=call.call_index,
+        source_block_indices=call.source_block_indices,
+        audio_sample_start=call.audio_sample_start,
+        audio_sample_end=call.audio_sample_end,
+        sample_rate=call.sample_rate,
+        physical_origin_seconds=call.physical_origin_seconds,
+        legacy_origin_seconds=call.legacy_origin_seconds,
+        legacy_origin_kind=call.legacy_origin_kind,
+        authority_origin_seconds=call.authority_origin_seconds,
+        backend_model_config_digest=call.backend_model_config_digest,
+        route_input_digest=call.route_input_digest,
+        strict_unit_status=capture.status,
+        strict_failure=transform.failure,
+        raw_units_digest=capture.raw_units_digest,
+        normalized_relative_digest=capture.normalized_relative_digest,
+        legacy_slice_digest=legacy_slice_digest,
+        legacy_absolute_digest=legacy_absolute_digest,
+        authority_transform_status=transform.status,
+        authority_absolute_digest=transform.authority_absolute_digest,
+        raw_unit_ids=call.raw_unit_ids,
     )
     return (
         capture,
@@ -1530,6 +1719,34 @@ def _issued_public_snapshot(issued: IssuedFreshAlignment) -> tuple[object, ...]:
     )
 
 
+def _reference_call_facts(call: _ObservedPhysicalCall) -> ReferencePhysicalCallFacts:
+    return ReferencePhysicalCallFacts(
+        call.call_index,
+        call.source_block_indices,
+        tuple(
+            copy.deepcopy(call.post_units[index])
+            for index in range(len(call.post_units))
+        ),
+        None
+        if call.original_units is None
+        else tuple(
+            copy.deepcopy(call.original_units[index])
+            for index in range(len(call.original_units))
+        ),
+        call.raw_unit_ids,
+        call.raw_node_range,
+        call.audio_sample_start,
+        call.audio_sample_end,
+        call.sample_rate,
+        call.sample_count,
+        call.physical_origin_seconds,
+        call.legacy_origin_seconds,
+        call.legacy_origin_kind,
+        call.authority_origin_seconds,
+        call.geometry_failure,
+    )
+
+
 def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment:
     """Run AO-11 through AO-13 and atomically issue one sealed acquisition."""
     if not isinstance(session, FreshAlignmentSession):
@@ -1538,33 +1755,54 @@ def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment
     session_record.sealed = True
     issuer = session_record.issuer
     issuer.sealed = True
-    rows = tuple(_call_capture(issuer, call) for call in issuer.observed)
-    captures = tuple(row[0] for row in rows)
-    transforms = tuple(row[1] for row in rows)
+    observed = tuple(issuer.observed)
+    legacy_projections = tuple(
+        _legacy_call_projection(issuer, call) for call in observed
+    )
+    captures = tuple(_strict_call_capture(call) for call in observed)
+    transforms = tuple(
+        _authority_call_transform(call, capture, legacy)
+        for call, capture, legacy in zip(
+            observed, captures, legacy_projections, strict=True
+        )
+    )
+    rows = tuple(
+        _assemble_call_capture(call, capture, transform, legacy)
+        for call, capture, transform, legacy in zip(
+            observed,
+            captures,
+            transforms,
+            legacy_projections,
+            strict=True,
+        )
+    )
+    reference_calls = tuple(_reference_call_facts(call) for call in observed)
     call_inputs = tuple(row[2] for row in rows)
     physical_calls = tuple(row[3] for row in rows)
     legacy_receipts = tuple(row[4] for row in rows)
     legacy_by_source: dict[int, tuple[Mapping[str, Any], ...]] = {}
-    for call, row in zip(issuer.observed, rows, strict=True):
+    for call, row in zip(observed, rows, strict=True):
         for source_index, owner in zip(call.source_block_indices, row[5], strict=True):
             legacy_by_source[source_index] = owner
     legacy_block_units = tuple(
         legacy_by_source.get(block.source_index, ()) for block in issuer.blocks
     )
-    route, skipped, claims = _route_inputs(issuer, call_inputs)
-    profile = _align_context_authority_profile(issuer.context)
-    if not isinstance(profile, AuthorityLimitProfile):
-        raise TypeError("context authority profile has the wrong type")
-    distribution = _build_context_authority_distribution(
-        blocks=issuer.blocks,
-        delivery_route=route,
-        calls=call_inputs,
-        skipped_blocks=skipped,
-        route_claims=claims,
-        iso=issuer.language,
-        _limits=profile,
-        _verifier_cut_mutator=issuer.verifier_cut_mutator,
-    )
+    with align_runtime_activity("AO-13", "route-topology-preflight"):
+        route, skipped, claims = _route_inputs(issuer, call_inputs)
+        profile = _align_context_authority_profile(issuer.context)
+        if not isinstance(profile, AuthorityLimitProfile):
+            raise TypeError("context authority profile has the wrong type")
+    with align_runtime_activity("AO-13", "canonical-authority-allocation"):
+        distribution = _build_context_authority_distribution(
+            blocks=issuer.blocks,
+            delivery_route=route,
+            calls=call_inputs,
+            skipped_blocks=skipped,
+            route_claims=claims,
+            iso=issuer.language,
+            _limits=profile,
+            _verifier_cut_mutator=issuer.verifier_cut_mutator,
+        )
     if distribution.work.status == "seal-mismatch":
         terminal = distribution.work.terminal_call_index
         raise_distribution_seal_mismatch(
@@ -1580,12 +1818,13 @@ def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment
         for transform in transforms
         for unit in (transform.units if transform.units is not None else ())
     )
-    seed = build_align_seed(
-        blocks=issuer.blocks,
-        units=fresh_units,
-        distribution=distribution,
-        iso=issuer.language,
-    )
+    with align_runtime_activity("AO-13", "authority-seed"):
+        seed = build_align_seed(
+            blocks=issuer.blocks,
+            units=fresh_units,
+            distribution=distribution,
+            iso=issuer.language,
+        )
     receipt_digest = _stable_digest(
         {
             "context_content_digest": issuer.context.context_content_digest,
@@ -1618,6 +1857,9 @@ def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment
         copy.deepcopy(physical_calls),
         copy.deepcopy(legacy_receipts),
         copy.deepcopy(legacy_block_units),
+        reference_calls,
+        copy.deepcopy(issuer.backend_model_config_facts),
+        copy.deepcopy(issuer.route_input_facts),
     )
     record.public_snapshot = _issued_public_snapshot(issued)
     record.seals = _fresh_seals(record)
@@ -1833,6 +2075,87 @@ def _fresh_core_inputs(
         getattr(seed, "status"),
         tuple(getattr(seed, "reasons")),
         copy.deepcopy(record.physical_calls),
+    )
+
+
+def _fresh_producer_core_inputs(
+    context: IssuedAlignContext,
+    acquisition: IssuedFreshAlignment,
+    *,
+    strict_input_status: object,
+    v2_policy_status: object,
+    profile_status: object,
+    evidence_status: object,
+) -> EvidenceCoreProducerInputs:
+    """Return the producer's own thaw of all AO-16 fields."""
+    record = _fresh_record(context, acquisition)
+    seed = record.seed
+    profile = _align_context_authority_profile(context)
+    if not isinstance(profile, AuthorityLimitProfile):
+        raise TypeError("context authority profile has the wrong type")
+    return EvidenceCoreProducerInputs(
+        context.context_content_digest,
+        acquisition.receipt_digest,
+        context.engine_family,
+        context.effective_iso,
+        context.route_kind,
+        copy.deepcopy(_align_context_stable_fields(context)),
+        copy.deepcopy(profile),
+        copy.deepcopy(record.blocks),
+        copy.deepcopy(record.captures),
+        copy.deepcopy(record.transforms),
+        copy.deepcopy(record.distribution),
+        getattr(seed, "status"),
+        tuple(getattr(seed, "reasons")),
+        copy.deepcopy(record.physical_calls),
+        copy.deepcopy(record.legacy_receipts),
+        copy.deepcopy(record.legacy_block_units),
+        copy.deepcopy(strict_input_status),
+        copy.deepcopy(v2_policy_status),
+        copy.deepcopy(profile_status),
+        copy.deepcopy(evidence_status),
+    )
+
+
+def _fresh_reference_core_inputs(
+    context: IssuedAlignContext,
+    acquisition: IssuedFreshAlignment,
+) -> EvidenceCoreReferenceInputs:
+    """Return separate issuer/context thaws for independent projector C."""
+    record = _fresh_record(context, acquisition)
+    payload = record.adapter_payload
+    if payload is None:
+        raise ValueError("fresh alignment lacks its sealed adapter payload")
+    profile = _align_context_authority_profile(context)
+    if not isinstance(profile, AuthorityLimitProfile):
+        raise TypeError("context authority profile has the wrong type")
+    seed = record.seed
+    profile_status = getattr(payload.profile_resolution, "status")
+    evidence_status = getattr(payload.evidence_resolution, "status")
+    return EvidenceCoreReferenceInputs(
+        context.context_content_digest,
+        acquisition.receipt_digest,
+        context.engine_family,
+        context.effective_iso,
+        context.route_kind,
+        copy.deepcopy(_align_context_stable_fields(context)),
+        copy.deepcopy(profile),
+        copy.deepcopy(record.blocks),
+        copy.deepcopy(record.captures),
+        copy.deepcopy(record.transforms),
+        copy.deepcopy(record.distribution),
+        getattr(seed, "status"),
+        tuple(getattr(seed, "reasons")),
+        copy.deepcopy(record.physical_calls),
+        copy.deepcopy(record.legacy_receipts),
+        copy.deepcopy(record.legacy_block_units),
+        copy.deepcopy(record.reference_calls),
+        copy.deepcopy(record.backend_model_config_facts),
+        copy.deepcopy(record.route_input_facts),
+        copy.deepcopy(payload.strict_input_status),
+        copy.deepcopy(payload.v2_policy_status),
+        copy.deepcopy(profile_status),
+        copy.deepcopy(evidence_status),
     )
 
 

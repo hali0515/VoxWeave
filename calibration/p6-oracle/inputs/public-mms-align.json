@@ -1,0 +1,21 @@
+{
+  "target": "episode.vtt",
+  "language": "ja",
+  "route": "mms-full",
+  "vtt": "WEBVTT\n\n00:00:00.200 --> 00:00:00.900\n第一\n\n00:00:01.100 --> 00:00:01.800\n第二\n",
+  "json": "{\"language\":\"ja\"}\n",
+  "media": {
+    "sample_rate": 16000,
+    "sample_count": 48000
+  },
+  "block_units": [
+    [
+      {"text": "第", "start": 0.2, "end": 0.5},
+      {"text": "一", "start": 0.5, "end": 0.9}
+    ],
+    [
+      {"text": "第", "start": 1.1, "end": 1.4},
+      {"text": "二", "start": 1.4, "end": 1.8}
+    ]
+  ]
+}

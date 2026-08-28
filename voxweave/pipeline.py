@@ -28,6 +28,10 @@ from voxweave.chunking import (
     vad_speech_segments,
 )
 from voxweave.align_failures import CanonicalFailure, SecondaryFailure
+from voxweave.align_runtime import (
+    align_runtime_activity,
+    bind_align_runtime_identity,
+)
 from voxweave.core.providers import degradation_capture, provider_snapshot
 from voxweave.core.schema import Cue, Unit
 from voxweave.core.segdoc import (
@@ -4757,6 +4761,60 @@ def _encode_align_json_bytes(
     )
 
 
+@dataclass(frozen=True)
+class _SelectedLegacyAlignResult:
+    block_units: tuple[tuple[Mapping[str, Any], ...], ...]
+    spans: tuple[tuple[float, float], ...]
+    all_units: tuple[Mapping[str, Any], ...]
+
+
+def _seal_legacy_owner_slices(
+    block_units: Sequence[Sequence[Mapping[str, Any]]],
+) -> tuple[tuple[Mapping[str, Any], ...], ...]:
+    """Retain only the already-distributed legacy owners, without surplus access."""
+
+    return tuple(tuple(owner) for owner in block_units)
+
+
+def _seal_legacy_absolute_times(
+    block_units: Sequence[Sequence[Mapping[str, Any]]],
+) -> list[list[dict[str, Any]]]:
+    """Read and seal the exact historical text/start/end projection."""
+
+    return [
+        [
+            {
+                "text": unit["text"],
+                "start": unit["start"],
+                "end": unit["end"],
+            }
+            for unit in owner
+        ]
+        for owner in block_units
+    ]
+
+
+def _seal_selected_legacy_align_result(
+    block_units: Sequence[Sequence[Mapping[str, Any]]],
+    spans: Sequence[tuple[float, float]],
+    all_units: Sequence[Mapping[str, Any]],
+) -> _SelectedLegacyAlignResult:
+    """Seal the exact selected-legacy projection before strict AO work begins."""
+
+    def seal_unit(unit: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {
+            "text": unit["text"],
+            "start": unit["start"],
+            "end": unit["end"],
+        }
+
+    return _SelectedLegacyAlignResult(
+        tuple(tuple(seal_unit(unit) for unit in owner) for owner in block_units),
+        tuple((start, end) for start, end in spans),
+        tuple(seal_unit(unit) for unit in all_units),
+    )
+
+
 def _align_blocks(
     wav: Path,
     blocks: list[dict],
@@ -4962,55 +5020,58 @@ def align(
     explicit_media_requested = media_path is not None
     rep = reporter or Reporter()
     json_path = swap_ext(vtt_path, ".json")
-    try:
-        vtt_input_bytes = vtt_path.read_bytes()
-    except OSError as exc:
-        _attach_canonical_failure(
-            exc,
-            kind="subtitle-snapshot-failed",
-            phase="snapshot",
-            detail_code="vtt-read",
-        )
-        raise
-    if (
-        _expected_vtt_sha256 is not None
-        and hashlib.sha256(vtt_input_bytes).hexdigest() != _expected_vtt_sha256
-    ):
-        raise episode_transaction.InputStaleError(
-            "vtt-generation", "input changed before alignment; re-run"
-        )
-    try:
-        expected_json = episode_transaction.capture_file_generation(json_path)
-    except OSError as exc:
-        _attach_canonical_failure(
-            exc,
-            kind="subtitle-snapshot-failed",
-            phase="snapshot",
-            detail_code="sibling-read",
-        )
-        raise
+    with align_runtime_activity("AO-01", "vtt-generation-snapshot"):
+        try:
+            vtt_input_bytes = vtt_path.read_bytes()
+        except OSError as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="subtitle-snapshot-failed",
+                phase="snapshot",
+                detail_code="vtt-read",
+            )
+            raise
+        if (
+            _expected_vtt_sha256 is not None
+            and hashlib.sha256(vtt_input_bytes).hexdigest() != _expected_vtt_sha256
+        ):
+            raise episode_transaction.InputStaleError(
+                "vtt-generation", "input changed before alignment; re-run"
+            )
+    with align_runtime_activity("AO-01", "sibling-generation-snapshot"):
+        try:
+            expected_json = episode_transaction.capture_file_generation(json_path)
+        except OSError as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="subtitle-snapshot-failed",
+                phase="snapshot",
+                detail_code="sibling-read",
+            )
+            raise
     json_input_bytes = expected_json.bytes_value
     from voxweave.align_snapshot import decode_sibling_json_snapshot
 
-    try:
-        sibling_snapshot = decode_sibling_json_snapshot(
-            json_path.name,
-            json_input_bytes,
+    with align_runtime_activity("AO-02", "sibling-decode-and-raw-carriers"):
+        try:
+            sibling_snapshot = decode_sibling_json_snapshot(
+                json_path.name,
+                json_input_bytes,
+            )
+        except RuntimeError as exc:
+            _attach_json_decode_failure(exc)
+            raise
+        data = sibling_snapshot.thaw_legacy()
+        pair_declared = "voiceprint_capture" in data or "voiceprint_media" in data
+        voiceprint_pair = (
+            _replay_voiceprint_pair(
+                data,
+                json_input_bytes,
+                source=json_path.name,
+            )
+            if json_input_bytes is not None
+            else None
         )
-    except RuntimeError as exc:
-        _attach_json_decode_failure(exc)
-        raise
-    data = sibling_snapshot.thaw_legacy()
-    pair_declared = "voiceprint_capture" in data or "voiceprint_media" in data
-    voiceprint_pair = (
-        _replay_voiceprint_pair(
-            data,
-            json_input_bytes,
-            source=json_path.name,
-        )
-        if json_input_bytes is not None
-        else None
-    )
     # align re-times an existing cue stream; it never re-segments, so it only
     # labels (and later preserves) whatever produced that stream.
     log.debug("re-timing %s (%s)", vtt_path.name, resolve_segmentation_manifest(data))
@@ -5021,41 +5082,43 @@ def align(
 
     from voxweave.align_snapshot import decode_align_snapshot
 
-    try:
-        input_snapshot = decode_align_snapshot(
-            vtt_path.name,
-            vtt_input_bytes,
-            json_input_bytes,
-            effective_iso=iso,
-            sibling_snapshot=sibling_snapshot,
-        )
-    except RuntimeError as exc:
-        _attach_vtt_decode_failure(exc)
-        raise
+    with align_runtime_activity("AO-02", "subtitle-decode"):
+        try:
+            input_snapshot = decode_align_snapshot(
+                vtt_path.name,
+                vtt_input_bytes,
+                json_input_bytes,
+                effective_iso=iso,
+                sibling_snapshot=sibling_snapshot,
+            )
+        except RuntimeError as exc:
+            _attach_vtt_decode_failure(exc)
+            raise
 
-    media = Path(media_path) if media_path else _find_sibling_media(vtt_path)
-    if media is None or not media.exists():
-        exc = FileNotFoundError(
-            f"source media for {vtt_path.name} not found (expected sibling with same stem); "
-            f"align needs the original file to re-align, or specify --media"
-        )
-        _attach_canonical_failure(
-            exc,
-            kind="media-identity-invalid",
-            phase="media",
-            detail_code="media-not-found",
-        )
-        raise exc
-    try:
-        media_input_fingerprint = media_fingerprint(media)
-    except OSError as exc:
-        _attach_canonical_failure(
-            exc,
-            kind="media-identity-invalid",
-            phase="media",
-            detail_code="media-fingerprint",
-        )
-        raise
+    with align_runtime_activity("AO-03", "selected-media-identity"):
+        media = Path(media_path) if media_path else _find_sibling_media(vtt_path)
+        if media is None or not media.exists():
+            exc = FileNotFoundError(
+                f"source media for {vtt_path.name} not found (expected sibling with same stem); "
+                f"align needs the original file to re-align, or specify --media"
+            )
+            _attach_canonical_failure(
+                exc,
+                kind="media-identity-invalid",
+                phase="media",
+                detail_code="media-not-found",
+            )
+            raise exc
+        try:
+            media_input_fingerprint = media_fingerprint(media)
+        except OSError as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="media-identity-invalid",
+                phase="media",
+                detail_code="media-fingerprint",
+            )
+            raise
 
     # Full-file single-pass alignment (whisperx fork align_ctc) for both MMS (ja) and wav2vec2
     # CTC (en): concatenate all cue text, run one global monotone forced-align over the whole
@@ -5068,9 +5131,11 @@ def align(
     # NOT revert ja to per-cue MMS: repeated small ONNX calls corrupt the heap (~180-226 cues).
     from voxweave.config import align_model_for
 
-    mms = backend.uses_mms(iso)
-    ctc_model = None if mms else align_model_for(iso)
-    full_pass = mms or bool(ctc_model)
+    with align_runtime_activity("AO-03", "route-family-plan"):
+        mms = backend.uses_mms(iso)
+        ctc_model = None if mms else align_model_for(iso)
+        full_pass = mms or bool(ctc_model)
+        route_kind = "mms-full" if mms else "ctc-full" if ctc_model else "qwen-crop"
     delivery_order = (
         tuple(range(len(input_snapshot.blocks)))
         if full_pass
@@ -5114,25 +5179,26 @@ def align(
                 detail_code="no-route-source",
             )
             raise exc
-        try:
-            spans = realign.route_blocks(blocks, word_segments)
-            crops = realign.crop_blocks(spans)
-        except (IndexError, KeyError) as exc:
-            _attach_canonical_failure(
-                exc,
-                kind="qwen-window-operation-failed",
-                phase="route-plan",
-                detail_code="route-bound-access",
-            )
-            raise
-        except (ArithmeticError, TypeError, ValueError) as exc:
-            _attach_canonical_failure(
-                exc,
-                kind="qwen-window-operation-failed",
-                phase="route-plan",
-                detail_code="route-bound-arithmetic",
-            )
-            raise
+        with align_runtime_activity("AO-03", "qwen-route-plan"):
+            try:
+                spans = realign.route_blocks(blocks, word_segments)
+                crops = realign.crop_blocks(spans)
+            except (IndexError, KeyError) as exc:
+                _attach_canonical_failure(
+                    exc,
+                    kind="qwen-window-operation-failed",
+                    phase="route-plan",
+                    detail_code="route-bound-access",
+                )
+                raise
+            except (ArithmeticError, TypeError, ValueError) as exc:
+                _attach_canonical_failure(
+                    exc,
+                    kind="qwen-window-operation-failed",
+                    phase="route-plan",
+                    detail_code="route-bound-arithmetic",
+                )
+                raise
         if all(c is None for c in crops):
             exc = RuntimeError(
                 "routing failed: no alignable blocks (text completely mismatches word_segments?)"
@@ -5169,21 +5235,24 @@ def align(
         else:
             acquisition_media = selected_snapshot.path
     try:
-        wav = _prepare_16k_for_align(
-            acquisition_media,
-            separate=separate,
-            normalize=normalize,
-            reporter=rep,
-            tmp=tmp,
-            cache_media=media,
-            source_fingerprint=(
-                selected_snapshot.fingerprint if selected_snapshot is not None else None
-            ),
-        )
+        with align_runtime_activity("AO-04", "prepared-audio-and-cache"):
+            wav = _prepare_16k_for_align(
+                acquisition_media,
+                separate=separate,
+                normalize=normalize,
+                reporter=rep,
+                tmp=tmp,
+                cache_media=media,
+                source_fingerprint=(
+                    selected_snapshot.fingerprint
+                    if selected_snapshot is not None
+                    else None
+                ),
+            )
         from voxweave import align_orchestration
 
-        route_kind = "mms-full" if mms else "ctc-full" if ctc_model else "qwen-crop"
-        prepared_audio_sha256 = align_orchestration.file_sha256(wav)
+        with align_runtime_activity("AO-04", "prepared-audio-digest"):
+            prepared_audio_sha256 = align_orchestration.file_sha256(wav)
         from voxweave.align_inputs import LegacyAlignPolicy
 
         legacy_policy = LegacyAlignPolicy(
@@ -5194,26 +5263,31 @@ def align(
         stored_manifest_value = data.get("segmentation")
         strict_shot_changes = data.get("shot_changes")
         strict_sing_spans = data.get("sing_spans")
-        align_context = align_orchestration.issue_public_align_context(
-            target_path=vtt_path,
-            sibling_path=json_path,
-            media_path=media,
-            prepared_audio_path=wav,
-            expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
-            expected_json=expected_json,
-            expected_vtt_sha256=_expected_vtt_sha256,
-            media_fingerprint=media_input_fingerprint,
-            effective_iso=iso,
-            route_kind=route_kind,
-            blocks=blocks,
-            prepared_audio_sha256=prepared_audio_sha256,
-            legacy_policy=legacy_policy,
-            stored_language=data.get("language"),
-            segmentation=stored_manifest_value,
-            strict_shot_changes=strict_shot_changes,
-            strict_sing_spans=strict_sing_spans,
-            explicit_media=explicit_media_requested,
-            block_content_sha256=input_snapshot.block_content_sha256,
+        with align_runtime_activity("AO-05", "context-and-limit-profile-issuance"):
+            align_context = align_orchestration.issue_public_align_context(
+                target_path=vtt_path,
+                sibling_path=json_path,
+                media_path=media,
+                prepared_audio_path=wav,
+                expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
+                expected_json=expected_json,
+                expected_vtt_sha256=_expected_vtt_sha256,
+                media_fingerprint=media_input_fingerprint,
+                effective_iso=iso,
+                route_kind=route_kind,
+                blocks=blocks,
+                prepared_audio_sha256=prepared_audio_sha256,
+                legacy_policy=legacy_policy,
+                stored_language=data.get("language"),
+                segmentation=stored_manifest_value,
+                strict_shot_changes=strict_shot_changes,
+                strict_sing_spans=strict_sing_spans,
+                explicit_media=explicit_media_requested,
+                block_content_sha256=input_snapshot.block_content_sha256,
+            )
+        bind_align_runtime_identity(
+            route_kind=align_context.route_kind,
+            engine_family=align_context.engine_family,
         )
         observation_input = {
             "context_content_digest": align_context.context_content_digest,
@@ -5306,63 +5380,86 @@ def align(
             ).encode("utf-8")
             return hashlib.sha256(encoded).hexdigest()
 
-        fresh_session = begin_fresh_alignment(
-            align_context,
-            alignment_texts=tuple(
-                str(block.get("alignment_text", block["text"])) for block in blocks
-            ),
-            source_indices=tuple(int(block["source_index"]) for block in blocks),
-            language=iso,
-            prepared_audio_sample_count=prepared_sample_count,
-            sample_rate=prepared_sample_rate,
-            backend_model_config_digest=stable_fact_digest(model_facts),
-            route_input_digest=stable_fact_digest(route_facts),
-        )
-        capture_raw_call = _fresh_alignment_call_observer(fresh_session)
-        invoke_backend_call = _fresh_alignment_backend_invoker(fresh_session)
-        invoke_qwen_call = _fresh_alignment_qwen_invoker(fresh_session)
+        with align_runtime_activity("AO-05", "acquisition-authorization"):
+            fresh_session = begin_fresh_alignment(
+                align_context,
+                alignment_texts=tuple(
+                    str(block.get("alignment_text", block["text"])) for block in blocks
+                ),
+                source_indices=tuple(int(block["source_index"]) for block in blocks),
+                language=iso,
+                prepared_audio_sample_count=prepared_sample_count,
+                sample_rate=prepared_sample_rate,
+                backend_model_config_digest=stable_fact_digest(model_facts),
+                route_input_digest=stable_fact_digest(route_facts),
+                backend_model_config_facts=model_facts,
+                route_input_facts=route_facts,
+            )
+        with align_runtime_activity("AO-06", "physical-call-preparation"):
+            capture_raw_call = _fresh_alignment_call_observer(fresh_session)
+            invoke_backend_call = _fresh_alignment_backend_invoker(fresh_session)
+            invoke_qwen_call = _fresh_alignment_qwen_invoker(fresh_session)
 
-        block_units = _align_blocks(
-            wav,
-            blocks,
-            iso,
-            mms=mms,
-            ctc_model=ctc_model,
-            crops=crops,
-            reporter=rep,
-            tmp_chunks=tmp_chunks,
-            # vad_speech persisted by transcribe (same media timeline): lets the CTC
-            # full pass mask non-speech emissions; absent/empty -> no masking
-            speech_spans=_spans_in(data.get("vad_speech")),
-            raw_call_observer=capture_raw_call,
-            qwen_invoker=invoke_qwen_call,
-            backend_invoker=invoke_backend_call,
-        )
+        with align_runtime_activity("AO-07", "physical-backend-and-opaque-observation"):
+            block_units = _align_blocks(
+                wav,
+                blocks,
+                iso,
+                mms=mms,
+                ctc_model=ctc_model,
+                crops=crops,
+                reporter=rep,
+                tmp_chunks=tmp_chunks,
+                # vad_speech persisted by transcribe (same media timeline): lets the CTC
+                # full pass mask non-speech emissions; absent/empty -> no masking
+                speech_spans=_spans_in(data.get("vad_speech")),
+                raw_call_observer=capture_raw_call,
+                qwen_invoker=invoke_qwen_call,
+                backend_invoker=invoke_backend_call,
+            )
+        with align_runtime_activity("AO-08", "legacy-owner-slice"):
+            legacy_owner_slices = _seal_legacy_owner_slices(block_units)
+        with align_runtime_activity("AO-09", "legacy-time-transform"):
+            block_units = _seal_legacy_absolute_times(legacy_owner_slices)
 
         # Tight cropping eliminates "last word drifts into inter-sentence silence", so
         # position_units_with_vad is not needed here (unlike the transcribe path).
-        final, all_units = realign.group_block_spans(block_units)
-        if not all_units:
-            exc = RuntimeError(f"no aligned units for {media.name}")
-            _attach_canonical_failure(
-                exc,
-                kind="no-aligned-units",
-                phase="fresh-acquisition",
-                detail_code="all-block-units-empty",
+        with align_runtime_activity("AO-10", "group-block-spans"):
+            final, all_units = realign.group_block_spans(block_units)
+        with align_runtime_activity("AO-10", "common-all-empty-decision"):
+            if not all_units:
+                exc = RuntimeError(f"no aligned units for {media.name}")
+                _attach_canonical_failure(
+                    exc,
+                    kind="no-aligned-units",
+                    phase="fresh-acquisition",
+                    detail_code="all-block-units-empty",
+                )
+                raise exc
+        # Preserve the exact historical helper chain.  The selected result is sealed
+        # before seal_fresh_alignment may begin AO-11 strict recursive capture.
+        with align_runtime_activity("AO-10", "fill-insert-blocks"):
+            filled = realign.fill_insert_blocks(final)
+        with align_runtime_activity("AO-10", "enforce-min-duration"):
+            duration_enforced = realign.enforce_min_duration(
+                filled,
+                min_dur=MIN_CUE_SEC,
             )
-            raise exc
-        acquisition = seal_fresh_alignment(fresh_session)
-        # fill_insert -> enforce_min_duration -> rescue_tiny_cues (extend flash cues like
-        # so/あ, overlap allowed with next-neighbor only) -> clamp.
-        spans_filled = realign.clamp_spans(
-            realign.rescue_tiny_cues(
-                realign.enforce_min_duration(
-                    realign.fill_insert_blocks(final), min_dur=MIN_CUE_SEC
-                ),
+        with align_runtime_activity("AO-10", "rescue-tiny-cues"):
+            rescued = realign.rescue_tiny_cues(
+                duration_enforced,
                 trig=TINY_CUE_SEC,
                 target=TINY_CUE_TARGET,
             )
-        )
+        with align_runtime_activity("AO-10", "clamp-spans"):
+            spans_filled = realign.clamp_spans(rescued)
+        with align_runtime_activity("AO-10", "seal-selected-legacy-result"):
+            selected_legacy = _seal_selected_legacy_align_result(
+                block_units,
+                spans_filled,
+                all_units,
+            )
+        acquisition = seal_fresh_alignment(fresh_session)
 
         # Preserve vad_speech / shot_changes from the original JSON (computed by
         # transcribe from the original media; align does not recompute them).
@@ -5395,9 +5492,9 @@ def align(
             context=align_context,
             acquisition=acquisition,
             blocks=blocks,
-            block_units=block_units,
-            spans=spans_filled,
-            all_units=all_units,
+            block_units=selected_legacy.block_units,
+            spans=selected_legacy.spans,
+            all_units=selected_legacy.all_units,
             language=iso,
             vad_speech=keep_vad,
             shot_changes=keep_shots,
@@ -5436,16 +5533,17 @@ def align(
         rep.stage("write VTT + JSON")
         from voxweave.align_evidence import encode_align_evidence
 
-        try:
-            evidence_bytes = encode_align_evidence(selection.evidence)
-        except BaseException as exc:
-            _attach_canonical_failure(
-                exc,
-                kind="preencode-failed",
-                phase="preencode",
-                detail_code="evidence-encode",
-            )
-            raise
+        with align_runtime_activity("AO-22", "selected-evidence-preencode"):
+            try:
+                evidence_bytes = encode_align_evidence(selection.evidence)
+            except BaseException as exc:
+                _attach_canonical_failure(
+                    exc,
+                    kind="preencode-failed",
+                    phase="preencode",
+                    detail_code="evidence-encode",
+                )
+                raise
         evidence_artifact = episode_transaction.EvidencePublication(
             swap_ext(vtt_path, ".align-evidence.json"),
             evidence_bytes,
@@ -5477,62 +5575,66 @@ def align(
         )
         completed_selection = selection
         aligned_cue_count = len(blocks)
-        aligned_unit_count = len(all_units)
+        aligned_unit_count = len(selected_legacy.all_units)
     except BaseException as exc:
         production_failure = exc
         raise
     finally:
         # Release aligner singleton VRAM (separation self-releases earlier).
         disposal_failure: BaseException | None = None
-        try:
-            snapshots.close()
-        except BaseException as exc:
-            disposal_failure = _record_disposal_failure(
-                production_failure,
-                disposal_failure,
-                exc,
-                detail_code="media-snapshot-residue",
-            )
-        backend.release()
-        for p in tmp:
+        with align_runtime_activity("AO-24", "media-snapshot-disposal"):
             try:
-                p.unlink(missing_ok=True)
+                snapshots.close()
             except BaseException as exc:
                 disposal_failure = _record_disposal_failure(
                     production_failure,
                     disposal_failure,
                     exc,
-                    detail_code="audio-temp-residue",
+                    detail_code="media-snapshot-residue",
                 )
-        for c in tmp_chunks:
-            try:
-                c.unlink(missing_ok=True)
-            except BaseException as exc:
-                disposal_failure = _record_disposal_failure(
-                    production_failure,
-                    disposal_failure,
-                    exc,
-                    detail_code="audio-temp-residue",
-                )
-        if align_context is not None:
-            from voxweave import align_orchestration
+        with align_runtime_activity("AO-24", "backend-and-audio-temp-disposal"):
+            backend.release()
+            for p in tmp:
+                try:
+                    p.unlink(missing_ok=True)
+                except BaseException as exc:
+                    disposal_failure = _record_disposal_failure(
+                        production_failure,
+                        disposal_failure,
+                        exc,
+                        detail_code="audio-temp-residue",
+                    )
+            for c in tmp_chunks:
+                try:
+                    c.unlink(missing_ok=True)
+                except BaseException as exc:
+                    disposal_failure = _record_disposal_failure(
+                        production_failure,
+                        disposal_failure,
+                        exc,
+                        detail_code="audio-temp-residue",
+                    )
+        with align_runtime_activity("AO-24", "selection-role-retirement"):
+            if align_context is not None:
+                from voxweave import align_orchestration
 
-            align_orchestration.retire_align_selection(align_context)
+                align_orchestration.retire_align_selection(align_context)
         if production_failure is None and disposal_failure is not None:
             raise disposal_failure
-    if (
-        os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1"
-        and _shadow_observer is not None
-        and completed_selection is not None
-        and observation_input is not None
-        and prepared_audio_sha256 is not None
-    ):
-        _notify_align_shadow_observer(
-            _shadow_observer,
-            selection=completed_selection,
-            input_summary=observation_input,
-            prepared_audio_sha256=prepared_audio_sha256,
-        )
+    with align_runtime_activity("AO-25", "artifact-and-observer-dispatch"):
+        if (
+            os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1"
+            and _shadow_observer is not None
+            and completed_selection is not None
+            and observation_input is not None
+            and prepared_audio_sha256 is not None
+        ):
+            _notify_align_shadow_observer(
+                _shadow_observer,
+                selection=completed_selection,
+                input_summary=observation_input,
+                prepared_audio_sha256=prepared_audio_sha256,
+            )
     log.info(
         "aligned %s → %d cues, %d units",
         vtt_path.name,

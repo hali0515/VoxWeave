@@ -14,6 +14,7 @@ from voxweave.align_context import (
 )
 from voxweave.align_evidence_core import EvidenceCore
 from voxweave.align_failures import CanonicalFailure
+from voxweave.align_runtime import align_runtime_activity
 from voxweave.align_snapshot import FrozenObject
 from voxweave.engine_registry import EngineFamily
 
@@ -657,7 +658,8 @@ def run_locked_align_adapter(
             status=V2Status("not-requested", None),
             projection_inputs=projection_inputs,
         )
-    failure = _pre_w1_failure(context, acquisition, payload)
+    with align_runtime_activity("AO-14", "seed-policy-profile-evidence-admission"):
+        failure = _pre_w1_failure(context, acquisition, payload)
     if failure is not None:
         _retire_fresh_transfer(context, acquisition)
         return _adapter_result(
@@ -669,13 +671,22 @@ def run_locked_align_adapter(
             projection_inputs=projection_inputs,
         )
     retained_observation: list[_SemanticObservation] = []
+    isolated_w1_error: Exception | None = None
     try:
-        v2, semantic_observation = _w1_delivery(
-            context,
-            acquisition,
-            payload,
-            _observation_sink=retained_observation,
-        )
+        with align_runtime_activity("AO-15", "fresh-w1-finalizer-and-validation"):
+            try:
+                v2, semantic_observation = _w1_delivery(
+                    context,
+                    acquisition,
+                    payload,
+                    _observation_sink=retained_observation,
+                )
+            except Exception as exc:
+                if context.engine_family == "boundary-v2":
+                    raise
+                isolated_w1_error = exc
+        if isolated_w1_error is not None:
+            raise isolated_w1_error
     except AlignAdapterError as exc:
         _retire_fresh_transfer(context, acquisition)
         if context.engine_family == "boundary-v2":

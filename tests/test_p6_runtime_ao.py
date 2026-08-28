@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -14,6 +14,52 @@ class _DisplayHelperFailure(RuntimeError):
 
 class _StrictCaptureFailure(RuntimeError):
     pass
+
+
+def test_runtime_capture_is_invocation_scoped_and_retains_failed_activity() -> None:
+    from voxweave.align_runtime import (
+        align_runtime_activity,
+        bind_align_runtime_identity,
+        capture_align_runtime_trace,
+    )
+
+    with capture_align_runtime_trace() as capture:
+        bind_align_runtime_identity(
+            route_kind="ctc-full",
+            engine_family="legacy-v1",
+        )
+        with pytest.raises(RuntimeError, match="injected operation"):
+            with align_runtime_activity("AO-10", "injected-operation"):
+                raise RuntimeError("injected operation")
+    trace = capture.snapshot()
+
+    assert trace.route_kind == "ctc-full"
+    assert trace.engine_family == "legacy-v1"
+    assert tuple((event.state, event.ordinal) for event in trace.events) == (
+        ("started", 0),
+        ("failed", 1),
+    )
+
+
+def test_runtime_capture_rejects_nested_owners_and_identity_changes() -> None:
+    from voxweave.align_runtime import (
+        bind_align_runtime_identity,
+        capture_align_runtime_trace,
+    )
+
+    with capture_align_runtime_trace():
+        with pytest.raises(RuntimeError, match="already active"):
+            with capture_align_runtime_trace():
+                pytest.fail("nested capture unexpectedly started")
+        bind_align_runtime_identity(
+            route_kind="qwen-crop",
+            engine_family="legacy-v1",
+        )
+        with pytest.raises(RuntimeError, match="route identity changed"):
+            bind_align_runtime_identity(
+                route_kind="mms-full",
+                engine_family="legacy-v1",
+            )
 
 
 def _write_public_align_episode(
@@ -77,9 +123,7 @@ def _stub_public_route(
 
     if route in {"ctc-full", "mms-full"}:
         target = (
-            "align_blocks_full_ctc"
-            if route == "ctc-full"
-            else "align_blocks_full_mms"
+            "align_blocks_full_ctc" if route == "ctc-full" else "align_blocks_full_mms"
         )
 
         def fake_full_pass(
@@ -163,9 +207,7 @@ def _activity_count(
     state: str,
 ) -> int:
     return sum(
-        event.phase == phase
-        and event.activity == activity
-        and event.state == state
+        event.phase == phase and event.activity == activity and event.state == state
         for event in trace.events  # type: ignore[attr-defined]
     )
 
@@ -197,9 +239,8 @@ def test_public_align_runtime_trace_records_real_route_and_ao10_before_ao11(
     assert trace.engine_family == "legacy-v1"
     record = trace.as_record()
     assert record["schema_version"] == 1
-    assert [event["ordinal"] for event in record["events"]] == list(
-        range(len(record["events"]))
-    )
+    events = cast(list[dict[str, object]], record["events"])
+    assert [event["ordinal"] for event in events] == list(range(len(events)))
     completed = _completed(trace)
     ao10 = (
         ("AO-10", "group-block-spans"),
@@ -292,3 +333,57 @@ def test_public_align_strict_failure_runs_each_ao10_helper_exactly_once_first(
         assert _activity_count(trace, "AO-10", activity, "completed") == 1
     assert _activity_count(trace, "AO-11", "strict-capture", "started") == 1
     assert _activity_count(trace, "AO-11", "strict-capture", "failed") == 1
+
+
+def test_multicall_qwen_completes_all_ao11_captures_before_any_ao12_transform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from voxweave import pipeline
+    from voxweave.align_runtime import capture_align_runtime_trace
+
+    vtt_path, media_path = _write_public_align_episode(tmp_path, route="qwen-crop")
+    (tmp_path / "episode.json").write_text(
+        json.dumps(
+            {
+                "language": "zh",
+                "word_segments": [
+                    {"text": "你", "start": 0.0, "end": 0.75},
+                    {"text": "好", "start": 1.0, "end": 1.75},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    vtt_path.write_text(
+        (
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:00.750\n你\n\n"
+            "00:00:01.000 --> 00:00:01.750\n好\n"
+        ),
+        encoding="utf-8",
+    )
+    _stub_public_route(
+        monkeypatch,
+        tmp_path,
+        route="qwen-crop",
+        media_path=media_path,
+    )
+
+    with capture_align_runtime_trace() as capture:
+        assert (
+            pipeline.align(vtt_path, media_path=media_path, separate=False) == vtt_path
+        )
+    relevant = [
+        (phase, activity)
+        for phase, activity in _completed(capture.snapshot())
+        if phase in {"AO-11", "AO-12"}
+    ]
+
+    assert relevant == [
+        ("AO-11", "strict-capture"),
+        ("AO-11", "strict-capture"),
+        ("AO-12", "physical-origin-transform"),
+        ("AO-12", "physical-origin-transform"),
+    ]

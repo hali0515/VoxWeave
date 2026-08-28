@@ -1,0 +1,12 @@
+{
+  "target": "episode.vtt",
+  "language": "en",
+  "route": "ctc-full",
+  "vtt": "WEBVTT\n\n00:00:00.200 --> 00:00:00.900\nFIRST\n\n00:00:01.100 --> 00:00:01.800\nSECOND\n",
+  "json": "{\"language\":\"en\",\"word_segments\":[{\"text\":\"FIRST\",\"start\":0.2,\"end\":0.9},{\"text\":\"SECOND\",\"start\":1.1,\"end\":1.8}],\"vad_speech\":[[0.15,0.95],[1.05,1.85]],\"speaker_turns\":null,\"segmentation\":{\"engine\":\"p5-boundary-v2\",\"degraded\":[],\"providers\":{}}}\n",
+  "media": {"sample_rate": 16000, "sample_count": 48000},
+  "block_units": [
+    [{"text": "FIRST", "start": 0.2, "end": 0.9}],
+    [{"text": "SECOND", "start": 1.1, "end": 1.8}]
+  ]
+}

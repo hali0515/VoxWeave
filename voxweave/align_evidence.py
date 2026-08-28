@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NoReturn
 
-from voxweave.align_acquisition import IssuedFreshAlignment, _fresh_evidence_inputs
+from voxweave.align_acquisition import IssuedFreshAlignment
 from voxweave.align_context import (
     IssuedAlignContext,
     _align_context_authority_profile,
@@ -41,7 +41,11 @@ from voxweave.align_distribution import (
     AuthorityJobWorkReceipt,
     LegacyCallDistributionReceipt,
 )
-from voxweave.align_evidence_core import EvidenceCore, EvidenceCorePhysicalCall
+from voxweave.align_evidence_core import (
+    EvidenceCore,
+    EvidenceCorePhysicalCall,
+    evidence_core_value,
+)
 from voxweave.align_failures import (
     AUTHORITY_REASON_ORDER,
     SEED_REASON_ORDER,
@@ -783,12 +787,42 @@ def _core_value(
     profile_status: ProfileStatus,
     evidence_status: EvidenceStatus,
 ) -> dict[str, Any]:
-    stable = _context_value(context)
-    _blocks, _captures, _transforms, legacy_receipts, _legacy_units = (
-        _fresh_evidence_inputs(context, acquisition)
-    )
+    projection = evidence_core_value(evidence_core)
+    strict_value = {
+        "kind": strict_input_status.kind,
+        "detail_code": strict_input_status.detail_code,
+    }
+    policy_value = {
+        "kind": v2_policy_status.kind,
+        "detail_code": v2_policy_status.detail_code,
+    }
+    profile_value = {
+        "kind": profile_status.kind,
+        "source": profile_status.source,
+        "detail_code": profile_status.detail_code,
+    }
+    evidence_value = {
+        "kind": evidence_status.kind,
+        "detail_code": evidence_status.detail_code,
+    }
     if (
-        evidence_core.receipt_digest != acquisition.receipt_digest
+        projection.get("schema_version") != 8
+        or projection.get("kind") != "fresh-alignment"
+        or projection.get("context_content_digest") != context.context_content_digest
+        or projection.get("receipt_digest") != acquisition.receipt_digest
+        or projection.get("language") != context.effective_iso
+        or projection.get("route") != context.route_kind
+        or projection.get("raw_unit_count") != evidence_core.raw_unit_count
+        or projection.get("strict_input_status") != strict_value
+        or projection.get("v2_policy_status") != policy_value
+        or projection.get("profile_status") != profile_value
+        or projection.get("evidence_status") != evidence_value
+        or projection.get("seed_status")
+        != {
+            "kind": evidence_core.seed_status,
+            "reasons": list(evidence_core.seed_reasons),
+        }
+        or evidence_core.receipt_digest != acquisition.receipt_digest
         or len(evidence_core.physical_calls) != len(acquisition.physical_calls)
         or evidence_core.authority_status != acquisition.distribution.status
         or evidence_core.authority_work != acquisition.distribution.work
@@ -796,64 +830,7 @@ def _core_value(
         or evidence_core.seed_reasons != acquisition.seed_reasons
     ):
         raise _binding_failure("independent-projection")
-    history = _history_value(context, stable)
-    route = _route_value(
-        context, stable, evidence_core.physical_calls, acquisition.distribution.work
-    )
-    legacy = _legacy_value(legacy_receipts)
-    authority = _authority_value(acquisition.distribution, evidence_core)
-    evidence_blocks = _block_values(
-        evidence_core, _legacy_ids_by_source(legacy_receipts)
-    )
-    admission_valid = (
-        strict_input_status.kind == "valid"
-        and all(
-            call.authority_transform_status == "valid"
-            for call in evidence_core.physical_calls
-        )
-        and evidence_core.authority_status == "valid"
-        and evidence_core.seed_status == "valid"
-        and v2_policy_status.kind == "valid"
-        and profile_status.kind == "valid"
-        and evidence_status.kind == "valid"
-    )
-    return {
-        "schema_version": 8,
-        "kind": "fresh-alignment",
-        "context_content_digest": context.context_content_digest,
-        "receipt_digest": acquisition.receipt_digest,
-        "language": context.effective_iso,
-        "route": context.route_kind,
-        "input_history": history,
-        "route_plan": route,
-        "physical_calls": _physical_values(evidence_core),
-        "legacy_distribution": legacy,
-        "authority_distribution": authority,
-        "blocks": evidence_blocks,
-        "raw_unit_count": evidence_core.raw_unit_count,
-        "strict_input_status": {
-            "kind": strict_input_status.kind,
-            "detail_code": strict_input_status.detail_code,
-        },
-        "seed_status": {
-            "kind": evidence_core.seed_status,
-            "reasons": list(evidence_core.seed_reasons),
-        },
-        "v2_policy_status": {
-            "kind": v2_policy_status.kind,
-            "detail_code": v2_policy_status.detail_code,
-        },
-        "profile_status": {
-            "kind": profile_status.kind,
-            "source": profile_status.source,
-            "detail_code": profile_status.detail_code,
-        },
-        "evidence_status": {
-            "kind": evidence_status.kind,
-            "detail_code": evidence_status.detail_code,
-        },
-        "v2_admission_status": "valid" if admission_valid else "invalid",
-    }
+    return projection
 
 
 def bind_align_evidence(

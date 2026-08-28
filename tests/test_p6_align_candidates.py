@@ -8,7 +8,7 @@ def _evaluated(tmp_path, *, shadow_requested=False):
     from voxweave.align_acquisition import (
         _bind_fresh_adapter_payload,
         _fresh_alignment_call_observer,
-        _fresh_core_inputs,
+        _fresh_producer_core_inputs,
         begin_fresh_alignment,
         seal_fresh_alignment,
     )
@@ -113,31 +113,30 @@ def _evaluated(tmp_path, *, shadow_requested=False):
     evidence_resolution = resolve_finalize_evidence(
         shot_changes=(1.5,), sing_spans=((1.0, 2.0),)
     )
+    strict_status = StrictInputStatus("valid", None)
+    policy_status = validate_v2_policy(policy)
     _bind_fresh_adapter_payload(
         context,
         acquisition,
         legacy_delivery=delivery,
         projection_inputs=inputs,
-        strict_input_status=StrictInputStatus("valid", None),
-        v2_policy_status=validate_v2_policy(policy),
+        strict_input_status=strict_status,
+        v2_policy_status=policy_status,
         profile_resolution=profile,
         evidence_resolution=evidence_resolution,
     )
     adapter_result = run_locked_align_adapter(
         context, acquisition, shadow_enabled=shadow_requested
     )
-    core_inputs = _fresh_core_inputs(context, acquisition)
     evidence_core = build_evidence_core(
-        context_content_digest=context.context_content_digest,
-        blocks=core_inputs[0],
-        captures=core_inputs[1],
-        transforms=core_inputs[2],
-        distribution=core_inputs[3],
-        seed_status=core_inputs[4],
-        seed_reasons=core_inputs[5],
-        physical_calls=core_inputs[6],
-        receipt_digest=acquisition.receipt_digest,
-        language="en",
+        _fresh_producer_core_inputs(
+            context,
+            acquisition,
+            strict_input_status=strict_status,
+            v2_policy_status=policy_status,
+            profile_status=profile.status,
+            evidence_status=evidence_resolution.status,
+        )
     )
     comparison = None
     if adapter_result.v2_status.kind == "valid":

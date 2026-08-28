@@ -851,11 +851,19 @@ def _qwen_origin_relation(
                 continue
             physical = getattr(call, "physical_origin_seconds", None)
             nominal = getattr(call, "legacy_origin_seconds", None)
+            authority_origin = getattr(call, "authority_origin_seconds", None)
             passed = passed and _finite_float(physical) and _finite_float(nominal)
-            if not (_finite_float(physical) and _finite_float(nominal)):
+            if type(physical) is not float or type(nominal) is not float:
+                continue
+            if not (math.isfinite(physical) and math.isfinite(nominal)):
                 continue
             origin_delta = physical - nominal
-            passed = passed and _finite_float(origin_delta)
+            passed = passed and (
+                _finite_float(origin_delta)
+                and type(authority_origin) is float
+                and math.isfinite(authority_origin)
+                and _same_float(float(authority_origin) - nominal, origin_delta)
+            )
             for side in ("start", "end"):
                 relative = getattr(word, f"relative_{side}", None)
                 authority_bound = getattr(word, side, None)

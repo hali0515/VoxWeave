@@ -11,16 +11,22 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import io
 import importlib.util
 import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import Any, Iterator, NoReturn, cast
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
@@ -77,6 +83,66 @@ EXPECTED_GATES = {
     "G-SDH-SELECTED",
 }
 AO_PHASES = tuple(f"AO-{index:02d}" for index in range(1, 26))
+AO10_HELPER_CHAIN = (
+    "group-block-spans",
+    "common-all-empty-decision",
+    "fill-insert-blocks",
+    "enforce-min-duration",
+    "rescue-tiny-cues",
+    "clamp-spans",
+    "seal-selected-legacy-result",
+)
+EXPECTED_RUNTIME_SCENARIOS = {
+    "mms-legacy-happy": {
+        "route": "mms-full",
+        "expected_family": "legacy-v1",
+        "shadow_requested": False,
+        "injections": [],
+        "expect_failure": False,
+    },
+    "qwen-all-skip-legacy": {
+        "route": "qwen-crop",
+        "expected_family": "legacy-v1",
+        "shadow_requested": False,
+        "injections": [],
+        "expect_failure": True,
+    },
+    "qwen-all-skip-boundary": {
+        "route": "qwen-crop",
+        "expected_family": "boundary-v2",
+        "shadow_requested": False,
+        "injections": [],
+        "expect_failure": True,
+    },
+    "ao15-uncontained-boundary": {
+        "route": "ctc-full",
+        "expected_family": "boundary-v2",
+        "shadow_requested": False,
+        "injections": ["ao15-w1"],
+        "expect_failure": True,
+    },
+    "ao15-isolated-then-ao16-legacy": {
+        "route": "ctc-full",
+        "expected_family": "legacy-v1",
+        "shadow_requested": True,
+        "injections": ["ao15-w1"],
+        "expect_failure": False,
+    },
+    "paired-ao15-ao16-boundary": {
+        "route": "ctc-full",
+        "expected_family": "boundary-v2",
+        "shadow_requested": False,
+        "injections": ["ao15-w1", "ao16-core"],
+        "expect_failure": True,
+    },
+    "paired-ao15-ao16-legacy": {
+        "route": "ctc-full",
+        "expected_family": "legacy-v1",
+        "shadow_requested": True,
+        "injections": ["ao15-w1", "ao16-core"],
+        "expect_failure": True,
+    },
+}
 REFERENCE_COMMITS = {
     "historical": "6e6033fa3930b263133f02c1332ae4d79a490f8b",
     "post_p11": "b6d3b76dd518f943d922dc31cde227745892933d",
@@ -87,6 +153,74 @@ REGISTRY_PATHS = {
     "engine-registry": REPO_ROOT / "voxweave" / "engine_registry.py",
     "p6-oracle-schema": SCHEMA_PATH,
 }
+
+_RUNTIME_MUTATION: ContextVar[str | None] = ContextVar(
+    "p6_oracle_runtime_mutation",
+    default=None,
+)
+
+
+class PublicCaseResult:
+    """Bytes and production observations from one isolated public command."""
+
+    __slots__ = (
+        "artifacts",
+        "case_id",
+        "command",
+        "episode_root",
+        "evidence_verification",
+        "runtime_trace",
+        "source_root",
+    )
+
+    def __init__(
+        self,
+        *,
+        artifacts: Mapping[str, bytes],
+        case_id: str,
+        command: str,
+        episode_root: Path,
+        evidence_verification: Mapping[str, Any] | None,
+        runtime_trace: Mapping[str, Any] | None,
+        source_root: Path,
+    ) -> None:
+        self.artifacts = dict(artifacts)
+        self.case_id = case_id
+        self.command = command
+        self.episode_root = episode_root
+        self.evidence_verification = evidence_verification
+        self.runtime_trace = runtime_trace
+        self.source_root = source_root
+
+
+class RuntimeScenarioResult:
+    __slots__ = ("evidence_verification", "outcome", "runtime_trace", "scenario_id")
+
+    def __init__(
+        self,
+        *,
+        evidence_verification: Mapping[str, Any] | None,
+        outcome: Mapping[str, Any],
+        runtime_trace: Mapping[str, Any],
+        scenario_id: str,
+    ) -> None:
+        self.evidence_verification = evidence_verification
+        self.outcome = outcome
+        self.runtime_trace = runtime_trace
+        self.scenario_id = scenario_id
+
+
+@contextmanager
+def _runtime_mutation_for_test(name: str) -> Iterator[None]:
+    """Select a copied-source mutation; the checked-in tree is never changed."""
+
+    if name != "ao10-after-ao11":
+        raise ValueError(f"unknown P6 runtime mutation {name!r}")
+    token: Token[str | None] = _RUNTIME_MUTATION.set(name)
+    try:
+        yield
+    finally:
+        _RUNTIME_MUTATION.reset(token)
 
 
 class OracleInvalid(Exception):
@@ -256,6 +390,88 @@ def _validate_environment(environment: Mapping[str, Any], *, case_id: str) -> No
             _invalid(f"case {case_id} environment differs for {name}")
 
 
+def _require_exact_keys(
+    value: object,
+    expected: set[str],
+    *,
+    label: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != expected:
+        observed = sorted(value) if isinstance(value, Mapping) else type(value).__name__
+        _invalid(f"{label} is not closed: {observed} != {sorted(expected)}")
+    return cast(Mapping[str, Any], value)
+
+
+def _validate_public_fixture(
+    case: Mapping[str, Any],
+    *,
+    oracle_root: Path,
+) -> None:
+    runtime = cast(Mapping[str, Any], case["public_runtime"])
+    fixture_path = _resolve_under(
+        oracle_root,
+        runtime["fixture"],
+        label=f"{case['id']}.public_runtime.fixture",
+    )
+    matching_facts = [
+        fact for fact in case["input_files"] if fact["path"] == runtime["fixture"]
+    ]
+    if len(matching_facts) != 1:
+        _invalid(
+            f"case {case['id']} public fixture must have one immutable input-file fact"
+        )
+    fixture = _read_json(fixture_path)
+    command = case["command"]
+    route = case["route"]
+    common = {"target", "language", "route", "json"}
+    if command == "align":
+        expected = common | {"vtt", "media"}
+        expected.add("qwen_call_units" if route == "qwen-crop" else "block_units")
+    elif command == "correct":
+        expected = common | {"vtt"}
+    elif command == "split":
+        expected = common | {"speaker_mapping"}
+    else:
+        _invalid(f"case {case['id']} has no public fixture law for {command}")
+    root = _require_exact_keys(fixture, expected, label=f"case {case['id']} fixture")
+    if root["target"] != case["logical_target"] or root["route"] != route:
+        _invalid(f"case {case['id']} public fixture identity differs from manifest")
+    for name in ("target", "language", "route", "json"):
+        if type(root[name]) is not str or not root[name]:
+            _invalid(f"case {case['id']} fixture {name} is not a nonempty string")
+    if command in {"align", "correct"} and type(root["vtt"]) is not str:
+        _invalid(f"case {case['id']} fixture VTT is not text")
+    if command == "split" and type(root["speaker_mapping"]) is not str:
+        _invalid(f"case {case['id']} fixture speaker mapping is not text")
+    if command == "align":
+        media = _require_exact_keys(
+            root["media"],
+            {"sample_rate", "sample_count"},
+            label=f"case {case['id']} fixture media",
+        )
+        if any(type(media[name]) is not int or media[name] <= 0 for name in media):
+            _invalid(f"case {case['id']} fixture media geometry is invalid")
+        receipt_name = "qwen_call_units" if route == "qwen-crop" else "block_units"
+        receipts = root[receipt_name]
+        if not isinstance(receipts, list) or not receipts:
+            _invalid(f"case {case['id']} fixture has no physical receipt units")
+        for call_index, units in enumerate(receipts):
+            if not isinstance(units, list) or not units:
+                _invalid(f"case {case['id']} fixture call {call_index} has no units")
+            for unit_index, unit in enumerate(units):
+                row = _require_exact_keys(
+                    unit,
+                    {"text", "start", "end"},
+                    label=(
+                        f"case {case['id']} fixture call {call_index} unit {unit_index}"
+                    ),
+                )
+                if type(row["text"]) is not str or not all(
+                    type(row[name]) in {int, float} for name in ("start", "end")
+                ):
+                    _invalid(f"case {case['id']} fixture unit has invalid scalars")
+
+
 def _validate_manifest_semantics(
     manifest: Mapping[str, Any], *, manifest_path: Path
 ) -> None:
@@ -346,6 +562,44 @@ def _validate_manifest_semantics(
         "boundary-v2",
     }:
         _invalid("G-ALIGN-AO selected-family inventory is incomplete")
+    scenarios = align_gate.get("runtime_scenarios", ())
+    if not isinstance(scenarios, list):
+        _invalid("G-ALIGN-AO runtime scenario inventory is not an array")
+    scenario_ids = [scenario["id"] for scenario in scenarios]
+    if len(scenario_ids) != len(set(scenario_ids)) or set(scenario_ids) != set(
+        EXPECTED_RUNTIME_SCENARIOS
+    ):
+        _invalid("G-ALIGN-AO runtime scenario inventory is incomplete")
+    for scenario in scenarios:
+        scenario_id = scenario["id"]
+        observed_law = {
+            name: scenario[name]
+            for name in (
+                "route",
+                "expected_family",
+                "shadow_requested",
+                "injections",
+                "expect_failure",
+            )
+        }
+        if observed_law != EXPECTED_RUNTIME_SCENARIOS[scenario_id]:
+            _invalid(f"G-ALIGN-AO scenario law differs: {scenario_id}")
+        _validate_file_fact(
+            oracle_root,
+            scenario["fixture"],
+            label=f"G-ALIGN-AO.{scenario_id}.fixture",
+        )
+        scenario_fixture_path = _resolve_under(
+            oracle_root,
+            scenario["fixture"]["path"],
+            label=f"G-ALIGN-AO.{scenario_id}.fixture.path",
+        )
+        scenario_fixture = _read_json(scenario_fixture_path)
+        if (
+            not isinstance(scenario_fixture, Mapping)
+            or scenario_fixture.get("route") != scenario["route"]
+        ):
+            _invalid(f"G-ALIGN-AO scenario fixture route differs: {scenario_id}")
 
     for name, matrix in manifest["matrices"].items():
         vector_ids = [vector["id"] for vector in matrix["vectors"]]
@@ -355,6 +609,29 @@ def _validate_manifest_semantics(
     for case in cases:
         case_id = case["id"]
         _validate_environment(case["environment"], case_id=case_id)
+        runtime = cast(Mapping[str, Any], case["public_runtime"])
+        expected_trace = runtime["expected_trace"]
+        expected_w1_usable = runtime["expected_w1_usable"]
+        current_align = (
+            case["command"] == "align" and case["reference_set"] != "6e6033f"
+        )
+        if current_align != (expected_trace is not None):
+            _invalid(f"case {case_id} has inconsistent public runtime trace law")
+        if current_align != (type(expected_w1_usable) is bool):
+            _invalid(f"case {case_id} has inconsistent W1 audit expectation")
+        if current_align:
+            required_phases = (
+                AO_PHASES
+                if runtime["expected_family"] == "boundary-v2"
+                else tuple(
+                    phase for phase in AO_PHASES if phase not in {"AO-15", "AO-17"}
+                )
+            )
+            if tuple(event["phase"] for event in expected_trace) != required_phases:
+                _invalid(
+                    f"case {case_id} public trace does not pin every applicable phase"
+                )
+        _validate_public_fixture(case, oracle_root=oracle_root)
         if (case["logical_media"] is None) != (case["route"] == "media-free"):
             _invalid(f"case {case_id} has inconsistent media-free route facts")
         for index, fact in enumerate(case["input_files"]):
@@ -372,21 +649,32 @@ def _validate_manifest_semantics(
             profile["test_case_id"] is not None
         ):
             _invalid(f"case {case_id} qualification metadata is inconsistent")
-        for index, output in enumerate(case["expected_paths"]):
-            expected = _resolve_under(
-                oracle_root,
-                output["expected_path"],
-                label=f"{case_id}.expected[{index}]",
-            )
-            if not expected.is_file():
-                _invalid(f"expected oracle output is missing: {expected}")
-            if expected.stat().st_size != output["size"]:
-                _invalid(f"expected oracle output size differs: {expected}")
-            if _sha256_file(expected) != output["sha256"]:
-                _invalid(f"expected oracle output digest differs: {expected}")
-        artifacts = [output["artifact"] for output in case["expected_paths"]]
-        if len(artifacts) != len(set(artifacts)):
-            _invalid(f"case {case_id} declares a duplicate output artifact")
+        output_sets = {
+            "detached": case["expected_paths"],
+            "public-command": runtime["expected_paths"],
+        }
+        detached_artifacts = {output["artifact"] for output in output_sets["detached"]}
+        public_artifacts = {
+            output["artifact"] for output in output_sets["public-command"]
+        }
+        if detached_artifacts != public_artifacts:
+            _invalid(f"case {case_id} public and detached artifact sets differ")
+        for authority, outputs in output_sets.items():
+            artifacts = [output["artifact"] for output in outputs]
+            if len(artifacts) != len(set(artifacts)):
+                _invalid(f"case {case_id} declares a duplicate {authority} artifact")
+            for index, output in enumerate(outputs):
+                expected = _resolve_under(
+                    oracle_root,
+                    output["expected_path"],
+                    label=f"{case_id}.{authority}.expected[{index}]",
+                )
+                if not expected.is_file():
+                    _invalid(f"expected oracle output is missing: {expected}")
+                if expected.stat().st_size != output["size"]:
+                    _invalid(f"expected oracle output size differs: {expected}")
+                if _sha256_file(expected) != output["sha256"]:
+                    _invalid(f"expected oracle output digest differs: {expected}")
 
 
 def _load_checked_manifest(path: Path) -> Mapping[str, Any]:
@@ -1033,18 +1321,581 @@ def _project_case(case: Mapping[str, Any], oracle_root: Path) -> dict[str, bytes
     _invalid(f"unknown detached projector: {projector}")
 
 
+def _apply_runtime_mutation(source_root: Path, name: str | None) -> None:
+    if name is None:
+        return
+    if name != "ao10-after-ao11":  # pragma: no cover - guarded by context manager
+        _invalid(f"unknown copied-source runtime mutation: {name}")
+    path = source_root / "voxweave" / "pipeline.py"
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        _invalid(f"cannot read copied pipeline for mutation: {exc}")
+    seal = "        acquisition = seal_fresh_alignment(fresh_session)\n"
+    anchor = '        with align_runtime_activity("AO-10", "group-block-spans"):\n'
+    if source.count(seal) != 1 or source.count(anchor) != 1:
+        _invalid("copied pipeline does not expose the reviewed AO-10/AO-11 seam")
+    source = source.replace(seal, "", 1).replace(anchor, seal + anchor, 1)
+    try:
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            stream.write(source)
+    except OSError as exc:
+        _invalid(f"cannot apply copied-source runtime mutation: {exc}")
+
+
+def _copy_public_source(source_root: Path, *, historical: bool) -> None:
+    if not historical:
+        try:
+            shutil.copytree(REPO_ROOT / "voxweave", source_root / "voxweave")
+        except OSError as exc:
+            _invalid(f"cannot copy current public-command source: {exc}")
+        return
+    try:
+        archived = subprocess.run(
+            ["git", "archive", REFERENCE_COMMITS["historical"], "voxweave"],
+            cwd=REPO_ROOT,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        _invalid(f"cannot archive historical public-command source: {exc}")
+    if archived.returncode != 0:
+        _invalid("historical public-command source archive is unavailable")
+    source_root.mkdir(parents=True, exist_ok=False)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archived.stdout), mode="r:") as archive:
+            archive.extractall(source_root, filter="data")
+    except (OSError, tarfile.TarError) as exc:
+        _invalid(f"cannot extract historical public-command source: {exc}")
+
+
+def _public_artifact_path(
+    artifact: str,
+    *,
+    episode_root: Path,
+    route_evidence_path: Path,
+) -> Path:
+    paths = {
+        "vtt": episode_root / "episode.vtt",
+        "main-json": episode_root / "episode.json",
+        "align-evidence": episode_root / "episode.align-evidence.json",
+        "route-evidence": route_evidence_path,
+    }
+    try:
+        return paths[artifact]
+    except KeyError:
+        _invalid(f"unknown public artifact: {artifact}")
+
+
+def _public_worker_environment(
+    recorded: Mapping[str, str | None], *, source_root: Path
+) -> dict[str, str]:
+    """Build the closed environment used by isolated public-command workers."""
+
+    environment = {"PATH": os.environ.get("PATH", os.defpath)}
+    for name, value in recorded.items():
+        if value is not None:
+            environment[name] = value
+    environment["PYTHONPATH"] = str(source_root)
+    return environment
+
+
+def _execute_public_case(
+    case: Mapping[str, Any],
+    *,
+    manifest_path: Path,
+) -> PublicCaseResult:
+    """Run one recorded CLI command against copied production in a clean root."""
+
+    oracle_root = manifest_path.resolve().parent
+    runtime = cast(Mapping[str, Any], case["public_runtime"])
+    fixture_path = _resolve_under(
+        oracle_root,
+        runtime["fixture"],
+        label=f"{case['id']}.public_runtime.fixture",
+    )
+    fixture = _read_json(fixture_path)
+    if not isinstance(fixture, Mapping):
+        _invalid(f"case {case['id']} public runtime fixture is not an object")
+
+    historical = case["reference_set"] == "6e6033f"
+    with tempfile.TemporaryDirectory(prefix=f"p6-oracle-{case['id']}-") as raw_root:
+        isolated_root = Path(raw_root)
+        source_root = isolated_root / "source"
+        episode_root = isolated_root / "episode"
+        worker_path = source_root / "p6_oracle_public.py"
+        request_path = isolated_root / "request.json"
+        trace_path = isolated_root / "trace.json"
+        verification_path = isolated_root / "evidence-verification.json"
+        outcome_path = isolated_root / "outcome.json"
+        route_evidence_path = isolated_root / "route-evidence.json"
+        try:
+            _copy_public_source(source_root, historical=historical)
+            shutil.copy2(SCRIPTS_DIR / "p6_oracle_public.py", worker_path)
+        except OSError as exc:
+            _invalid(f"cannot construct isolated public-command source: {exc}")
+        if not historical:
+            _apply_runtime_mutation(source_root, _RUNTIME_MUTATION.get())
+        request = {
+            "arguments": list(case["arguments"]),
+            "case_id": case["id"],
+            "command": case["command"],
+            "expected_family": runtime["expected_family"],
+            "fixture": fixture,
+            "historical": historical,
+            "shadow_requested": case["id"] == "selected-v2-segmentation",
+        }
+        try:
+            cc.write_json(request_path, request)
+        except OSError as exc:
+            _invalid(f"cannot write isolated public-command request: {exc}")
+        environment = _public_worker_environment(
+            case["environment"], source_root=source_root
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(worker_path),
+                    "--request",
+                    str(request_path),
+                    "--episode-root",
+                    str(episode_root),
+                    "--trace-out",
+                    str(trace_path),
+                    "--evidence-verification-out",
+                    str(verification_path),
+                    "--outcome-out",
+                    str(outcome_path),
+                    "--route-evidence-out",
+                    str(route_evidence_path),
+                ],
+                cwd=isolated_root,
+                check=False,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _invalid(f"public command {case['id']} could not execute: {exc}")
+        if completed.returncode != 0:
+            excerpt = completed.stdout[-4000:].strip()
+            _invalid(
+                f"public command {case['id']} exited {completed.returncode}: {excerpt}"
+            )
+
+        runtime_trace = _read_json(trace_path)
+        if runtime_trace is not None and not isinstance(runtime_trace, Mapping):
+            _invalid(f"public command {case['id']} emitted a nonobject runtime trace")
+        evidence_verification = _read_json(verification_path)
+        if evidence_verification is not None and not isinstance(
+            evidence_verification, Mapping
+        ):
+            _invalid(
+                f"public command {case['id']} emitted invalid evidence verification"
+            )
+        outcome = _read_json(outcome_path)
+        if outcome != {"exception_class": None, "success": True}:
+            _invalid(
+                f"public command {case['id']} did not report successful completion"
+            )
+        artifacts: dict[str, bytes] = {}
+        for output in runtime["expected_paths"]:
+            artifact = output["artifact"]
+            path = _public_artifact_path(
+                artifact,
+                episode_root=episode_root,
+                route_evidence_path=route_evidence_path,
+            )
+            try:
+                artifacts[artifact] = path.read_bytes()
+            except OSError as exc:
+                _invalid(
+                    f"public command {case['id']} did not produce {artifact}: {exc}"
+                )
+        return PublicCaseResult(
+            artifacts=artifacts,
+            case_id=case["id"],
+            command=case["command"],
+            episode_root=episode_root,
+            evidence_verification=cast(
+                Mapping[str, Any] | None,
+                evidence_verification,
+            ),
+            runtime_trace=cast(Mapping[str, Any] | None, runtime_trace),
+            source_root=source_root,
+        )
+
+
+def _execute_runtime_scenario(
+    scenario: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any],
+    manifest_path: Path,
+) -> RuntimeScenarioResult:
+    oracle_root = manifest_path.resolve().parent
+    scenario_id = scenario["id"]
+    fixture_path = _resolve_under(
+        oracle_root,
+        scenario["fixture"]["path"],
+        label=f"G-ALIGN-AO.{scenario_id}.fixture.path",
+    )
+    fixture = _read_json(fixture_path)
+    if not isinstance(fixture, Mapping):
+        _invalid(f"G-ALIGN-AO scenario fixture is not an object: {scenario_id}")
+    with tempfile.TemporaryDirectory(prefix=f"p6-oracle-{scenario_id}-") as raw_root:
+        isolated_root = Path(raw_root)
+        source_root = isolated_root / "source"
+        episode_root = isolated_root / "episode"
+        worker_path = source_root / "p6_oracle_public.py"
+        request_path = isolated_root / "request.json"
+        trace_path = isolated_root / "trace.json"
+        verification_path = isolated_root / "evidence-verification.json"
+        outcome_path = isolated_root / "outcome.json"
+        route_evidence_path = isolated_root / "route-evidence.json"
+        try:
+            shutil.copytree(REPO_ROOT / "voxweave", source_root / "voxweave")
+            shutil.copy2(SCRIPTS_DIR / "p6_oracle_public.py", worker_path)
+        except OSError as exc:
+            _invalid(f"cannot construct G-ALIGN-AO scenario source: {exc}")
+        _apply_runtime_mutation(source_root, _RUNTIME_MUTATION.get())
+        request = {
+            "arguments": ["align", "episode.vtt", "--media", "episode.wav"],
+            "case_id": scenario_id,
+            "command": "align",
+            "expect_failure": scenario["expect_failure"],
+            "expected_family": scenario["expected_family"],
+            "fixture": fixture,
+            "injections": list(scenario["injections"]),
+            "shadow_requested": scenario["shadow_requested"],
+        }
+        try:
+            cc.write_json(request_path, request)
+        except OSError as exc:
+            _invalid(f"cannot write G-ALIGN-AO scenario request: {exc}")
+        environment = _public_worker_environment(
+            manifest["cases"][0]["environment"], source_root=source_root
+        )
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(worker_path),
+                    "--request",
+                    str(request_path),
+                    "--episode-root",
+                    str(episode_root),
+                    "--trace-out",
+                    str(trace_path),
+                    "--evidence-verification-out",
+                    str(verification_path),
+                    "--outcome-out",
+                    str(outcome_path),
+                    "--route-evidence-out",
+                    str(route_evidence_path),
+                ],
+                cwd=isolated_root,
+                check=False,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _invalid(f"G-ALIGN-AO scenario {scenario_id} could not execute: {exc}")
+        if completed.returncode != 0:
+            excerpt = completed.stdout[-4000:].strip()
+            _invalid(
+                f"G-ALIGN-AO scenario {scenario_id} exited "
+                f"{completed.returncode}: {excerpt}"
+            )
+        trace = _read_json(trace_path)
+        outcome = _read_json(outcome_path)
+        verification = _read_json(verification_path)
+        if not isinstance(trace, Mapping) or not isinstance(outcome, Mapping):
+            _invalid(f"G-ALIGN-AO scenario {scenario_id} emitted invalid records")
+        if verification is not None and not isinstance(verification, Mapping):
+            _invalid(f"G-ALIGN-AO scenario {scenario_id} emitted invalid verification")
+        return RuntimeScenarioResult(
+            evidence_verification=cast(Mapping[str, Any] | None, verification),
+            outcome=cast(Mapping[str, Any], outcome),
+            runtime_trace=cast(Mapping[str, Any], trace),
+            scenario_id=scenario_id,
+        )
+
+
+def _runtime_ao_failures(
+    case: Mapping[str, Any],
+    trace: Mapping[str, Any],
+) -> list[str]:
+    prefix = f"public-command/{case['id']}/G-ALIGN-AO"
+    failures: list[str] = []
+    if set(trace) != {"schema_version", "route_kind", "engine_family", "events"}:
+        return [f"{prefix}: runtime trace is not closed"]
+    runtime = cast(Mapping[str, Any], case["public_runtime"])
+    if trace["schema_version"] != 1:
+        failures.append(f"{prefix}: runtime trace schema differs")
+    if trace["route_kind"] != case["route"]:
+        failures.append(f"{prefix}: route identity differs")
+    if trace["engine_family"] != runtime["expected_family"]:
+        failures.append(f"{prefix}: selected family identity differs")
+    events = trace["events"]
+    if not isinstance(events, list) or not events:
+        return failures + [f"{prefix}: runtime event stream is empty"]
+    stack: list[tuple[str, str]] = []
+    starts: list[tuple[str, str]] = []
+    completed: list[dict[str, str]] = []
+    for index, raw_event in enumerate(events):
+        if not isinstance(raw_event, Mapping) or set(raw_event) != {
+            "ordinal",
+            "phase",
+            "activity",
+            "state",
+        }:
+            failures.append(f"{prefix}: event {index} is not closed")
+            continue
+        phase = raw_event["phase"]
+        activity = raw_event["activity"]
+        state = raw_event["state"]
+        if raw_event["ordinal"] != index:
+            failures.append(f"{prefix}: event ordinal {index} differs")
+        if phase not in AO_PHASES or type(activity) is not str or not activity:
+            failures.append(f"{prefix}: event {index} identity is invalid")
+            continue
+        key = (phase, activity)
+        if state == "started":
+            if starts and AO_PHASES.index(phase) < AO_PHASES.index(starts[-1][0]):
+                failures.append(f"{prefix}: live start order regressed at {phase}")
+            starts.append(key)
+            stack.append(key)
+        elif state in {"completed", "failed"}:
+            if not stack or stack[-1] != key:
+                failures.append(f"{prefix}: event lifecycle is not properly nested")
+            else:
+                stack.pop()
+            if state == "completed":
+                completed.append({"phase": phase, "activity": activity})
+        else:
+            failures.append(f"{prefix}: event {index} has unknown state")
+    if stack:
+        failures.append(f"{prefix}: runtime event lifecycle is incomplete")
+    expected = runtime["expected_trace"]
+    first_completed: list[dict[str, str]] = []
+    completed_phases: set[str] = set()
+    for event in completed:
+        if event["phase"] in completed_phases:
+            continue
+        completed_phases.add(event["phase"])
+        first_completed.append(event)
+    if first_completed != expected:
+        failures.append(f"{prefix}: first completed phase activities differ")
+    ao10 = [activity for phase, activity in starts if phase == "AO-10"]
+    if tuple(ao10) != AO10_HELPER_CHAIN:
+        failures.append(f"{prefix}: AO-10 helper chain differs")
+    try:
+        ao10_end = starts.index(("AO-10", "seal-selected-legacy-result"))
+        ao11 = starts.index(("AO-11", "strict-capture"))
+    except ValueError:
+        failures.append(f"{prefix}: AO-10/AO-11 live activities are incomplete")
+    else:
+        if ao10_end >= ao11:
+            failures.append(f"{prefix}: AO-11 began before AO-10 completed")
+    return sorted(set(failures))
+
+
+def _runtime_scenario_failures(
+    scenario: Mapping[str, Any],
+    result: RuntimeScenarioResult,
+) -> list[str]:
+    scenario_id = scenario["id"]
+    prefix = f"public-command/G-ALIGN-AO/{scenario_id}"
+    trace = result.runtime_trace
+    failures: list[str] = []
+    if set(trace) != {"schema_version", "route_kind", "engine_family", "events"}:
+        return [f"{prefix}: runtime trace is not closed"]
+    if trace["schema_version"] != 1:
+        failures.append(f"{prefix}: trace schema differs")
+    if trace["route_kind"] != scenario["route"]:
+        failures.append(f"{prefix}: route identity differs")
+    if trace["engine_family"] != scenario["expected_family"]:
+        failures.append(f"{prefix}: family identity differs")
+    expected_success = not scenario["expect_failure"]
+    if result.outcome.get("success") is not expected_success:
+        failures.append(f"{prefix}: command outcome differs")
+    events = trace["events"]
+    if not isinstance(events, list) or not events:
+        return failures + [f"{prefix}: event stream is empty"]
+    stack: list[tuple[str, str]] = []
+    starts: list[tuple[str, str]] = []
+    states: set[tuple[str, str, str]] = set()
+    for index, event in enumerate(events):
+        if not isinstance(event, Mapping) or set(event) != {
+            "ordinal",
+            "phase",
+            "activity",
+            "state",
+        }:
+            failures.append(f"{prefix}: event {index} is not closed")
+            continue
+        phase, activity, state = event["phase"], event["activity"], event["state"]
+        if event["ordinal"] != index:
+            failures.append(f"{prefix}: event ordinal {index} differs")
+        if phase not in AO_PHASES or type(activity) is not str or not activity:
+            failures.append(f"{prefix}: event {index} identity is invalid")
+            continue
+        key = (phase, activity)
+        states.add((phase, activity, state))
+        if state == "started":
+            if starts and AO_PHASES.index(phase) < AO_PHASES.index(starts[-1][0]):
+                failures.append(f"{prefix}: live start order regressed at {phase}")
+            starts.append(key)
+            stack.append(key)
+        elif state in {"completed", "failed"}:
+            if not stack or stack[-1] != key:
+                failures.append(f"{prefix}: lifecycle is not properly nested")
+            else:
+                stack.pop()
+        else:
+            failures.append(f"{prefix}: event {index} state is invalid")
+    if stack:
+        failures.append(f"{prefix}: lifecycle is incomplete")
+
+    first_started_phases = tuple(dict.fromkeys(phase for phase, _activity in starts))
+    expected_started_phases = {
+        "mms-legacy-happy": AO_PHASES[:14] + ("AO-16",) + AO_PHASES[17:],
+        "qwen-all-skip-legacy": AO_PHASES[:10] + ("AO-24",),
+        "qwen-all-skip-boundary": AO_PHASES[:10] + ("AO-24",),
+        "ao15-uncontained-boundary": AO_PHASES[:15] + ("AO-24",),
+        "paired-ao15-ao16-boundary": AO_PHASES[:15] + ("AO-24",),
+        "ao15-isolated-then-ao16-legacy": (AO_PHASES[:16] + AO_PHASES[17:]),
+        "paired-ao15-ao16-legacy": AO_PHASES[:16] + ("AO-24",),
+    }[scenario_id]
+    if first_started_phases != expected_started_phases:
+        failures.append(f"{prefix}: first live phase sequence differs")
+
+    def require(phase: str, activity: str, state: str) -> None:
+        if (phase, activity, state) not in states:
+            failures.append(f"{prefix}: missing {phase}/{activity}/{state}")
+
+    def reject_phases(*phases: str) -> None:
+        observed = sorted({phase for phase, _activity in starts} & set(phases))
+        if observed:
+            failures.append(f"{prefix}: forbidden live phases started: {observed}")
+
+    if scenario_id == "mms-legacy-happy":
+        ao10 = tuple(activity for phase, activity in starts if phase == "AO-10")
+        if ao10 != AO10_HELPER_CHAIN:
+            failures.append(f"{prefix}: AO-10 helper chain differs")
+        try:
+            ao10_end = starts.index(("AO-10", "seal-selected-legacy-result"))
+            ao11 = starts.index(("AO-11", "strict-capture"))
+        except ValueError:
+            failures.append(f"{prefix}: AO-10/AO-11 live activities are incomplete")
+        else:
+            if ao10_end >= ao11:
+                failures.append(f"{prefix}: AO-11 began before AO-10 completed")
+        require("AO-16", "mandatory-evidence-core-and-ald6", "completed")
+        require("AO-25", "artifact-and-observer-dispatch", "completed")
+        if any(phase == "AO-15" for phase, _activity in starts):
+            failures.append(f"{prefix}: unrequested AO-15 started")
+        verification = result.evidence_verification
+        if (
+            verification is None
+            or verification.get("detail_code") is not None
+            or verification.get("integrity") is not True
+            or verification.get("w1_usable") is not True
+        ):
+            failures.append(f"{prefix}: successful evidence integrity failed")
+    elif scenario_id.startswith("qwen-all-skip-"):
+        require("AO-10", "group-block-spans", "completed")
+        require("AO-10", "common-all-empty-decision", "failed")
+        reject_phases(*AO_PHASES[10:23], "AO-25")
+    elif scenario_id in {
+        "ao15-uncontained-boundary",
+        "paired-ao15-ao16-boundary",
+    }:
+        require("AO-15", "fresh-w1-finalizer-and-validation", "failed")
+        reject_phases(
+            "AO-16",
+            "AO-17",
+            "AO-18",
+            "AO-19",
+            "AO-20",
+            "AO-21",
+            "AO-22",
+            "AO-23",
+            "AO-25",
+        )
+    elif scenario_id == "ao15-isolated-then-ao16-legacy":
+        require("AO-15", "fresh-w1-finalizer-and-validation", "completed")
+        require("AO-16", "mandatory-evidence-core-and-ald6", "completed")
+        reject_phases("AO-17")
+        verification = result.evidence_verification
+        if (
+            verification is None
+            or verification.get("detail_code") is not None
+            or verification.get("integrity") is not True
+            or verification.get("w1_usable") is not True
+        ):
+            failures.append(f"{prefix}: isolated-path evidence integrity failed")
+    elif scenario_id == "paired-ao15-ao16-legacy":
+        require("AO-15", "fresh-w1-finalizer-and-validation", "completed")
+        require("AO-16", "mandatory-evidence-core-and-ald6", "failed")
+        reject_phases(
+            "AO-17", "AO-18", "AO-19", "AO-20", "AO-21", "AO-22", "AO-23", "AO-25"
+        )
+    else:  # pragma: no cover - closed at manifest validation
+        failures.append(f"{prefix}: scenario has no validator")
+    return sorted(set(failures))
+
+
 def _compare(manifest: Mapping[str, Any], *, manifest_path: Path) -> list[str]:
     oracle_root = manifest_path.resolve().parent
     expected_declared: set[Path] = set()
     mismatches: list[str] = []
     for case in manifest["cases"]:
         candidates = _project_case(case, oracle_root)
+        public = _execute_public_case(case, manifest_path=manifest_path)
+        runtime = cast(Mapping[str, Any], case["public_runtime"])
         declared_artifacts = {output["artifact"] for output in case["expected_paths"]}
+        public_declared_artifacts = {
+            output["artifact"] for output in runtime["expected_paths"]
+        }
         if set(candidates) != declared_artifacts:
             mismatches.append(
-                f"artifact-set mismatch: projected/{case['id']} "
+                f"detached-authority/{case['id']}: artifact set "
                 f"{sorted(candidates)} != {sorted(declared_artifacts)}"
             )
+        if set(public.artifacts) != public_declared_artifacts:
+            mismatches.append(
+                f"public-command/{case['id']}: artifact set "
+                f"{sorted(public.artifacts)} != {sorted(public_declared_artifacts)}"
+            )
+        if case["command"] == "align" and case["reference_set"] != "6e6033f":
+            verification = public.evidence_verification
+            if (
+                verification is None
+                or verification.get("detail_code") is not None
+                or verification.get("integrity") is not True
+                or verification.get("w1_usable") is not runtime["expected_w1_usable"]
+            ):
+                mismatches.append(
+                    f"public-command/{case['id']}/align-evidence: "
+                    "production integrity verification failed"
+                )
+            if public.runtime_trace is None:
+                mismatches.append(
+                    f"public-command/{case['id']}/G-ALIGN-AO: trace is absent"
+                )
+            else:
+                mismatches.extend(_runtime_ao_failures(case, public.runtime_trace))
         for output in case["expected_paths"]:
             artifact = output["artifact"]
             expected = _resolve_under(
@@ -1059,14 +1910,51 @@ def _compare(manifest: Mapping[str, Any], *, manifest_path: Path) -> list[str]:
             if candidate_bytes is None:
                 continue
             if candidate_bytes != expected_bytes:
+                authority = (
+                    "detached-evidence"
+                    if artifact == "align-evidence"
+                    else "detached-projector"
+                )
                 mismatches.append(
-                    f"byte mismatch: projected/{case['id']}/{artifact} != "
+                    f"{authority}/{case['id']}/{artifact}: byte mismatch != "
                     f"{expected.relative_to(oracle_root)}"
                 )
             if len(candidate_bytes) != output["size"]:
-                mismatches.append(f"size mismatch: projected/{case['id']}/{artifact}")
+                mismatches.append(
+                    f"detached-projector/{case['id']}/{artifact}: size mismatch"
+                )
             if _sha256_bytes(candidate_bytes) != output["sha256"]:
-                mismatches.append(f"digest mismatch: projected/{case['id']}/{artifact}")
+                mismatches.append(
+                    f"detached-projector/{case['id']}/{artifact}: digest mismatch"
+                )
+        for output in runtime["expected_paths"]:
+            artifact = output["artifact"]
+            expected = _resolve_under(
+                oracle_root,
+                output["expected_path"],
+                label="public-command expected output",
+            )
+            expected_declared.add(expected)
+            try:
+                expected_bytes = expected.read_bytes()
+            except OSError as exc:
+                _invalid(f"cannot compare public-command oracle output: {exc}")
+            public_bytes = public.artifacts.get(artifact)
+            if public_bytes is None:
+                continue
+            if public_bytes != expected_bytes:
+                mismatches.append(
+                    f"public-command/{case['id']}/{artifact}: byte mismatch != "
+                    f"{expected.relative_to(oracle_root)}"
+                )
+            if len(public_bytes) != output["size"]:
+                mismatches.append(
+                    f"public-command/{case['id']}/{artifact}: size mismatch"
+                )
+            if _sha256_bytes(public_bytes) != output["sha256"]:
+                mismatches.append(
+                    f"public-command/{case['id']}/{artifact}: digest mismatch"
+                )
 
     expected_tree = _tree_files(oracle_root / "expected")
     for extra in sorted(expected_tree - expected_declared):
@@ -1088,6 +1976,13 @@ def _comparison_report(
         "artifact_count": sum(
             len(case["expected_paths"]) for case in manifest["cases"]
         ),
+        "authority_artifact_counts": {
+            "detached": sum(len(case["expected_paths"]) for case in manifest["cases"]),
+            "public-command": sum(
+                len(case["public_runtime"]["expected_paths"])
+                for case in manifest["cases"]
+            ),
+        },
         "case_count": len(manifest["cases"]),
         "command": "compare",
         "failure_count": len(failures),
@@ -1509,8 +2404,47 @@ def _check_dependencies() -> list[str]:
     return failures
 
 
-def _source_gates(manifest: Mapping[str, Any]) -> list[str]:
+def _public_runtime_gate(
+    manifest: Mapping[str, Any],
+    *,
+    manifest_path: Path,
+) -> list[str]:
+    failures: list[str] = []
+    for case in manifest["cases"]:
+        if case["command"] != "align" or case["reference_set"] == "6e6033f":
+            continue
+        result = _execute_public_case(case, manifest_path=manifest_path)
+        if result.runtime_trace is None:
+            failures.append(f"public-command/{case['id']}/G-ALIGN-AO: trace is absent")
+            continue
+        failures.extend(_runtime_ao_failures(case, result.runtime_trace))
+    scenarios = manifest["gates"]["G-ALIGN-AO"]["runtime_scenarios"]
+    for scenario in scenarios:
+        result = _execute_runtime_scenario(
+            scenario,
+            manifest=manifest,
+            manifest_path=manifest_path,
+        )
+        failures.extend(_runtime_scenario_failures(scenario, result))
+    return failures
+
+
+def _source_gates(
+    manifest: Mapping[str, Any],
+    *,
+    manifest_path: Path | None = None,
+) -> list[str]:
     failures = _check_ao_source()
+    failures.extend(
+        _public_runtime_gate(
+            manifest,
+            manifest_path=(
+                REPO_ROOT / "calibration" / "p6-oracle" / "manifest.json"
+                if manifest_path is None
+                else manifest_path
+            ),
+        )
+    )
     failures.extend(_check_test_evidence(manifest))
     failures.extend(_execute_test_evidence(manifest))
     failures.extend(_check_injection_registry(manifest))
@@ -1580,7 +2514,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     oracle_root=manifest_path.parent,
                 )
         else:
-            failures = _source_gates(manifest)
+            failures = _source_gates(manifest, manifest_path=manifest_path)
     except OracleInvalid as exc:
         print(f"invalid: {exc}", file=sys.stderr)
         return EXIT_INVALID

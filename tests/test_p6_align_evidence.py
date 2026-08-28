@@ -7,7 +7,7 @@ def _verified(tmp_path):
     from voxweave.align_acquisition import (
         _bind_fresh_adapter_payload,
         _fresh_alignment_call_observer,
-        _fresh_core_inputs,
+        _fresh_producer_core_inputs,
         begin_fresh_alignment,
         seal_fresh_alignment,
     )
@@ -104,18 +104,15 @@ def _verified(tmp_path):
         evidence_resolution=evidence,
     )
     adapter = run_locked_align_adapter(context, acquisition, shadow_enabled=False)
-    inputs = _fresh_core_inputs(context, acquisition)
     core = build_evidence_core(
-        context_content_digest=context.context_content_digest,
-        blocks=inputs[0],
-        captures=inputs[1],
-        transforms=inputs[2],
-        distribution=inputs[3],
-        seed_status=inputs[4],  # type: ignore[arg-type]
-        seed_reasons=inputs[5],
-        physical_calls=inputs[6],
-        receipt_digest=acquisition.receipt_digest,
-        language="en",
+        _fresh_producer_core_inputs(
+            context,
+            acquisition,
+            strict_input_status=strict,
+            v2_policy_status=policy_status,
+            profile_status=profile.status,
+            evidence_status=evidence.status,
+        )
     )
     result = issue_align_evaluated_result(
         context, adapter, evidence_core=core, comparison=None

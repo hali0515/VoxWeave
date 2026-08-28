@@ -26,6 +26,7 @@ from voxweave.align_context import (
     verify_context_binding,
 )
 from voxweave.align_failures import CanonicalFailure, SecondaryFailure
+from voxweave.align_runtime import align_runtime_activity
 from voxweave.speakers import load_speaker_mapping_bytes
 from voxweave.voicebase import media_fingerprint
 from voxweave.voiceepisode import episode_lock
@@ -430,16 +431,17 @@ def _replace_primary(stage: _OwnedStage, detail_code: str) -> None:
 
 @contextmanager
 def _transaction_lock(path: Path) -> Iterator[None]:
-    try:
-        manager = episode_lock(Path(path))
-        manager.__enter__()
-    except Exception as exc:
-        raise TransactionOperationError(
-            "episode-lock-failed",
-            "episode-lock",
-            "episode-lock-acquire",
-            exc,
-        ) from exc
+    with align_runtime_activity("AO-23", "episode-lock-acquire"):
+        try:
+            manager = episode_lock(Path(path))
+            manager.__enter__()
+        except Exception as exc:
+            raise TransactionOperationError(
+                "episode-lock-failed",
+                "episode-lock",
+                "episode-lock-acquire",
+                exc,
+            ) from exc
     try:
         yield
     except BaseException as exc:
@@ -683,91 +685,101 @@ def commit_primary_outputs(
     machine_stage: _OwnedStage | None = None
     evidence_stage: _OwnedStage | None = None
     try:
-        stages.append(_stage_primary(json_target, main_json_bytes, "main-json-stage"))
-        stages.append(_stage_primary(vtt_target, vtt_bytes, "vtt-stage"))
-        if machine_artifact is not None:
-            machine_stage = _stage_primary(
-                machine_artifact.path,
-                machine_artifact.bytes_value,
-                "machine-artifact-stage",
+        with align_runtime_activity("AO-22", "primary-and-evidence-stage"):
+            stages.append(
+                _stage_primary(json_target, main_json_bytes, "main-json-stage")
             )
-            stages.append(machine_stage)
-        if evidence_artifact is not None:
-            evidence_stage = _stage_primary(
-                evidence_artifact.path,
-                evidence_artifact.bytes_value,
-                "evidence-stage",
-            )
-            stages.append(evidence_stage)
-        with _transaction_lock(Path(episode_path)):
-            _check_primary_generations(
-                command=command,
-                json_path=json_target,
-                vtt_path=vtt_target,
-                expected_json=expected_json,
-                expected_vtt=expected_vtt,
-            )
-            if expected_media_fingerprint is not None:
-                if media_path is None:
-                    raise ValueError("media generation requires a media path")
-                require_media_generation(media_path, expected_media_fingerprint)
-            if expected_pair_decision is not None:
-                assert media_path is not None
-                assert expected_voiceprint_media_fingerprint is not None
-                require_media_pair_decision(
-                    media_path,
-                    voiceprint_media_fingerprint=(
-                        expected_voiceprint_media_fingerprint
-                    ),
-                    expected_decision=expected_pair_decision,
-                )
-            if speaker_mapping_path is not None:
-                assert expected_speaker_mapping is not None
-                segmentation_context = (
-                    context if isinstance(context, IssuedSegmentationContext) else None
-                )
-                _require_bound_speaker_mapping(
-                    segmentation_context,
-                    speaker_mapping_path,
-                    expected_speaker_mapping,
-                )
-                observed_mapping = observe_speaker_mapping_generation(
-                    speaker_mapping_path
-                )
-                if not same_speaker_mapping_generation(
-                    expected_speaker_mapping, observed_mapping
-                ):
-                    raise _stale(command, "speaker-mapping-generation")
-            _consume_commit_role(
-                context,
-                command=command,
-                vtt_path=vtt_target,
-                json_path=json_target,
-                media_path=media_path,
-            )
-            for stage, detail_code in zip(
-                stages[:2], ("main-json-replace", "vtt-replace"), strict=True
-            ):
-                _replace_primary(stage, detail_code)
-                landed.append(stage.target)
-            for cleanup in (
-                item for item in cleanup_paths if item.detail_code != "evidence-unlink"
-            ):
-                _cleanup_after_primary(cleanup)
+            stages.append(_stage_primary(vtt_target, vtt_bytes, "vtt-stage"))
             if machine_artifact is not None:
-                assert machine_stage is not None
-                _replace_primary(machine_stage, "machine-artifact-replace")
-                machine_landed.append(machine_artifact.path)
-            for cleanup in (
-                item
-                for item in cleanup_paths
-                if item.detail_code == "evidence-unlink" and evidence_artifact is None
-            ):
-                _cleanup_after_primary(cleanup)
+                machine_stage = _stage_primary(
+                    machine_artifact.path,
+                    machine_artifact.bytes_value,
+                    "machine-artifact-stage",
+                )
+                stages.append(machine_stage)
             if evidence_artifact is not None:
-                assert evidence_stage is not None
-                _replace_primary(evidence_stage, "evidence-replace")
-                landed.append(evidence_artifact.path)
+                evidence_stage = _stage_primary(
+                    evidence_artifact.path,
+                    evidence_artifact.bytes_value,
+                    "evidence-stage",
+                )
+                stages.append(evidence_stage)
+        with _transaction_lock(Path(episode_path)):
+            with align_runtime_activity("AO-23", "generation-and-binding-recheck"):
+                _check_primary_generations(
+                    command=command,
+                    json_path=json_target,
+                    vtt_path=vtt_target,
+                    expected_json=expected_json,
+                    expected_vtt=expected_vtt,
+                )
+                if expected_media_fingerprint is not None:
+                    if media_path is None:
+                        raise ValueError("media generation requires a media path")
+                    require_media_generation(media_path, expected_media_fingerprint)
+                if expected_pair_decision is not None:
+                    assert media_path is not None
+                    assert expected_voiceprint_media_fingerprint is not None
+                    require_media_pair_decision(
+                        media_path,
+                        voiceprint_media_fingerprint=(
+                            expected_voiceprint_media_fingerprint
+                        ),
+                        expected_decision=expected_pair_decision,
+                    )
+                if speaker_mapping_path is not None:
+                    assert expected_speaker_mapping is not None
+                    segmentation_context = (
+                        context
+                        if isinstance(context, IssuedSegmentationContext)
+                        else None
+                    )
+                    _require_bound_speaker_mapping(
+                        segmentation_context,
+                        speaker_mapping_path,
+                        expected_speaker_mapping,
+                    )
+                    observed_mapping = observe_speaker_mapping_generation(
+                        speaker_mapping_path
+                    )
+                    if not same_speaker_mapping_generation(
+                        expected_speaker_mapping, observed_mapping
+                    ):
+                        raise _stale(command, "speaker-mapping-generation")
+                _consume_commit_role(
+                    context,
+                    command=command,
+                    vtt_path=vtt_target,
+                    json_path=json_target,
+                    media_path=media_path,
+                )
+            with align_runtime_activity("AO-24", "commit-and-required-cleanup"):
+                for stage, detail_code in zip(
+                    stages[:2], ("main-json-replace", "vtt-replace"), strict=True
+                ):
+                    _replace_primary(stage, detail_code)
+                    landed.append(stage.target)
+                for cleanup in (
+                    item
+                    for item in cleanup_paths
+                    if item.detail_code != "evidence-unlink"
+                ):
+                    _cleanup_after_primary(cleanup)
+                if machine_artifact is not None:
+                    assert machine_stage is not None
+                    _replace_primary(machine_stage, "machine-artifact-replace")
+                    machine_landed.append(machine_artifact.path)
+                for cleanup in (
+                    item
+                    for item in cleanup_paths
+                    if item.detail_code == "evidence-unlink"
+                    and evidence_artifact is None
+                ):
+                    _cleanup_after_primary(cleanup)
+                if evidence_artifact is not None:
+                    assert evidence_stage is not None
+                    _replace_primary(evidence_stage, "evidence-replace")
+                    landed.append(evidence_artifact.path)
     except BaseException as exc:
         leftovers = _discard_stages(stages)
         if leftovers:

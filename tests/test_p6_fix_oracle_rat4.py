@@ -231,6 +231,13 @@ def test_p6_oracle_compare_writes_a_deterministic_closed_json_report(tmp_path):
         "artifact_count": sum(
             len(case["expected_paths"]) for case in manifest["cases"]
         ),
+        "authority_artifact_counts": {
+            "detached": sum(len(case["expected_paths"]) for case in manifest["cases"]),
+            "public-command": sum(
+                len(case["public_runtime"]["expected_paths"])
+                for case in manifest["cases"]
+            ),
+        },
         "case_count": len(manifest["cases"]),
         "command": "compare",
         "failure_count": 0,
