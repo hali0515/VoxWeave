@@ -499,6 +499,38 @@ def test_vtt_replace_failure_reports_json_as_the_only_landed_primary(
     assert not tuple(tmp_path.glob("*.part*"))
 
 
+def test_episode_lock_failure_is_canonical_and_discards_stages(tmp_path, monkeypatch):
+    from voxweave import episode_transaction
+
+    json_path = tmp_path / "episode.json"
+    vtt_path = tmp_path / "episode.vtt"
+    json_path.write_bytes(b"old json")
+    vtt_path.write_bytes(b"old vtt")
+
+    def fail_lock(_path):
+        raise OSError("lock unavailable")
+
+    monkeypatch.setattr(episode_transaction, "episode_lock", fail_lock)
+    with pytest.raises(episode_transaction.TransactionOperationError) as caught:
+        episode_transaction.commit_primary_outputs(
+            command="align",
+            episode_path=vtt_path,
+            json_path=json_path,
+            vtt_path=vtt_path,
+            expected_json=episode_transaction.capture_file_generation(json_path),
+            expected_vtt=episode_transaction.capture_file_generation(vtt_path),
+            main_json_bytes=b"new json",
+            vtt_bytes=b"new vtt",
+        )
+    assert caught.value.failure.kind == "episode-lock-failed"
+    assert caught.value.failure.phase == "episode-lock"
+    assert caught.value.failure.detail_code == "episode-lock-acquire"
+    assert caught.value.landed == ()
+    assert json_path.read_bytes() == b"old json"
+    assert vtt_path.read_bytes() == b"old vtt"
+    assert not tuple(tmp_path.glob("*.part*"))
+
+
 def test_segmentation_transaction_consumes_commit_only_after_recheck(tmp_path):
     from voxweave.align_context import (
         consume_context_role,
