@@ -171,6 +171,14 @@ def _strip_state_dict(sd: dict) -> dict:
     return sd
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _resolve_separator_files() -> tuple[Path, Path]:
     """Locate separator ckpt + yaml. Auto-downloads ckpt from HF if missing; falls back to bundled yaml if yaml is absent."""
     ckpt = Path(SEPARATOR_CKPT)
@@ -208,9 +216,9 @@ def separator_identity() -> dict[str, object]:
     checkpoint_identity = (
         resolved_checkpoint.name
         if resolved_checkpoint.parent.name == "blobs"
-        else "unresolved"
+        else _sha256_file(resolved_checkpoint)
     )
-    config_digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    config_digest = _sha256_file(config_path)
     return {
         "repo": SEPARATOR_REPO,
         "file": SEPARATOR_REPO_FILE,

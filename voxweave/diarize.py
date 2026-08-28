@@ -39,6 +39,7 @@ log = logging.getLogger("voxweave")
 DIARIZE_MODEL = os.environ.get(
     "VOXWEAVE_DIARIZE_MODEL", "pyannote/speaker-diarization-3.1"
 )
+EMBEDDING_CHECKPOINT_FILE = "pytorch_model.bin"
 
 # Atom-level speaker assignment needs at least this much absolute overlap with a
 # turn (seconds); below it the atom inherits its neighbors (guards 20ms grazes).
@@ -140,8 +141,32 @@ def _checkpoint_identity(pipeline: object) -> str:
     try:
         resolved = Path(raw_path).resolve(strict=True)
     except OSError:
+        pass
+    else:
+        return resolved.name if resolved.parent.name == "blobs" else "unresolved"
+
+    if not isinstance(raw_path, str):
         return "unresolved"
-    return resolved.name if resolved.parent.name == "blobs" else "unresolved"
+    if "@" in raw_path:
+        model_id, revision = raw_path.rsplit("@", 1)
+    else:
+        model_id, revision = raw_path, None
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(
+            model_id,
+            EMBEDDING_CHECKPOINT_FILE,
+            revision=revision,
+            cache_dir=config.AUDIO_CACHE,
+        )
+        if isinstance(cached, str):
+            resolved = Path(cached).resolve(strict=True)
+            if resolved.parent.name == "blobs":
+                return resolved.name
+    except (ImportError, OSError, ValueError):
+        pass
+    return "unresolved"
 
 
 def _package_version(distribution: str) -> str:
