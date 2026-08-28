@@ -1,0 +1,375 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxweave.local/schemas/align-evidence.schema.json",
+  "title": "Voxweave P6 durable align evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "context_content_digest",
+    "receipt_digest",
+    "language",
+    "route",
+    "input_history",
+    "route_plan",
+    "physical_calls",
+    "legacy_distribution",
+    "authority_distribution",
+    "blocks",
+    "raw_unit_count",
+    "strict_input_status",
+    "seed_status",
+    "v2_policy_status",
+    "profile_status",
+    "evidence_status",
+    "v2_admission_status",
+    "selected_outputs"
+  ],
+  "properties": {
+    "schema_version": { "const": 8 },
+    "kind": { "const": "fresh-alignment" },
+    "context_content_digest": { "$ref": "#/$defs/sha256" },
+    "receipt_digest": { "$ref": "#/$defs/sha256" },
+    "language": { "type": "string", "minLength": 1 },
+    "route": { "enum": ["ctc-full", "mms-full", "qwen-crop"] },
+    "input_history": { "$ref": "#/$defs/inputHistory" },
+    "route_plan": { "$ref": "#/$defs/routePlan" },
+    "physical_calls": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/physicalCall" }
+    },
+    "legacy_distribution": { "$ref": "#/$defs/legacyDistribution" },
+    "authority_distribution": { "$ref": "#/$defs/authorityDistribution" },
+    "blocks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/block" }
+    },
+    "raw_unit_count": { "$ref": "#/$defs/nonnegativeInteger" },
+    "strict_input_status": { "$ref": "#/$defs/simpleStatus" },
+    "seed_status": { "$ref": "#/$defs/seedStatus" },
+    "v2_policy_status": { "$ref": "#/$defs/simpleStatus" },
+    "profile_status": { "$ref": "#/$defs/profileStatus" },
+    "evidence_status": { "$ref": "#/$defs/simpleStatus" },
+    "v2_admission_status": { "enum": ["valid", "invalid"] },
+    "selected_outputs": { "$ref": "#/$defs/selectedOutputs" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "shaOrNull": {
+      "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+    },
+    "nonnegativeInteger": { "type": "integer", "minimum": 0 },
+    "integerOrNull": {
+      "oneOf": [{ "$ref": "#/$defs/nonnegativeInteger" }, { "type": "null" }]
+    },
+    "numberOrNull": {
+      "oneOf": [{ "type": "number" }, { "type": "null" }]
+    },
+    "stringArray": { "type": "array", "items": { "type": "string" } },
+    "integerArray": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/nonnegativeInteger" }
+    },
+    "binary64": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+    "inputHistory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "vtt_present", "vtt_size", "vtt_sha256",
+        "sibling_json_present", "sibling_json_size", "sibling_json_sha256",
+        "block_content_sha256", "registry_family", "media_fingerprint",
+        "media_logical_id", "media_display_name", "prepared_audio_size",
+        "prepared_audio_sha256", "profile_input_sha256",
+        "evidence_carriers_sha256", "authority_limit_profile_kind",
+        "authority_limit_profile_digest", "legacy_policy_binary64",
+        "target_logical_id", "expected_vtt_sha256"
+      ],
+      "properties": {
+        "vtt_present": { "type": "boolean" },
+        "vtt_size": { "$ref": "#/$defs/integerOrNull" },
+        "vtt_sha256": { "$ref": "#/$defs/shaOrNull" },
+        "sibling_json_present": { "type": "boolean" },
+        "sibling_json_size": { "$ref": "#/$defs/integerOrNull" },
+        "sibling_json_sha256": { "$ref": "#/$defs/shaOrNull" },
+        "block_content_sha256": { "$ref": "#/$defs/sha256" },
+        "registry_family": { "enum": ["legacy-v1", "boundary-v2"] },
+        "media_fingerprint": { "$ref": "#/$defs/sha256" },
+        "media_logical_id": { "type": "string", "minLength": 1 },
+        "media_display_name": { "type": "string", "minLength": 1 },
+        "prepared_audio_size": { "$ref": "#/$defs/nonnegativeInteger" },
+        "prepared_audio_sha256": { "$ref": "#/$defs/sha256" },
+        "profile_input_sha256": { "$ref": "#/$defs/sha256" },
+        "evidence_carriers_sha256": { "$ref": "#/$defs/sha256" },
+        "authority_limit_profile_kind": { "enum": ["production", "test-only"] },
+        "authority_limit_profile_digest": { "$ref": "#/$defs/sha256" },
+        "legacy_policy_binary64": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["min_cue_sec", "tiny_cue_sec", "tiny_cue_target"],
+          "properties": {
+            "min_cue_sec": { "$ref": "#/$defs/binary64" },
+            "tiny_cue_sec": { "$ref": "#/$defs/binary64" },
+            "tiny_cue_target": { "$ref": "#/$defs/binary64" }
+          }
+        },
+        "target_logical_id": { "type": "string", "minLength": 1 },
+        "expected_vtt_sha256": { "$ref": "#/$defs/shaOrNull" }
+      }
+    },
+    "routePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "entries"],
+      "properties": {
+        "digest": { "$ref": "#/$defs/sha256" },
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/routeEntry" } }
+      }
+    },
+    "routeEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delivery_index", "source_index", "route_start", "route_end",
+        "action", "call_index", "skip_reason"
+      ],
+      "properties": {
+        "delivery_index": { "$ref": "#/$defs/nonnegativeInteger" },
+        "source_index": { "$ref": "#/$defs/nonnegativeInteger" },
+        "route_start": { "$ref": "#/$defs/numberOrNull" },
+        "route_end": { "$ref": "#/$defs/numberOrNull" },
+        "action": { "enum": ["full-pass-member", "qwen-call", "qwen-skip"] },
+        "call_index": { "$ref": "#/$defs/integerOrNull" },
+        "skip_reason": {
+          "enum": [null, "missing-crop", "empty-alignment-text"]
+        }
+      }
+    },
+    "strictFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "call_unit_index", "detail_code"],
+      "properties": {
+        "stage": { "enum": ["strict-capture", "sample-geometry", "authority-transform"] },
+        "call_unit_index": { "$ref": "#/$defs/integerOrNull" },
+        "detail_code": {
+          "enum": ["strict-raw-node", "sample-geometry", "physical-origin-mismatch", "authority-recompute", "surplus-transform"]
+        }
+      }
+    },
+    "physicalCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "call_index", "source_block_indices", "sample_start", "sample_end",
+        "sample_rate", "physical_origin_seconds", "legacy_origin_seconds",
+        "legacy_origin_kind", "authority_origin_seconds",
+        "backend_model_config_sha256", "route_input_sha256",
+        "strict_unit_status", "strict_failure", "raw_units_sha256",
+        "relative_units_sha256", "legacy_slice_sha256",
+        "legacy_absolute_sha256", "authority_transform_status",
+        "authority_absolute_sha256", "raw_unit_ids"
+      ],
+      "properties": {
+        "call_index": { "$ref": "#/$defs/nonnegativeInteger" },
+        "source_block_indices": { "$ref": "#/$defs/integerArray" },
+        "sample_start": { "$ref": "#/$defs/nonnegativeInteger" },
+        "sample_end": { "$ref": "#/$defs/nonnegativeInteger" },
+        "sample_rate": { "type": "integer", "minimum": 1 },
+        "physical_origin_seconds": { "type": "number" },
+        "legacy_origin_seconds": { "type": "number" },
+        "legacy_origin_kind": { "enum": ["identity", "sample-origin", "nominal-route"] },
+        "authority_origin_seconds": { "type": "number" },
+        "backend_model_config_sha256": { "$ref": "#/$defs/sha256" },
+        "route_input_sha256": { "$ref": "#/$defs/sha256" },
+        "strict_unit_status": { "enum": ["valid", "invalid"] },
+        "strict_failure": {
+          "oneOf": [{ "$ref": "#/$defs/strictFailure" }, { "type": "null" }]
+        },
+        "raw_units_sha256": { "$ref": "#/$defs/shaOrNull" },
+        "relative_units_sha256": { "$ref": "#/$defs/shaOrNull" },
+        "legacy_slice_sha256": { "$ref": "#/$defs/shaOrNull" },
+        "legacy_absolute_sha256": { "$ref": "#/$defs/shaOrNull" },
+        "authority_transform_status": { "enum": ["valid", "invalid"] },
+        "authority_absolute_sha256": { "$ref": "#/$defs/shaOrNull" },
+        "raw_unit_ids": { "$ref": "#/$defs/stringArray" }
+      }
+    },
+    "legacyDistribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "calls"],
+      "properties": {
+        "digest": { "$ref": "#/$defs/sha256" },
+        "calls": { "type": "array", "items": { "$ref": "#/$defs/legacyCall" } }
+      }
+    },
+    "legacyCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "call_index", "owner_source_indices", "expected_counts",
+        "requested_ranges", "realized_ranges", "owner_unit_ids", "final_cursor",
+        "consumed_prefix_unit_ids", "shortage_source_indices", "leftover_unit_ids"
+      ],
+      "properties": {
+        "call_index": { "$ref": "#/$defs/nonnegativeInteger" },
+        "owner_source_indices": { "$ref": "#/$defs/integerArray" },
+        "expected_counts": { "$ref": "#/$defs/integerArray" },
+        "requested_ranges": { "type": "array", "items": { "$ref": "#/$defs/integerArray" } },
+        "realized_ranges": { "type": "array", "items": { "$ref": "#/$defs/integerArray" } },
+        "owner_unit_ids": { "type": "array", "items": { "$ref": "#/$defs/stringArray" } },
+        "final_cursor": { "$ref": "#/$defs/nonnegativeInteger" },
+        "consumed_prefix_unit_ids": { "$ref": "#/$defs/stringArray" },
+        "shortage_source_indices": { "$ref": "#/$defs/integerArray" },
+        "leftover_unit_ids": { "$ref": "#/$defs/stringArray" }
+      }
+    },
+    "authorityDistribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "digest", "owner_source_indices", "expected_counts",
+        "owner_unit_ids", "consumed_count", "leftover_unit_ids", "reasons", "work"
+      ],
+      "properties": {
+        "status": { "enum": ["valid", "invalid"] },
+        "digest": { "$ref": "#/$defs/sha256" },
+        "owner_source_indices": {
+          "oneOf": [{ "$ref": "#/$defs/integerArray" }, { "type": "null" }]
+        },
+        "expected_counts": {
+          "oneOf": [{ "$ref": "#/$defs/integerArray" }, { "type": "null" }]
+        },
+        "owner_unit_ids": {
+          "oneOf": [
+            { "type": "array", "items": { "$ref": "#/$defs/stringArray" } },
+            { "type": "null" }
+          ]
+        },
+        "consumed_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "leftover_unit_ids": { "$ref": "#/$defs/stringArray" },
+        "reasons": { "$ref": "#/$defs/stringArray" },
+        "work": { "$ref": "#/$defs/work" }
+      }
+    },
+    "work": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "route_status", "route_mismatch", "route_claims",
+        "declared_delivery_block_count", "declared_call_count",
+        "declared_skip_count", "declared_raw_node_count", "charged_call_count",
+        "limit_profile_kind", "limit_profile_digest", "limits", "totals",
+        "terminal_call_index", "denied_charge", "calls", "skipped_blocks"
+      ],
+      "properties": {
+        "status": { "type": "string" },
+        "route_status": { "enum": ["valid", "invalid"] },
+        "route_mismatch": { "type": ["object", "null"] },
+        "route_claims": { "type": "array", "items": { "type": "object" } },
+        "declared_delivery_block_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "declared_call_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "declared_skip_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "declared_raw_node_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "charged_call_count": { "$ref": "#/$defs/nonnegativeInteger" },
+        "limit_profile_kind": { "enum": ["production", "test-only"] },
+        "limit_profile_digest": { "$ref": "#/$defs/sha256" },
+        "limits": { "type": "object" },
+        "totals": { "type": "object" },
+        "terminal_call_index": { "$ref": "#/$defs/integerOrNull" },
+        "denied_charge": { "type": ["object", "null"] },
+        "calls": { "type": "array", "items": { "type": "object" } },
+        "skipped_blocks": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_index", "legacy_unit_ids", "authority_unit_ids", "word_data",
+        "speech_start", "speech_end"
+      ],
+      "properties": {
+        "source_index": { "$ref": "#/$defs/nonnegativeInteger" },
+        "legacy_unit_ids": { "$ref": "#/$defs/stringArray" },
+        "authority_unit_ids": {
+          "oneOf": [{ "$ref": "#/$defs/stringArray" }, { "type": "null" }]
+        },
+        "word_data": {
+          "oneOf": [
+            { "type": "array", "items": { "$ref": "#/$defs/word" } },
+            { "type": "null" }
+          ]
+        },
+        "speech_start": { "$ref": "#/$defs/numberOrNull" },
+        "speech_end": { "$ref": "#/$defs/numberOrNull" }
+      }
+    },
+    "word": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit_id", "call_index", "call_unit_index", "text", "relative_start",
+        "relative_end", "physical_origin_seconds", "start", "end", "provenance",
+        "original_relative_start", "original_relative_end"
+      ],
+      "properties": {
+        "unit_id": { "type": "string", "minLength": 1 },
+        "call_index": { "$ref": "#/$defs/nonnegativeInteger" },
+        "call_unit_index": { "$ref": "#/$defs/nonnegativeInteger" },
+        "text": { "type": "string" },
+        "relative_start": { "$ref": "#/$defs/numberOrNull" },
+        "relative_end": { "$ref": "#/$defs/numberOrNull" },
+        "physical_origin_seconds": { "type": "number" },
+        "start": { "$ref": "#/$defs/numberOrNull" },
+        "end": { "$ref": "#/$defs/numberOrNull" },
+        "provenance": { "enum": ["aligner", "align-interpolated"] },
+        "original_relative_start": { "$ref": "#/$defs/numberOrNull" },
+        "original_relative_end": { "$ref": "#/$defs/numberOrNull" }
+      }
+    },
+    "simpleStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "detail_code"],
+      "properties": {
+        "kind": { "enum": ["valid", "invalid"] },
+        "detail_code": { "type": ["string", "null"] }
+      }
+    },
+    "seedStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "reasons"],
+      "properties": {
+        "kind": { "enum": ["valid", "invalid"] },
+        "reasons": { "$ref": "#/$defs/stringArray" }
+      }
+    },
+    "profileStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "source", "detail_code"],
+      "properties": {
+        "kind": { "enum": ["valid", "invalid"] },
+        "source": {
+          "enum": ["language-override", "unsupported-manifest", "profile-absent", "stored-profile", "manifest-absent"]
+        },
+        "detail_code": { "type": ["string", "null"] }
+      }
+    },
+    "selectedOutputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine_family", "vtt_present", "vtt_sha256", "json_present", "json_sha256"],
+      "properties": {
+        "engine_family": { "enum": ["legacy-v1", "boundary-v2"] },
+        "vtt_present": { "const": true },
+        "vtt_sha256": { "$ref": "#/$defs/sha256" },
+        "json_present": { "const": true },
+        "json_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

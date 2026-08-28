@@ -1512,6 +1512,27 @@ def _fresh_core_inputs(
     )
 
 
+def _fresh_evidence_inputs(
+    context: IssuedAlignContext,
+    acquisition: IssuedFreshAlignment,
+) -> tuple[
+    tuple[AuthorityBlock, ...],
+    tuple[StrictCaptureResult, ...],
+    tuple[AuthorityTransformResult, ...],
+    tuple[LegacyCallDistributionReceipt, ...],
+    tuple[tuple[Mapping[str, Any], ...], ...],
+]:
+    """Return a separate thaw of facts needed by the AO-21 evidence binder."""
+    record = _fresh_record(context, acquisition)
+    return (
+        copy.deepcopy(record.blocks),
+        copy.deepcopy(record.captures),
+        copy.deepcopy(record.transforms),
+        copy.deepcopy(record.legacy_receipts),
+        copy.deepcopy(record.legacy_block_units),
+    )
+
+
 def _fresh_seed(
     context: IssuedAlignContext, acquisition: IssuedFreshAlignment
 ) -> object:
