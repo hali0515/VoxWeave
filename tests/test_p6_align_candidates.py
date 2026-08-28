@@ -85,9 +85,10 @@ def _evaluated(tmp_path, *, shadow_requested=False):
         speech_start=1.0,
         speech_end=2.0,
     )
+    evidence_core = _core(context)
     delivery = AlignDelivery(
         context.context_content_digest,
-        "b" * 64,
+        evidence_core.core_digest,
         "legacy-v1",
         "ctc-full",
         (cue,),
@@ -108,7 +109,7 @@ def _evaluated(tmp_path, *, shadow_requested=False):
         context,
         delivery=delivery,
         projection_inputs=inputs,
-        evidence_core=_core(context),
+        evidence_core=evidence_core,
         shadow_requested=shadow_requested,
     )
     return context, result
