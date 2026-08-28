@@ -1128,6 +1128,35 @@ def test_align_shadow_runs_seed_reconciliation_before_pending_w1(
     assert artifact.fresh["seed_status"] == "invalid"
 
 
+def test_align_shadow_runs_profile_admission_before_pending_w1(
+    tmp_path, monkeypatch
+):
+    from voxweave import align_inputs
+
+    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
+    monkeypatch.setattr(
+        align_inputs,
+        "resolve_align_profile",
+        lambda *_args, **_kwargs: align_inputs.ProfileResolution(
+            None,
+            align_inputs.ProfileStatus(
+                "invalid",
+                "stored-profile",
+                "profile-domain",
+            ),
+        ),
+    )
+    observed: list[object] = []
+
+    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
+
+    artifact = observed[0]
+    assert artifact.failure.kind == "profile-invalid"
+    assert artifact.failure.detail_code == "profile-domain"
+    assert artifact.fresh["profile_status"] == "invalid"
+
+
 def test_align_shadow_observer_failure_cannot_change_selected_return(
     tmp_path, monkeypatch, caplog
 ):
