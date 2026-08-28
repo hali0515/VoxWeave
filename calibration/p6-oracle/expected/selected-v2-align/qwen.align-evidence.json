@@ -1,28 +1,75 @@
 {
   "schema_version": 8,
   "kind": "fresh-alignment",
-  "context_content_digest": "1111111111111111111111111111111111111111111111111111111111111111",
-  "receipt_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+  "context_content_digest": "25f7f6e7350dda464ddd75631cba5c17c4fbf340603642b1944908b3fe3bc8dc",
+  "receipt_digest": "3af50130ec6aeb88834c3a13225b0d9c959eaf6f99c5529850cd330e1a827638",
   "language": "en",
   "route": "qwen-crop",
+  "source_facts": {
+    "backend_model_config": {
+      "route": "qwen-crop",
+      "language": "en",
+      "backend": "qwen-asr",
+      "model": "Qwen/Qwen3-ForcedAligner-0.6B",
+      "sample_rate": 16000
+    },
+    "route_input": {
+      "route": "qwen-crop",
+      "language": "en",
+      "blocks": [
+        {
+          "source_index": 0,
+          "alignment_text": "First line",
+          "start": "0x1.0000000000000p-3",
+          "end": "0x1.4000000000000p+0"
+        },
+        {
+          "source_index": 1,
+          "alignment_text": "Second line",
+          "start": "0x1.8000000000000p+0",
+          "end": "0x1.6000000000000p+1"
+        },
+        {
+          "source_index": 2,
+          "alignment_text": "Call response",
+          "start": "0x1.8000000000000p+1",
+          "end": "0x1.1000000000000p+2"
+        }
+      ],
+      "crops": [
+        [
+          "0x1.9999999999998p-6",
+          "0x1.599999999999ap+0"
+        ],
+        [
+          "0x1.6666666666666p+0",
+          "0x1.6cccccccccccdp+1"
+        ],
+        [
+          "0x1.7333333333333p+1",
+          "0x1.1666666666666p+2"
+        ]
+      ]
+    }
+  },
   "input_history": {
     "vtt_present": true,
-    "vtt_size": 148,
-    "vtt_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "vtt_size": 193,
+    "vtt_sha256": "2da0e4719c6146ba8a8667de5de945ed18bd536aaf7beaadb1d485fc4d3fdbf0",
     "sibling_json_present": true,
-    "sibling_json_size": 376,
-    "sibling_json_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "block_content_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "sibling_json_size": 670,
+    "sibling_json_sha256": "aaa922573d022e941a822abe8645f1b018b17967bd1a2d74c1d192e4ebcfd589",
+    "block_content_sha256": "912d816629960d8b7240529b129f3fe6c171be08bb395eba462776d9a312d38b",
     "registry_family": "boundary-v2",
-    "media_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "media_fingerprint": "19726673d805bbeaeb12ab5ca223c8ed3f195081cd40ba9ea7b404083204e7b1",
     "media_logical_id": "explicit:episode.wav",
     "media_display_name": "episode.wav",
-    "prepared_audio_size": 1280044,
-    "prepared_audio_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-    "profile_input_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-    "evidence_carriers_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "prepared_audio_size": 160044,
+    "prepared_audio_sha256": "262d1f34f300560a4c82ba8127ddea9e1d72946f187fdbd3e8f70ee096077aec",
+    "profile_input_sha256": "835e04b5ee5752302891be8a921bab5adcbf0f0efd9ce135e8165264dcf8b296",
+    "evidence_carriers_sha256": "be36e4a03b94b015acc153077238484f5e51bda132d6dfccb0d7dfbc13b11e17",
     "authority_limit_profile_kind": "production",
-    "authority_limit_profile_digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+    "authority_limit_profile_digest": "251b66817a8c22f753b7f6852c7005426262662aa8fe4a3acfd8b77164482391",
     "legacy_policy_binary64": {
       "min_cue_sec": "0000000000000000",
       "tiny_cue_sec": "3fc999999999999a",
@@ -32,13 +79,13 @@
     "expected_vtt_sha256": null
   },
   "route_plan": {
-    "digest": "1010101010101010101010101010101010101010101010101010101010101010",
+    "digest": "e84021e9159ef7d2a5d5fa5634bdd031438adf6d7d3473a4295d90e407056849",
     "entries": [
       {
         "delivery_index": 0,
         "source_index": 0,
-        "route_start": 0.1234,
-        "route_end": 1.3,
+        "route_start": 0.024999999999999994,
+        "route_end": 1.25,
         "action": "qwen-call",
         "call_index": 0,
         "skip_reason": null
@@ -46,8 +93,8 @@
       {
         "delivery_index": 1,
         "source_index": 1,
-        "route_start": 1.5,
-        "route_end": 2.8,
+        "route_start": 1.4,
+        "route_end": 2.75,
         "action": "qwen-call",
         "call_index": 1,
         "skip_reason": null
@@ -55,8 +102,8 @@
       {
         "delivery_index": 2,
         "source_index": 2,
-        "route_start": 2.9999,
-        "route_end": 4.3,
+        "route_start": 2.9,
+        "route_end": 4.25,
         "action": "qwen-call",
         "call_index": 2,
         "skip_reason": null
@@ -69,26 +116,40 @@
       "source_block_indices": [
         0
       ],
-      "sample_start": 2000,
-      "sample_end": 20800,
+      "sample_start": 399,
+      "sample_end": 21600,
       "sample_rate": 16000,
-      "physical_origin_seconds": 0.125,
-      "legacy_origin_seconds": 0.1234,
+      "physical_origin_seconds": 0.0249375,
+      "legacy_origin_seconds": 0.024999999999999994,
       "legacy_origin_kind": "nominal-route",
-      "authority_origin_seconds": 0.125,
-      "backend_model_config_sha256": "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000",
-      "route_input_sha256": "0000ffffeeeeddddccccbbbbaaaa999988887777666655554444333322221111",
+      "authority_origin_seconds": 0.0249375,
+      "backend_model_config_sha256": "54d6ca41cca0304698bc3e2b3f43312795dab7387e132d6e1edbef481cefb164",
+      "route_input_sha256": "2a144af5954a52cd823bbb4f0a8ddcfe8a15b328f3c5d5842433cb74ba759c08",
       "strict_unit_status": "valid",
       "strict_failure": null,
-      "raw_units_sha256": "1212121212121212121212121212121212121212121212121212121212121212",
-      "relative_units_sha256": "1313131313131313131313131313131313131313131313131313131313131313",
-      "legacy_slice_sha256": "1414141414141414141414141414141414141414141414141414141414141414",
-      "legacy_absolute_sha256": "1515151515151515151515151515151515151515151515151515151515151515",
+      "raw_units_sha256": "07d06bc5be53880a0b0b30ff6c34c9c72a44a31d4b16a0acb4f6860ad86f06ae",
+      "relative_units_sha256": "0a12347c163fa240a5d1458e22645e14accc163a6d659e6d12007fc74761a6f2",
+      "legacy_retained_units": [
+        [
+          {
+            "text": "First",
+            "start": 0.1,
+            "end": 0.575
+          },
+          {
+            "text": "line",
+            "start": 0.675,
+            "end": 1.225
+          }
+        ]
+      ],
+      "legacy_slice_sha256": "a2eadad5f6fa3b657f1e951bb0125db6508b3f6d3a8a6407f027b7e2102ca063",
+      "legacy_absolute_sha256": "37e01cef8dd48fafb6f3b612ec01bcd7bab03235e846d6818025a1734a40d4c9",
       "authority_transform_status": "valid",
-      "authority_absolute_sha256": "1616161616161616161616161616161616161616161616161616161616161616",
+      "authority_absolute_sha256": "ab0621f13e796adde06d34cf49f75d511d8bda07cb4bd4c334e62c52f71943ac",
       "raw_unit_ids": [
-        "q0",
-        "q1"
+        "r0",
+        "r1"
       ]
     },
     {
@@ -96,26 +157,40 @@
       "source_block_indices": [
         1
       ],
-      "sample_start": 24000,
-      "sample_end": 44800,
+      "sample_start": 22400,
+      "sample_end": 45600,
       "sample_rate": 16000,
-      "physical_origin_seconds": 1.5,
-      "legacy_origin_seconds": 1.5,
+      "physical_origin_seconds": 1.4,
+      "legacy_origin_seconds": 1.4,
       "legacy_origin_kind": "nominal-route",
-      "authority_origin_seconds": 1.5,
-      "backend_model_config_sha256": "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000",
-      "route_input_sha256": "1717171717171717171717171717171717171717171717171717171717171717",
+      "authority_origin_seconds": 1.4,
+      "backend_model_config_sha256": "54d6ca41cca0304698bc3e2b3f43312795dab7387e132d6e1edbef481cefb164",
+      "route_input_sha256": "2a144af5954a52cd823bbb4f0a8ddcfe8a15b328f3c5d5842433cb74ba759c08",
       "strict_unit_status": "valid",
       "strict_failure": null,
-      "raw_units_sha256": "1818181818181818181818181818181818181818181818181818181818181818",
-      "relative_units_sha256": "1919191919191919191919191919191919191919191919191919191919191919",
-      "legacy_slice_sha256": "2020202020202020202020202020202020202020202020202020202020202020",
-      "legacy_absolute_sha256": "2121212121212121212121212121212121212121212121212121212121212121",
+      "raw_units_sha256": "da853c4d2ce322eae97013a45e82ac434ab803b9774dd189cc0c1d3ceeadc948",
+      "relative_units_sha256": "86b73e89875600bbfc354bfaeb8efdc94bde54387c6183994c76ce60c4c87568",
+      "legacy_retained_units": [
+        [
+          {
+            "text": "Second",
+            "start": 0.1,
+            "end": 0.7
+          },
+          {
+            "text": "line",
+            "start": 0.8,
+            "end": 1.35
+          }
+        ]
+      ],
+      "legacy_slice_sha256": "ed102bbbf63d92c5b90851ce916a0032d68547255412704be6359ac138980cf5",
+      "legacy_absolute_sha256": "ffc17a67e706940593e07b50d1112615cc1068e6ff27569bb754b08b878409e7",
       "authority_transform_status": "valid",
-      "authority_absolute_sha256": "2323232323232323232323232323232323232323232323232323232323232323",
+      "authority_absolute_sha256": "a381b95ca5cba06f3c545da011879a55b66e67d08127b7a6dcf1ce9257fe04e1",
       "raw_unit_ids": [
-        "q2",
-        "q3"
+        "r2",
+        "r3"
       ]
     },
     {
@@ -123,31 +198,45 @@
       "source_block_indices": [
         2
       ],
-      "sample_start": 48000,
-      "sample_end": 68800,
+      "sample_start": 46400,
+      "sample_end": 69600,
       "sample_rate": 16000,
-      "physical_origin_seconds": 3.0,
-      "legacy_origin_seconds": 2.9999,
+      "physical_origin_seconds": 2.9,
+      "legacy_origin_seconds": 2.9,
       "legacy_origin_kind": "nominal-route",
-      "authority_origin_seconds": 3.0,
-      "backend_model_config_sha256": "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0000",
-      "route_input_sha256": "2424242424242424242424242424242424242424242424242424242424242424",
+      "authority_origin_seconds": 2.9,
+      "backend_model_config_sha256": "54d6ca41cca0304698bc3e2b3f43312795dab7387e132d6e1edbef481cefb164",
+      "route_input_sha256": "2a144af5954a52cd823bbb4f0a8ddcfe8a15b328f3c5d5842433cb74ba759c08",
       "strict_unit_status": "valid",
       "strict_failure": null,
-      "raw_units_sha256": "2525252525252525252525252525252525252525252525252525252525252525",
-      "relative_units_sha256": "2626262626262626262626262626262626262626262626262626262626262626",
-      "legacy_slice_sha256": "2727272727272727272727272727272727272727272727272727272727272727",
-      "legacy_absolute_sha256": "2828282828282828282828282828282828282828282828282828282828282828",
+      "raw_units_sha256": "119f1035d1909ed847f5807a6c6871c2ea1c56b5bd29f67f527683391c166605",
+      "relative_units_sha256": "4087e427c01abeda2ca481116b9629f6c49b912b41d71184553a4e127233f132",
+      "legacy_retained_units": [
+        [
+          {
+            "text": "Call",
+            "start": 0.1,
+            "end": 0.55
+          },
+          {
+            "text": "response",
+            "start": 0.65,
+            "end": 1.35
+          }
+        ]
+      ],
+      "legacy_slice_sha256": "f91ab8b133b18833e316a9b103ad78615e59f350e89a967be01634abd180fde6",
+      "legacy_absolute_sha256": "317ec6526bf3dc91480a415645833d3b9838ea2a5e36d97e9601a3854eb9853e",
       "authority_transform_status": "valid",
-      "authority_absolute_sha256": "2929292929292929292929292929292929292929292929292929292929292929",
+      "authority_absolute_sha256": "63dd6427e6b1db9a2973dd144daa662e5c4d10e83e0ff815fc8e6cf0a5574e74",
       "raw_unit_ids": [
-        "q4",
-        "q5"
+        "r4",
+        "r5"
       ]
     }
   ],
   "legacy_distribution": {
-    "digest": "3030303030303030303030303030303030303030303030303030303030303030",
+    "digest": "ec931d2dcf527c5eba73349d8d69215ef004bee080e0a1ba66889c4a8a906ed5",
     "calls": [
       {
         "call_index": 0,
@@ -171,14 +260,14 @@
         ],
         "owner_unit_ids": [
           [
-            "q0",
-            "q1"
+            "r0",
+            "r1"
           ]
         ],
         "final_cursor": 2,
         "consumed_prefix_unit_ids": [
-          "q0",
-          "q1"
+          "r0",
+          "r1"
         ],
         "shortage_source_indices": [],
         "leftover_unit_ids": []
@@ -205,14 +294,14 @@
         ],
         "owner_unit_ids": [
           [
-            "q2",
-            "q3"
+            "r2",
+            "r3"
           ]
         ],
         "final_cursor": 2,
         "consumed_prefix_unit_ids": [
-          "q2",
-          "q3"
+          "r2",
+          "r3"
         ],
         "shortage_source_indices": [],
         "leftover_unit_ids": []
@@ -239,14 +328,14 @@
         ],
         "owner_unit_ids": [
           [
-            "q4",
-            "q5"
+            "r4",
+            "r5"
           ]
         ],
         "final_cursor": 2,
         "consumed_prefix_unit_ids": [
-          "q4",
-          "q5"
+          "r4",
+          "r5"
         ],
         "shortage_source_indices": [],
         "leftover_unit_ids": []
@@ -255,7 +344,7 @@
   },
   "authority_distribution": {
     "status": "valid",
-    "digest": "3131313131313131313131313131313131313131313131313131313131313131",
+    "digest": "e3d71e19b5f1b7a74b09c05bbea690678d7dd11d7fb1f833997fe3bc6ed5533f",
     "owner_source_indices": [
       0,
       1,
@@ -268,16 +357,16 @@
     ],
     "owner_unit_ids": [
       [
-        "q0",
-        "q1"
+        "r0",
+        "r1"
       ],
       [
-        "q2",
-        "q3"
+        "r2",
+        "r3"
       ],
       [
-        "q4",
-        "q5"
+        "r4",
+        "r5"
       ]
     ],
     "consumed_count": 6,
@@ -313,7 +402,7 @@
       "declared_raw_node_count": 6,
       "charged_call_count": 3,
       "limit_profile_kind": "production",
-      "limit_profile_digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+      "limit_profile_digest": "251b66817a8c22f753b7f6852c7005426262662aa8fe4a3acfd8b77164482391",
       "limits": {
         "call_limit": 4096,
         "state_limit": 4000000,
@@ -322,10 +411,10 @@
         "normalize_char_limit": 256000000
       },
       "totals": {
-        "states": 24,
+        "states": 12,
         "edges": 12,
         "intervals": 12,
-        "normalize_chars": 82
+        "normalize_chars": 166
       },
       "terminal_call_index": null,
       "denied_charge": null,
@@ -345,7 +434,7 @@
           "block_count": 1,
           "raw_node_count": 2,
           "typed_unit_count": 2,
-          "surface_chars": 18,
+          "surface_chars": 19,
           "strict_preflight_status": "valid",
           "strict_failure": null,
           "limits": {
@@ -356,18 +445,18 @@
           },
           "allocator": {
             "status": "complete",
-            "states": 4,
+            "states": 2,
             "edges": 2,
             "intervals": 2,
-            "normalize_chars": 9,
+            "normalize_chars": 25,
             "terminal_detail_code": null
           },
           "verifier": {
             "status": "complete",
-            "states": 4,
+            "states": 2,
             "edges": 2,
             "intervals": 2,
-            "normalize_chars": 9,
+            "normalize_chars": 25,
             "terminal_detail_code": null
           }
         },
@@ -386,7 +475,7 @@
           "block_count": 1,
           "raw_node_count": 2,
           "typed_unit_count": 2,
-          "surface_chars": 20,
+          "surface_chars": 21,
           "strict_preflight_status": "valid",
           "strict_failure": null,
           "limits": {
@@ -397,18 +486,18 @@
           },
           "allocator": {
             "status": "complete",
-            "states": 4,
+            "states": 2,
             "edges": 2,
             "intervals": 2,
-            "normalize_chars": 10,
+            "normalize_chars": 28,
             "terminal_detail_code": null
           },
           "verifier": {
             "status": "complete",
-            "states": 4,
+            "states": 2,
             "edges": 2,
             "intervals": 2,
-            "normalize_chars": 10,
+            "normalize_chars": 28,
             "terminal_detail_code": null
           }
         },
@@ -427,7 +516,7 @@
           "block_count": 1,
           "raw_node_count": 2,
           "typed_unit_count": 2,
-          "surface_chars": 44,
+          "surface_chars": 25,
           "strict_preflight_status": "valid",
           "strict_failure": null,
           "limits": {
@@ -438,18 +527,18 @@
           },
           "allocator": {
             "status": "complete",
-            "states": 4,
+            "states": 2,
             "edges": 2,
             "intervals": 2,
-            "normalize_chars": 22,
+            "normalize_chars": 30,
             "terminal_detail_code": null
           },
           "verifier": {
             "status": "complete",
-            "states": 4,
+            "states": 2,
             "edges": 2,
             "intervals": 2,
-            "normalize_chars": 22,
+            "normalize_chars": 30,
             "terminal_detail_code": null
           }
         }
@@ -461,84 +550,84 @@
     {
       "source_index": 0,
       "legacy_unit_ids": [
-        "q0",
-        "q1"
+        "r0",
+        "r1"
       ],
       "authority_unit_ids": [
-        "q0",
-        "q1"
+        "r0",
+        "r1"
       ],
       "word_data": [
         {
-          "unit_id": "q0",
+          "unit_id": "r0",
           "call_index": 0,
           "call_unit_index": 0,
           "text": "First",
-          "relative_start": 0.0,
-          "relative_end": 0.475,
-          "physical_origin_seconds": 0.125,
-          "start": 0.125,
-          "end": 0.6,
+          "relative_start": 0.1,
+          "relative_end": 0.575,
+          "physical_origin_seconds": 0.0249375,
+          "start": 0.1249375,
+          "end": 0.5999375,
           "provenance": "aligner",
-          "original_relative_start": 0.0,
-          "original_relative_end": 0.475
+          "original_relative_start": 0.1,
+          "original_relative_end": 0.575
         },
         {
-          "unit_id": "q1",
+          "unit_id": "r1",
           "call_index": 0,
           "call_unit_index": 1,
           "text": "line",
-          "relative_start": 0.575,
-          "relative_end": 1.125,
-          "physical_origin_seconds": 0.125,
-          "start": 0.7,
-          "end": 1.25,
+          "relative_start": 0.675,
+          "relative_end": 1.225,
+          "physical_origin_seconds": 0.0249375,
+          "start": 0.6999375000000001,
+          "end": 1.2499375000000001,
           "provenance": "aligner",
-          "original_relative_start": 0.575,
-          "original_relative_end": 1.125
+          "original_relative_start": 0.675,
+          "original_relative_end": 1.225
         }
       ],
-      "speech_start": 0.125,
-      "speech_end": 1.25
+      "speech_start": 0.1249375,
+      "speech_end": 1.2499375000000001
     },
     {
       "source_index": 1,
       "legacy_unit_ids": [
-        "q2",
-        "q3"
+        "r2",
+        "r3"
       ],
       "authority_unit_ids": [
-        "q2",
-        "q3"
+        "r2",
+        "r3"
       ],
       "word_data": [
         {
-          "unit_id": "q2",
+          "unit_id": "r2",
           "call_index": 1,
           "call_unit_index": 0,
           "text": "Second",
-          "relative_start": 0.0,
-          "relative_end": 0.6,
-          "physical_origin_seconds": 1.5,
+          "relative_start": 0.1,
+          "relative_end": 0.7,
+          "physical_origin_seconds": 1.4,
           "start": 1.5,
-          "end": 2.1,
+          "end": 2.0999999999999996,
           "provenance": "aligner",
-          "original_relative_start": 0.0,
-          "original_relative_end": 0.6
+          "original_relative_start": 0.1,
+          "original_relative_end": 0.7
         },
         {
-          "unit_id": "q3",
+          "unit_id": "r3",
           "call_index": 1,
           "call_unit_index": 1,
           "text": "line",
-          "relative_start": 0.7,
-          "relative_end": 1.25,
-          "physical_origin_seconds": 1.5,
+          "relative_start": 0.8,
+          "relative_end": 1.35,
+          "physical_origin_seconds": 1.4,
           "start": 2.2,
           "end": 2.75,
           "provenance": "aligner",
-          "original_relative_start": 0.7,
-          "original_relative_end": 1.25
+          "original_relative_start": 0.8,
+          "original_relative_end": 1.35
         }
       ],
       "speech_start": 1.5,
@@ -547,41 +636,41 @@
     {
       "source_index": 2,
       "legacy_unit_ids": [
-        "q4",
-        "q5"
+        "r4",
+        "r5"
       ],
       "authority_unit_ids": [
-        "q4",
-        "q5"
+        "r4",
+        "r5"
       ],
       "word_data": [
         {
-          "unit_id": "q4",
+          "unit_id": "r4",
           "call_index": 2,
           "call_unit_index": 0,
           "text": "Call",
-          "relative_start": 0.0,
-          "relative_end": 0.45,
-          "physical_origin_seconds": 3.0,
+          "relative_start": 0.1,
+          "relative_end": 0.55,
+          "physical_origin_seconds": 2.9,
           "start": 3.0,
           "end": 3.45,
           "provenance": "aligner",
-          "original_relative_start": 0.0,
-          "original_relative_end": 0.45
+          "original_relative_start": 0.1,
+          "original_relative_end": 0.55
         },
         {
-          "unit_id": "q5",
+          "unit_id": "r5",
           "call_index": 2,
           "call_unit_index": 1,
           "text": "response",
-          "relative_start": 0.55,
-          "relative_end": 1.25,
-          "physical_origin_seconds": 3.0,
+          "relative_start": 0.65,
+          "relative_end": 1.35,
+          "physical_origin_seconds": 2.9,
           "start": 3.55,
           "end": 4.25,
           "provenance": "aligner",
-          "original_relative_start": 0.55,
-          "original_relative_end": 1.25
+          "original_relative_start": 0.65,
+          "original_relative_end": 1.35
         }
       ],
       "speech_start": 3.0,
@@ -603,7 +692,7 @@
   },
   "profile_status": {
     "kind": "valid",
-    "source": "manifest-absent",
+    "source": "unsupported-manifest",
     "detail_code": null
   },
   "evidence_status": {
@@ -614,8 +703,8 @@
   "selected_outputs": {
     "engine_family": "boundary-v2",
     "vtt_present": true,
-    "vtt_sha256": "2da0e4719c6146ba8a8667de5de945ed18bd536aaf7beaadb1d485fc4d3fdbf0",
+    "vtt_sha256": "aae397b3fc14bfbf99e7c1b8ccf786740a5b822bbe3e897ae2275d3531a2c91c",
     "json_present": true,
-    "json_sha256": "227bd0a7b4b9268c16ec5aed2a18afcbe6391b71f036a5e79681478afe7d2aee"
+    "json_sha256": "a27ae53cd43798337a87845c69864c399728d550024ce64b7c37261c24f6713a"
   }
 }

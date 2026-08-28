@@ -5408,6 +5408,7 @@ def align(
                 alignment_texts=tuple(
                     str(block.get("alignment_text", block["text"])) for block in blocks
                 ),
+                source_texts=tuple(str(block["text"]) for block in blocks),
                 source_indices=tuple(int(block["source_index"]) for block in blocks),
                 language=iso,
                 prepared_audio_sample_count=prepared_sample_count,

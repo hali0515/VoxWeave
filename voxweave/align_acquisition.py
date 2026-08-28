@@ -1123,6 +1123,7 @@ class FreshAlignmentIssuer:
         context: IssuedAlignContext,
         *,
         alignment_texts: Sequence[str],
+        source_texts: Sequence[str] | None,
         source_indices: Sequence[int],
         language: str,
         prepared_audio_sample_count: int,
@@ -1146,11 +1147,14 @@ class FreshAlignmentIssuer:
         if type(sample_rate) is not int or sample_rate <= 0:
             raise ValueError("sample rate must be a positive exact integer")
         texts = tuple(alignment_texts)
+        sealed_texts = texts if source_texts is None else tuple(source_texts)
         original_sources = tuple(source_indices)
         if (
             len(original_sources) != len(texts)
+            or len(sealed_texts) != len(texts)
             or len(set(original_sources)) != len(original_sources)
             or any(type(index) is not int or index < 0 for index in original_sources)
+            or any(type(text) is not str for text in sealed_texts)
         ):
             raise ValueError(
                 "fresh acquisition source indices must be unique nonnegative integers"
@@ -1158,8 +1162,10 @@ class FreshAlignmentIssuer:
         consume_context_role(context, "acquisition", consumer="FreshAlignmentIssuer")
         self.context = context
         self.blocks = tuple(
-            AuthorityBlock(source_index, str(text))
-            for source_index, text in zip(original_sources, texts, strict=True)
+            AuthorityBlock(source_index, str(text), sealed_text)
+            for source_index, text, sealed_text in zip(
+                original_sources, texts, sealed_texts, strict=True
+            )
         )
         self.language = language
         self.prepared_audio_sample_count = prepared_audio_sample_count
@@ -1426,6 +1432,7 @@ def begin_fresh_alignment(
     context: IssuedAlignContext,
     *,
     alignment_texts: Sequence[str],
+    source_texts: Sequence[str] | None = None,
     source_indices: Sequence[int],
     language: str,
     prepared_audio_sample_count: int,
@@ -1442,6 +1449,7 @@ def begin_fresh_alignment(
         _ISSUER_TOKEN,
         context,
         alignment_texts=alignment_texts,
+        source_texts=source_texts,
         source_indices=source_indices,
         language=language,
         prepared_audio_sample_count=prepared_audio_sample_count,

@@ -2469,6 +2469,9 @@ def _w1_usable_audit(root: Mapping[str, Any]) -> bool:
     """Return the unsigned section 9.3 usability audit conjunction."""
     try:
         history = root["input_history"]
+        source_facts = root["source_facts"]
+        model_facts = source_facts["backend_model_config"]
+        route_facts = source_facts["route_input"]
         authority = root["authority_distribution"]
         work = authority["work"]
         owner_ranges = authority["owner_unit_ids"]
@@ -2477,6 +2480,11 @@ def _w1_usable_audit(root: Mapping[str, Any]) -> bool:
         return False
     if (
         not isinstance(history, Mapping)
+        or not isinstance(source_facts, Mapping)
+        or not isinstance(model_facts, Mapping)
+        or not isinstance(route_facts, Mapping)
+        or tuple(model_facts) != _MODEL_FACT_KEYS
+        or tuple(route_facts) != _ROUTE_FACT_KEYS
         or not isinstance(authority, Mapping)
         or not isinstance(work, Mapping)
         or history.get("authority_limit_profile_kind") != "production"

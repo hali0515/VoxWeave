@@ -3,20 +3,18 @@
 This directory is immutable comparison data for `scripts/p6_oracle.py`. The
 `inputs`, `media`, and `backend-receipts` trees describe reproducible inputs,
 while `expected` contains the approved reference sets. The detached runner
-projects candidate bytes in memory from those inputs and receipts. It also executes
-each recorded public command in an isolated clean source root and compares the bytes
-read from that command against the separately declared `expected/public-command`
-facts. CI comparison is read-only and has no rerecording path or checked-in
-candidate-output tree.
+projects the sole candidate authority in memory from those inputs and receipts. It also
+executes each recorded public command in an isolated clean source root and compares the
+bytes read from that command directly with the standalone projection. CI comparison is
+read-only and has no rerecording path or checked-in candidate-output tree.
 
 The selected-v2 reference sets contain complete VTT and main-JSON primaries. Align
 cases also contain the complete closed RAT-2 evidence sidecar, including physical-call
 geometry and selected-primary hash links. The combined case is a separate full golden,
-not a textual delta mask. Existing detached goldens stay independent from the immutable
-public-command goldens even when the two authorities produce different bytes. Every
-declared matrix vector names executable pytest evidence; `source-gates --check` executes
-the deduplicated set. Acoustic quality calibration remains owned by
-`scripts/calib_alignment.py`.
+not a textual delta mask. Public output has no parallel golden authority: every artifact
+must equal its case's independent standalone projection byte for byte. Every declared
+matrix vector names executable pytest evidence; `source-gates --check` executes the
+deduplicated set. Acoustic quality calibration remains owned by `scripts/calib_alignment.py`.
 
 Run the complete oracle gate program through the locale-pinned entry point:
 

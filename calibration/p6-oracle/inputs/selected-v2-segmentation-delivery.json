@@ -6,75 +6,182 @@
     "terminal": "fixed-point",
     "cues": [
       {
-        "unit_range": [0, 2],
-        "text": "第一声",
+        "unit_range": [
+          0,
+          5
+        ],
+        "text": "第一声問い答え余韻",
         "start": 0.1,
-        "end": 1.4,
+        "end": 4.65,
         "word_data": [
-          {"text": "第一", "start": 0.1, "end": 0.7},
-          {"text": "声", "start": 0.8, "end": 1.4}
+          {
+            "text": "第",
+            "start": 0.1,
+            "end": 0.7
+          },
+          {
+            "text": "一",
+            "start": 0.1,
+            "end": 0.7
+          },
+          {
+            "text": "声",
+            "start": 0.8,
+            "end": 1.4
+          },
+          {
+            "text": "問",
+            "start": 1.7,
+            "end": 2.3
+          },
+          {
+            "text": "い",
+            "start": 1.7,
+            "end": 2.3
+          },
+          {
+            "text": "答",
+            "start": 2.5,
+            "end": 3.2
+          },
+          {
+            "text": "え",
+            "start": 2.5,
+            "end": 3.2
+          },
+          {
+            "text": "余",
+            "start": 3.5,
+            "end": 4.4
+          },
+          {
+            "text": "韻",
+            "start": 3.5,
+            "end": 4.4
+          }
         ],
         "speech_start": 0.1,
-        "speech_end": 1.4,
-        "lyric": false,
-        "speaker_ids": ["SPEAKER_00"]
-      },
-      {
-        "unit_range": [2, 4],
-        "text": "問い\n答え",
-        "start": 1.7,
-        "end": 3.2,
-        "word_data": [
-          {"text": "問い", "start": 1.7, "end": 2.3},
-          {"text": "答え", "start": 2.5, "end": 3.2}
-        ],
-        "speech_start": 1.7,
-        "speech_end": 3.2,
-        "lyric": null,
-        "speaker_ids": ["SPEAKER_00", "SPEAKER_01"]
-      },
-      {
-        "unit_range": [4, 5],
-        "text": "余韻",
-        "start": 3.5,
-        "end": 4.4,
-        "word_data": [{"text": "余韻", "start": 3.5, "end": 4.4}],
-        "speech_start": 3.5,
         "speech_end": 4.4,
-        "lyric": true,
-        "speaker_ids": ["SPEAKER_01"]
+        "lyric": null,
+        "speaker_ids": [
+          "SPEAKER_00"
+        ]
       }
     ],
     "top_level_word_segments": [
-      {"text": "第一", "start": 0.1, "end": 0.7},
-      {"text": "声", "start": 0.8, "end": 1.4},
-      {"text": "問い", "start": 1.7, "end": 2.3},
-      {"text": "答え", "start": 2.5, "end": 3.2},
-      {"text": "余韻", "start": 3.5, "end": 4.4}
+      {
+        "text": "第一",
+        "start": 0.1,
+        "end": 0.7
+      },
+      {
+        "text": "声",
+        "start": 0.8,
+        "end": 1.4
+      },
+      {
+        "text": "問い",
+        "start": 1.7,
+        "end": 2.3
+      },
+      {
+        "text": "答え",
+        "start": 2.5,
+        "end": 3.2
+      },
+      {
+        "text": "余韻",
+        "start": 3.5,
+        "end": 4.4
+      }
     ],
     "carriers": {
-      "vad_speech": [[0.05, 1.45], [1.65, 3.25], [3.45, 4.45]],
-      "shot_changes": [1.6, 3.4],
-      "sing_spans": [[3.45, 4.45]],
+      "vad_speech": [
+        [
+          0.05,
+          1.45
+        ],
+        [
+          1.65,
+          3.25
+        ],
+        [
+          3.45,
+          4.45
+        ]
+      ],
+      "shot_changes": [
+        1.6,
+        3.4
+      ],
+      "sing_spans": [
+        [
+          3.45,
+          4.45
+        ]
+      ],
       "speaker_turns": {
         "present": true,
-        "value": [[0.05, 2.3, "SPEAKER_00"], [2.3, 4.45, "SPEAKER_01"]]
+        "value": [
+          [
+            0.05,
+            4.45,
+            "SPEAKER_00"
+          ]
+        ]
       },
-      "voiceprint_capture": "capture-segmentation-v2",
-      "voiceprint_media": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+      "voiceprint_capture": null,
+      "voiceprint_media": null
     },
     "manifest": {
-      "engine": "p5-boundary-v2",
-      "terminal": "fixed-point",
-      "degraded": [],
+      "manifest_version": 1,
+      "engine": "boundary-optimizer-v2",
+      "voxweave": "0.13.0",
+      "python": "3.13.12",
+      "language": "ja",
+      "profile": {
+        "max_line_length": 18,
+        "max_lines": 1,
+        "clause_ms": 560,
+        "vad_skip_ms": 1000,
+        "offline_ms": 980,
+        "min_cue_s": 0.5,
+        "max_cue_s": 7.0,
+        "glue_gap_s": 0.3,
+        "cps": 7.0,
+        "lag_out_s": 0.25,
+        "shot_snap_s": 0.458
+      },
+      "env": {
+        "gap_adaptive": false,
+        "vad_emission_mask": false
+      },
       "providers": {
-        "boundary": "issued-optimizer-selection",
-        "semantic": "disabled"
-      }
+        "sentences": {
+          "provider": "pysbd",
+          "version": "0.3.4"
+        },
+        "atoms": {
+          "provider": "budoux",
+          "version": "0.8.4"
+        },
+        "pos": {
+          "provider": "fugashi-unidic",
+          "version": "1.5.2",
+          "dict": "unidic-lite 1.0.8 (UnidicFeatures26)",
+          "ja_pos_enabled": true
+        }
+      },
+      "degraded": []
     }
   },
   "projection_inputs": {
     "timestamps": true,
-    "speaker_names": [["SPEAKER_00", "Aoi"], ["SPEAKER_01", "Ren"]]
+    "speaker_names": [
+      [
+        "SPEAKER_00",
+        "Aoi"
+      ]
+    ]
   }
 }

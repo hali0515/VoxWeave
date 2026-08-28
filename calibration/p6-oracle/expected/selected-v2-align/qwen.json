@@ -3,36 +3,36 @@
   "segments": [
     {
       "text": "First line",
-      "start": 0.125,
-      "end": 1.25
+      "start": 0.1249375,
+      "end": 1.3166666666666667
     },
     {
       "text": "Second line",
-      "start": 1.5,
-      "end": 2.75,
+      "start": 1.4,
+      "end": 2.8166666666666664,
       "lyric": true
     },
     {
-      "text": "Call\nresponse",
-      "start": 3.0,
-      "end": 4.25
+      "text": "Call response",
+      "start": 2.9,
+      "end": 4.5
     }
   ],
   "word_segments": [
     {
       "text": "First",
-      "start": 0.125,
-      "end": 0.6
+      "start": 0.1249375,
+      "end": 0.5999375
     },
     {
       "text": "line",
-      "start": 0.7,
-      "end": 1.25
+      "start": 0.6999375000000001,
+      "end": 1.2499375000000001
     },
     {
       "text": "Second",
       "start": 1.5,
-      "end": 2.1
+      "end": 2.0999999999999996
     },
     {
       "text": "line",
@@ -86,8 +86,6 @@
       "SPEAKER_01"
     ]
   ],
-  "voiceprint_capture": "capture-selected-v2",
-  "voiceprint_media": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "segmentation": {
     "engine": "p5-boundary-v2",
     "degraded": [],

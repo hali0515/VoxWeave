@@ -14,10 +14,12 @@ import hashlib
 import io
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -298,6 +300,176 @@ def _canonical_digest(value: object) -> str:
         value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
     ).encode("utf-8")
     return _sha256_bytes(encoded)
+
+
+def _frozen_json_bytes(value: object) -> bytes:
+    """Encode stable JSON independently of the production frozen serializer."""
+
+    def frame(payload: bytes) -> bytes:
+        return len(payload).to_bytes(8, "big") + payload
+
+    if value is None:
+        return b"N"
+    if type(value) is bool:
+        return b"B" + (b"\x01" if value else b"\x00")
+    if type(value) is int:
+        return b"I" + frame(str(value).encode("ascii"))
+    if type(value) is float:
+        if math.isnan(value):
+            classification = b"n"
+        elif value == math.inf:
+            classification = b"p"
+        elif value == -math.inf:
+            classification = b"m"
+        else:
+            classification = b"f"
+        return b"F" + classification + struct.pack(">d", value)
+    if type(value) is str:
+        return b"S" + frame(value.encode("utf-8", errors="surrogatepass"))
+    if type(value) is list:
+        payload = len(value).to_bytes(8, "big") + b"".join(
+            frame(_frozen_json_bytes(member)) for member in value
+        )
+        return b"A" + payload
+    if isinstance(value, Mapping):
+        members = [len(value).to_bytes(8, "big")]
+        for key, member in value.items():
+            if type(key) is not str:
+                _invalid("standalone stable JSON object key is not a string")
+            members.append(frame(key.encode("utf-8", errors="surrogatepass")))
+            members.append(frame(_frozen_json_bytes(member)))
+        return b"O" + b"".join(members)
+    _invalid(f"standalone stable JSON has unsupported {type(value).__name__}")
+
+
+def _frozen_json_digest(value: object) -> str:
+    return _sha256_bytes(_frozen_json_bytes(value))
+
+
+def _durable_fact_float(value: object, *, label: str) -> float | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        _invalid(f"{label} is not canonical binary64 text")
+    try:
+        decoded = float.fromhex(value)
+    except ValueError:
+        _invalid(f"{label} is not canonical binary64 text")
+    if not math.isfinite(decoded) or decoded.hex() != value:
+        _invalid(f"{label} is not canonical finite binary64 text")
+    return decoded
+
+
+def _same_optional_binary64(left: object, right: object) -> bool:
+    if left is None or right is None:
+        return left is right
+    return type(left) is float and type(right) is float and left.hex() == right.hex()
+
+
+def _durable_source_fact_digests(
+    value: object,
+    *,
+    context_content_digest: object,
+    language: object,
+    route: object,
+) -> tuple[Mapping[str, Any], Mapping[str, Any], str, str]:
+    facts = _closed_mapping(
+        value,
+        ("backend_model_config", "route_input"),
+        label="selected align durable source facts",
+    )
+    model_value = facts["backend_model_config"]
+    if not isinstance(model_value, Mapping):
+        _invalid("selected align model/config source facts are not an object")
+    model = model_value
+    if tuple(model) == ("route", "language", "backend", "model", "sample_rate"):
+        if (
+            model["route"] != route
+            or model["language"] != language
+            or type(model["backend"]) is not str
+            or not model["backend"]
+            or type(model["model"]) is not str
+            or not model["model"]
+            or type(model["sample_rate"]) is not int
+            or model["sample_rate"] <= 0
+        ):
+            _invalid("selected align model/config source facts are invalid")
+    elif tuple(model) == ("kind", "route", "language"):
+        if (
+            model["kind"] != "default"
+            or model["route"] != route
+            or model["language"] != language
+        ):
+            _invalid("selected align default model/config source facts are invalid")
+    else:
+        _invalid("selected align model/config source facts are not closed")
+
+    route_value = facts["route_input"]
+    if not isinstance(route_value, Mapping):
+        _invalid("selected align route-input source facts are not an object")
+    route_facts = route_value
+    if tuple(route_facts) == ("route", "language", "blocks", "crops"):
+        if route_facts["route"] != route or route_facts["language"] != language:
+            _invalid("selected align route-input facts disagree with evidence")
+        blocks = _closed_sequence(
+            route_facts["blocks"], label="selected align route-input blocks"
+        )
+        observed_sources: set[int] = set()
+        for block_value in blocks:
+            block = _closed_mapping(
+                block_value,
+                ("source_index", "alignment_text", "start", "end"),
+                label="selected align route-input block",
+            )
+            source_index = block["source_index"]
+            if (
+                type(source_index) is not int
+                or source_index < 0
+                or source_index in observed_sources
+                or type(block["alignment_text"]) is not str
+            ):
+                _invalid("selected align route-input block is invalid")
+            observed_sources.add(source_index)
+            _durable_fact_float(block["start"], label="route-input block start")
+            _durable_fact_float(block["end"], label="route-input block end")
+        crops = _closed_sequence(
+            route_facts["crops"], label="selected align route-input crops"
+        )
+        if route in ("ctc-full", "mms-full"):
+            if crops:
+                _invalid("selected align full-pass route carries crop facts")
+        elif route == "qwen-crop":
+            if len(crops) != len(blocks):
+                _invalid("selected align Qwen crop/block cardinality differs")
+        else:
+            _invalid("selected align route-input route is unknown")
+        for crop_value in crops:
+            if crop_value is None:
+                continue
+            crop = _closed_sequence(crop_value, label="selected align route-input crop")
+            if len(crop) != 2:
+                _invalid("selected align route-input crop is not one pair")
+            start = _durable_fact_float(crop[0], label="route-input crop start")
+            end = _durable_fact_float(crop[1], label="route-input crop end")
+            assert start is not None and end is not None
+            if start > end:
+                _invalid("selected align route-input crop is reversed")
+    elif tuple(route_facts) == ("kind", "context_content_digest", "route"):
+        if (
+            route_facts["kind"] != "default"
+            or route_facts["context_content_digest"] != context_content_digest
+            or route_facts["route"] != route
+        ):
+            _invalid("selected align default route-input facts are invalid")
+    else:
+        _invalid("selected align route-input source facts are not closed")
+
+    return (
+        model,
+        route_facts,
+        _canonical_digest(model),
+        _canonical_digest(route_facts),
+    )
 
 
 def _validate_file_fact(root: Path, fact: Mapping[str, Any], *, label: str) -> None:
@@ -649,32 +821,22 @@ def _validate_manifest_semantics(
             profile["test_case_id"] is not None
         ):
             _invalid(f"case {case_id} qualification metadata is inconsistent")
-        output_sets = {
-            "detached": case["expected_paths"],
-            "public-command": runtime["expected_paths"],
-        }
-        detached_artifacts = {output["artifact"] for output in output_sets["detached"]}
-        public_artifacts = {
-            output["artifact"] for output in output_sets["public-command"]
-        }
-        if detached_artifacts != public_artifacts:
-            _invalid(f"case {case_id} public and detached artifact sets differ")
-        for authority, outputs in output_sets.items():
-            artifacts = [output["artifact"] for output in outputs]
-            if len(artifacts) != len(set(artifacts)):
-                _invalid(f"case {case_id} declares a duplicate {authority} artifact")
-            for index, output in enumerate(outputs):
-                expected = _resolve_under(
-                    oracle_root,
-                    output["expected_path"],
-                    label=f"{case_id}.{authority}.expected[{index}]",
-                )
-                if not expected.is_file():
-                    _invalid(f"expected oracle output is missing: {expected}")
-                if expected.stat().st_size != output["size"]:
-                    _invalid(f"expected oracle output size differs: {expected}")
-                if _sha256_file(expected) != output["sha256"]:
-                    _invalid(f"expected oracle output digest differs: {expected}")
+        outputs = case["expected_paths"]
+        artifacts = [output["artifact"] for output in outputs]
+        if len(artifacts) != len(set(artifacts)):
+            _invalid(f"case {case_id} declares a duplicate artifact")
+        for index, output in enumerate(outputs):
+            expected = _resolve_under(
+                oracle_root,
+                output["expected_path"],
+                label=f"{case_id}.expected[{index}]",
+            )
+            if not expected.is_file():
+                _invalid(f"expected oracle output is missing: {expected}")
+            if expected.stat().st_size != output["size"]:
+                _invalid(f"expected oracle output size differs: {expected}")
+            if _sha256_file(expected) != output["sha256"]:
+                _invalid(f"expected oracle output digest differs: {expected}")
 
 
 def _load_checked_manifest(path: Path) -> Mapping[str, Any]:
@@ -742,6 +904,18 @@ def _compact_json(value: object) -> bytes:
 
 def _primary_json(value: object) -> bytes:
     try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        _invalid(f"detached primary projector cannot encode its delivery: {exc}")
+
+
+def _evidence_json(value: object) -> bytes:
+    try:
         return (
             json.dumps(
                 value,
@@ -752,11 +926,7 @@ def _primary_json(value: object) -> bytes:
             + b"\n"
         )
     except (TypeError, ValueError) as exc:
-        _invalid(f"detached primary projector cannot encode its delivery: {exc}")
-
-
-def _evidence_json(value: object) -> bytes:
-    return _primary_json(value)
+        _invalid(f"detached evidence projector cannot encode its delivery: {exc}")
 
 
 def _timestamp(seconds: object) -> str:
@@ -817,17 +987,27 @@ def _voice_text(text: str, decoration: Mapping[str, Any]) -> str:
     if speakers is None:
         return text
     rows = _closed_sequence(speakers, label="selected align line speakers")
-    lines = text.split("\n")
-    if len(rows) != len(lines):
-        _invalid("selected align line-speaker cardinality differs from cue lines")
-    rendered: list[str] = []
-    for line, row in zip(lines, rows, strict=True):
+    ownership: dict[str, set[str | None]] = {}
+    for row in rows:
         if not isinstance(row, list) or len(row) != 2:
             _invalid("selected align line-speaker row is malformed")
         name, bound_text = row
-        if bound_text != line or (name is not None and type(name) is not str):
+        if type(bound_text) is not str or (name is not None and type(name) is not str):
             _invalid("selected align line-speaker row is not content-bound")
-        rendered.append(line if name is None else f"<v {name}>{line}</v>")
+        normalized_name = name if isinstance(name, str) and name.strip() else None
+        ownership.setdefault(bound_text, set()).add(normalized_name)
+    lines = text.split("\n")
+    line_names = [
+        next(iter(candidates)) if len(candidates) == 1 else None
+        for line in lines
+        for candidates in (ownership.get(line, set()),)
+    ]
+    if not any(line_names):
+        return text
+    rendered = [
+        line if name is None else f"<v {name}>{line}</v>"
+        for line, name in zip(lines, line_names, strict=True)
+    ]
     return "\n".join(rendered)
 
 
@@ -981,6 +1161,7 @@ def _align_evidence(
             "receipt_digest",
             "language",
             "route",
+            "source_facts",
             "input_history",
             "route_plan",
             "physical_calls",
@@ -1009,6 +1190,85 @@ def _align_evidence(
     calls = _closed_sequence(core["physical_calls"], label="physical calls")
     if not calls:
         _invalid("selected align evidence has no physical call")
+    model_facts, route_facts, model_digest, route_digest = _durable_source_fact_digests(
+        core["source_facts"],
+        context_content_digest=core["context_content_digest"],
+        language=core["language"],
+        route=core["route"],
+    )
+    route_plan = _closed_mapping(
+        core["route_plan"],
+        ("digest", "entries"),
+        label="selected align route plan",
+    )
+    route_entries: list[Mapping[str, Any]] = []
+    for expected_delivery_index, entry_value in enumerate(
+        _closed_sequence(route_plan["entries"], label="selected align route entries")
+    ):
+        entry = _closed_mapping(
+            entry_value,
+            (
+                "delivery_index",
+                "source_index",
+                "route_start",
+                "route_end",
+                "action",
+                "call_index",
+                "skip_reason",
+            ),
+            label="selected align route entry",
+        )
+        if (
+            entry["delivery_index"] != expected_delivery_index
+            or type(entry["source_index"]) is not int
+            or entry["source_index"] < 0
+            or (
+                entry["route_start"] is not None
+                and (
+                    type(entry["route_start"]) is not float
+                    or not math.isfinite(entry["route_start"])
+                )
+            )
+            or (
+                entry["route_end"] is not None
+                and (
+                    type(entry["route_end"]) is not float
+                    or not math.isfinite(entry["route_end"])
+                )
+            )
+        ):
+            _invalid("selected align route entry is invalid")
+        route_entries.append(entry)
+    legacy = _closed_mapping(
+        core["legacy_distribution"],
+        ("digest", "calls"),
+        label="selected align legacy distribution",
+    )
+    legacy_rows = _closed_sequence(
+        legacy["calls"], label="selected align legacy call receipts"
+    )
+    legacy_keys = (
+        "owner_source_indices",
+        "expected_counts",
+        "requested_ranges",
+        "realized_ranges",
+        "owner_unit_ids",
+        "final_cursor",
+        "consumed_prefix_unit_ids",
+        "shortage_source_indices",
+        "leftover_unit_ids",
+    )
+    legacy_by_call: dict[int, Mapping[str, Any]] = {}
+    for row in legacy_rows:
+        receipt = _closed_mapping(
+            row,
+            ("call_index", *legacy_keys),
+            label="selected align legacy call receipt",
+        )
+        call_index = receipt["call_index"]
+        if type(call_index) is not int or call_index in legacy_by_call:
+            _invalid("selected align legacy call order is invalid")
+        legacy_by_call[call_index] = receipt
     for row in calls:
         call = _closed_mapping(
             row,
@@ -1028,6 +1288,7 @@ def _align_evidence(
                 "strict_failure",
                 "raw_units_sha256",
                 "relative_units_sha256",
+                "legacy_retained_units",
                 "legacy_slice_sha256",
                 "legacy_absolute_sha256",
                 "authority_transform_status",
@@ -1060,6 +1321,108 @@ def _align_evidence(
             _invalid("selected align sample-origin call does not match geometry")
         if origin_kind == "nominal-route" and core["route"] != "qwen-crop":
             _invalid("selected align nominal origin appears outside Qwen")
+        if call["backend_model_config_sha256"] != model_digest:
+            _invalid("selected align model/config digest differs from source facts")
+        if call["route_input_sha256"] != route_digest:
+            _invalid("selected align route-input digest differs from source facts")
+        if (
+            tuple(model_facts)
+            == ("route", "language", "backend", "model", "sample_rate")
+            and call["sample_rate"] != model_facts["sample_rate"]
+        ):
+            _invalid("selected align model sample rate differs from physical call")
+        retained = _closed_sequence(
+            call["legacy_retained_units"],
+            label="selected align retained legacy groups",
+        )
+        if len(retained) != len(call["source_block_indices"]):
+            _invalid("selected align retained legacy groups differ from call owners")
+        absolute_retained: list[list[dict[str, Any]]] = []
+        for group in retained:
+            absolute_group: list[dict[str, Any]] = []
+            for unit in _closed_sequence(
+                group, label="selected align retained legacy group"
+            ):
+                retained_unit = _closed_mapping(
+                    unit,
+                    ("text", "start", "end"),
+                    label="selected align retained legacy unit",
+                )
+                if type(retained_unit["text"]) is not str or any(
+                    type(retained_unit[name]) not in (int, float)
+                    or not math.isfinite(retained_unit[name])
+                    for name in ("start", "end")
+                ):
+                    _invalid("selected align retained legacy unit is invalid")
+                if retained_unit["start"] > retained_unit["end"]:
+                    _invalid("selected align retained legacy unit is reversed")
+                if origin_kind == "identity":
+                    absolute_start = retained_unit["start"]
+                    absolute_end = retained_unit["end"]
+                else:
+                    absolute_start = (
+                        retained_unit["start"] + call["legacy_origin_seconds"]
+                    )
+                    absolute_end = retained_unit["end"] + call["legacy_origin_seconds"]
+                if (
+                    not math.isfinite(absolute_start)
+                    or not math.isfinite(absolute_end)
+                    or absolute_start > absolute_end
+                ):
+                    _invalid("selected align absolute legacy unit is invalid")
+                absolute_group.append(
+                    {
+                        "text": retained_unit["text"],
+                        "start": absolute_start,
+                        "end": absolute_end,
+                    }
+                )
+            absolute_retained.append(absolute_group)
+        if call["legacy_absolute_sha256"] != _frozen_json_digest(absolute_retained):
+            _invalid("selected align legacy absolute digest is not independently true")
+        receipt = legacy_by_call.get(call["call_index"])
+        if receipt is None:
+            _invalid("selected align physical call lacks a legacy receipt")
+        slice_value = {name: receipt[name] for name in legacy_keys}
+        if call["legacy_slice_sha256"] != _frozen_json_digest(slice_value):
+            _invalid("selected align legacy slice digest is not independently true")
+    if tuple(route_facts) == ("route", "language", "blocks", "crops"):
+        fact_blocks = cast(Sequence[Mapping[str, Any]], route_facts["blocks"])
+        fact_crops = cast(Sequence[Any], route_facts["crops"])
+        if len(fact_blocks) != len(route_entries):
+            _invalid("selected align source facts differ from route-plan cardinality")
+        for index, (block, entry) in enumerate(
+            zip(fact_blocks, route_entries, strict=True)
+        ):
+            if block["source_index"] != entry["source_index"]:
+                _invalid("selected align source facts differ from route delivery order")
+            block_start = _durable_fact_float(
+                block["start"], label="route-input block start"
+            )
+            block_end = _durable_fact_float(block["end"], label="route-input block end")
+            if route_facts["route"] in ("ctc-full", "mms-full"):
+                if not _same_optional_binary64(block_start, entry["route_start"]):
+                    _invalid("selected align full-pass start differs from source facts")
+                if not _same_optional_binary64(block_end, entry["route_end"]):
+                    _invalid("selected align full-pass end differs from source facts")
+                continue
+            crop = fact_crops[index]
+            if entry["action"] == "qwen-call":
+                if not isinstance(crop, list):
+                    _invalid("selected align Qwen call lacks durable crop facts")
+                crop_start = _durable_fact_float(
+                    crop[0], label="route-input crop start"
+                )
+                if not _same_optional_binary64(crop_start, entry["route_start"]):
+                    _invalid("selected align Qwen start differs from crop facts")
+            elif crop is not None:
+                _invalid("selected align Qwen skip carries durable crop facts")
+            elif not _same_optional_binary64(block_start, entry["route_start"]):
+                _invalid("selected align Qwen skipped start differs from source facts")
+            if block_end is not None and not _same_optional_binary64(
+                block_end, entry["route_end"]
+            ):
+                _invalid("selected align Qwen end differs from source facts")
     value = {
         "schema_version": core["schema_version"],
         "kind": "fresh-alignment",
@@ -1505,7 +1868,7 @@ def _execute_public_case(
                 f"public command {case['id']} did not report successful completion"
             )
         artifacts: dict[str, bytes] = {}
-        for output in runtime["expected_paths"]:
+        for output in case["expected_paths"]:
             artifact = output["artifact"]
             path = _public_artifact_path(
                 artifact,
@@ -1865,18 +2228,15 @@ def _compare(manifest: Mapping[str, Any], *, manifest_path: Path) -> list[str]:
         public = _execute_public_case(case, manifest_path=manifest_path)
         runtime = cast(Mapping[str, Any], case["public_runtime"])
         declared_artifacts = {output["artifact"] for output in case["expected_paths"]}
-        public_declared_artifacts = {
-            output["artifact"] for output in runtime["expected_paths"]
-        }
         if set(candidates) != declared_artifacts:
             mismatches.append(
                 f"detached-authority/{case['id']}: artifact set "
                 f"{sorted(candidates)} != {sorted(declared_artifacts)}"
             )
-        if set(public.artifacts) != public_declared_artifacts:
+        if set(public.artifacts) != declared_artifacts:
             mismatches.append(
                 f"public-command/{case['id']}: artifact set "
-                f"{sorted(public.artifacts)} != {sorted(public_declared_artifacts)}"
+                f"{sorted(public.artifacts)} != {sorted(declared_artifacts)}"
             )
         if case["command"] == "align" and case["reference_set"] != "6e6033f":
             verification = public.evidence_verification
@@ -1927,33 +2287,13 @@ def _compare(manifest: Mapping[str, Any], *, manifest_path: Path) -> list[str]:
                 mismatches.append(
                     f"detached-projector/{case['id']}/{artifact}: digest mismatch"
                 )
-        for output in runtime["expected_paths"]:
-            artifact = output["artifact"]
-            expected = _resolve_under(
-                oracle_root,
-                output["expected_path"],
-                label="public-command expected output",
-            )
-            expected_declared.add(expected)
-            try:
-                expected_bytes = expected.read_bytes()
-            except OSError as exc:
-                _invalid(f"cannot compare public-command oracle output: {exc}")
             public_bytes = public.artifacts.get(artifact)
             if public_bytes is None:
                 continue
-            if public_bytes != expected_bytes:
+            if public_bytes != candidate_bytes:
                 mismatches.append(
                     f"public-command/{case['id']}/{artifact}: byte mismatch != "
-                    f"{expected.relative_to(oracle_root)}"
-                )
-            if len(public_bytes) != output["size"]:
-                mismatches.append(
-                    f"public-command/{case['id']}/{artifact}: size mismatch"
-                )
-            if _sha256_bytes(public_bytes) != output["sha256"]:
-                mismatches.append(
-                    f"public-command/{case['id']}/{artifact}: digest mismatch"
+                    "standalone-projector"
                 )
 
     expected_tree = _tree_files(oracle_root / "expected")
@@ -1976,13 +2316,6 @@ def _comparison_report(
         "artifact_count": sum(
             len(case["expected_paths"]) for case in manifest["cases"]
         ),
-        "authority_artifact_counts": {
-            "detached": sum(len(case["expected_paths"]) for case in manifest["cases"]),
-            "public-command": sum(
-                len(case["public_runtime"]["expected_paths"])
-                for case in manifest["cases"]
-            ),
-        },
         "case_count": len(manifest["cases"]),
         "command": "compare",
         "failure_count": len(failures),

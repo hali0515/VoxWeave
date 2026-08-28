@@ -214,18 +214,12 @@
       "required": [
         "fixture",
         "expected_family",
-        "expected_paths",
         "expected_trace",
         "expected_w1_usable"
       ],
       "properties": {
         "fixture": {"$ref": "#/$defs/path"},
         "expected_family": {"enum": ["legacy-v1", "boundary-v2"]},
-        "expected_paths": {
-          "type": "array",
-          "minItems": 1,
-          "items": {"$ref": "#/$defs/outputFact"}
-        },
         "expected_trace": {
           "anyOf": [
             {

@@ -1,7 +1,7 @@
 {
   "delivery": {
-    "context_content_digest": "4444444444444444444444444444444444444444444444444444444444444444",
-    "receipt_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "context_content_digest": "a70dc3c4ca1317a8df3b464b3262a5266b87f4bea2c7c4ef1926bd2a05a54386",
+    "receipt_digest": "7303f871c61deb264806b404026d9ecca5373d458a864d80586f25f08d2c2553",
     "engine_family": "boundary-v2",
     "route_kind": "ctc-full",
     "cues": [
@@ -9,10 +9,18 @@
         "source_index": 0,
         "text": "FIRST",
         "start": 0.2,
-        "end": 0.9,
+        "end": 1.0166666666666668,
         "lyric": false,
-        "unit_ids": ["c0"],
-        "word_data": [{"text": "FIRST", "start": 0.2, "end": 0.9}],
+        "unit_ids": [
+          "r0"
+        ],
+        "word_data": [
+          {
+            "text": "FIRST",
+            "start": 0.2,
+            "end": 0.9
+          }
+        ],
         "speech_start": 0.2,
         "speech_end": 0.9
       },
@@ -20,57 +28,125 @@
         "source_index": 1,
         "text": "SECOND",
         "start": 1.1,
-        "end": 1.8,
+        "end": 2.05,
         "lyric": false,
-        "unit_ids": ["c1"],
-        "word_data": [{"text": "SECOND", "start": 1.1, "end": 1.8}],
+        "unit_ids": [
+          "r1"
+        ],
+        "word_data": [
+          {
+            "text": "SECOND",
+            "start": 1.1,
+            "end": 1.8
+          }
+        ],
         "speech_start": 1.1,
         "speech_end": 1.8
       }
     ],
     "word_segments": [
-      {"text": "FIRST", "start": 0.2, "end": 0.9},
-      {"text": "SECOND", "start": 1.1, "end": 1.8}
+      {
+        "text": "FIRST",
+        "start": 0.2,
+        "end": 0.9
+      },
+      {
+        "text": "SECOND",
+        "start": 1.1,
+        "end": 1.8
+      }
     ]
   },
   "projection_inputs": {
     "language": "en",
     "source_blocks": [
-      {"source_index": 0, "speaker": null, "speakers": null},
-      {"source_index": 1, "speaker": null, "speakers": null}
+      {
+        "source_index": 0,
+        "speaker": null,
+        "speakers": null
+      },
+      {
+        "source_index": 1,
+        "speaker": null,
+        "speakers": null
+      }
     ],
-    "vad_speech": [[0.15, 0.95], [1.05, 1.85]],
+    "vad_speech": [
+      [
+        0.15,
+        0.95
+      ],
+      [
+        1.05,
+        1.85
+      ]
+    ],
     "shot_changes": null,
     "sing_spans": null,
-    "speaker_turns": {"present": true, "value": null},
+    "speaker_turns": {
+      "present": true,
+      "value": null
+    },
     "voiceprint_capture": null,
     "voiceprint_media": null,
-    "segmentation": {"engine": "p5-boundary-v2", "degraded": [], "providers": {}}
+    "segmentation": {
+      "engine": "p5-boundary-v2",
+      "degraded": [],
+      "providers": {}
+    }
   },
   "evidence_core": {
     "schema_version": 8,
-    "context_content_digest": "4444444444444444444444444444444444444444444444444444444444444444",
-    "receipt_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "context_content_digest": "a70dc3c4ca1317a8df3b464b3262a5266b87f4bea2c7c4ef1926bd2a05a54386",
+    "receipt_digest": "7303f871c61deb264806b404026d9ecca5373d458a864d80586f25f08d2c2553",
     "language": "en",
     "route": "ctc-full",
+    "source_facts": {
+      "backend_model_config": {
+        "route": "ctc-full",
+        "language": "en",
+        "backend": "ctc",
+        "model": "detached-synthetic-ctc",
+        "sample_rate": 16000
+      },
+      "route_input": {
+        "route": "ctc-full",
+        "language": "en",
+        "blocks": [
+          {
+            "source_index": 0,
+            "alignment_text": "FIRST",
+            "start": "0x1.999999999999ap-3",
+            "end": "0x1.ccccccccccccdp-1"
+          },
+          {
+            "source_index": 1,
+            "alignment_text": "SECOND",
+            "start": "0x1.199999999999ap+0",
+            "end": "0x1.ccccccccccccdp+0"
+          }
+        ],
+        "crops": []
+      }
+    },
     "input_history": {
       "vtt_present": true,
       "vtt_size": 82,
-      "vtt_sha256": "abab68452707bfbab149aae3c3b14f4af298016c4f3121ea23e1ef65f86c35f2",
+      "vtt_sha256": "86f3d91bd9cbfc19b510fe87eeca281a5685d62a3de21454c8b2b9b93067bacf",
       "sibling_json_present": true,
-      "sibling_json_size": 99,
-      "sibling_json_sha256": "4cc95ff2d35a1e2010d6032bd44ef6bb464178df98b530b4671e5e2463b4c0fa",
-      "block_content_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "sibling_json_size": 247,
+      "sibling_json_sha256": "7ef89f1a3cb6d1e539641089a11a1e6d10014b5b1d8adbffdae051e16373542d",
+      "block_content_sha256": "b9be749683fcc6d7e8842adaa9426f296ad889e90020358e2fe41b22599780dc",
       "registry_family": "boundary-v2",
-      "media_fingerprint": "7777777777777777777777777777777777777777777777777777777777777777",
+      "media_fingerprint": "7cfa134e694c687b86f7adf3e37ec9c382c45e2a663827b5db77ad32fcfd792d",
       "media_logical_id": "explicit:episode.wav",
       "media_display_name": "episode.wav",
-      "prepared_audio_size": 7680044,
-      "prepared_audio_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-      "profile_input_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
-      "evidence_carriers_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "prepared_audio_size": 96044,
+      "prepared_audio_sha256": "d303811b8c84619667cd0501342f84ec6cbe69f7aa3856dcf52fabda374c92b8",
+      "profile_input_sha256": "3527ae86ccfedbefa680636f72e7a1755158756ca8ab47aff23f8b357bc7c76e",
+      "evidence_carriers_sha256": "c6ed35e8d9d9f6e29fc6356bd830fb5263b5b03de307818804d66e7a7da94b46",
       "authority_limit_profile_kind": "production",
-      "authority_limit_profile_digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
+      "authority_limit_profile_digest": "251b66817a8c22f753b7f6852c7005426262662aa8fe4a3acfd8b77164482391",
       "legacy_policy_binary64": {
         "min_cue_sec": "0000000000000000",
         "tiny_cue_sec": "3fc999999999999a",
@@ -80,48 +156,120 @@
       "expected_vtt_sha256": null
     },
     "route_plan": {
-      "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "digest": "e7320e0a2010a3064b92b706ac456c0d8ede1ca1928f7b2de960f9dd00aa8f3c",
       "entries": [
-        {"delivery_index": 0, "source_index": 0, "route_start": 100.0, "route_end": 101.0, "action": "full-pass-member", "call_index": 0, "skip_reason": null},
-        {"delivery_index": 1, "source_index": 1, "route_start": 0.0, "route_end": 1.0, "action": "full-pass-member", "call_index": 0, "skip_reason": null}
+        {
+          "delivery_index": 0,
+          "source_index": 0,
+          "route_start": 0.2,
+          "route_end": 0.9,
+          "action": "full-pass-member",
+          "call_index": 0,
+          "skip_reason": null
+        },
+        {
+          "delivery_index": 1,
+          "source_index": 1,
+          "route_start": 1.1,
+          "route_end": 1.8,
+          "action": "full-pass-member",
+          "call_index": 0,
+          "skip_reason": null
+        }
       ]
     },
     "physical_calls": [
       {
         "call_index": 0,
-        "source_block_indices": [0, 1],
+        "source_block_indices": [
+          0,
+          1
+        ],
         "sample_start": 0,
-        "sample_end": 1920000,
+        "sample_end": 48000,
         "sample_rate": 16000,
         "physical_origin_seconds": 0.0,
         "legacy_origin_seconds": 0.0,
         "legacy_origin_kind": "identity",
         "authority_origin_seconds": 0.0,
-        "backend_model_config_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "route_input_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "backend_model_config_sha256": "f6757a18f81abc408e42b5710f275f7b85ffd5d9980ea9203436f3da580e336f",
+        "route_input_sha256": "5a3277bab12cbef1a6c2199ea2bdd2991f9d6d53c60debe410aa87daf31379fd",
         "strict_unit_status": "valid",
         "strict_failure": null,
-        "raw_units_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-        "relative_units_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "legacy_slice_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-        "legacy_absolute_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "raw_units_sha256": "d7c9c4eb6fdc760d84c3a4b3cb2057d50e5d5857ebf579cf6554875a4615fd47",
+        "relative_units_sha256": "8658a355b99ce349f81acd667daf4c5a3c27b5881b544c0bb84bb1ecd1062958",
+        "legacy_retained_units": [
+          [
+            {
+              "text": "FIRST",
+              "start": 0.2,
+              "end": 0.9
+            }
+          ],
+          [
+            {
+              "text": "SECOND",
+              "start": 1.1,
+              "end": 1.8
+            }
+          ]
+        ],
+        "legacy_slice_sha256": "49637100b4d6061e0c1107a2064bd356481446f5d641ea2fb5f8457d68216c8e",
+        "legacy_absolute_sha256": "7b2649ab0fa49f62d332b38b8195b5303ac0c5281675786c7797f1e95538a208",
         "authority_transform_status": "valid",
-        "authority_absolute_sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
-        "raw_unit_ids": ["c0", "c1"]
+        "authority_absolute_sha256": "a9221f5c47310a6411679f0689db9487f102d2fee54207e86572e33d873b8c8b",
+        "raw_unit_ids": [
+          "r0",
+          "r1"
+        ]
       }
     ],
     "legacy_distribution": {
-      "digest": "1010101010101010101010101010101010101010101010101010101010101010",
+      "digest": "01f233679961a2e58458706b11889d5a484d1fef50573913cbeb3a9036357cb5",
       "calls": [
         {
           "call_index": 0,
-          "owner_source_indices": [0, 1],
-          "expected_counts": [1, 1],
-          "requested_ranges": [[0, 1], [1, 2]],
-          "realized_ranges": [[0, 1], [1, 2]],
-          "owner_unit_ids": [["c0"], ["c1"]],
+          "owner_source_indices": [
+            0,
+            1
+          ],
+          "expected_counts": [
+            1,
+            1
+          ],
+          "requested_ranges": [
+            [
+              0,
+              1
+            ],
+            [
+              1,
+              2
+            ]
+          ],
+          "realized_ranges": [
+            [
+              0,
+              1
+            ],
+            [
+              1,
+              2
+            ]
+          ],
+          "owner_unit_ids": [
+            [
+              "r0"
+            ],
+            [
+              "r1"
+            ]
+          ],
           "final_cursor": 2,
-          "consumed_prefix_unit_ids": ["c0", "c1"],
+          "consumed_prefix_unit_ids": [
+            "r0",
+            "r1"
+          ],
           "shortage_source_indices": [],
           "leftover_unit_ids": []
         }
@@ -129,10 +277,23 @@
     },
     "authority_distribution": {
       "status": "valid",
-      "digest": "2020202020202020202020202020202020202020202020202020202020202020",
-      "owner_source_indices": [0, 1],
-      "expected_counts": [1, 1],
-      "owner_unit_ids": [["c0"], ["c1"]],
+      "digest": "db3be823a66120f7a71fb2e43141640e6f97b1bb02c0ea74c4bbcb441c89e5b6",
+      "owner_source_indices": [
+        0,
+        1
+      ],
+      "expected_counts": [
+        1,
+        1
+      ],
+      "owner_unit_ids": [
+        [
+          "r0"
+        ],
+        [
+          "r1"
+        ]
+      ],
       "consumed_count": 2,
       "leftover_unit_ids": [],
       "reasons": [],
@@ -141,8 +302,18 @@
         "route_status": "valid",
         "route_mismatch": null,
         "route_claims": [
-          {"owner_kind": "call", "owner_index": 0, "delivery_index": 0, "source_index": 0},
-          {"owner_kind": "call", "owner_index": 0, "delivery_index": 1, "source_index": 1}
+          {
+            "owner_kind": "call",
+            "owner_index": 0,
+            "delivery_index": 0,
+            "source_index": 0
+          },
+          {
+            "owner_kind": "call",
+            "owner_index": 0,
+            "delivery_index": 1,
+            "source_index": 1
+          }
         ],
         "declared_delivery_block_count": 2,
         "declared_call_count": 1,
@@ -150,26 +321,65 @@
         "declared_raw_node_count": 2,
         "charged_call_count": 1,
         "limit_profile_kind": "production",
-        "limit_profile_digest": "7fe1e6689f237536a969041bd3249482e7b33c1cd6a5821e2a7b96fe1576cfd5",
-        "limits": {"call_limit": 4096, "state_limit": 4000000, "edge_limit": 16000000, "interval_limit": 4000000, "normalize_char_limit": 256000000},
-        "totals": {"states": 8, "edges": 4, "intervals": 4, "normalize_chars": 22},
+        "limit_profile_digest": "251b66817a8c22f753b7f6852c7005426262662aa8fe4a3acfd8b77164482391",
+        "limits": {
+          "call_limit": 4096,
+          "state_limit": 4000000,
+          "edge_limit": 16000000,
+          "interval_limit": 4000000,
+          "normalize_char_limit": 256000000
+        },
+        "totals": {
+          "states": 6,
+          "edges": 6,
+          "intervals": 6,
+          "normalize_chars": 68
+        },
         "terminal_call_index": null,
         "denied_charge": null,
         "calls": [
           {
             "call_index": 0,
-            "route_claim_positions": [0, 1],
-            "source_block_indices": [0, 1],
-            "raw_node_range": [0, 2],
+            "route_claim_positions": [
+              0,
+              1
+            ],
+            "source_block_indices": [
+              0,
+              1
+            ],
+            "raw_node_range": [
+              0,
+              2
+            ],
             "block_count": 2,
             "raw_node_count": 2,
             "typed_unit_count": 2,
             "surface_chars": 22,
             "strict_preflight_status": "valid",
             "strict_failure": null,
-            "limits": {"state_limit": 1000000, "edge_limit": 4000000, "interval_limit": 1000000, "normalize_char_limit": 64000000},
-            "allocator": {"status": "complete", "states": 4, "edges": 2, "intervals": 2, "normalize_chars": 11, "terminal_detail_code": null},
-            "verifier": {"status": "complete", "states": 4, "edges": 2, "intervals": 2, "normalize_chars": 11, "terminal_detail_code": null}
+            "limits": {
+              "state_limit": 1000000,
+              "edge_limit": 4000000,
+              "interval_limit": 1000000,
+              "normalize_char_limit": 64000000
+            },
+            "allocator": {
+              "status": "complete",
+              "states": 3,
+              "edges": 3,
+              "intervals": 3,
+              "normalize_chars": 34,
+              "terminal_detail_code": null
+            },
+            "verifier": {
+              "status": "complete",
+              "states": 3,
+              "edges": 3,
+              "intervals": 3,
+              "normalize_chars": 34,
+              "terminal_detail_code": null
+            }
           }
         ],
         "skipped_blocks": []
@@ -178,27 +388,81 @@
     "blocks": [
       {
         "source_index": 0,
-        "legacy_unit_ids": ["c0"],
-        "authority_unit_ids": ["c0"],
-        "word_data": [{"unit_id": "c0", "call_index": 0, "call_unit_index": 0, "text": "FIRST", "relative_start": 0.2, "relative_end": 0.9, "physical_origin_seconds": 0.0, "start": 0.2, "end": 0.9, "provenance": "aligner", "original_relative_start": 0.2, "original_relative_end": 0.9}],
+        "legacy_unit_ids": [
+          "r0"
+        ],
+        "authority_unit_ids": [
+          "r0"
+        ],
+        "word_data": [
+          {
+            "unit_id": "r0",
+            "call_index": 0,
+            "call_unit_index": 0,
+            "text": "FIRST",
+            "relative_start": 0.2,
+            "relative_end": 0.9,
+            "physical_origin_seconds": 0.0,
+            "start": 0.2,
+            "end": 0.9,
+            "provenance": "aligner",
+            "original_relative_start": 0.2,
+            "original_relative_end": 0.9
+          }
+        ],
         "speech_start": 0.2,
         "speech_end": 0.9
       },
       {
         "source_index": 1,
-        "legacy_unit_ids": ["c1"],
-        "authority_unit_ids": ["c1"],
-        "word_data": [{"unit_id": "c1", "call_index": 0, "call_unit_index": 1, "text": "SECOND", "relative_start": 1.1, "relative_end": 1.8, "physical_origin_seconds": 0.0, "start": 1.1, "end": 1.8, "provenance": "aligner", "original_relative_start": 1.1, "original_relative_end": 1.8}],
+        "legacy_unit_ids": [
+          "r1"
+        ],
+        "authority_unit_ids": [
+          "r1"
+        ],
+        "word_data": [
+          {
+            "unit_id": "r1",
+            "call_index": 0,
+            "call_unit_index": 1,
+            "text": "SECOND",
+            "relative_start": 1.1,
+            "relative_end": 1.8,
+            "physical_origin_seconds": 0.0,
+            "start": 1.1,
+            "end": 1.8,
+            "provenance": "aligner",
+            "original_relative_start": 1.1,
+            "original_relative_end": 1.8
+          }
+        ],
         "speech_start": 1.1,
         "speech_end": 1.8
       }
     ],
     "raw_unit_count": 2,
-    "strict_input_status": {"kind": "valid", "detail_code": null},
-    "seed_status": {"kind": "valid", "reasons": []},
-    "v2_policy_status": {"kind": "valid", "detail_code": null},
-    "profile_status": {"kind": "valid", "source": "manifest-absent", "detail_code": null},
-    "evidence_status": {"kind": "valid", "detail_code": null},
+    "strict_input_status": {
+      "kind": "valid",
+      "detail_code": null
+    },
+    "seed_status": {
+      "kind": "valid",
+      "reasons": []
+    },
+    "v2_policy_status": {
+      "kind": "valid",
+      "detail_code": null
+    },
+    "profile_status": {
+      "kind": "valid",
+      "source": "unsupported-manifest",
+      "detail_code": null
+    },
+    "evidence_status": {
+      "kind": "valid",
+      "detail_code": null
+    },
     "v2_admission_status": "valid"
   }
 }

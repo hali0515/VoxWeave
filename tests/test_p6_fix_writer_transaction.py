@@ -218,6 +218,21 @@ def test_rat2_w1_usability_is_the_exact_section_9_3_conjunction(
     from voxweave.align_evidence import _w1_usable_audit
 
     evidence = {
+        "source_facts": {
+            "backend_model_config": {
+                "route": "qwen-crop",
+                "language": "en",
+                "backend": "qwen-asr",
+                "model": "synthetic",
+                "sample_rate": 16_000,
+            },
+            "route_input": {
+                "route": "qwen-crop",
+                "language": "en",
+                "blocks": [],
+                "crops": [],
+            },
+        },
         "input_history": {"authority_limit_profile_kind": profile_kind},
         "authority_distribution": {
             "owner_unit_ids": owner_ranges,

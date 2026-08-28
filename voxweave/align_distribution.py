@@ -343,6 +343,7 @@ class StrictFailureLocator:
 class AuthorityBlock:
     source_index: int
     alignment_text: str
+    text: str | None = None
 
 
 @dataclass(frozen=True)

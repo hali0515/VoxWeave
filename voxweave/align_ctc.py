@@ -333,24 +333,28 @@ def _ctc_flat_pass(
     if not words:
         units: list[dict] = []
     else:
-        logp = (
-            _ctc_emit_full(al, wav)
-            if _backend_invoker is None
-            else _backend_invoker(lambda: _ctc_emit_full(al, wav))
-        )
-        if speech_spans:
-            logp = _mask_emissions_outside_speech(
-                logp, speech_spans, wav.shape[-1], al.sr, al.blank
+
+        def align_flat_result() -> list[dict]:
+            logp = _ctc_emit_full(al, wav)
+            if speech_spans:
+                logp = _mask_emissions_outside_speech(
+                    logp, speech_spans, wav.shape[-1], al.sr, al.blank
+                )
+            return _ctc_align_logp(
+                al,
+                logp,
+                toks,
+                meta,
+                words,
+                nospace,
+                wav.shape[-1],
+                _raw_original_observer,
             )
-        units = _ctc_align_logp(
-            al,
-            logp,
-            toks,
-            meta,
-            words,
-            nospace,
-            wav.shape[-1],
-            _raw_original_observer,
+
+        units = (
+            align_flat_result()
+            if _backend_invoker is None
+            else _backend_invoker(align_flat_result)
         )
     if _raw_result_observer is not None:
         _raw_result_observer(units)

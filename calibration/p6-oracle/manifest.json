@@ -19,7 +19,7 @@
     "align-delta-registry": "267bdf609013b7f2a37abef1a14b0a5fa6e9770fea0da958b5d92d64ce36f931",
     "align-failure-registry": "69471bfcc890ef4d59b2f8cc36e37c48a5e971202527f13bf4e1b9b9cccdc9cd",
     "engine-registry": "1f9e2da1257cdd5e4c9a956ba9505a0c4122f6e964e23a17d6f788f4dc8be140",
-    "p6-oracle-schema": "ede06a5405828bd17d06d2b16ed9114c23400cbd0719fd16aadff9c26f1ac838"
+    "p6-oracle-schema": "081da9306641c0e018d3735b35dd0d6173a4e515ec3505de7b17f359d6981741"
   },
   "gates": {
     "G-CONTEXT": {
@@ -1465,7 +1465,7 @@
           "id": "whole-file-identity-without-plus-zero",
           "assertion": "Executable gate coverage pins whole file identity without plus zero as a closed matrix vector.",
           "evidence": [
-            "tests/test_p6_distribution.py::test_whole_file_identity_performs_no_addition_and_preserves_unit_shape"
+            "tests/test_p6_distribution.py::test_whole_file_identity_performs_no_addition_and_drops_extra_fields"
           ]
         },
         {
@@ -2580,15 +2580,6 @@
       "public_runtime": {
         "fixture": "inputs/public-historical-align.json",
         "expected_family": "legacy-v1",
-        "expected_paths": [
-          {
-            "kind": "primary",
-            "expected_path": "expected/6e6033f/legacy.vtt",
-            "size": 82,
-            "sha256": "5d80b36871aa6fb22a0cd6ef49d71d1c872980f19e698f3b030f53b990fc5bd9",
-            "artifact": "vtt"
-          }
-        ],
         "expected_trace": null,
         "expected_w1_usable": null
       }
@@ -2668,15 +2659,6 @@
       "public_runtime": {
         "fixture": "inputs/public-post-p11-correct.json",
         "expected_family": "legacy-v1",
-        "expected_paths": [
-          {
-            "kind": "primary",
-            "expected_path": "expected/post-p11/speaker-turns.json",
-            "size": 63,
-            "sha256": "0a7c63b14c0f2a966dddd0b2819c462737828bb124f208da83a3870c67ebbc75",
-            "artifact": "main-json"
-          }
-        ],
         "expected_trace": null,
         "expected_w1_usable": null
       }
@@ -2761,15 +2743,6 @@
       "public_runtime": {
         "fixture": "inputs/public-rat4-align.json",
         "expected_family": "legacy-v1",
-        "expected_paths": [
-          {
-            "kind": "evidence",
-            "expected_path": "expected/p6-lexical/lexical-call.json",
-            "size": 83,
-            "sha256": "880d8551335a03ec915a4c28e018ba7d14be97598558a956ee5c38c84e9c60f8",
-            "artifact": "route-evidence"
-          }
-        ],
         "expected_trace": [
           {"phase": "AO-01", "activity": "vtt-generation-snapshot"},
           {"phase": "AO-02", "activity": "sibling-decode-and-raw-carriers"},
@@ -2815,8 +2788,8 @@
         {
           "path": "inputs/selected-v2-align-delivery.json",
           "present": true,
-          "size": 16232,
-          "sha256": "05367b9f6883f999835ed93b8b163f7032b209701c506ea193dc858417cb151d"
+          "size": 23910,
+          "sha256": "46ff46ad7368e0f51b85f1350e9c9692ae5490931af397b964d9a626db3fcae5"
         },
         {
           "path": "inputs/public-selected-v2-align.json",
@@ -2849,22 +2822,22 @@
           "kind": "primary",
           "artifact": "vtt",
           "expected_path": "expected/selected-v2-align/qwen.vtt",
-          "size": 193,
-          "sha256": "2da0e4719c6146ba8a8667de5de945ed18bd536aaf7beaadb1d485fc4d3fdbf0"
+          "size": 169,
+          "sha256": "aae397b3fc14bfbf99e7c1b8ccf786740a5b822bbe3e897ae2275d3531a2c91c"
         },
         {
           "kind": "primary",
           "artifact": "main-json",
           "expected_path": "expected/selected-v2-align/qwen.json",
-          "size": 1413,
-          "sha256": "227bd0a7b4b9268c16ec5aed2a18afcbe6391b71f036a5e79681478afe7d2aee"
+          "size": 1359,
+          "sha256": "a27ae53cd43798337a87845c69864c399728d550024ce64b7c37261c24f6713a"
         },
         {
           "kind": "evidence",
           "artifact": "align-evidence",
           "expected_path": "expected/selected-v2-align/qwen.align-evidence.json",
-          "size": 17012,
-          "sha256": "6eb3a40048f21001ee36e265d9559af1e3c4141a23892a34883ed71c1a45701f"
+          "size": 19083,
+          "sha256": "3f5f94b6eb476307e7f55bb89bebdce8417a97e1ddd437ce14c6aaf5c4fdd67a"
         }
       ],
       "authority_limit_profile": {
@@ -2897,29 +2870,6 @@
       "public_runtime": {
         "fixture": "inputs/public-selected-v2-align.json",
         "expected_family": "boundary-v2",
-        "expected_paths": [
-          {
-            "kind": "primary",
-            "artifact": "vtt",
-            "expected_path": "expected/public-command/selected-v2-align/episode.vtt",
-            "size": 169,
-            "sha256": "aae397b3fc14bfbf99e7c1b8ccf786740a5b822bbe3e897ae2275d3531a2c91c"
-          },
-          {
-            "kind": "primary",
-            "artifact": "main-json",
-            "expected_path": "expected/public-command/selected-v2-align/episode.json",
-            "size": 1359,
-            "sha256": "a27ae53cd43798337a87845c69864c399728d550024ce64b7c37261c24f6713a"
-          },
-          {
-            "kind": "evidence",
-            "artifact": "align-evidence",
-            "expected_path": "expected/public-command/selected-v2-align/episode.align-evidence.json",
-            "size": 17131,
-            "sha256": "f222dc51e57ca83cac2a53886d4b80abd81c60769f797de2d1eac3eb47e300ab"
-          }
-        ],
         "expected_trace": [
           {"phase": "AO-01", "activity": "vtt-generation-snapshot"},
           {"phase": "AO-02", "activity": "sibling-decode-and-raw-carriers"},
@@ -2965,8 +2915,8 @@
         {
           "path": "inputs/selected-v2-segmentation-delivery.json",
           "present": true,
-          "size": 2388,
-          "sha256": "0d59093d7e6ceb11c7651108de747113b11ac31bcf4b225909e2a9f07ef368f1"
+          "size": 3664,
+          "sha256": "3940beba707ac20be248be0a1de2f020bb65b76d5e3053d4e438a8880dcd33bf"
         },
         {
           "path": "inputs/public-selected-v2-segmentation.json",
@@ -2999,15 +2949,15 @@
           "kind": "primary",
           "artifact": "vtt",
           "expected_path": "expected/selected-v2-segmentation/episode.vtt",
-          "size": 183,
-          "sha256": "7f2bf62a67e5fbea0552b3674780d27717009dd7aa95c166af3d04481a40ba33"
+          "size": 77,
+          "sha256": "cd49ba3039521b5aebd878d96d2db37365294aa3ca06cd42766b2c836cbcf196"
         },
         {
           "kind": "primary",
           "artifact": "main-json",
           "expected_path": "expected/selected-v2-segmentation/episode.json",
-          "size": 1981,
-          "sha256": "aec03ad5159cea6165cee8e7e3144703095ae2d169737ea2168b7ef00474f45f"
+          "size": 2619,
+          "sha256": "26499aa5170f3087398556349acd1a2f97bd948f76c1e5c15ab488625bce3ffa"
         }
       ],
       "authority_limit_profile": {
@@ -3039,22 +2989,6 @@
       "public_runtime": {
         "fixture": "inputs/public-selected-v2-segmentation.json",
         "expected_family": "boundary-v2",
-        "expected_paths": [
-          {
-            "kind": "primary",
-            "artifact": "vtt",
-            "expected_path": "expected/public-command/selected-v2-segmentation/episode.vtt",
-            "size": 77,
-            "sha256": "cd49ba3039521b5aebd878d96d2db37365294aa3ca06cd42766b2c836cbcf196"
-          },
-          {
-            "kind": "primary",
-            "artifact": "main-json",
-            "expected_path": "expected/public-command/selected-v2-segmentation/episode.json",
-            "size": 2619,
-            "sha256": "26499aa5170f3087398556349acd1a2f97bd948f76c1e5c15ab488625bce3ffa"
-          }
-        ],
         "expected_trace": null,
         "expected_w1_usable": null
       }
@@ -3076,8 +3010,8 @@
         {
           "path": "inputs/combined-ratified-align-delivery.json",
           "present": true,
-          "size": 8959,
-          "sha256": "69e7ab3385ed7bf86983ab7001784df0e8a077286a931aefeea110ebe4016936"
+          "size": 12351,
+          "sha256": "93a53e09701602a3245dcdfb08137f0b821ba8e07121f0060e9741f3502426bc"
         },
         {
           "path": "inputs/public-combined-align.json",
@@ -3111,21 +3045,21 @@
           "artifact": "vtt",
           "expected_path": "expected/selected-v2-align/combined.vtt",
           "size": 82,
-          "sha256": "86f3d91bd9cbfc19b510fe87eeca281a5685d62a3de21454c8b2b9b93067bacf"
+          "sha256": "bbaab61d7ceca53339f7861a0045e631591e3a589f033f6021ec804c7c125ed8"
         },
         {
           "kind": "primary",
           "artifact": "main-json",
           "expected_path": "expected/selected-v2-align/combined.json",
-          "size": 578,
-          "sha256": "8c508592b8bc5dae8c9b77f79842f41258cbad2cfcded4113c1ed0c99398af1f"
+          "size": 593,
+          "sha256": "16c389329361c3398e1efcb0d1612e5234e0fd69da87fa470b8790dc1fb8ba1b"
         },
         {
           "kind": "evidence",
           "artifact": "align-evidence",
           "expected_path": "expected/selected-v2-align/combined.align-evidence.json",
-          "size": 9023,
-          "sha256": "25ffca5059bb8a36894b4f7b1077653849aa1bfbf229093858c850af689da94a"
+          "size": 9977,
+          "sha256": "d3d31b48c83e5bdbf0b03b2e4a16ad30e1d55d8fc334cdfe99db7cbe3a559c65"
         }
       ],
       "authority_limit_profile": {
@@ -3157,29 +3091,6 @@
       "public_runtime": {
         "fixture": "inputs/public-combined-align.json",
         "expected_family": "boundary-v2",
-        "expected_paths": [
-          {
-            "kind": "primary",
-            "artifact": "vtt",
-            "expected_path": "expected/public-command/combined-ratified-align/episode.vtt",
-            "size": 82,
-            "sha256": "bbaab61d7ceca53339f7861a0045e631591e3a589f033f6021ec804c7c125ed8"
-          },
-          {
-            "kind": "primary",
-            "artifact": "main-json",
-            "expected_path": "expected/public-command/combined-ratified-align/episode.json",
-            "size": 593,
-            "sha256": "16c389329361c3398e1efcb0d1612e5234e0fd69da87fa470b8790dc1fb8ba1b"
-          },
-          {
-            "kind": "evidence",
-            "artifact": "align-evidence",
-            "expected_path": "expected/public-command/combined-ratified-align/episode.align-evidence.json",
-            "size": 9021,
-            "sha256": "9c43343f5eb7441be4e364535c54f47c84338ad7d64c644d1a86adf74310982b"
-          }
-        ],
         "expected_trace": [
           {"phase": "AO-01", "activity": "vtt-generation-snapshot"},
           {"phase": "AO-02", "activity": "sibling-decode-and-raw-carriers"},

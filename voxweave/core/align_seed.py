@@ -112,7 +112,10 @@ def build_align_seed(
 
     block_by_source = {block.source_index: block for block in blocks}
     if len(block_by_source) != len(blocks) or any(
-        type(block.source_index) is not int or type(block.alignment_text) is not str
+        type(block.source_index) is not int
+        or type(block.alignment_text) is not str
+        or block.text is not None
+        and type(block.text) is not str
         for block in blocks
     ):
         raise ValueError("seed blocks have an invalid source domain")
@@ -211,12 +214,13 @@ def build_align_seed(
             reasons.add("display-seed-invalid")
             continue
         block = block_by_source[source_index]
+        block_text = block.alignment_text if block.text is None else block.text
         unit_range = (cursor, cursor + len(owned))
         cursor = unit_range[1]
         seed_blocks.append(
             AlignSeedBlock(
                 source_index,
-                block.alignment_text,
+                block_text,
                 tuple(unit.unit_id for unit in owned),
                 unit_range,
                 owned,

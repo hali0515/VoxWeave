@@ -212,5 +212,5 @@ def test_seed_retains_exact_source_text_as_w1_fallback():
     assert seed.status == "valid"
     assert seed.blocks is not None
     assert seed.blocks[0].text == "Call\nresponse"
-    assert seed.blocks[0].footprint == "Call\nresponse"
+    assert seed.blocks[0].footprint == "Call response"
     assert materialize_seed_cues(seed)[0]["text"] == "Call\nresponse"
