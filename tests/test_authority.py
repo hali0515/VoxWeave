@@ -110,7 +110,11 @@ def test_capability_is_single_use():
 
 def test_authority_kinds_are_closed_and_sorted():
     module = authority()
-    assert module.AUTHORITY_KINDS == ("optimizer-selection", "v1-capture")
+    assert module.AUTHORITY_KINDS == (
+        "fresh-alignment",
+        "optimizer-selection",
+        "v1-capture",
+    )
 
 
 # --------------------------------------------------------------- root probe

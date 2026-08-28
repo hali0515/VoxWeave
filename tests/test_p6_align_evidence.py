@@ -33,7 +33,7 @@ def test_final_evidence_binds_only_after_verified_primary_hashes(tmp_path):
     )
     assert evidence.selected_outputs.engine_family == "legacy-v1"
     assert evidence.selected_outputs.vtt_sha256 == verified.vtt_sha256
-    assert evidence.durable_authority is False
+    assert evidence.durable_authority is True
     encoded = encode_align_evidence(evidence)
     parsed = json.loads(encoded)
     assert tuple(parsed)[-1] == "selected_outputs"
@@ -57,21 +57,14 @@ def test_evidence_bind_rejects_unverified_hash_substitution(tmp_path):
     assert error.value.failure.detail_code == "evidence-binding"
 
 
-def test_pending_rat2_blocks_durable_trust_claim_but_not_in_memory_scaffold(tmp_path):
-    from voxweave.align_evidence import (
-        DurableEvidenceUnavailable,
-        bind_align_evidence,
-        verify_durable_align_evidence,
-    )
+def test_rat2_exposes_only_the_path_bound_durable_verifier():
+    import inspect
 
-    context, result, verified = _verified(tmp_path)
-    evidence = bind_align_evidence(
-        context,
-        result.evidence_core,
-        engine_family=verified.engine_family,
-        vtt_sha256=verified.vtt_sha256,
-        main_json_sha256=verified.main_json_sha256,
+    import voxweave.align_evidence as module
+
+    assert not hasattr(module, "verify_durable_align_evidence")
+    assert tuple(inspect.signature(module.verify_align_evidence).parameters) == (
+        "vtt_path",
+        "explicit_media_path",
+        "corpus_root",
     )
-    with pytest.raises(DurableEvidenceUnavailable) as error:
-        verify_durable_align_evidence(evidence)
-    assert error.value.decision == "RAT-2"

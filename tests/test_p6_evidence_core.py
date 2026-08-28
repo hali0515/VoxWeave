@@ -93,7 +93,11 @@ def test_evidence_core_rejects_producer_reason_or_surface_scalar_corruption():
 
 
 def test_ald6_is_always_triggered_and_exact():
-    from voxweave.align_evidence_core import evaluate_ald6, project_evidence_core
+    from voxweave.align_evidence_core import (
+        EvidenceCoreProjectionError,
+        evaluate_ald6,
+        project_evidence_core,
+    )
 
     blocks, capture, transform, distribution = _facts()
     core = project_evidence_core(
@@ -105,8 +109,12 @@ def test_ald6_is_always_triggered_and_exact():
         seed_status="valid",
         seed_reasons=(),
     )
-    assert evaluate_ald6(core, core).triggered is True
-    assert evaluate_ald6(core, core).passed is True
+    with pytest.raises(EvidenceCoreProjectionError, match="independent"):
+        evaluate_ald6(core, core)
+    independent = dataclasses.replace(core)
+    assert independent is not core
+    assert evaluate_ald6(core, independent).triggered is True
+    assert evaluate_ald6(core, independent).passed is True
     changed = dataclasses.replace(core, context_content_digest="b" * 64)
     outcome = evaluate_ald6(changed, core)
     assert outcome.triggered is True and outcome.passed is False

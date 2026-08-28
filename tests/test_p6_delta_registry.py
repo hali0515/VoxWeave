@@ -43,17 +43,7 @@ def test_registry_import_is_dependency_neutral():
     assert loaded.isdisjoint(forbidden)
 
 
-def test_semantic_gate_is_explicitly_unavailable_while_rat1_is_pending():
-    from voxweave.core.align_compare import (
-        SemanticComparisonUnavailable,
-        compare_semantic_deltas,
-        semantic_comparison_available,
-    )
+def test_semantic_gate_is_available_after_rat1_approval():
+    from voxweave.core.align_compare import semantic_comparison_available
 
-    assert semantic_comparison_available() is False
-    try:
-        compare_semantic_deltas()
-    except SemanticComparisonUnavailable as error:
-        assert error.decision == "RAT-1"
-    else:  # pragma: no cover - the pending default must stay fail-closed
-        raise AssertionError("pending RAT-1 unexpectedly enabled semantic comparison")
+    assert semantic_comparison_available() is True

@@ -144,21 +144,15 @@ def _split_replay_bytes(
         encoding="utf-8",
     )
 
-    def detached_segment(**kwargs):
-        units = [dict(unit) for unit in kwargs["word_segments"]]
-        return SimpleNamespace(
-            language="en",
-            units=units,
-            cues=[
-                {
-                    "text": "word",
-                    "start": 0.0,
-                    "end": 0.5,
-                    "word_data": units,
-                }
-            ],
-            manifest={},
-        )
+    detached = pipeline.segment_document(
+        language="en",
+        word_segments=[{"text": "word", "start": 0.0, "end": 0.5}],
+        speaker_turns=None,
+        annotate_speakers=False,
+    )
+
+    def detached_segment(**_kwargs):
+        return detached
 
     monkeypatch.setattr(pipeline, "segment_document", detached_segment)
     monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1" if shadow else "0")

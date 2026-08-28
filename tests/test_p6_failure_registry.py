@@ -76,9 +76,7 @@ def test_failure_and_reason_registries_are_exact_and_closed():
         "display-seed-invalid",
         "footprint-reconciliation",
     )
-    assert RATIFICATION_DORMANT_DETAILS == (
-        ("input-stale", "speaker-mapping-generation", "RAT-7"),
-    )
+    assert RATIFICATION_DORMANT_DETAILS == ()
 
 
 def test_every_outcome_has_a_nonempty_closed_detail_tuple():
@@ -86,6 +84,18 @@ def test_every_outcome_has_a_nonempty_closed_detail_tuple():
 
     assert tuple(OUTCOME_DETAILS) == EXPECTED_KINDS
     assert all(details for details in OUTCOME_DETAILS.values())
+    assert OUTCOME_DETAILS["stage-failed"] == (
+        "main-json-stage",
+        "vtt-stage",
+        "evidence-stage",
+        "machine-artifact-stage",
+    )
+    assert OUTCOME_DETAILS["commit-failed"] == (
+        "main-json-replace",
+        "vtt-replace",
+        "evidence-replace",
+        "machine-artifact-replace",
+    )
     assert (
         len({detail for details in OUTCOME_DETAILS.values() for detail in details}) > 40
     )
@@ -134,9 +144,9 @@ def test_canonical_failure_validates_parent_detail_and_secondary_shape():
         )
 
 
-def test_rat7_detail_is_registered_but_explicitly_dormant():
+def test_rat7_detail_is_registered_and_active():
     from voxweave.align_failures import OUTCOME_DETAILS, is_detail_dormant
 
     assert "speaker-mapping-generation" in OUTCOME_DETAILS["input-stale"]
-    assert is_detail_dormant("input-stale", "speaker-mapping-generation") is True
+    assert is_detail_dormant("input-stale", "speaker-mapping-generation") is False
     assert is_detail_dormant("input-stale", "vtt-generation") is False
