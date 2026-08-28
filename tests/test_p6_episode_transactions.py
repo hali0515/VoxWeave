@@ -647,7 +647,9 @@ def test_segmentation_transaction_consumes_commit_only_after_recheck(tmp_path):
     assert role_vector(context) == ("C", "C", "C")
 
 
-def test_split_mapping_change_does_not_reprobe_before_rat7(tmp_path, monkeypatch):
+def test_split_mapping_change_is_stale_after_rat7(tmp_path, monkeypatch):
+    from voxweave.episode_transaction import InputStaleError
+
     json_path = tmp_path / "episode.json"
     json_path.write_text(
         json.dumps(
@@ -669,8 +671,10 @@ def test_split_mapping_change_does_not_reprobe_before_rat7(tmp_path, monkeypatch
         return result
 
     monkeypatch.setattr(pipeline, "segment_document", change_mapping)
-    out = pipeline.split(json_path)
-    assert "<v Alice>" in out.read_text(encoding="utf-8")
+    with pytest.raises(InputStaleError) as caught:
+        pipeline.split(json_path)
+    assert caught.value.failure.detail_code == "speaker-mapping-generation"
+    assert not (tmp_path / "episode.vtt").exists()
 
 
 @pytest.mark.parametrize("command", ["process", "split"])
