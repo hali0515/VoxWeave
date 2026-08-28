@@ -88,6 +88,7 @@ def _install_align_seams(
             _iso: str,
             *_args: Any,
             bounds: Any = None,
+            _preparation_invoker: Any = None,
             _raw_call_observer: Any = None,
             _backend_invoker: Any = None,
             _legacy_distribution_invoker: Any = None,
@@ -96,25 +97,35 @@ def _install_align_seams(
         ) -> list[list[dict[str, Any]]]:
             from voxweave.align_common import _distribute_units
 
-            groups = deepcopy(block_units)
-            remaining = list(groups)
-            ordered: list[list[dict[str, Any]]] = []
-            for text in texts:
-                matches = [
-                    index
-                    for index, group in enumerate(remaining)
-                    if text
-                    in {
-                        "".join(str(unit["text"]) for unit in group),
-                        " ".join(str(unit["text"]) for unit in group),
-                    }
-                ]
-                if len(matches) != 1:
-                    break
-                ordered.append(remaining.pop(matches[0]))
-            if len(ordered) == len(groups) and not remaining:
-                groups = ordered
-            raw = [unit for group in groups for unit in group]
+            def prepare_full_pass() -> tuple[
+                list[list[dict[str, Any]]],
+                list[dict[str, Any]],
+            ]:
+                groups = deepcopy(block_units)
+                remaining = list(groups)
+                ordered: list[list[dict[str, Any]]] = []
+                for text in texts:
+                    matches = [
+                        index
+                        for index, group in enumerate(remaining)
+                        if text
+                        in {
+                            "".join(str(unit["text"]) for unit in group),
+                            " ".join(str(unit["text"]) for unit in group),
+                        }
+                    ]
+                    if len(matches) != 1:
+                        break
+                    ordered.append(remaining.pop(matches[0]))
+                if len(ordered) == len(groups) and not remaining:
+                    groups = ordered
+                return groups, [unit for group in groups for unit in group]
+
+            groups, raw = (
+                prepare_full_pass()
+                if _preparation_invoker is None
+                else _preparation_invoker(prepare_full_pass)
+            )
             if _backend_invoker is not None:
                 raw = _backend_invoker(lambda: raw)
             if _raw_call_observer is not None:

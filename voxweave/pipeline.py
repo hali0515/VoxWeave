@@ -4768,6 +4768,16 @@ class _SelectedLegacyAlignResult:
     all_units: tuple[Mapping[str, Any], ...]
 
 
+@dataclass(frozen=True)
+class _PreparedQwenCall:
+    source_index: int
+    wav_path: Path
+    text: str
+    nominal_start: float
+    nominal_end: float
+    sample_geometry: tuple[int, int, int, int] | None
+
+
 def _retain_qwen_owner_slice(raw_units: Sequence[dict]) -> list[dict]:
     """Assign one physical Qwen result to its single historical cue owner."""
 
@@ -4809,6 +4819,7 @@ def _align_blocks(
     raw_call_observer: Callable[..., None] | None = None,
     qwen_invoker: Callable[..., Sequence[Any]] | None = None,
     backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    physical_preparation_invoker: Callable[[Callable[[], Any]], Any] | None = None,
     legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
     legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
@@ -4845,6 +4856,7 @@ def _align_blocks(
             bounds=bounds,
             _raw_call_observer=raw_call_observer,
             _backend_invoker=backend_invoker,
+            _preparation_invoker=physical_preparation_invoker,
             _legacy_distribution_invoker=legacy_distribution_invoker,
             _legacy_shift_invoker=legacy_shift_invoker,
         )
@@ -4861,6 +4873,7 @@ def _align_blocks(
             speech_spans=speech_spans,
             _raw_call_observer=raw_call_observer,
             _backend_invoker=backend_invoker,
+            _preparation_invoker=physical_preparation_invoker,
             _legacy_distribution_invoker=legacy_distribution_invoker,
             _legacy_shift_invoker=legacy_shift_invoker,
         )
@@ -4868,52 +4881,80 @@ def _align_blocks(
         return units
     reporter.task("per-cue alignment", len(blocks))
     block_units: list[list[dict]] = [[] for _ in blocks]
-    pending_qwen: list[tuple[int, list[dict], float]] = []
-    for i, crop in enumerate(crops):
-        text = realign.join_block_texts(
-            [blocks[i].get("alignment_text", blocks[i]["text"])], iso
-        )
-        if crop is None or not text:  # insertion block or empty: skip
-            reporter.advance(1)
-            continue
-        cs, ce = crop
-        observed_geometry: tuple[int, int, int, int] | None = None
 
-        def observe_sample_geometry(
-            sample_start: int,
-            sample_end: int,
-            sample_rate: int,
-            sample_count: int,
-        ) -> None:
-            nonlocal observed_geometry
-            if observed_geometry is not None:
-                raise RuntimeError("Qwen slice reported sample geometry twice")
-            observed_geometry = (
-                sample_start,
-                sample_end,
-                sample_rate,
-                sample_count,
+    def prepare_qwen_calls() -> list[_PreparedQwenCall]:
+        prepared: list[_PreparedQwenCall] = []
+        for i, crop in enumerate(crops):
+            text = realign.join_block_texts(
+                [blocks[i].get("alignment_text", blocks[i]["text"])], iso
             )
+            if crop is None or not text:  # insertion block or empty: skip
+                reporter.advance(1)
+                continue
+            cs, ce = crop
+            observed_geometry: tuple[int, int, int, int] | None = None
 
-        cwav = slice_wav(
-            wav,
-            cs,
-            ce,
-            _sample_geometry_observer=observe_sample_geometry,
-            _canonical_qwen_failures=True,
+            def observe_sample_geometry(
+                sample_start: int,
+                sample_end: int,
+                sample_rate: int,
+                sample_count: int,
+            ) -> None:
+                nonlocal observed_geometry
+                if observed_geometry is not None:
+                    raise RuntimeError("Qwen slice reported sample geometry twice")
+                observed_geometry = (
+                    sample_start,
+                    sample_end,
+                    sample_rate,
+                    sample_count,
+                )
+
+            cwav = slice_wav(
+                wav,
+                cs,
+                ce,
+                _sample_geometry_observer=observe_sample_geometry,
+                _canonical_qwen_failures=True,
+            )
+            tmp_chunks.append(cwav)
+            prepared.append(
+                _PreparedQwenCall(
+                    source_index=i,
+                    wav_path=cwav,
+                    text=text,
+                    nominal_start=float(cs),
+                    nominal_end=float(ce),
+                    sample_geometry=observed_geometry,
+                )
+            )
+        return prepared
+
+    prepared_qwen = (
+        prepare_qwen_calls()
+        if physical_preparation_invoker is None
+        else cast(
+            list[_PreparedQwenCall],
+            physical_preparation_invoker(prepare_qwen_calls),
         )
-        tmp_chunks.append(cwav)
-        geometry = observed_geometry
+    )
+    pending_qwen: list[tuple[int, list[dict], float]] = []
+    for prepared in prepared_qwen:
+        geometry = prepared.sample_geometry
         if qwen_invoker is None:
-            raw_units = backend.align_text(cwav, text, iso)
+            raw_units = backend.align_text(prepared.wav_path, prepared.text, iso)
         else:
             raw_units = cast(
                 list[dict[str, Any]],
                 qwen_invoker(
-                    lambda: backend.align_text(cwav, text, iso),
-                    i,
-                    float(cs),
-                    float(ce),
+                    lambda: backend.align_text(
+                        prepared.wav_path,
+                        prepared.text,
+                        iso,
+                    ),
+                    prepared.source_index,
+                    prepared.nominal_start,
+                    prepared.nominal_end,
                     audio_sample_start=None if geometry is None else geometry[0],
                     audio_sample_end=None if geometry is None else geometry[1],
                     sample_rate=None if geometry is None else geometry[2],
@@ -4921,7 +4962,7 @@ def _align_blocks(
                 ),
             )
 
-        pending_qwen.append((i, raw_units, cs))
+        pending_qwen.append((prepared.source_index, raw_units, prepared.nominal_start))
 
     if not pending_qwen:
         with align_runtime_activity("AO-07", "no-physical-calls"):
@@ -5418,10 +5459,13 @@ def align(
                 backend_model_config_facts=model_facts,
                 route_input_facts=route_facts,
             )
-        with align_runtime_activity("AO-06", "physical-call-preparation"):
-            capture_raw_call = _fresh_alignment_call_observer(fresh_session)
-            invoke_backend_call = _fresh_alignment_backend_invoker(fresh_session)
-            invoke_qwen_call = _fresh_alignment_qwen_invoker(fresh_session)
+        capture_raw_call = _fresh_alignment_call_observer(fresh_session)
+        invoke_backend_call = _fresh_alignment_backend_invoker(fresh_session)
+        invoke_qwen_call = _fresh_alignment_qwen_invoker(fresh_session)
+
+        def invoke_physical_preparation(operation: Callable[[], Any]) -> Any:
+            with align_runtime_activity("AO-06", "physical-call-preparation"):
+                return operation()
 
         def invoke_legacy_distribution(operation: Callable[[], Any]) -> Any:
             with align_runtime_activity("AO-08", "legacy-owner-slice"):
@@ -5446,6 +5490,7 @@ def align(
             raw_call_observer=capture_raw_call,
             qwen_invoker=invoke_qwen_call,
             backend_invoker=invoke_backend_call,
+            physical_preparation_invoker=invoke_physical_preparation,
             legacy_distribution_invoker=invoke_legacy_distribution,
             legacy_shift_invoker=invoke_legacy_shift,
         )

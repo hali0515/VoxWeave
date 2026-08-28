@@ -721,16 +721,17 @@ def test_qwen_all_aligned_lists_empty_is_canonical_before_projection(
 def _assert_qwen_window_failure_runtime_trace(trace: object) -> None:
     events = trace.events  # type: ignore[attr-defined]
     assert [
-        (event.phase, event.activity)
-        for event in events
-        if event.state == "failed"
+        (event.phase, event.activity) for event in events if event.state == "failed"
     ] == [("AO-06", "physical-call-preparation")]
-    assert sum(
-        event.phase == "AO-06"
-        and event.activity == "physical-call-preparation"
-        and event.state == "started"
-        for event in events
-    ) == 1
+    assert (
+        sum(
+            event.phase == "AO-06"
+            and event.activity == "physical-call-preparation"
+            and event.state == "started"
+            for event in events
+        )
+        == 1
+    )
     assert not [
         event
         for event in events
@@ -739,8 +740,7 @@ def _assert_qwen_window_failure_runtime_trace(trace: object) -> None:
     assert not [
         event
         for event in events
-        if 7 <= int(event.phase.removeprefix("AO-")) <= 23
-        or event.phase == "AO-25"
+        if 7 <= int(event.phase.removeprefix("AO-")) <= 23 or event.phase == "AO-25"
     ]
     assert any(
         event.phase == "AO-24"
