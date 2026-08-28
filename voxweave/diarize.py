@@ -40,6 +40,8 @@ DIARIZE_MODEL = os.environ.get(
     "VOXWEAVE_DIARIZE_MODEL", "pyannote/speaker-diarization-3.1"
 )
 EMBEDDING_CHECKPOINT_FILE = "pytorch_model.bin"
+PYANNOTE_CACHE_ENV = "PYANNOTE_CACHE"
+PYANNOTE_CACHE_SUBDIR = "pyannote"
 
 # Atom-level speaker assignment needs at least this much absolute overlap with a
 # turn (seconds); below it the atom inherits its neighbors (guards 20ms grazes).
@@ -132,6 +134,45 @@ def _outer_config_identity() -> str:
     return "unresolved"
 
 
+def _private_pyannote_cache() -> Path:
+    """Return the pyannote-owned HF cache inside VoxWeave's audio cache."""
+    return Path(config.AUDIO_CACHE) / PYANNOTE_CACHE_SUBDIR
+
+
+def _legacy_pyannote_cache() -> Path:
+    """Return pyannote.audio 3.x's cache location when its env var is unset."""
+    return Path.home() / ".cache" / "torch" / "pyannote"
+
+
+def _configure_pyannote_cache() -> None:
+    """Keep pyannote's non-propagated nested downloads in VoxWeave's cache."""
+    if PYANNOTE_CACHE_ENV not in os.environ:
+        os.environ[PYANNOTE_CACHE_ENV] = os.fspath(_private_pyannote_cache())
+
+
+def _embedding_cache_dirs() -> tuple[str | None, ...]:
+    """Return current and legacy embedding caches in lookup priority order."""
+    candidates: tuple[str | None, ...] = (
+        os.fspath(_private_pyannote_cache()),
+        os.environ.get(PYANNOTE_CACHE_ENV),
+        os.fspath(_legacy_pyannote_cache()),
+        None,
+    )
+    ordered: list[str | None] = []
+    seen: set[str | None] = set()
+    for candidate in candidates:
+        key = (
+            None
+            if candidate is None
+            else os.path.normcase(os.path.abspath(os.path.expanduser(candidate)))
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(candidate)
+    return tuple(ordered)
+
+
 def _checkpoint_identity(pipeline: object) -> str:
     """Return a content-addressed HF blob name, never a mutable local filename."""
     embedder = getattr(pipeline, "_embedding", None)
@@ -153,19 +194,22 @@ def _checkpoint_identity(pipeline: object) -> str:
         model_id, revision = raw_path, None
     try:
         from huggingface_hub import try_to_load_from_cache
-
-        cached = try_to_load_from_cache(
-            model_id,
-            EMBEDDING_CHECKPOINT_FILE,
-            revision=revision,
-            cache_dir=config.AUDIO_CACHE,
-        )
-        if isinstance(cached, str):
-            resolved = Path(cached).resolve(strict=True)
-            if resolved.parent.name == "blobs":
-                return resolved.name
-    except (ImportError, OSError, ValueError):
-        pass
+    except ImportError:
+        return "unresolved"
+    for cache_dir in _embedding_cache_dirs():
+        try:
+            cached = try_to_load_from_cache(
+                model_id,
+                EMBEDDING_CHECKPOINT_FILE,
+                revision=revision,
+                cache_dir=cache_dir,
+            )
+            if isinstance(cached, str):
+                resolved = Path(cached).resolve(strict=True)
+                if resolved.parent.name == "blobs":
+                    return resolved.name
+        except (OSError, ValueError):
+            continue
     return "unresolved"
 
 
@@ -327,6 +371,8 @@ def _load_pipeline(pipeline_cls, token: str):
     ``torch.serialization.safe_globals``. That context is a no-op on older torch
     that already defaults to ``weights_only=False``.
     """
+    _configure_pyannote_cache()
+
     import torch
     from pyannote.audio.core.task import (  # pyright: ignore[reportMissingImports]
         Problem,
@@ -350,6 +396,9 @@ def _load_pipeline(pipeline_cls, token: str):
 def _get_pipeline(token: str):
     global _pipeline
     if _pipeline is None:
+        # pyannote.audio captures PYANNOTE_CACHE in a module constant at import
+        # time, so establish the private default before importing the package.
+        _configure_pyannote_cache()
         try:
             import torch
 

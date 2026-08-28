@@ -1,7 +1,12 @@
+import builtins
 import hashlib
 import os
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
+
+from huggingface_hub import constants as hf_constants
 
 from voxweave import backend, config, diarize, voicematch
 
@@ -38,10 +43,27 @@ def _real_shape_pipeline(repo_id: str = EMBEDDING_REPO) -> SimpleNamespace:
     )
 
 
+def _isolated_embedding_caches(tmp_path, monkeypatch):
+    audio_cache = tmp_path / "audio"
+    user_cache = tmp_path / "user-pyannote"
+    legacy_cache = tmp_path / "legacy-pyannote"
+    hf_cache = tmp_path / "huggingface"
+    monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
+    monkeypatch.setenv(diarize.PYANNOTE_CACHE_ENV, str(user_cache))
+    monkeypatch.setattr(diarize, "_legacy_pyannote_cache", lambda: legacy_cache)
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(hf_cache))
+    return (
+        audio_cache / diarize.PYANNOTE_CACHE_SUBDIR,
+        user_cache,
+        legacy_cache,
+        hf_cache,
+    )
+
+
 def test_checkpoint_identity_resolves_real_pyannote_hub_id_shape(tmp_path, monkeypatch):
     cache_root = tmp_path / "audio"
     _snapshot, blob_name = _cache_hf_file(
-        cache_root,
+        cache_root / diarize.PYANNOTE_CACHE_SUBDIR,
         EMBEDDING_REPO,
         "pytorch_model.bin",
         b"real-shaped wespeaker checkpoint",
@@ -49,6 +71,81 @@ def test_checkpoint_identity_resolves_real_pyannote_hub_id_shape(tmp_path, monke
     monkeypatch.setattr(config, "AUDIO_CACHE", str(cache_root))
 
     assert diarize._checkpoint_identity(_real_shape_pipeline()) == blob_name
+
+
+def test_checkpoint_identity_searches_current_and_legacy_caches_in_order(
+    tmp_path, monkeypatch
+):
+    cache_dirs = _isolated_embedding_caches(tmp_path, monkeypatch)
+    snapshots: list[Path] = []
+    blob_names: list[str] = []
+    for index, cache_dir in enumerate(cache_dirs):
+        snapshot, blob_name = _cache_hf_file(
+            cache_dir,
+            EMBEDDING_REPO,
+            "pytorch_model.bin",
+            f"checkpoint from cache {index}".encode(),
+        )
+        snapshots.append(snapshot)
+        blob_names.append(blob_name)
+
+    for index, blob_name in enumerate(blob_names):
+        assert diarize._checkpoint_identity(_real_shape_pipeline()) == blob_name
+        snapshots[index].unlink()
+    assert diarize._checkpoint_identity(_real_shape_pipeline()) == "unresolved"
+
+
+def test_pyannote_cache_defaults_under_audio_cache_when_unset(tmp_path, monkeypatch):
+    audio_cache = tmp_path / "audio"
+    monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
+    monkeypatch.delenv(diarize.PYANNOTE_CACHE_ENV, raising=False)
+
+    diarize._configure_pyannote_cache()
+
+    assert os.environ[diarize.PYANNOTE_CACHE_ENV] == str(
+        audio_cache / diarize.PYANNOTE_CACHE_SUBDIR
+    )
+
+
+def test_pyannote_cache_preserves_user_location(tmp_path, monkeypatch):
+    user_cache = tmp_path / "user-selected"
+    monkeypatch.setattr(config, "AUDIO_CACHE", str(tmp_path / "audio"))
+    monkeypatch.setenv(diarize.PYANNOTE_CACHE_ENV, str(user_cache))
+
+    diarize._configure_pyannote_cache()
+
+    assert os.environ[diarize.PYANNOTE_CACHE_ENV] == str(user_cache)
+
+
+def test_get_pipeline_defaults_pyannote_cache_before_import(tmp_path, monkeypatch):
+    audio_cache = tmp_path / "audio"
+    expected_cache = str(audio_cache / diarize.PYANNOTE_CACHE_SUBDIR)
+    monkeypatch.setattr(config, "AUDIO_CACHE", str(audio_cache))
+    monkeypatch.delenv(diarize.PYANNOTE_CACHE_ENV, raising=False)
+    monkeypatch.setattr(diarize, "_pipeline", None)
+    monkeypatch.setattr(diarize, "_ensure_torchaudio_compat", lambda: None)
+
+    fake_package = types.ModuleType("pyannote")
+    fake_package.__path__ = []
+    fake_audio = types.ModuleType("pyannote.audio")
+    setattr(fake_audio, "Pipeline", object())
+    monkeypatch.setitem(sys.modules, "pyannote", fake_package)
+    monkeypatch.setitem(sys.modules, "pyannote.audio", fake_audio)
+
+    import_observations: list[str | None] = []
+    real_import = builtins.__import__
+
+    def tracking_import(name, *args, **kwargs):
+        if name == "pyannote.audio":
+            import_observations.append(os.environ.get(diarize.PYANNOTE_CACHE_ENV))
+        return real_import(name, *args, **kwargs)
+
+    loaded = SimpleNamespace(to=lambda _device: None)
+    monkeypatch.setattr(builtins, "__import__", tracking_import)
+    monkeypatch.setattr(diarize, "_load_pipeline", lambda _cls, _token: loaded)
+
+    assert diarize._get_pipeline("hf_test") is loaded
+    assert import_observations == [expected_cache]
 
 
 def test_checkpoint_identity_keeps_blob_path_branch_and_rejects_mutable_path(
@@ -69,7 +166,7 @@ def test_checkpoint_identity_keeps_blob_path_branch_and_rejects_mutable_path(
 def test_checkpoint_identity_is_unresolved_when_hub_checkpoint_is_not_cached(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(config, "AUDIO_CACHE", str(tmp_path / "empty-audio-cache"))
+    _isolated_embedding_caches(tmp_path, monkeypatch)
     assert diarize._checkpoint_identity(_real_shape_pipeline()) == "unresolved"
 
 
@@ -118,7 +215,7 @@ def test_real_shape_capture_provenance_builds_known_compatibility(
         outer_config,
     )
     _embedding_snapshot, embedding_blob = _cache_hf_file(
-        cache_root,
+        cache_root / diarize.PYANNOTE_CACHE_SUBDIR,
         EMBEDDING_REPO,
         "pytorch_model.bin",
         b"real-shaped wespeaker checkpoint",
