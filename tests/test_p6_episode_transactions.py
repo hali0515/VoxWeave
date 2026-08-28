@@ -424,6 +424,81 @@ def test_align_transaction_stages_then_publishes_json_before_vtt(tmp_path, monke
     assert not tuple(tmp_path.glob("*.part*"))
 
 
+def test_primary_stage_failure_is_canonical_and_mutates_nothing(tmp_path, monkeypatch):
+    from voxweave import episode_transaction
+
+    json_path = tmp_path / "episode.json"
+    vtt_path = tmp_path / "episode.vtt"
+    json_path.write_bytes(b"old json")
+    vtt_path.write_bytes(b"old vtt")
+    expected_json = episode_transaction.capture_file_generation(json_path)
+    expected_vtt = episode_transaction.capture_file_generation(vtt_path)
+    real_stage = episode_transaction._stage_bytes
+
+    def fail_json_stage(target, value):
+        if target == json_path:
+            raise OSError("stage disk full")
+        return real_stage(target, value)
+
+    monkeypatch.setattr(episode_transaction, "_stage_bytes", fail_json_stage)
+    with pytest.raises(episode_transaction.TransactionOperationError) as caught:
+        episode_transaction.commit_primary_outputs(
+            command="align",
+            episode_path=vtt_path,
+            json_path=json_path,
+            vtt_path=vtt_path,
+            expected_json=expected_json,
+            expected_vtt=expected_vtt,
+            main_json_bytes=b"new json",
+            vtt_bytes=b"new vtt",
+        )
+    assert caught.value.failure.kind == "stage-failed"
+    assert caught.value.failure.phase == "stage"
+    assert caught.value.failure.detail_code == "main-json-stage"
+    assert caught.value.landed == ()
+    assert json_path.read_bytes() == b"old json"
+    assert vtt_path.read_bytes() == b"old vtt"
+
+
+def test_vtt_replace_failure_reports_json_as_the_only_landed_primary(
+    tmp_path, monkeypatch
+):
+    from voxweave import episode_transaction
+
+    json_path = tmp_path / "episode.json"
+    vtt_path = tmp_path / "episode.vtt"
+    json_path.write_bytes(b"old json")
+    vtt_path.write_bytes(b"old vtt")
+    expected_json = episode_transaction.capture_file_generation(json_path)
+    expected_vtt = episode_transaction.capture_file_generation(vtt_path)
+    real_replace = episode_transaction._replace_stage
+
+    def fail_vtt_replace(stage):
+        if stage.target == vtt_path:
+            raise OSError("replace failed")
+        return real_replace(stage)
+
+    monkeypatch.setattr(episode_transaction, "_replace_stage", fail_vtt_replace)
+    with pytest.raises(episode_transaction.TransactionOperationError) as caught:
+        episode_transaction.commit_primary_outputs(
+            command="align",
+            episode_path=vtt_path,
+            json_path=json_path,
+            vtt_path=vtt_path,
+            expected_json=expected_json,
+            expected_vtt=expected_vtt,
+            main_json_bytes=b"new json",
+            vtt_bytes=b"new vtt",
+        )
+    assert caught.value.failure.kind == "commit-failed"
+    assert caught.value.failure.phase == "commit"
+    assert caught.value.failure.detail_code == "vtt-replace"
+    assert caught.value.landed == (json_path,)
+    assert json_path.read_bytes() == b"new json"
+    assert vtt_path.read_bytes() == b"old vtt"
+    assert not tuple(tmp_path.glob("*.part*"))
+
+
 def test_segmentation_transaction_consumes_commit_only_after_recheck(tmp_path):
     from voxweave.align_context import (
         consume_context_role,
