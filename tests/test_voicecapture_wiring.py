@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from voxweave import backend, chunking, diarize, pipeline, songdet
+from voxweave import backend, chunking, diarize, episode_transaction, pipeline, songdet
 from voxweave.mediasnapshot import SnapshotUnavailable
 from voxweave.voicebase import (
     load_voiceprints,
@@ -198,7 +198,7 @@ def test_capture_raw_decoder_reads_stable_snapshot_through_truncate_aba(
     assert decoded_sources and not decoded_sources[0].exists()
 
 
-def test_live_media_mismatch_drops_pair_and_machine_artifacts(
+def test_live_media_mismatch_stale_aborts_without_machine_artifact_cleanup(
     tmp_path, monkeypatch, caplog
 ):
     media = tmp_path / "episode.mkv"
@@ -208,22 +208,22 @@ def test_live_media_mismatch_drops_pair_and_machine_artifacts(
 
     def fake_transcribe(_source, **_kwargs):
         turns = [TURN]
+        media.write_bytes(b"replacement media")
         return "en", [dict(UNIT)], [], [], turns, _capture(turns)
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
-    monkeypatch.setattr(pipeline, "media_fingerprint", lambda _path: "f" * 64)
     with caplog.at_level("WARNING", logger="voxweave"):
-        pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+        with pytest.raises(episode_transaction.MediaStaleError) as caught:
+            pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
 
-    sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
-    assert "voiceprint_capture" not in sibling
-    assert "voiceprint_media" not in sibling
+    assert caught.value.failure.detail_code == "media-generation"
+    assert not (tmp_path / "episode.json").exists()
+    assert not (tmp_path / "episode.vtt").exists()
     for suffix in (".voiceprints.json", ".speakers.suggest.json", ".speakers.html"):
-        assert not pipeline.swap_ext(media, suffix).exists()
-    assert "live media changed" in caplog.text
+        assert pipeline.swap_ext(media, suffix).read_text(encoding="utf-8") == "stale"
 
 
-def test_process_final_json_replace_recheck_drops_late_media_change(
+def test_process_capture_publishes_primaries_then_machine_artifact(
     tmp_path, monkeypatch
 ):
     media = tmp_path / "episode.mkv"
@@ -244,31 +244,25 @@ def test_process_final_json_replace_recheck_drops_late_media_change(
             _capture(turns),
         ),
     )
-    original_write = pipeline.fsio.atomic_write_text
-    changed = []
+    real_replace = episode_transaction._replace_stage
+    order: list[str] = []
 
-    def mutate_at_json_replace(path, content, **kwargs):
-        if Path(path).suffix == ".json" and "voiceprint_capture" in content:
-            final_check = kwargs["before_replace"]
+    def observed_replace(stage):
+        order.append(stage.target.name)
+        real_replace(stage)
 
-            def mutate_then_check():
-                media.write_bytes(b"B" * 64)
-                changed.append(True)
-                return final_check()
-
-            kwargs["before_replace"] = mutate_then_check
-        return original_write(path, content, **kwargs)
-
-    monkeypatch.setattr(pipeline.fsio, "atomic_write_text", mutate_at_json_replace)
+    monkeypatch.setattr(episode_transaction, "_replace_stage", observed_replace)
 
     pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
 
     sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
-    assert changed == [True]
-    assert "voiceprint_capture" not in sibling
-    assert "voiceprint_media" not in sibling
-    for suffix in (".voiceprints.json", ".speakers.suggest.json", ".speakers.html"):
-        assert not pipeline.swap_ext(media, suffix).exists()
+    assert order == ["episode.json", "episode.vtt", "episode.voiceprints.json"]
+    assert isinstance(sibling["voiceprint_capture"], str)
+    assert sibling["voiceprint_capture"].startswith("c")
+    assert sibling["voiceprint_media"] == media_fingerprint(media)
+    assert (tmp_path / "episode.voiceprints.json").exists()
+    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+    assert not (tmp_path / "episode.speakers.html").exists()
 
 
 def test_snapshot_unavailable_continues_without_capture(tmp_path, monkeypatch):
@@ -330,15 +324,15 @@ def test_process_primary_write_failure_exits_with_no_false_sidecar(
     def fake_transcribe(_source, **_kwargs):
         return "en", [dict(UNIT)], [], [], turns, _capture(turns)
 
-    original_write = pipeline.fsio.atomic_write_text
+    real_replace = episode_transaction._replace_stage
 
-    def failing_write(path, content, **kwargs):
-        if Path(path).suffix == failed_suffix:
+    def failing_replace(stage):
+        if stage.target.suffix == failed_suffix:
             raise OSError(f"injected {failed_suffix} failure")
-        return original_write(path, content, **kwargs)
+        return real_replace(stage)
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
-    monkeypatch.setattr(pipeline.fsio, "atomic_write_text", failing_write)
+    monkeypatch.setattr(episode_transaction, "_replace_stage", failing_replace)
 
     with pytest.raises(OSError, match="injected"):
         pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
@@ -373,11 +367,14 @@ def test_process_sidecar_write_failure_names_landed_primary_outputs(
             _capture(turns),
         ),
     )
-    monkeypatch.setattr(
-        pipeline,
-        "write_voiceprints",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
-    )
+    real_replace = episode_transaction._replace_stage
+
+    def fail_sidecar_replace(stage):
+        if stage.target == tmp_path / "episode.voiceprints.json":
+            raise OSError("disk full")
+        return real_replace(stage)
+
+    monkeypatch.setattr(episode_transaction, "_replace_stage", fail_sidecar_replace)
 
     with pytest.raises(
         RuntimeError,
