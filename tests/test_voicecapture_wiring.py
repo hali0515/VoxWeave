@@ -334,9 +334,15 @@ def test_process_primary_write_failure_exits_with_no_false_sidecar(
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
     monkeypatch.setattr(episode_transaction, "_replace_stage", failing_replace)
 
-    with pytest.raises(OSError, match="injected"):
+    with pytest.raises(
+        episode_transaction.TransactionOperationError, match="injected"
+    ) as caught:
         pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
 
+    assert caught.value.failure.kind == "commit-failed"
+    assert caught.value.failure.detail_code == (
+        "main-json-replace" if failed_suffix == ".json" else "vtt-replace"
+    )
     assert not (tmp_path / "episode.voiceprints.json").exists()
     if failed_suffix == ".vtt":
         sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
