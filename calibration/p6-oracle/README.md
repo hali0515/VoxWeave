@@ -12,3 +12,15 @@ geometry and selected-primary hash links. The combined case is a separate full g
 not a textual delta mask. Every declared matrix vector names executable pytest evidence;
 `source-gates --check` executes the deduplicated set. Acoustic quality calibration remains
 owned by `scripts/calib_alignment.py`.
+
+Run the complete oracle gate program through the locale-pinned entry point:
+
+```text
+make quality-p6-oracle VARIANT=cuda
+```
+
+That target runs validation, byte comparison, and source coverage with the exact
+recorded environment and writes the comparison report outside this immutable corpus.
+The runner itself deliberately retains its strict environment check, so invoking it
+directly under an arbitrary shell locale may return the documented invalid-environment
+exit code.

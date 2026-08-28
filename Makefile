@@ -1,6 +1,7 @@
 .PHONY: install reinstall uninstall dev test lint typecheck \
 	quality quality-segmentation quality-shadow-segmentation \
 	quality-shadow-segmentation-full \
+	quality-p6-oracle \
 	quality-record-segmentation
 
 # Install as a global uv tool (end-user mode): puts the voxweave command on PATH.
@@ -105,6 +106,9 @@ SEG_CORPUS ?= calibration/segmentation/corpus.json
 SEG_BASELINE ?= calibration/segmentation/baseline.json
 SEG_REPORT ?= build/calibration/segmentation-report.json
 SEG_SHADOW_REPORT ?= build/calibration/segmentation-shadow-report.json
+P6_ORACLE_MANIFEST ?= calibration/p6-oracle/manifest.json
+P6_ORACLE_REPORT ?= build/p6-oracle-report.json
+P6_ORACLE_ENV = env -i PATH="$(PATH)" LANG=zh_CN.UTF-8 LC_ALL=C.UTF-8
 
 # `quality` is only the public, zero-GPU, deterministic lane: no media, no model, no
 # network, runnable from a bare checkout. The alignment ruler needs private media and
@@ -116,6 +120,17 @@ quality-segmentation:
 	  --corpus $(SEG_CORPUS) \
 	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \
 	  --json-out $(SEG_REPORT) --check
+
+# Canonical P6 oracle entry point. The runner intentionally validates its recorded
+# environment; this target supplies that environment explicitly instead of depending on
+# the invoking shell's locale, timezone, hash seed, or project-specific variables.
+quality-p6-oracle:
+	$(P6_ORACLE_ENV) uv run --extra $(VARIANT) python scripts/p6_oracle.py validate \
+	  --manifest $(P6_ORACLE_MANIFEST)
+	$(P6_ORACLE_ENV) uv run --extra $(VARIANT) python scripts/p6_oracle.py compare \
+	  --manifest $(P6_ORACLE_MANIFEST) --check --json-out $(P6_ORACLE_REPORT)
+	$(P6_ORACLE_ENV) uv run --extra $(VARIANT) python scripts/p6_oracle.py source-gates \
+	  --manifest $(P6_ORACLE_MANIFEST) --check
 
 # P5: full optimizer/finalizer/speaker shadow matrix beside the shipped v1 answer.
 # Same corpus, same baseline, same environment as `quality-segmentation` -- the

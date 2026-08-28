@@ -112,10 +112,19 @@ def _load_manifest() -> dict[str, Any]:
     return value
 
 
+def _pinned_oracle_environment() -> dict[str, str]:
+    return {
+        "LANG": "zh_CN.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": os.environ.get("PATH", os.defpath),
+    }
+
+
 def _oracle_command(*arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(ORACLE_RUNNER), *arguments],
         cwd=REPO_ROOT,
+        env=_pinned_oracle_environment(),
         check=False,
         text=True,
         capture_output=True,
