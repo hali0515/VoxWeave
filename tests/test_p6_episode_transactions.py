@@ -1157,6 +1157,46 @@ def test_align_shadow_runs_profile_admission_before_pending_w1(
     assert artifact.fresh["profile_status"] == "invalid"
 
 
+def test_qwen_align_block_keeps_nominal_legacy_and_observes_sample_origin(
+    tmp_path, monkeypatch
+):
+    import numpy as np
+    import soundfile as sf
+
+    from voxweave import backend
+
+    wav = tmp_path / "prepared.wav"
+    sf.write(wav, np.zeros(16_000, dtype=np.float32), 16_000)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda *_args, **_kwargs: [{"text": "x", "start": 0.0, "end": 0.1}],
+    )
+    chunks: list = []
+    origins: list[float] = []
+
+    delivered = pipeline._align_blocks(
+        wav,
+        [{"text": "x", "start": 0.10001, "end": 0.5}],
+        "zh",
+        mms=False,
+        ctc_model=None,
+        crops=[(0.10001, 0.5)],
+        reporter=pipeline.Reporter(),
+        tmp_chunks=chunks,
+        raw_call_observer=lambda _raw, _sources, origin, _identity: origins.append(
+            origin
+        ),
+    )
+    try:
+        assert delivered[0][0]["start"] == 0.10001
+        assert origins == [int(0.10001 * 16_000) / 16_000]
+        assert origins[0] != delivered[0][0]["start"]
+    finally:
+        for path in chunks:
+            path.unlink(missing_ok=True)
+
+
 def test_align_shadow_observer_failure_cannot_change_selected_return(
     tmp_path, monkeypatch, caplog
 ):
