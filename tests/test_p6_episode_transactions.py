@@ -223,6 +223,80 @@ def test_process_releases_panns_after_handoff_when_segmentation_fails(
     assert released == ["panns"]
 
 
+def test_process_panns_release_failure_preserves_exception_and_landed_accounting(
+    tmp_path, monkeypatch
+):
+    class ReleaseFailure(OSError):
+        pass
+
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    sidecar = tmp_path / "episode.sdh.vtt"
+    release_calls: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "transcribe",
+        lambda *_args, **_kwargs: ("en", _units(), None, [], [], None),
+    )
+
+    def write_sidecar(*_args, **_kwargs):
+        sidecar.write_bytes(b"auxiliary")
+        return sidecar
+
+    def fail_release():
+        release_calls.append("panns")
+        raise ReleaseFailure("release failed exactly")
+
+    monkeypatch.setattr(pipeline, "_write_sdh_sidecar", write_sidecar)
+    monkeypatch.setattr(songdet, "release_model", fail_release)
+
+    with pytest.raises(ReleaseFailure, match="release failed exactly") as caught:
+        pipeline.process(media, sdh=True, shot_snap=False)
+
+    assert release_calls == ["panns"]
+    assert caught.value.failure.kind == "model-release-failed"
+    assert caught.value.failure.phase == "dispose"
+    assert caught.value.failure.detail_code == "panns-release"
+    assert caught.value.landed == (
+        tmp_path / "episode.json",
+        tmp_path / "episode.vtt",
+    )
+    assert caught.value.auxiliary_landed == (sidecar,)
+
+
+def test_process_panns_release_failure_is_secondary_to_earlier_failure(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    release_calls: list[str] = []
+    monkeypatch.setattr(
+        pipeline,
+        "transcribe",
+        lambda *_args, **_kwargs: ("en", _units(), None, [], [], None),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "segment_document",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("segmentation failed")),
+    )
+
+    def fail_release():
+        release_calls.append("panns")
+        raise OSError("late release failed")
+
+    monkeypatch.setattr(songdet, "release_model", fail_release)
+
+    with pytest.raises(RuntimeError, match="segmentation failed") as caught:
+        pipeline.process(media, sdh=True, shot_snap=False)
+
+    assert release_calls == ["panns"]
+    assert len(caught.value.secondary_failures) == 1
+    assert caught.value.secondary_failures[0].kind == "model-release-failed"
+    assert caught.value.secondary_failures[0].phase == "dispose"
+    assert caught.value.secondary_failures[0].detail_code == "panns-release"
+
+
 def test_sdh_generation_change_retains_existing_auxiliary(
     tmp_path, monkeypatch, caplog
 ):
