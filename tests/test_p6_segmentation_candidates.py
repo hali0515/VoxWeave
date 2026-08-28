@@ -227,6 +227,25 @@ def test_encoder_role_is_single_use_and_candidate_set_remains_issuer_only(tmp_pa
     assert getattr(error.value, "detail_code", None) == "context-consumed"
 
 
+def test_legacy_encoder_failure_does_not_suppress_boundary_attempt(
+    tmp_path, monkeypatch
+):
+    import voxweave.segmentation_candidates as encoder
+
+    context, result = _result(tmp_path, shadow_enabled=True)
+    real = encoder.project_segmentation_delivery
+
+    def fail_legacy(delivery, inputs, *, strict):
+        if delivery.engine_family == "legacy-v1":
+            raise UnicodeError("injected legacy encoder failure")
+        return real(delivery, inputs, strict=strict)
+
+    monkeypatch.setattr(encoder, "project_segmentation_delivery", fail_legacy)
+    candidates = encoder.encode_segmentation_candidates(context, result)
+    assert isinstance(candidates.outcome_for("legacy-v1"), encoder.CandidateFailure)
+    assert isinstance(candidates.outcome_for("boundary-v2"), encoder.EncodedCandidate)
+
+
 def test_shadow_builds_real_p5_boundary_delivery_without_selecting_it(tmp_path):
     from voxweave.candidate_encoder import EncodedCandidate
     from voxweave.segmentation_candidates import (
