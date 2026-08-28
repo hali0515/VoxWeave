@@ -33,7 +33,6 @@ from voxweave.core.segdoc import (
     DisplayProfile,
     SegDocument,
     build_seg_document,
-    normalize_speaker_turn_bounds,
 )
 from voxweave.debug import DebugSink, FileDebugSink
 from voxweave.lang import (
@@ -1061,10 +1060,13 @@ def _spans_in(raw: Any) -> list[tuple[float, float]] | None:
 def _turns_in(raw: Any) -> list[tuple[float, float, str]] | None:
     """Parse persisted ``speaker_turns`` (``[[start, end, label], ...]``).
 
-    Malformed entries (wrong arity, non-numeric bounds) are skipped with a warning.
-    Point turns survive; reversed turns collapse at their declared start through
-    the shared typed normalization used by speaker evidence. None if
-    absent/empty or nothing survives.
+    This is the byte-preserving production replay seam: numeric bounds are only
+    coerced to ``float``.  Reversed, point and non-finite legacy values survive
+    exactly as they did before P5; the shadow's speaker-evidence consumer owns
+    normalization on its detached document copy after the feature flag.
+
+    Malformed entries (wrong arity or non-numeric bounds) are skipped with a
+    warning. None if absent/empty or nothing survives.
     """
     if not raw:
         return None
@@ -1072,8 +1074,7 @@ def _turns_in(raw: Any) -> list[tuple[float, float, str]] | None:
     for entry in raw:
         try:
             s, e, lb = entry
-            start, end = normalize_speaker_turn_bounds(float(s), float(e))
-            out.append((start, end, str(lb)))
+            out.append((float(s), float(e), str(lb)))
         except (TypeError, ValueError):
             log.warning("skipping malformed speaker_turns entry: %r", entry)
     return out or None
@@ -1762,6 +1763,50 @@ def _shadow_movement_distribution(movement: Sequence[Any]) -> dict[str, Any]:
     }
 
 
+def _shadow_source_units(units: Sequence[Any]) -> list[dict[str, Any]]:
+    """Closed source-unit authority used by schema-side partition replay."""
+    return [
+        {
+            "confidence": unit.confidence,
+            "end": unit.end,
+            "id": unit.id,
+            "provenance": unit.provenance,
+            "start": unit.start,
+            "surface": unit.surface,
+        }
+        for unit in units
+    ]
+
+
+def _shadow_finalizer_verification(
+    stream: Any, evidence: Any, policy: Any
+) -> dict[str, Any]:
+    """Digest-bound canonical inputs for schema-side finalizer replay."""
+    from voxweave.core.finalizer import _stream_payload
+
+    seed = _stream_payload(
+        stream.cues,
+        stream.profile,
+        stream.row_id,
+        stream.evaluation_id,
+    )
+    return {
+        "authority_id": stream.seed_id,
+        "authority_kind": stream.authority_kind,
+        "evidence": {
+            "shots": list(evidence.shots),
+            "sing_spans": [list(span) for span in evidence.sing_spans],
+        },
+        "policy": {
+            "grid": policy.grid,
+            "min_gap": policy.min_gap,
+            "overlap_policy": policy.overlap_policy,
+        },
+        "seed_digest": stream.capability.seal.digest,
+        "seed_payload": seed,
+    }
+
+
 def _shadow_finalizer_row(
     result: Any,
     stream: Any,
@@ -1830,6 +1875,7 @@ def _shadow_finalizer_row(
                 else "unresolved"
             ),
             "validator": validator,
+            "verification": _shadow_finalizer_verification(stream, evidence, policy),
         },
         cues,
     )
@@ -2188,6 +2234,7 @@ def _shadow_v2_artifact(
         V1Partition,
         _document_partition,
         _document_waivers,
+        _optimization_reuse,
         optimize_document,
         selected_evidence_spans,
     )
@@ -2393,6 +2440,7 @@ def _shadow_v2_artifact(
         else V1Partition(cuts=v1_partition, cues=tuple(reference))
     )
     preview = AuditedFinalizerPreview(FinalizerPreview(shadow_document.profile))
+    pricing_reuse = _optimization_reuse(shadow_document, canonical_spaced=True)
     solution = optimize_document(
         shadow_document,
         v1=v1_reference_input,
@@ -2400,6 +2448,7 @@ def _shadow_v2_artifact(
         subunit_split=split,
         speakers=projected_speakers,
         speaker_weight=W_SPEAKER_INTERIOR,
+        _reuse=pricing_reuse,
     )
     speaker_off = optimize_document(
         shadow_document,
@@ -2408,11 +2457,13 @@ def _shadow_v2_artifact(
         subunit_split=split,
         speakers=projected_speakers,
         speaker_weight=0.0,
+        _reuse=pricing_reuse,
     )
     optimizer_artifact_bytes = json.dumps(
         solution.artifact, sort_keys=True, separators=(",", ":")
     )
     artifact = solution.artifact
+    artifact["units"] = _shadow_source_units(shadow_document.units)
     artifact["preview_fidelity"] = preview.to_dict()
     artifact["v1_projection"] = {
         "cut_count": None if v1_partition is None else len(v1_partition),
@@ -2437,6 +2488,19 @@ def _shadow_v2_artifact(
     fallback_ranges = [
         list(item.unit_range) for item in solution.solutions if not item.optimized
     ]
+
+    raw_cues = [copy.deepcopy(cue) for item in solution.solutions for cue in item.cues]
+    raw_v2 = _shadow_stream_block(
+        raw_cues,
+        raw_partition,
+        "solver-partition",
+        document=shadow_document,
+        origin="v2",
+        stage="raw",
+        waivers=_restamp_by_footprint(solver_waivers, raw_partition, unit_count),
+        origins=_origins_by_footprint(fallback_ranges, raw_partition, unit_count),
+    )
+    artifact["raw"] = raw_v2
 
     def owned_footprints(partition: Sequence[int] | None) -> list[str]:
         if partition is None:
@@ -2605,6 +2669,7 @@ def _shadow_v2_artifact(
             "unit_count": unit_count,
             "v1_unprojected": v1_partition is None,
         }
+        artifact["validator"]["raw"] = raw_v2["validator"]
         artifact["validator"]["core"] = core_v2["validator"]
         artifact["validator"]["legacy_overlay"] = delivery_v2["validator"]
         artifact["validator"]["raw_duplicate_v1_cues"] = overlapping
@@ -2991,6 +3056,7 @@ def _shadow_v2_artifact(
         "unit_count": totals["unit_count"],
         "v1_unprojected": v1_partition is None,
     }
+    artifact["validator"]["raw"] = raw_v2["validator"]
     artifact["validator"]["core"] = core_v2["validator"]
     artifact["validator"]["legacy_overlay"] = delivery_v2["validator"]
     artifact["validator"]["raw_duplicate_v1_cues"] = overlapping

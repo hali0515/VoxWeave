@@ -180,6 +180,36 @@ class CostTables:
     fallback_start: float = 0.0
     predecessor_stateful: bool = False
     speaker_pricing_refused: bool = False
+    document_nodes: tuple[int, ...] = ()
+
+
+@dataclass
+class _OptimizationReuse:
+    """One document's immutable topology plus reusable unit-node maps.
+
+    The two speaker pricing rows differ only in their weight.  They therefore
+    share this raw lattice and the interval-to-document node maps; selected-edge
+    evidence remains row-local and is installed on a replaced lattice below.
+    """
+
+    document: SegDocument
+    lattice: DocumentLattice
+    document_nodes: dict[int, tuple[int, ...]]
+
+
+def _optimization_reuse(
+    document: SegDocument, *, canonical_spaced: bool = False
+) -> _OptimizationReuse:
+    """Open a reuse scope for solves over the exact same document object."""
+    return _OptimizationReuse(
+        document=document,
+        lattice=build_document_lattice(
+            document,
+            cache_speaker_evidence=False,
+            canonical_spaced=canonical_spaced,
+        ),
+        document_nodes={},
+    )
 
 
 def build_cost_context(
@@ -283,9 +313,9 @@ def _base_edge_cost(
     lattice: IntervalLattice,
     edge: Edge,
     ctx: CostContext,
+    document_nodes: Sequence[int],
 ) -> CostBreakdown:
     """Price one edge from the same phase-1 facts materialization will use."""
-    document_nodes = _document_nodes(lattice, ctx.layer)
     left = document_nodes[edge.start_node]
     right = document_nodes[edge.end_node]
     common = {
@@ -378,6 +408,7 @@ def _speaker_price(
     edge: Edge,
     ctx: CostContext,
     base: CostBreakdown,
+    document_nodes: Sequence[int],
     *,
     previous_end: float,
 ) -> tuple[Edge, CostBreakdown]:
@@ -391,7 +422,7 @@ def _speaker_price(
         previous_end=previous_end,
     )
     if resolved.evidence_unavailable_reason is not None:
-        return resolved, _base_edge_cost(lattice, resolved, ctx)
+        return resolved, _base_edge_cost(lattice, resolved, ctx, document_nodes)
     if not isinstance(resolved.evidence_span, EvidenceSpan):
         raise ValueError("resolved speaker edge has no EvidenceSpan")
     unit_range = (
@@ -410,7 +441,7 @@ def _speaker_price(
     # is a phase-1 input, so both the speaker term and the base preview price must
     # be recomputed for the resolved edge rather than retaining a representative
     # table entry produced with ``fallback_start``.
-    resolved_base = _base_edge_cost(lattice, resolved, ctx)
+    resolved_base = _base_edge_cost(lattice, resolved, ctx, document_nodes)
     return resolved, _with_speaker_cost(resolved_base, speaker)
 
 
@@ -419,6 +450,7 @@ def build_cost_tables(
     ctx: CostContext,
     *,
     fallback_start: float = 0.0,
+    document_nodes: Sequence[int] | None = None,
 ) -> CostTables:
     """Price every legal edge and every candidate cut of one interval.
 
@@ -433,13 +465,20 @@ def build_cost_tables(
     speaker_parts: list[CostBreakdown] = []
     predecessor_stateful = False
     speaker_pricing_refused = False
+    resolved_document_nodes = (
+        _document_nodes(lattice, ctx.layer)
+        if document_nodes is None
+        else tuple(document_nodes)
+    )
+    if len(resolved_document_nodes) != len(lattice.atoms) + 1:
+        raise ValueError("document-node map does not match interval topology")
     for edge in lattice.edges:
         priced_edge = edge
         if isinstance(ctx.speaker_evidence, UnitSpeakers) and edge.evidence_deferred:
             priced_edge = _resolve_edge_for_previous(
                 lattice, edge, ctx, previous_end=fallback_start
             )
-        base = _base_edge_cost(lattice, priced_edge, ctx)
+        base = _base_edge_cost(lattice, priced_edge, ctx, resolved_document_nodes)
         key = (edge.start_node, edge.end_node)
         base_edges[key] = base
         if isinstance(ctx.speaker_evidence, UnitSpeakers):
@@ -515,6 +554,7 @@ def build_cost_tables(
         fallback_start=float(fallback_start),
         predecessor_stateful=predecessor_stateful,
         speaker_pricing_refused=speaker_pricing_refused,
+        document_nodes=resolved_document_nodes,
     )
 
 
@@ -590,6 +630,7 @@ def _assemble_path(
                 candidate,
                 tables.speaker_context,
                 tables.base_edges[key],
+                tables.document_nodes,
                 previous_end=previous_end,
             )
             if candidate.input_end is None:
@@ -766,6 +807,7 @@ def _solve_interval_with_predecessor_state(
                     edge,
                     ctx,
                     bases[key],
+                    tables.document_nodes,
                     previous_end=previous_end,
                 )
                 if resolved.input_end is None:
@@ -1938,6 +1980,7 @@ def optimize_document(
     subunit_split: RefineResult | None = None,
     speakers: UnitSpeakers | None = None,
     speaker_weight: float | None = None,
+    _reuse: _OptimizationReuse | None = None,
 ) -> DocumentSolution:
     """Solve every hard interval of one document and assemble its artifact.
 
@@ -1984,7 +2027,14 @@ def optimize_document(
     # The first fabricated bound of each interval depends on the preceding
     # selected interval's delivered input end.  Build admission first, then
     # resolve each interval only when that predecessor is known.
-    lattice = build_document_lattice(document, cache_speaker_evidence=False)
+    if _reuse is not None and _reuse.document is not document:
+        raise ValueError("optimization reuse belongs to a different document")
+    reuse = (
+        _optimization_reuse(document, canonical_spaced=speaker_enabled)
+        if _reuse is None
+        else _reuse
+    )
+    lattice = reuse.lattice
     ctx = build_cost_context(
         document,
         lattice,
@@ -2007,11 +2057,17 @@ def optimize_document(
             if speaker_enabled
             else raw_interval_lattice
         )
+        cached_nodes = reuse.document_nodes.get(raw_interval_lattice.interval.index)
         tables = build_cost_tables(
             interval_lattice,
             ctx,
             fallback_start=fallback_start,
+            document_nodes=cached_nodes,
         )
+        if cached_nodes is None:
+            reuse.document_nodes[raw_interval_lattice.interval.index] = (
+                tables.document_nodes
+            )
         solution = optimize_interval(
             interval_lattice,
             tables,

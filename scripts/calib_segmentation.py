@@ -124,6 +124,9 @@ DEFAULT_BASELINE = REPO_ROOT / "calibration" / "segmentation" / "baseline.json"
 DEFAULT_COARSE_CORPUS = (
     REPO_ROOT / "calibration" / "segmentation" / "corpus-coarse.json"
 )
+DEFAULT_AUTHORIZED_DEFERRALS = (
+    REPO_ROOT / "calibration" / "segmentation" / "p5-authorized-deferrals.txt"
+)
 
 #: Tracked-size ceilings from design 4.4; exceeding either is exit 2, not a gate.
 MAX_CASE_BYTES = 256 * 1024
@@ -3983,6 +3986,356 @@ def _coarse_start_errors(fine: Case, rows: Sequence[Mapping[str, Any]]) -> list[
     return errors
 
 
+def _n14_profile(value: Any) -> Any:
+    """Decode the closed artifact profile for an independent N14 replay."""
+    from voxweave.core.segdoc import DisplayProfile
+
+    if not isinstance(value, Mapping):
+        raise ValueError("profile is missing")
+    keys = {
+        "clause_ms",
+        "cps",
+        "glue_gap_s",
+        "lag_out_s",
+        "language",
+        "max_cue_s",
+        "max_line_length",
+        "max_lines",
+        "min_cue_s",
+        "offline_ms",
+        "shot_snap_s",
+        "vad_skip_ms",
+    }
+    if set(value) != keys:
+        raise ValueError("profile is not closed")
+    return DisplayProfile(**{key: value[key] for key in keys})
+
+
+def _n14_units(value: Any) -> list[Any]:
+    """Decode only serialized source-unit facts; never read producer objects."""
+    from voxweave.core.segdoc import SourceUnit
+
+    if not isinstance(value, list):
+        raise ValueError("source units are missing")
+    units = []
+    for index, raw in enumerate(value):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"unit {index} is not a mapping")
+        if set(raw) != {"confidence", "end", "id", "provenance", "start", "surface"}:
+            raise ValueError(f"unit {index} is not closed")
+        units.append(
+            SourceUnit(
+                id=str(raw["id"]),
+                surface=str(raw["surface"]),
+                start=raw["start"],
+                end=raw["end"],
+                provenance=str(raw["provenance"]),
+                confidence=raw["confidence"],
+            )
+        )
+    return units
+
+
+def _n14_oracle(
+    units: Sequence[Any],
+    profile: Any,
+    interval_ranges: Sequence[tuple[int, int]],
+) -> dict[str, Any]:
+    """Rebuild text-only admission and derive the legal edge set independently."""
+    from dataclasses import replace
+
+    from voxweave.core.boundary_lattice import band_atoms, build_document_lattice
+    from voxweave.core.canonical_text import canonical_legal, canonical_text
+    from voxweave.core.layout import _join
+    from voxweave.core.segdoc import SegDocument
+
+    text_profile = replace(profile, max_cue_s=0.0)
+    checked = false_negative = false_positive = 0
+    mismatch_examples: list[dict[str, Any]] = []
+    unknown: list[str] = []
+    limit = band_atoms(text_profile) + 2
+    for interval_index, (low, high) in enumerate(interval_ranges):
+        owned_units = list(units[low:high])
+        document = SegDocument(
+            language=text_profile.language,
+            units=owned_units,
+            profile=text_profile,
+            vad_speech=None,
+            shot_changes=None,
+            sing_spans=None,
+            speaker_turns=None,
+            manifest={},
+            text=_join([unit.surface for unit in owned_units], text_profile.language),
+        )
+        built = build_document_lattice(
+            document,
+            cache_speaker_evidence=False,
+            canonical_spaced=True,
+        )
+        if len(built.lattices) != 1:
+            unknown.append(
+                f"interval {interval_index}: text-only replay produced "
+                f"{len(built.lattices)} intervals"
+            )
+            continue
+        lattice = built.lattices[0]
+        actual = {(edge.start_node, edge.end_node) for edge in lattice.edges}
+        expected: set[tuple[int, int]] = set()
+        for position, start in enumerate(lattice.nodes):
+            for end in lattice.nodes[position + 1 :]:
+                if end - start > limit:
+                    break
+                atoms = lattice.atoms[start:end]
+                raw = _join([atom.text for atom in atoms], text_profile.language)
+                final = canonical_text(
+                    [
+                        {"text": atom.text, "start": atom.start, "end": atom.end}
+                        for atom in atoms
+                    ],
+                    fallback_text=raw,
+                    lang=text_profile.language,
+                    profile=text_profile,
+                    expected_footprint=raw,
+                )
+                checked += 1
+                if (
+                    any(atom.start is not None for atom in atoms)
+                    and any(atom.end is not None for atom in atoms)
+                    and canonical_legal(final, text_profile)
+                ):
+                    expected.add((start, end))
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        false_negative += len(missing)
+        false_positive += len(extra)
+        if missing or extra:
+            mismatch_examples.append(
+                {
+                    "extra": [list(pair) for pair in extra[:5]],
+                    "interval": interval_index,
+                    "missing": [list(pair) for pair in missing[:5]],
+                }
+            )
+    return {
+        "checked": checked,
+        "false_negative": false_negative,
+        "false_positive": false_positive,
+        "mismatch_examples": mismatch_examples,
+        "unknown": unknown,
+    }
+
+
+def n14_artifact_evidence(
+    artifact: Mapping[str, Any], *, case_id: str, corpus: str
+) -> dict[str, Any]:
+    """Derive N14 work, FD-9 and both-direction facts from serialized authority."""
+    from voxweave.core.boundary_lattice import band_atoms
+    from voxweave.core.canonical_text import CANONICAL_PASS_FACTOR
+    from voxweave.core.layout import _no_spaces
+
+    failures: list[str] = []
+    unknown: list[str] = []
+    work_rows: list[dict[str, Any]] = []
+    finalizer_rows: list[dict[str, Any]] = []
+    interval_ranges: list[tuple[int, int]] = []
+    try:
+        profile = _n14_profile(artifact.get("profile"))
+        units = _n14_units(artifact.get("units"))
+    except (TypeError, ValueError) as exc:
+        return {
+            "case": case_id,
+            "corpus": corpus,
+            "failures": [],
+            "language_class": "unknown",
+            "oracle": {"checked": 0},
+            "unknown": [f"{case_id}: {exc}"],
+        }
+
+    intervals = artifact.get("intervals")
+    if not isinstance(intervals, list) or not intervals:
+        unknown.append(f"{case_id}: interval work evidence is missing")
+    else:
+        cursor = 0
+        for index, raw in enumerate(intervals):
+            if not isinstance(raw, Mapping):
+                unknown.append(f"{case_id}: interval {index} is not a mapping")
+                continue
+            unit_range = raw.get("unit_range")
+            actual = raw.get("canonical_chars")
+            if (
+                not isinstance(unit_range, list)
+                or len(unit_range) != 2
+                or any(
+                    isinstance(item, bool) or not isinstance(item, int)
+                    for item in unit_range
+                )
+                or isinstance(actual, bool)
+                or not isinstance(actual, int)
+                or actual < 0
+            ):
+                unknown.append(f"{case_id}: interval {index} work row is malformed")
+                continue
+            low, high = unit_range
+            if low != cursor or not low < high <= len(units):
+                unknown.append(
+                    f"{case_id}: interval {index} range {unit_range!r} does not tile units"
+                )
+                continue
+            cursor = high
+            interval_ranges.append((low, high))
+            raw_chars = sum(len(unit.surface) for unit in units[low:high])
+            bound = CANONICAL_PASS_FACTOR * raw_chars * (band_atoms(profile) + 2) ** 2
+            passed = actual <= bound
+            if not passed:
+                failures.append(
+                    f"{case_id}: interval {index} canonical_chars {actual} exceeds "
+                    f"independent bound {bound}"
+                )
+            work_rows.append(
+                {
+                    "bound": bound,
+                    "canonical_chars": actual,
+                    "interval": index,
+                    "passed": passed,
+                    "raw_chars": raw_chars,
+                    "unit_range": [low, high],
+                }
+            )
+        if cursor != len(units):
+            unknown.append(
+                f"{case_id}: interval work ranges stop at {cursor}/{len(units)} units"
+            )
+
+    totals = artifact.get("totals")
+    reported_total = (
+        totals.get("canonical_chars") if isinstance(totals, Mapping) else None
+    )
+    recomputed_total = sum(row["canonical_chars"] for row in work_rows)
+    if isinstance(reported_total, bool) or not isinstance(reported_total, int):
+        unknown.append(f"{case_id}: totals.canonical_chars is missing or malformed")
+    elif reported_total != recomputed_total:
+        failures.append(
+            f"{case_id}: totals.canonical_chars {reported_total} disagrees with "
+            f"interval sum {recomputed_total}"
+        )
+
+    lanes = artifact.get("lanes")
+    delivery = lanes.get(SHADOW_LANE_FINALIZER) if isinstance(lanes, Mapping) else None
+    rows = delivery.get("rows") if isinstance(delivery, Mapping) else None
+    required_rows = {"v1", "v2", "v2-speaker-off"}
+    comparison = artifact.get("refiner_comparison")
+    if isinstance(comparison, Mapping) and comparison.get("materialized") is True:
+        required_rows.add("refiner-off")
+    if not isinstance(rows, Mapping):
+        unknown.append(f"{case_id}: authoritative finalizer rows are missing")
+    else:
+        required_rows.update(
+            str(row_id)
+            for row_id, row in rows.items()
+            if isinstance(row, Mapping) and isinstance(row.get("finalizer"), Mapping)
+        )
+        for row_id in sorted(required_rows):
+            row = rows.get(row_id)
+            finalizer = row.get("finalizer") if isinstance(row, Mapping) else None
+            if not isinstance(finalizer, Mapping):
+                unknown.append(f"{case_id}: finalizer row {row_id} has no evidence")
+                continue
+            entries = finalizer.get("entries")
+            deltas = finalizer.get("deltas_fired")
+            if not isinstance(entries, list) or not isinstance(deltas, list):
+                unknown.append(
+                    f"{case_id}: finalizer row {row_id} evidence is malformed"
+                )
+                continue
+            organic = sum(
+                isinstance(entry, Mapping)
+                and entry.get("kind") == "stutter-not-proven-fixed-within-4-scans"
+                for entry in entries
+            )
+            delta_count = sum(delta == "FD-9" for delta in deltas)
+            if organic or delta_count:
+                failures.append(
+                    f"{case_id}: finalizer row {row_id} fired organic FD-9 "
+                    f"({organic} report(s), {delta_count} delta(s))"
+                )
+            finalizer_rows.append(
+                {
+                    "fd9_deltas": delta_count,
+                    "fd9_reports": organic,
+                    "row": row_id,
+                }
+            )
+
+    oracle = (
+        _n14_oracle(units, profile, interval_ranges)
+        if interval_ranges
+        else {
+            "checked": 0,
+            "false_negative": 0,
+            "false_positive": 0,
+            "mismatch_examples": [],
+            "unknown": ["no valid interval ranges"],
+        }
+    )
+    unknown.extend(
+        f"{case_id}: oracle: {detail}" for detail in oracle.get("unknown", ())
+    )
+    if int(oracle.get("checked") or 0) == 0:
+        unknown.append(f"{case_id}: both-direction oracle denominator is zero")
+    if int(oracle.get("false_negative") or 0) or int(oracle.get("false_positive") or 0):
+        failures.append(
+            f"{case_id}: both-direction oracle found "
+            f"{oracle['false_negative']} missing and {oracle['false_positive']} extra edge(s)"
+        )
+    return {
+        "case": case_id,
+        "corpus": corpus,
+        "failures": failures,
+        "finalizer_rows": finalizer_rows,
+        "language": profile.language,
+        "language_class": "no-space" if _no_spaces(profile.language) else "spaced",
+        "oracle": oracle,
+        "reported_total": reported_total,
+        "recomputed_total": recomputed_total,
+        "unknown": unknown,
+        "work": work_rows,
+    }
+
+
+def n14_matrix_unknown(evidence: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Require positive oracle denominators in both corpora and language classes."""
+    required = {
+        (corpus, language_class)
+        for corpus in ("tracked", "coarse")
+        for language_class in ("spaced", "no-space")
+    }
+    observed = {
+        (str(row.get("corpus")), str(row.get("language_class")))
+        for row in evidence
+        if int((row.get("oracle") or {}).get("checked") or 0) > 0
+    }
+    return [
+        f"N14 missing positive denominator for {corpus}/{language_class}"
+        for corpus, language_class in sorted(required - observed)
+    ]
+
+
+def n14_exit_code(
+    evidence: Sequence[Mapping[str, Any]], *, require_matrix: bool = False
+) -> int:
+    """Fold N14 evidence: missing is invalid, a disproved property is a failure."""
+    if not evidence:
+        return cc.EXIT_INVALID
+    unknown = [item for row in evidence for item in row.get("unknown") or ()]
+    if require_matrix:
+        unknown.extend(n14_matrix_unknown(evidence))
+    if unknown:
+        return cc.EXIT_INVALID
+    if any(row.get("failures") for row in evidence):
+        return cc.EXIT_GATE_FAILED
+    return cc.EXIT_OK
+
+
 def run_coarse_gates(
     tracked: Corpus,
     path: str | Path = DEFAULT_COARSE_CORPUS,
@@ -3991,8 +4344,9 @@ def run_coarse_gates(
     manifest = load_coarse_manifest(path)
     by_relpath = {case.relpath: case for case in tracked.cases}
     rows: list[dict[str, Any]] = []
+    n14_rows: list[dict[str, Any]] = []
     failures: list[str] = []
-    stops: list[str] = []
+    stops: list[dict[str, str]] = []
     for fixture in manifest["cases"]:
         source = by_relpath.get(str(fixture["source_case"]))
         if source is None:
@@ -4059,6 +4413,11 @@ def run_coarse_gates(
         from voxweave.core.layout import _line_budget_width, _vis_width
 
         parent_document = seg_document_of(derived, result)
+        n14 = n14_artifact_evidence(
+            artifact, case_id=str(fixture["id"]), corpus="coarse"
+        )
+        n14_rows.append(n14)
+        failures.extend(n14["failures"])
         width_budget = _line_budget_width(
             parent_document.profile.max_line_length,
             parent_document.profile.language,
@@ -4109,8 +4468,13 @@ def run_coarse_gates(
         comparison = artifact.get("refiner_comparison") or {}
         if comparison.get("materialized") is not True:
             stops.append(
-                f"{fixture['id']}: refiner-off optimizer root unavailable "
-                "because the frozen factory refuses adopted-v1 intervals"
+                {
+                    "detail": (
+                        "refiner-off optimizer root unavailable because the frozen "
+                        "factory refuses adopted-v1 intervals"
+                    ),
+                    "id": f"PD-SUBUNIT/{fixture['id']}",
+                }
             )
         elif comparison.get("diffs_confined_to_coarse_caused") is not True:
             failures.append(
@@ -4149,6 +4513,7 @@ def run_coarse_gates(
         "cases": rows,
         "evidence_exercised": evidence_exercised,
         "failures": failures,
+        "n14": n14_rows,
         "path": str(path),
         "stops": stops,
         "trigger_classes_exercised": exercised,
@@ -5175,6 +5540,7 @@ def shadow_exit_code(
     perturbation_failures: Sequence[Any],
     perturbation_unknown: Sequence[Any] = (),
     measurement_errors: Sequence[str] = (),
+    unauthorized_stops: Sequence[Any] = (),
 ) -> int:
     """Fold the independent verdicts onto the shared 0/1/2 contract.
 
@@ -5185,11 +5551,78 @@ def shadow_exit_code(
     not 1 -- neither is evidence of a regression, and neither may pass.
     """
     code = gate_exit_code(gate_results)
-    if code == cc.EXIT_INVALID or measurement_errors or perturbation_unknown:
+    if (
+        code == cc.EXIT_INVALID
+        or measurement_errors
+        or perturbation_unknown
+        or unauthorized_stops
+    ):
         return cc.EXIT_INVALID
     if code == cc.EXIT_GATE_FAILED or c13_failures or perturbation_failures:
         return cc.EXIT_GATE_FAILED
     return cc.EXIT_OK
+
+
+def load_authorized_deferrals(
+    path: str | Path = DEFAULT_AUTHORIZED_DEFERRALS,
+) -> set[str]:
+    """Read exact section-14 deferral ids from the tracked controller list."""
+    source = Path(path)
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise cc.CalibrationError(
+            f"cannot read authorized deferrals: {source}"
+        ) from exc
+    if not lines or lines[0] != "# Source: p5-s14-addendum.md":
+        raise cc.CalibrationError(
+            f"{source}: missing exact addendum source header",
+            ["expected '# Source: p5-s14-addendum.md' on line 1"],
+        )
+    ids = [
+        line.strip() for line in lines[1:] if line.strip() and not line.startswith("#")
+    ]
+    if not ids or len(ids) != len(set(ids)):
+        raise cc.CalibrationError(
+            f"{source}: authorized deferral ids are empty or duplicated"
+        )
+    return set(ids)
+
+
+def adjudicate_deferrals(
+    stops: Sequence[Mapping[str, Any]],
+    *,
+    authorized_ids: set[str] | None = None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Label known frozen-law deferrals and keep every unknown STOP invalid."""
+    allowed = load_authorized_deferrals() if authorized_ids is None else authorized_ids
+    authorized: list[dict[str, str]] = []
+    unknown: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(stops):
+        stop_id = raw.get("id")
+        detail = raw.get("detail")
+        if not isinstance(stop_id, str) or not stop_id or not isinstance(detail, str):
+            unknown.append(
+                {
+                    "detail": f"malformed STOP at index {index}",
+                    "id": f"malformed-stop-{index}",
+                    "status": "unauthorized_stop",
+                }
+            )
+            continue
+        status = "authorized_deferred" if stop_id in allowed else "unauthorized_stop"
+        row = {"detail": detail, "id": stop_id, "status": status}
+        if stop_id in seen:
+            row["detail"] = f"duplicate STOP: {detail}"
+            row["status"] = "unauthorized_stop"
+            unknown.append(row)
+        elif status == "authorized_deferred":
+            authorized.append(row)
+        else:
+            unknown.append(row)
+        seen.add(stop_id)
+    return authorized, unknown
 
 
 def _lane_case_row(result: LaneResult) -> dict[str, Any]:
@@ -5242,7 +5675,8 @@ def build_shadow_report(
     speaker_gates: Mapping[str, Any] | None = None,
     speech_truncation: Mapping[str, Any] | None = None,
     coarse_gates: Mapping[str, Any] | None = None,
-    stop_items: Sequence[str] = (),
+    n14: Mapping[str, Any] | None = None,
+    stop_items: Sequence[Mapping[str, Any]] = (),
     warnings: Sequence[str] = (),
     timing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -5310,7 +5744,8 @@ def build_shadow_report(
             None if speech_truncation is None else dict(speech_truncation)
         ),
         "coarse_gates": None if coarse_gates is None else dict(coarse_gates),
-        "stop_items": list(stop_items),
+        "n14": None if n14 is None else dict(n14),
+        "stop_items": [dict(item) for item in stop_items],
         "baseline": (
             None
             if baseline is None
@@ -5517,6 +5952,14 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
             f"  coarse N4c: {len(coarse['cases'])} cases,"
             f" {len(coarse['failures'])} failures, {len(coarse['stops'])} STOPs"
         )
+    n14 = report.get("n14")
+    if n14:
+        print(
+            f"  N14          {n14['oracle_checked']} oracle pairs,"
+            f" {len(n14['failures'])} failures, {len(n14['unknown'])} unknown"
+        )
+    for item in report.get("stop_items") or ():
+        print(f"  {item['status']}: {item['id']} -- {item['detail']}")
     speech = report.get("speech_truncation")
     if speech:
         print(
@@ -5548,7 +5991,7 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         raise cc.CalibrationError(f"{corpus.path} selected no cases")
 
     warnings: list[str] = []
-    stop_items: list[str] = []
+    stop_items: list[dict[str, str]] = []
     baseline: dict[str, Any] | None = None
     baseline_path = args.baseline
     if (
@@ -5578,6 +6021,12 @@ def cmd_shadow(args: argparse.Namespace) -> int:
 
     coverage_failures: list[str] = []
     measurement_errors: list[str] = []
+    tracked_n14 = [
+        n14_artifact_evidence(row.artifact, case_id=row.case.id, corpus="tracked")
+        for row in shadow_cases
+    ]
+    for evidence in tracked_n14:
+        coverage_failures.extend(evidence["failures"])
     for row in shadow_cases:
         violations = shadow_violation_counts(row.artifact)
         measurement_errors.extend(
@@ -5642,14 +6091,16 @@ def cmd_shadow(args: argparse.Namespace) -> int:
                     for check in rechecks
                 )
             ):
-                item = (
-                    f"N20/{row.case.id}/{row_id}: {len(fallback_rows)} canonical "
-                    "fallback(s); the frozen W1 authority factory exposes no "
-                    "owned-footprint input, although the same word_data "
-                    "reconciles when that normative footprint is supplied"
-                )
+                item = {
+                    "detail": (
+                        f"{len(fallback_rows)} canonical fallback(s); the frozen W1 "
+                        "authority factory exposes no owned-footprint input, although "
+                        "the same word_data reconciles when that normative footprint "
+                        "is supplied"
+                    ),
+                    "id": f"N20/{row.case.id}/{row_id}",
+                }
                 stop_items.append(item)
-                warnings.append(f"STOP: {item}")
             elif fallback_rows:
                 coverage_failures.append(
                     f"{row.case.id}: {row_id} fired "
@@ -5724,12 +6175,14 @@ def cmd_shadow(args: argparse.Namespace) -> int:
                     f"{gate['id']}: value={gate.get('value')} target={gate.get('target')}"
                 )
             elif gate["status"] == "stopped":
-                item = (
-                    f"{gate['id']} STOP: requested rate {gate['target']:.6f} exceeds "
-                    f"the frozen lineage's expressible ceiling {gate['possible_rate']:.6f}"
-                )
+                item = {
+                    "detail": (
+                        f"requested rate {gate['target']:.6f} exceeds the frozen "
+                        f"lineage's expressible ceiling {gate['possible_rate']:.6f}"
+                    ),
+                    "id": str(gate["id"]),
+                }
                 stop_items.append(item)
-                warnings.append(item)
     if partial:
         warnings.append("partial run (--case): non-inferiority gates skipped")
 
@@ -5739,9 +6192,35 @@ def cmd_shadow(args: argparse.Namespace) -> int:
     if coarse_gates is not None:
         coverage_failures.extend(coarse_gates["failures"])
         for coarse_stop in coarse_gates["stops"]:
-            item = f"PD-SUBUNIT STOP: {coarse_stop}"
-            stop_items.append(item)
-            warnings.append(item)
+            stop_items.append(dict(coarse_stop))
+
+    n14_evidence = [
+        *tracked_n14,
+        *(coarse_gates.get("n14") or () if coarse_gates is not None else ()),
+    ]
+    n14_matrix = n14_matrix_unknown(n14_evidence) if tracked_full else []
+    n14_unknown = [
+        *(item for evidence in n14_evidence for item in evidence.get("unknown") or ()),
+        *n14_matrix,
+    ]
+    n14_code = n14_exit_code(n14_evidence, require_matrix=tracked_full)
+    n14_report = {
+        "cases": n14_evidence,
+        "failures": [
+            item for evidence in n14_evidence for item in evidence.get("failures") or ()
+        ],
+        "matrix_unknown": n14_matrix,
+        "oracle_checked": sum(
+            int((evidence.get("oracle") or {}).get("checked") or 0)
+            for evidence in n14_evidence
+        ),
+        "status": {
+            cc.EXIT_OK: "pass",
+            cc.EXIT_GATE_FAILED: "fail",
+            cc.EXIT_INVALID: "invalid",
+        }[n14_code],
+        "unknown": n14_unknown,
+    }
 
     ablation_started = time.perf_counter()
     ablation = None
@@ -5793,6 +6272,8 @@ def cmd_shadow(args: argparse.Namespace) -> int:
     perturbation_wall_s = time.perf_counter() - perturbation_started
 
     report_started = time.perf_counter()
+    authorized_deferrals, unauthorized_stops = adjudicate_deferrals(stop_items)
+    adjudicated_stops = [*authorized_deferrals, *unauthorized_stops]
     report = build_shadow_report(
         corpus,
         shadow_cases,
@@ -5807,7 +6288,8 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         speaker_gates=speaker_gates,
         speech_truncation=speech_truncation,
         coarse_gates=coarse_gates,
-        stop_items=stop_items,
+        n14=n14_report,
+        stop_items=adjudicated_stops,
         warnings=warnings,
         timing={
             "ablation_wall_s": round(ablation_wall_s, 4),
@@ -5833,7 +6315,8 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         coverage_failures,
         perturbation_failures,
         perturbation_unknown,
-        ablation_unknown,
+        [*ablation_unknown, *n14_unknown],
+        unauthorized_stops,
     )
     code = verdict if args.check else cc.EXIT_OK
     failures = (
@@ -5844,10 +6327,14 @@ def cmd_shadow(args: argparse.Namespace) -> int:
         + len(perturbation_failures)
         + len(perturbation_unknown)
         + len(ablation_unknown)
+        + len(n14_unknown)
+        + len(unauthorized_stops)
     )
-    warned = sum(
-        1 for r in gate_results if r["mode"] == "warning" and r["status"] != "pass"
-    ) + len(warnings)
+    warned = (
+        sum(1 for r in gate_results if r["mode"] == "warning" and r["status"] != "pass")
+        + len(warnings)
+        + len(authorized_deferrals)
+    )
     status = {
         cc.EXIT_OK: "pass",
         cc.EXIT_GATE_FAILED: "fail",

@@ -14,8 +14,8 @@ a weaker interpretation of the live contract.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, cast
 
 LIVE_SHADOW_SCHEMA_VERSION = 2
 
@@ -48,12 +48,14 @@ TOP_LEVEL_KEYS = frozenset(
         "production_degraded",
         "profile",
         "providers",
+        "raw",
         "refiner_comparison",
         "schema_version",
         "shadow_degraded",
         "speaker_evidence",
         "subunit_split",
         "totals",
+        "units",
         "v1",
         "v1_projection",
         "vad_state",
@@ -156,7 +158,34 @@ _FINALIZER_KEYS = frozenset(
         "waivers",
     }
 )
-_FINALIZER_ROW_KEYS = _STREAM_KEYS | {"finalizer"}
+_FINALIZER_ROW_KEYS = _STREAM_KEYS | {"finalizer", "verification"}
+_UNIT_KEYS = frozenset({"confidence", "end", "id", "provenance", "start", "surface"})
+_VERIFICATION_KEYS = frozenset(
+    {
+        "authority_id",
+        "authority_kind",
+        "evidence",
+        "policy",
+        "seed_digest",
+        "seed_payload",
+    }
+)
+_SEED_PAYLOAD_KEYS = frozenset({"cues", "evaluation_id", "profile", "row_id"})
+_EVIDENCE_KEYS = frozenset({"shots", "sing_spans"})
+_POLICY_KEYS = frozenset({"grid", "min_gap", "overlap_policy"})
+_TRACE_KEYS = frozenset(
+    {"cycle", "legs", "schedule_canonicality", "sweeps", "terminal"}
+)
+_TRACE_LEG_KEYS = frozenset(
+    {"cue_index", "from", "reads", "rule_id", "slot", "sweep", "target", "to"}
+)
+_BOUNDARY_KEYS = frozenset({"cue_index", "side"})
+_READ_KEYS = frozenset({"boundary", "value"})
+_CYCLE_KEYS = frozenset({"adopted", "members", "per_boundary_values"})
+_CYCLE_VALUES_KEYS = frozenset({"boundary", "values"})
+_MOVEMENT_KEYS = frozenset({"boundary", "delivered", "delta", "phase1"})
+_MOVEMENT_DISTRIBUTION_KEYS = frozenset({"start", "end"})
+_MOVEMENT_SUMMARY_KEYS = frozenset({"count", "max", "p50", "p90"})
 _SPEAKER_KEYS = frozenset(
     {
         "attribution",
@@ -289,6 +318,192 @@ def _finite_number(value: Any, path: str, errors: list[str]) -> float | None:
     return float(value)
 
 
+def _source_units(value: Any, path: str, errors: list[str]) -> list[Any] | None:
+    """Decode the closed unit authority used by independent row validation."""
+    from .segdoc import SourceUnit
+
+    rows = _list(value, path, errors)
+    if rows is None:
+        return None
+    units: list[SourceUnit] = []
+    for index, raw in enumerate(rows):
+        row_path = f"{path}[{index}]"
+        row = _mapping(raw, row_path, errors)
+        if row is None:
+            continue
+        _closed(row, _UNIT_KEYS, row_path, errors)
+        unit_id = row.get("id")
+        surface = row.get("surface")
+        provenance = row.get("provenance")
+        if unit_id != f"u{index}":
+            errors.append(f"{row_path}.id: expected positional id 'u{index}'")
+        if not isinstance(surface, str):
+            errors.append(f"{row_path}.surface: expected string")
+        if not isinstance(provenance, str):
+            errors.append(f"{row_path}.provenance: expected string")
+        bounds: dict[str, float | None] = {}
+        for key in ("start", "end", "confidence"):
+            raw_value = row.get(key)
+            if raw_value is None:
+                bounds[key] = None
+            else:
+                bounds[key] = _finite_number(raw_value, f"{row_path}.{key}", errors)
+        if (
+            unit_id == f"u{index}"
+            and isinstance(surface, str)
+            and isinstance(provenance, str)
+            and all(
+                row.get(key) is None or bounds[key] is not None
+                for key in ("start", "end", "confidence")
+            )
+        ):
+            units.append(
+                SourceUnit(
+                    cast(str, unit_id),
+                    surface,
+                    bounds["start"],
+                    bounds["end"],
+                    provenance,
+                    bounds["confidence"],
+                )
+            )
+    return units if len(units) == len(rows) else None
+
+
+def _display_profile(value: Any, path: str, errors: list[str]) -> Any | None:
+    from .segdoc import THRESHOLD_KEYS, DisplayProfile
+
+    block = _mapping(value, path, errors)
+    if block is None:
+        return None
+    expected = frozenset({"language", "max_line_length", "max_lines", *THRESHOLD_KEYS})
+    _closed(block, expected, path, errors)
+    language = block.get("language")
+    if not isinstance(language, str):
+        errors.append(f"{path}.language: expected string")
+    integer_values: dict[str, int] = {}
+    for key in ("max_line_length", "max_lines"):
+        raw = block.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            errors.append(f"{path}.{key}: expected positive integer")
+        else:
+            integer_values[key] = raw
+    numeric_values: dict[str, float] = {}
+    for key in THRESHOLD_KEYS:
+        number = _finite_number(block.get(key), f"{path}.{key}", errors)
+        if number is not None:
+            numeric_values[key] = number
+    if (
+        isinstance(language, str)
+        and len(integer_values) == 2
+        and len(numeric_values) == len(THRESHOLD_KEYS)
+    ):
+        return DisplayProfile(
+            language=language,
+            max_line_length=integer_values["max_line_length"],
+            max_lines=integer_values["max_lines"],
+            **numeric_values,
+        )
+    return None
+
+
+def _waiver_rows(value: Any, path: str, errors: list[str]) -> list[Any] | None:
+    from .partition_check import Waiver
+
+    rows = _list(value, path, errors)
+    if rows is None:
+        return None
+    out: list[Waiver] = []
+    expected = frozenset({"cap", "cue_index", "detail", "kind", "span", "unit_ids"})
+    for index, raw in enumerate(rows):
+        row_path = f"{path}[{index}]"
+        row = _mapping(raw, row_path, errors)
+        if row is None:
+            continue
+        _closed(row, expected, row_path, errors)
+        cue_index = _nonnegative_int(
+            row.get("cue_index"), f"{row_path}.cue_index", errors
+        )
+        cap = _finite_number(row.get("cap"), f"{row_path}.cap", errors)
+        kind, detail = row.get("kind"), row.get("detail")
+        if not isinstance(kind, str):
+            errors.append(f"{row_path}.kind: expected string")
+        if not isinstance(detail, str):
+            errors.append(f"{row_path}.detail: expected string")
+        span = _list(row.get("span"), f"{row_path}.span", errors)
+        decoded_span: list[float | None] = []
+        if span is not None:
+            if len(span) != 2:
+                errors.append(f"{row_path}.span: expected two bounds")
+            else:
+                for slot, item in enumerate(span):
+                    decoded_span.append(
+                        None
+                        if item is None
+                        else _finite_number(item, f"{row_path}.span[{slot}]", errors)
+                    )
+        unit_ids = _list(row.get("unit_ids"), f"{row_path}.unit_ids", errors)
+        decoded_ids: list[int] = []
+        if unit_ids is not None:
+            for slot, item in enumerate(unit_ids):
+                decoded = _nonnegative_int(item, f"{row_path}.unit_ids[{slot}]", errors)
+                if decoded is not None:
+                    decoded_ids.append(decoded)
+        if (
+            cue_index is not None
+            and cap is not None
+            and isinstance(kind, str)
+            and isinstance(detail, str)
+            and len(decoded_span) == 2
+            and all(item is None or isinstance(item, float) for item in decoded_span)
+            and unit_ids is not None
+            and len(decoded_ids) == len(unit_ids)
+        ):
+            out.append(
+                Waiver(
+                    kind,
+                    cue_index,
+                    tuple(decoded_ids),
+                    cast("tuple[float | None, float | None]", tuple(decoded_span)),
+                    cap,
+                    detail,
+                )
+            )
+    return out if len(out) == len(rows) else None
+
+
+def _report_rows(value: Any, path: str, errors: list[str]) -> list[Any] | None:
+    from .partition_check import ReportTag
+
+    rows = _list(value, path, errors)
+    if rows is None:
+        return None
+    out: list[ReportTag] = []
+    for index, raw in enumerate(rows):
+        row_path = f"{path}[{index}]"
+        row = _mapping(raw, row_path, errors)
+        if row is None:
+            continue
+        _closed(row, frozenset({"cue_index", "evidence", "kind"}), row_path, errors)
+        cue_index = row.get("cue_index")
+        if cue_index is not None and (
+            isinstance(cue_index, bool) or not isinstance(cue_index, int)
+        ):
+            errors.append(f"{row_path}.cue_index: expected integer or null")
+        kind = row.get("kind")
+        evidence = _mapping(row.get("evidence"), f"{row_path}.evidence", errors)
+        if not isinstance(kind, str):
+            errors.append(f"{row_path}.kind: expected string")
+        if (
+            (cue_index is None or isinstance(cue_index, int))
+            and not isinstance(cue_index, bool)
+            and isinstance(kind, str)
+            and evidence is not None
+        ):
+            out.append(ReportTag(kind, cue_index, dict(evidence)))
+    return out if len(out) == len(rows) else None
+
+
 def _margin_summary_block(value: Any, path: str, errors: list[str]) -> int | None:
     block = _mapping(value, path, errors)
     if block is None:
@@ -415,13 +630,140 @@ def _cue_rows(
             errors.append(f"{path}: ownership does not cover {unit_count} units")
     elif unit_count not in (None, 0):
         errors.append(f"{path}: non-empty document has no cue ownership rows")
+    for index, (left, right) in enumerate(zip(cues, cues[1:])):
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+            continue
+        left_end = left.get("end")
+        right_start = right.get("start")
+        if (
+            isinstance(left_end, (int, float))
+            and not isinstance(left_end, bool)
+            and math.isfinite(float(left_end))
+            and isinstance(right_start, (int, float))
+            and not isinstance(right_start, bool)
+            and math.isfinite(float(right_start))
+            and float(right_start) < float(left_end) - 1e-6
+        ):
+            errors.append(
+                f"{path}: overlap between cues {index} and {index + 1} "
+                f"({left_end} > {right_start})"
+            )
     return cues
+
+
+def _recompute_partition_row(
+    row: Mapping[str, Any],
+    *,
+    units: Sequence[Any] | None,
+    profile: Any | None,
+    path: str,
+    errors: list[str],
+    validator_stage: str,
+    validator_origins: frozenset[str],
+    finalizer: bool,
+) -> None:
+    """Rebuild one partition check from serialized values, never producer aliases."""
+    from .partition_check import check_partition
+
+    cues = row.get("cues")
+    partition = row.get("partition")
+    validator = row.get("validator")
+    if (
+        units is None
+        or profile is None
+        or not isinstance(cues, list)
+        or not isinstance(partition, list)
+        or not isinstance(validator, Mapping)
+    ):
+        return
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in partition):
+        return
+    unit_count = len(units)
+    if any(not 0 < item < unit_count for item in partition):
+        errors.append(f"{path}.partition: cuts must lie inside (0, {unit_count})")
+    if any(left >= right for left, right in zip(partition, partition[1:])):
+        errors.append(f"{path}.partition: cuts must be strictly increasing")
+
+    expected_cuts: list[int] = []
+    row_cues: list[dict[str, Any]] = []
+    for index, raw in enumerate(cues):
+        if not isinstance(raw, Mapping):
+            return
+        unit_range = raw.get("unit_range")
+        if (
+            not isinstance(unit_range, list)
+            or len(unit_range) != 2
+            or any(
+                isinstance(item, bool) or not isinstance(item, int)
+                for item in unit_range
+            )
+        ):
+            return
+        if index + 1 < len(cues):
+            expected_cuts.append(unit_range[1])
+        row_cues.append(
+            {
+                "end": raw.get("end"),
+                "lyric": raw.get("lyric"),
+                "speech_end": raw.get("speech_end"),
+                "speech_start": raw.get("speech_start"),
+                "start": raw.get("start"),
+                "text": raw.get("text"),
+            }
+        )
+    if partition != expected_cuts:
+        errors.append(
+            f"{path}.partition: expected cue unit-range boundaries "
+            f"{expected_cuts!r}, got {partition!r}"
+        )
+
+    origin = validator.get("origin")
+    if origin not in validator_origins or validator_stage not in {
+        "raw",
+        "core",
+        "legacy-overlay",
+        "finalizer",
+    }:
+        return
+    waivers_value: Any = validator.get("waivers")
+    reports: list[Any] = []
+    if finalizer:
+        finalizer_block = row.get("finalizer")
+        if not isinstance(finalizer_block, Mapping):
+            return
+        waivers_value = finalizer_block.get("waivers")
+        decoded_reports = _report_rows(
+            finalizer_block.get("entries"), f"{path}.finalizer.entries", errors
+        )
+        if decoded_reports is None:
+            return
+        reports = decoded_reports
+    waivers = _waiver_rows(waivers_value, f"{path}.replay_waivers", errors)
+    if waivers is None:
+        return
+    recomputed = check_partition(
+        partition,
+        cast("Sequence[Any]", row_cues),
+        units=cast("Sequence[Any]", units),
+        profile=profile,
+        origin=cast("Any", origin),
+        stage=cast("Any", validator_stage),
+        waivers={waiver.cue_index: waiver for waiver in waivers},
+        reports=reports,
+    ).to_dict()
+    if recomputed != validator:
+        errors.append(
+            f"{path}.validator: serialized check_partition result is stale; "
+            f"recomputed {recomputed!r}"
+        )
 
 
 def _stream_row(
     value: Any,
     *,
     unit_count: int | None,
+    units: Sequence[Any] | None,
+    profile: Any | None,
     path: str,
     errors: list[str],
     validator_stage: str,
@@ -429,6 +771,7 @@ def _stream_row(
     finalizer: bool = False,
     speaker_measurement: bool = False,
     projection_cross_check: bool = False,
+    finalizer_row_id: str | None = None,
 ) -> Mapping[str, Any] | None:
     row = _mapping(value, path, errors)
     if row is None:
@@ -480,15 +823,492 @@ def _stream_row(
             if cross.get("agrees") is not True:
                 errors.append(f"{path}.projection_cross_check.agrees: expected true")
     if finalizer:
-        _finalizer(row.get("finalizer"), f"{path}.finalizer", errors)
+        seed = _finalizer_verification(
+            row.get("verification"),
+            row,
+            path=f"{path}.verification",
+            errors=errors,
+            expected_row_id=finalizer_row_id,
+            profile=profile,
+        )
+        _finalizer(
+            row.get("finalizer"),
+            f"{path}.finalizer",
+            errors,
+            row=row,
+            seed=seed,
+            verification=row.get("verification"),
+            profile=profile,
+        )
     if speaker_measurement:
         _speaker_measurement(
             row.get("speaker_measurement"), f"{path}.speaker_measurement", errors
         )
+    _recompute_partition_row(
+        row,
+        units=units,
+        profile=profile,
+        path=path,
+        errors=errors,
+        validator_stage=validator_stage,
+        validator_origins=validator_origins,
+        finalizer=finalizer,
+    )
     return row
 
 
-def _finalizer(value: Any, path: str, errors: list[str]) -> Mapping[str, Any] | None:
+def _finalizer_verification(
+    value: Any,
+    row: Mapping[str, Any],
+    *,
+    path: str,
+    errors: list[str],
+    expected_row_id: str | None,
+    profile: Any | None,
+) -> tuple[Any, ...] | None:
+    """Decode and authenticate the phase-1 seed carried for trace replay."""
+    from .authority import AUTHORITY_KINDS, digest_payload
+    from .finalizer import Phase1Cue, _profile_payload
+
+    block = _mapping(value, path, errors)
+    if block is None:
+        return None
+    _closed(block, _VERIFICATION_KEYS, path, errors)
+    authority_id = block.get("authority_id")
+    authority_kind = block.get("authority_kind")
+    digest = block.get("seed_digest")
+    if not isinstance(authority_id, str) or not authority_id:
+        errors.append(f"{path}.authority_id: expected non-empty string")
+    if authority_kind not in AUTHORITY_KINDS:
+        errors.append(f"{path}.authority_kind: outside closed authority vocabulary")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+    ):
+        errors.append(f"{path}.seed_digest: expected lowercase sha256")
+
+    payload = _mapping(block.get("seed_payload"), f"{path}.seed_payload", errors)
+    if payload is None:
+        return None
+    _closed(payload, _SEED_PAYLOAD_KEYS, f"{path}.seed_payload", errors)
+    if isinstance(digest, str) and digest_payload(payload) != digest:
+        errors.append(f"{path}.seed_digest: does not bind seed_payload")
+    wanted_row = (
+        None if expected_row_id is None else f"{LANE_FINALIZER}/{expected_row_id}"
+    )
+    if wanted_row is not None and payload.get("row_id") != wanted_row:
+        errors.append(
+            f"{path}.seed_payload.row_id: expected {wanted_row!r}, "
+            f"got {payload.get('row_id')!r}"
+        )
+    if not isinstance(payload.get("evaluation_id"), str):
+        errors.append(f"{path}.seed_payload.evaluation_id: expected string")
+    if profile is not None and payload.get("profile") != _profile_payload(profile):
+        errors.append(f"{path}.seed_payload.profile: disagrees with artifact profile")
+
+    raw_cues = _list(payload.get("cues"), f"{path}.seed_payload.cues", errors)
+    if raw_cues is None:
+        return None
+    cues: list[Phase1Cue] = []
+    for position, raw in enumerate(raw_cues):
+        cue_path = f"{path}.seed_payload.cues[{position}]"
+        if not isinstance(raw, list) or len(raw) != 12:
+            errors.append(f"{cue_path}: expected twelve-field phase-1 seed")
+            continue
+        index = _nonnegative_int(raw[0], f"{cue_path}[0]", errors)
+        numeric: dict[int, float] = {}
+        for slot in (1, 2, 3, 4):
+            number = _finite_number(raw[slot], f"{cue_path}[{slot}]", errors)
+            if number is not None:
+                numeric[slot] = number
+        optional: dict[int, float | None] = {}
+        for slot in (5, 6):
+            optional[slot] = (
+                None
+                if raw[slot] is None
+                else _finite_number(raw[slot], f"{cue_path}[{slot}]", errors)
+            )
+        text = raw[7]
+        reading = _nonnegative_int(raw[8], f"{cue_path}[8]", errors)
+        lyric = raw[9]
+        if not isinstance(text, str):
+            errors.append(f"{cue_path}[7]: expected text string")
+        if lyric is not None and not isinstance(lyric, bool):
+            errors.append(f"{cue_path}[9]: expected boolean or null")
+        unit_range_raw = raw[10]
+        unit_range: tuple[int, int] | None = None
+        if unit_range_raw is not None:
+            if (
+                not isinstance(unit_range_raw, list)
+                or len(unit_range_raw) != 2
+                or any(
+                    isinstance(item, bool) or not isinstance(item, int)
+                    for item in unit_range_raw
+                )
+            ):
+                errors.append(f"{cue_path}[10]: expected two integer bounds or null")
+            else:
+                unit_range = (unit_range_raw[0], unit_range_raw[1])
+        unit_rows = _list(raw[11], f"{cue_path}[11]", errors)
+        word_data: list[dict[str, Any]] = []
+        if unit_rows is not None:
+            for unit_index, unit_raw in enumerate(unit_rows):
+                unit_path = f"{cue_path}[11][{unit_index}]"
+                if not isinstance(unit_raw, list) or len(unit_raw) != 3:
+                    errors.append(f"{unit_path}: expected text/start/end triple")
+                    continue
+                if not isinstance(unit_raw[0], str):
+                    errors.append(f"{unit_path}[0]: expected string")
+                    continue
+                decoded: list[float | None] = []
+                for slot in (1, 2):
+                    decoded.append(
+                        None
+                        if unit_raw[slot] is None
+                        else _finite_number(
+                            unit_raw[slot], f"{unit_path}[{slot}]", errors
+                        )
+                    )
+                if all(
+                    unit_raw[slot] is None or decoded[slot - 1] is not None
+                    for slot in (1, 2)
+                ):
+                    word_data.append(
+                        {
+                            "text": unit_raw[0],
+                            "start": decoded[0],
+                            "end": decoded[1],
+                        }
+                    )
+        if (
+            index == position
+            and len(numeric) == 4
+            and all(raw[slot] is None or optional[slot] is not None for slot in (5, 6))
+            and isinstance(text, str)
+            and reading is not None
+            and (lyric is None or isinstance(lyric, bool))
+            and unit_rows is not None
+            and len(word_data) == len(unit_rows)
+        ):
+            cues.append(
+                Phase1Cue(
+                    index=position,
+                    start=numeric[1],
+                    end=numeric[2],
+                    seed_start=numeric[3],
+                    seed_end=numeric[4],
+                    speech_start=optional[5],
+                    speech_end=optional[6],
+                    text=text,
+                    lines=(text,),
+                    cell_widths=(),
+                    reading_chars=reading,
+                    raw_reading_chars=reading,
+                    word_data=cast("Any", word_data),
+                    unit_range=unit_range,
+                    lyric=lyric,
+                    reports=(),
+                )
+            )
+    if len(cues) != len(raw_cues):
+        return None
+    if len(cues) != row.get("cue_count"):
+        errors.append(
+            f"{path}.seed_payload.cues: seed count disagrees with delivered row"
+        )
+    return tuple(cues)
+
+
+def _boundary_ref(value: Any, path: str, errors: list[str]) -> Any | None:
+    from .finalizer import BoundaryRef
+
+    block = _mapping(value, path, errors)
+    if block is None:
+        return None
+    _closed(block, _BOUNDARY_KEYS, path, errors)
+    cue_index = _nonnegative_int(block.get("cue_index"), f"{path}.cue_index", errors)
+    side = block.get("side")
+    if side not in {"start", "end"}:
+        errors.append(f"{path}.side: expected 'start' or 'end'")
+    if cue_index is None or side not in {"start", "end"}:
+        return None
+    return BoundaryRef(cue_index, cast("Any", side))
+
+
+def _stream_state(value: Any, path: str, errors: list[str]) -> Any | None:
+    rows = _list(value, path, errors)
+    if rows is None:
+        return None
+    out: list[tuple[float, float]] = []
+    for index, raw in enumerate(rows):
+        row_path = f"{path}[{index}]"
+        if not isinstance(raw, list) or len(raw) != 2:
+            errors.append(f"{row_path}: expected start/end pair")
+            continue
+        start = _finite_number(raw[0], f"{row_path}[0]", errors)
+        end = _finite_number(raw[1], f"{row_path}[1]", errors)
+        if start is not None and end is not None:
+            out.append((start, end))
+    return tuple(out) if len(out) == len(rows) else None
+
+
+def _trace(value: Any, path: str, errors: list[str]) -> Any | None:
+    from .finalizer import CycleEvidence, NeighbourRead, Trace, TraceLeg
+
+    block = _mapping(value, path, errors)
+    if block is None:
+        return None
+    _closed(block, _TRACE_KEYS, path, errors)
+    terminal = block.get("terminal")
+    if terminal not in {"budget-exhausted", "cycle-adoption", "fixed-point"}:
+        errors.append(f"{path}.terminal: outside closed terminal vocabulary")
+    sweeps = _nonnegative_int(block.get("sweeps"), f"{path}.sweeps", errors)
+    if block.get("schedule_canonicality") != "unverified":
+        errors.append(f"{path}.schedule_canonicality: expected 'unverified'")
+    legs_raw = _list(block.get("legs"), f"{path}.legs", errors)
+    legs: list[TraceLeg] = []
+    if legs_raw is not None:
+        for index, raw in enumerate(legs_raw):
+            leg_path = f"{path}.legs[{index}]"
+            leg = _mapping(raw, leg_path, errors)
+            if leg is None:
+                continue
+            _closed(leg, _TRACE_LEG_KEYS, leg_path, errors)
+            cue_index = _nonnegative_int(
+                leg.get("cue_index"), f"{leg_path}.cue_index", errors
+            )
+            slot = _nonnegative_int(leg.get("slot"), f"{leg_path}.slot", errors)
+            sweep = _nonnegative_int(leg.get("sweep"), f"{leg_path}.sweep", errors)
+            from_value = _finite_number(leg.get("from"), f"{leg_path}.from", errors)
+            to_value = _finite_number(leg.get("to"), f"{leg_path}.to", errors)
+            rule_id = leg.get("rule_id")
+            if not isinstance(rule_id, str):
+                errors.append(f"{leg_path}.rule_id: expected string")
+            target = _boundary_ref(leg.get("target"), f"{leg_path}.target", errors)
+            reads_raw = _list(leg.get("reads"), f"{leg_path}.reads", errors)
+            reads: list[NeighbourRead] = []
+            if reads_raw is not None:
+                for read_index, read_raw in enumerate(reads_raw):
+                    read_path = f"{leg_path}.reads[{read_index}]"
+                    read = _mapping(read_raw, read_path, errors)
+                    if read is None:
+                        continue
+                    _closed(read, _READ_KEYS, read_path, errors)
+                    boundary = _boundary_ref(
+                        read.get("boundary"), f"{read_path}.boundary", errors
+                    )
+                    read_value = (
+                        None
+                        if read.get("value") is None
+                        else _finite_number(
+                            read.get("value"), f"{read_path}.value", errors
+                        )
+                    )
+                    if boundary is not None and (
+                        read.get("value") is None or read_value is not None
+                    ):
+                        reads.append(NeighbourRead(boundary, read_value))
+            if (
+                cue_index is not None
+                and slot is not None
+                and sweep is not None
+                and from_value is not None
+                and to_value is not None
+                and isinstance(rule_id, str)
+                and target is not None
+                and reads_raw is not None
+                and len(reads) == len(reads_raw)
+            ):
+                legs.append(
+                    TraceLeg(
+                        rule_id,
+                        sweep,
+                        cue_index,
+                        slot,
+                        target,
+                        from_value,
+                        to_value,
+                        tuple(reads),
+                    )
+                )
+
+    cycle_value = block.get("cycle")
+    cycle = None
+    cycle_valid = cycle_value is None
+    if cycle_value is not None:
+        cycle_block = _mapping(cycle_value, f"{path}.cycle", errors)
+        if cycle_block is not None:
+            _closed(cycle_block, _CYCLE_KEYS, f"{path}.cycle", errors)
+            adopted = _stream_state(
+                cycle_block.get("adopted"), f"{path}.cycle.adopted", errors
+            )
+            members_raw = _list(
+                cycle_block.get("members"), f"{path}.cycle.members", errors
+            )
+            members: list[Any] = []
+            if members_raw is not None:
+                for index, member in enumerate(members_raw):
+                    decoded = _stream_state(
+                        member, f"{path}.cycle.members[{index}]", errors
+                    )
+                    if decoded is not None:
+                        members.append(decoded)
+            values_raw = _list(
+                cycle_block.get("per_boundary_values"),
+                f"{path}.cycle.per_boundary_values",
+                errors,
+            )
+            values: list[tuple[Any, tuple[float, ...]]] = []
+            if values_raw is not None:
+                for index, raw in enumerate(values_raw):
+                    values_path = f"{path}.cycle.per_boundary_values[{index}]"
+                    values_block = _mapping(raw, values_path, errors)
+                    if values_block is None:
+                        continue
+                    _closed(values_block, _CYCLE_VALUES_KEYS, values_path, errors)
+                    boundary = _boundary_ref(
+                        values_block.get("boundary"),
+                        f"{values_path}.boundary",
+                        errors,
+                    )
+                    numbers_raw = _list(
+                        values_block.get("values"), f"{values_path}.values", errors
+                    )
+                    numbers: list[float] = []
+                    if numbers_raw is not None:
+                        for number_index, number_raw in enumerate(numbers_raw):
+                            number = _finite_number(
+                                number_raw,
+                                f"{values_path}.values[{number_index}]",
+                                errors,
+                            )
+                            if number is not None:
+                                numbers.append(number)
+                    if (
+                        boundary is not None
+                        and numbers_raw is not None
+                        and len(numbers) == len(numbers_raw)
+                    ):
+                        values.append((boundary, tuple(numbers)))
+            if (
+                adopted is not None
+                and members_raw is not None
+                and len(members) == len(members_raw)
+                and values_raw is not None
+                and len(values) == len(values_raw)
+            ):
+                cycle = CycleEvidence(tuple(members), tuple(values), adopted)
+                cycle_valid = True
+    if (
+        terminal in {"budget-exhausted", "cycle-adoption", "fixed-point"}
+        and sweeps is not None
+        and legs_raw is not None
+        and len(legs) == len(legs_raw)
+        and cycle_valid
+    ):
+        return Trace(
+            tuple(legs),
+            cast("Any", terminal),
+            cycle,
+            sweeps,
+        )
+    return None
+
+
+def _finalizer_inputs(
+    verification: Any, path: str, errors: list[str]
+) -> tuple[Any, Any] | None:
+    from .finalizer import FinalizeEvidence, FinalizePolicy
+
+    block = _mapping(verification, path, errors)
+    if block is None:
+        return None
+    evidence_block = _mapping(block.get("evidence"), f"{path}.evidence", errors)
+    policy_block = _mapping(block.get("policy"), f"{path}.policy", errors)
+    if evidence_block is None or policy_block is None:
+        return None
+    _closed(evidence_block, _EVIDENCE_KEYS, f"{path}.evidence", errors)
+    _closed(policy_block, _POLICY_KEYS, f"{path}.policy", errors)
+    shots_raw = _list(evidence_block.get("shots"), f"{path}.evidence.shots", errors)
+    shots: list[float] = []
+    if shots_raw is not None:
+        for index, raw in enumerate(shots_raw):
+            value = _finite_number(raw, f"{path}.evidence.shots[{index}]", errors)
+            if value is not None:
+                shots.append(value)
+    spans_raw = _list(
+        evidence_block.get("sing_spans"), f"{path}.evidence.sing_spans", errors
+    )
+    spans: list[tuple[float, float]] = []
+    if spans_raw is not None:
+        for index, raw in enumerate(spans_raw):
+            span_path = f"{path}.evidence.sing_spans[{index}]"
+            if not isinstance(raw, list) or len(raw) != 2:
+                errors.append(f"{span_path}: expected start/end pair")
+                continue
+            start = _finite_number(raw[0], f"{span_path}[0]", errors)
+            end = _finite_number(raw[1], f"{span_path}[1]", errors)
+            if start is not None and end is not None:
+                spans.append((start, end))
+    if policy_block != {
+        "grid": None,
+        "min_gap": "two-frame",
+        "overlap_policy": "reject",
+    }:
+        errors.append(f"{path}.policy: outside frozen P5 policy")
+    if (
+        shots_raw is None
+        or len(shots) != len(shots_raw)
+        or spans_raw is None
+        or len(spans) != len(spans_raw)
+    ):
+        return None
+    return (
+        FinalizeEvidence(tuple(shots), tuple(spans)),
+        FinalizePolicy(),
+    )
+
+
+def _movement_distribution(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    def summary(values: list[float]) -> dict[str, Any]:
+        ordered = sorted(values)
+
+        def rank(percentile: float) -> float | None:
+            if not ordered:
+                return None
+            return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
+
+        return {
+            "count": len(ordered),
+            "max": max(ordered) if ordered else None,
+            "p50": rank(0.50),
+            "p90": rank(0.90),
+        }
+
+    return {
+        side: summary(
+            [
+                abs(float(row["delta"]))
+                for row in rows
+                if isinstance(row.get("boundary"), Mapping)
+                and row["boundary"].get("side") == side
+            ]
+        )
+        for side in ("start", "end")
+    }
+
+
+def _finalizer(
+    value: Any,
+    path: str,
+    errors: list[str],
+    *,
+    row: Mapping[str, Any],
+    seed: tuple[Any, ...] | None,
+    verification: Any,
+    profile: Any | None,
+) -> Mapping[str, Any] | None:
     block = _mapping(value, path, errors)
     if block is None:
         return None
@@ -528,8 +1348,14 @@ def _finalizer(value: Any, path: str, errors: list[str]) -> Mapping[str, Any] | 
                     f"{entry_path}.evidence.reason: expected canonical fallback reason"
                 )
     _string_list(block.get("deltas_fired"), f"{path}.deltas_fired", errors)
-    for name in ("movement", "stability_errors", "trace_errors", "waivers"):
-        _list(block.get(name), f"{path}.{name}", errors)
+    movement_rows = _list(block.get("movement"), f"{path}.movement", errors)
+    stability_rows = _string_list(
+        block.get("stability_errors"), f"{path}.stability_errors", errors
+    )
+    trace_error_rows = _string_list(
+        block.get("trace_errors"), f"{path}.trace_errors", errors
+    )
+    _waiver_rows(block.get("waivers"), f"{path}.waivers", errors)
     if block.get("valid") is not True:
         errors.append(f"{path}.valid: schema 2 requires a valid finalizer row")
     if block.get("stability_errors"):
@@ -544,20 +1370,175 @@ def _finalizer(value: Any, path: str, errors: list[str]) -> Mapping[str, Any] | 
         "fixed-point",
     }:
         errors.append(f"{path}.terminal: outside closed terminal vocabulary")
-    _finite_number(
+    max_start = _finite_number(
         block.get("max_start_movement_s"),
         f"{path}.max_start_movement_s",
         errors,
     )
-    _nonnegative_int(
+    max_sweeps = _nonnegative_int(
         block.get("max_sweeps_observed"),
         f"{path}.max_sweeps_observed",
         errors,
     )
-    _mapping(block.get("trace"), f"{path}.trace", errors)
-    _mapping(
+    trace = _trace(block.get("trace"), f"{path}.trace", errors)
+    distribution = _mapping(
         block.get("movement_distribution"), f"{path}.movement_distribution", errors
     )
+    if distribution is not None:
+        _closed(
+            distribution,
+            _MOVEMENT_DISTRIBUTION_KEYS,
+            f"{path}.movement_distribution",
+            errors,
+        )
+        for side in ("start", "end"):
+            summary = _mapping(
+                distribution.get(side), f"{path}.movement_distribution.{side}", errors
+            )
+            if summary is None:
+                continue
+            _closed(
+                summary,
+                _MOVEMENT_SUMMARY_KEYS,
+                f"{path}.movement_distribution.{side}",
+                errors,
+            )
+            _nonnegative_int(
+                summary.get("count"),
+                f"{path}.movement_distribution.{side}.count",
+                errors,
+            )
+            for name in ("max", "p50", "p90"):
+                if summary.get(name) is not None:
+                    _finite_number(
+                        summary.get(name),
+                        f"{path}.movement_distribution.{side}.{name}",
+                        errors,
+                    )
+
+    inputs = _finalizer_inputs(verification, f"{path}.verification", errors)
+    row_cues = row.get("cues")
+    if (
+        seed is not None
+        and profile is not None
+        and inputs is not None
+        and trace is not None
+        and isinstance(row_cues, list)
+    ):
+        from .trace_validator import replay_trace, stability_check
+
+        evidence, policy = inputs
+        delivered_rows: list[tuple[float, float]] = []
+        for index, cue in enumerate(row_cues):
+            if not isinstance(cue, Mapping):
+                break
+            start = _finite_number(
+                cue.get("start"), f"{path}.row.cues[{index}].start", errors
+            )
+            end = _finite_number(
+                cue.get("end"), f"{path}.row.cues[{index}].end", errors
+            )
+            if start is None or end is None:
+                break
+            delivered_rows.append((start, end))
+        if len(delivered_rows) == len(row_cues) == len(seed):
+            delivered = tuple(delivered_rows)
+            recomputed_trace_errors = list(
+                replay_trace(
+                    trace,
+                    seed,
+                    profile=profile,
+                    evidence=evidence,
+                    policy=policy,
+                    delivered=delivered,
+                )
+            )
+            if (
+                trace_error_rows is not None
+                and trace_error_rows != recomputed_trace_errors
+            ):
+                errors.append(
+                    f"{path}.trace_errors: stale trace replay; recomputed "
+                    f"{recomputed_trace_errors!r}"
+                )
+            recomputed_stability_errors = list(
+                stability_check(
+                    delivered,
+                    seed,
+                    profile=profile,
+                    evidence=evidence,
+                    policy=policy,
+                    terminal=trace.terminal,
+                )
+            )
+            if (
+                stability_rows is not None
+                and stability_rows != recomputed_stability_errors
+            ):
+                errors.append(
+                    f"{path}.stability_errors: stale stability replay; recomputed "
+                    f"{recomputed_stability_errors!r}"
+                )
+
+            expected_movement: list[dict[str, Any]] = []
+            for index, (phase1, delivered_pair) in enumerate(zip(seed, delivered)):
+                for side, slot in (("start", 0), ("end", 1)):
+                    phase1_value = phase1.start if slot == 0 else phase1.end
+                    delivered_value = delivered_pair[slot]
+                    expected_movement.append(
+                        {
+                            "boundary": {"cue_index": index, "side": side},
+                            "delivered": delivered_value,
+                            "delta": delivered_value - phase1_value,
+                            "phase1": phase1_value,
+                        }
+                    )
+            decoded_movement: list[Mapping[str, Any]] = []
+            if movement_rows is not None:
+                for index, raw in enumerate(movement_rows):
+                    movement_path = f"{path}.movement[{index}]"
+                    movement = _mapping(raw, movement_path, errors)
+                    if movement is None:
+                        continue
+                    _closed(movement, _MOVEMENT_KEYS, movement_path, errors)
+                    _boundary_ref(
+                        movement.get("boundary"), f"{movement_path}.boundary", errors
+                    )
+                    for key in ("delivered", "delta", "phase1"):
+                        _finite_number(
+                            movement.get(key), f"{movement_path}.{key}", errors
+                        )
+                    decoded_movement.append(movement)
+                if movement_rows != expected_movement:
+                    errors.append(
+                        f"{path}.movement: ledger is detached from seed/delivered row"
+                    )
+            if distribution is not None and decoded_movement:
+                recomputed_distribution = _movement_distribution(decoded_movement)
+                if distribution != recomputed_distribution:
+                    errors.append(
+                        f"{path}.movement_distribution: stale; recomputed "
+                        f"{recomputed_distribution!r}"
+                    )
+            expected_max_start = max(
+                (
+                    abs(delivered_pair[0] - phase1.start)
+                    for phase1, delivered_pair in zip(seed, delivered)
+                ),
+                default=0.0,
+            )
+            if max_start is not None and max_start != expected_max_start:
+                errors.append(
+                    f"{path}.max_start_movement_s: expected {expected_max_start}, "
+                    f"got {max_start}"
+                )
+            if max_sweeps is not None and max_sweeps != trace.sweeps:
+                errors.append(
+                    f"{path}.max_sweeps_observed: expected trace sweeps "
+                    f"{trace.sweeps}, got {max_sweeps}"
+                )
+            if block.get("terminal") != trace.terminal:
+                errors.append(f"{path}.terminal: disagrees with trace terminal")
     return block
 
 
@@ -585,7 +1566,12 @@ def _speaker_measurement(value: Any, path: str, errors: list[str]) -> None:
 
 
 def _lanes(
-    value: Any, *, unit_count: int | None, errors: list[str]
+    value: Any,
+    *,
+    unit_count: int | None,
+    units: Sequence[Any] | None,
+    profile: Any | None,
+    errors: list[str],
 ) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None]:
     lanes = _mapping(value, "lanes", errors)
     if lanes is None:
@@ -612,6 +1598,8 @@ def _lanes(
         _stream_row(
             lane.get("v1"),
             unit_count=unit_count,
+            units=units,
+            profile=profile,
             path=f"lanes.{lane_id}.v1",
             errors=errors,
             validator_stage=stage,
@@ -620,6 +1608,8 @@ def _lanes(
         _stream_row(
             lane.get("v2"),
             unit_count=unit_count,
+            units=units,
+            profile=profile,
             path=f"lanes.{lane_id}.v2",
             errors=errors,
             validator_stage=stage,
@@ -656,12 +1646,15 @@ def _lanes(
                 _stream_row(
                     final_rows[row_id],
                     unit_count=unit_count,
+                    units=units,
+                    profile=profile,
                     path=f"lanes.{LANE_FINALIZER}.rows.{row_id}",
                     errors=errors,
                     validator_stage="finalizer",
                     validator_origins=frozenset({"v1" if row_id == "v1" else "v2"}),
                     finalizer=True,
                     speaker_measurement=row_id == "v2-speaker-off",
+                    finalizer_row_id=row_id,
                 )
 
     display = _mapping(lanes.get(LANE_DISPLAY), f"lanes.{LANE_DISPLAY}", errors)
@@ -683,6 +1676,8 @@ def _lanes(
             _stream_row(
                 rows.get("v1"),
                 unit_count=unit_count,
+                units=units,
+                profile=profile,
                 path=f"lanes.{LANE_DISPLAY}.rows.v1",
                 errors=errors,
                 validator_stage="core",
@@ -859,6 +1854,17 @@ def validate_shadow_v2_payload(
         ):
             errors.append("totals.interval_count: disagrees with serialized intervals")
 
+    source_units = _source_units(artifact.get("units"), "units", errors)
+    if (
+        source_units is not None
+        and unit_count is not None
+        and len(source_units) != unit_count
+    ):
+        errors.append(
+            f"units: expected coverage.unit_count {unit_count}, got {len(source_units)}"
+        )
+    profile_value = _display_profile(artifact.get("profile"), "profile", errors)
+
     intervals = _list(artifact.get("intervals"), "intervals", errors)
     validator = _mapping(artifact.get("validator"), "validator", errors)
     if validator is not None:
@@ -873,15 +1879,29 @@ def validate_shadow_v2_payload(
         if not isinstance(validator.get("raw_duplicate_v1_cues"), bool):
             errors.append("validator.raw_duplicate_v1_cues: expected boolean")
 
+    raw_row = _stream_row(
+        artifact.get("raw"),
+        unit_count=unit_count,
+        units=source_units,
+        profile=profile_value,
+        path="raw",
+        errors=errors,
+        validator_stage="raw",
+        validator_origins=frozenset({"v2"}),
+    )
     lanes, final_rows = _lanes(
-        artifact.get("lanes"), unit_count=unit_count, errors=errors
+        artifact.get("lanes"),
+        unit_count=unit_count,
+        units=source_units,
+        profile=profile_value,
+        errors=errors,
     )
     core_v2 = _lane_row(lanes, LANE_CORE, "v2")
     legacy_v2 = _lane_row(lanes, LANE_LEGACY, "v2")
     final_v2 = _lane_row(lanes, LANE_FINALIZER, "v2")
     if validator is not None:
         for key, stage, row in (
-            ("raw", "raw", core_v2),
+            ("raw", "raw", raw_row),
             ("core", "core", core_v2),
             ("legacy_overlay", "legacy-overlay", legacy_v2),
             ("finalizer", "finalizer", final_v2),
@@ -896,6 +1916,7 @@ def validate_shadow_v2_payload(
                 expected_unit_count=unit_count,
             )
         for key, row, row_path in (
+            ("raw", raw_row, "raw"),
             ("core", core_v2, f"lanes.{LANE_CORE}.v2"),
             ("legacy_overlay", legacy_v2, f"lanes.{LANE_LEGACY}.v2"),
             ("finalizer", final_v2, f"lanes.{LANE_FINALIZER}.rows.v2"),
@@ -990,6 +2011,37 @@ def validate_shadow_v2_payload(
                         errors.append(
                             f"{path}: finalizer root is parented by a finalize call"
                         )
+                    short_row_id = row_id.removeprefix(f"{LANE_FINALIZER}/")
+                    final_row = final_rows.get(short_row_id)
+                    verification = (
+                        final_row.get("verification")
+                        if isinstance(final_row, Mapping)
+                        else None
+                    )
+                    if isinstance(verification, Mapping):
+                        if event.get("call_id") != verification.get("authority_id"):
+                            errors.append(
+                                f"{path}.call_id: disagrees with {row_id} verification"
+                            )
+                        if event.get("authority_kind") != verification.get(
+                            "authority_kind"
+                        ):
+                            errors.append(
+                                f"{path}.authority_kind: disagrees with {row_id} "
+                                "verification"
+                            )
+                        seed_payload = verification.get("seed_payload")
+                        if isinstance(seed_payload, Mapping):
+                            if seed_payload.get("row_id") != row_id:
+                                errors.append(
+                                    f"{path}.row_id: disagrees with sealed seed row"
+                                )
+                            if seed_payload.get("evaluation_id") != event.get(
+                                "evaluation_id"
+                            ):
+                                errors.append(
+                                    f"{path}.evaluation_id: disagrees with sealed seed"
+                                )
                 if sorted(event_rows) != sorted(expected_rows):
                     errors.append("authorities.events: row roots are not one-to-one")
             if lineage is not None:

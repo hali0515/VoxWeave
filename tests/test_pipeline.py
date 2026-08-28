@@ -6,6 +6,7 @@ silently truncated by ``Path.with_suffix`` when deriving .vtt/.json sibling path
 
 import json
 import logging
+import math
 from pathlib import Path
 
 import pytest
@@ -365,12 +366,16 @@ def test_turns_in_all_malformed_returns_none(caplog):
     assert result is None
 
 
-def test_turns_in_retains_zero_duration_and_clamps_reversed_turns_to_points():
+def test_turns_in_retains_zero_duration_reversed_and_nonfinite_turns():
     assert pipeline._turns_in([[0, 1, "A"], [1, 1, "B"], [2, 1.5, "C"]]) == [
         (0.0, 1.0, "A"),
         (1.0, 1.0, "B"),
-        (2.0, 2.0, "C"),
+        (2.0, 1.5, "C"),
     ]
+    nonfinite = pipeline._turns_in([[float("inf"), float("nan"), "D"]])
+    assert nonfinite is not None
+    assert math.isinf(nonfinite[0][0])
+    assert math.isnan(nonfinite[0][1])
 
 
 # --- #23: SDH sidecar failure must not lose the already-written main VTT ---

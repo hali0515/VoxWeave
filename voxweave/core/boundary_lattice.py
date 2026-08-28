@@ -1711,15 +1711,18 @@ def _build_mixed_edges(
     units: Sequence[SourceUnit],
     *,
     work: CanonicalWork | None = None,
+    canonical_spaced: bool = False,
 ) -> MixedEdges:
     """Scan every start node through the provably bounded candidate band.
 
-    Spaced-language packing and aligned duration are monotone in the end node.
-    Canonical no-space legality is not: kinsoku can repair a prefix when a later
-    closing glyph arrives, so that branch stops only at the LAW's monotone
-    stripped-cell lower bound. The duration blocker case (even the shortest
-    candidate cue is over the cap) is the only place an exemption can enter,
-    and it goes through the same resolution the all-invisible branch uses.
+    Canonical legality is not monotone: kinsoku can repair a prefix when a later
+    closing glyph arrives, and bounded stutter can change spaced-language line
+    packing. The policy-2 lane therefore stops only at the LAW's monotone
+    stripped-cell lower bound and admits from cached ``FinalText`` directly.
+    ``canonical_spaced=False`` retains the frozen policy-1 packer behavior.
+    The duration blocker case (even the shortest candidate cue is over the cap)
+    is the only place an exemption can enter, and it goes through the same
+    resolution the all-invisible branch uses.
 
     That resolution answers three different things and they must not be
     conflated. It can say *the run splits* (a cap-legal partition exists at
@@ -1734,12 +1737,12 @@ def _build_mixed_edges(
     relief nodes.
     """
     lang = profile.language
-    no_spaces = _no_spaces(lang)
+    canonical_admission = _no_spaces(lang) or canonical_spaced
     max_cue_s = profile.max_cue_s
     node_set = set(nodes)
     packer = (
         None
-        if no_spaces
+        if canonical_admission
         else IncrementalPacker(lang, profile.max_line_length, profile.max_lines)
     )
     canonical_work = work if work is not None else CanonicalWork()
@@ -1763,7 +1766,7 @@ def _build_mixed_edges(
             starts.append(atom.start)
             ends.append(atom.end)
             end_node = index + 1
-            if no_spaces:
+            if canonical_admission:
                 joined = _join(surfaces, lang)
                 if band_scan_lower_bound_exceeded(joined, profile):
                     break
@@ -1779,10 +1782,9 @@ def _build_mixed_edges(
                 assert packer is not None
                 measure = packer.extend(atom.text)
             if not measure.fits:
-                if no_spaces:
-                    # Canonical wrapping is not monotone: a later kinsoku glyph
-                    # can repair this prefix. Only the stripped-cell lower bound
-                    # above is strong enough to terminate a no-space scan.
+                if canonical_admission:
+                    # Only the stripped-cell lower bound above is strong enough
+                    # to terminate a canonical scan.
                     continue
                 break
             low = span_min(starts)
@@ -1893,6 +1895,7 @@ def build_interval_lattice(
     *,
     units: Sequence[SourceUnit],
     span_violations: Sequence[SpanViolation] = (),
+    canonical_spaced: bool = False,
 ) -> IntervalLattice:
     """Build one interval's legal cue set, or say precisely why there is none."""
     lang = profile.language
@@ -2027,7 +2030,14 @@ def build_interval_lattice(
             )
 
     canonical_work = CanonicalWork()
-    scan = _build_mixed_edges(atoms, nodes, profile, units, work=canonical_work)
+    scan = _build_mixed_edges(
+        atoms,
+        nodes,
+        profile,
+        units,
+        work=canonical_work,
+        canonical_spaced=canonical_spaced,
+    )
     steps = scan.packer_steps
     cap_relief_nodes = 0
     guard = len(atoms) + 2
@@ -2038,7 +2048,14 @@ def build_interval_lattice(
             break
         nodes = tuple(sorted(set(nodes) | set(fresh)))
         cap_relief_nodes += len(fresh)
-        scan = _build_mixed_edges(atoms, nodes, profile, units, work=canonical_work)
+        scan = _build_mixed_edges(
+            atoms,
+            nodes,
+            profile,
+            units,
+            work=canonical_work,
+            canonical_spaced=canonical_spaced,
+        )
         steps += scan.packer_steps
     edges, waivers, infeasible = scan.edges, scan.waivers, scan.infeasible
     edges_from = _edges_from(edges)
@@ -2055,7 +2072,14 @@ def build_interval_lattice(
                 max_lines=profile.max_lines,
             )
             nodes = tuple(sorted(set(nodes) | set(injected)))
-            scan = _build_mixed_edges(atoms, nodes, profile, units, work=canonical_work)
+            scan = _build_mixed_edges(
+                atoms,
+                nodes,
+                profile,
+                units,
+                work=canonical_work,
+                canonical_spaced=canonical_spaced,
+            )
             edges, waivers, infeasible = scan.edges, scan.waivers, scan.infeasible
             steps += scan.packer_steps
             edges_from = _edges_from(edges)
@@ -2218,7 +2242,10 @@ def _cache_candidate_evidence(
 
 
 def build_document_lattice(
-    document: SegDocument, *, cache_speaker_evidence: bool = False
+    document: SegDocument,
+    *,
+    cache_speaker_evidence: bool = False,
+    canonical_spaced: bool = False,
 ) -> DocumentLattice:
     """Preflight, atom layer, barriers, intervals, per-interval lattices.
 
@@ -2237,6 +2264,7 @@ def build_document_lattice(
             document.profile,
             units=document.units,
             span_violations=span_violations,
+            canonical_spaced=canonical_spaced,
         )
         for interval in intervals
     )

@@ -728,9 +728,9 @@ def test_relief_nodes_never_include_the_interval_ends():
 
 
 def test_relief_regression_a_boundaryless_run_still_has_a_legal_path():
-    """The defect the semantic path lacked, reproduced on ``"あ" * 200``."""
+    """N14's exact relief fixture: one boundaryless 1,000-unit run."""
     prof = profile("ja", max_line_length=18, max_lines=1)
-    doc = document(timed(["あ"] * 200, dur=0.1), prof=prof)
+    doc = document(timed(["あ"] * 1_000, dur=0.01), prof=prof)
     built = build_document_lattice(doc)
     assert len(built.lattices) == 1
     lattice = built.lattices[0]

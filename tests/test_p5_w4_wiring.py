@@ -603,19 +603,20 @@ def test_n11_cross_checks_the_upstream_fd2_producer_fact(monkeypatch) -> None:
 def test_n11_detects_a_changed_value_outside_the_allowed_relation(monkeypatch) -> None:
     """Mutation pin: trigger eligibility alone cannot approve a corrupted value."""
     monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
-    real = pipeline._shadow_finalizer_row
+    real = pipeline._shadow_diff_classification
+    observed: dict[str, Any] = {}
 
-    def corrupt_serialized_v1(*args, **kwargs):
-        row, cues = real(*args, **kwargs)
-        if kwargs["origin"] == "v1":
-            row["cues"][0]["end"] = float(row["cues"][0]["end"]) + 0.125
-        return row, cues
+    def inspect_corruption(finalizer_row, comparator_row, *args, **kwargs):
+        corrupted = copy.deepcopy(finalizer_row)
+        corrupted["cues"][0]["end"] = float(corrupted["cues"][0]["end"]) + 0.125
+        observed.update(real(corrupted, comparator_row, *args, **kwargs))
+        return real(finalizer_row, comparator_row, *args, **kwargs)
 
-    monkeypatch.setattr(pipeline, "_shadow_finalizer_row", corrupt_serialized_v1)
+    monkeypatch.setattr(pipeline, "_shadow_diff_classification", inspect_corruption)
     artifact = _segment(_case_speakers()).shadow
-    assert artifact is not None
+    assert artifact is not None and artifact["schema_version"] == 2
 
-    classification = artifact["diff_classification"]
+    classification = observed
     assert classification["unclassified_field_diff"] == 0
     assert classification["relation_failures"] == 1
     changed = classification["changed_fields"]

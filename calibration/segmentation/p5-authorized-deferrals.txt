@@ -1,0 +1,7 @@
+# Source: p5-s14-addendum.md
+N20/en-03/v1
+N3b-expressed-rate
+PD-SUBUNIT/coarse-width-ja
+PD-SUBUNIT/coarse-both-ja
+PD-SUBUNIT/coarse-per-char-yue
+PD-SUBUNIT/coarse-mixed-en
