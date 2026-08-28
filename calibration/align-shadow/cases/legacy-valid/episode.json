@@ -1,0 +1,33 @@
+{
+  "language": "en",
+  "word_segments": [
+    {
+      "text": "hello",
+      "start": 0.0,
+      "end": 0.8
+    },
+    {
+      "text": "world",
+      "start": 2.0,
+      "end": 2.8
+    }
+  ],
+  "segmentation": {
+    "manifest_version": 1,
+    "engine": "legacy-v1",
+    "language": "en",
+    "profile": {
+      "max_line_length": 42,
+      "max_lines": 2,
+      "clause_ms": 400,
+      "vad_skip_ms": 1000,
+      "offline_ms": 700,
+      "min_cue_s": 0,
+      "max_cue_s": 0,
+      "glue_gap_s": 0,
+      "cps": 0,
+      "lag_out_s": 0,
+      "shot_snap_s": 0
+    }
+  }
+}

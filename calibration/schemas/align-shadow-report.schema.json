@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxweave.local/schemas/align-shadow-report.schema.json",
+  "title": "Voxweave P6 align shadow calibration report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "manifest_sha256",
+    "registry_sha256",
+    "cases",
+    "case_count",
+    "valid_count",
+    "infrastructure_invalid_count",
+    "correctness_failure_count"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "registry_sha256": { "$ref": "#/$defs/sha256" },
+    "cases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/case" }
+    },
+    "case_count": { "type": "integer", "minimum": 0 },
+    "valid_count": { "type": "integer", "minimum": 0 },
+    "infrastructure_invalid_count": { "type": "integer", "minimum": 0 },
+    "correctness_failure_count": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "selectedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "selected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine_family", "vtt", "json", "evidence"],
+      "properties": {
+        "engine_family": { "enum": ["legacy-v1", "boundary-v2"] },
+        "vtt": { "$ref": "#/$defs/selectedFile" },
+        "json": { "$ref": "#/$defs/selectedFile" },
+        "evidence": { "$ref": "#/$defs/selectedFile" }
+      }
+    },
+    "p11Decisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "speaker_turns_present",
+        "voiceprint_capture_present",
+        "voiceprint_media_present"
+      ],
+      "properties": {
+        "speaker_turns_present": { "type": "boolean" },
+        "voiceprint_capture_present": { "type": "boolean" },
+        "voiceprint_media_present": { "type": "boolean" }
+      }
+    },
+    "imports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "voxweave.align_evidence_core",
+        "voxweave.align_delta_registry",
+        "voxweave.core.finalizer",
+        "voxweave.core.align_compare",
+        "voxweave.align_shadow",
+        "voxweave.align_shadow_minimal"
+      ],
+      "properties": {
+        "voxweave.align_evidence_core": { "type": "boolean" },
+        "voxweave.align_delta_registry": { "type": "boolean" },
+        "voxweave.core.finalizer": { "type": "boolean" },
+        "voxweave.core.align_compare": { "type": "boolean" },
+        "voxweave.align_shadow": { "type": "boolean" },
+        "voxweave.align_shadow_minimal": { "type": "boolean" }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "shadow_enabled",
+        "observer",
+        "injection",
+        "normal_return",
+        "selected",
+        "p11_decisions",
+        "evidence_bytes_b64",
+        "artifact_kind",
+        "artifact_bytes_b64",
+        "artifact_sha256",
+        "imports",
+        "observer_call_count",
+        "alds",
+        "outcome"
+      ],
+      "properties": {
+        "shadow_enabled": { "type": "boolean" },
+        "observer": { "enum": ["none", "collector", "throwing"] },
+        "injection": { "type": ["string", "null"] },
+        "normal_return": { "type": ["string", "null"] },
+        "selected": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/selected" }
+          ]
+        },
+        "p11_decisions": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/p11Decisions" }
+          ]
+        },
+        "evidence_bytes_b64": { "type": ["string", "null"] },
+        "artifact_kind": {
+          "enum": ["rich", "minimal-failure", "none", "unavailable"]
+        },
+        "artifact_bytes_b64": { "type": ["string", "null"] },
+        "artifact_sha256": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/sha256" }
+          ]
+        },
+        "imports": { "$ref": "#/$defs/imports" },
+        "observer_call_count": { "type": "integer", "minimum": 0 },
+        "alds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^ALD-[0-6]$" },
+          "uniqueItems": true
+        },
+        "outcome": {
+          "enum": ["valid", "correctness-failure", "infrastructure-invalid"]
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "engine_family",
+        "fully_admitted",
+        "expected_failure",
+        "expected_detail_code",
+        "expected_alds",
+        "runs"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "engine_family": { "enum": ["legacy-v1", "boundary-v2"] },
+        "fully_admitted": { "type": "boolean" },
+        "expected_failure": { "type": ["string", "null"] },
+        "expected_detail_code": { "type": ["string", "null"] },
+        "expected_alds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^ALD-[0-6]$" },
+          "uniqueItems": true
+        },
+        "runs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/run" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,669 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://voxweave.local/schemas/align-shadow-artifact.schema.json",
+  "title": "Voxweave P6 align shadow artifact",
+  "oneOf": [
+    { "$ref": "#/$defs/rich" },
+    { "$ref": "#/$defs/minimal" }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "failureKind": {
+      "type": "string",
+      "enum": [
+        "subtitle-snapshot-failed",
+        "align-input-decode-invalid",
+        "v2-input-invalid",
+        "carrier-extraction-failed",
+        "media-identity-invalid",
+        "media-snapshot-unavailable",
+        "semantic-backend-unavailable",
+        "qwen-route-invalid",
+        "qwen-window-operation-failed",
+        "dp-route-hints-invalid",
+        "cache-lock-failed",
+        "cache-companion-invalid",
+        "cache-operation-failed",
+        "context-authority-invalid",
+        "legacy-time-transform-failed",
+        "fresh-backend-output-invalid",
+        "fresh-time-transform-invalid",
+        "fresh-distribution-invalid",
+        "fresh-reconciliation-invalid",
+        "fresh-seed-invalid",
+        "v2-policy-invalid",
+        "fresh-authority-invalid",
+        "fresh-seal-broken",
+        "profile-invalid",
+        "evidence-invalid",
+        "segmentation-v2-invalid",
+        "finalizer-budget-exhausted",
+        "finalizer-output-invalid",
+        "finalizer-partition-failed",
+        "finalizer-trace-failed",
+        "finalizer-stability-failed",
+        "align-delta-invalid",
+        "no-aligned-units",
+        "selected-render-invalid",
+        "final-evidence-invalid",
+        "shadow-internal-error",
+        "shadow-artifact-unavailable",
+        "preencode-failed",
+        "stage-failed",
+        "episode-lock-failed",
+        "input-stale",
+        "media-stale",
+        "commit-failed",
+        "artifact-cleanup-failed",
+        "model-release-failed",
+        "observer-failed",
+        "snapshot-dispose-failed"
+      ]
+    },
+    "failureDetail": {
+      "type": "string",
+      "enum": [
+        "acquisition-unissued",
+        "all-block-units-empty",
+        "all-crops-none",
+        "allocation-ambiguous",
+        "allocation-budget",
+        "allocation-no-tiling",
+        "allocator-limit-profile",
+        "audio-temp-residue",
+        "authority-recompute",
+        "authority-seal",
+        "backend-call-shape",
+        "backend-raised",
+        "cache-decode",
+        "cache-lock-acquire",
+        "cache-replace",
+        "cache-stage",
+        "candidate-family-manifest",
+        "closed-schema",
+        "companion-hash",
+        "companion-media",
+        "companion-replace",
+        "companion-schema",
+        "companion-size",
+        "companion-unlink",
+        "comparator-stage",
+        "context-binding",
+        "context-consumed",
+        "context-role",
+        "context-seal",
+        "context-unissued",
+        "context-unused-role",
+        "correct-generation",
+        "crop-geometry",
+        "crop-over-budget",
+        "cue-schema",
+        "cue-source-map",
+        "delivery-unit-range",
+        "derived-hash",
+        "distribution-seal",
+        "endpoint-not-configured",
+        "episode-lock-acquire",
+        "evidence-binding",
+        "evidence-domain",
+        "evidence-encode",
+        "evidence-replace",
+        "evidence-stage",
+        "evidence-unlink",
+        "expected-vtt-generation",
+        "finalizer-partition",
+        "footprint-fallback",
+        "footprint-reconciliation",
+        "hint-nonfinite",
+        "hint-nonmonotone",
+        "hint-shape",
+        "html-unlink",
+        "independent-projection",
+        "json-projection",
+        "legacy-slice-seal",
+        "machine-artifact-replace",
+        "machine-artifact-stage",
+        "main-json-encode",
+        "main-json-replace",
+        "main-json-stage",
+        "media-fingerprint",
+        "media-generation",
+        "media-logical-id",
+        "media-not-found",
+        "media-snapshot-residue",
+        "minimal-artifact-construction",
+        "named-multi-unattributed",
+        "negative-policy",
+        "no-route-source",
+        "non-string-selected-object-key",
+        "nonfinite-policy",
+        "observer-callback",
+        "p7-prerequisite-open",
+        "pair-decision",
+        "panns-release",
+        "partial-empty-ownership",
+        "phase1-fidelity",
+        "phase1-seal",
+        "physical-origin-mismatch",
+        "plan-nontiling",
+        "primitive-relation",
+        "process-output-generation",
+        "profile-domain",
+        "profile-language",
+        "profile-shape",
+        "profile-stage",
+        "punctuation-only-block",
+        "raw-seal",
+        "receipt-context",
+        "reflink-and-copy-failed",
+        "registry-digest",
+        "relative-normalization",
+        "relative-seal",
+        "renderer-stage",
+        "resolved-default-domain",
+        "retained-unit-end",
+        "retained-unit-operand",
+        "retained-unit-start",
+        "retained-unit-text",
+        "rich-artifact-construction",
+        "root-transfer",
+        "route-bound-access",
+        "route-bound-arithmetic",
+        "route-owner-mismatch",
+        "sample-end-index",
+        "sample-geometry",
+        "sample-open",
+        "sample-seek-read",
+        "sample-start-index",
+        "sample-temp-create",
+        "sample-write",
+        "seed-admission",
+        "selected-candidate-missing",
+        "selected-hash-link",
+        "selected-json-cycle",
+        "semantic-selector-unmodelled",
+        "shot-shape",
+        "sibling-generation",
+        "sibling-json-duplicate-key",
+        "sibling-json-encoding",
+        "sibling-json-nonfinite",
+        "sibling-json-syntax",
+        "sibling-read",
+        "sibling-top-level-shape",
+        "sing-shape",
+        "snapshot-verification-failed",
+        "speaker-mapping-generation",
+        "stability-check",
+        "stage-residue",
+        "strict-carrier-domain",
+        "strict-raw-node",
+        "suggest-unlink",
+        "surplus-transform",
+        "sweep-budget",
+        "terminal-validity",
+        "trace-replay",
+        "trigger-set",
+        "unit-coverage",
+        "unsupported-selected-json-node",
+        "voiceprints-unlink",
+        "vtt-encode",
+        "vtt-encoding",
+        "vtt-format-mismatch",
+        "vtt-generation",
+        "vtt-no-cues",
+        "vtt-projection",
+        "vtt-read",
+        "vtt-replace",
+        "vtt-stage",
+        "w1-root-event",
+        "w1-stage"
+      ]
+    },
+    "failureLeaf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "phase", "detail_code"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/failureKind" },
+        "phase": { "type": "string", "minLength": 1 },
+        "detail_code": { "$ref": "#/$defs/failureDetail" }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "phase", "detail_code", "secondary"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/failureKind" },
+        "phase": { "type": "string", "minLength": 1 },
+        "detail_code": { "$ref": "#/$defs/failureDetail" },
+        "secondary": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/failureLeaf" }
+        }
+      }
+    },
+    "selected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine_family",
+        "vtt_sha256",
+        "json_sha256",
+        "evidence_sha256"
+      ],
+      "properties": {
+        "engine_family": {
+          "enum": ["legacy-v1", "boundary-v2"]
+        },
+        "vtt_sha256": { "$ref": "#/$defs/sha256" },
+        "json_sha256": { "$ref": "#/$defs/sha256" },
+        "evidence_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "legacyCue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_index", "text", "start", "end", "lyric", "unit_ids"],
+      "properties": {
+        "source_index": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string" },
+        "start": { "type": "number" },
+        "end": { "type": "number" },
+        "lyric": {
+          "oneOf": [
+            { "type": "null" },
+            { "const": true }
+          ]
+        },
+        "unit_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "semanticRootLineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expected_row_id",
+        "input_kind",
+        "authority_kind",
+        "parent_absent",
+        "record_count",
+        "matching_row_count",
+        "stable_input_digest"
+      ],
+      "properties": {
+        "expected_row_id": { "const": "align/delivery-finalizer/v2" },
+        "input_kind": { "const": "phase1" },
+        "authority_kind": { "const": "fresh-alignment" },
+        "parent_absent": { "const": true },
+        "record_count": { "const": 1 },
+        "matching_row_count": { "const": 1 },
+        "stable_input_digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "semantic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantic_root_lineage",
+        "phase1_seed",
+        "delivered",
+        "report",
+        "trace"
+      ],
+      "properties": {
+        "semantic_root_lineage": { "$ref": "#/$defs/semanticRootLineage" },
+        "phase1_seed": { "type": "array" },
+        "delivered": { "type": "array" },
+        "report": { "type": "object" },
+        "trace": { "type": "object" }
+      }
+    },
+    "validators": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "partition_result",
+        "trace_problems",
+        "stability_problems"
+      ],
+      "properties": {
+        "partition_result": { "type": "object" },
+        "trace_problems": { "type": "array" },
+        "stability_problems": { "type": "array" }
+      }
+    },
+    "comparisonResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "registry_sha256",
+        "active_classes",
+        "primitive_field_diffs",
+        "violations"
+      ],
+      "properties": {
+        "registry_sha256": {
+          "const": "cd25f04a5ea8b515658b4181548aa3f79d70d91b849a4cc1e06b354f1f5f68b3"
+        },
+        "active_classes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["ALD-0", "ALD-1", "ALD-2", "ALD-3", "ALD-4", "ALD-5"]
+          },
+          "uniqueItems": true
+        },
+        "primitive_field_diffs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["authority-time", "text", "start", "end", "lyric"]
+          },
+          "uniqueItems": true
+        },
+        "violations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["ALD-0", "ALD-1", "ALD-2", "ALD-3", "ALD-4", "ALD-5"]
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "rich": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "artifact_kind",
+        "status",
+        "failure",
+        "input",
+        "fresh",
+        "legacy",
+        "v2",
+        "comparison",
+        "selected"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "artifact_kind": { "const": "rich" },
+        "status": { "enum": ["valid", "invalid"] },
+        "failure": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/failure" }
+          ]
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "context_content_digest",
+            "vtt_sha256",
+            "sibling_present",
+            "sibling_sha256",
+            "media_fingerprint",
+            "media_logical_id",
+            "effective_iso",
+            "route",
+            "block_count",
+            "block_content_sha256",
+            "profile_source"
+          ],
+          "properties": {
+            "context_content_digest": { "$ref": "#/$defs/sha256" },
+            "vtt_sha256": { "$ref": "#/$defs/sha256" },
+            "sibling_present": { "type": "boolean" },
+            "sibling_sha256": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/sha256" }
+              ]
+            },
+            "media_fingerprint": { "$ref": "#/$defs/sha256" },
+            "media_logical_id": { "type": "string", "minLength": 1 },
+            "effective_iso": { "type": "string", "minLength": 2 },
+            "route": { "enum": ["ctc-full", "mms-full", "qwen-crop"] },
+            "block_count": { "type": "integer", "minimum": 0 },
+            "block_content_sha256": { "$ref": "#/$defs/sha256" },
+            "profile_source": {
+              "enum": [
+                "language-override",
+                "unsupported-manifest",
+                "profile-absent",
+                "stored-profile",
+                "manifest-absent"
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "sibling_present": { "const": true } },
+                "required": ["sibling_present"]
+              },
+              "then": {
+                "properties": {
+                  "sibling_sha256": { "$ref": "#/$defs/sha256" }
+                }
+              },
+              "else": {
+                "properties": { "sibling_sha256": { "type": "null" } }
+              }
+            }
+          ]
+        },
+        "fresh": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "receipt_digest",
+            "prepared_audio_sha256",
+            "physical_call_count",
+            "raw_unit_count",
+            "legacy_distribution_digest",
+            "authority_distribution_digest",
+            "authority_distribution_status",
+            "seed_status",
+            "strict_input_status",
+            "v2_policy_status",
+            "profile_status",
+            "evidence_status",
+            "v2_admission_status"
+          ],
+          "properties": {
+            "receipt_digest": { "$ref": "#/$defs/sha256" },
+            "prepared_audio_sha256": { "$ref": "#/$defs/sha256" },
+            "physical_call_count": { "type": "integer", "minimum": 0 },
+            "raw_unit_count": { "type": "integer", "minimum": 0 },
+            "legacy_distribution_digest": { "$ref": "#/$defs/sha256" },
+            "authority_distribution_digest": { "$ref": "#/$defs/sha256" },
+            "authority_distribution_status": { "enum": ["valid", "invalid"] },
+            "seed_status": { "enum": ["valid", "invalid"] },
+            "strict_input_status": { "enum": ["valid", "invalid"] },
+            "v2_policy_status": { "enum": ["valid", "invalid"] },
+            "profile_status": { "enum": ["valid", "invalid"] },
+            "evidence_status": { "enum": ["valid", "invalid"] },
+            "v2_admission_status": { "enum": ["valid", "invalid"] }
+          }
+        },
+        "legacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["normalized_delivery", "vtt_sha256", "json_sha256"],
+          "properties": {
+            "normalized_delivery": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/legacyCue" }
+            },
+            "vtt_sha256": { "$ref": "#/$defs/sha256" },
+            "json_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "v2": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["semantic", "validators"],
+          "properties": {
+            "semantic": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/semantic" }
+              ]
+            },
+            "validators": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/validators" }
+              ]
+            }
+          },
+          "oneOf": [
+            {
+              "properties": {
+                "semantic": { "type": "null" },
+                "validators": { "type": "null" }
+              }
+            },
+            {
+              "properties": {
+                "semantic": { "$ref": "#/$defs/semantic" },
+                "validators": { "type": "null" }
+              }
+            },
+            {
+              "properties": {
+                "semantic": { "$ref": "#/$defs/semantic" },
+                "validators": { "$ref": "#/$defs/validators" }
+              }
+            }
+          ]
+        },
+        "comparison": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result"],
+          "properties": {
+            "result": {
+              "oneOf": [
+                { "type": "null" },
+                { "$ref": "#/$defs/comparisonResult" }
+              ]
+            }
+          }
+        },
+        "selected": { "$ref": "#/$defs/selected" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "valid" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "failure": { "type": "null" },
+              "fresh": {
+                "properties": {
+                  "authority_distribution_status": { "const": "valid" },
+                  "seed_status": { "const": "valid" },
+                  "strict_input_status": { "const": "valid" },
+                  "v2_policy_status": { "const": "valid" },
+                  "profile_status": { "const": "valid" },
+                  "evidence_status": { "const": "valid" },
+                  "v2_admission_status": { "const": "valid" }
+                }
+              },
+              "v2": {
+                "properties": {
+                  "semantic": { "$ref": "#/$defs/semantic" },
+                  "validators": {
+                    "allOf": [
+                      { "$ref": "#/$defs/validators" },
+                      {
+                        "properties": {
+                          "trace_problems": { "maxItems": 0 },
+                          "stability_problems": { "maxItems": 0 }
+                        }
+                      }
+                    ]
+                  }
+                }
+              },
+              "comparison": {
+                "properties": {
+                  "result": {
+                    "allOf": [
+                      { "$ref": "#/$defs/comparisonResult" },
+                      { "properties": { "violations": { "maxItems": 0 } } }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": { "failure": { "$ref": "#/$defs/failure" } }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "comparison": {
+                "properties": { "result": { "type": "object" } },
+                "required": ["result"]
+              }
+            },
+            "required": ["comparison"]
+          },
+          "then": {
+            "properties": {
+              "v2": {
+                "properties": {
+                  "semantic": { "$ref": "#/$defs/semantic" },
+                  "validators": { "$ref": "#/$defs/validators" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "minimal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "artifact_kind",
+        "status",
+        "failure",
+        "context_content_digest",
+        "receipt_digest",
+        "selected"
+      ],
+      "properties": {
+        "schema_version": { "const": 2 },
+        "artifact_kind": { "const": "minimal-failure" },
+        "status": { "const": "invalid" },
+        "failure": { "$ref": "#/$defs/failure" },
+        "context_content_digest": { "$ref": "#/$defs/sha256" },
+        "receipt_digest": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/sha256" }
+          ]
+        },
+        "selected": { "$ref": "#/$defs/selected" }
+      }
+    }
+  }
+}

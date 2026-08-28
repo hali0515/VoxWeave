@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "manifest_sha256": "19fab12f8b9c7dbc5dd0475360def88817812f68857ae55810090ed6c710c5fb",
+  "manifest_schema_sha256": "262a1057289dbe80697d571e10bdd001086a5f2fa44eaa93532b86dc3b059ae9",
+  "artifact_schema_sha256": "2fe4e972e152e452acd2664d629e819d8abe3a1dc29e2c622a99f9851ba5c7ba",
+  "report_schema_sha256": "ec4b9a4db4f3096970617cfb8f5228a3443104b7eb0db481d982992d1592a250",
+  "registry_sha256": "3e8544c024f77c40a51417481f626328103ee4a77ce236026a07d227b6fd2dad",
+  "cases": {
+    "boundary-valid": {
+      "selected": {
+        "engine_family": "boundary-v2",
+        "vtt": {
+          "path": "episode.vtt",
+          "sha256": "67132a10be1e45fb74a3750a401ffa97e8d080845d622f081599ec09ddcd1cb5"
+        },
+        "json": {
+          "path": "episode.json",
+          "sha256": "d5eda64dcedc292f1ec8d276703d1bb0498754e265a3546d280a91c4b6924cc8"
+        },
+        "evidence": {
+          "path": "episode.align-evidence.json",
+          "sha256": "a4e32eafb3702127717c84304d34de8e83dbc98729ca9838956e7a0b8deaf60f"
+        }
+      },
+      "artifact_kind": "rich",
+      "failure": null,
+      "detail_code": null,
+      "alds": [
+        "ALD-2",
+        "ALD-6"
+      ],
+      "artifact_sha256": "c9a3cf3dc2c1fbe918532760eab1882ae20df42a882dc6e5c46cb1ca2dd0a191"
+    },
+    "legacy-typed-invalid": {
+      "selected": {
+        "engine_family": "legacy-v1",
+        "vtt": {
+          "path": "episode.vtt",
+          "sha256": "46714ea38a67691513d56a49b96938c78876d2bdfe08080a1092cb3b29f765fe"
+        },
+        "json": {
+          "path": "episode.json",
+          "sha256": "cf5588c7e3f0823489285142363834373d5abe24f88af4e427a9cbfa6f3e0d88"
+        },
+        "evidence": {
+          "path": "episode.align-evidence.json",
+          "sha256": "a6e7b81a7a69055dda49ad657368641449552b075ee2f9c2aa63ea825e13896b"
+        }
+      },
+      "artifact_kind": "rich",
+      "failure": "v2-input-invalid",
+      "detail_code": "sibling-json-duplicate-key",
+      "alds": [
+        "ALD-6"
+      ],
+      "artifact_sha256": "9ffbe29efd0030990da3099d68f82253d2763db719471931d3d57c537f3105ff"
+    },
+    "legacy-valid": {
+      "selected": {
+        "engine_family": "legacy-v1",
+        "vtt": {
+          "path": "episode.vtt",
+          "sha256": "46714ea38a67691513d56a49b96938c78876d2bdfe08080a1092cb3b29f765fe"
+        },
+        "json": {
+          "path": "episode.json",
+          "sha256": "cf5588c7e3f0823489285142363834373d5abe24f88af4e427a9cbfa6f3e0d88"
+        },
+        "evidence": {
+          "path": "episode.align-evidence.json",
+          "sha256": "05942423e9e25fb674405b2c31a5600bcc890fc77cf37669e98e410b7a9798db"
+        }
+      },
+      "artifact_kind": "rich",
+      "failure": null,
+      "detail_code": null,
+      "alds": [
+        "ALD-6"
+      ],
+      "artifact_sha256": "25009a796491de47e9190e72b5d89d63dcfd278f73e2b80a58843b6b32d5459a"
+    }
+  }
+}

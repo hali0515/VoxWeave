@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import threading
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from voxweave.align_context import (
@@ -140,9 +140,9 @@ class _SemanticObservation:
     delivered: object
     report: object
     trace: object
-    partition_result: object
-    trace_problems: object
-    stability_problems: object
+    partition_result: object | None
+    trace_problems: object | None
+    stability_problems: object | None
 
 
 class AlignAdapterError(RuntimeError):
@@ -290,6 +290,8 @@ def _w1_delivery(
     context: IssuedAlignContext,
     acquisition: object,
     payload: object,
+    *,
+    _observation_sink: list[_SemanticObservation] | None = None,
 ) -> tuple[AlignDelivery, _SemanticObservation]:
     from typing import cast
 
@@ -391,12 +393,29 @@ def _w1_delivery(
         sing_spans=tuple(evidence_resolution.sing_spans or ()),
     )
     policy = FinalizePolicy()
+    semantic_root_lineage = lineage_tuples(ledger)
     finalized = finalize(
         stream,
         profile=profile,
         evidence=finalizer_evidence,
         policy=policy,
     )
+    semantic_observation = _SemanticObservation(
+        semantic_root_lineage,
+        deepcopy(stream.cues),
+        deepcopy(finalized.cues),
+        deepcopy(finalized.report),
+        deepcopy(finalized.trace),
+        None,
+        None,
+        None,
+    )
+
+    def retain_observation() -> None:
+        if _observation_sink is not None:
+            _observation_sink[:] = [semantic_observation]
+
+    retain_observation()
     root_errors = check_roots(
         ledger,
         expected={"align/delivery-finalizer/v2": "fresh-alignment"},
@@ -458,6 +477,11 @@ def _w1_delivery(
         reports=finalized.report.entries,
         waivers=waivers,
     )
+    semantic_observation = replace(
+        semantic_observation,
+        partition_result=deepcopy(partition_result),
+    )
+    retain_observation()
     if partition_result.exit_driving:
         raise AlignAdapterError(
             CanonicalFailure(
@@ -474,6 +498,11 @@ def _w1_delivery(
         policy=policy,
         delivered=delivered,
     )
+    semantic_observation = replace(
+        semantic_observation,
+        trace_problems=deepcopy(trace_errors),
+    )
+    retain_observation()
     if trace_errors:
         raise AlignAdapterError(
             CanonicalFailure("finalizer-trace-failed", "trace-replay", "trace-replay")
@@ -486,6 +515,11 @@ def _w1_delivery(
         policy=policy,
         terminal=finalized.trace.terminal,
     )
+    semantic_observation = replace(
+        semantic_observation,
+        stability_problems=deepcopy(stability_errors),
+    )
+    retain_observation()
     if stability_errors:
         raise AlignAdapterError(
             CanonicalFailure(
@@ -524,16 +558,7 @@ def _w1_delivery(
             if unit.start is not None and unit.end is not None
         ),
     )
-    return delivery, _SemanticObservation(
-        lineage_tuples(ledger),
-        deepcopy(stream.cues),
-        deepcopy(finalized.cues),
-        deepcopy(finalized.report),
-        deepcopy(finalized.trace),
-        deepcopy(partition_result),
-        deepcopy(trace_errors),
-        deepcopy(stability_errors),
-    )
+    return delivery, semantic_observation
 
 
 def run_locked_align_adapter(
@@ -605,8 +630,14 @@ def run_locked_align_adapter(
             status=V2Status("invalid", failure),
             projection_inputs=projection_inputs,
         )
+    retained_observation: list[_SemanticObservation] = []
     try:
-        v2, semantic_observation = _w1_delivery(context, acquisition, payload)
+        v2, semantic_observation = _w1_delivery(
+            context,
+            acquisition,
+            payload,
+            _observation_sink=retained_observation,
+        )
     except AlignAdapterError as exc:
         _retire_fresh_transfer(context, acquisition)
         if context.engine_family == "boundary-v2":
@@ -618,6 +649,9 @@ def run_locked_align_adapter(
             v2=None,
             status=V2Status("invalid", exc.failure),
             projection_inputs=projection_inputs,
+            semantic_observation=(
+                retained_observation[0] if retained_observation else None
+            ),
         )
     except Exception as exc:
         _retire_fresh_transfer(context, acquisition)
@@ -631,6 +665,9 @@ def run_locked_align_adapter(
             v2=None,
             status=V2Status("invalid", failure),
             projection_inputs=projection_inputs,
+            semantic_observation=(
+                retained_observation[0] if retained_observation else None
+            ),
         )
     _fresh_record(context, acquisition)
     return _adapter_result(

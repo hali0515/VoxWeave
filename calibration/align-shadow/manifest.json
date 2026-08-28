@@ -1,0 +1,258 @@
+{
+  "schema_version": 1,
+  "artifact_schema_version": 2,
+  "registry_sha256": "3e8544c024f77c40a51417481f626328103ee4a77ce236026a07d227b6fd2dad",
+  "environment": {
+    "python_major_minor": "3.13",
+    "platform": "linux-x86_64",
+    "locale": "UTF-8",
+    "timezone": null,
+    "hash_seed": null
+  },
+  "cases": [
+    {
+      "id": "boundary-valid",
+      "route": "ctc-full",
+      "effective_iso": "en",
+      "argv": [
+        "episode.vtt",
+        "--media",
+        "episode.wav"
+      ],
+      "env": {
+        "VOXWEAVE_SEG_V2_SHADOW": null,
+        "PYTHONHASHSEED": null
+      },
+      "inputs": [
+        {
+          "path": "cases/boundary-valid/episode.vtt",
+          "size": 81,
+          "sha256": "46714ea38a67691513d56a49b96938c78876d2bdfe08080a1092cb3b29f765fe"
+        },
+        {
+          "path": "cases/boundary-valid/episode.json",
+          "size": 575,
+          "sha256": "873e62bd0881c3ee374fad4c75c9d88d779fdaddad94b87e3445da2503be017a"
+        },
+        {
+          "path": "cases/boundary-valid/episode.wav",
+          "size": 41,
+          "sha256": "740b847496f4105aca7e4a6a205c66fd0630b7746182dcf233bb447ec76a1630"
+        }
+      ],
+      "backend_receipt": {
+        "path": "cases/boundary-valid/backend-receipt.json",
+        "size": 449,
+        "sha256": "c081260a55d54bd33a9dce995ee5ea6ac304e216173dcb3a740ad42ffc834164"
+      },
+      "authority_limit_profile": {
+        "kind": "production",
+        "values": {
+          "call": {
+            "state_limit": 1000000,
+            "edge_limit": 4000000,
+            "interval_limit": 1000000,
+            "normalize_char_limit": 64000000
+          },
+          "job": {
+            "call_limit": 4096,
+            "state_limit": 4000000,
+            "edge_limit": 16000000,
+            "interval_limit": 4000000,
+            "normalize_char_limit": 256000000
+          }
+        },
+        "digest": "251b66817a8c22f753b7f6852c7005426262662aa8fe4a3acfd8b77164482391",
+        "test_case_id": null
+      },
+      "expected": {
+        "fully_admitted": true,
+        "selected": {
+          "engine_family": "boundary-v2",
+          "vtt": {
+            "path": "episode.vtt",
+            "sha256": "67132a10be1e45fb74a3750a401ffa97e8d080845d622f081599ec09ddcd1cb5"
+          },
+          "json": {
+            "path": "episode.json",
+            "sha256": "d5eda64dcedc292f1ec8d276703d1bb0498754e265a3546d280a91c4b6924cc8"
+          },
+          "evidence": {
+            "path": "episode.align-evidence.json",
+            "sha256": "a4e32eafb3702127717c84304d34de8e83dbc98729ca9838956e7a0b8deaf60f"
+          }
+        },
+        "artifact_kind": "rich",
+        "failure": null,
+        "detail_code": null,
+        "alds": [
+          "ALD-2",
+          "ALD-6"
+        ],
+        "artifact_sha256": "c9a3cf3dc2c1fbe918532760eab1882ae20df42a882dc6e5c46cb1ca2dd0a191"
+      }
+    },
+    {
+      "id": "legacy-typed-invalid",
+      "route": "ctc-full",
+      "effective_iso": "en",
+      "argv": [
+        "episode.vtt",
+        "--media",
+        "episode.wav"
+      ],
+      "env": {
+        "VOXWEAVE_SEG_V2_SHADOW": null,
+        "PYTHONHASHSEED": null
+      },
+      "inputs": [
+        {
+          "path": "cases/legacy-typed-invalid/episode.vtt",
+          "size": 81,
+          "sha256": "46714ea38a67691513d56a49b96938c78876d2bdfe08080a1092cb3b29f765fe"
+        },
+        {
+          "path": "cases/legacy-typed-invalid/episode.json",
+          "size": 593,
+          "sha256": "9a0efef63c3a1ffe3694d4eaefaa9a3f97472e427f368fccaf11a70aedce6617"
+        },
+        {
+          "path": "cases/legacy-typed-invalid/episode.wav",
+          "size": 41,
+          "sha256": "740b847496f4105aca7e4a6a205c66fd0630b7746182dcf233bb447ec76a1630"
+        }
+      ],
+      "backend_receipt": {
+        "path": "cases/legacy-typed-invalid/backend-receipt.json",
+        "size": 449,
+        "sha256": "c081260a55d54bd33a9dce995ee5ea6ac304e216173dcb3a740ad42ffc834164"
+      },
+      "authority_limit_profile": {
+        "kind": "production",
+        "values": {
+          "call": {
+            "state_limit": 1000000,
+            "edge_limit": 4000000,
+            "interval_limit": 1000000,
+            "normalize_char_limit": 64000000
+          },
+          "job": {
+            "call_limit": 4096,
+            "state_limit": 4000000,
+            "edge_limit": 16000000,
+            "interval_limit": 4000000,
+            "normalize_char_limit": 256000000
+          }
+        },
+        "digest": "251b66817a8c22f753b7f6852c7005426262662aa8fe4a3acfd8b77164482391",
+        "test_case_id": null
+      },
+      "expected": {
+        "fully_admitted": false,
+        "selected": {
+          "engine_family": "legacy-v1",
+          "vtt": {
+            "path": "episode.vtt",
+            "sha256": "46714ea38a67691513d56a49b96938c78876d2bdfe08080a1092cb3b29f765fe"
+          },
+          "json": {
+            "path": "episode.json",
+            "sha256": "cf5588c7e3f0823489285142363834373d5abe24f88af4e427a9cbfa6f3e0d88"
+          },
+          "evidence": {
+            "path": "episode.align-evidence.json",
+            "sha256": "a6e7b81a7a69055dda49ad657368641449552b075ee2f9c2aa63ea825e13896b"
+          }
+        },
+        "artifact_kind": "rich",
+        "failure": "v2-input-invalid",
+        "detail_code": "sibling-json-duplicate-key",
+        "alds": [
+          "ALD-6"
+        ],
+        "artifact_sha256": "9ffbe29efd0030990da3099d68f82253d2763db719471931d3d57c537f3105ff"
+      }
+    },
+    {
+      "id": "legacy-valid",
+      "route": "ctc-full",
+      "effective_iso": "en",
+      "argv": [
+        "episode.vtt",
+        "--media",
+        "episode.wav"
+      ],
+      "env": {
+        "VOXWEAVE_SEG_V2_SHADOW": null,
+        "PYTHONHASHSEED": null
+      },
+      "inputs": [
+        {
+          "path": "cases/legacy-valid/episode.vtt",
+          "size": 81,
+          "sha256": "46714ea38a67691513d56a49b96938c78876d2bdfe08080a1092cb3b29f765fe"
+        },
+        {
+          "path": "cases/legacy-valid/episode.json",
+          "size": 573,
+          "sha256": "c9f50f1960c4419a84fc0efd1146e4f3f6a4b1b946f7ac3e82dfdd13bacc34be"
+        },
+        {
+          "path": "cases/legacy-valid/episode.wav",
+          "size": 41,
+          "sha256": "740b847496f4105aca7e4a6a205c66fd0630b7746182dcf233bb447ec76a1630"
+        }
+      ],
+      "backend_receipt": {
+        "path": "cases/legacy-valid/backend-receipt.json",
+        "size": 449,
+        "sha256": "c081260a55d54bd33a9dce995ee5ea6ac304e216173dcb3a740ad42ffc834164"
+      },
+      "authority_limit_profile": {
+        "kind": "production",
+        "values": {
+          "call": {
+            "state_limit": 1000000,
+            "edge_limit": 4000000,
+            "interval_limit": 1000000,
+            "normalize_char_limit": 64000000
+          },
+          "job": {
+            "call_limit": 4096,
+            "state_limit": 4000000,
+            "edge_limit": 16000000,
+            "interval_limit": 4000000,
+            "normalize_char_limit": 256000000
+          }
+        },
+        "digest": "251b66817a8c22f753b7f6852c7005426262662aa8fe4a3acfd8b77164482391",
+        "test_case_id": null
+      },
+      "expected": {
+        "fully_admitted": true,
+        "selected": {
+          "engine_family": "legacy-v1",
+          "vtt": {
+            "path": "episode.vtt",
+            "sha256": "46714ea38a67691513d56a49b96938c78876d2bdfe08080a1092cb3b29f765fe"
+          },
+          "json": {
+            "path": "episode.json",
+            "sha256": "cf5588c7e3f0823489285142363834373d5abe24f88af4e427a9cbfa6f3e0d88"
+          },
+          "evidence": {
+            "path": "episode.align-evidence.json",
+            "sha256": "05942423e9e25fb674405b2c31a5600bcc890fc77cf37669e98e410b7a9798db"
+          }
+        },
+        "artifact_kind": "rich",
+        "failure": null,
+        "detail_code": null,
+        "alds": [
+          "ALD-6"
+        ],
+        "artifact_sha256": "25009a796491de47e9190e72b5d89d63dcfd278f73e2b80a58843b6b32d5459a"
+      }
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "route": "ctc-full",
+  "calls": [
+    {
+      "source_indices": [
+        0,
+        1
+      ],
+      "physical_origin_seconds": 0.0,
+      "block_units": [
+        [
+          {
+            "text": "hello",
+            "start": 0.0,
+            "end": 0.8
+          }
+        ],
+        [
+          {
+            "text": "world",
+            "start": 2.0,
+            "end": 2.8
+          }
+        ]
+      ]
+    }
+  ]
+}

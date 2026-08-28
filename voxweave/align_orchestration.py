@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,11 +50,38 @@ from voxweave.align_snapshot import (
     RawJSONCarrier,
     StrictInputStatus,
     freeze_json,
+    frozen_json_digest,
 )
 from voxweave.episode_transaction import FileGeneration
 
 
-ALIGN_AO_ORDER = tuple(f"AO-{index:02d}" for index in range(1, 26))
+ALIGN_AO_PHASE_ORDER = (
+    "AO-01",
+    "AO-02",
+    "AO-03",
+    "AO-04",
+    "AO-05",
+    "AO-06",
+    "AO-07",
+    "AO-08",
+    "AO-09",
+    "AO-10",
+    "AO-11",
+    "AO-12",
+    "AO-13",
+    "AO-14",
+    "AO-15",
+    "AO-16",
+    "AO-17",
+    "AO-18",
+    "AO-19",
+    "AO-20",
+    "AO-21",
+    "AO-22",
+    "AO-23",
+    "AO-24",
+    "AO-25",
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +89,8 @@ class AlignSelection:
     context: IssuedAlignContext
     result: AlignEvaluatedResult
     verified: candidate_encoder.VerifiedEncodedCandidate
+    legacy_vtt_sha256: str
+    legacy_main_json_sha256: str
     evidence: FinalAlignEvidence
     distribution: AuthorityDistributionReceipt
     strict_input_status: StrictInputStatus
@@ -119,6 +149,7 @@ def issue_public_align_context(
     strict_shot_changes: object,
     strict_sing_spans: object,
     explicit_media: bool = False,
+    block_content_sha256: str | None = None,
 ) -> IssuedAlignContext:
     """Seal stable invocation facts, then authorize the physical call lane."""
     if type(explicit_media) is not bool:
@@ -126,10 +157,51 @@ def issue_public_align_context(
     prepared = Path(prepared_audio_path)
     media = Path(media_path)
     source_indices = _original_source_indices(blocks)
+    normalized_media_name = unicodedata.normalize("NFC", media.name)
+    normalized_target_name = unicodedata.normalize("NFC", Path(target_path).name)
     media_logical_id = (
-        f"explicit:{media.name}"
+        f"explicit:{normalized_media_name}"
         if explicit_media
         else f"sibling:{media.suffix.lower()}"
+    )
+    stable_blocks = [
+        {
+            "source_index": source_index,
+            "text": str(block["text"]),
+            "alignment_text": str(block.get("alignment_text", block["text"])),
+            "start": block.get("start"),
+            "end": block.get("end"),
+            "lyric": block.get("lyric") is True,
+            "speaker": block.get("speaker"),
+            "speakers": block.get("speakers"),
+        }
+        for source_index, block in zip(source_indices, blocks, strict=True)
+    ]
+    derived_block_digest = frozen_json_digest(freeze_json(stable_blocks))
+    sealed_block_digest = (
+        derived_block_digest if block_content_sha256 is None else block_content_sha256
+    )
+    if (
+        type(sealed_block_digest) is not str
+        or len(sealed_block_digest) != 64
+        or any(c not in "0123456789abcdef" for c in sealed_block_digest)
+    ):
+        raise ValueError("block_content_sha256 must be lowercase SHA-256")
+    profile_input_sha256 = frozen_json_digest(
+        freeze_json(
+            {
+                "stored_language": stored_language,
+                "segmentation": segmentation,
+            }
+        )
+    )
+    evidence_carriers_sha256 = frozen_json_digest(
+        freeze_json(
+            {
+                "shot_changes": strict_shot_changes,
+                "sing_spans": strict_sing_spans,
+            }
+        )
     )
     stable = freeze_json(
         {
@@ -137,22 +209,16 @@ def issue_public_align_context(
             "vtt_generation": _generation_value(expected_vtt),
             "sibling_generation": _generation_value(expected_json),
             "expected_vtt_sha256": expected_vtt_sha256,
-            "blocks": [
-                {
-                    "source_index": source_index,
-                    "text": str(block["text"]),
-                    "start": block.get("start"),
-                    "end": block.get("end"),
-                    "lyric": True if block.get("lyric") is True else None,
-                }
-                for source_index, block in zip(source_indices, blocks, strict=True)
-            ],
+            "block_content_sha256": sealed_block_digest,
+            "blocks": stable_blocks,
             "media_fingerprint": media_fingerprint,
             "media_logical_id": media_logical_id,
             "media_display_name": media.name,
-            "target_logical_id": Path(target_path).name,
+            "target_logical_id": normalized_target_name,
             "prepared_audio_size": prepared.stat().st_size,
             "prepared_audio_sha256": prepared_audio_sha256,
+            "profile_input_sha256": profile_input_sha256,
+            "evidence_carriers_sha256": evidence_carriers_sha256,
             "adapter_inputs": {
                 "legacy_policy": {
                     "min_cue_sec": legacy_policy.min_cue_sec,
@@ -371,6 +437,9 @@ def build_align_selection(
         comparison=comparison,
     )
     candidates = candidate_encoder.encode_align_candidates(context, result)
+    legacy_candidate = candidates.outcome_for("legacy-v1")
+    if not isinstance(legacy_candidate, candidate_encoder.EncodedCandidate):
+        raise RuntimeError("legacy alignment candidate is unavailable")
     selected = candidate_encoder.select_align_candidate(context, candidates)
     verified = candidate_encoder.verify_selected_align_projection(
         context, result, selected
@@ -378,6 +447,11 @@ def build_align_selection(
     bound_evidence = bind_align_evidence(
         context,
         producer_core,
+        acquisition=acquisition,
+        strict_input_status=strict_input_status,
+        v2_policy_status=v2_policy_status,
+        profile_status=profile.status,
+        evidence_status=evidence_resolution.status,
         engine_family=verified.engine_family,
         vtt_sha256=verified.vtt_sha256,
         main_json_sha256=verified.main_json_sha256,
@@ -386,6 +460,8 @@ def build_align_selection(
         context,
         result,
         verified,
+        legacy_candidate.vtt_sha256,
+        legacy_candidate.main_json_sha256,
         bound_evidence,
         acquisition.distribution,
         strict_input_status,
@@ -403,7 +479,7 @@ def retire_align_selection(selection: AlignSelection | IssuedAlignContext) -> No
 
 
 __all__ = [
-    "ALIGN_AO_ORDER",
+    "ALIGN_AO_PHASE_ORDER",
     "AlignSelection",
     "build_align_selection",
     "file_sha256",

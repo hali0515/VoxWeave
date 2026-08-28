@@ -480,6 +480,14 @@ def test_valid_rich_artifacts_retain_complete_atomic_semantic_facts(
         assert artifact["v2"]["validators"]["trace_problems"] == []
         assert artifact["v2"]["validators"]["stability_problems"] == []
         assert artifact["comparison"]["result"]["violations"] == []
+        if artifact["selected"]["engine_family"] == "boundary-v2":
+            assert (
+                artifact["legacy"]["vtt_sha256"] != artifact["selected"]["vtt_sha256"]
+            )
+            assert (
+                artifact["legacy"]["json_sha256"] != artifact["selected"]["json_sha256"]
+            )
+            assert "ALD-2" in artifact["comparison"]["result"]["active_classes"]
         seen_families.add(artifact["selected"]["engine_family"])
     assert seen_families == {"legacy-v1", "boundary-v2"}
 
@@ -506,6 +514,33 @@ def test_typed_invalid_observation_is_a_successful_corpus_outcome(
         assert artifact["failure"]["detail_code"] == case["expected_detail_code"]
         assert run["alds"] == case["expected_alds"]
         assert run["outcome"] == "valid"
+
+
+def test_post_finalize_partition_cutoff_retains_only_the_semantic_group(tmp_path):
+    runner = _load_runner_module()
+    manifest = runner._validate_manifest(MANIFEST_PATH)
+    case = next(case for case in manifest["cases"] if case["id"] == "legacy-valid")
+    run = runner._worker_command(
+        manifest_path=MANIFEST_PATH,
+        case_id=case["id"],
+        shadow_enabled=True,
+        observer_kind="collector",
+        injections=frozenset({"post-finalize-partition"}),
+        result_path=tmp_path / "post-finalize-partition.json",
+        env=case["env"],
+    )
+
+    assert run["outcome"] == "valid"
+    assert run["selected"]["engine_family"] == "legacy-v1"
+    artifact = _artifact_from_run(run)
+    assert artifact is not None
+    jsonschema.Draft202012Validator(_load_json(ARTIFACT_SCHEMA_PATH)).validate(artifact)
+    assert artifact["status"] == "invalid"
+    assert artifact["failure"]["kind"] == "finalizer-partition-failed"
+    assert artifact["failure"]["detail_code"] == "finalizer-partition"
+    assert artifact["v2"]["semantic"] is not None
+    assert artifact["v2"]["validators"] is None
+    assert artifact["comparison"]["result"] is None
 
 
 @pytest.mark.parametrize(
