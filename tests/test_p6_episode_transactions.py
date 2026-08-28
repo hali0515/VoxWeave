@@ -748,3 +748,104 @@ def test_public_align_requires_independent_selected_projection(tmp_path, monkeyp
 
     assert json_path.read_bytes() == original_json
     assert vtt_path.read_bytes() == original_vtt
+
+
+def _stub_public_shadow_align(tmp_path, monkeypatch):
+    from voxweave import backend
+
+    media = tmp_path / "episode.wav"
+    media.write_bytes(b"media")
+    json_path = tmp_path / "episode.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "language": "zh",
+                "word_segments": [
+                    {"text": "你", "start": 0.0, "end": 0.5},
+                    {"text": "好", "start": 0.5, "end": 1.0},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    vtt_path = tmp_path / "episode.vtt"
+    vtt_path.write_text("WEBVTT\n\n你好\n", encoding="utf-8")
+    monkeypatch.setattr(
+        pipeline, "_prepare_16k_for_align", lambda *_args, **_kwargs: media
+    )
+    monkeypatch.setattr(pipeline, "slice_wav", lambda *_args, **_kwargs: media)
+    monkeypatch.setattr(
+        backend,
+        "align_text",
+        lambda _wav, text, _iso: [
+            {"text": value, "start": float(index), "end": float(index) + 0.5}
+            for index, value in enumerate(text)
+        ],
+    )
+    return media, json_path, vtt_path
+
+
+def test_align_shadow_observer_runs_once_after_disposal(tmp_path, monkeypatch):
+    from voxweave import backend
+
+    _media, json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
+    released: list[str] = []
+    observed: list[object] = []
+    monkeypatch.setattr(backend, "release", lambda: released.append("backend"))
+
+    def observer(artifact):
+        assert released == ["backend"]
+        observed.append(artifact)
+
+    assert pipeline.align(vtt_path, _shadow_observer=observer) == vtt_path
+    assert len(observed) == 1
+    artifact = observed[0]
+    assert artifact.artifact_kind == "rich"
+    assert artifact.status == "invalid"
+    assert artifact.failure.detail_code == "w1-root-event"
+    assert (
+        artifact.selected["vtt_sha256"]
+        == hashlib.sha256(vtt_path.read_bytes()).hexdigest()
+    )
+    assert (
+        artifact.selected["json_sha256"]
+        == hashlib.sha256(json_path.read_bytes()).hexdigest()
+    )
+
+
+def test_align_shadow_rich_failure_notifies_with_minimal_artifact(
+    tmp_path, monkeypatch
+):
+    from voxweave import align_shadow
+
+    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
+    monkeypatch.setattr(
+        align_shadow,
+        "build_rich_align_shadow_artifact",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("rich failed")),
+    )
+    observed: list[object] = []
+
+    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
+    assert len(observed) == 1
+    assert observed[0].artifact_kind == "minimal-failure"
+    assert observed[0].failure.detail_code == "rich-artifact-construction"
+
+
+def test_align_shadow_observer_failure_cannot_change_selected_return(
+    tmp_path, monkeypatch, caplog
+):
+    _media, json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
+
+    def fail_observer(_artifact):
+        raise RuntimeError("observer failed")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        assert pipeline.align(vtt_path, _shadow_observer=fail_observer) == vtt_path
+
+    assert json_path.exists() and vtt_path.exists()
+    assert any("align shadow observer failed" in row.message for row in caplog.records)
