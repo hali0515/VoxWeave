@@ -120,9 +120,7 @@ def _issued(tmp_path, *, timestamps=True):
         vad_speech=(_frozen_array([0.0, 1.0]),),
         shot_changes=(_frozen_value(0.45),),
         sing_spans=(_frozen_array([0.0, 0.4]),),
-        speaker_turns=RawJSONCarrier(
-            True, _frozen_array([[0.0, 1.1, "S0"]])
-        ),
+        speaker_turns=RawJSONCarrier(True, _frozen_array([[0.0, 1.1, "S0"]])),
         voiceprint_capture="capture_abcdefghijklmnopqrstuvwxyz234567",
         voiceprint_media="a" * 64,
     )
@@ -155,7 +153,9 @@ def _issued(tmp_path, *, timestamps=True):
     return context, issued
 
 
-def _result(tmp_path, *, shadow_enabled=False, semantic_selector_enabled=False, timestamps=True):
+def _result(
+    tmp_path, *, shadow_enabled=False, semantic_selector_enabled=False, timestamps=True
+):
     from voxweave.segmentation_adapter import run_locked_segmentation_adapter
 
     context, issued = _issued(tmp_path, timestamps=timestamps)
@@ -265,7 +265,9 @@ def test_rat6_semantic_mode_is_typed_nonselected_failure_with_no_fallback(tmp_pa
     candidates = encode_segmentation_candidates(context, result)
     boundary = candidates.outcome_for("boundary-v2")
     assert isinstance(boundary, CandidateFailure)
-    assert select_segmentation_candidate(context, candidates).engine_family == "legacy-v1"
+    assert (
+        select_segmentation_candidate(context, candidates).engine_family == "legacy-v1"
+    )
     qualification = _issue_simulated_boundary_row("rat6-no-fallback")
     with pytest.raises(SelectedCandidateError) as error:
         select_qualified_segmentation_candidate(
@@ -322,7 +324,9 @@ def test_independent_segmentation_projection_rejects_byte_corruption(tmp_path):
     assert error.value.failure.detail_code == "derived-hash"
 
 
-def test_selected_sdh_dialogue_uses_intrinsic_delivery_times_when_vtt_is_plain(tmp_path):
+def test_selected_sdh_dialogue_uses_intrinsic_delivery_times_when_vtt_is_plain(
+    tmp_path,
+):
     from voxweave.segmentation_candidates import (
         encode_segmentation_candidates,
         project_selected_sdh_dialogue,
@@ -342,3 +346,46 @@ def test_selected_sdh_dialogue_uses_intrinsic_delivery_times_when_vtt_is_plain(t
         {"text": "world", "start": 0.5, "end": 1.0},
     )
     assert all("speaker_ids" not in cue for cue in dialogue)
+
+
+def test_changed_segmentation_context_registry_family_is_rejected(tmp_path):
+    from voxweave.align_context import ContextAuthorityError
+    from voxweave.segmentation_adapter import run_locked_segmentation_adapter
+
+    context, issued = _issued(tmp_path)
+    object.__setattr__(context, "engine_family", "boundary-v2")
+    with pytest.raises(ContextAuthorityError) as error:
+        run_locked_segmentation_adapter(
+            context,
+            issued,
+            shadow_enabled=False,
+            semantic_selector_enabled=False,
+        )
+    assert error.value.detail_code == "context-binding"
+
+
+def test_changed_legacy_provider_ledger_is_rejected_before_adapter_consumption(tmp_path):
+    from voxweave.align_context import role_vector
+    from voxweave.segmentation_adapter import run_locked_segmentation_adapter
+
+    context, issued = _issued(tmp_path)
+    object.__setattr__(issued, "provider_ledger", _frozen_object({"forged": True}))
+    with pytest.raises(ValueError):
+        run_locked_segmentation_adapter(
+            context,
+            issued,
+            shadow_enabled=False,
+            semantic_selector_enabled=False,
+        )
+    assert role_vector(context) == ("L", "L", "L")
+
+
+def test_changed_adapter_binding_is_rejected_before_encoder_consumption(tmp_path):
+    from voxweave.align_context import role_vector
+    from voxweave.segmentation_candidates import encode_segmentation_candidates
+
+    context, result = _result(tmp_path)
+    object.__setattr__(result, "_binding", "forged")
+    with pytest.raises(ValueError):
+        encode_segmentation_candidates(context, result)
+    assert role_vector(context) == ("C", "L", "L")
