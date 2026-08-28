@@ -512,6 +512,39 @@ def test_partial_run_skips_the_gates(corpus_path: Path, tmp_path: Path) -> None:
     assert len(report["cases"]) == 1
 
 
+def test_shadow_cli_exits_two_for_a_live_misbound_finalizer_validator(
+    corpus_path: Path, monkeypatch
+) -> None:
+    """Structural admission remains exit-driving even when gates are partial."""
+    from voxweave import pipeline
+
+    real_finalizer_row = pipeline._shadow_finalizer_row
+
+    def corrupt_validator_context(*args, **kwargs):
+        row, cues = real_finalizer_row(*args, **kwargs)
+        validator = row["validator"]
+        assert validator is not None
+        validator["stage"] = "raw"
+        validator["cue_count"] = int(row["cue_count"]) + 1
+        return row, cues
+
+    monkeypatch.setattr(pipeline, "_shadow_finalizer_row", corrupt_validator_context)
+    assert (
+        _run_cli(
+            [
+                "shadow",
+                "--corpus",
+                str(corpus_path),
+                "--case",
+                "en-01",
+                "--no-ablation",
+                "--check",
+            ]
+        )
+        == cc.EXIT_INVALID
+    )
+
+
 def test_ablation_reports_one_row_per_term(corpus_path: Path) -> None:
     corpus = calib.load_corpus(corpus_path)
     case = _cases(corpus, "en-01")

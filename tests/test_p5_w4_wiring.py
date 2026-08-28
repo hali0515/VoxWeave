@@ -70,6 +70,32 @@ def test_live_post_assembly_validator_rejects_a_deleted_required_block(
     assert "artifact: missing keys authorities" in artifact["error"]["detail"]
 
 
+def test_live_admission_rejects_finalizer_validator_from_the_wrong_row(
+    monkeypatch,
+) -> None:
+    """A shaped check block is not evidence unless it names this stage and row."""
+    monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
+    real_finalizer_row = pipeline._shadow_finalizer_row
+
+    def corrupt_validator_context(*args, **kwargs):
+        row, cues = real_finalizer_row(*args, **kwargs)
+        validator = row["validator"]
+        assert validator is not None
+        validator["stage"] = "raw"
+        validator["cue_count"] = int(row["cue_count"]) + 1
+        return row, cues
+
+    monkeypatch.setattr(pipeline, "_shadow_finalizer_row", corrupt_validator_context)
+    artifact = _segment(_case_plain()).shadow
+    assert artifact is not None
+
+    assert artifact["schema_version"] == 1
+    assert artifact["kind"] == "segmentation-shadow-error"
+    detail = artifact["error"]["detail"]
+    assert "expected stage 'finalizer', got 'raw'" in detail
+    assert "validator.cue_count: expected row cue_count 1, got 2" in detail
+
+
 def test_required_schema_two_blocks_cannot_be_deleted(monkeypatch) -> None:
     from voxweave.core.shadow_schema import validate_shadow_v2_payload
 
@@ -136,6 +162,102 @@ def test_schema_two_nested_evidence_shapes_are_closed(monkeypatch) -> None:
         assert any(
             expected in error for error in validate_shadow_v2_payload(artifact)
         ), expected
+
+
+def test_schema_binds_every_validator_block_to_its_stage_row_and_document(
+    monkeypatch,
+) -> None:
+    from voxweave.core.shadow_schema import validate_shadow_v2_payload
+
+    monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
+    original = _segment(_case_speakers()).shadow
+    assert original is not None
+
+    validator_paths = (
+        ("validator", "raw"),
+        ("validator", "core"),
+        ("validator", "legacy_overlay"),
+        ("validator", "finalizer"),
+        ("lanes", pipeline.SHADOW_LANE_CORE, "v1", "validator"),
+        ("lanes", pipeline.SHADOW_LANE_CORE, "v2", "validator"),
+        ("lanes", pipeline.SHADOW_LANE_DELIVERY_LEGACY, "v1", "validator"),
+        ("lanes", pipeline.SHADOW_LANE_DELIVERY_LEGACY, "v2", "validator"),
+        (
+            "lanes",
+            pipeline.SHADOW_LANE_FINALIZER,
+            "rows",
+            "v1",
+            "validator",
+        ),
+        (
+            "lanes",
+            pipeline.SHADOW_LANE_FINALIZER,
+            "rows",
+            "v2",
+            "validator",
+        ),
+        (
+            "lanes",
+            pipeline.SHADOW_LANE_FINALIZER,
+            "rows",
+            "v2-speaker-off",
+            "validator",
+        ),
+        (
+            "lanes",
+            pipeline.SHADOW_LANE_LEGACY_DISPLAY,
+            "rows",
+            "v1",
+            "validator",
+        ),
+    )
+
+    def block_at(artifact: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]:
+        block: Any = artifact
+        for key in path:
+            block = block[key]
+        return cast(dict[str, Any], block)
+
+    for path in validator_paths:
+        source = block_at(cast(dict[str, Any], original), path)
+        mutations = {
+            "stage": "raw" if source["stage"] != "raw" else "finalizer",
+            "origin": "v1" if source["origin"] == "v2" else "v2",
+            "cue_count": int(source["cue_count"]) + 1,
+            "unit_count": int(source["unit_count"]) + 1,
+        }
+        for field, value in mutations.items():
+            artifact = cast(dict[str, Any], copy.deepcopy(original))
+            block_at(artifact, path)[field] = value
+            expected_path = f"{'.'.join(path)}.{field}"
+            assert any(
+                expected_path in error for error in validate_shadow_v2_payload(artifact)
+            ), expected_path
+
+    copy_targets = {
+        "core": ("lanes", pipeline.SHADOW_LANE_CORE, "v2", "validator"),
+        "legacy_overlay": (
+            "lanes",
+            pipeline.SHADOW_LANE_DELIVERY_LEGACY,
+            "v2",
+            "validator",
+        ),
+        "finalizer": (
+            "lanes",
+            pipeline.SHADOW_LANE_FINALIZER,
+            "rows",
+            "v2",
+            "validator",
+        ),
+    }
+    for slot, row_path in copy_targets.items():
+        artifact = cast(dict[str, Any], copy.deepcopy(original))
+        artifact["validator"][slot] = dict(artifact["validator"][slot])
+        artifact["validator"][slot]["exit_driving"] += 1
+        assert any(
+            f"validator.{slot}: disagrees with" in error
+            for error in validate_shadow_v2_payload(artifact)
+        ), row_path
 
 
 def test_report_alias_and_fallback_rechecks_are_closed_schema_invariants(

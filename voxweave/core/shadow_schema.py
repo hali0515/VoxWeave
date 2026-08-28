@@ -315,19 +315,47 @@ def _margin_summary_block(value: Any, path: str, errors: list[str]) -> int | Non
     return count
 
 
-def _validator_block(value: Any, path: str, errors: list[str]) -> None:
+def _validator_block(
+    value: Any,
+    path: str,
+    errors: list[str],
+    *,
+    expected_stage: str,
+    permitted_origins: frozenset[str],
+    expected_cue_count: int | None,
+    expected_unit_count: int | None,
+) -> Mapping[str, Any] | None:
     block = _mapping(value, path, errors)
     if block is None:
-        return
+        return None
     _closed(block, _CHECK_KEYS, path, errors)
-    for key in ("cue_count", "exit_driving", "unit_count", "unwaived"):
+    cue_count = _nonnegative_int(block.get("cue_count"), f"{path}.cue_count", errors)
+    unit_count = _nonnegative_int(block.get("unit_count"), f"{path}.unit_count", errors)
+    for key in ("exit_driving", "unwaived"):
         _nonnegative_int(block.get(key), f"{path}.{key}", errors)
     _list(block.get("violations"), f"{path}.violations", errors)
     _list(block.get("waivers"), f"{path}.waivers", errors)
-    if not isinstance(block.get("origin"), str):
+    origin = block.get("origin")
+    if not isinstance(origin, str):
         errors.append(f"{path}.origin: expected string")
-    if not isinstance(block.get("stage"), str):
+    elif origin not in permitted_origins:
+        expected = ", ".join(repr(item) for item in sorted(permitted_origins))
+        errors.append(f"{path}.origin: expected one of {expected}, got {origin!r}")
+    stage = block.get("stage")
+    if not isinstance(stage, str):
         errors.append(f"{path}.stage: expected string")
+    elif stage != expected_stage:
+        errors.append(f"{path}.stage: expected stage {expected_stage!r}, got {stage!r}")
+    if expected_cue_count is not None and cue_count != expected_cue_count:
+        errors.append(
+            f"{path}.cue_count: expected row cue_count {expected_cue_count}, got {cue_count!r}"
+        )
+    if expected_unit_count is not None and unit_count != expected_unit_count:
+        errors.append(
+            f"{path}.unit_count: expected coverage.unit_count "
+            f"{expected_unit_count}, got {unit_count!r}"
+        )
+    return block
 
 
 def _cue_rows(
@@ -396,6 +424,8 @@ def _stream_row(
     unit_count: int | None,
     path: str,
     errors: list[str],
+    validator_stage: str,
+    validator_origins: frozenset[str],
     finalizer: bool = False,
     speaker_measurement: bool = False,
     projection_cross_check: bool = False,
@@ -425,7 +455,15 @@ def _stream_row(
             errors.append(f"{path}: partition/cue cardinality mismatch")
     if not isinstance(row.get("projection"), str):
         errors.append(f"{path}.projection: expected string")
-    _validator_block(row.get("validator"), f"{path}.validator", errors)
+    _validator_block(
+        row.get("validator"),
+        f"{path}.validator",
+        errors,
+        expected_stage=validator_stage,
+        permitted_origins=validator_origins,
+        expected_cue_count=cue_count,
+        expected_unit_count=unit_count,
+    )
     if projection_cross_check:
         cross = _mapping(
             row.get("projection_cross_check"),
@@ -576,12 +614,16 @@ def _lanes(
             unit_count=unit_count,
             path=f"lanes.{lane_id}.v1",
             errors=errors,
+            validator_stage=stage,
+            validator_origins=frozenset({"v1"}),
         )
         _stream_row(
             lane.get("v2"),
             unit_count=unit_count,
             path=f"lanes.{lane_id}.v2",
             errors=errors,
+            validator_stage=stage,
+            validator_origins=frozenset({"v2"}),
             projection_cross_check=lane_id == LANE_CORE,
         )
 
@@ -616,6 +658,8 @@ def _lanes(
                     unit_count=unit_count,
                     path=f"lanes.{LANE_FINALIZER}.rows.{row_id}",
                     errors=errors,
+                    validator_stage="finalizer",
+                    validator_origins=frozenset({"v1" if row_id == "v1" else "v2"}),
                     finalizer=True,
                     speaker_measurement=row_id == "v2-speaker-off",
                 )
@@ -641,8 +685,38 @@ def _lanes(
                 unit_count=unit_count,
                 path=f"lanes.{LANE_DISPLAY}.rows.v1",
                 errors=errors,
+                validator_stage="core",
+                validator_origins=frozenset({"v1"}),
             )
     return lanes, final_rows
+
+
+def _lane_row(
+    lanes: Mapping[str, Any] | None, lane_id: str, row_id: str
+) -> Mapping[str, Any] | None:
+    """Return one already-validated row without inventing a fallback slot."""
+    if lanes is None:
+        return None
+    lane = lanes.get(lane_id)
+    if not isinstance(lane, Mapping):
+        return None
+    if "rows" in lane:
+        rows = lane.get("rows")
+        if not isinstance(rows, Mapping):
+            return None
+        row = rows.get(row_id)
+    else:
+        row = lane.get(row_id)
+    return row if isinstance(row, Mapping) else None
+
+
+def _declared_cue_count(row: Mapping[str, Any] | None) -> int | None:
+    if row is None:
+        return None
+    value = row.get("cue_count")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _fallback_rechecks(
@@ -789,8 +863,6 @@ def validate_shadow_v2_payload(
     validator = _mapping(artifact.get("validator"), "validator", errors)
     if validator is not None:
         _closed(validator, _VALIDATOR_KEYS, "validator", errors)
-        for key in ("raw", "core", "legacy_overlay", "finalizer"):
-            _validator_block(validator.get(key), f"validator.{key}", errors)
         if not isinstance(validator.get("interval_document_agree"), bool):
             errors.append("validator.interval_document_agree: expected boolean")
         _nonnegative_int(
@@ -804,17 +876,37 @@ def validate_shadow_v2_payload(
     lanes, final_rows = _lanes(
         artifact.get("lanes"), unit_count=unit_count, errors=errors
     )
+    core_v2 = _lane_row(lanes, LANE_CORE, "v2")
+    legacy_v2 = _lane_row(lanes, LANE_LEGACY, "v2")
+    final_v2 = _lane_row(lanes, LANE_FINALIZER, "v2")
+    if validator is not None:
+        for key, stage, row in (
+            ("raw", "raw", core_v2),
+            ("core", "core", core_v2),
+            ("legacy_overlay", "legacy-overlay", legacy_v2),
+            ("finalizer", "finalizer", final_v2),
+        ):
+            _validator_block(
+                validator.get(key),
+                f"validator.{key}",
+                errors,
+                expected_stage=stage,
+                permitted_origins=frozenset({"v2"}),
+                expected_cue_count=_declared_cue_count(row),
+                expected_unit_count=unit_count,
+            )
+        for key, row, row_path in (
+            ("core", core_v2, f"lanes.{LANE_CORE}.v2"),
+            ("legacy_overlay", legacy_v2, f"lanes.{LANE_LEGACY}.v2"),
+            ("finalizer", final_v2, f"lanes.{LANE_FINALIZER}.rows.v2"),
+        ):
+            if row is not None and validator.get(key) != row.get("validator"):
+                errors.append(f"validator.{key}: disagrees with {row_path}.validator")
     if final_rows is not None:
         v2 = final_rows.get("v2")
         if isinstance(v2, Mapping):
             if artifact.get("finalizer") != v2.get("finalizer"):
                 errors.append("finalizer: disagrees with delivery_finalizer/v2")
-            if validator is not None and validator.get("finalizer") != v2.get(
-                "validator"
-            ):
-                errors.append(
-                    "validator.finalizer: disagrees with delivery_finalizer/v2"
-                )
         invalid = [
             row_id
             for row_id, row in final_rows.items()
