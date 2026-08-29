@@ -9,7 +9,8 @@
   "execution": {
     "interpreter": "CPython 3.13.12",
     "platform": "Linux x86_64",
-    "container_digest": "c981c4bd6fa4da42c70c382711db6e24c752a4f971ed3168d01594582ff78ede",
+    "package_version": "0.13.0",
+    "container_digest": "7f0479a8261a3900fc3494a1f12b7681d0a023200c7c08710d364db772175c47",
     "locale": "C.UTF-8",
     "timezone": "unset",
     "hash_seed": "unset",
@@ -19,7 +20,7 @@
     "align-delta-registry": "267bdf609013b7f2a37abef1a14b0a5fa6e9770fea0da958b5d92d64ce36f931",
     "align-failure-registry": "69471bfcc890ef4d59b2f8cc36e37c48a5e971202527f13bf4e1b9b9cccdc9cd",
     "engine-registry": "1f9e2da1257cdd5e4c9a956ba9505a0c4122f6e964e23a17d6f788f4dc8be140",
-    "p6-oracle-schema": "081da9306641c0e018d3735b35dd0d6173a4e515ec3505de7b17f359d6981741"
+    "p6-oracle-schema": "1f521b2551adf5b8c74e3bb95c5ce501a42c50dd5a7312b4cd1b120a7058acfc"
   },
   "gates": {
     "G-CONTEXT": {
@@ -2915,8 +2916,8 @@
         {
           "path": "inputs/selected-v2-segmentation-delivery.json",
           "present": true,
-          "size": 3664,
-          "sha256": "3940beba707ac20be248be0a1de2f020bb65b76d5e3053d4e438a8880dcd33bf"
+          "size": 3636,
+          "sha256": "51c291120ab8fcfa66a79538c4c050ee67ed1f06ffd2b1baa905d132b914e5ef"
         },
         {
           "path": "inputs/public-selected-v2-segmentation.json",
@@ -2956,8 +2957,9 @@
           "kind": "primary",
           "artifact": "main-json",
           "expected_path": "expected/selected-v2-segmentation/episode.json",
-          "size": 2619,
-          "sha256": "26499aa5170f3087398556349acd1a2f97bd948f76c1e5c15ab488625bce3ffa"
+          "size": 2652,
+          "sha256": "6d57362bf11dcfde468ecb327599de18898edacdbd7d99dc51e545936dbce1f5",
+          "parameterization": "execution.package_version"
         }
       ],
       "authority_limit_profile": {

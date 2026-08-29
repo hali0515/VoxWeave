@@ -50,6 +50,24 @@ def _load_calib_common() -> Any:
 
 cc = _load_calib_common()
 
+
+def _load_oracle_environment() -> Any:
+    cached = sys.modules.get("p6_oracle_environment")
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(
+        "p6_oracle_environment", SCRIPTS_DIR / "p6_oracle_environment.py"
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - packaging accident
+        raise RuntimeError(f"cannot load {SCRIPTS_DIR / 'p6_oracle_environment.py'}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["p6_oracle_environment"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+oracle_environment = _load_oracle_environment()
+
 EXIT_OK = 0
 EXIT_MISMATCH = 1
 EXIT_INVALID = 2
@@ -64,6 +82,8 @@ EXPECTED_REFERENCE_SETS = {
     "selected-v2-segmentation",
 }
 EXPECTED_RATIFIED_DELTAS = {"RAT-1", "RAT-2", "RAT-3", "RAT-4", "RAT-5", "RAT-7"}
+PACKAGE_VERSION_PARAMETERIZATION = "execution.package_version"
+PACKAGE_VERSION_TEMPLATE = oracle_environment.PACKAGE_VERSION_TEMPLATE
 EXPECTED_GATES = {
     "G-CONTEXT",
     "G-TIME-ORDER",
@@ -522,6 +542,18 @@ def _validate_execution(execution: Mapping[str, Any]) -> None:
     lock_digest = _sha256_file(lock_path)
     if lock_digest != execution["dependency_lock_sha256"]:
         _invalid("dependency lock digest differs from the oracle environment")
+    try:
+        project_version = oracle_environment.project_package_version(REPO_ROOT)
+        locked_version = oracle_environment.locked_package_version(REPO_ROOT)
+        installed_version = oracle_environment.installed_package_version()
+    except oracle_environment.ExecutionEnvironmentError as exc:
+        _invalid(str(exc))
+    if execution["package_version"] != project_version:
+        _invalid("project package version differs from the oracle environment")
+    if execution["package_version"] != locked_version:
+        _invalid("locked package version differs from the oracle environment")
+    if execution["package_version"] != installed_version:
+        _invalid("installed package version differs from the oracle environment")
     locale = os.environ.get("LC_ALL") or os.environ.get("LANG") or "unset"
     timezone = os.environ.get("TZ") or "unset"
     hash_seed = os.environ.get("PYTHONHASHSEED") or "unset"
@@ -531,16 +563,14 @@ def _validate_execution(execution: Mapping[str, Any]) -> None:
         _invalid("timezone does not match the recorded oracle environment")
     if execution["hash_seed"] != hash_seed:
         _invalid("hash seed does not match the recorded oracle environment")
-    environment_digest = _canonical_digest(
-        {
-            "dependency_lock_sha256": lock_digest,
-            "hash_seed": hash_seed,
-            "interpreter": expected_interpreter,
-            "locale": locale,
-            "platform": expected_platform,
-            "timezone": timezone,
-            "toolchain": "detached-environment-v1",
-        }
+    environment_digest = oracle_environment.container_digest(
+        dependency_lock_sha256=lock_digest,
+        hash_seed=hash_seed,
+        interpreter=expected_interpreter,
+        locale=locale,
+        package_version=execution["package_version"],
+        platform=expected_platform,
+        timezone=timezone,
     )
     if execution["container_digest"] != environment_digest:
         _invalid(
@@ -778,6 +808,7 @@ def _validate_manifest_semantics(
         if len(vector_ids) != len(set(vector_ids)):
             _invalid(f"matrix {name} has duplicate vector IDs")
 
+    parameterized_outputs: list[tuple[str, str, str]] = []
     for case in cases:
         case_id = case["id"]
         _validate_environment(case["environment"], case_id=case_id)
@@ -837,6 +868,34 @@ def _validate_manifest_semantics(
                 _invalid(f"expected oracle output size differs: {expected}")
             if _sha256_file(expected) != output["sha256"]:
                 _invalid(f"expected oracle output digest differs: {expected}")
+            parameterization = output.get("parameterization")
+            try:
+                template_count = expected.read_text(encoding="utf-8").count(
+                    PACKAGE_VERSION_TEMPLATE
+                )
+            except (OSError, UnicodeDecodeError) as exc:
+                _invalid(f"cannot inspect expected output {expected}: {exc}")
+            if parameterization is not None:
+                parameterized_outputs.append(
+                    (case_id, output["artifact"], parameterization)
+                )
+                if template_count != 1:
+                    _invalid(
+                        f"parameterized output must contain one version template: {expected}"
+                    )
+            elif template_count:
+                _invalid(
+                    f"non-parameterized output contains the version template: {expected}"
+                )
+
+    if parameterized_outputs != [
+        (
+            "selected-v2-segmentation",
+            "main-json",
+            PACKAGE_VERSION_PARAMETERIZATION,
+        )
+    ]:
+        _invalid("package-version parameterization inventory differs")
 
 
 def _load_checked_manifest(path: Path) -> Mapping[str, Any]:
@@ -1453,8 +1512,10 @@ def _project_selected_align(
 
 
 def _project_selected_segmentation(
-    case: Mapping[str, Any], oracle_root: Path
+    case: Mapping[str, Any], oracle_root: Path, *, package_version: str
 ) -> dict[str, bytes]:
+    if type(package_version) is not str or not package_version:
+        _invalid("selected segmentation package version is invalid")
     document = _closed_mapping(
         _load_delivery(
             case, oracle_root, basename="selected-v2-segmentation-delivery.json"
@@ -1603,7 +1664,31 @@ def _project_selected_segmentation(
     if capture is not None:
         main["voiceprint_capture"] = capture
         main["voiceprint_media"] = media
-    main["segmentation"] = delivery["manifest"]
+    manifest = _closed_mapping(
+        delivery["manifest"],
+        (
+            "manifest_version",
+            "engine",
+            "python",
+            "language",
+            "profile",
+            "env",
+            "providers",
+            "degraded",
+        ),
+        label="selected segmentation manifest facts",
+    )
+    main["segmentation"] = {
+        "manifest_version": manifest["manifest_version"],
+        "engine": manifest["engine"],
+        "voxweave": package_version,
+        "python": manifest["python"],
+        "language": manifest["language"],
+        "profile": manifest["profile"],
+        "env": manifest["env"],
+        "providers": manifest["providers"],
+        "degraded": manifest["degraded"],
+    }
     return {
         "vtt": ("\n".join(vtt_rows).rstrip() + "\n").encode("utf-8"),
         "main-json": _primary_json(main),
@@ -1624,7 +1709,12 @@ def _case_input(case: Mapping[str, Any], oracle_root: Path, *, basename: str) ->
         _invalid(f"cannot read detached projector input {matches[0]}: {exc}")
 
 
-def _project_case(case: Mapping[str, Any], oracle_root: Path) -> dict[str, bytes]:
+def _project_case(
+    case: Mapping[str, Any],
+    oracle_root: Path,
+    *,
+    package_version: str,
+) -> dict[str, bytes]:
     """Project one candidate wholly inside this detached stdlib-only runner."""
 
     projector = case["projector"]
@@ -1680,7 +1770,11 @@ def _project_case(case: Mapping[str, Any], oracle_root: Path) -> dict[str, bytes
             case, oracle_root, basename="combined-ratified-align-delivery.json"
         )
     if projector == "selected-v2-segmentation":
-        return _project_selected_segmentation(case, oracle_root)
+        return _project_selected_segmentation(
+            case,
+            oracle_root,
+            package_version=package_version,
+        )
     _invalid(f"unknown detached projector: {projector}")
 
 
@@ -1734,6 +1828,23 @@ def _copy_public_source(source_root: Path, *, historical: bool) -> None:
         _invalid(f"cannot extract historical public-command source: {exc}")
 
 
+def _copy_distribution_metadata(source_root: Path, *, package_version: str) -> None:
+    try:
+        observed_version = oracle_environment.installed_package_version()
+        metadata_path = oracle_environment.installed_metadata_path()
+    except oracle_environment.ExecutionEnvironmentError as exc:
+        _invalid(str(exc))
+    if observed_version != package_version:
+        _invalid("public worker package version differs before metadata isolation")
+    destination = source_root / metadata_path.name
+    if destination.exists():
+        _invalid("public worker metadata destination already exists")
+    try:
+        shutil.copytree(metadata_path, destination)
+    except OSError as exc:
+        _invalid(f"cannot copy installed distribution metadata: {exc}")
+
+
 def _public_artifact_path(
     artifact: str,
     *,
@@ -1769,6 +1880,7 @@ def _execute_public_case(
     case: Mapping[str, Any],
     *,
     manifest_path: Path,
+    package_version: str,
 ) -> PublicCaseResult:
     """Run one recorded CLI command against copied production in a clean root."""
 
@@ -1796,6 +1908,10 @@ def _execute_public_case(
         route_evidence_path = isolated_root / "route-evidence.json"
         try:
             _copy_public_source(source_root, historical=historical)
+            _copy_distribution_metadata(
+                source_root,
+                package_version=package_version,
+            )
             shutil.copy2(SCRIPTS_DIR / "p6_oracle_public.py", worker_path)
         except OSError as exc:
             _invalid(f"cannot construct isolated public-command source: {exc}")
@@ -1808,6 +1924,7 @@ def _execute_public_case(
             "expected_family": runtime["expected_family"],
             "fixture": fixture,
             "historical": historical,
+            "package_version": package_version,
             "shadow_requested": case["id"] == "selected-v2-segmentation",
         }
         try:
@@ -1923,6 +2040,10 @@ def _execute_runtime_scenario(
         route_evidence_path = isolated_root / "route-evidence.json"
         try:
             shutil.copytree(REPO_ROOT / "voxweave", source_root / "voxweave")
+            _copy_distribution_metadata(
+                source_root,
+                package_version=manifest["execution"]["package_version"],
+            )
             shutil.copy2(SCRIPTS_DIR / "p6_oracle_public.py", worker_path)
         except OSError as exc:
             _invalid(f"cannot construct G-ALIGN-AO scenario source: {exc}")
@@ -1935,6 +2056,7 @@ def _execute_runtime_scenario(
             "expected_family": scenario["expected_family"],
             "fixture": fixture,
             "injections": list(scenario["injections"]),
+            "package_version": manifest["execution"]["package_version"],
             "shadow_requested": scenario["shadow_requested"],
         }
         try:
@@ -2219,13 +2341,59 @@ def _runtime_scenario_failures(
     return sorted(set(failures))
 
 
+def _package_version_projection_failure(
+    template_projection: bytes,
+    live_projection: bytes,
+    *,
+    package_version: str,
+) -> str | None:
+    encoded_template = json.dumps(
+        PACKAGE_VERSION_TEMPLATE,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    encoded_version = json.dumps(
+        package_version,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    if template_projection.count(encoded_template) != 1:
+        return "package-version template cardinality differs"
+    if (
+        template_projection.replace(encoded_template, encoded_version, 1)
+        != live_projection
+    ):
+        return "live projection differs beyond the recorded package version"
+    return None
+
+
 def _compare(manifest: Mapping[str, Any], *, manifest_path: Path) -> list[str]:
     oracle_root = manifest_path.resolve().parent
+    package_version = manifest["execution"]["package_version"]
     expected_declared: set[Path] = set()
     mismatches: list[str] = []
     for case in manifest["cases"]:
-        candidates = _project_case(case, oracle_root)
-        public = _execute_public_case(case, manifest_path=manifest_path)
+        candidates = _project_case(
+            case,
+            oracle_root,
+            package_version=package_version,
+        )
+        has_parameterized_output = any(
+            output.get("parameterization") == PACKAGE_VERSION_PARAMETERIZATION
+            for output in case["expected_paths"]
+        )
+        template_candidates = (
+            _project_case(
+                case,
+                oracle_root,
+                package_version=PACKAGE_VERSION_TEMPLATE,
+            )
+            if has_parameterized_output
+            else candidates
+        )
+        public = _execute_public_case(
+            case,
+            manifest_path=manifest_path,
+            package_version=package_version,
+        )
         runtime = cast(Mapping[str, Any], case["public_runtime"])
         declared_artifacts = {output["artifact"] for output in case["expected_paths"]}
         if set(candidates) != declared_artifacts:
@@ -2269,7 +2437,25 @@ def _compare(manifest: Mapping[str, Any], *, manifest_path: Path) -> list[str]:
             candidate_bytes = candidates.get(artifact)
             if candidate_bytes is None:
                 continue
-            if candidate_bytes != expected_bytes:
+            expected_projection = (
+                template_candidates.get(artifact)
+                if output.get("parameterization") == PACKAGE_VERSION_PARAMETERIZATION
+                else candidate_bytes
+            )
+            if expected_projection is None:
+                continue
+            if output.get("parameterization") == PACKAGE_VERSION_PARAMETERIZATION:
+                parameterization_failure = _package_version_projection_failure(
+                    expected_projection,
+                    candidate_bytes,
+                    package_version=package_version,
+                )
+                if parameterization_failure is not None:
+                    mismatches.append(
+                        f"detached-projector/{case['id']}/{artifact}: "
+                        f"{parameterization_failure}"
+                    )
+            if expected_projection != expected_bytes:
                 authority = (
                     "detached-evidence"
                     if artifact == "align-evidence"
@@ -2279,11 +2465,11 @@ def _compare(manifest: Mapping[str, Any], *, manifest_path: Path) -> list[str]:
                     f"{authority}/{case['id']}/{artifact}: byte mismatch != "
                     f"{expected.relative_to(oracle_root)}"
                 )
-            if len(candidate_bytes) != output["size"]:
+            if len(expected_projection) != output["size"]:
                 mismatches.append(
                     f"detached-projector/{case['id']}/{artifact}: size mismatch"
                 )
-            if _sha256_bytes(candidate_bytes) != output["sha256"]:
+            if _sha256_bytes(expected_projection) != output["sha256"]:
                 mismatches.append(
                     f"detached-projector/{case['id']}/{artifact}: digest mismatch"
                 )
@@ -2746,7 +2932,11 @@ def _public_runtime_gate(
     for case in manifest["cases"]:
         if case["command"] != "align" or case["reference_set"] == "6e6033f":
             continue
-        result = _execute_public_case(case, manifest_path=manifest_path)
+        result = _execute_public_case(
+            case,
+            manifest_path=manifest_path,
+            package_version=manifest["execution"]["package_version"],
+        )
         if result.runtime_trace is None:
             failures.append(f"public-command/{case['id']}/G-ALIGN-AO: trace is absent")
             continue

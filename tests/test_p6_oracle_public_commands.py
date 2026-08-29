@@ -71,8 +71,13 @@ def public_authority_run() -> dict[str, Any]:
             results[case["id"]] = oracle._execute_public_case(
                 case,
                 manifest_path=ORACLE_MANIFEST,
+                package_version=manifest["execution"]["package_version"],
             )
-            projections[case["id"]] = oracle._project_case(case, oracle_root)
+            projections[case["id"]] = oracle._project_case(
+                case,
+                oracle_root,
+                package_version=manifest["execution"]["package_version"],
+            )
         return {
             "manifest": manifest,
             "projections": projections,
@@ -143,8 +148,17 @@ def test_public_command_environment_rejects_ambient_feature_flags(
         case for case in manifest["cases"] if case["id"] == "selected-v2-segmentation"
     )
 
-    result = oracle._execute_public_case(case, manifest_path=ORACLE_MANIFEST)
-    assert result.artifacts == oracle._project_case(case, ORACLE_MANIFEST.parent)
+    package_version = manifest["execution"]["package_version"]
+    result = oracle._execute_public_case(
+        case,
+        manifest_path=ORACLE_MANIFEST,
+        package_version=package_version,
+    )
+    assert result.artifacts == oracle._project_case(
+        case,
+        ORACLE_MANIFEST.parent,
+        package_version=package_version,
+    )
 
 
 def test_align_public_cases_expose_production_owned_runtime_phase_traces(
@@ -160,7 +174,11 @@ def test_align_public_cases_expose_production_owned_runtime_phase_traces(
     ]
 
     for case in align_cases:
-        result = oracle._execute_public_case(case, manifest_path=ORACLE_MANIFEST)
+        result = oracle._execute_public_case(
+            case,
+            manifest_path=ORACLE_MANIFEST,
+            package_version=manifest["execution"]["package_version"],
+        )
         trace = result.runtime_trace
         assert trace is not None
         assert trace["route_kind"] == case["route"]

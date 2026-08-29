@@ -36,6 +36,7 @@
       "required": [
         "interpreter",
         "platform",
+        "package_version",
         "container_digest",
         "locale",
         "timezone",
@@ -45,6 +46,7 @@
       "properties": {
         "interpreter": {"type": "string", "minLength": 1},
         "platform": {"type": "string", "minLength": 1},
+        "package_version": {"type": "string", "minLength": 1},
         "container_digest": {"$ref": "#/$defs/sha256"},
         "locale": {"type": "string", "minLength": 1},
         "timezone": {"type": "string", "minLength": 1},
@@ -164,7 +166,8 @@
         },
         "expected_path": {"$ref": "#/$defs/path"},
         "size": {"type": "integer", "minimum": 0},
-        "sha256": {"$ref": "#/$defs/sha256"}
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "parameterization": {"const": "execution.package_version"}
       }
     },
     "environment": {

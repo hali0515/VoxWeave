@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import wave
@@ -282,6 +283,19 @@ def _invoke(request: dict[str, Any]) -> None:
     )
 
 
+def _verify_package_version(value: object) -> None:
+    if type(value) is not str or not value:
+        raise TypeError("public oracle package version is invalid")
+    try:
+        observed = importlib.metadata.version("voxweave")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise RuntimeError(
+            "public oracle distribution metadata is unavailable"
+        ) from exc
+    if observed != value:
+        raise RuntimeError("public oracle distribution version differs from execution")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", type=Path, required=True)
@@ -295,6 +309,7 @@ def main() -> int:
     fixture = request["fixture"]
     if not isinstance(fixture, dict):
         raise TypeError("public oracle fixture is not an object")
+    _verify_package_version(request.get("package_version"))
     arguments.episode_root.mkdir(parents=True, exist_ok=False)
     target, media_path = _materialize(fixture, arguments.episode_root)
     os.chdir(arguments.episode_root)

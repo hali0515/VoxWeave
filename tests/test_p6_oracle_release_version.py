@@ -9,19 +9,21 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
 import pytest
+from packaging.version import Version
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ORACLE_ROOT = REPO_ROOT / "calibration" / "p6-oracle"
 ORACLE_MANIFEST = ORACLE_ROOT / "manifest.json"
 ORACLE_RUNNER = REPO_ROOT / "scripts" / "p6_oracle.py"
+PUBLIC_WORKER = REPO_ROOT / "scripts" / "p6_oracle_public.py"
 RELEASE_REFRESH = REPO_ROOT / "scripts" / "p6_oracle_release_refresh.py"
 PACKAGE_VERSION_TEMPLATE = "__P6_ORACLE_EXECUTION_PACKAGE_VERSION__"
-SIMULATED_VERSION = "0.14.0"
 
 
 def _load_oracle_runner() -> Any:
@@ -31,6 +33,31 @@ def _load_oracle_runner() -> Any:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _load_public_worker() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "p6_oracle_release_version_worker", PUBLIC_WORKER
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_release_refresh(path: Path = RELEASE_REFRESH) -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "p6_oracle_release_version_refresh", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    scripts_dir = str(path.parent)
+    sys.path.insert(0, scripts_dir)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        assert sys.path.pop(0) == scripts_dir
     return module
 
 
@@ -90,13 +117,20 @@ def _copy_repository(tmp_path: Path) -> Path:
     return destination
 
 
-def _simulate_version_bump(repository: Path) -> None:
+def _simulate_version_bump(repository: Path) -> str:
     pyproject = repository / "pyproject.toml"
     pyproject_text = pyproject.read_text(encoding="utf-8")
-    old_project = 'version = "0.13.0"'
+    current_version = tomllib.loads(pyproject_text)["project"]["version"]
+    parsed = Version(current_version)
+    major = parsed.release[0]
+    minor = parsed.release[1] if len(parsed.release) > 1 else 0
+    epoch = f"{parsed.epoch}!" if parsed.epoch else ""
+    simulated_version = f"{epoch}{major}.{minor + 1}.0"
+    assert Version(simulated_version) > parsed
+    old_project = f'version = "{current_version}"'
     assert pyproject_text.count(old_project) == 1
     pyproject.write_text(
-        pyproject_text.replace(old_project, f'version = "{SIMULATED_VERSION}"', 1),
+        pyproject_text.replace(old_project, f'version = "{simulated_version}"', 1),
         encoding="utf-8",
     )
 
@@ -107,17 +141,18 @@ def _simulate_version_bump(repository: Path) -> None:
         r'[^"\n]+'
         r'("\nsource = \{ editable = "\." \})'
     )
-    updated, count = pattern.subn(rf"\g<1>{SIMULATED_VERSION}\g<2>", lock_text)
+    updated, count = pattern.subn(rf"\g<1>{simulated_version}\g<2>", lock_text)
     assert count == 1
     lock_path.write_text(updated, encoding="utf-8")
+    return simulated_version
 
 
-def _fake_distribution(repository: Path) -> Path:
+def _fake_distribution(repository: Path, *, package_version: str) -> Path:
     site = repository / ".release-test-site"
-    metadata = site / f"voxweave-{SIMULATED_VERSION}.dist-info"
+    metadata = site / f"voxweave-{package_version}.dist-info"
     metadata.mkdir(parents=True)
     (metadata / "METADATA").write_text(
-        f"Metadata-Version: 2.1\nName: voxweave\nVersion: {SIMULATED_VERSION}\n",
+        f"Metadata-Version: 2.1\nName: voxweave\nVersion: {package_version}\n",
         encoding="utf-8",
     )
     return site
@@ -167,7 +202,13 @@ def test_package_version_is_one_execution_recorded_projection_value():
     assert output["parameterization"] == "execution.package_version"
 
 
-def test_versioned_expected_bytes_are_both_emitted_by_the_standalone_projector():
+def test_versioned_expected_bytes_are_both_emitted_by_the_standalone_projector(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("LANG", "zh_CN.UTF-8")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
     oracle = _load_oracle_runner()
     manifest = oracle._load_checked_manifest(ORACLE_MANIFEST)
     case = next(
@@ -189,10 +230,104 @@ def test_versioned_expected_bytes_are_both_emitted_by_the_standalone_projector()
             ORACLE_ROOT / "expected" / "selected-v2-segmentation" / "episode.json"
         ).read_bytes()
     )
+    live_document = json.loads(live["main-json"])
+    template_document = json.loads(template["main-json"])
     assert (
-        json.loads(live["main-json"])["segmentation"]["voxweave"]
+        live_document["segmentation"]["voxweave"]
         == manifest["execution"]["package_version"]
     )
+    assert template_document["segmentation"]["voxweave"] == PACKAGE_VERSION_TEMPLATE
+    live_document["segmentation"]["voxweave"] = PACKAGE_VERSION_TEMPLATE
+    assert live_document == template_document
+    assert (
+        oracle._package_version_projection_failure(
+            template["main-json"],
+            live["main-json"],
+            package_version=manifest["execution"]["package_version"],
+        )
+        is None
+    )
+    assert "beyond" in oracle._package_version_projection_failure(
+        template["main-json"],
+        live["main-json"] + b" ",
+        package_version=manifest["execution"]["package_version"],
+    )
+
+
+def test_public_worker_rejects_a_recorded_version_other_than_live_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    worker = _load_public_worker()
+    monkeypatch.setattr(worker.importlib.metadata, "version", lambda _name: "7.8.9")
+
+    worker._verify_package_version("7.8.9")
+    with pytest.raises(RuntimeError, match="distribution version differs"):
+        worker._verify_package_version("7.8.8")
+
+
+def test_release_refresh_writer_refuses_an_expected_artifact_target():
+    refresh = _load_release_refresh()
+    expected_path = (
+        ORACLE_ROOT / "expected" / "selected-v2-segmentation" / "episode.json"
+    )
+    before = expected_path.read_bytes()
+
+    with pytest.raises(refresh.RefreshInvalid, match="only the oracle manifest"):
+        refresh._atomic_write(expected_path, b"mutated expected bytes")
+
+    assert expected_path.read_bytes() == before
+
+
+def test_container_digest_independently_binds_the_recorded_package_version():
+    execution = json.loads(ORACLE_MANIFEST.read_bytes())["execution"]
+    digest_facts = {
+        "dependency_lock_sha256": execution["dependency_lock_sha256"],
+        "hash_seed": execution["hash_seed"],
+        "interpreter": execution["interpreter"],
+        "locale": execution["locale"],
+        "package_version": execution["package_version"],
+        "platform": execution["platform"],
+        "timezone": execution["timezone"],
+        "toolchain": "detached-environment-v2",
+    }
+    encoded = json.dumps(
+        digest_facts,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert hashlib.sha256(encoded).hexdigest() == execution["container_digest"]
+
+
+def test_release_refresh_does_not_overwrite_a_precommit_manifest_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository = _copy_repository(tmp_path)
+    simulated_version = _simulate_version_bump(repository)
+    manifest_path = repository / "calibration" / "p6-oracle" / "manifest.json"
+    refresh = _load_release_refresh(
+        repository / "scripts" / "p6_oracle_release_refresh.py"
+    )
+    monkeypatch.setattr(
+        refresh.oracle_environment,
+        "installed_package_version",
+        lambda: simulated_version,
+    )
+
+    def mutate_during_preflight(_candidate: dict[str, Any]) -> None:
+        raw = manifest_path.read_text(encoding="utf-8")
+        assert raw.count('"runner_version": 1') == 1
+        manifest_path.write_text(
+            raw.replace('"runner_version": 1', '"runner_version": 2', 1),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(refresh, "_preflight", mutate_during_preflight)
+    with pytest.raises(refresh.RefreshInvalid, match="manifest differs from HEAD"):
+        refresh._refresh()
+
+    assert json.loads(manifest_path.read_bytes())["runner_version"] == 2
 
 
 @pytest.mark.parametrize("dirty_kind", ("expected", "non-execution-manifest"))
@@ -201,8 +336,11 @@ def test_release_refresh_refuses_non_execution_or_expected_drift(
     tmp_path: Path,
 ):
     repository = _copy_repository(tmp_path)
-    _simulate_version_bump(repository)
-    metadata_site = _fake_distribution(repository)
+    simulated_version = _simulate_version_bump(repository)
+    metadata_site = _fake_distribution(
+        repository,
+        package_version=simulated_version,
+    )
     environment = _oracle_environment(repository, metadata_site)
     manifest_path = repository / "calibration" / "p6-oracle" / "manifest.json"
     if dirty_kind == "expected":
@@ -247,8 +385,11 @@ def test_simulated_release_refresh_passes_all_three_oracle_gates(tmp_path: Path)
     manifest_path = repository / "calibration" / "p6-oracle" / "manifest.json"
     before = json.loads(manifest_path.read_bytes())
     before_expected = _expected_snapshot(repository)
-    _simulate_version_bump(repository)
-    metadata_site = _fake_distribution(repository)
+    simulated_version = _simulate_version_bump(repository)
+    metadata_site = _fake_distribution(
+        repository,
+        package_version=simulated_version,
+    )
     environment = _oracle_environment(repository, metadata_site)
     runner = repository / "scripts" / "p6_oracle.py"
 
@@ -275,7 +416,7 @@ def test_simulated_release_refresh_passes_all_three_oracle_gates(tmp_path: Path)
         for key in before["execution"]
         if before["execution"][key] != after["execution"][key]
     } == {"package_version", "dependency_lock_sha256", "container_digest"}
-    assert after["execution"]["package_version"] == SIMULATED_VERSION
+    assert after["execution"]["package_version"] == simulated_version
     assert (
         after["execution"]["dependency_lock_sha256"]
         == hashlib.sha256((repository / "uv.lock").read_bytes()).hexdigest()

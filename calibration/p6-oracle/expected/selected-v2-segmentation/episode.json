@@ -115,7 +115,7 @@
   "segmentation": {
     "manifest_version": 1,
     "engine": "boundary-optimizer-v2",
-    "voxweave": "0.13.0",
+    "voxweave": "__P6_ORACLE_EXECUTION_PACKAGE_VERSION__",
     "python": "3.13.12",
     "language": "ja",
     "profile": {
