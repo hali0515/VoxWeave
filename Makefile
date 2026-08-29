@@ -5,13 +5,12 @@
 	quality-record-segmentation
 
 # Install as a global uv tool (end-user mode): puts the voxweave command on PATH.
-# The separation / layout / song-skip / CJK-break / translation pipeline is baked into the core
-# deps; the install variant selects the compute platform AND the ASR/alignment backend:
+# Separation / layout / song-skip / diarization / CJK-break / translation support is baked into
+# the core deps; the install variant selects the compute platform AND the ASR/alignment backend:
 #   VARIANT=cuda (default) -> NVIDIA/Linux: torch Qwen3-ASR+aligner (qwen-asr) + onnxruntime-gpu +
 #                             faster-whisper, on the cu128 torch wheel (Blackwell sm_120, no auto-detect)
 #   VARIANT=mps            -> Apple Silicon/macOS: native MLX Qwen3-ASR+aligner (mlx-audio) on the
 #                             default torch wheel (MPS built in for the separator; no whisper engine)
-# Convenience targets: `make cuda` / `make mps` == `make install VARIANT=<x>`.
 # Everything lands in an isolated uv tool venv (a bare `uv pip` cannot reach that venv).
 # Override the torch index per-invocation if needed, e.g. CPU-only: make install TORCH_BACKEND=cpu
 
@@ -41,19 +40,10 @@ else
   TORCH_BACKEND ?= cpu
 endif
 
-# ---- Extras ------------------------------------------------------------------
-# Explicit EXTRAS=... always wins (EXTRAS= for none; stack with commas). Otherwise
-# preserve what the existing tool venv already has, so a plain `make reinstall`
-# never silently drops diarize (detected via its pyannote package); a first install
-# defaults to diarize (the feature stays opt-in behind --diarize + the HF token).
-TOOL_SITE := $(firstword $(wildcard $(HOME)/.local/share/uv/tools/voxweave/lib/python*/site-packages))
-ifeq ($(TOOL_SITE),)
-  EXTRAS ?= diarize
-else ifneq ($(wildcard $(TOOL_SITE)/pyannote),)
-  EXTRAS ?= diarize
-else
-  EXTRAS ?=
-endif
+# ---- Compatibility extras ----------------------------------------------------
+# Diarization is a core dependency. Keep explicit extras available so older source-install
+# commands such as EXTRAS=diarize still resolve through the empty compatibility alias.
+EXTRAS ?=
 comma := ,
 INSTALL_SPEC = .[$(VARIANT)$(if $(EXTRAS),$(comma)$(EXTRAS))]
 

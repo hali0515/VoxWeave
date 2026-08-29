@@ -131,8 +131,9 @@ uv tool install "voxweave[mps]"                          # full pipeline + MLX W
 ```
 
 The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
-Japanese/CJK), layout, song-skip — plus CJK line-break and translation are baked into the
-**core dependencies**. The variant selects the compute platform **and the ASR/alignment backend**:
+Japanese/CJK), layout, song-skip, and speaker-diarization support — plus CJK line-break and
+translation — is baked into the **core dependencies**. The variant selects the compute platform
+**and the ASR/alignment backend**:
 
 - `[cuda]` (NVIDIA/Linux): the in-process PyTorch Qwen3-ASR + forced aligner (`qwen-asr`), GPU
   onnxruntime (CUDAExecutionProvider for MMS alignment), and the faster-whisper hybrid engine.
@@ -148,35 +149,41 @@ Japanese/CJK), layout, song-skip — plus CJK line-break and translation are bak
   torch-MPS. `qwen-asr` is excluded because its `transformers==4.57.6` pin conflicts with mlx-audio,
   so `[cuda]` and `[mps]` are mutually exclusive — pick one per host.
 
+Speaker diarization support ships by default on both variants but remains opt-in at runtime.
+Before using `--diarize`, accept the conditions for the gated
+`pyannote/speaker-diarization-3.1` model, then authenticate once with `hf auth login` or set
+`VOXWEAVE_HF_TOKEN` / `HF_TOKEN`.
+
 **From source** (for development or pulling new code):
 
 ```bash
 make install       # auto-detects the platform: Apple Silicon -> [mps], anything else -> [cuda]
-                   # (cu128 torch wheel with an NVIDIA driver, CPU wheel without); includes
-                   # [diarize] by default and keeps whatever extras the existing venv already has
-make reinstall     # after pulling new code (same auto-detection, preserves installed extras)
+                   # (cu128 torch wheel with an NVIDIA driver, CPU wheel without)
+make reinstall     # after pulling new code (same platform detection)
 make uninstall
 ```
 
-Override the detection per invocation: `make install VARIANT=mps`, `make install EXTRAS=`
-(no extras), `make install TORCH_BACKEND=cpu`.
+Override the detection per invocation: `make install VARIANT=mps` or
+`make install TORCH_BACKEND=cpu`.
 
 <details>
-<summary><b>Extras & what each pulls</b></summary>
+<summary><b>Dependencies & what each variant pulls</b></summary>
 
-- The core pulls `qwen-asr` (hard-pins `transformers==4.57.6` + `accelerate==1.12.0`) + a
-  pure-torch Mel-Band Roformer vendored in `voxweave.vendor` (**no onnx/onnxruntime** —
+- The core pulls a pure-torch Mel-Band Roformer vendored in `voxweave.vendor`
+  (**no onnx/onnxruntime** —
   `audio-separator` is intentionally avoided because it eagerly imports onnxruntime at the
   top level) + MMS-300m forced aligner (`ctc-forced-aligner`) + layout (`pysbd`) + song-skip
-  (`panns-inference`) + CJK break (`budoux` + `jieba`) + translation (`openai`).
+  (`panns-inference`) + CJK break (`budoux` + `jieba`) + translation (`openai`) +
+  `pyannote-audio>=3.4,<4` for opt-in speaker diarization.
 - **`[cuda]`** (NVIDIA/Linux): `qwen-asr` + `onnxruntime-gpu` + `faster-whisper`. **`[mps]`**
   (Apple Silicon/macOS): `mlx-audio` + plain `onnxruntime`. Declared **conflicting** in
   `[tool.uv]` (incompatible `transformers` pins), so `uv` resolves each in its own fork — pick one
   per host (`make dev VARIANT=mps` on Apple Silicon).
-- **`[diarize]`** (stackable on either variant): `pyannote-audio` 3.x for `--diarize`. The
-  `pyannote/speaker-diarization-3.1` checkpoint is HF-gated — accept its model-card conditions
-  (and segmentation-3.0's) once, then any stored token works (`hf auth login` is enough).
-  Stay on pyannote 3.x: 4.x peaks ~9.5 GB VRAM on the same model (pyannote-audio#1963).
+- **Diarization ships by default but runs only with `--diarize`.** The
+  `pyannote/speaker-diarization-3.1` checkpoint is HF-gated; accept its model-card conditions
+  (and segmentation-3.0's) once, then use `hf auth login`, `VOXWEAVE_HF_TOKEN`, or `HF_TOKEN`.
+  The dependency stays below pyannote 4: 3.x uses about 1.6 GB VRAM for this model, while 4.x
+  peaks near 9.5 GB on the same workload (pyannote-audio#1963).
 - The device is auto-detected at runtime (cuda → mps → cpu); override with `VOXWEAVE_DEVICE`. On
   mps the MLX backend is selected automatically; force it either way with `VOXWEAVE_BACKEND=mlx|torch`.
 - **Development**: `make dev` (= `uv sync --extra cuda --dev`; on Apple Silicon use
@@ -189,6 +196,9 @@ Override the detection per invocation: `make install VARIANT=mps`, `make install
 ```bash
 # Transcribe a video to a timestamped VTT (+ a JSON source of truth)
 voxweave episode.mkv
+
+# Opt in to speaker diarization (requires gated-model access; see Setup)
+voxweave interview.mkv --diarize
 
 # ...edit episode.vtt by hand (fix wording, line breaks)...
 
@@ -230,7 +240,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.                                                                                                                                                                                                     |
 | `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export).                                                                                                                                                                                              |
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
-| `--diarize`                    | pyannote speaker diarization: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). Needs `voxweave[diarize]` + an HF token for the gated checkpoint (`VOXWEAVE_HF_TOKEN` / `HF_TOKEN` / conf `hf_token`, or just `hf auth login` once). Speaker turns persist to the sibling JSON, so `voxweave split` replays the formatting without re-running the model. |
+| `--diarize`                    | Opt in to the default-installed pyannote speaker diarizer: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). The gated checkpoint requires `VOXWEAVE_HF_TOKEN`, `HF_TOKEN`, config `hf_token`, or a prior `hf auth login`. Speaker turns persist to the sibling JSON, so `voxweave split` replays the formatting without re-running the model. |
 | `--voiceprints/--no-voiceprints` | Opt in to a voice-biometric centroid sidecar for reviewed cross-episode speaker suggestions. Requires a fresh `--diarize` run and is off by default. Precedence: CLI, `VOXWEAVE_VOICEPRINTS`, `[defaults].voiceprints`, then off. |
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
@@ -504,6 +514,8 @@ default config is written on first run (migrated automatically from a pre-rename
 - `VOXWEAVE_ALIGNER_MODEL` (default `Qwen/Qwen3-ForcedAligner-0.6B`)
 - `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)
 - `VOXWEAVE_BACKEND` (`mlx` | `torch`; default: `mlx` on mps, else `torch`) — picks the ASR/alignment backend
+- `VOXWEAVE_HF_TOKEN` / `HF_TOKEN` — authentication for gated models, including
+  `pyannote/speaker-diarization-3.1`; alternatively authenticate once with `hf auth login`
 - `VOXWEAVE_OFFLINE` (`1` to enable) — once all models are cached, sets `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` so loading skips the per-file HEAD revalidation + optional-file probing huggingface_hub/transformers otherwise do on every run (no network on a cache hit). Leave off for the first download.
 - `VOXWEAVE_MLX_ASR_REPO` / `VOXWEAVE_MLX_ALIGNER_REPO` / `VOXWEAVE_MLX_WHISPER_REPO` — MLX backend
   repos. By default the ASR repo tracks `--model` size (`--model 1.7b` → `mlx-community/Qwen3-ASR-1.7B-8bit`)
@@ -586,7 +598,7 @@ mms      = 4                             # MMS-300m emission batch (ja aligner)
 separate   = true                        # vocal separation before ASR/alignment (--separate/--no-separate)
 skip_songs = true                        # PANNs music detection + skip before ASR (--skip-songs/--no-skip-songs)
 normalize  = false                       # loudnorm on the 16k input (--normalize/--no-normalize)
-diarize    = false                       # pyannote speaker diarization (--diarize/--no-diarize; needs voxweave[diarize] + HF token)
+diarize    = false                       # pyannote speaker diarization (--diarize/--no-diarize; gated-model token required)
 voiceprints = false                      # opt-in biometric centroid capture; requires diarize
 timestamps = true                        # word-level timestamps in the VTT (--timestamps/--no-timestamps)
 shot_snap  = true                        # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)

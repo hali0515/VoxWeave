@@ -58,7 +58,7 @@ def test_lock_records_pyannote_as_core_and_preserves_the_empty_alias() -> None:
     metadata = package["metadata"]
 
     assert {"name": "pyannote-audio"} in dependencies
-    assert optional["diarize"] == []
+    assert "diarize" not in optional  # uv omits empty optional-dependency tables
     assert {
         "name": "pyannote-audio",
         "specifier": ">=3.4,<4",
@@ -137,5 +137,6 @@ def test_readme_describes_default_install_and_opt_in_runtime() -> None:
     assert "HF_TOKEN" in readme
     assert re.search(r"^diarize\s*=\s*false", readme, flags=re.MULTILINE)
 
-    cli_source = (REPO_ROOT / "voxweave" / "cli.py").read_text(encoding="utf-8")
-    assert "voxweave[diarize]" not in cli_source.lower()
+    for source_path in (REPO_ROOT / "voxweave").rglob("*.py"):
+        source = source_path.read_text(encoding="utf-8")
+        assert "voxweave[diarize]" not in source.lower(), source_path

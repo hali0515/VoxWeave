@@ -46,6 +46,10 @@ dependencies = [
   # wav2vec2 CTC forced alignment for English (WhisperX-equivalent; backend.align_text_ctc).
   # Tracks torch ABI; lower bound only.
   "torchaudio>=2.1",
+  # Speaker diarization (--diarize): pyannote.audio 3.x +
+  # pyannote/speaker-diarization-3.1 (MIT, ~1.6 GB VRAM). Keep the <4 ceiling:
+  # pyannote.audio 4.x currently peaks near 9.5 GB on the same model.
+  "pyannote-audio>=3.4,<4",
   # MMS-300m + uroman forced alignment (default aligner for ja/CJK; zero OOV; align_text_mms).
   # The onnxruntime build is platform-selected via the [cuda]/[mps] extras (onnxruntime-gpu on
   # CUDA, plain onnxruntime on macOS) — see [project.optional-dependencies] + [tool.uv] below.
@@ -110,13 +114,9 @@ mps = [
   "mlx-audio>=0.4.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
-# Speaker diarization (--diarize): pyannote.audio 3.x + pyannote/speaker-diarization-3.1
-# (MIT, ~1.6 GB VRAM; the 4.x line needs torch>=2.8 and currently peaks ~9.5 GB on the
-# same model — see pyannote-audio#1963). The checkpoint is HF-gated: accept the model
-# card conditions and set VOXWEAVE_HF_TOKEN / HF_TOKEN.
-diarize = [
-  "pyannote-audio>=3.4,<4",
-]
+# Empty compatibility alias: legacy voxweave[cuda,diarize] and voxweave[mps,diarize]
+# specifications still resolve, while diarization support now ships in the core environment.
+diarize = []
 
 [dependency-groups]
 # jsonschema validates the tracked calibration contracts (calibration/schemas/*.schema.json).

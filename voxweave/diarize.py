@@ -588,8 +588,8 @@ def _get_pipeline(token: str):
             )
         except ModuleNotFoundError as e:
             raise RuntimeError(
-                "diarization requires pyannote.audio (not installed); "
-                "install with: pip install 'voxweave[diarize]'"
+                "diarization requires the default pyannote.audio dependency; "
+                "reinstall voxweave to repair the environment"
             ) from e
         pl = _load_pipeline(Pipeline, token)
         if pl is None:

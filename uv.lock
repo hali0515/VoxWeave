@@ -5074,6 +5074,7 @@ dependencies = [
     { name = "numpy" },
     { name = "openai" },
     { name = "panns-inference" },
+    { name = "pyannote-audio" },
     { name = "pysbd" },
     { name = "pyyaml" },
     { name = "rich" },
@@ -5092,9 +5093,6 @@ cuda = [
     { name = "huggingface-hub", version = "0.36.2", source = { registry = "https://pypi.org/simple" } },
     { name = "onnxruntime-gpu", marker = "sys_platform != 'darwin'" },
     { name = "qwen-asr" },
-]
-diarize = [
-    { name = "pyannote-audio" },
 ]
 mps = [
     { name = "mlx-audio", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -5129,7 +5127,7 @@ requires-dist = [
     { name = "onnxruntime-gpu", marker = "sys_platform != 'darwin' and extra == 'cuda'", specifier = ">=1.20" },
     { name = "openai", specifier = ">=1.40" },
     { name = "panns-inference", specifier = ">=0.1.0" },
-    { name = "pyannote-audio", marker = "extra == 'diarize'", specifier = ">=3.4,<4" },
+    { name = "pyannote-audio", specifier = ">=3.4,<4" },
     { name = "pysbd", specifier = ">=0.3.4" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "qwen-asr", marker = "extra == 'cuda'", specifier = ">=0.0.4" },

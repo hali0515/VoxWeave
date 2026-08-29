@@ -243,8 +243,9 @@ def cli(verbose: bool) -> None:
     "--diarize/--no-diarize",
     default=None,
     help="Run pyannote speaker diarization: two-speaker cues become Netflix dual-speaker"
-    " events (-line per speaker), 3+ speaker cues split at speaker boundaries. Needs"
-    " 'voxweave[diarize]' + an HF token for the gated checkpoint (VOXWEAVE_HF_TOKEN)."
+    " events (-line per speaker), 3+ speaker cues split at speaker boundaries. The"
+    " default install includes support; the gated checkpoint needs VOXWEAVE_HF_TOKEN,"
+    " HF_TOKEN, conf hf_token, or a prior 'hf auth login'."
     " Default: off, or conf [defaults].diarize.",
 )
 @click.option(
