@@ -9,12 +9,12 @@
   "execution": {
     "interpreter": "CPython 3.13.12",
     "platform": "Linux x86_64",
-    "package_version": "0.13.0",
-    "container_digest": "7f0479a8261a3900fc3494a1f12b7681d0a023200c7c08710d364db772175c47",
+    "package_version": "0.14.0",
+    "container_digest": "2c4d7aa62329edb846efb1148306e4a8048ed19009ab12bf356f9a504fabf861",
     "locale": "C.UTF-8",
     "timezone": "unset",
     "hash_seed": "unset",
-    "dependency_lock_sha256": "63c30bb7b2dea08b0b6488374c704c045fe6b23a3868e3867545847e1c6b4fdb"
+    "dependency_lock_sha256": "c27cf486b3f0ad7c8d2fe423a374ce2a3eed097ce92cc6c948457c9cbfb67e70"
   },
   "registry_digests": {
     "align-delta-registry": "267bdf609013b7f2a37abef1a14b0a5fa6e9770fea0da958b5d92d64ce36f931",
