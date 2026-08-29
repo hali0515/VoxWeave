@@ -9,6 +9,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PYANNOTE_REQUIREMENT = "pyannote-audio>=3.4,<4"
+STALE_SEMANTIC_SPLIT = re.compile(
+    r"\bsemantic\b[^\r\n]{0,96}?\bsplit\w*\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _project() -> dict[str, object]:
@@ -127,7 +131,6 @@ def test_readme_describes_default_install_and_opt_in_runtime() -> None:
 
     assert "voxweave[diarize]" not in lowered
     assert "`[diarize]`" not in lowered
-    assert re.search(r"semantic[-_ ]split", readme, flags=re.IGNORECASE) is None
     assert "pyannote-audio" in lowered
     assert "ships by default" in lowered
     assert "--diarize" in readme
@@ -140,3 +143,25 @@ def test_readme_describes_default_install_and_opt_in_runtime() -> None:
     for source_path in (REPO_ROOT / "voxweave").rglob("*.py"):
         source = source_path.read_text(encoding="utf-8")
         assert "voxweave[diarize]" not in source.lower(), source_path
+
+
+def test_tracked_documentation_has_no_removed_semantic_split_language() -> None:
+    result = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.md", "*.rst", "*.txt"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+    )
+    documentation = [
+        REPO_ROOT / raw_path.decode("utf-8")
+        for raw_path in result.stdout.split(b"\0")
+        if raw_path
+    ]
+    assert documentation
+
+    stale = {
+        str(path.relative_to(REPO_ROOT)): match.group(0)
+        for path in documentation
+        if (match := STALE_SEMANTIC_SPLIT.search(path.read_text(encoding="utf-8")))
+    }
+    assert stale == {}

@@ -26,7 +26,7 @@ repository for the complete text).
 
 ### Subtitle splitting — `voxweave/core/smart_split.py`
 
-The semantic subtitle-splitting pipeline (`split_at_sentence_end`,
+The subtitle-splitting pipeline (`split_at_sentence_end`,
 `split_long_cues_with_word_timings`, etc.) is adapted from
 [dashed/whisperx-subtitles-replicate](https://github.com/dashed/whisperx-subtitles-replicate)
 (`predict.py`), which is MIT-licensed. Modified to add CJK / no-space language
