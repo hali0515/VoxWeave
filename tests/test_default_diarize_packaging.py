@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -62,15 +64,61 @@ def test_lock_records_pyannote_as_core_and_preserves_the_empty_alias() -> None:
         "specifier": ">=3.4,<4",
     } in metadata["requires-dist"]
     assert "diarize" in metadata["provides-extras"]
+    locked_pyannote = next(
+        package
+        for package in tomllib.loads(
+            (REPO_ROOT / "uv.lock").read_text(encoding="utf-8")
+        )["package"]
+        if package["name"] == "pyannote-audio"
+    )
+    assert locked_pyannote["version"].split(".", 1)[0] == "3"
 
 
-def test_make_install_has_no_diarize_extra_detection() -> None:
+def test_make_install_has_no_diarize_extra_detection(tmp_path: Path) -> None:
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
 
     assert "TOOL_SITE" not in makefile
-    assert "EXTRAS" not in makefile
-    assert "INSTALL_SPEC = .[$(VARIANT)]" in makefile
     assert "pyannote" not in makefile.lower()
+    environment = {
+        "HOME": str(tmp_path),
+        "PATH": os.environ.get("PATH", os.defpath),
+    }
+    for variant in ("cuda", "mps"):
+        result = subprocess.run(
+            [
+                "make",
+                "-n",
+                "install",
+                f"VARIANT={variant}",
+                "TORCH_BACKEND=cpu",
+            ],
+            cwd=REPO_ROOT,
+            env=environment,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "extras=none" in result.stdout
+        assert f'".[{variant}]"' in result.stdout
+
+    compatibility = subprocess.run(
+        [
+            "make",
+            "-n",
+            "install",
+            "VARIANT=cuda",
+            "TORCH_BACKEND=cpu",
+            "EXTRAS=diarize",
+        ],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert compatibility.returncode == 0, compatibility.stdout + compatibility.stderr
+    assert '".[cuda,diarize]"' in compatibility.stdout
 
 
 def test_readme_describes_default_install_and_opt_in_runtime() -> None:
@@ -88,3 +136,6 @@ def test_readme_describes_default_install_and_opt_in_runtime() -> None:
     assert "VOXWEAVE_HF_TOKEN" in readme
     assert "HF_TOKEN" in readme
     assert re.search(r"^diarize\s*=\s*false", readme, flags=re.MULTILINE)
+
+    cli_source = (REPO_ROOT / "voxweave" / "cli.py").read_text(encoding="utf-8")
+    assert "voxweave[diarize]" not in cli_source.lower()
