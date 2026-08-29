@@ -73,9 +73,10 @@ uninstall:
 dev:
 	uv sync --extra $(VARIANT) --dev
 
-# Unit tests (no network).
+# Unit tests (no network). --extra $(VARIANT) keeps this hermetic on a fresh
+# clone; without it the run env lacks the backend deps and imports fail.
 test:
-	uv run pytest tests/ -v
+	uv run --extra $(VARIANT) pytest tests/ -v
 
 # Lint / format (project-wide; repo has no ruff config but this is the canonical invocation).
 lint:
@@ -85,7 +86,7 @@ lint:
 # Static type check (pyright, basic mode, production code only -- see [tool.pyright]).
 # Zero errors is the bar; CI enforces it so type noise cannot accumulate again.
 typecheck:
-	uv run pyright
+	uv run --extra $(VARIANT) pyright
 
 # ---- Quality rulers ----------------------------------------------------------
 # `make test` answers "did behaviour change unintentionally". These answer "is the
