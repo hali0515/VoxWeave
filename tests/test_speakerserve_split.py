@@ -7,7 +7,7 @@ import json
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Iterator, Mapping, cast
 
 import pytest
 
@@ -20,7 +20,7 @@ from voxweave.voicebase import (
     validate_voiceprint_conjunction,
     write_voiceprints,
 )
-from voxweave.voicestore import load_voice_store
+from voxweave.voicestore import load_voice_store, new_voice_store
 
 
 CAPTURE_ID = "c" + "1" * 32
@@ -35,6 +35,21 @@ PROVENANCE = {
     "audio": {"separated": False, "normalized": False, "sample_rate": 16000},
     "pyannote_version": "3.4.0",
     "torch_version": "test",
+}
+COMMUNITY_MODEL = "pyannote/speaker-diarization-community-1"
+COMMUNITY_REVISION = "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee"
+COMMUNITY_CHECKPOINT = (
+    "6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929"
+)
+COMMUNITY_PROVENANCE = {
+    "diarization_model": COMMUNITY_MODEL,
+    "outer_config_sha256": "a" * 64,
+    "embedding_model": (f"{COMMUNITY_MODEL}@{COMMUNITY_REVISION}#subfolder=embedding"),
+    "embedding_checkpoint": COMMUNITY_CHECKPOINT,
+    "embedding_dim": 256,
+    "audio": {"separated": False, "normalized": False, "sample_rate": 16000},
+    "pyannote_version": "4.0.7",
+    "torch_version": "2.11.0",
 }
 
 
@@ -108,6 +123,9 @@ def _post(
 def _running_split_server(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    provenance: Mapping[str, object] | None = None,
+    provider_identity: turnembed.EmbeddingIdentity | None = None,
 ) -> Iterator[
     tuple[
         speakerserve.SpeakerHTTPServer,
@@ -117,6 +135,15 @@ def _running_split_server(
         dict[str, object],
     ]
 ]:
+    selected_provenance = copy.deepcopy(dict(provenance or PROVENANCE))
+    selected_identity = provider_identity or turnembed.EmbeddingIdentity(
+        model=cast(str, selected_provenance["embedding_model"]),
+        checkpoint_sha256=cast(str, selected_provenance["embedding_checkpoint"]),
+        pyannote_version=cast(str, selected_provenance["pyannote_version"]),
+    )
+    selected_dim = cast(int, selected_provenance["embedding_dim"])
+    selected_vector_a = [1.0, *([0.0] * (selected_dim - 1))]
+    selected_vector_b = [0.0, 1.0, *([0.0] * (selected_dim - 2))]
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"stable episode media")
     fingerprint = media_fingerprint(media)
@@ -144,7 +171,7 @@ def _running_split_server(
     sidecar = {
         "version": 1,
         "capture_id": CAPTURE_ID,
-        "provenance": copy.deepcopy(PROVENANCE),
+        "provenance": selected_provenance,
         "binding": {
             "turns_digest": canonical_turns_digest(turns),
             "media_fingerprint": fingerprint,
@@ -152,8 +179,8 @@ def _running_split_server(
             "created": "2026-08-30T00:00:00Z",
         },
         "speakers": {
-            "SPEAKER_00": list(VECTOR_A),
-            "SPEAKER_01": list(VECTOR_B),
+            "SPEAKER_00": selected_vector_a,
+            "SPEAKER_01": selected_vector_b,
         },
     }
     sidecar_path = tmp_path / "episode.voiceprints.json"
@@ -180,9 +207,13 @@ def _running_split_server(
     def fake_embeddings(path: Path, selected_turns: object):
         observations["embedding_wav"] = Path(path)
         observations["embedding_turns"] = list(selected_turns)  # type: ignore[arg-type]
+        observations["embedding_request_identity"] = cast(
+            turnembed.AttestedTurnRequest,
+            selected_turns,
+        ).identity
         return turnembed.AttestedTurnEmbeddings(
-            {0: list(VECTOR_A), 1: list(VECTOR_B)},
-            identity=_fixture_embedding_identity(),
+            {0: selected_vector_a, 1: selected_vector_b},
+            identity=selected_identity,
         )
 
     def fake_bisect(embeddings: object):
@@ -585,6 +616,9 @@ def test_split_returns_mocked_groups_and_does_not_mutate_episode(
             (0.0, 3.0, "SPEAKER_00"),
             (6.0, 9.0, "SPEAKER_00"),
         ]
+        assert observations["embedding_request_identity"] == (
+            _fixture_embedding_identity()
+        )
         assert observations["clips"] == [
             (tmp_path / "prepared.wav", 0.0, 3.0),
             (tmp_path / "prepared.wav", 6.0, 9.0),
@@ -593,6 +627,116 @@ def test_split_returns_mocked_groups_and_does_not_mutate_episode(
         assert paths["sidecar"].read_bytes() == originals["sidecar"]
         assert paths["mapping"].read_bytes() == originals["mapping"]
         assert paths["suggest"].read_bytes() == originals["suggest"]
+        assert not paths["undo"].exists()
+
+
+def test_community1_split_confirms_with_exact_authority_and_matching_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = turnembed.EmbeddingIdentity(
+        model=cast(str, COMMUNITY_PROVENANCE["embedding_model"]),
+        checkpoint_sha256=cast(
+            str,
+            COMMUNITY_PROVENANCE["embedding_checkpoint"],
+        ),
+        pyannote_version=cast(str, COMMUNITY_PROVENANCE["pyannote_version"]),
+    )
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=COMMUNITY_PROVENANCE,
+        provider_identity=identity,
+    ) as (server, paths, _originals, _logs, observations):
+        proposal = _preview_split(server)
+
+        assert observations["embedding_request_identity"] == identity
+        assert _confirm_split(server, proposal) == (200, {"new_id": "SPEAKER_02"})
+
+        sibling = json.loads(paths["sibling"].read_bytes())
+        sidecar = json.loads(paths["sidecar"].read_bytes())
+        assert sidecar["provenance"] == COMMUNITY_PROVENANCE
+        validate_voiceprint_conjunction(
+            sidecar,
+            sibling,
+            media_fingerprint(paths["media"]),
+        )
+
+        for name in (
+            "VOXWEAVE_VOICES_ACCEPT",
+            "VOXWEAVE_VOICES_SUGGEST",
+            "VOXWEAVE_VOICES_MARGIN",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        store = new_voice_store("Example Show", COMMUNITY_PROVENANCE)
+        matching = speakers._matching_record(
+            sidecar,
+            tmp_path / "voices.json",
+            store,
+        )
+        assert matching is not None
+        matches, _record, _thresholds = matching
+        assert set(matches) == {"SPEAKER_00", "SPEAKER_01", "SPEAKER_02"}
+
+        cross_authority = copy.deepcopy(COMMUNITY_PROVENANCE)
+        cross_authority["embedding_model"] = (
+            "pyannote/wespeaker-voxceleb-resnet34-LM@" + ("d" * 40)
+        )
+        cross_authority["embedding_checkpoint"] = "3" * 64
+        cross_store = new_voice_store("Example Show", cross_authority)
+        assert (
+            speakers._matching_record(
+                sidecar,
+                tmp_path / "cross-authority-voices.json",
+                cross_store,
+            )
+            is None
+        )
+
+
+def test_community1_split_refuses_cross_embedding_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_identity = turnembed.EmbeddingIdentity(
+        model="pyannote/wespeaker-voxceleb-resnet34-LM@" + ("d" * 40),
+        checkpoint_sha256="3" * 64,
+        pyannote_version=cast(str, COMMUNITY_PROVENANCE["pyannote_version"]),
+    )
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=COMMUNITY_PROVENANCE,
+        provider_identity=other_identity,
+    ) as (server, paths, originals, _logs, observations):
+        status, headers, body = _post(
+            server,
+            "/split",
+            {"speaker_id": "SPEAKER_00"},
+            token=server.token,
+        )
+
+        assert status == 409
+        assert headers["Cache-Control"] == "no-store"
+        assert "does not match the voiceprint capture" in json.loads(body)["error"]
+        assert observations["embedding_request_identity"] == (
+            turnembed.EmbeddingIdentity(
+                model=cast(str, COMMUNITY_PROVENANCE["embedding_model"]),
+                checkpoint_sha256=cast(
+                    str,
+                    COMMUNITY_PROVENANCE["embedding_checkpoint"],
+                ),
+                pyannote_version=cast(
+                    str,
+                    COMMUNITY_PROVENANCE["pyannote_version"],
+                ),
+            )
+        )
+        assert "bisect_embeddings" not in observations
+        assert observations["clips"] == []
+        assert paths["sibling"].read_bytes() == originals["sibling"]
+        assert paths["sidecar"].read_bytes() == originals["sidecar"]
+        assert paths["mapping"].read_bytes() == originals["mapping"]
         assert not paths["undo"].exists()
 
 

@@ -333,9 +333,10 @@ When burning a mapped SRT, recovered speaker identity is retained in the tempora
 field while the visible dialogue remains prefix-free.
 
 `voxweave speakers episode.mkv --purge-voiceprints` removes that episode's voiceprint
-artifact and suggestion record from both supported legacy and cache locations, plus any legacy
-audition HTML, while holding the episode transaction lock. It also works after the media has
-been removed. It deliberately keeps the human-edited mapping.
+artifact and suggestion record from both supported legacy and cache locations. It also removes
+the cache-only one-level speaker-split undo snapshot and any legacy audition HTML while holding
+the episode transaction lock. It works after the media has been removed and deliberately keeps
+the human-edited mapping.
 
 ### Re-align after editing
 

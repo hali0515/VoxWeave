@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.metadata
 import math
 import operator
-import os
 import threading
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, overload
 
 import numpy as np
 
@@ -67,13 +67,43 @@ class AttestedTurnEmbeddings(dict[int, list[float]]):
         return self.__identity
 
 
+class AttestedTurnRequest(Sequence[object]):
+    """Turn sequence carrying the exact voiceprint authority it must reproduce."""
+
+    __slots__ = ("__identity", "__turns")
+
+    def __init__(
+        self,
+        turns: Sequence[object],
+        *,
+        identity: EmbeddingIdentity,
+    ) -> None:
+        self.__turns = tuple(turns)
+        self.__identity = identity
+
+    @property
+    def identity(self) -> EmbeddingIdentity:
+        """Frozen identity the provider must verify before inference."""
+        return self.__identity
+
+    def __len__(self) -> int:
+        return len(self.__turns)
+
+    @overload
+    def __getitem__(self, index: int) -> object: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[object, ...]: ...
+
+    def __getitem__(self, index: int | slice) -> object | tuple[object, ...]:
+        return self.__turns[index]
+
+
 @dataclass(frozen=True, slots=True)
-class _AudioMetadata:
-    sample_rate: int
-    num_frames: int
-    num_channels: int
-    bits_per_sample: int = 0
-    encoding: str = ""
+class _EmbeddingAuthority:
+    checkpoint: str
+    revision: str | None
+    subfolder: str | None
 
 
 _inference: Any | None = None
@@ -84,38 +114,73 @@ _inference_identity: EmbeddingIdentity | None = None
 _inference_lock = threading.RLock()
 
 
-def _configure_pyannote_import() -> Path:
-    """Set the private cache and restore torchaudio APIs pyannote 3.x imports."""
-    os.environ.setdefault(
-        "PYANNOTE_CACHE",
-        os.fspath(Path(config.AUDIO_CACHE) / "pyannote"),
-    )
-    cache_dir = Path(os.environ["PYANNOTE_CACHE"]).expanduser()
-    import torchaudio
+def _canonical_embedding_source(authority: _EmbeddingAuthority) -> str:
+    source = authority.checkpoint
+    if authority.revision is not None:
+        source = f"{source}@{authority.revision}"
+    if authority.subfolder is not None:
+        source = f"{source}#subfolder={authority.subfolder}"
+    return source
 
-    module: Any = torchaudio
-    if not hasattr(module, "AudioMetaData"):
-        module.AudioMetaData = _AudioMetadata
-    if not hasattr(module, "info"):
 
-        def info(filepath: object, *_args: object, **_kwargs: object) -> _AudioMetadata:
-            import soundfile as sf
+def _parse_embedding_source(source: str) -> _EmbeddingAuthority:
+    """Parse the canonical source format persisted in voiceprint provenance."""
+    if not source or source == "unresolved" or source.count("#") > 1:
+        raise TurnEmbeddingError("speaker embedding model authority is invalid")
+    checkpoint_and_revision, separator, fragment = source.partition("#")
+    subfolder: str | None = None
+    if separator:
+        prefix = "subfolder="
+        if not fragment.startswith(prefix) or not fragment.removeprefix(prefix):
+            raise TurnEmbeddingError("speaker embedding model authority is invalid")
+        subfolder = fragment.removeprefix(prefix)
+        subfolder_path = PurePosixPath(subfolder)
+        if subfolder_path.is_absolute() or ".." in subfolder_path.parts:
+            raise TurnEmbeddingError("speaker embedding model authority is invalid")
 
-            metadata = sf.info(str(filepath))
-            return _AudioMetadata(
-                sample_rate=int(metadata.samplerate),
-                num_frames=int(metadata.frames),
-                num_channels=int(metadata.channels),
+    configured = Path(checkpoint_and_revision).expanduser()
+    if configured.exists():
+        checkpoint = checkpoint_and_revision
+        revision = None
+    elif "@" in checkpoint_and_revision:
+        checkpoint, revision = checkpoint_and_revision.rsplit("@", 1)
+        if not checkpoint or not revision:
+            raise TurnEmbeddingError("speaker embedding model authority is invalid")
+    else:
+        checkpoint = checkpoint_and_revision
+        revision = None
+    authority = _EmbeddingAuthority(checkpoint, revision, subfolder)
+    if _canonical_embedding_source(authority) != source:
+        raise TurnEmbeddingError("speaker embedding model authority is not canonical")
+    return authority
+
+
+def _download_checkpoint(
+    authority: _EmbeddingAuthority,
+    token: str | None,
+) -> Path:
+    """Resolve one exact authority inside VoxWeave's private audio cache."""
+    configured = Path(authority.checkpoint).expanduser()
+    if configured.is_file():
+        if authority.revision is not None or authority.subfolder is not None:
+            raise TurnEmbeddingError(
+                "local speaker embedding files cannot use revision or subfolder"
             )
-
-        module.info = info
-    if not hasattr(module, "list_audio_backends"):
-        module.list_audio_backends = lambda: ["soundfile"]
-    return cache_dir
-
-
-def _download_checkpoint(cache_dir: Path, token: str) -> Path:
-    """Resolve the exact PyTorch checkpoint through the current HF token API."""
+        return configured
+    if configured.is_dir():
+        if authority.revision is not None:
+            raise TurnEmbeddingError(
+                "local speaker embedding directories cannot use a revision"
+            )
+        checkpoint = configured
+        if authority.subfolder is not None:
+            checkpoint = checkpoint / authority.subfolder
+        checkpoint = checkpoint / EMBEDDING_CHECKPOINT_FILE
+        if not checkpoint.is_file():
+            raise TurnEmbeddingError(
+                "local speaker embedding checkpoint does not exist"
+            )
+        return checkpoint
     try:
         from huggingface_hub import hf_hub_download
     except ModuleNotFoundError as exc:
@@ -124,24 +189,64 @@ def _download_checkpoint(cache_dir: Path, token: str) -> Path:
         ) from exc
     try:
         checkpoint = hf_hub_download(
-            repo_id=EMBEDDING_MODEL,
-            filename=EMBEDDING_CHECKPOINT_FILE,
-            cache_dir=cache_dir,
+            authority.checkpoint,
+            EMBEDDING_CHECKPOINT_FILE,
+            revision=authority.revision,
+            subfolder=authority.subfolder,
             token=token,
+            cache_dir=config.AUDIO_CACHE,
         )
     except Exception as exc:
         raise TurnEmbeddingError(
-            f"could not download speaker embedding model {EMBEDDING_MODEL}: {exc}"
+            "could not download speaker embedding model "
+            f"{_canonical_embedding_source(authority)}: {exc}"
         ) from exc
     return Path(checkpoint)
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _snapshot_commit(
+    cached_path: Path,
+    authority: _EmbeddingAuthority,
+) -> str | None:
+    """Extract a commit only from this model's validated HF snapshot path."""
+    absolute = cached_path.absolute()
+    expected_relative = Path(authority.subfolder or "") / EMBEDDING_CHECKPOINT_FILE
+    for snapshot in absolute.parents:
+        if snapshot.parent.name != "snapshots":
+            continue
+        repo_cache = snapshot.parent.parent
+        expected_repo_cache = f"models--{authority.checkpoint.replace('/', '--')}"
+        if repo_cache.name != expected_repo_cache:
+            return None
+        try:
+            relative = absolute.relative_to(snapshot)
+        except ValueError:
+            return None
+        if relative != expected_relative:
+            return None
+        commit = snapshot.name
+        if len(commit) != 40 or any(
+            character not in "0123456789abcdef" for character in commit
+        ):
+            return None
+        return commit
+    return None
+
+
+def _embedding_source(
+    authority: _EmbeddingAuthority,
+    cached_path: Path,
+) -> str:
+    commit = _snapshot_commit(cached_path, authority)
+    if commit is None:
+        return _canonical_embedding_source(authority)
+    return _canonical_embedding_source(
+        _EmbeddingAuthority(
+            authority.checkpoint,
+            commit,
+            authority.subfolder,
+        )
+    )
 
 
 def _pyannote_version() -> str:
@@ -153,23 +258,26 @@ def _pyannote_version() -> str:
 
 def _construct_bound_checkpoint(
     checkpoint: Path,
-    construct: Callable[[Path], Any],
+    construct: Callable[[io.BytesIO], Any],
+    *,
+    expected_sha256: str | None = None,
 ) -> tuple[Any, str]:
-    """Construct from one resolved file and refuse a concurrent byte change."""
+    """Hash and construct from the same frozen checkpoint bytes."""
     try:
         resolved = Path(checkpoint).resolve(strict=True)
-        before = _sha256_file(resolved)
-    except OSError as exc:
+        payload = resolved.read_bytes()
+    except (MemoryError, OSError) as exc:
         raise TurnEmbeddingError(
             "speaker embedding checkpoint could not be bound before construction"
         ) from exc
-    value = construct(resolved)
-    try:
-        after = _sha256_file(resolved)
-    except OSError as exc:
+    before = hashlib.sha256(payload).hexdigest()
+    if expected_sha256 is not None and before != expected_sha256:
         raise TurnEmbeddingError(
-            "speaker embedding checkpoint changed during construction"
-        ) from exc
+            "speaker embedding checkpoint does not match requested identity"
+        )
+    checkpoint_buffer = io.BytesIO(payload)
+    value = construct(checkpoint_buffer)
+    after = hashlib.sha256(checkpoint_buffer.getvalue()).hexdigest()
     if before != after:
         raise TurnEmbeddingError(
             "speaker embedding checkpoint changed during construction"
@@ -177,70 +285,105 @@ def _construct_bound_checkpoint(
     return value, before
 
 
-def _load_inference() -> tuple[Any, EmbeddingIdentity]:
+def _load_inference(
+    expected_identity: EmbeddingIdentity | None = None,
+) -> tuple[Any, EmbeddingIdentity]:
     """Load the production embedding family lazily on the best torch device."""
+    if expected_identity is None:
+        authority = _EmbeddingAuthority(EMBEDDING_MODEL, None, None)
+    else:
+        if (
+            len(expected_identity.checkpoint_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_identity.checkpoint_sha256
+            )
+            or not expected_identity.pyannote_version
+            or expected_identity.pyannote_version == "unresolved"
+        ):
+            raise TurnEmbeddingError("speaker embedding identity is invalid")
+        authority = _parse_embedding_source(expected_identity.model)
+
+    pyannote_version = _pyannote_version()
+    if (
+        expected_identity is not None
+        and pyannote_version != expected_identity.pyannote_version
+    ):
+        raise TurnEmbeddingError(
+            "installed pyannote.audio version does not match requested identity"
+        )
     token = config.conf_hf_token()
-    if not token:
+    if (
+        not token
+        and not Path(authority.checkpoint).expanduser().exists()
+        and authority.checkpoint
+        in {
+            EMBEDDING_MODEL,
+            "pyannote/speaker-diarization-community-1",
+        }
+    ):
         raise TurnEmbeddingError(
             "speaker splitting needs the Hugging Face token used for diarization; "
             "set VOXWEAVE_HF_TOKEN / HF_TOKEN or run `hf auth login`"
         )
-    cache_dir = _configure_pyannote_import()
-    checkpoint = _download_checkpoint(cache_dir, token)
+    checkpoint = _download_checkpoint(authority, token)
+    embedding_source = _embedding_source(authority, checkpoint)
+    if expected_identity is not None and embedding_source != expected_identity.model:
+        raise TurnEmbeddingError(
+            "resolved speaker embedding model does not match requested identity"
+        )
     try:
         import torch
         from pyannote.audio import Model  # pyright: ignore[reportMissingImports]
-        from pyannote.audio.core.task import (  # pyright: ignore[reportMissingImports]
-            Problem,
-            Resolution,
-            Specifications,
-        )
         from pyannote.audio.pipelines.speaker_verification import (  # pyright: ignore[reportMissingImports]
             PretrainedSpeakerEmbedding,
         )
-        from torch.torch_version import TorchVersion
     except (ImportError, AttributeError) as exc:
         raise TurnEmbeddingError(
             "speaker splitting could not import the pyannote embedding runtime"
         ) from exc
 
     device = torch.device(runtime.get_device())
-    safe_globals = getattr(torch.serialization, "safe_globals", None)
 
-    def construct(bound_checkpoint: Path) -> Any:
-        if safe_globals is None:
-            return Model.from_pretrained(
-                bound_checkpoint,
-                map_location=device,
-                strict=False,
-            )
-        with safe_globals([TorchVersion, Specifications, Problem, Resolution]):
-            return Model.from_pretrained(
-                bound_checkpoint,
-                map_location=device,
-                strict=False,
-            )
+    def construct(bound_checkpoint: io.BytesIO) -> Any:
+        return Model.from_pretrained(
+            bound_checkpoint,
+            map_location=device,
+            strict=True,
+            token=token,
+            cache_dir=config.AUDIO_CACHE,
+        )
 
     try:
         model, checkpoint_sha256 = _construct_bound_checkpoint(
             checkpoint,
             construct,
+            expected_sha256=(
+                expected_identity.checkpoint_sha256
+                if expected_identity is not None
+                else None
+            ),
         )
     except TurnEmbeddingError:
         raise
     except Exception as exc:
         raise TurnEmbeddingError(
-            f"could not load speaker embedding model {EMBEDDING_MODEL}: {exc}"
+            f"could not load speaker embedding model {embedding_source}: {exc}"
         ) from exc
     if model is None:
         raise TurnEmbeddingError(
-            f"could not load speaker embedding model {EMBEDDING_MODEL}"
+            f"could not load speaker embedding model {embedding_source}"
         )
     try:
-        inference = PretrainedSpeakerEmbedding(model, device=device)
+        inference = PretrainedSpeakerEmbedding(
+            model,
+            device=device,
+            token=token,
+            cache_dir=config.AUDIO_CACHE,
+        )
     except Exception as exc:
         raise TurnEmbeddingError(
-            f"could not initialize speaker embedding model {EMBEDDING_MODEL}: {exc}"
+            f"could not initialize speaker embedding model {embedding_source}: {exc}"
         ) from exc
     try:
         sample_rate = operator.index(inference.sample_rate)
@@ -252,24 +395,44 @@ def _load_inference() -> tuple[Any, EmbeddingIdentity]:
         raise TurnEmbeddingError(
             f"speaker embedding model requires {sample_rate} Hz audio, expected {SAMPLE_RATE} Hz"
         )
-    return inference, EmbeddingIdentity(
-        model=EMBEDDING_MODEL,
+    identity = EmbeddingIdentity(
+        model=embedding_source,
         checkpoint_sha256=checkpoint_sha256,
-        pyannote_version=_pyannote_version(),
+        pyannote_version=pyannote_version,
     )
+    if expected_identity is not None and identity != expected_identity:
+        raise TurnEmbeddingError(
+            "loaded speaker embedding does not match requested identity"
+        )
+    return inference, identity
 
 
-def _get_inference() -> Any:
+def _resident_matches(expected_identity: EmbeddingIdentity | None) -> bool:
+    identity = _inference_identity
+    if identity is None:
+        return False
+    if expected_identity is not None:
+        return identity == expected_identity
+    try:
+        authority = _parse_embedding_source(identity.model)
+    except TurnEmbeddingError:
+        return False
+    return authority.checkpoint == EMBEDDING_MODEL and authority.subfolder is None
+
+
+def _get_inference(
+    expected_identity: EmbeddingIdentity | None = None,
+) -> Any:
     global _inference, _inference_identity
     with _inference_lock:
-        if _inference is None:
-            loaded, identity = _load_inference()
-            _inference_identity = identity
-            _inference = loaded
-        elif _inference_identity is None:
+        if _inference is not None and _inference_identity is None:
             raise TurnEmbeddingError(
                 "speaker embedding inference has no checkpoint identity"
             )
+        if _inference is None or not _resident_matches(expected_identity):
+            loaded, identity = _load_inference(expected_identity)
+            _inference_identity = identity
+            _inference = loaded
         return _inference
 
 
@@ -381,9 +544,12 @@ def turn_embeddings(
     model construction stay lazy so CPU-only tests can replace the inference
     boundary without importing pyannote.
     """
+    expected_identity = (
+        turns.identity if isinstance(turns, AttestedTurnRequest) else None
+    )
     if not turns:
         with _inference_lock:
-            _get_inference()
+            _get_inference(expected_identity)
             identity = _inference_identity
             if identity is None:
                 raise TurnEmbeddingError(
@@ -398,7 +564,7 @@ def turn_embeddings(
     result: dict[int, list[float]] = {}
     dimension: int | None = None
     with _inference_lock:
-        inference = _get_inference()
+        inference = _get_inference(expected_identity)
         identity = _inference_identity
         if identity is None:
             raise TurnEmbeddingError(
@@ -528,6 +694,7 @@ def bisect_embeddings(
 
 __all__ = [
     "AttestedTurnEmbeddings",
+    "AttestedTurnRequest",
     "EmbeddingIdentity",
     "TurnEmbeddingError",
     "UnsplittableSpeakerError",

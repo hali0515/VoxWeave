@@ -1,4 +1,5 @@
 import hashlib
+import io
 import math
 from pathlib import Path
 
@@ -36,30 +37,155 @@ def _install_fake_provider(
         pyannote_version="3.4.0",
     )
     monkeypatch.setattr(turnembed, "_read_mono_16k", lambda _path: waveform)
-    monkeypatch.setattr(turnembed, "_get_inference", lambda: model)
+    monkeypatch.setattr(turnembed, "_get_inference", lambda _identity=None: model)
     monkeypatch.setattr(turnembed, "_inference_identity", identity)
     return identity
 
 
-def test_checkpoint_download_uses_explicit_token_and_cache(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("repository", "subfolder"),
+    [
+        (turnembed.EMBEDDING_MODEL, None),
+        ("pyannote/speaker-diarization-community-1", "embedding"),
+    ],
+)
+def test_checkpoint_download_uses_pinned_authority_token_and_cache(
+    tmp_path,
+    monkeypatch,
+    repository,
+    subfolder,
 ) -> None:
+    revision = "f" * 40
     checkpoint = tmp_path / "resolved.bin"
-    seen = {}
+    calls = []
 
-    def fake_download(**kwargs):
-        seen.update(kwargs)
+    def fake_download(*args, **kwargs):
+        calls.append((args, kwargs))
         return str(checkpoint)
 
+    monkeypatch.setattr(turnembed.config, "AUDIO_CACHE", str(tmp_path))
     monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_download)
 
-    assert turnembed._download_checkpoint(tmp_path, "hf_test") == checkpoint
-    assert seen == {
-        "repo_id": turnembed.EMBEDDING_MODEL,
-        "filename": turnembed.EMBEDDING_CHECKPOINT_FILE,
-        "cache_dir": tmp_path,
+    authority = turnembed._EmbeddingAuthority(
+        repository,
+        revision,
+        subfolder,
+    )
+
+    assert turnembed._download_checkpoint(authority, "hf_test") == checkpoint
+    assert calls == [
+        (
+            (
+                repository,
+                turnembed.EMBEDDING_CHECKPOINT_FILE,
+            ),
+            {
+                "cache_dir": str(tmp_path),
+                "revision": revision,
+                "subfolder": subfolder,
+                "token": "hf_test",
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("repository", "subfolder"),
+    [
+        (turnembed.EMBEDDING_MODEL, None),
+        ("pyannote/speaker-diarization-community-1", "embedding"),
+    ],
+)
+def test_pyannote4_loader_binds_exact_snapshot_authorities(
+    tmp_path,
+    monkeypatch,
+    repository,
+    subfolder,
+) -> None:
+    commit = "a" * 40
+    cache_dir = tmp_path / "audio-cache"
+    checkpoint = (
+        cache_dir / f"models--{repository.replace('/', '--')}" / "snapshots" / commit
+    )
+    if subfolder is not None:
+        checkpoint = checkpoint / subfolder
+    checkpoint = checkpoint / turnembed.EMBEDDING_CHECKPOINT_FILE
+    checkpoint.parent.mkdir(parents=True)
+    payload = b"pyannote 4 checkpoint"
+    checkpoint.write_bytes(payload)
+    model = object()
+    inference = _FakeEmbeddingModel([], min_num_samples=1)
+    model_source = f"{repository}@{commit}"
+    if subfolder is not None:
+        model_source = f"{model_source}#subfolder={subfolder}"
+    requested = turnembed.EmbeddingIdentity(
+        model=model_source,
+        checkpoint_sha256=hashlib.sha256(payload).hexdigest(),
+        pyannote_version="4.0.7",
+    )
+    authorities = []
+    model_calls = []
+    inference_calls = []
+
+    from pyannote.audio import Model
+    from pyannote.audio.pipelines import speaker_verification
+
+    def fake_from_pretrained(path, **kwargs):
+        model_calls.append((path, kwargs))
+        return model
+
+    def fake_pretrained(embedding, **kwargs):
+        inference_calls.append((embedding, kwargs))
+        return inference
+
+    monkeypatch.setattr(turnembed.config, "AUDIO_CACHE", str(cache_dir))
+    monkeypatch.setattr(turnembed.config, "conf_hf_token", lambda: "hf_test")
+    monkeypatch.setattr(turnembed.runtime, "get_device", lambda: "cpu")
+    monkeypatch.setattr(
+        turnembed,
+        "_download_checkpoint",
+        lambda authority, token: authorities.append((authority, token)) or checkpoint,
+    )
+    monkeypatch.setattr(turnembed, "_pyannote_version", lambda: "4.0.7")
+    monkeypatch.setattr(Model, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(
+        speaker_verification,
+        "PretrainedSpeakerEmbedding",
+        fake_pretrained,
+    )
+
+    loaded, identity = turnembed._load_inference(requested)
+
+    assert loaded is inference
+    assert authorities == [
+        (
+            turnembed._EmbeddingAuthority(
+                repository,
+                commit,
+                subfolder,
+            ),
+            "hf_test",
+        )
+    ]
+    assert len(model_calls) == 1
+    loaded_checkpoint, model_kwargs = model_calls[0]
+    assert isinstance(loaded_checkpoint, io.BytesIO)
+    assert loaded_checkpoint.getvalue() == payload
+    assert str(model_kwargs.pop("map_location")) == "cpu"
+    assert model_kwargs == {
+        "strict": True,
         "token": "hf_test",
+        "cache_dir": str(cache_dir),
     }
+    assert len(inference_calls) == 1
+    loaded_model, inference_kwargs = inference_calls[0]
+    assert loaded_model is model
+    assert str(inference_kwargs.pop("device")) == "cpu"
+    assert inference_kwargs == {
+        "token": "hf_test",
+        "cache_dir": str(cache_dir),
+    }
+    assert identity == requested
 
 
 def test_bound_checkpoint_accepts_stable_bytes(tmp_path) -> None:
@@ -67,16 +193,16 @@ def test_bound_checkpoint_accepts_stable_bytes(tmp_path) -> None:
     payload = b"stable checkpoint bytes"
     checkpoint.write_bytes(payload)
     sentinel = object()
-    seen: list[Path] = []
+    seen: list[bytes] = []
 
-    def construct(resolved: Path):
-        seen.append(resolved)
+    def construct(bound: io.BytesIO):
+        seen.append(bound.getvalue())
         return sentinel
 
     value, digest = turnembed._construct_bound_checkpoint(checkpoint, construct)
 
     assert value is sentinel
-    assert seen == [checkpoint.resolve()]
+    assert seen == [payload]
     assert digest == hashlib.sha256(payload).hexdigest()
 
 
@@ -84,8 +210,10 @@ def test_bound_checkpoint_refuses_mutation_during_construction(tmp_path) -> None
     checkpoint = tmp_path / "checkpoint.bin"
     checkpoint.write_bytes(b"before")
 
-    def mutate(resolved: Path):
-        resolved.write_bytes(b"after")
+    def mutate(bound: io.BytesIO):
+        bound.seek(0)
+        bound.write(b"after")
+        bound.truncate()
         return object()
 
     with pytest.raises(
@@ -93,6 +221,70 @@ def test_bound_checkpoint_refuses_mutation_during_construction(tmp_path) -> None
         match="checkpoint changed during construction",
     ):
         turnembed._construct_bound_checkpoint(checkpoint, mutate)
+
+
+def test_bound_checkpoint_ignores_path_aba_during_construction(tmp_path) -> None:
+    checkpoint = tmp_path / "checkpoint.bin"
+    payload = b"attested checkpoint bytes"
+    checkpoint.write_bytes(payload)
+
+    def replace_path(bound: io.BytesIO):
+        checkpoint.write_bytes(b"unattested replacement")
+        loaded = bound.getvalue()
+        checkpoint.write_bytes(payload)
+        return loaded
+
+    value, digest = turnembed._construct_bound_checkpoint(checkpoint, replace_path)
+
+    assert value == payload
+    assert digest == hashlib.sha256(payload).hexdigest()
+
+
+def test_bound_checkpoint_refuses_requested_digest_mismatch_before_construction(
+    tmp_path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint.bin"
+    checkpoint.write_bytes(b"actual")
+    constructed = False
+
+    def construct(_bound: io.BytesIO):
+        nonlocal constructed
+        constructed = True
+        return object()
+
+    with pytest.raises(
+        turnembed.TurnEmbeddingError,
+        match="does not match requested identity",
+    ):
+        turnembed._construct_bound_checkpoint(
+            checkpoint,
+            construct,
+            expected_sha256=hashlib.sha256(b"expected").hexdigest(),
+        )
+
+    assert constructed is False
+
+
+def test_requested_pyannote_version_mismatch_refuses_before_download(
+    monkeypatch,
+) -> None:
+    identity = turnembed.EmbeddingIdentity(
+        model=turnembed.EMBEDDING_MODEL,
+        checkpoint_sha256="a" * 64,
+        pyannote_version="4.0.6",
+    )
+    monkeypatch.setattr(turnembed, "_pyannote_version", lambda: "4.0.7")
+    monkeypatch.setattr(
+        turnembed,
+        "_download_checkpoint",
+        lambda *_args: pytest.fail("version mismatch must precede download"),
+    )
+
+    with pytest.raises(
+        turnembed.TurnEmbeddingError,
+        match="version does not match requested identity",
+    ):
+        turnembed._load_inference(identity)
 
 
 def test_checkpoint_identity_hashes_contents_not_filename(tmp_path) -> None:
@@ -118,7 +310,7 @@ def test_inference_identity_is_published_with_singleton(monkeypatch) -> None:
     )
     calls = 0
 
-    def load_inference():
+    def load_inference(_expected_identity=None):
         nonlocal calls
         calls += 1
         return inference, identity
@@ -160,6 +352,22 @@ def test_attested_embeddings_are_dict_compatible_with_frozen_identity() -> None:
         )
 
 
+def test_attested_turn_request_is_a_frozen_sequence() -> None:
+    identity = turnembed.EmbeddingIdentity(
+        model="pyannote/example@" + ("e" * 40) + "#subfolder=embedding",
+        checkpoint_sha256="f" * 64,
+        pyannote_version="4.0.7",
+    )
+    turns = [(0.0, 1.0, "SPEAKER_00"), (1.0, 2.0, "SPEAKER_00")]
+    request = turnembed.AttestedTurnRequest(turns, identity=identity)
+
+    assert list(request) == turns
+    assert request[1:] == (turns[1],)
+    assert request.identity is identity
+    with pytest.raises(AttributeError):
+        setattr(request, "identity", identity)
+
+
 def test_turn_embeddings_contract_and_model_driven_padding(monkeypatch) -> None:
     model = _FakeEmbeddingModel(
         [_vector(3.0, 4.0), _vector(3.0, 4.0)],
@@ -172,13 +380,14 @@ def test_turn_embeddings_contract_and_model_driven_padding(monkeypatch) -> None:
         8 / turnembed.SAMPLE_RATE,
     )
 
-    embeddings = turnembed.turn_embeddings(
-        Path("unused.wav"),
+    turns = turnembed.AttestedTurnRequest(
         [
             (0.0, 4 / turnembed.SAMPLE_RATE, "SPEAKER_00"),
             (4 / turnembed.SAMPLE_RATE, 14 / turnembed.SAMPLE_RATE, "SPEAKER_00"),
         ],
+        identity=identity,
     )
+    embeddings = turnembed.turn_embeddings(Path("unused.wav"), turns)
 
     assert list(embeddings) == [0, 1]
     assert isinstance(embeddings, turnembed.AttestedTurnEmbeddings)

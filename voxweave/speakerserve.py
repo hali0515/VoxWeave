@@ -672,9 +672,17 @@ def _build_split_proposal(
 ) -> tuple[_SplitProposal, dict[str, object]]:
     staged = _stage_split_inputs(server, speaker_id)
     selected_turns = [staged.turns[index] for index in staged.selected_indices]
+    embedding_request = turnembed.AttestedTurnRequest(
+        selected_turns,
+        identity=turnembed.EmbeddingIdentity(
+            model=staged.embedding_model,
+            checkpoint_sha256=staged.embedding_checkpoint,
+            pyannote_version=staged.pyannote_version,
+        ),
+    )
     wav_path = _prepare_split_wav(server.media_path, staged)
     try:
-        provider_embeddings = turnembed.turn_embeddings(wav_path, selected_turns)
+        provider_embeddings = turnembed.turn_embeddings(wav_path, embedding_request)
         _require_embedding_identity(staged, provider_embeddings)
         expected = set(range(len(selected_turns)))
         if set(provider_embeddings) != expected:
