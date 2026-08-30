@@ -2,6 +2,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -493,7 +494,7 @@ class _SmoothingAnnotation:
 
 class _SmoothingPipeline:
     def __call__(self, _source, **kwargs):
-        assert kwargs["return_embeddings"] is True
+        assert "return_embeddings" not in kwargs
         embeddings = np.array(
             [
                 [1.0, *([0.0] * 15)],
@@ -501,7 +502,12 @@ class _SmoothingPipeline:
             ],
             dtype=np.float32,
         )
-        return _SmoothingAnnotation(), embeddings
+        annotation = _SmoothingAnnotation()
+        return SimpleNamespace(
+            speaker_diarization=annotation,
+            exclusive_speaker_diarization=annotation,
+            speaker_embeddings=embeddings,
+        )
 
 
 def test_smoothing_active_capture_publishes_valid_four_part_conjunction(
@@ -515,7 +521,9 @@ def test_smoothing_active_capture_publishes_valid_four_part_conjunction(
     # diarize_turns resolves the HF token before reaching the stubbed pipeline;
     # provide one so the test does not depend on ambient credentials.
     monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
-    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: _SmoothingPipeline())
+    monkeypatch.setattr(
+        diarize, "_get_pipeline", lambda _token, _model: _SmoothingPipeline()
+    )
     monkeypatch.setattr(
         diarize,
         "_build_provenance",

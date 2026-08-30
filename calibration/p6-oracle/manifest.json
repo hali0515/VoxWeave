@@ -10,11 +10,11 @@
     "interpreter": "CPython 3.13.12",
     "platform": "Linux x86_64",
     "package_version": "0.15.0",
-    "container_digest": "34797f833dcac6a81e2787e58c9d045185b87f8604976db2f1e96e3fb225a300",
+    "container_digest": "6e46df845d9ba2c5e85e79ed6170e2b6e52df78cd777506cd6d02b39dbc0495d",
     "locale": "C.UTF-8",
     "timezone": "unset",
     "hash_seed": "unset",
-    "dependency_lock_sha256": "c4462a20c14ca1ed8ac7008b76d1ca856d5d528fae93a8390254e2bba9bf8105"
+    "dependency_lock_sha256": "ef275eae33ffbd1ad7f5af701138cdd2a68f66dd7b77c8bb728d3bdf41023f98"
   },
   "registry_digests": {
     "align-delta-registry": "267bdf609013b7f2a37abef1a14b0a5fa6e9770fea0da958b5d92d64ce36f931",

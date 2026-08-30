@@ -1,12 +1,7 @@
 # tests/test_diarize_compat.py
-# torch/torchaudio 2.11 compatibility for pyannote.audio 3.4 diarization, with no
-# network / GPU / real pyannote. Covers: the torchaudio symbol shims
-# (AudioMetaData / info / list_audio_backends) applied only when missing,
-# idempotent, and never clobbering an older torchaudio that still ships them; and
-# diarize_turns feeding pyannote a {"waveform", "sample_rate"} dict (bypassing
-# pyannote's runtime torchaudio I/O) with defensive stereo downmix.
-import sys
-import types
+# pyannote.audio 4.x compatibility with no network / GPU / real pyannote.
+# Covers retirement of the 3.4-era torchaudio shim and diarize_turns feeding a
+# decoded waveform dictionary (bypassing torchcodec) with defensive stereo downmix.
 from pathlib import Path
 
 import numpy as np
@@ -17,13 +12,10 @@ import torch
 from voxweave import config, diarize
 
 
-def _fake_torchaudio(**attrs) -> types.ModuleType:
-    """A stand-in torchaudio module (``load`` present, like 2.11) plus overrides."""
-    m = types.ModuleType("torchaudio")
-    m.load = lambda *a, **k: None  # torchaudio 2.11 still ships load
-    for key, value in attrs.items():
-        setattr(m, key, value)
-    return m
+@pytest.fixture(autouse=True)
+def _isolated_model_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOXWEAVE_CONFIG", str(tmp_path / "voxweave.conf"))
+    monkeypatch.delenv("VOXWEAVE_DIARIZE_MODEL", raising=False)
 
 
 class _FakeSeg:
@@ -55,73 +47,8 @@ class _CapturePipeline:
         return _FakeAnnotation([(_FakeSeg(0.0, 1.0), "A", "SPEAKER_00")])
 
 
-# --- torchaudio shims -------------------------------------------------------
-
-
-def test_ensure_compat_adds_missing_symbols(monkeypatch):
-    fake = _fake_torchaudio()
-    monkeypatch.setitem(sys.modules, "torchaudio", fake)
-    diarize._ensure_torchaudio_compat()
-    assert hasattr(fake, "AudioMetaData")
-    assert hasattr(fake, "info")
-    assert hasattr(fake, "list_audio_backends")
-    assert fake.list_audio_backends() == ["soundfile"]
-    meta = fake.AudioMetaData(sample_rate=16000, num_frames=32000, num_channels=1)
-    assert meta.sample_rate == 16000
-    assert meta.num_frames == 32000
-    assert meta.num_channels == 1
-    assert meta.bits_per_sample == 0
-    assert meta.encoding == ""
-
-
-def test_ensure_compat_info_reads_via_soundfile(monkeypatch):
-    fake_ta = _fake_torchaudio()
-    monkeypatch.setitem(sys.modules, "torchaudio", fake_ta)
-
-    class _Info:
-        samplerate = 22050
-        frames = 44100
-        channels = 2
-
-    fake_sf = types.ModuleType("soundfile")
-    fake_sf.info = lambda path: _Info()
-    monkeypatch.setitem(sys.modules, "soundfile", fake_sf)
-
-    diarize._ensure_torchaudio_compat()
-    meta = fake_ta.info("whatever.wav")
-    assert (meta.sample_rate, meta.num_frames, meta.num_channels) == (22050, 44100, 2)
-
-
-def test_ensure_compat_is_idempotent(monkeypatch):
-    fake = _fake_torchaudio()
-    monkeypatch.setitem(sys.modules, "torchaudio", fake)
-    diarize._ensure_torchaudio_compat()
-    amd, info, backends = fake.AudioMetaData, fake.info, fake.list_audio_backends
-    diarize._ensure_torchaudio_compat()  # second call must not rebuild the shims
-    assert fake.AudioMetaData is amd
-    assert fake.info is info
-    assert fake.list_audio_backends is backends
-
-
-def test_ensure_compat_leaves_existing_symbols(monkeypatch):
-    sentinel_amd = object()
-
-    def sentinel_info(*a, **k):
-        return "real"
-
-    def sentinel_backends():
-        return ["ffmpeg", "soundfile"]
-
-    fake = _fake_torchaudio(
-        AudioMetaData=sentinel_amd,
-        info=sentinel_info,
-        list_audio_backends=sentinel_backends,
-    )
-    monkeypatch.setitem(sys.modules, "torchaudio", fake)
-    diarize._ensure_torchaudio_compat()
-    assert fake.AudioMetaData is sentinel_amd
-    assert fake.info is sentinel_info
-    assert fake.list_audio_backends is sentinel_backends
+def test_pyannote34_torchaudio_shim_is_retired():
+    assert not hasattr(diarize, "_ensure_torchaudio_compat")
 
 
 # --- diarize_turns waveform-dict input --------------------------------------
@@ -133,7 +60,7 @@ def test_diarize_turns_feeds_waveform_dict(monkeypatch, tmp_path):
     sf.write(str(wav_path), sig, 16000, subtype="FLOAT")
 
     fake = _CapturePipeline()
-    monkeypatch.setattr(diarize, "_get_pipeline", lambda token: fake)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token, _model: fake)
 
     result = diarize.diarize_turns(wav_path, token="hf_test")
     assert result.turns == [(0.0, 1.0, "SPEAKER_00")]
@@ -157,7 +84,7 @@ def test_diarize_turns_downmixes_stereo(monkeypatch, tmp_path):
     sf.write(str(wav_path), np.stack([left, right], axis=1), 16000, subtype="FLOAT")
 
     fake = _CapturePipeline()
-    monkeypatch.setattr(diarize, "_get_pipeline", lambda token: fake)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token, _model: fake)
 
     diarize.diarize_turns(wav_path, token="hf_test")
     wf = fake.calls[0][0]["waveform"]
@@ -170,10 +97,10 @@ def test_diarize_turns_no_token_mentions_hf_auth_login(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(config, "conf_hf_token", lambda: None)
 
-    def _boom(token):
+    def _boom(_token, _model):
         raise AssertionError("pipeline must not load without a token")
 
     monkeypatch.setattr(diarize, "_get_pipeline", _boom)
     with pytest.raises(RuntimeError) as ei:
-        diarize.diarize_turns(Path("nope.wav"))
+        diarize.diarize_turns(Path("nope.wav"), model="3.1")
     assert "hf auth login" in str(ei.value)

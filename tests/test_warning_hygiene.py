@@ -66,6 +66,9 @@ def tiny_wav(tmp_path):
 def fake_pipeline(monkeypatch):
     def install(pl):
         monkeypatch.setattr(diarize, "_pipeline", pl)
+        monkeypatch.setattr(
+            diarize, "_pipeline_model", diarize.config.DEFAULT_DIARIZE_MODEL
+        )
         return pl
 
     yield install
@@ -82,7 +85,7 @@ def test_diarize_disables_tf32_for_inference_and_restores(
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.allow_tf32 = True
     try:
-        result = diarize.diarize_turns(tiny_wav, token="dummy")
+        result = diarize.diarize_turns(tiny_wav, token="dummy", model="3.1")
         assert result.turns == []
         assert pl.seen_matmul_tf32 is False
         assert pl.seen_cudnn_tf32 is False
@@ -105,7 +108,7 @@ def test_diarize_restores_tf32_policy_when_pipeline_raises(
     torch.backends.cudnn.allow_tf32 = True
     try:
         with pytest.raises(RuntimeError, match="boom"):
-            diarize.diarize_turns(tiny_wav, token="dummy")
+            diarize.diarize_turns(tiny_wav, token="dummy", model="3.1")
         assert torch.get_float32_matmul_precision() == "high"
         assert torch.backends.cudnn.allow_tf32 is True
     finally:
@@ -117,7 +120,7 @@ def test_diarize_swallows_known_pipeline_warnings(tiny_wav, fake_pipeline) -> No
     fake_pipeline(_FakePipeline(warn=True))
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter("always")
-        diarize.diarize_turns(tiny_wav, token="dummy")
+        diarize.diarize_turns(tiny_wav, token="dummy", model="3.1")
     noisy = [
         r
         for r in records

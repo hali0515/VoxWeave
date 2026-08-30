@@ -250,6 +250,16 @@ def cli(verbose: bool) -> None:
     " Default: off, or conf [defaults].diarize.",
 )
 @click.option(
+    "--diarize-model",
+    default=None,
+    metavar="MODEL",
+    help=(
+        "Diarization pipeline: 3.1 (default), community-1, or any Hugging Face "
+        "pipeline ID. Precedence: CLI, VOXWEAVE_DIARIZE_MODEL, conf "
+        "[diarize].model, then 3.1."
+    ),
+)
+@click.option(
     "--voiceprints/--no-voiceprints",
     default=None,
     help=(
@@ -324,6 +334,7 @@ def cmd_transcribe(
     keep_lyrics: bool,
     sdh: bool,
     diarize: bool | None,
+    diarize_model: str | None,
     voiceprints: bool | None,
     min_speakers: int | None,
     max_speakers: int | None,
@@ -348,6 +359,7 @@ def cmd_transcribe(
         )
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
+    diarize_model = config.resolve_diarize_model(diarize_model)
     if voiceprints and not diarize:
         raise click.UsageError(
             "voiceprint capture is on from "
@@ -368,6 +380,7 @@ def cmd_transcribe(
             keep_lyrics=keep_lyrics,
             sdh=sdh,
             diarize=diarize,
+            diarize_model=diarize_model,
             voiceprints=voiceprints,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
