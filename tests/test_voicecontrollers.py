@@ -150,6 +150,18 @@ def test_matching_prefill_stays_html_only_and_mapping_empty(tmp_path, monkeypatc
     assert "Aqua" not in rendered
 
 
+def test_cross_model_embedding_space_skips_voice_matching(tmp_path, caplog):
+    sidecar_provenance = copy.deepcopy(PROVENANCE)
+    sidecar_provenance["diarization_model"] = "pyannote/speaker-diarization-community-1"
+    store_provenance = copy.deepcopy(sidecar_provenance)
+    store_provenance["diarization_model"] = "pyannote/speaker-diarization-3.1"
+    sidecar = {"provenance": sidecar_provenance}
+    store = new_voice_store("Example Show", store_provenance)
+
+    assert speakers._matching_record(sidecar, tmp_path / "voices.json", store) is None
+    assert "compatibility differs" in caplog.text
+
+
 def test_store_names_are_context_escaped_and_vectors_never_render(
     tmp_path, monkeypatch
 ):

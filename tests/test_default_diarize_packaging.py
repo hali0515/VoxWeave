@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PYANNOTE_REQUIREMENT = "pyannote-audio>=3.4,<4"
+PYANNOTE_REQUIREMENT = "pyannote-audio>=4,<5"
 STALE_SEMANTIC_SPLIT = re.compile(
     r"\bsemantic\b[^\r\n]{0,96}?\bsplit\w*\b",
     flags=re.IGNORECASE,
@@ -65,7 +65,7 @@ def test_lock_records_pyannote_as_core_and_preserves_the_empty_alias() -> None:
     assert "diarize" not in optional  # uv omits empty optional-dependency tables
     assert {
         "name": "pyannote-audio",
-        "specifier": ">=3.4,<4",
+        "specifier": ">=4,<5",
     } in metadata["requires-dist"]
     assert "diarize" in metadata["provides-extras"]
     locked_pyannote = next(
@@ -75,7 +75,7 @@ def test_lock_records_pyannote_as_core_and_preserves_the_empty_alias() -> None:
         )["package"]
         if package["name"] == "pyannote-audio"
     )
-    assert locked_pyannote["version"].split(".", 1)[0] == "3"
+    assert locked_pyannote["version"].split(".", 1)[0] == "4"
 
 
 def test_make_install_has_no_diarize_extra_detection(tmp_path: Path) -> None:
@@ -134,7 +134,12 @@ def test_readme_describes_default_install_and_opt_in_runtime() -> None:
     assert "pyannote-audio" in lowered
     assert "ships by default" in lowered
     assert "--diarize" in readme
+    assert "--diarize-model" in readme
+    assert "VOXWEAVE_DIARIZE_MODEL" in readme
     assert "pyannote/speaker-diarization-3.1" in readme
+    assert "pyannote/speaker-diarization-community-1" in readme
+    assert "CC-BY-4.0" in readme
+    assert "2,723.963 MiB" in readme
     assert "hf auth login" in readme
     assert "VOXWEAVE_HF_TOKEN" in readme
     assert "HF_TOKEN" in readme

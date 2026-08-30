@@ -6,6 +6,8 @@
 # constants overridable by env. Plus --min-speakers/--max-speakers plumbing
 # (CLI -> pipeline.process -> transcribe -> diarize_turns).
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import soundfile as sf
@@ -94,9 +96,11 @@ class _FakePipeline:
     def __call__(self, file, **kwargs):
         self.calls.append((file, kwargs))
         annotation = _FakeAnnotation(self._tracks, self._labels)
-        if kwargs.get("return_embeddings"):
-            return annotation, self._embeddings
-        return annotation
+        return SimpleNamespace(
+            speaker_diarization=annotation,
+            exclusive_speaker_diarization=annotation,
+            speaker_embeddings=self._embeddings,
+        )
 
 
 def _wav(tmp_path):
@@ -112,14 +116,14 @@ def test_diarize_turns_smooths_output(monkeypatch, tmp_path):
         (_FakeSeg(1.2, 2.0), "b", "SPEAKER_00"),
     ]
     fake = _FakePipeline(tracks)
-    monkeypatch.setattr(diarize, "_get_pipeline", lambda token: fake)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token, _model: fake)
     result = diarize.diarize_turns(_wav(tmp_path), token="hf_test")
     assert result.turns == [(0.0, 2.0, "SPEAKER_00")]
 
 
 def test_diarize_turns_forwards_min_max_speakers(monkeypatch, tmp_path):
     fake = _FakePipeline([(_FakeSeg(0.0, 1.0), "a", "SPEAKER_00")])
-    monkeypatch.setattr(diarize, "_get_pipeline", lambda token: fake)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token, _model: fake)
     diarize.diarize_turns(
         _wav(tmp_path), token="hf_test", min_speakers=2, max_speakers=3
     )
@@ -145,13 +149,13 @@ def test_embedding_rows_follow_labels_and_drop_zero_padding(monkeypatch, tmp_pat
             ]
         ),
     )
-    monkeypatch.setattr(diarize, "_get_pipeline", lambda token: fake)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token, _model: fake)
 
     result = diarize.diarize_turns(
         _wav(tmp_path), token="hf_test", want_embeddings=True
     )
 
-    assert fake.calls[0][1]["return_embeddings"] is True
+    assert "return_embeddings" not in fake.calls[0][1]
     assert set(result.centroids or {}) == {"SPEAKER_A", "SPEAKER_B"}
     assert (result.centroids or {})["SPEAKER_B"][:2] == pytest.approx([0.6, 0.8])
     assert (result.centroids or {})["SPEAKER_A"][2] == pytest.approx(1.0)

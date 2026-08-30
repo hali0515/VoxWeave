@@ -9,25 +9,26 @@ hyphen, no space) when the language allows two lines and both halves fit one
 line, otherwise the cue splits at the speaker boundaries. ``split`` replays
 formatting from the persisted turns without re-running pyannote.
 
-Model: ``pyannote/speaker-diarization-3.1`` (pyannote.audio 3.x; MIT, ~1.6 GB
-VRAM). The checkpoint is HF-gated: accept the conditions on the model card and
-provide a token (VOXWEAVE_HF_TOKEN / HF_TOKEN env, or ``hf_token`` in the conf).
+The default pipeline remains ``pyannote/speaker-diarization-3.1`` for existing
+gated-model access. ``community-1`` and arbitrary Hugging Face pipeline IDs are
+selectable per invocation. Both bundled aliases run through pyannote.audio 4.x.
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.metadata
 import logging
 import math
 import os
-import sys
-import tempfile
+import threading
 import warnings
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Iterator, cast
 
 import yaml
 
@@ -40,12 +41,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("voxweave")
 
-DIARIZE_MODEL = os.environ.get(
-    "VOXWEAVE_DIARIZE_MODEL", "pyannote/speaker-diarization-3.1"
-)
+DIARIZE_MODEL = config.DEFAULT_DIARIZE_MODEL
+COMMUNITY_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
 EMBEDDING_CHECKPOINT_FILE = "pytorch_model.bin"
-PYANNOTE_CACHE_ENV = "PYANNOTE_CACHE"
-PYANNOTE_CACHE_SUBDIR = "pyannote"
 
 # Atom-level speaker assignment needs at least this much absolute overlap with a
 # turn (seconds); below it the atom inherits its neighbors (guards 20ms grazes).
@@ -114,18 +112,20 @@ class _EmbeddingCheckpointBinding:
 class _EmbeddingLoadAuthority:
     """Embedding source passed to the loader and its pre-load authority."""
 
-    loader_value: str
+    loader_value: object
     provenance_value: str
     binding: _EmbeddingCheckpointBinding
-    local_path: Path | None
+    loaded_path: Path
 
 
 @dataclass(frozen=True)
 class _PipelineLoadPlan:
     """Immutable pipeline config plus the embedding authority it carries."""
 
-    config_yaml: str | None
+    checkpoint: str | Path | dict[str, Any]
+    revision: str | None
     authority: _EmbeddingLoadAuthority | None
+    outer_config_sha256: str
 
 
 class EmbeddingCheckpointChangedError(RuntimeError):
@@ -134,6 +134,7 @@ class EmbeddingCheckpointChangedError(RuntimeError):
 
 _EMBEDDING_BINDING_ATTR = "_voxweave_embedding_checkpoint_binding"
 _EMBEDDING_MODEL_ATTR = "_voxweave_embedding_model"
+_OUTER_CONFIG_ATTR = "_voxweave_outer_config_sha256"
 
 
 def _sha256_file(path: Path) -> str:
@@ -144,199 +145,368 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _outer_config_identity() -> str:
-    """Hash the exact cached/local pyannote pipeline config, if discoverable."""
-    configured = Path(DIARIZE_MODEL)
-    if configured.is_file():
-        try:
-            return _sha256_file(configured)
-        except OSError:
-            return "unresolved"
-    if "@" in DIARIZE_MODEL:
-        model_id, revision = DIARIZE_MODEL.rsplit("@", 1)
-    else:
-        model_id, revision = DIARIZE_MODEL, None
-    try:
-        from huggingface_hub import try_to_load_from_cache
-
-        cached = try_to_load_from_cache(
-            model_id,
-            "config.yaml",
-            revision=revision,
-            cache_dir=config.AUDIO_CACHE,
-        )
-        if isinstance(cached, str):
-            return _sha256_file(Path(cached))
-    except (ImportError, OSError, ValueError):
-        pass
-    return "unresolved"
+def _split_model_revision(model: str) -> tuple[str, str | None]:
+    """Split Hugging Face ``repo@revision`` without rewriting local paths."""
+    if Path(model).exists() or "@" not in model:
+        return model, None
+    model_id, revision = model.rsplit("@", 1)
+    if not model_id or not revision:
+        return model, None
+    return model_id, revision
 
 
-def _private_pyannote_cache() -> Path:
-    """Return the pyannote-owned HF cache inside VoxWeave's audio cache."""
-    return Path(config.AUDIO_CACHE) / PYANNOTE_CACHE_SUBDIR
-
-
-def _configure_pyannote_cache() -> None:
-    """Keep pyannote's non-propagated nested downloads in VoxWeave's cache."""
-    if PYANNOTE_CACHE_ENV not in os.environ:
-        os.environ[PYANNOTE_CACHE_ENV] = os.fspath(_private_pyannote_cache())
-
-
-def _snapshot_commit(cached_path: Path, model_id: str) -> str | None:
-    """Extract a content-addressed commit from a standard HF snapshot path."""
-    if cached_path.name != EMBEDDING_CHECKPOINT_FILE:
-        return None
-    snapshot = cached_path.parent
-    snapshots = snapshot.parent
-    repo_cache = snapshots.parent
-    commit = snapshot.name
-    expected_repo_cache = f"models--{model_id.replace('/', '--')}"
-    if snapshots.name != "snapshots" or repo_cache.name != expected_repo_cache:
-        return None
-    if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
-        return None
-    return commit
-
-
-def _embedding_load_authority(
-    raw_path: object,
-) -> _EmbeddingLoadAuthority | None:
-    """Fix one local path or cached hub snapshot before model construction."""
-    if not isinstance(raw_path, (str, os.PathLike)):
-        return None
-    try:
-        resolved = Path(raw_path).resolve(strict=True)
-    except OSError:
-        pass
-    else:
-        try:
-            binding = _EmbeddingCheckpointBinding(
-                path=resolved, sha256=_sha256_file(resolved)
-            )
-            return _EmbeddingLoadAuthority(
-                loader_value=os.fspath(resolved),
-                provenance_value=os.fspath(raw_path),
-                binding=binding,
-                local_path=resolved,
-            )
-        except OSError:
+def _snapshot_commit(
+    cached_path: Path,
+    model_id: str,
+    *,
+    filename: str = EMBEDDING_CHECKPOINT_FILE,
+    subfolder: str | None = None,
+) -> str | None:
+    """Extract a commit from a validated HF snapshot path, including subfolders."""
+    absolute = cached_path.absolute()
+    expected_relative = Path(subfolder) / filename if subfolder else Path(filename)
+    for snapshot in absolute.parents:
+        if snapshot.parent.name != "snapshots":
+            continue
+        repo_cache = snapshot.parent.parent
+        expected_repo_cache = f"models--{model_id.replace('/', '--')}"
+        if repo_cache.name != expected_repo_cache:
             return None
-
-    if not isinstance(raw_path, str):
-        return None
-    if "@" in raw_path:
-        model_id, revision = raw_path.rsplit("@", 1)
-    else:
-        model_id, revision = raw_path, None
-    try:
-        from huggingface_hub import try_to_load_from_cache
-    except ImportError:
-        return None
-    model_module = sys.modules.get("pyannote.audio.core.model")
-    if model_module is None or not hasattr(model_module, "CACHE_DIR"):
-        return None
-    cache_dir = getattr(model_module, "CACHE_DIR")
-    if cache_dir is not None and not isinstance(cache_dir, (str, os.PathLike)):
-        return None
-    if cache_dir is not None:
-        cache_dir = os.fspath(cache_dir)
-    try:
-        cached = try_to_load_from_cache(
-            model_id,
-            EMBEDDING_CHECKPOINT_FILE,
-            revision=revision,
-            cache_dir=cache_dir,
-        )
-        if isinstance(cached, str):
-            cached_path = Path(cached).absolute()
-            commit = _snapshot_commit(cached_path, model_id)
-            if commit is None:
-                return None
-            resolved = cached_path.resolve(strict=True)
-            binding = _EmbeddingCheckpointBinding(
-                path=resolved, sha256=_sha256_file(resolved)
-            )
-            return _EmbeddingLoadAuthority(
-                loader_value=os.fspath(resolved),
-                provenance_value=raw_path,
-                binding=binding,
-                local_path=None,
-            )
-    except (OSError, ValueError):
-        pass
+        try:
+            relative = absolute.relative_to(snapshot)
+        except ValueError:
+            return None
+        if relative != expected_relative:
+            return None
+        commit = snapshot.name
+        if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit):
+            return None
+        return commit
     return None
 
 
-def _pipeline_config_path() -> Path | None:
-    """Resolve the exact local/cached pipeline config used to plan construction."""
-    configured = Path(DIARIZE_MODEL)
+def _canonical_embedding_source(
+    checkpoint: str,
+    *,
+    revision: str | None,
+    subfolder: str | None,
+) -> str:
+    source = checkpoint if revision is None else f"{checkpoint}@{revision}"
+    if subfolder:
+        source = f"{source}#subfolder={subfolder}"
+    return source
+
+
+def _pipeline_config_path(model: str, token: str | None = None) -> Path | None:
+    """Download or resolve the exact pipeline config inside VoxWeave's cache."""
+    configured = Path(model)
+    if configured.is_dir():
+        configured = configured / "config.yaml"
     try:
         return configured.resolve(strict=True)
     except OSError:
         pass
-    if "@" in DIARIZE_MODEL:
-        model_id, revision = DIARIZE_MODEL.rsplit("@", 1)
-    else:
-        model_id, revision = DIARIZE_MODEL, None
+    model_id, revision = _split_model_revision(model)
     try:
-        from huggingface_hub import try_to_load_from_cache
+        from huggingface_hub import hf_hub_download
 
-        cached = try_to_load_from_cache(
+        cached = hf_hub_download(
             model_id,
             "config.yaml",
             revision=revision,
+            token=token,
             cache_dir=config.AUDIO_CACHE,
         )
-        if isinstance(cached, str):
-            return Path(cached).absolute()
     except (ImportError, OSError, ValueError):
-        pass
-    return None
+        return None
+    return Path(cached).absolute()
 
 
-def _prepare_pipeline_load() -> _PipelineLoadPlan:
-    """Pin the nested embedding source in a private pipeline-config copy."""
-    config_path = _pipeline_config_path()
-    if config_path is None:
-        return _PipelineLoadPlan(config_yaml=None, authority=None)
+def _outer_config_identity(
+    model: str = DIARIZE_MODEL,
+    token: str | None = None,
+) -> str:
+    """Hash the exact local/cached pyannote pipeline config."""
     try:
-        with config_path.open("r", encoding="utf-8") as stream:
-            document: Any = yaml.safe_load(stream)
-    except (OSError, UnicodeError, yaml.YAMLError):
-        return _PipelineLoadPlan(config_yaml=None, authority=None)
-    if not isinstance(document, dict):
-        return _PipelineLoadPlan(config_yaml=None, authority=None)
+        config_path = _pipeline_config_path(model, token)
+        return "unresolved" if config_path is None else _sha256_file(config_path)
+    except (OSError, ValueError):
+        return "unresolved"
 
+
+def _embedding_load_authority(
+    raw_path: object,
+    *,
+    parent_model: str | None = None,
+    parent_revision: str | None = None,
+    token: str | None = None,
+) -> _EmbeddingLoadAuthority | None:
+    """Bind one local or Hub embedding checkpoint before construction."""
+    original_mapping = dict(raw_path) if isinstance(raw_path, Mapping) else None
+    checkpoint: object = raw_path
+    revision: object = None
+    subfolder: object = None
+    if isinstance(raw_path, Mapping):
+        checkpoint = raw_path.get("checkpoint")
+        revision = raw_path.get("revision")
+        subfolder = raw_path.get("subfolder")
+    elif isinstance(raw_path, str) and raw_path.startswith("$model/"):
+        checkpoint = parent_model
+        revision = parent_revision
+        subfolder = raw_path.removeprefix("$model/")
+
+    if not isinstance(checkpoint, (str, os.PathLike)):
+        return None
+    if revision is not None and not isinstance(revision, str):
+        return None
+    if subfolder is not None and not isinstance(subfolder, str):
+        return None
+    raw_checkpoint = os.fspath(checkpoint)
+    configured = Path(raw_checkpoint)
+    local_checkpoint: Path | None = None
+
+    def mapping_loader_value(
+        resolved_checkpoint: str,
+        *,
+        resolved_revision: str | None,
+        resolved_subfolder: str | None,
+    ) -> dict[str, object]:
+        value = dict(original_mapping or {})
+        value["checkpoint"] = resolved_checkpoint
+        if resolved_revision is not None:
+            value["revision"] = resolved_revision
+        elif original_mapping is None:
+            value.pop("revision", None)
+        if resolved_subfolder is not None:
+            value["subfolder"] = resolved_subfolder
+        elif original_mapping is None:
+            value.pop("subfolder", None)
+        if original_mapping is None:
+            # pyannote's string branch calls Model.from_pretrained(strict=False).
+            value["strict"] = False
+        value["token"] = token
+        value["cache_dir"] = config.AUDIO_CACHE
+        return value
+
+    if configured.is_file() and not subfolder:
+        local_checkpoint = configured
+        resolved_configured = os.fspath(configured.resolve(strict=True))
+        loader_value: object = (
+            resolved_configured
+            if original_mapping is None
+            else mapping_loader_value(
+                resolved_configured,
+                resolved_revision=cast(str | None, revision),
+                resolved_subfolder=None,
+            )
+        )
+    elif configured.is_dir():
+        local_checkpoint = configured
+        if subfolder:
+            local_checkpoint = local_checkpoint / subfolder
+        local_checkpoint = local_checkpoint / EMBEDDING_CHECKPOINT_FILE
+        loader_value = mapping_loader_value(
+            os.fspath(configured.resolve(strict=True)),
+            resolved_revision=cast(str | None, revision),
+            resolved_subfolder=cast(str | None, subfolder),
+        )
+    else:
+        model_id, inline_revision = _split_model_revision(raw_checkpoint)
+        selected_revision = cast(str | None, revision) or inline_revision
+        try:
+            from huggingface_hub import hf_hub_download
+            from huggingface_hub.errors import EntryNotFoundError
+
+            cached = hf_hub_download(
+                model_id,
+                EMBEDDING_CHECKPOINT_FILE,
+                subfolder=cast(str | None, subfolder),
+                revision=selected_revision,
+                token=token,
+                cache_dir=config.AUDIO_CACHE,
+            )
+        except EntryNotFoundError:
+            return None
+        except (ImportError, OSError, ValueError):
+            return None
+        cached_path = Path(cached).absolute()
+        commit = _snapshot_commit(
+            cached_path,
+            model_id,
+            subfolder=cast(str | None, subfolder),
+        )
+        pinned_revision = commit or selected_revision
+        local_checkpoint = cached_path
+        loader_value = mapping_loader_value(
+            model_id,
+            resolved_revision=pinned_revision,
+            resolved_subfolder=cast(str | None, subfolder),
+        )
+        raw_checkpoint = model_id
+        revision = pinned_revision
+
+    try:
+        resolved = local_checkpoint.resolve(strict=True)
+        binding = _EmbeddingCheckpointBinding(
+            path=resolved,
+            sha256=_sha256_file(resolved),
+        )
+    except OSError:
+        return None
+    return _EmbeddingLoadAuthority(
+        loader_value=loader_value,
+        provenance_value=_canonical_embedding_source(
+            raw_checkpoint,
+            revision=cast(str | None, revision),
+            subfolder=cast(str | None, subfolder),
+        ),
+        binding=binding,
+        loaded_path=resolved,
+    )
+
+
+def _expand_model_references(
+    value: object,
+    *,
+    model_id: str,
+    revision: str | None,
+    token: str | None,
+    parent_subfolder: str | None = None,
+) -> None:
+    """Expand pyannote 4.x ``$model/subfolder`` references with stable coordinates."""
+
+    def expand(reference: str) -> dict[str, object]:
+        subfolder = reference.removeprefix("$model/")
+        if "@" in subfolder:
+            subfolder, child_revision = subfolder.rsplit("@", 1)
+        else:
+            child_revision = revision
+        if parent_subfolder:
+            subfolder = f"{parent_subfolder.rstrip('/')}/{subfolder.lstrip('/')}"
+        return {
+            "checkpoint": model_id,
+            **({"revision": child_revision} if child_revision is not None else {}),
+            "subfolder": subfolder,
+            "token": token,
+            "cache_dir": config.AUDIO_CACHE,
+        }
+
+    if isinstance(value, dict):
+        for key, child in tuple(value.items()):
+            if isinstance(child, str) and child.startswith("$model/"):
+                value[key] = expand(child)
+            else:
+                _expand_model_references(
+                    child,
+                    model_id=model_id,
+                    revision=revision,
+                    token=token,
+                    parent_subfolder=parent_subfolder,
+                )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            if isinstance(child, str) and child.startswith("$model/"):
+                value[index] = expand(child)
+            else:
+                _expand_model_references(
+                    child,
+                    model_id=model_id,
+                    revision=revision,
+                    token=token,
+                    parent_subfolder=parent_subfolder,
+                )
+
+
+def _prepare_pipeline_load(
+    model: str = DIARIZE_MODEL,
+    token: str | None = None,
+) -> _PipelineLoadPlan:
+    """Pin outer config and embedding coordinates before pipeline construction."""
+    model_id, requested_revision = _split_model_revision(model)
+    config_path = _pipeline_config_path(model, token)
+    if config_path is None:
+        return _PipelineLoadPlan(
+            checkpoint=model_id,
+            revision=requested_revision,
+            authority=None,
+            outer_config_sha256="unresolved",
+        )
+    try:
+        config_bytes = config_path.read_bytes()
+        outer_sha256 = hashlib.sha256(config_bytes).hexdigest()
+        document: Any = yaml.safe_load(config_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return _PipelineLoadPlan(
+            checkpoint=model_id,
+            revision=requested_revision,
+            authority=None,
+            outer_config_sha256="unresolved",
+        )
+    if not isinstance(document, dict):
+        return _PipelineLoadPlan(
+            checkpoint=model_id,
+            revision=requested_revision,
+            authority=None,
+            outer_config_sha256=outer_sha256,
+        )
+
+    try:
+        configured_model = Path(model).resolve(strict=True)
+    except OSError:
+        configured_model = None
+    if configured_model is None:
+        snapshot_revision = _snapshot_commit(
+            config_path,
+            model_id,
+            filename="config.yaml",
+        )
+        pinned_revision = snapshot_revision or requested_revision
+        reference_model = model_id
+    else:
+        pinned_revision = None
+        reference_model = os.fspath(
+            configured_model if configured_model.is_dir() else configured_model.parent
+        )
+    _expand_model_references(
+        document,
+        model_id=reference_model,
+        revision=pinned_revision,
+        token=token,
+    )
     authority = None
     pipeline_config = document.get("pipeline")
     if isinstance(pipeline_config, dict):
         params = pipeline_config.get("params")
         if isinstance(params, dict):
-            authority = _embedding_load_authority(params.get("embedding"))
+            authority = _embedding_load_authority(
+                params.get("embedding"),
+                parent_model=reference_model,
+                parent_revision=pinned_revision,
+                token=token,
+            )
             if authority is not None:
                 params["embedding"] = authority.loader_value
-    try:
-        config_yaml = yaml.safe_dump(
-            document,
-            allow_unicode=True,
-            sort_keys=False,
-        )
-    except yaml.YAMLError:
-        return _PipelineLoadPlan(config_yaml=None, authority=None)
-    return _PipelineLoadPlan(config_yaml=config_yaml, authority=authority)
+    return _PipelineLoadPlan(
+        checkpoint=document,
+        revision=None,
+        authority=authority,
+        outer_config_sha256=outer_sha256,
+    )
 
 
 def _store_embedding_checkpoint(
     pipeline: object,
     binding: _EmbeddingCheckpointBinding | None,
     model: str | None = None,
+    outer_config_sha256: str | None = None,
 ) -> None:
     """Carry a pre-construction binding onto the resident pipeline once."""
     try:
         if model is not None:
             setattr(pipeline, _EMBEDDING_MODEL_ATTR, model)
         setattr(pipeline, _EMBEDDING_BINDING_ATTR, binding)
+        if outer_config_sha256 is not None:
+            setattr(pipeline, _OUTER_CONFIG_ATTR, outer_config_sha256)
     except (AttributeError, TypeError):
         log.warning("could not bind embedding checkpoint provenance to pipeline")
 
@@ -359,25 +529,46 @@ def _package_version(distribution: str) -> str:
 def _build_provenance(
     pipeline: object,
     *,
+    model: str = DIARIZE_MODEL,
     embedding_dim: int | str,
     audio_profile: Mapping[str, object] | None,
     torch_version: str,
 ) -> dict[str, object]:
-    embedding_model = getattr(
-        pipeline,
-        _EMBEDDING_MODEL_ATTR,
-        getattr(pipeline, "embedding", "unresolved"),
-    )
+    embedding_model = getattr(pipeline, _EMBEDDING_MODEL_ATTR, None)
     if not isinstance(embedding_model, str) or not embedding_model:
-        embedding_model = "unresolved"
+        raw_embedding = getattr(pipeline, "embedding", None)
+        if isinstance(raw_embedding, str) and raw_embedding:
+            embedding_model = raw_embedding
+        elif isinstance(raw_embedding, Mapping):
+            checkpoint = raw_embedding.get("checkpoint")
+            revision = raw_embedding.get("revision")
+            subfolder = raw_embedding.get("subfolder")
+            if (
+                isinstance(checkpoint, str)
+                and checkpoint
+                and (revision is None or isinstance(revision, str))
+                and (subfolder is None or isinstance(subfolder, str))
+            ):
+                embedding_model = _canonical_embedding_source(
+                    checkpoint,
+                    revision=cast(str | None, revision),
+                    subfolder=cast(str | None, subfolder),
+                )
+            else:
+                embedding_model = "unresolved"
+        else:
+            embedding_model = "unresolved"
     audio: dict[str, object] = (
         dict(audio_profile)
         if audio_profile is not None
         else {"separated": False, "normalized": False, "sample_rate": 16000}
     )
+    outer_config_sha256 = getattr(pipeline, _OUTER_CONFIG_ATTR, None)
+    if not isinstance(outer_config_sha256, str) or not outer_config_sha256:
+        outer_config_sha256 = _outer_config_identity(model)
     return {
-        "diarization_model": DIARIZE_MODEL,
-        "outer_config_sha256": _outer_config_identity(),
+        "diarization_model": model,
+        "outer_config_sha256": outer_config_sha256,
         "embedding_model": embedding_model,
         "embedding_checkpoint": _checkpoint_identity(pipeline),
         "embedding_dim": embedding_dim,
@@ -449,114 +640,103 @@ def _env_float(name: str, default: float) -> float:
 
 
 _pipeline = None  # pyannote Pipeline singleton -- lazy-loaded, released after use
-
-
-def _ensure_torchaudio_compat() -> None:
-    """Restore torchaudio symbols pyannote.audio 3.4 imports but 2.11 removed.
-
-    ``pyannote/audio/core/io.py`` annotates a function ``-> torchaudio.AudioMetaData``
-    at import time and calls ``torchaudio.info`` / ``torchaudio.list_audio_backends``
-    for file-path inputs; torchaudio 2.11 dropped all three. We never touch
-    torchaudio I/O at runtime (diarize_turns feeds a decoded waveform dict), but
-    the import-time annotation still resolves the attribute, so the shims must
-    exist before ``import pyannote.audio``.
-
-    Each shim installs only if missing (hasattr guard) so it is idempotent and an
-    older torchaudio that still ships the real symbols is left untouched.
-    """
-    import torchaudio
-
-    ta: Any = torchaudio
-    if not hasattr(ta, "AudioMetaData"):
-
-        @dataclass
-        class AudioMetaData:
-            sample_rate: int
-            num_frames: int
-            num_channels: int
-            bits_per_sample: int = 0
-            encoding: str = ""
-
-        ta.AudioMetaData = AudioMetaData
-    if not hasattr(ta, "info"):
-
-        def info(filepath, *_a, **_k):
-            import soundfile as sf
-
-            meta = sf.info(str(filepath))
-            return ta.AudioMetaData(
-                sample_rate=int(meta.samplerate),
-                num_frames=int(meta.frames),
-                num_channels=int(meta.channels),
-            )
-
-        ta.info = info
-    if not hasattr(ta, "list_audio_backends"):
-
-        def list_audio_backends():
-            return ["soundfile"]
-
-        ta.list_audio_backends = list_audio_backends
+_pipeline_model: str | None = None
+_pipeline_lock = threading.RLock()
 
 
 def _call_pipeline_from_pretrained(
     pipeline_cls,
-    token: str,
-    checkpoint_path: str | Path,
+    token: str | None,
+    checkpoint_path: str | Path | dict[str, Any],
+    *,
+    revision: str | None = None,
 ):
-    """Call pyannote under torch 2.11's weights_only compatibility context.
-
-    torch >= 2.6 loads with ``weights_only=True``, which rejects the plain Python
-    objects pyannote pickles into its checkpoints ("Unsupported global"). We
-    allowlist exactly the classes the load names -- all in trusted torch /
-    pyannote namespaces, discovered empirically against the official
-    ``pyannote/speaker-diarization-3.1`` repo (a gated repo the user has accepted;
-    the token is verified before we get here) -- via
-    ``torch.serialization.safe_globals``. That context is a no-op on older torch
-    that already defaults to ``weights_only=False``.
-    """
-    import torch
-    from pyannote.audio.core.task import (  # pyright: ignore[reportMissingImports]
-        Problem,
-        Resolution,
-        Specifications,
+    """Call the pyannote 4.x loader with its explicit revision and private cache."""
+    return pipeline_cls.from_pretrained(
+        checkpoint_path,
+        revision=revision,
+        token=token,
+        cache_dir=config.AUDIO_CACHE,
     )
-    from torch.torch_version import TorchVersion
 
-    allow = [TorchVersion, Specifications, Problem, Resolution]
-    safe_globals = getattr(torch.serialization, "safe_globals", None)
-    if safe_globals is None:  # torch < 2.4: weights_only already defaults to False
-        return pipeline_cls.from_pretrained(
-            checkpoint_path,
-            use_auth_token=token,
-            cache_dir=config.AUDIO_CACHE,
+
+def _is_legacy_agglomerative_plan(model: str, plan: _PipelineLoadPlan) -> bool:
+    model_id, _revision = _split_model_revision(model)
+    if model_id != config.DEFAULT_DIARIZE_MODEL or not isinstance(
+        plan.checkpoint, dict
+    ):
+        return False
+    pipeline_config = plan.checkpoint.get("pipeline")
+    if not isinstance(pipeline_config, Mapping):
+        return False
+    if pipeline_config.get("name") != "pyannote.audio.pipelines.SpeakerDiarization":
+        return False
+    params = pipeline_config.get("params")
+    return (
+        isinstance(params, Mapping)
+        and params.get("clustering") == "AgglomerativeClustering"
+        and "plda" not in params
+    )
+
+
+@contextmanager
+def _without_unused_legacy_plda(
+    model: str,
+    plan: _PipelineLoadPlan,
+) -> Iterator[None]:
+    """Prevent pyannote 4 from fetching c1's unused PLDA for the 3.1 pipeline."""
+    model_id, _revision = _split_model_revision(model)
+    if model_id != config.DEFAULT_DIARIZE_MODEL:
+        yield
+        return
+    if not _is_legacy_agglomerative_plan(model, plan):
+        raise RuntimeError(
+            "speaker-diarization-3.1 under pyannote.audio 4 requires a verified "
+            "AgglomerativeClustering pipeline config"
         )
-    with safe_globals(allow):
-        return pipeline_cls.from_pretrained(
-            checkpoint_path,
-            use_auth_token=token,
-            cache_dir=config.AUDIO_CACHE,
-        )
+    speaker_diarization = cast(
+        Any,
+        importlib.import_module("pyannote.audio.pipelines.speaker_diarization"),
+    )
+
+    original = speaker_diarization.get_plda
+    speaker_diarization.get_plda = lambda *_args, **_kwargs: None
+    try:
+        yield
+    finally:
+        speaker_diarization.get_plda = original
 
 
-def _load_pipeline(pipeline_cls, token: str):
+def _load_pipeline(
+    pipeline_cls,
+    token: str | None,
+    model: str = DIARIZE_MODEL,
+):
     """Construct a pipeline with loader-authoritative embedding provenance."""
-    _configure_pyannote_cache()
-    plan = _prepare_pipeline_load()
-    if plan.config_yaml is None:
-        pl = _call_pipeline_from_pretrained(pipeline_cls, token, DIARIZE_MODEL)
-    else:
-        with tempfile.TemporaryDirectory(prefix="voxweave-pyannote-") as temp_dir:
-            pinned_config = Path(temp_dir) / "config.yaml"
-            pinned_config.write_text(plan.config_yaml, encoding="utf-8")
-            pl = _call_pipeline_from_pretrained(pipeline_cls, token, pinned_config)
+    with _pipeline_lock:
+        return _load_pipeline_locked(pipeline_cls, token, model)
+
+
+def _load_pipeline_locked(
+    pipeline_cls,
+    token: str | None,
+    model: str,
+):
+    plan = _prepare_pipeline_load(model, token)
+    with _without_unused_legacy_plda(model, plan):
+        pl = _call_pipeline_from_pretrained(
+            pipeline_cls,
+            token,
+            plan.checkpoint,
+            revision=plan.revision,
+        )
     if pl is None:
         return None
 
     authority = plan.authority
-    if authority is not None and authority.local_path is not None:
+    if authority is not None:
         try:
-            after = _sha256_file(authority.local_path)
+            after = _sha256_file(authority.loaded_path)
         except OSError as exc:
             raise EmbeddingCheckpointChangedError(
                 "embedding checkpoint changed during pipeline construction"
@@ -569,20 +749,38 @@ def _load_pipeline(pipeline_cls, token: str):
         pl,
         authority.binding if authority is not None else None,
         authority.provenance_value if authority is not None else None,
+        plan.outer_config_sha256,
     )
     return pl
 
 
-def _get_pipeline(token: str):
-    global _pipeline
+def _model_card_url(model: str) -> str:
+    model_id, _revision = _split_model_revision(model)
+    return f"https://hf.co/{model_id}"
+
+
+def _gated_model_error(model: str) -> RuntimeError:
+    return RuntimeError(
+        f"could not load {model}: accept the model-card conditions at "
+        f"{_model_card_url(model)}, then use `hf auth login` or set "
+        "VOXWEAVE_HF_TOKEN / HF_TOKEN (or hf_token in "
+        "~/.config/voxweave.conf)"
+    )
+
+
+def _get_pipeline(token: str | None, model: str = DIARIZE_MODEL):
+    with _pipeline_lock:
+        return _get_pipeline_locked(token, model)
+
+
+def _get_pipeline_locked(token: str | None, model: str):
+    global _pipeline, _pipeline_model
+    if _pipeline is not None and _pipeline_model != model:
+        release()
     if _pipeline is None:
-        # pyannote.audio captures PYANNOTE_CACHE in a module constant at import
-        # time, so establish the private default before importing the package.
-        _configure_pyannote_cache()
         try:
             import torch
 
-            _ensure_torchaudio_compat()  # must precede the pyannote import
             from pyannote.audio import (  # pyright: ignore[reportMissingImports]
                 Pipeline,
             )
@@ -591,26 +789,45 @@ def _get_pipeline(token: str):
                 "diarization requires the default pyannote.audio dependency; "
                 "reinstall voxweave to repair the environment"
             ) from e
-        pl = _load_pipeline(Pipeline, token)
+        try:
+            pl = _load_pipeline(Pipeline, token, model)
+        except Exception as exc:
+            try:
+                from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
+
+                response = getattr(exc, "response", None)
+                status_code = getattr(response, "status_code", None)
+                gated = isinstance(exc, GatedRepoError) or (
+                    isinstance(exc, HfHubHTTPError) and status_code == 403
+                )
+            except ImportError:
+                gated = False
+            if gated:
+                raise _gated_model_error(model) from exc
+            raise
         if pl is None:
-            raise RuntimeError(
-                f"could not load {DIARIZE_MODEL}: accept the user conditions on "
-                f"https://hf.co/{DIARIZE_MODEL} (and its segmentation model) and "
-                "set VOXWEAVE_HF_TOKEN / HF_TOKEN"
-            )
+            raise _gated_model_error(model)
         if torch.cuda.is_available():
             pl.to(torch.device("cuda"))
         _pipeline = pl
-        log.info("loaded diarization pipeline %s", DIARIZE_MODEL)
+        _pipeline_model = model
+        log.info("loaded diarization pipeline %s", model)
     return _pipeline
 
 
 def release() -> None:
     """Drop the pipeline singleton and free its VRAM (mirrors backend.release)."""
-    global _pipeline
-    if _pipeline is None:
-        return
+    with _pipeline_lock:
+        _release_locked()
+
+
+def _release_locked() -> None:
+    global _pipeline, _pipeline_model
+    had_pipeline = _pipeline is not None
     _pipeline = None
+    _pipeline_model = None
+    if not had_pipeline:
+        return
     try:
         import torch
 
@@ -624,20 +841,42 @@ def diarize_turns(
     wav_path: Path,
     *,
     token: str | None = None,
+    model: str | None = None,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
     want_embeddings: bool = False,
     audio_profile: Mapping[str, object] | None = None,
 ) -> DiarizationResult:
     """Run diarization and optionally return normalized, label-keyed centroids."""
-    token = token or config.conf_hf_token()
-    if not token:
-        raise RuntimeError(
-            f"diarization needs a Hugging Face token for the gated {DIARIZE_MODEL} "
-            "checkpoint: accept the conditions on its model card, then either log "
-            "in once with `hf auth login`, or set VOXWEAVE_HF_TOKEN / HF_TOKEN "
-            "(or hf_token in ~/.config/voxweave.conf)"
+    with _pipeline_lock:
+        return _diarize_turns_locked(
+            wav_path,
+            token=token,
+            model=model,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            want_embeddings=want_embeddings,
+            audio_profile=audio_profile,
         )
+
+
+def _diarize_turns_locked(
+    wav_path: Path,
+    *,
+    token: str | None,
+    model: str | None,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    want_embeddings: bool,
+    audio_profile: Mapping[str, object] | None,
+) -> DiarizationResult:
+    resolved_model = config.resolve_diarize_model(model)
+    token = token or config.conf_hf_token()
+    if not token and resolved_model in {
+        config.DEFAULT_DIARIZE_MODEL,
+        COMMUNITY_DIARIZE_MODEL,
+    }:
+        raise _gated_model_error(resolved_model)
     import soundfile as sf
     import torch
 
@@ -652,7 +891,7 @@ def diarize_turns(
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     try:
-        pl = _get_pipeline(token)
+        pl = _get_pipeline(token, resolved_model)
         kwargs: dict[str, int] = {}
         if min_speakers is not None:
             kwargs["min_speakers"] = min_speakers
@@ -676,15 +915,35 @@ def diarize_turns(
             warnings.filterwarnings(
                 "ignore", message=r"TensorFloat-32 \(TF32\) has been disabled"
             )
-            raw_result = pl(
-                {"waveform": wav, "sample_rate": int(sr)},
-                return_embeddings=want_embeddings,
-                **kwargs,
-            )
+            audio_input = {"waveform": wav, "sample_rate": int(sr)}
+            version = _package_version("pyannote.audio")
+            try:
+                pyannote_major = int(version.split(".", 1)[0])
+            except ValueError:
+                pyannote_major = 4
+            if pyannote_major >= 4:
+                raw_result = pl(audio_input, **kwargs)
+            else:
+                raw_result = pl(
+                    audio_input,
+                    return_embeddings=want_embeddings,
+                    **kwargs,
+                )
     finally:
         torch.set_float32_matmul_precision(matmul_precision)
         torch.backends.cudnn.allow_tf32 = cudnn_tf32
-    if want_embeddings and isinstance(raw_result, tuple) and len(raw_result) == 2:
+    output_annotation = getattr(raw_result, "speaker_diarization", None)
+    if output_annotation is not None:
+        annotation = output_annotation
+        embeddings = (
+            getattr(raw_result, "speaker_embeddings", None) if want_embeddings else None
+        )
+        if want_embeddings:
+            centroids, embedding_dim = _normalized_centroids(annotation, embeddings)
+        else:
+            centroids = None
+            embedding_dim = "unresolved"
+    elif want_embeddings and isinstance(raw_result, tuple) and len(raw_result) == 2:
         annotation, embeddings = raw_result
         centroids, embedding_dim = _normalized_centroids(annotation, embeddings)
     else:
@@ -715,6 +974,7 @@ def diarize_turns(
     )
     provenance = _build_provenance(
         pl,
+        model=resolved_model,
         embedding_dim=embedding_dim,
         audio_profile=audio_profile,
         torch_version=str(torch.__version__),

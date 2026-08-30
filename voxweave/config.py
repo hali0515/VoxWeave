@@ -21,6 +21,11 @@ DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 # 0.6B emits no punctuation, so fusion must use 1.7B.
 DEFAULT_FUSION_WHISPER = "large-v3"
 DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
+DEFAULT_DIARIZE_MODEL = "pyannote/speaker-diarization-3.1"
+DIARIZE_MODEL_ALIASES = {
+    "3.1": DEFAULT_DIARIZE_MODEL,
+    "community-1": "pyannote/speaker-diarization-community-1",
+}
 # Per-language aligner defaults. Unlisted languages fall back to Qwen3-ForcedAligner.
 #
 # en: facebook/wav2vec2-large-960h-lv60-self loaded via HF (same LV60K-self weights as
@@ -89,6 +94,12 @@ _TEMPLATE = """\
 # ctc = 1        # wav2vec2 CTC emission 30s windows (en aligner)
 # mms = 4        # MMS-300m emission batch (ja aligner, ctc-forced-aligner generate_emissions)
 
+# Speaker diarization pipeline. The default remains 3.1 for compatibility with existing
+# gated-model access. Use "community-1" after accepting its separate model-card conditions,
+# or provide any full Hugging Face pipeline ID. (= --diarize-model / VOXWEAVE_DIARIZE_MODEL)
+[diarize]
+# model = "3.1"
+
 # Default on/off for the boolean pipeline flags. Explicit CLI flags always win
 # (e.g. separate = false here, --separate on the command line for one run).
 [defaults]
@@ -129,6 +140,7 @@ _KNOWN_KEYS = frozenset(
         "hf_token",
         "fusion",
         "batch",
+        "diarize",
         "align",
         "defaults",
     }
@@ -249,6 +261,42 @@ def conf_hf_token() -> str | None:
         return _nonempty_str(huggingface_hub.get_token())
     except Exception:
         return None
+
+
+def _conf_diarize_model() -> str | None:
+    """Return ``[diarize].model`` when it is a non-blank string."""
+    section = _load().get("diarize")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        log.warning(
+            "config key %r has wrong type (expected table), ignoring", "diarize"
+        )
+        return None
+    raw = section.get("model")
+    if raw is not None and not isinstance(raw, str):
+        log.warning("config [diarize].model has wrong type (expected string), ignoring")
+        return None
+    return _nonempty_str(raw)
+
+
+def resolve_diarize_model(cli_value: str | None = None) -> str:
+    """Resolve and normalize the diarization pipeline ID.
+
+    Precedence is explicit CLI value, ``VOXWEAVE_DIARIZE_MODEL``,
+    ``[diarize].model``, then the 3.1 compatibility default. Known short names
+    map to their full Hugging Face IDs; every other non-blank value passes
+    through unchanged.
+    """
+    selected = _nonempty_str(cli_value)
+    if selected is None:
+        selected = _nonempty_str(os.environ.get("VOXWEAVE_DIARIZE_MODEL"))
+    if selected is None:
+        selected = _conf_diarize_model()
+    if selected is None:
+        selected = DEFAULT_DIARIZE_MODEL
+    selected = selected.strip()
+    return DIARIZE_MODEL_ALIASES.get(selected.lower(), selected)
 
 
 _LOAD_STRATEGIES = ("peak", "sum")

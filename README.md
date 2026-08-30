@@ -150,9 +150,21 @@ translation — is baked into the **core dependencies**. The variant selects the
   so `[cuda]` and `[mps]` are mutually exclusive — pick one per host.
 
 Speaker diarization support ships by default on both variants but remains opt-in at runtime.
-Before using `--diarize`, accept the conditions for the gated
-`pyannote/speaker-diarization-3.1` model, then authenticate once with `hf auth login` or set
+The default model stays `pyannote/speaker-diarization-3.1`, so existing users do not suddenly
+hit a 403 from the separately gated community-1 repository. Before using `--diarize`, accept
+the conditions for the model you select, then authenticate once with `hf auth login` or set
 `VOXWEAVE_HF_TOKEN` / `HF_TOKEN`.
+
+Phase-0 measurements used pyannote.audio 4.0.7, the same Japanese 16 kHz test waveform, and an
+RTX PRO 4000 24 GB. Peak allocated CUDA memory was identical in that run:
+
+| Short name | Resolved pipeline | Model license | Peak allocated VRAM |
+| ---------- | ----------------- | ------------- | ------------------- |
+| `3.1` (default) | `pyannote/speaker-diarization-3.1` | MIT | 2,723.963 MiB |
+| `community-1` | `pyannote/speaker-diarization-community-1` | CC-BY-4.0 | 2,723.963 MiB |
+
+Community-1 generally improves speaker counting and is selectable per run; keeping 3.1 as the
+default preserves access for users who have accepted only the existing 3.1 gate.
 
 **From source** (for development or pulling new code):
 
@@ -174,16 +186,18 @@ Override the detection per invocation: `make install VARIANT=mps` or
   `audio-separator` is intentionally avoided because it eagerly imports onnxruntime at the
   top level) + MMS-300m forced aligner (`ctc-forced-aligner`) + layout (`pysbd`) + song-skip
   (`panns-inference`) + CJK break (`budoux` + `jieba`) + translation (`openai`) +
-  `pyannote-audio>=3.4,<4` for opt-in speaker diarization.
+  `pyannote-audio>=4,<5` for opt-in speaker diarization.
 - **`[cuda]`** (NVIDIA/Linux): `qwen-asr` + `onnxruntime-gpu` + `faster-whisper`. **`[mps]`**
   (Apple Silicon/macOS): `mlx-audio` + plain `onnxruntime`. Declared **conflicting** in
   `[tool.uv]` (incompatible `transformers` pins), so `uv` resolves each in its own fork — pick one
   per host (`make dev VARIANT=mps` on Apple Silicon).
-- **Diarization ships by default but runs only with `--diarize`.** The
-  `pyannote/speaker-diarization-3.1` checkpoint is HF-gated; accept its model-card conditions
-  (and segmentation-3.0's) once, then use `hf auth login`, `VOXWEAVE_HF_TOKEN`, or `HF_TOKEN`.
-  The dependency stays below pyannote 4: 3.x uses about 1.6 GB VRAM for this model, while 4.x
-  peaks near 9.5 GB on the same workload (pyannote-audio#1963).
+- **Diarization ships by default but runs only with `--diarize`.** Both supported pyannote
+  pipelines are gated independently. Accept the
+  [`speaker-diarization-3.1`](https://hf.co/pyannote/speaker-diarization-3.1) conditions (and
+  segmentation-3.0's) for the default, or the
+  [`speaker-diarization-community-1`](https://hf.co/pyannote/speaker-diarization-community-1)
+  conditions before selecting community-1. Then use `hf auth login`, `VOXWEAVE_HF_TOKEN`, or
+  `HF_TOKEN`.
 - The device is auto-detected at runtime (cuda → mps → cpu); override with `VOXWEAVE_DEVICE`. On
   mps the MLX backend is selected automatically; force it either way with `VOXWEAVE_BACKEND=mlx|torch`.
 - **Development**: `make dev` (= `uv sync --extra cuda --dev`; on Apple Silicon use
@@ -199,6 +213,9 @@ voxweave episode.mkv
 
 # Opt in to speaker diarization (requires gated-model access; see Setup)
 voxweave interview.mkv --diarize
+
+# Select community-1 after accepting its separate model-card conditions
+voxweave interview.mkv --diarize --diarize-model community-1
 
 # ...edit episode.vtt by hand (fix wording, line breaks)...
 
@@ -241,6 +258,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export).                                                                                                                                                                                              |
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
 | `--diarize`                    | Opt in to the default-installed pyannote speaker diarizer: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). The gated checkpoint requires `VOXWEAVE_HF_TOKEN`, `HF_TOKEN`, config `hf_token`, or a prior `hf auth login`. Speaker turns persist to the sibling JSON, so `voxweave split` replays the formatting without re-running the model. |
+| `--diarize-model`              | Select `3.1` (the default), `community-1`, or any full Hugging Face pipeline id. The same setting is available as `VOXWEAVE_DIARIZE_MODEL` or `[diarize].model`; precedence is CLI > env > config > default. |
 | `--voiceprints/--no-voiceprints` | Opt in to a voice-biometric centroid sidecar for reviewed cross-episode speaker suggestions. Requires a fresh `--diarize` run and is off by default. Precedence: CLI, `VOXWEAVE_VOICEPRINTS`, `[defaults].voiceprints`, then off. |
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
@@ -528,10 +546,12 @@ default config is written on first run (migrated automatically from a pre-rename
 
 - `VOXWEAVE_ASR_MODEL` (default `Qwen/Qwen3-ASR-0.6B`; same as `--model`)
 - `VOXWEAVE_ALIGNER_MODEL` (default `Qwen/Qwen3-ForcedAligner-0.6B`)
+- `VOXWEAVE_DIARIZE_MODEL` (default `pyannote/speaker-diarization-3.1`; short names `3.1` and
+  `community-1`, or any full Hugging Face pipeline id; same as `--diarize-model`)
 - `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)
 - `VOXWEAVE_BACKEND` (`mlx` | `torch`; default: `mlx` on mps, else `torch`) — picks the ASR/alignment backend
-- `VOXWEAVE_HF_TOKEN` / `HF_TOKEN` — authentication for gated models, including
-  `pyannote/speaker-diarization-3.1`; alternatively authenticate once with `hf auth login`
+- `VOXWEAVE_HF_TOKEN` / `HF_TOKEN` — authentication for gated models, including both pyannote
+  diarizers; alternatively authenticate once with `hf auth login`
 - `VOXWEAVE_OFFLINE` (`1` to enable) — once all models are cached, sets `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` so loading skips the per-file HEAD revalidation + optional-file probing huggingface_hub/transformers otherwise do on every run (no network on a cache hit). Leave off for the first download.
 - `VOXWEAVE_MLX_ASR_REPO` / `VOXWEAVE_MLX_ALIGNER_REPO` / `VOXWEAVE_MLX_WHISPER_REPO` — MLX backend
   repos. By default the ASR repo tracks `--model` size (`--model 1.7b` → `mlx-community/Qwen3-ASR-1.7B-8bit`)
@@ -608,6 +628,11 @@ load_strategy = "sum"
 separate = 1                             # vocal separation (MelBandRoformer) 8s windows
 ctc      = 1                             # wav2vec2 CTC emission 30s windows (en aligner)
 mms      = 4                             # MMS-300m emission batch (ja aligner)
+
+# Diarization pipeline (= --diarize-model / env VOXWEAVE_DIARIZE_MODEL).
+# Values: "3.1" (built-in default), "community-1", or any full Hugging Face pipeline id.
+[diarize]
+model = "community-1"
 
 # Default on/off for the boolean pipeline flags. An explicit CLI flag always wins
 # (e.g. separate = false here, --separate on the command line for one run).

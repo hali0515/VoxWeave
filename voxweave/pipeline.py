@@ -890,6 +890,7 @@ def transcribe(
     skip_songs: bool = False,
     keep_lyrics: bool = False,
     diarize: bool = False,
+    diarize_model: str | None = None,
     voiceprints: bool = False,
     normalize: bool = False,
     reporter: Reporter | None = None,
@@ -1311,6 +1312,7 @@ def transcribe(
             try:
                 diarization = diarize_mod.diarize_turns(
                     wav,
+                    model=diarize_model,
                     min_speakers=min_speakers,
                     max_speakers=max_speakers,
                     want_embeddings=voiceprints,
@@ -4092,6 +4094,7 @@ def process(
     max_speakers: int | None = None,
     semantic_split: bool = False,
     semantic_model: str | None = None,
+    diarize_model: str | None = None,
 ) -> Path:
     """Full pipeline: transcribe -> smart_split -> write siblings. Return the .vtt path.
 
@@ -4149,6 +4152,7 @@ def process(
             keep_lyrics=keep_lyrics,
             sdh=sdh,
             diarize=diarize,
+            diarize_model=diarize_model,
             voiceprints=capture_enabled,
             word_segments=word_segments,
             asr_model=asr_model,
@@ -4252,6 +4256,7 @@ def _process_from_source(
     keep_lyrics: bool = False,
     sdh: bool = False,
     diarize: bool = False,
+    diarize_model: str | None = None,
     voiceprints: bool = False,
     word_segments: tuple[str, list[dict]] | None = None,
     asr_model: str | None = None,
@@ -4293,6 +4298,7 @@ def _process_from_source(
                 skip_songs=skip_songs,
                 keep_lyrics=keep_lyrics,
                 diarize=diarize,
+                diarize_model=diarize_model,
                 voiceprints=voiceprints,
                 normalize=normalize,
                 reporter=reporter,
