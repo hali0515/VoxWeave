@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+FileGeneration = tuple[int, int, int, int]
+
 
 @contextmanager
 def atomic_path(dst: Path) -> Iterator[Path]:
@@ -75,7 +77,7 @@ def atomic_write_text_new(
     *,
     encoding: str = "utf-8",
     before_install: Callable[[], None] | None = None,
-) -> None:
+) -> FileGeneration:
     """Atomically create a text file, raising ``FileExistsError`` if it exists.
 
     Prefer installing a completed, fsynced temp through an atomic hard link. On
@@ -86,7 +88,8 @@ def atomic_write_text_new(
     ``before_install`` runs after the requested bytes are durable and adjacent
     to each protected install attempt. A fallback from hard links to ``O_EXCL``
     therefore invokes it again before claiming ``dst``. Raising leaves ``dst``
-    absent and removes the prepared temp.
+    absent and removes the prepared temp. The return value identifies the exact
+    file generation installed, captured from the durable temp before publication.
     """
     dst = Path(dst)
     fd, name = tempfile.mkstemp(
@@ -98,6 +101,13 @@ def atomic_write_text_new(
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
+            metadata = os.fstat(f.fileno())
+            installed_generation = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
         if before_install is not None:
             before_install()
         try:
@@ -120,3 +130,4 @@ def atomic_write_text_new(
                 raise
     finally:
         tmp.unlink(missing_ok=True)
+    return installed_generation

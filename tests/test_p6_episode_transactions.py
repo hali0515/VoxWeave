@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from voxweave import pipeline, sdh, songdet
+from voxweave import artifacts, episode_transaction, pipeline, sdh, songdet
 
 
 def _vtt(text: str = "hello", *, settings: str = "") -> str:
@@ -70,11 +70,15 @@ def test_correct_apply_stale_generation_mutates_nothing(tmp_path, monkeypatch):
 def test_correct_all_rejected_canonical_rewrite_deletes_stale_evidence(
     tmp_path, monkeypatch
 ):
+    media = tmp_path / "episode.mp4"
+    media.write_bytes(b"media")
     vtt = tmp_path / "episode.vtt"
     original = _vtt(settings="align:start position:20%")
     vtt.write_text(original, encoding="utf-8")
     evidence = tmp_path / "episode.align-evidence.json"
     evidence.write_text("stale", encoding="utf-8")
+    cached_evidence = artifacts.claim_paths(media).align_evidence(vtt)
+    cached_evidence.write_text("cached stale", encoding="utf-8")
     monkeypatch.setattr(
         pipeline.asrfix_mod,
         "correct_cues",
@@ -89,6 +93,7 @@ def test_correct_all_rejected_canonical_rewrite_deletes_stale_evidence(
     assert result["aligned"] is False
     assert vtt.read_bytes() != original.encode("utf-8")
     assert not evidence.exists()
+    assert not cached_evidence.exists()
     assert tuple(result) == (
         "out",
         "audit",
@@ -115,6 +120,38 @@ def test_correct_byte_identical_rewrite_retains_evidence(tmp_path, monkeypatch):
     assert vtt.read_text(encoding="utf-8") == original
     assert evidence.read_text(encoding="utf-8") == "still-current"
     assert result["aligned"] is False
+
+
+def test_correct_retires_cached_evidence_created_at_commit_seam(tmp_path, monkeypatch):
+    media = tmp_path / "episode.mp4"
+    media.write_bytes(b"media")
+    vtt = tmp_path / "episode.vtt"
+    vtt.write_text(_vtt(), encoding="utf-8")
+    cached = artifacts.artifacts_root() / "episode" / "episode.align-evidence.json"
+    real_commit = episode_transaction.commit_correction
+
+    def create_evidence_then_commit(**kwargs):
+        claimed = artifacts.claim_paths(media).align_evidence(vtt)
+        assert claimed == cached
+        claimed.write_text("concurrent selected evidence", encoding="utf-8")
+        return real_commit(**kwargs)
+
+    monkeypatch.setattr(
+        pipeline.asrfix_mod,
+        "correct_cues",
+        lambda _payload, **_kwargs: [
+            {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "typo"}
+        ],
+    )
+    monkeypatch.setattr(
+        episode_transaction,
+        "commit_correction",
+        create_evidence_then_commit,
+    )
+
+    pipeline.correct(vtt, apply=True)
+
+    assert not cached.exists()
 
 
 def test_correct_real_fix_hands_exact_committed_hash_to_align(tmp_path, monkeypatch):
@@ -834,13 +871,17 @@ def test_process_voiceprint_candidate_uses_the_same_context_bound_transaction(
     assert isinstance(seen["context"], IssuedSegmentationContext)
     assert seen["main_json_bytes"] == (tmp_path / "episode.json").read_bytes()
     assert seen["vtt_bytes"] == out.read_bytes()
-    assert seen["machine_artifact"].path == tmp_path / "episode.voiceprints.json"
+    assert seen["machine_artifact"].path == artifacts.claim_paths(media).voiceprints
 
 
 @pytest.mark.parametrize("command", ["process", "split"])
 def test_successful_segmentation_retires_stale_align_evidence(command, tmp_path):
     evidence = tmp_path / "episode.align-evidence.json"
     evidence.write_text("stale", encoding="utf-8")
+    cached_evidence = artifacts.claim_paths(tmp_path / "episode.mkv").align_evidence(
+        tmp_path / "episode.vtt"
+    )
+    cached_evidence.write_text("cached stale", encoding="utf-8")
     if command == "process":
         pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
     else:
@@ -851,6 +892,21 @@ def test_successful_segmentation_retires_stale_align_evidence(command, tmp_path)
         )
         pipeline.split(json_path)
     assert not evidence.exists()
+    assert not cached_evidence.exists()
+
+
+def test_align_legacy_evidence_writeback_retires_cached_copy(tmp_path, monkeypatch):
+    media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    cached = artifacts.claim_paths(media).align_evidence(vtt_path)
+    cached.write_text("cached stale", encoding="utf-8")
+    legacy = tmp_path / "episode.align-evidence.json"
+    legacy.write_text("legacy stale", encoding="utf-8")
+
+    assert pipeline.align(vtt_path) == vtt_path
+
+    assert legacy.exists()
+    assert legacy.read_bytes() != b"legacy stale"
+    assert not cached.exists()
 
 
 def test_split_invalid_declared_pair_cleans_full_machine_artifact_set(tmp_path, caplog):

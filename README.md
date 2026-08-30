@@ -245,7 +245,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
 | `--vad-mask/--no-vad-mask`     | Suppress CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                    |
-| `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) to `debug/<stem>/`.                                                                                                                                                                                                  |
+| `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) under `${VOXWEAVE_CACHE_ROOT:-~/.cache/voxweave}/artifacts/<stem>/debug/`.                                                                                                                                              |
 
 The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--voiceprints`, `--timestamps`,
 `--shot-snap`, `--vad-mask`) can have their defaults set persistently via the `[defaults]`
@@ -255,15 +255,17 @@ section of `~/.config/voxweave.conf` — an explicit CLI flag always wins for th
 
 ### Label speakers
 
-After a diarized transcription, `voxweave speakers <media>` creates an offline
-`<stem>.speakers.html` audition page and an empty `<stem>.speakers.json` mapping. The page
-embeds up to three clean, non-overlapping speech clips per diarizer id; open it directly from
-disk, listen, enter names, and copy its live JSON into the mapping file.
+After a diarized transcription, `voxweave speakers <media>` prepares an audition page in
+memory, serves it on `127.0.0.1`, and opens it in your browser. The page embeds up to three
+clean, non-overlapping speech clips per diarizer id. Listen, enter names, then select **Save**
+to write them directly to the episode's speaker mapping. The server runs until Ctrl+C; use
+`--no-open` to print the URL without opening a browser, or `--port N` to choose its loopback
+port. No audition HTML is written to disk.
 
 ```bash
 voxweave episode.mkv --diarize
 voxweave speakers episode.mkv
-# edit episode.speakers.json, then render names without rerunning any model
+# Save names in the browser, stop the server with Ctrl+C, then render them
 voxweave split episode.json
 ```
 
@@ -274,11 +276,11 @@ human-entered names into an explicitly selected show store:
 ```bash
 voxweave episode.mkv --diarize --voiceprints
 voxweave speakers episode.mkv
-# review/edit episode.speakers.json first
+# Save reviewed names in the browser first
 voxweave speakers episode.mkv --enroll \
   --voices ./example-show.voices.json --show "Example Show"
 
-# Later episodes: suggestions stay in HTML + a regenerable sidecar.
+# Later episodes: suggestions appear in the served page and a regenerable cache record.
 voxweave speakers episode-02.mkv --voices ./example-show.voices.json
 ```
 
@@ -288,7 +290,8 @@ normalized `--show`; discovery without `--show` reports the store but stays in m
 The shipped matching policy is **suggest-only**: `VOXWEAVE_VOICES_ACCEPT` defaults to `off`,
 so stored names appear as review buttons and never become authoritative mapping values.
 Even when an operator configures a finite accept threshold, a machine prefill exists only in
-the HTML input; the on-disk v1 mapping is still created with empty names and must be reviewed.
+the served input; the v1 mapping is still created with empty names and must be reviewed and
+saved by the operator.
 
 The versioned mapping is intentionally small:
 
@@ -297,22 +300,25 @@ The versioned mapping is intentionally small:
 ```
 
 `split` renders mapped names as WebVTT voice tags while keeping transcript text and the
-sibling JSON clean. Empty or missing names remain unlabeled. The audition command refuses to
-overwrite an existing mapping because it is user data. When burning a mapped SRT, recovered
-speaker identity is retained in the temporary ASS `Name` field while the visible dialogue
-remains prefix-free.
+sibling JSON clean. Empty or missing names remain unlabeled. An existing mapping is the normal
+edit flow: the server re-reads it for the page and replaces it only when you select **Save**.
+When burning a mapped SRT, recovered speaker identity is retained in the temporary ASS `Name`
+field while the visible dialogue remains prefix-free.
 
 `voxweave speakers episode.mkv --purge-voiceprints` removes that episode's voiceprint
-sidecar, suggestion record, and audition HTML while holding the episode transaction lock; it
-also works after the media has been removed. It deliberately keeps the human-edited mapping.
+artifact and suggestion record from both supported legacy and cache locations, plus any legacy
+audition HTML, while holding the episode transaction lock. It also works after the media has
+been removed. It deliberately keeps the human-edited mapping.
 
 ### Re-align after editing
 
 `voxweave align <vtt>` — takes the edited VTT text and **re-runs forced alignment against the
 original audio**, overwriting the timestamped VTT and updating the JSON. Does not re-run ASR
 or touch smart_split. Aligns on separated 16k vocals by default (prevents BGM interference);
-prefers a cached `cache/<stem>.vocals.32k.flac`, otherwise re-separates and caches. A document
-carrying a voiceprint pair accepts that cache only with its matching integrity companion.
+prefers the episode's cached `vocals.32k.flac` under the artifact cache, otherwise re-separates
+and caches it there. Existing media-adjacent `cache/<stem>.vocals.32k.flac` entries remain a
+legacy read/write-back lane. When a voiceprint pair requires source binding, both managed and
+legacy vocals caches are accepted only when their matching integrity companion validates.
 
 ```bash
 voxweave align episode.vtt                 # finds episode.<ext> in the same dir
@@ -351,8 +357,9 @@ voxweave split episode.json --no-timestamps   # plain-text editing draft
 `voxweave correct <vtt>` — optional **pre-align** LLM pass that fixes obvious ASR typos, split
 words, and garbled proper nouns, producing a reviewable diff. Conservative substitution only
 (no completion/rewrite), gated by a code check that the matched text equals the original
-line-for-line. By default writes only a sidecar `<stem>.asrfix.vtt` + audit JSON — the
-original VTT is untouched. Use `--apply` to overwrite, **then run `align`** to reassign timing.
+line-for-line. By default writes only an adjacent sidecar `<stem>.asrfix.vtt` plus an audit
+JSON in the episode artifact cache — the original VTT is untouched. Use `--apply` to overwrite,
+**then run `align`** to reassign timing.
 
 ```bash
 voxweave correct episode.vtt --glossary names.json   # review the sidecar
@@ -522,10 +529,11 @@ default config is written on first run (migrated automatically from a pre-rename
   and the Whisper repo tracks the Whisper size (`--model large-v3` → `mlx-community/whisper-large-v3-mlx`);
   set the matching var to hard-pin a specific quant (e.g. a 4-bit build) regardless of `--model`.
 
-All model weights (torch + MLX) are cached under `~/.cache/voxweave/{asr,align,audio}`
-(auto-downloaded on first use; override the root with `VOXWEAVE_CACHE_ROOT`), so a container only
-needs to bind-mount that one directory. Each model exposes an env override to swap the HF repo, or
-to point at an explicit local file (which, if it exists, skips the HF download):
+Model weights (torch + MLX), private media snapshots, and per-media machine artifacts all live
+under `~/.cache/voxweave/` (override the root with `VOXWEAVE_CACHE_ROOT`), so a container only
+needs to bind-mount that one directory. Model weights are auto-downloaded under the `asr`,
+`align`, and `audio` subdirectories on first use. Each model exposes an env override to swap the
+HF repo, or to point at an explicit local file (which, if it exists, skips the HF download):
 
 - `VOXWEAVE_SEPARATOR_REPO` / `VOXWEAVE_SEPARATOR_REPO_FILE` (default `KimberleyJSN/melbandroformer` /
   `MelBandRoformer.ckpt`), or `VOXWEAVE_SEPARATOR_CKPT` / `VOXWEAVE_SEPARATOR_CONFIG` for explicit
@@ -540,7 +548,7 @@ to point at an explicit local file (which, if it exists, skips the HF download):
 
 - `VOXWEAVE_VOICEPRINTS` (`1/0`, `true/false`, `yes/no`, or `on/off`; opt-in capture,
   overridden by the explicit CLI flag)
-- `VOXWEAVE_VOICES_ACCEPT` (default `off`; finite `[-1,1]` enables reviewed HTML prefills)
+- `VOXWEAVE_VOICES_ACCEPT` (default `off`; finite `[-1,1]` enables reviewed audition-page prefills)
 - `VOXWEAVE_VOICES_SUGGEST` (default `0.45`; minimum similarity shown as a suggestion)
 - `VOXWEAVE_VOICES_MARGIN` (default `0.05`; minimum top-two margin for a prefill)
 
@@ -626,7 +634,7 @@ ja = "mms"                                      # Japanese: MMS-300m + uroman fu
 
 ## Data contract
 
-Each input produces two sibling files:
+Each input keeps its editable delivery set beside the media:
 
 - **`<stem>.json`** — the source of truth: word/character-level segments, language, VAD speech,
   plus optional replay data (`shot_changes`, `sing_spans`, `speaker_turns`) so `split` can
@@ -634,29 +642,61 @@ Each input produces two sibling files:
 - **`<stem>.vtt`** — editable subtitles. By default cues carry word-level timestamps (same
   precision as `align` output, ready to use); `--no-timestamps` writes a plain-text editing
   draft for hand-correction, which `align` re-times.
-- **`<stem>.speakers.json`** (optional) — versioned diarizer-id-to-name display mapping. Names
-  render into VTT/SRT/ASS but never enter transcript text or `<stem>.json`.
-- **`<stem>.voiceprints.json`** (optional, sensitive) — episode-bound biometric centroids,
-  produced only by explicit capture. The sibling JSON carries only the non-biometric
-  `voiceprint_capture`/`voiceprint_media` binding strings.
-- **`<stem>.speakers.suggest.json`** and **`<stem>.speakers.html`** (optional, regenerable,
-  sensitive) — reproducible match suggestions and the offline audition page with embedded
-  audio. Machine names never enter the transcript or human mapping automatically.
+- **Subtitle-family deliverables** — translated `.vtt`/`.srt`/`.ass` files and derived files
+  such as `<stem>.sdh.vtt` and `<stem>.asrfix.vtt` also stay beside the media.
+
+Other episode state is stored under
+`${VOXWEAVE_CACHE_ROOT:-~/.cache/voxweave}/artifacts/<stem>/`. For `episode.mkv`, the layout is:
+
+```text
+artifacts/episode/
+├── source.json                    # absolute source-path claim
+├── episode.episode.lock           # episode transaction lock
+├── .episode-domain-<sha256>.lock  # same-directory stem collision lock
+├── speakers.json                  # reviewed diarizer-id-to-name mapping
+├── speakers.suggest.json          # regenerable match suggestions
+├── voiceprints.json               # optional biometric centroids
+├── vocals.32k.flac                # separated-vocals cache
+├── vocals.32k.flac.meta.json      # source-bound integrity companion, when required
+├── vocals.32k.flac.lock           # vocals-cache lock
+├── episode.zh.progress.json       # interrupted translation resume state
+├── episode.align-evidence.json    # durable alignment evidence
+├── episode.asrfix.json            # correction audit
+└── debug/                         # optional --debug bundle
+```
+
+The marker normally claims the absolute media path. For a supported standalone subtitle
+command with no discoverable sibling media, it claims that absolute input path instead. If
+another source path already owns the plain stem, VoxWeave uses
+`<stem>--<sha1-of-absolute-path-first-8>/` instead. The cache root is evaluated when a command
+runs, so `VOXWEAVE_CACHE_ROOT` can select a different location per invocation.
+
+Existing adjacent machine sidecars remain compatible: when an adjacent
+`<stem>.speakers.json`, `<stem>.speakers.suggest.json`, `<stem>.voiceprints.json`, translation
+progress file, alignment-evidence file, correction audit, or old `cache/` vocals entry exists,
+VoxWeave reads it first and writes updates back to that same legacy lane. New artifacts use the
+cache. An existing adjacent `<stem>.episode.lock` is joined to the cache lock so old and new
+VoxWeave processes still serialize the same episode. The adjacent `<stem>.json` transcript is
+not a legacy exception: it remains the current source of truth by design. The
+explicit/discovered show-level `voxweave.voices.json` is a user-managed database and also stays
+where the user placed it.
 
 ### Sensitive and derived speaker data
 
-Treat voiceprint sidecars, show-level voices stores, suggestion records, audition HTML,
+Treat voiceprint artifacts, show-level voices stores, suggestion records, in-memory auditions,
 calibration reports, crash-temporary files, and media snapshots as sensitive or derived data.
-The audition page contains embedded audio; a snapshot contains private media bytes rather than
-biometrics. Snapshots live under `${VOXWEAVE_CACHE_ROOT:-~/.cache/voxweave}/snapshots`, are mode
+The served audition contains embedded audio but is never saved by VoxWeave; a snapshot contains
+private media bytes rather than biometrics. Snapshots live under
+`${VOXWEAVE_CACHE_ROOT:-~/.cache/voxweave}/snapshots`, are mode
 `0600` in an owner-only directory, and inactive crash residue older than one hour is cleaned on
 a later snapshot creation. Active snapshots are lock-protected from that janitor.
 
-The purge command removes only the three per-episode machine artifacts listed above. Remove a
-show voices store, calibration report, inactive snapshot residue, or crash-temporary file
-manually when it is no longer needed. Do not remove an active snapshot. Backups, filesystem
-snapshots, synced folders, and manual copies are outside VoxWeave's control and are not erased
-by purge; delete them separately according to their retention policy.
+The purge command removes only the episode voiceprints, suggestion record, and any legacy
+audition HTML; it preserves the reviewed mapping, transcript, subtitles, and unrelated cache
+state. Remove a show voices store, calibration report, inactive snapshot residue, or
+crash-temporary file manually when it is no longer needed. Do not remove an active snapshot.
+Backups, filesystem snapshots, synced folders, and manual copies are outside VoxWeave's control
+and are not erased by purge; delete them separately according to their retention policy.
 
 Both VTT forms are accepted by `align`. The aligner strips punctuation as a hard constraint;
 ASR punctuation is re-injected by time so the final output has correct spacing and breaks

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from voxweave import pipeline, speakers, speakerserve, translate
+from voxweave import artifacts, pipeline, speakers, speakerserve, translate
 from voxweave.asrfix import render_vtt as render_corrected_vtt
 from voxweave.cli import cli
 from voxweave.export import (
@@ -617,7 +617,7 @@ def test_create_audition_returns_embedded_page_and_installs_empty_mapping(
     monkeypatch.setattr(speakers, "extract_clip", fake_extract)
     audition = speakers.create_speaker_audition(media)
 
-    mapping_path = tmp_path / "episode.01.speakers.json"
+    mapping_path = artifacts.claim_paths(media).speaker_mapping
     page = audition.page
     assert audition.mapping_path == mapping_path
     assert audition.sibling_json_path == tmp_path / "episode.01.json"
@@ -632,6 +632,7 @@ def test_create_audition_returns_embedded_page_and_installs_empty_mapping(
         "version": 1,
         "speakers": {"SPEAKER_00": ""},
     }
+    assert not (tmp_path / "episode.01.speakers.json").exists()
     assert not list(tmp_path.glob("*.html"))
 
 
@@ -664,8 +665,46 @@ def test_create_audition_preserves_existing_mapping_and_still_builds_page(
 
     assert called
     assert 'data-speaker="SPEAKER_00"' in audition.page
+    assert audition.pristine_mapping_generation is None
     assert mapping.read_bytes() == before
     assert not (tmp_path / "episode.speakers.html").exists()
+
+
+def test_create_audition_legacy_mapping_ignores_unselected_poisoned_cache(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    (tmp_path / "episode.json").write_text(
+        json.dumps(
+            {
+                "speaker_turns": [[0.0, 8.0, "SPEAKER_00"]],
+                "vad_speech": [[0.0, 8.0]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    mapping = tmp_path / "episode.speakers.json"
+    mapping.write_text(
+        '{"version":1,"speakers":{"SPEAKER_00":"Aoi"}}',
+        encoding="utf-8",
+    )
+    poisoned = artifacts.artifacts_root() / "episode"
+    poisoned.mkdir(parents=True)
+    marker = poisoned / "source.json"
+    marker.write_text("not-json", encoding="utf-8")
+    monkeypatch.setattr(
+        speakers,
+        "extract_clip",
+        lambda *_args: Path(_args[-1]).write_bytes(b"clip"),
+    )
+
+    audition = speakers.create_speaker_audition(media)
+
+    assert audition.mapping_path == mapping
+    assert 'data-speaker="SPEAKER_00"' in audition.page
+    assert json.loads(mapping.read_bytes())["speakers"] == {"SPEAKER_00": "Aoi"}
+    assert marker.read_text(encoding="utf-8") == "not-json"
 
 
 def test_create_audition_missing_turns_has_actionable_hint(tmp_path):
@@ -705,6 +744,7 @@ def test_speakers_cli_routes_through_shared_error_wrapper(tmp_path, monkeypatch)
     assert result.exit_code == 0, result.output
     assert seen["page"] == audition.page
     assert seen["media_path"] == media
+    assert seen["pristine_mapping_generation"] is None
     assert seen["port"] == 1234
     assert seen["open_browser"] is False
 

@@ -6,7 +6,17 @@ from pathlib import Path
 
 import pytest
 
-from voxweave import speakerserve
+from voxweave import artifacts, speakerserve
+
+
+def _generation(path: Path) -> tuple[int, int, int, int]:
+    metadata = path.stat()
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
 
 
 @contextmanager
@@ -174,6 +184,19 @@ def test_reads_reject_foreign_host(tmp_path):
             assert server.token.encode() not in body
 
 
+def test_save_accepts_its_exact_self_origin(tmp_path):
+    with _running_server(tmp_path) as (server, mapping, _logs):
+        token = _serve_info(server)["token"]
+        status, _headers, _body = _save(
+            server,
+            token,
+            {"version": 1, "speakers": {"SPEAKER_00": "Aoi"}},
+            origin=server.origin,
+        )
+        assert status == 200
+        assert json.loads(mapping.read_bytes())["speakers"] == {"SPEAKER_00": "Aoi"}
+
+
 def test_save_rejects_foreign_host_before_other_failures(tmp_path):
     with _running_server(tmp_path) as (server, mapping, _logs):
         before = mapping.read_bytes()
@@ -245,3 +268,187 @@ def test_server_never_creates_an_html_artifact(tmp_path):
     with _running_server(tmp_path) as (server, _mapping, _logs):
         assert _request(server, "GET", "/")[0] == 200
     assert not list(tmp_path.glob("*.html"))
+
+
+@pytest.mark.parametrize(
+    "method", ["HEAD", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"]
+)
+def test_other_http_methods_are_method_not_allowed(tmp_path, method):
+    with _running_server(tmp_path) as (server, _mapping, _logs):
+        assert _request(server, method, "/")[0] == 405
+
+
+def test_serve_closes_cleanly_after_keyboard_interrupt(tmp_path, monkeypatch):
+    class InterruptingServer:
+        origin = "http://127.0.0.1:3210"
+        closed = False
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            self.closed = True
+
+    server = InterruptingServer()
+    monkeypatch.setattr(speakerserve, "make_server", lambda **_kwargs: server)
+    reports: list[str] = []
+
+    result = speakerserve.serve(
+        page="page",
+        media_path=tmp_path / "episode.mp4",
+        mapping_path=tmp_path / "speakers.json",
+        sibling_path=tmp_path / "episode.json",
+        speaker_ids=(),
+        open_browser=False,
+        report=reports.append,
+    )
+
+    assert result == "http://127.0.0.1:3210/"
+    assert reports == [result]
+    assert server.closed is True
+
+
+def test_server_switches_to_legacy_writeback_if_adjacent_mapping_appears(tmp_path):
+    media = tmp_path / "episode.mp4"
+    media.write_bytes(b"media")
+    cached = artifacts.claim_paths(media).speaker_mapping
+    cached.write_text(
+        '{"version":1,"speakers":{"SPEAKER_00":"Cached"}}\n',
+        encoding="utf-8",
+    )
+    server = speakerserve.make_server(
+        page="page",
+        media_path=media,
+        mapping_path=cached,
+        sibling_path=tmp_path / "episode.json",
+        speaker_ids=("SPEAKER_00",),
+        pristine_mapping_generation=_generation(cached),
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        legacy = tmp_path / "episode.speakers.json"
+        legacy.write_text(
+            '{"version":1,"speakers":{"SPEAKER_00":""}}\n',
+            encoding="utf-8",
+        )
+        info = _serve_info(server)
+        assert info["speakers"] == {"SPEAKER_00": ""}
+        status, _headers, _body = _save(
+            server,
+            info["token"],
+            {"version": 1, "speakers": {"SPEAKER_00": "Winner"}},
+        )
+        assert status == 200
+        assert json.loads(legacy.read_bytes())["speakers"] == {"SPEAKER_00": "Winner"}
+        assert json.loads(cached.read_bytes())["speakers"] == {"SPEAKER_00": "Cached"}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_pristine_skeleton_is_omitted_until_even_an_empty_save_occurs(tmp_path):
+    media = tmp_path / "episode.mp4"
+    media.write_bytes(b"media")
+    mapping = artifacts.claim_paths(media).speaker_mapping
+    mapping.write_text(
+        '{"version":1,"speakers":{"SPEAKER_00":""}}\n',
+        encoding="utf-8",
+    )
+    server = speakerserve.make_server(
+        page="page",
+        media_path=media,
+        mapping_path=mapping,
+        sibling_path=tmp_path / "episode.json",
+        speaker_ids=("SPEAKER_00",),
+        pristine_mapping_generation=_generation(mapping),
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        info = _serve_info(server)
+        assert info["speakers"] == {}
+        status, _headers, _body = _save(
+            server,
+            info["token"],
+            {"version": 1, "speakers": {"SPEAKER_00": ""}},
+        )
+        assert status == 200
+        assert _serve_info(server)["speakers"] == {"SPEAKER_00": ""}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_edit_between_audition_creation_and_server_start_is_not_suppressed(tmp_path):
+    media = tmp_path / "episode.mp4"
+    media.write_bytes(b"media")
+    mapping = artifacts.claim_paths(media).speaker_mapping
+    mapping.write_text(
+        '{"version":1,"speakers":{"SPEAKER_00":""}}\n',
+        encoding="utf-8",
+    )
+    pristine_generation = _generation(mapping)
+    mapping.write_text(
+        '{"version":1,"speakers":{"SPEAKER_00":"Saved before serve"}}\n',
+        encoding="utf-8",
+    )
+
+    server = speakerserve.make_server(
+        page="page",
+        media_path=media,
+        mapping_path=mapping,
+        sibling_path=tmp_path / "episode.json",
+        speaker_ids=("SPEAKER_00",),
+        pristine_mapping_generation=pristine_generation,
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert _serve_info(server)["speakers"] == {"SPEAKER_00": "Saved before serve"}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_legacy_mapping_save_ignores_an_unselected_poisoned_cache_claim(tmp_path):
+    media = tmp_path / "episode.mp4"
+    media.write_bytes(b"media")
+    legacy = tmp_path / "episode.speakers.json"
+    legacy.write_text(
+        '{"version":1,"speakers":{"SPEAKER_00":"Before"}}\n',
+        encoding="utf-8",
+    )
+    poisoned = artifacts.artifacts_root() / "episode"
+    poisoned.mkdir(parents=True)
+    (poisoned / "source.json").write_text("not-json", encoding="utf-8")
+
+    server = speakerserve.make_server(
+        page="page",
+        media_path=media,
+        mapping_path=legacy,
+        sibling_path=tmp_path / "episode.json",
+        speaker_ids=("SPEAKER_00",),
+        port=0,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        info = _serve_info(server)
+        status, _headers, _body = _save(
+            server,
+            info["token"],
+            {"version": 1, "speakers": {"SPEAKER_00": "After"}},
+        )
+        assert status == 200
+        assert json.loads(legacy.read_bytes())["speakers"] == {"SPEAKER_00": "After"}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

@@ -32,6 +32,7 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         mapping_path: Path,
         sibling_path: Path,
         speaker_ids: Sequence[str],
+        pristine_mapping_generation: fsio.FileGeneration | None,
         port: int,
         report: Callable[[str], None],
     ) -> None:
@@ -40,6 +41,10 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         self.mapping_path = Path(mapping_path)
         self.sibling_path = Path(sibling_path)
         self.speaker_ids = tuple(speaker_ids)
+        self.pristine_mapping_path = (
+            self.mapping_path if pristine_mapping_generation is not None else None
+        )
+        self.pristine_mapping_generation = pristine_mapping_generation
         self.token = secrets.token_urlsafe(32)
         self.report = report
         super().__init__((HOST, port), _SpeakerRequestHandler)
@@ -113,10 +118,18 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/serve-info":
             try:
-                speakers = _mapping_entries(
-                    self.server.mapping_path,
+                from voxweave import pipeline
+
+                mapping_path = pipeline.speakers_mapping_path(self.server.media_path)
+                speakers, generation = _mapping_entries(
+                    mapping_path,
                     self.server.speaker_ids,
                 )
+                if (
+                    mapping_path == self.server.pristine_mapping_path
+                    and generation == self.server.pristine_mapping_generation
+                ):
+                    speakers = {}
             except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
                 self._json_reply(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -128,7 +141,7 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {
                     "token": self.server.token,
-                    "mapping_name": self.server.mapping_path.name,
+                    "mapping_name": mapping_path.name,
                     "speakers": speakers,
                 },
                 no_store=True,
@@ -177,13 +190,19 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         }
         document = {"version": 1, "speakers": ordered}
         with episode_lock(self.server.media_path):
+            from voxweave import pipeline
+
+            mapping_path = pipeline.speakers_mapping_path(self.server.media_path)
             fsio.atomic_write_text(
-                self.server.mapping_path,
+                mapping_path,
                 json.dumps(document, ensure_ascii=False, indent=2) + "\n",
             )
-        self._json_reply(HTTPStatus.OK, {"saved": True})
-        self.server.report(f"Saved {self.server.mapping_path}")
+        self.server.mapping_path = mapping_path
+        self.server.pristine_mapping_generation = None
+        self.server.pristine_mapping_path = None
+        self.server.report(f"Saved {mapping_path}")
         self.server.report(f"Next: voxweave split {self.server.sibling_path}")
+        self._json_reply(HTTPStatus.OK, {"saved": True})
 
     def do_HEAD(self) -> None:
         self._reply(HTTPStatus.METHOD_NOT_ALLOWED)
@@ -195,6 +214,15 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         self._reply(HTTPStatus.METHOD_NOT_ALLOWED)
 
     def do_DELETE(self) -> None:
+        self._reply(HTTPStatus.METHOD_NOT_ALLOWED)
+
+    def do_OPTIONS(self) -> None:
+        self._reply(HTTPStatus.METHOD_NOT_ALLOWED)
+
+    def do_TRACE(self) -> None:
+        self._reply(HTTPStatus.METHOD_NOT_ALLOWED)
+
+    def do_CONNECT(self) -> None:
         self._reply(HTTPStatus.METHOD_NOT_ALLOWED)
 
 
@@ -239,8 +267,24 @@ def _validated_mapping(
     return speakers
 
 
-def _mapping_entries(path: Path, speaker_ids: Sequence[str]) -> dict[str, str]:
+def _file_generation(path: Path) -> tuple[int, int, int, int]:
+    metadata = Path(path).stat()
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _mapping_entries(
+    path: Path, speaker_ids: Sequence[str]
+) -> tuple[dict[str, str], tuple[int, int, int, int]]:
+    before = _file_generation(path)
     value = _strict_json_loads(Path(path).read_bytes())
+    after = _file_generation(path)
+    if before != after:
+        raise ValueError("mapping changed while reading")
     if not isinstance(value, dict):
         raise ValueError("mapping must be an object")
     if type(value.get("version")) is not int or value.get("version") != 1:
@@ -257,7 +301,7 @@ def _mapping_entries(path: Path, speaker_ids: Sequence[str]) -> dict[str, str]:
         for key, name in speakers.items()
     ):
         raise ValueError("mapping contains invalid speaker entries")
-    return speakers
+    return speakers, after
 
 
 def make_server(
@@ -267,6 +311,7 @@ def make_server(
     mapping_path: Path,
     sibling_path: Path,
     speaker_ids: Sequence[str],
+    pristine_mapping_generation: fsio.FileGeneration | None = None,
     port: int = 0,
     report: Callable[[str], None] = print,
 ) -> SpeakerHTTPServer:
@@ -277,6 +322,7 @@ def make_server(
         mapping_path=mapping_path,
         sibling_path=sibling_path,
         speaker_ids=speaker_ids,
+        pristine_mapping_generation=pristine_mapping_generation,
         port=port,
         report=report,
     )
@@ -289,6 +335,7 @@ def serve(
     mapping_path: Path,
     sibling_path: Path,
     speaker_ids: Sequence[str],
+    pristine_mapping_generation: fsio.FileGeneration | None = None,
     port: int = 0,
     open_browser: bool = True,
     report: Callable[[str], None] = print,
@@ -300,6 +347,7 @@ def serve(
         mapping_path=mapping_path,
         sibling_path=sibling_path,
         speaker_ids=speaker_ids,
+        pristine_mapping_generation=pristine_mapping_generation,
         port=port,
         report=report,
     )

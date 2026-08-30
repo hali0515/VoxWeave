@@ -187,6 +187,7 @@ class PublicCaseResult:
 
     __slots__ = (
         "artifacts",
+        "cache_root",
         "case_id",
         "command",
         "episode_root",
@@ -199,6 +200,7 @@ class PublicCaseResult:
         self,
         *,
         artifacts: Mapping[str, bytes],
+        cache_root: Path,
         case_id: str,
         command: str,
         episode_root: Path,
@@ -207,6 +209,7 @@ class PublicCaseResult:
         source_root: Path,
     ) -> None:
         self.artifacts = dict(artifacts)
+        self.cache_root = cache_root
         self.case_id = case_id
         self.command = command
         self.episode_root = episode_root
@@ -1848,13 +1851,16 @@ def _copy_distribution_metadata(source_root: Path, *, package_version: str) -> N
 def _public_artifact_path(
     artifact: str,
     *,
+    cache_root: Path,
     episode_root: Path,
     route_evidence_path: Path,
 ) -> Path:
     paths = {
         "vtt": episode_root / "episode.vtt",
         "main-json": episode_root / "episode.json",
-        "align-evidence": episode_root / "episode.align-evidence.json",
+        "align-evidence": (
+            cache_root / "artifacts" / "episode" / "episode.align-evidence.json"
+        ),
         "route-evidence": route_evidence_path,
     }
     try:
@@ -1864,7 +1870,7 @@ def _public_artifact_path(
 
 
 def _public_worker_environment(
-    recorded: Mapping[str, str | None], *, source_root: Path
+    recorded: Mapping[str, str | None], *, cache_root: Path, source_root: Path
 ) -> dict[str, str]:
     """Build the closed environment used by isolated public-command workers."""
 
@@ -1873,6 +1879,7 @@ def _public_worker_environment(
         if value is not None:
             environment[name] = value
     environment["PYTHONPATH"] = str(source_root)
+    environment["VOXWEAVE_CACHE_ROOT"] = str(cache_root)
     return environment
 
 
@@ -1899,6 +1906,7 @@ def _execute_public_case(
     with tempfile.TemporaryDirectory(prefix=f"p6-oracle-{case['id']}-") as raw_root:
         isolated_root = Path(raw_root)
         source_root = isolated_root / "source"
+        cache_root = isolated_root / "cache"
         episode_root = isolated_root / "episode"
         worker_path = source_root / "p6_oracle_public.py"
         request_path = isolated_root / "request.json"
@@ -1932,7 +1940,7 @@ def _execute_public_case(
         except OSError as exc:
             _invalid(f"cannot write isolated public-command request: {exc}")
         environment = _public_worker_environment(
-            case["environment"], source_root=source_root
+            case["environment"], cache_root=cache_root, source_root=source_root
         )
         try:
             completed = subprocess.run(
@@ -1989,6 +1997,7 @@ def _execute_public_case(
             artifact = output["artifact"]
             path = _public_artifact_path(
                 artifact,
+                cache_root=cache_root,
                 episode_root=episode_root,
                 route_evidence_path=route_evidence_path,
             )
@@ -2000,6 +2009,7 @@ def _execute_public_case(
                 )
         return PublicCaseResult(
             artifacts=artifacts,
+            cache_root=cache_root,
             case_id=case["id"],
             command=case["command"],
             episode_root=episode_root,
@@ -2031,6 +2041,7 @@ def _execute_runtime_scenario(
     with tempfile.TemporaryDirectory(prefix=f"p6-oracle-{scenario_id}-") as raw_root:
         isolated_root = Path(raw_root)
         source_root = isolated_root / "source"
+        cache_root = isolated_root / "cache"
         episode_root = isolated_root / "episode"
         worker_path = source_root / "p6_oracle_public.py"
         request_path = isolated_root / "request.json"
@@ -2064,7 +2075,9 @@ def _execute_runtime_scenario(
         except OSError as exc:
             _invalid(f"cannot write G-ALIGN-AO scenario request: {exc}")
         environment = _public_worker_environment(
-            manifest["cases"][0]["environment"], source_root=source_root
+            manifest["cases"][0]["environment"],
+            cache_root=cache_root,
+            source_root=source_root,
         )
         try:
             completed = subprocess.run(

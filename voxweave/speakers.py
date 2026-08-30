@@ -1,8 +1,9 @@
 """Speaker-name mapping, audition snippets, and display metadata helpers.
 
 Phase 1 deliberately keeps names out of the transcription sibling JSON.  The
-``.speakers.json`` sidecar maps diarizer ids to display names, while VTT voice
-tags are parsed into transient cue metadata before any text-processing stage.
+per-media speaker mapping (or a legacy adjacent ``.speakers.json`` sidecar) maps
+diarizer ids to display names, while VTT voice tags are parsed into transient
+cue metadata before any text-processing stage.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from voxweave import fsio
+from voxweave import artifacts, fsio
 from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
 from voxweave.voicebase import (
     VOICES_STORE_MAX_BYTES,
@@ -91,6 +92,7 @@ class SpeakerAudition:
     sibling_json_path: Path
     mapping_path: Path
     speaker_ids: tuple[str, ...]
+    pristine_mapping_generation: fsio.FileGeneration | None = None
 
 
 def _read_exact_object(path: Path, max_bytes: int) -> tuple[bytes, dict[str, object]]:
@@ -966,9 +968,8 @@ def _delete_stale_suggest_for_refusal(
 ) -> None:
     from voxweave import pipeline
 
-    mapping_path = pipeline.swap_ext(media, ".speakers.json")
     with episode_lock(media):
-        if mapping_path.exists():
+        if artifacts.path_present(pipeline.speakers_mapping_path(media)):
             return
         if sibling_bytes is None:
             # Initial sibling read failures have no exact observation to
@@ -991,10 +992,35 @@ def _publish_audition(
     skeleton: Mapping[str, object],
     suggest_record: Mapping[str, object] | None,
     before_mapping_install: Callable[[], None] | None = None,
-) -> None:
+) -> fsio.FileGeneration | None:
+    """Publish state and identify the exact skeleton generation this call installed."""
     from voxweave import pipeline
 
-    suggest_path = pipeline.speakers_suggest_path(media)
+    if suggest_record is None:
+        legacy_mapping = artifacts.legacy_path(media, ".speakers.json")
+        legacy_suggest = artifacts.legacy_path(media, ".speakers.suggest.json")
+        try:
+            cached = artifacts.inspect_paths(media)
+        except artifacts.ArtifactMarkerError:
+            if mapping_path != legacy_mapping:
+                raise
+            cached = None
+        suggest_paths = tuple(
+            dict.fromkeys(
+                path
+                for path in (
+                    legacy_suggest,
+                    None if cached is None else cached.speaker_suggest,
+                )
+                if path is not None
+            )
+        )
+    else:
+        suggest_paths = (pipeline.speakers_suggest_path(media),)
+
+    def delete_suggestions() -> None:
+        for path in suggest_paths:
+            delete_suggest(path)
 
     def check_authority_before_install() -> None:
         assert before_mapping_install is not None
@@ -1004,20 +1030,20 @@ def _publish_audition(
             # The callback runs before this invocation can install the
             # protected mapping. These replaceable outputs therefore remain
             # ours to remove even if another actor created a mapping meanwhile.
-            delete_suggest(suggest_path)
+            delete_suggestions()
             raise
 
     try:
         if suggest_record is None:
-            delete_suggest(suggest_path)
+            delete_suggestions()
         else:
-            write_suggest(suggest_path, suggest_record)
+            write_suggest(suggest_paths[0], suggest_record)
         if mapping_path.exists():
             if before_mapping_install is not None:
                 check_authority_before_install()
-            return
+            return None
         try:
-            fsio.atomic_write_text_new(
+            installed_generation = fsio.atomic_write_text_new(
                 mapping_path,
                 json.dumps(skeleton, ensure_ascii=False, indent=2) + "\n",
                 before_install=(
@@ -1029,13 +1055,14 @@ def _publish_audition(
         except FileExistsError:
             # A concurrent editor or generator won the protected install.
             # Its mapping is authoritative user data and remains untouched.
-            return
+            return None
+        return installed_generation
     except BaseException:
         # These outputs are wholly regenerable and owned by this invocation.
         # The protected mapping either does not exist or was created atomically
         # as the final successful edge.
         if not mapping_path.exists():
-            delete_suggest(suggest_path)
+            delete_suggestions()
         raise
 
 
@@ -1053,7 +1080,6 @@ def create_speaker_audition(
     if not media.is_file():
         raise FileNotFoundError(f"media file not found: {media}")
     json_path = pipeline.swap_ext(media, ".json")
-    mapping_path = pipeline.swap_ext(media, ".speakers.json")
     sibling_bytes: bytes | None = None
     try:
         if not json_path.exists():
@@ -1170,6 +1196,7 @@ def create_speaker_audition(
         }
 
         def publish_locked(store_handle=None) -> SpeakerAudition:
+            active_mapping_path = pipeline.speakers_mapping_path(media)
             current_data = data
             current_sidecar = sidecar
             current_sibling_bytes = json_path.read_bytes()
@@ -1226,13 +1253,6 @@ def create_speaker_audition(
                 if matched is not None:
                     matches, suggest_record, _thresholds = matched
 
-            page = _render_audition_html(
-                media.name,
-                mapping_path.name,
-                embedded,
-                matches,
-            )
-
             def recheck_media_before_mapping_install() -> None:
                 assert snapshot_fingerprint is not None
                 try:
@@ -1246,21 +1266,28 @@ def create_speaker_audition(
                         "media changed during speaker generation; re-run"
                     )
 
-            _publish_audition(
+            pristine_mapping_generation = _publish_audition(
                 media,
-                mapping_path=mapping_path,
+                mapping_path=active_mapping_path,
                 skeleton=skeleton,
                 suggest_record=suggest_record,
                 before_mapping_install=(
                     recheck_media_before_mapping_install if pair is not None else None
                 ),
             )
+            page = _render_audition_html(
+                media.name,
+                active_mapping_path.name,
+                embedded,
+                matches,
+            )
             return SpeakerAudition(
                 page=page,
                 media_path=media,
                 sibling_json_path=json_path,
-                mapping_path=mapping_path,
+                mapping_path=active_mapping_path,
                 speaker_ids=tuple(picks),
+                pristine_mapping_generation=pristine_mapping_generation,
             )
 
         with episode_lock(media):
@@ -1296,7 +1323,7 @@ def create_speaker_audition(
             sibling_bytes=sibling_bytes,
         )
         raise
-    log.info("prepared speaker audition for %s", mapping_path.name)
+    log.info("prepared speaker audition for %s", output.mapping_path.name)
     return output
 
 
@@ -1315,7 +1342,7 @@ def enroll_speaker_voices(
     if not media.is_file():
         raise FileNotFoundError(f"media file not found: {media}")
     json_path = pipeline.swap_ext(media, ".json")
-    mapping_path = pipeline.swap_ext(media, ".speakers.json")
+    mapping_path = pipeline.speakers_mapping_path(media)
     sidecar_path = pipeline.voiceprints_path(media)
     if not mapping_path.exists():
         raise FileNotFoundError(
@@ -1511,15 +1538,23 @@ def purge_voiceprints(media: Path) -> tuple[Path, ...]:
     from voxweave import pipeline
 
     media = Path(media)
-    targets = (
-        pipeline.voiceprints_path(media),
-        pipeline.speakers_suggest_path(media),
-        pipeline.speakers_html_path(media),
-    )
     removed: list[Path] = []
     with episode_lock(media):
+        targets = (
+            *artifacts.fixed_candidates(
+                media,
+                ".voiceprints.json",
+                "voiceprints",
+            ),
+            *artifacts.fixed_candidates(
+                media,
+                ".speakers.suggest.json",
+                "speaker_suggest",
+            ),
+            pipeline.speakers_html_path(media),
+        )
         for target in targets:
-            if target.exists():
+            if artifacts.path_present(target):
                 target.unlink()
                 removed.append(target)
                 log.info("deleted %s", target)

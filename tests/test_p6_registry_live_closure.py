@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from voxweave import pipeline
+from voxweave import artifacts, pipeline
 
 
 def _stub_public_shadow_align(tmp_path, monkeypatch):
@@ -301,7 +301,7 @@ def test_media_snapshot_disposal_preserves_public_exception_after_selected_commi
     assert caught.value.failure.phase == "dispose"
     assert caught.value.failure.detail_code == "media-snapshot-residue"
     assert json_path.exists() and vtt_path.exists()
-    assert (tmp_path / "episode.align-evidence.json").exists()
+    assert artifacts.claim_paths(media).align_evidence(vtt_path).exists()
 
 
 def test_audio_temp_disposal_preserves_public_exception_after_selected_commit(
@@ -310,7 +310,7 @@ def test_audio_temp_disposal_preserves_public_exception_after_selected_commit(
     class AudioDisposeFailure(OSError):
         pass
 
-    _media, json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    media, json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
     real_unlink = Path.unlink
 
     def fail_crop_unlink(path, *args, **kwargs):
@@ -331,4 +331,4 @@ def test_audio_temp_disposal_preserves_public_exception_after_selected_commit(
     assert caught.value.failure.phase == "dispose"
     assert caught.value.failure.detail_code == "audio-temp-residue"
     assert json_path.exists() and vtt_path.exists()
-    assert (tmp_path / "episode.align-evidence.json").exists()
+    assert artifacts.claim_paths(media).align_evidence(vtt_path).exists()

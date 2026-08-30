@@ -5,12 +5,14 @@ import json
 
 def test_rat2_public_evidence_uses_the_closed_v10_schema(tmp_path, monkeypatch):
     from tests.test_p6_episode_transactions import _stub_public_shadow_align
-    from voxweave import pipeline
+    from voxweave import artifacts, pipeline
 
-    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
 
     assert pipeline.align(vtt_path) == vtt_path
-    evidence = json.loads((tmp_path / "episode.align-evidence.json").read_bytes())
+    evidence = json.loads(
+        artifacts.claim_paths(media).align_evidence(vtt_path).read_bytes()
+    )
 
     assert tuple(evidence) == (
         "schema_version",
@@ -116,12 +118,12 @@ def test_rat2_public_evidence_uses_the_closed_v10_schema(tmp_path, monkeypatch):
 
 def test_rat2_verifier_rejects_uncovered_internal_mutation(tmp_path, monkeypatch):
     from tests.test_p6_episode_transactions import _stub_public_shadow_align
-    from voxweave import align_evidence, pipeline
+    from voxweave import align_evidence, artifacts, pipeline
 
-    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
     assert pipeline.align(vtt_path) == vtt_path
 
-    path = tmp_path / "episode.align-evidence.json"
+    path = artifacts.claim_paths(media).align_evidence(vtt_path)
     value = json.loads(path.read_bytes())
     value["route_plan"]["entries"][0]["source_index"] += 1
     path.write_text(

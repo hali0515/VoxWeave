@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from voxweave.debug import DebugSink, FileDebugSink
 
 
@@ -52,3 +54,8 @@ def test_file_sink_writes_artifacts(tmp_path):
     assert (ch / "004_4.2-5.0.raw.txt").read_text() == ""
     assert not (ch / "004_4.2-5.0.units.json").exists()
     assert json.loads((root / "meta.json").read_text())["cues"] == 7
+
+
+def test_file_sink_has_no_implicit_adjacent_debug_root():
+    with pytest.raises(ValueError, match="exactly one of base or root is required"):
+        FileDebugSink("clip")

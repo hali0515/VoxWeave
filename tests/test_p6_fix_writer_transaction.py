@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from voxweave import pipeline
+from voxweave import artifacts, pipeline
 
 
 def _transaction_files(tmp_path):
@@ -93,9 +93,9 @@ def test_rat2_durable_verifier_recomputes_physical_call_claims(
     from tests.test_p6_episode_transactions import _stub_public_shadow_align
     from voxweave import align_evidence
 
-    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
     assert pipeline.align(vtt_path) == vtt_path
-    evidence_path = tmp_path / "episode.align-evidence.json"
+    evidence_path = artifacts.claim_paths(media).align_evidence(vtt_path)
     evidence = json.loads(evidence_path.read_bytes())
     evidence["physical_calls"][0][field] = "d" * 64
     evidence["receipt_digest"] = align_evidence._receipt_digest(evidence)
@@ -116,9 +116,9 @@ def test_rat2_default_source_facts_downgrade_production_w1_audit(tmp_path, monke
     from tests.test_p6_episode_transactions import _stub_public_shadow_align
     from voxweave import align_evidence
 
-    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
+    media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
     assert pipeline.align(vtt_path) == vtt_path
-    evidence_path = tmp_path / "episode.align-evidence.json"
+    evidence_path = artifacts.claim_paths(media).align_evidence(vtt_path)
     evidence = json.loads(evidence_path.read_bytes())
     model_facts = {
         "kind": "default",
@@ -167,7 +167,9 @@ def test_rat2_legacy_absolute_digest_is_reprojected_from_relative_retained_units
     json_path.write_text(json.dumps(source, ensure_ascii=False), encoding="utf-8")
 
     assert pipeline.align(vtt_path) == vtt_path
-    evidence = json.loads((tmp_path / "episode.align-evidence.json").read_bytes())
+    evidence = json.loads(
+        artifacts.claim_paths(_media).align_evidence(vtt_path).read_bytes()
+    )
     call = evidence["physical_calls"][0]
     assert call["legacy_origin_kind"] == "nominal-route"
     assert call["legacy_origin_seconds"] != 0.0
