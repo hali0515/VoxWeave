@@ -14,17 +14,31 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
+      # The P6 oracle validates its governing reference commits with
+      # `git cat-file -e`; a shallow clone lacks them, so fetch full history.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
+      # The tracked oracle manifest pins the exact interpreter it was recorded
+      # under (execution.interpreter); the oracle tests reject any other micro.
+      # Reading the pin from the manifest keeps CI in lockstep with each
+      # release refresh instead of hardcoding a version that drifts.
+      - name: Resolve the oracle interpreter pin
+        id: oracle-python
+        run: |
+          version=$(python3 -c "import json; print(json.load(open('calibration/p6-oracle/manifest.json'))['execution']['interpreter'].split()[1])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       # Mirrors `make dev`: core + [cuda] extra + dev group (pytest, pyright).
       # The cuda wheels install fine on a CPU runner; all model paths are
       # lazy-imported or mocked in tests, so nothing touches a GPU.
       - name: Sync environment
-        run: uv sync --extra cuda --dev
+        run: uv sync --extra cuda --dev --python "${{ steps.oracle-python.outputs.version }}"
 
       - name: Lint
         run: |
@@ -34,8 +48,11 @@ jobs:
       - name: Type check
         run: uv run pyright
 
+      # The oracle execution record also pins the ambient environment: locale
+      # C.UTF-8, TZ and PYTHONHASHSEED unset. Conform here rather than in the
+      # tests — the pin is the gate's contract, not an accident.
       - name: Test
-        run: uv run pytest tests/ -q
+        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run pytest tests/ -q
 
   # The segmentation ruler measures output *quality* against the recorded
   # baseline (calibration/segmentation/baseline.json). Three gates are

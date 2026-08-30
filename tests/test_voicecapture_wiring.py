@@ -503,6 +503,9 @@ def test_smoothing_active_capture_publishes_valid_four_part_conjunction(
     wav = _stub_transcribe_tail(tmp_path, monkeypatch)
     sf.write(wav, np.zeros(16000, dtype=np.float32), 16000)
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    # diarize_turns resolves the HF token before reaching the stubbed pipeline;
+    # provide one so the test does not depend on ambient credentials.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     monkeypatch.setattr(diarize, "_get_pipeline", lambda _token: _SmoothingPipeline())
     monkeypatch.setattr(
         diarize,
