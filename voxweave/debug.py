@@ -93,7 +93,7 @@ class DebugSink:
 
 
 class FileDebugSink(DebugSink):
-    """Write intermediate artifacts to ``debug/<stem>/``.
+    """Write intermediate artifacts to the caller-selected debug root.
 
     Saves raw ASR output per chunk (including markers, useful for spotting hallucinations
     and repetitions). Skipped chunks (``units=None``) are also saved for pinpointing problems.
@@ -107,8 +107,22 @@ class FileDebugSink(DebugSink):
     enabled = True
     root: Path  # always set in __init__ (the base class None is for the no-op sink)
 
-    def __init__(self, stem: str, base: Path | None = None) -> None:
-        self.root = (base or Path("debug")) / stem
+    def __init__(
+        self,
+        stem: str,
+        base: Path | None = None,
+        *,
+        root: Path | None = None,
+    ) -> None:
+        if base is None and root is None:
+            raise ValueError("exactly one of base or root is required")
+        if base is not None and root is not None:
+            raise ValueError("exactly one of base or root is required")
+        if root is not None:
+            self.root = Path(root)
+        else:
+            assert base is not None
+            self.root = Path(base) / stem
         self.chunks_dir = self.root / "chunks"
         self.chunks_dir.mkdir(parents=True, exist_ok=True)
         self._health: dict[str, realign.ZeroDurationDiagnostics] = {}

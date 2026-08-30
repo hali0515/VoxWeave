@@ -6,7 +6,7 @@ from pathlib import Path
 
 import rich_click as click
 
-from voxweave import config, pipeline
+from voxweave import artifacts, config, pipeline
 from voxweave.ui import (
     RichReporter,
     correct_summary_panel,
@@ -207,8 +207,9 @@ def cli(verbose: bool) -> None:
     "--debug",
     is_flag=True,
     default=False,
-    help="Save intermediate artifacts (fullband/vocals/chunk wavs + ASR raw/alignment) to debug/<stem>/ for"
-    " inspection (implies local mode: artifacts are only written during local orchestration).",
+    help="Save intermediate artifacts (fullband/vocals/chunk wavs + ASR raw/alignment) under the"
+    " per-media artifact cache for inspection (implies local mode: artifacts are only written"
+    " during local orchestration).",
 )
 @click.option(
     "--normalize/--no-normalize",
@@ -252,7 +253,8 @@ def cli(verbose: bool) -> None:
     "--voiceprints/--no-voiceprints",
     default=None,
     help=(
-        "Opt in to a biometric speaker-centroid sidecar. Requires diarization; "
+        "Opt in to a biometric speaker-centroid artifact (cache by default; an existing "
+        "legacy sidecar is updated). Requires diarization; "
         "precedence is CLI, VOXWEAVE_VOICEPRINTS, conf [defaults].voiceprints, "
         "then off."
     ),
@@ -375,7 +377,7 @@ def cmd_transcribe(
             shot_snap=shot_snap,
         )
     )
-    dbg_dir = Path("debug") / media.stem if debug else None
+    dbg_dir = artifacts.claim_paths(media).debug if debug else None
     summary_panel(
         out,
         separated=separate,
@@ -432,7 +434,8 @@ cli.default_cmd = (
 @click.option(
     "--purge-voiceprints",
     is_flag=True,
-    help="Delete voiceprints, suggestions, and audition HTML; media may be absent.",
+    help="Delete cached/legacy voiceprints and suggestions plus any legacy audition HTML;"
+    " preserve the reviewed mapping. Media may be absent.",
 )
 def cmd_speakers(
     media: Path,
@@ -446,7 +449,7 @@ def cmd_speakers(
     replace_episode: bool,
     purge_voiceprints: bool,
 ) -> None:
-    """Generate auditions, enroll reviewed names, or purge speaker biometrics."""
+    """Serve an in-memory audition, enroll reviewed names, or purge speaker biometrics."""
     from voxweave.speakers import (
         create_speaker_audition,
         enroll_speaker_voices,
@@ -512,6 +515,7 @@ def cmd_speakers(
                 mapping_path=out.mapping_path,
                 sibling_path=out.sibling_json_path,
                 speaker_ids=out.speaker_ids,
+                pristine_mapping_generation=out.pristine_mapping_generation,
                 port=port,
                 open_browser=not no_open,
                 report=click.echo,
@@ -875,7 +879,8 @@ def cmd_burn(
     "--apply",
     is_flag=True,
     default=False,
-    help="Overwrite the original VTT in place (no sidecar json) and auto re-align; default: write sidecar <stem>.asrfix.vtt for review.",
+    help="Overwrite the original VTT in place (no correction audit) and auto re-align;"
+    " default: write adjacent <stem>.asrfix.vtt plus a cache/legacy-lane audit for review.",
 )
 @click.option(
     "--align/--no-align",
@@ -905,9 +910,10 @@ def cmd_correct(
 ) -> None:
     """Pre-align LLM correction: fix obvious ASR errors, split words, and garbled proper nouns; produce a reviewable diff.
 
-    By default writes only sidecar ``<stem>.asrfix.vtt`` + audit ``<stem>.asrfix.json`` (original
-    VTT untouched). ``--apply`` overwrites the original VTT in place (no audit json) and, since the
-    text changed, automatically re-runs alignment to refresh timestamps (use ``--no-align`` to skip).
+    By default writes adjacent sidecar ``<stem>.asrfix.vtt`` plus an audit in the per-media
+    artifact cache (or an existing adjacent legacy audit lane); the original VTT is untouched.
+    ``--apply`` overwrites the original VTT in place (no audit json) and, since the text changed,
+    automatically re-runs alignment to refresh timestamps (use ``--no-align`` to skip).
     Safety gate: only applies revisions where orig matches the original text line-for-line.
     """
     from voxweave.translate import load_glossary

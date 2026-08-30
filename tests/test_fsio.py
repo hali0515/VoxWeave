@@ -50,9 +50,16 @@ def test_atomic_write_text_can_select_fallback_at_replace_edge(tmp_path):
 
 def test_atomic_write_text_new_creates_without_temp_residue(tmp_path):
     dst = tmp_path / "mapping.json"
-    fsio.atomic_write_text_new(dst, '{"version": 1}')
+    installed = fsio.atomic_write_text_new(dst, '{"version": 1}')
     assert dst.read_text(encoding="utf-8") == '{"version": 1}'
     assert list(tmp_path.iterdir()) == [dst]
+    metadata = dst.stat()
+    assert installed == (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
 
 
 def test_atomic_write_text_new_checks_authority_at_install_edge(tmp_path):

@@ -7,7 +7,15 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from voxweave import backend, chunking, diarize, episode_transaction, pipeline, songdet
+from voxweave import (
+    artifacts,
+    backend,
+    chunking,
+    diarize,
+    episode_transaction,
+    pipeline,
+    songdet,
+)
 from voxweave.mediasnapshot import SnapshotUnavailable
 from voxweave.voicebase import (
     load_voiceprints,
@@ -81,7 +89,7 @@ def test_process_uses_snapshot_and_commits_bound_pair(tmp_path, monkeypatch):
     )
 
     sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
-    sidecar, validated = load_voiceprints(tmp_path / "episode.voiceprints.json")
+    sidecar, validated = load_voiceprints(artifacts.claim_paths(media).voiceprints)
     assert out == tmp_path / "episode.vtt"
     assert sibling["voiceprint_capture"] == validated.capture_id
     assert sibling["voiceprint_media"] == media_fingerprint(media)
@@ -360,6 +368,7 @@ def test_process_sidecar_write_failure_names_landed_primary_outputs(
     turns = [TURN]
     for suffix in (".speakers.suggest.json", ".speakers.html"):
         pipeline.swap_ext(media, suffix).write_text("stale", encoding="utf-8")
+    voiceprints_path = artifacts.claim_paths(media).voiceprints
 
     monkeypatch.setattr(
         pipeline,
@@ -376,7 +385,7 @@ def test_process_sidecar_write_failure_names_landed_primary_outputs(
     real_replace = episode_transaction._replace_stage
 
     def fail_sidecar_replace(stage):
-        if stage.target == tmp_path / "episode.voiceprints.json":
+        if stage.target == voiceprints_path:
             raise OSError("disk full")
         return real_replace(stage)
 
@@ -396,7 +405,7 @@ def test_process_sidecar_write_failure_names_landed_primary_outputs(
 
     assert (tmp_path / "episode.json").exists()
     assert (tmp_path / "episode.vtt").exists()
-    assert not (tmp_path / "episode.voiceprints.json").exists()
+    assert not voiceprints_path.exists()
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
     assert not (tmp_path / "episode.speakers.html").exists()
 
@@ -523,7 +532,7 @@ def test_smoothing_active_capture_publishes_valid_four_part_conjunction(
     )
 
     sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
-    sidecar, validated = load_voiceprints(tmp_path / "episode.voiceprints.json")
+    sidecar, validated = load_voiceprints(artifacts.claim_paths(media).voiceprints)
     assert sibling["speaker_turns"] == [[0.0, 2.0, "SPEAKER_A"]]
     assert set(validated.speakers) == {"SPEAKER_A"}
     validate_voiceprint_conjunction(sidecar, sibling, media_fingerprint(media))
@@ -646,6 +655,7 @@ def test_episode_lock_canonicalizes_parent_symlink(tmp_path):
     assert episode_lock_path(real / "episode.mkv") == episode_lock_path(
         alias / "episode.mkv"
     )
-    assert os.path.realpath(real / "episode.episode.lock") == os.fspath(
-        episode_lock_path(real / "episode.mkv")
-    )
+    lock = episode_lock_path(real / "episode.mkv")
+    assert lock == artifacts.claim_paths(real / "episode.mkv").episode_lock
+    assert lock.parent != real
+    assert not (real / "episode.episode.lock").exists()

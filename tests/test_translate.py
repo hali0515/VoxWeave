@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from voxweave import pipeline, translate
+from voxweave import artifacts, pipeline, translate
 from voxweave.progress import Reporter
 
 
@@ -814,6 +814,8 @@ def test_progress_sig_mismatch_ignored(tmp_path):
 
 
 def test_pipeline_translate_cleans_progress_on_success(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
     vtt = tmp_path / "ep.vtt"
     vtt.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
     seen = {}
@@ -827,8 +829,162 @@ def test_pipeline_translate_cleans_progress_on_success(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline.translate_mod, "translate_cues", fake_cues)
     out = pipeline.translate(vtt, to="zh")
     assert out.read_text(encoding="utf-8")  # translation written
-    assert seen["progress_path"] is not None
+    assert seen["progress_path"] == artifacts.claim_paths(media).translation_progress(
+        vtt, "zh"
+    )
     assert not Path(seen["progress_path"]).exists()  # cleaned up on success
+    assert not (tmp_path / "ep.zh.progress.json").exists()
+
+
+def test_pipeline_translate_interruption_persists_only_cached_progress(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
+    vtt = tmp_path / "ep.vtt"
+    _write_vtt(vtt)
+
+    def interrupt(_payload, *, progress_path, progress_sig, **_kwargs):
+        translate.save_progress(progress_path, progress_sig, {0: "你好"})
+        raise ConnectionError("offline")
+
+    monkeypatch.setattr(pipeline.translate_mod, "translate_cues", interrupt)
+    with pytest.raises(ConnectionError, match="offline"):
+        pipeline.translate(vtt, to="zh")
+
+    progress = artifacts.claim_paths(media).translation_progress(vtt, "zh")
+    assert progress.exists()
+    assert not (tmp_path / "ep.zh.progress.json").exists()
+    assert not (tmp_path / "ep.zh.vtt").exists()
+
+
+def test_pipeline_translate_existing_legacy_progress_is_the_writeback_lane(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
+    vtt = tmp_path / "ep.vtt"
+    _write_vtt(vtt)
+    legacy = tmp_path / "ep.zh.progress.json"
+    legacy.write_text("old", encoding="utf-8")
+    seen: dict[str, Path] = {}
+
+    def complete(_payload, *, progress_path, **_kwargs):
+        seen["path"] = progress_path
+        return {0: "你好", 1: "世界"}
+
+    monkeypatch.setattr(pipeline.translate_mod, "translate_cues", complete)
+    pipeline.translate(vtt, to="zh")
+
+    assert seen["path"] == legacy
+    assert not legacy.exists()
+    assert artifacts.inspect_paths(media) is None
+
+
+def test_pipeline_translate_success_retires_both_progress_lanes(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
+    vtt = tmp_path / "ep.vtt"
+    _write_vtt(vtt)
+    cached = artifacts.claim_paths(media).translation_progress(vtt, "zh")
+    cached.write_text("cached", encoding="utf-8")
+    legacy = tmp_path / "ep.zh.progress.json"
+    legacy.write_text("legacy", encoding="utf-8")
+
+    monkeypatch.setattr(
+        pipeline.translate_mod,
+        "translate_cues",
+        lambda _payload, **_kwargs: {0: "你好", 1: "世界"},
+    )
+    pipeline.translate(vtt, to="zh")
+
+    assert not legacy.exists()
+    assert not cached.exists()
+
+
+def test_legacy_progress_success_ignores_an_unselected_poisoned_cache_claim(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
+    vtt = tmp_path / "ep.vtt"
+    _write_vtt(vtt)
+    legacy = tmp_path / "ep.zh.progress.json"
+    legacy.write_text("legacy", encoding="utf-8")
+    poisoned = artifacts.artifacts_root() / "ep"
+    poisoned.mkdir(parents=True)
+    marker = poisoned / "source.json"
+    marker.write_text("not-json", encoding="utf-8")
+
+    monkeypatch.setattr(
+        pipeline.translate_mod,
+        "translate_cues",
+        lambda _payload, **_kwargs: {0: "你好", 1: "世界"},
+    )
+    out = pipeline.translate(vtt, to="zh")
+
+    assert out.exists()
+    assert not legacy.exists()
+    assert marker.read_text(encoding="utf-8") == "not-json"
+
+
+def test_success_keeps_legacy_authority_if_cached_progress_cannot_be_retired(
+    tmp_path, monkeypatch, caplog
+):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
+    vtt = tmp_path / "ep.vtt"
+    _write_vtt(vtt)
+    cached = artifacts.claim_paths(media).translation_progress(vtt, "zh")
+    cached.mkdir()
+    legacy = tmp_path / "ep.zh.progress.json"
+    legacy.write_text("legacy", encoding="utf-8")
+
+    monkeypatch.setattr(
+        pipeline.translate_mod,
+        "translate_cues",
+        lambda _payload, **_kwargs: {0: "你好", 1: "世界"},
+    )
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = pipeline.translate(vtt, to="zh")
+
+    assert out.exists()
+    assert legacy.exists()
+    assert cached.is_dir()
+    assert any("progress cleanup" in record.message for record in caplog.records)
+
+
+def test_landed_translation_survives_cache_marker_change_during_publication(
+    tmp_path, monkeypatch, caplog
+):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
+    vtt = tmp_path / "ep.vtt"
+    _write_vtt(vtt)
+    paths = artifacts.claim_paths(media)
+    progress = paths.translation_progress(vtt, "zh")
+    progress.write_text("cached", encoding="utf-8")
+    output = tmp_path / "ep.zh.vtt"
+    original_write = pipeline.fsio.atomic_write_text
+
+    def write_then_replace_marker(path, text, **kwargs):
+        original_write(path, text, **kwargs)
+        if Path(path) == output:
+            paths.marker.write_text("not-json", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline.fsio, "atomic_write_text", write_then_replace_marker)
+    monkeypatch.setattr(
+        pipeline.translate_mod,
+        "translate_cues",
+        lambda _payload, **_kwargs: {0: "你好", 1: "世界"},
+    )
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = pipeline.translate(vtt, to="zh")
+
+    assert out == output
+    assert output.exists()
+    assert progress.exists()
+    assert any("progress cleanup" in record.message for record in caplog.records)
 
 
 # --------------------------------------------------------------------------- #

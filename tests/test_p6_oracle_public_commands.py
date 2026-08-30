@@ -94,6 +94,7 @@ def test_every_oracle_case_executes_its_recorded_public_command_in_a_clean_root(
     results = public_authority_run["results"]
     source_roots: set[Path] = set()
     episode_roots: set[Path] = set()
+    cache_roots: set[Path] = set()
 
     for case in manifest["cases"]:
         result = results[case["id"]]
@@ -115,8 +116,11 @@ def test_every_oracle_case_executes_its_recorded_public_command_in_a_clean_root(
         assert result.episode_root not in episode_roots
         assert not result.source_root.exists()
         assert not result.episode_root.exists()
+        assert result.cache_root not in cache_roots
+        assert not result.cache_root.exists()
         source_roots.add(result.source_root)
         episode_roots.add(result.episode_root)
+        cache_roots.add(result.cache_root)
 
     assert tuple(case["id"] for case in manifest["cases"]) == PUBLIC_CASE_IDS
 

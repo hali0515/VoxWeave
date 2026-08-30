@@ -169,6 +169,24 @@ def test_load_named_srt_matches_srt_sanitized_mapping_name(tmp_path):
     }
 
 
+def test_language_tagged_srt_prefers_its_exact_mapping_over_base_mapping(tmp_path):
+    srt = tmp_path / "ep.zh.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nExact: Hello\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ep.zh.speakers.json").write_text(
+        '{"version":1,"speakers":{"S0":"Exact"}}',
+        encoding="utf-8",
+    )
+    (tmp_path / "ep.speakers.json").write_text(
+        '{"version":1,"speakers":{"S0":"Base"}}',
+        encoding="utf-8",
+    )
+
+    assert load_subtitle_blocks(srt)[0]["speaker"] == "Exact"
+
+
 @pytest.mark.parametrize(
     "mapping",
     [

@@ -534,6 +534,7 @@ def _worker_run(
 
     with tempfile.TemporaryDirectory(prefix="voxweave-align-shadow-") as temporary:
         episode_root = Path(temporary)
+        os.environ["VOXWEAVE_CACHE_ROOT"] = str(episode_root / ".cache")
         copied = _copy_case_inputs(manifest_path, case, episode_root)
         argv = case["argv"]
         if argv != ["episode.vtt", "--media", "episode.wav"]:
@@ -541,7 +542,6 @@ def _worker_run(
         vtt_path = copied[argv[0]]
         media_path = copied[argv[2]]
         json_path = copied["episode.json"]
-        evidence_path = episode_root / "episode.align-evidence.json"
         receipt = _load_receipt(manifest_path, case)
         prepared_path = episode_root / "prepared.wav"
         with wave.open(str(prepared_path), "wb") as prepared:
@@ -550,8 +550,10 @@ def _worker_run(
             prepared.setframerate(16_000)
             prepared.writeframes(b"\x00\x00" * 32_000)
 
-        from voxweave import backend, config, engine_registry, pipeline
+        from voxweave import artifacts, backend, config, engine_registry, pipeline
         from voxweave.progress import Reporter
+
+        evidence_path = artifacts.claim_paths(media_path).align_evidence(vtt_path)
 
         family = case["expected"]["selected"]["engine_family"]
         registry = dict(engine_registry.LANGUAGE_ENGINE_FAMILY)

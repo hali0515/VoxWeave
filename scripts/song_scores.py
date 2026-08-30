@@ -5,11 +5,11 @@ song_flags gates (sing >= SING_MIN or music >= MUSIC_MIN, AND speech < SPEECH_MA
 so a missed span reveals WHICH gate failed (e.g. sung vocals scoring speech-like).
 
 Usage:
-    uv run python scripts/song_scores.py <media> <start_sec> <end_sec>
+    uv run --extra cuda python scripts/song_scores.py <media> <start_sec> <end_sec>
 
-Prefers the run's separated-vocals cache (cache/<stem>.vocals.32k.flac) next to
-the media -- scores are only meaningful on separated vocals (route ii); falls
-back to the raw media with a warning.
+Prefers the run's separated-vocals entry in the per-media VoxWeave artifact
+cache (or an existing legacy media-adjacent cache) -- scores are only meaningful
+on separated vocals (route ii); falls back to the raw media with a warning.
 """
 
 from __future__ import annotations

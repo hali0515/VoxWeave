@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NoReturn
 
+from voxweave import artifacts
 from voxweave.align_acquisition import IssuedFreshAlignment
 from voxweave.align_context import (
     IssuedAlignContext,
@@ -2518,7 +2519,24 @@ def verify_align_evidence(
 ) -> AlignEvidenceVerification:
     """Verify canonical sidecar bytes and live selected-primary/media links."""
     target = Path(vtt_path)
-    evidence_path = _swap_ext(target, ".align-evidence.json")
+    legacy_evidence = _swap_ext(target, ".align-evidence.json")
+    artifact_media = (
+        Path(explicit_media_path) if explicit_media_path is not None else None
+    )
+    if artifact_media is None:
+        try:
+            from voxweave.pipeline import _find_subtitle_media
+
+            artifact_media = _find_subtitle_media(target)
+        except (ImportError, OSError):
+            artifact_media = None
+    if artifacts.path_present(legacy_evidence):
+        evidence_path = legacy_evidence
+    else:
+        cached = artifacts.inspect_paths(artifact_media or target)
+        evidence_path = (
+            legacy_evidence if cached is None else cached.align_evidence(target)
+        )
     json_path = _swap_ext(target, ".json")
     try:
         encoded = evidence_path.read_bytes()

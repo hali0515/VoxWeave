@@ -250,13 +250,13 @@ def load_subtitle_blocks_bytes(path: Path, data: bytes) -> list[dict]:
     if is_ass:
         blocks = parse_ass_blocks(text)
     elif p.suffix.lower() == ".srt":
-        from voxweave.mux import detect_subtitle_language
-        from voxweave.pipeline import swap_ext
+        from voxweave.pipeline import inspect_speakers_mapping_path
         from voxweave.speakers import load_speaker_display_names
 
-        mapping_path = swap_ext(p, ".speakers.json")
-        if not mapping_path.exists() and detect_subtitle_language(p) is not None:
-            mapping_path = swap_ext(swap_ext(p, ""), ".speakers.json")
+        mapping_path = inspect_speakers_mapping_path(
+            p,
+            reference=p,
+        )
         known_names: list[str] = []
         if mapping_path.exists():
             try:

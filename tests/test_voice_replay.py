@@ -413,10 +413,12 @@ def test_bound_align_rejects_duration_only_and_legacy_cache(tmp_path, monkeypatc
     cache_owner.write_bytes(source.read_bytes())
     fingerprint = media_fingerprint(source)
     cache = pipeline.cache_vocals_path(cache_owner)
-    cache.parent.mkdir()
+    cache.parent.mkdir(exist_ok=True)
     cache.write_bytes(b"wrong unbound cache")
     cache_companion_path(cache).write_text("stale", encoding="utf-8")
-    pipeline.cache_16k_path(cache_owner).write_bytes(b"legacy cache")
+    legacy = pipeline.cache_16k_path(cache_owner)
+    legacy.parent.mkdir()
+    legacy.write_bytes(b"legacy cache")
     parts = tuple(
         tmp_path / name
         for name in ("full.wav", "vocals.wav", "speech.wav", "vocals32.wav")
@@ -463,7 +465,7 @@ def test_bound_align_validates_cache_while_lock_is_held(tmp_path, monkeypatch):
     cache_owner.write_bytes(source.read_bytes())
     fingerprint = media_fingerprint(source)
     cache = pipeline.cache_vocals_path(cache_owner)
-    cache.parent.mkdir()
+    cache.parent.mkdir(exist_ok=True)
     cache.write_bytes(b"bound cache")
     publish_cache_companion(
         cache,

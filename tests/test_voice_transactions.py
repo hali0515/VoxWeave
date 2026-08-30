@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from voxweave import episode_transaction, pipeline, speakers
+from voxweave import artifacts, episode_transaction, pipeline, speakers
 from voxweave.voicebase import (
     canonical_turns_digest,
     media_fingerprint,
@@ -140,9 +140,11 @@ def test_two_speaker_generators_leave_winner_outputs_intact(tmp_path, monkeypatc
                 outcomes.append(exc)
 
     assert all(isinstance(value, speakers.SpeakerAudition) for value in outcomes)
-    assert (tmp_path / "episode.speakers.json").exists()
+    paths = artifacts.claim_paths(media)
+    assert paths.speaker_mapping.exists()
+    assert not (tmp_path / "episode.speakers.json").exists()
     assert not (tmp_path / "episode.speakers.html").exists()
-    assert load_suggest(tmp_path / "episode.speakers.suggest.json")["version"] == 1
+    assert load_suggest(paths.speaker_suggest)["version"] == 1
 
 
 def test_process_commit_invalidates_staged_speaker_generation(tmp_path, monkeypatch):
@@ -213,10 +215,42 @@ def test_speaker_generation_and_purge_serialize_as_one_episode_set(
         removed = purge.result(timeout=10)
 
     assert len(removed) == 2
-    assert (tmp_path / "episode.speakers.json").exists()
+    paths = artifacts.claim_paths(media)
+    assert paths.speaker_mapping.exists()
+    assert not (tmp_path / "episode.speakers.json").exists()
     assert not (tmp_path / "episode.voiceprints.json").exists()
-    assert not (tmp_path / "episode.speakers.suggest.json").exists()
+    assert not paths.speaker_suggest.exists()
     assert not (tmp_path / "episode.speakers.html").exists()
+
+
+def test_purge_resolves_cache_targets_only_after_acquiring_episode_lock(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    published: dict[str, Path] = {}
+
+    @contextmanager
+    def publish_before_lock_yields(_media):
+        paths = artifacts.claim_paths(media)
+        paths.voiceprints.write_text("sensitive", encoding="utf-8")
+        paths.speaker_suggest.write_text("sensitive", encoding="utf-8")
+        paths.speaker_mapping.write_text("reviewed", encoding="utf-8")
+        published.update(
+            voiceprints=paths.voiceprints,
+            suggest=paths.speaker_suggest,
+            mapping=paths.speaker_mapping,
+        )
+        yield
+
+    monkeypatch.setattr(speakers, "episode_lock", publish_before_lock_yields)
+
+    removed = speakers.purge_voiceprints(media)
+
+    assert set(removed) == {published["voiceprints"], published["suggest"]}
+    assert not published["voiceprints"].exists()
+    assert not published["suggest"].exists()
+    assert published["mapping"].read_text(encoding="utf-8") == "reviewed"
 
 
 def test_process_commit_and_purge_serialize_as_one_episode_set(tmp_path, monkeypatch):

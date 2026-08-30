@@ -410,7 +410,18 @@ def cache_lock(cache_path: Path) -> Iterator[CacheLockHandle]:
         resolved = canonical_cache_path(cache_path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         lock = Path(f"{resolved}.lock")
-        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        descriptor = os.open(
+            lock,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError(f"vocals cache lock is not a regular file: {lock}")
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
     except OSError as exc:

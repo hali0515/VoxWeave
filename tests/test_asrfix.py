@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from voxweave import asrfix, pipeline
+from voxweave import artifacts, asrfix, pipeline
 
 
 class FakeClient:
@@ -252,6 +252,8 @@ def _make_vtt(tmp_path: Path, cues) -> Path:
 
 
 def test_pipeline_correct_sidecar_does_not_touch_vtt(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
     vtt = _make_vtt(tmp_path, ["如金仍是主力", "正常一句"])
     orig_text = vtt.read_text(encoding="utf-8")
     client = FakeClient(
@@ -270,7 +272,57 @@ def test_pipeline_correct_sidecar_does_not_touch_vtt(tmp_path, monkeypatch):
     # audit JSON
     audit = json.loads(res["audit"].read_text(encoding="utf-8"))
     assert len(audit["applied"]) == 1
+    assert res["audit"] == artifacts.claim_paths(media).asrfix_audit(vtt)
+    assert not (tmp_path / "ep.asrfix.json").exists()
     assert res["applied_in_place"] is False
+
+
+def test_pipeline_correct_existing_legacy_audit_is_overwritten_in_place(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
+    vtt = _make_vtt(tmp_path, ["hello"])
+    legacy = tmp_path / "ep.asrfix.json"
+    legacy.write_text("old", encoding="utf-8")
+    monkeypatch.setattr(
+        pipeline.asrfix_mod,
+        "correct_cues",
+        lambda _payload, **_kwargs: [
+            {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "x"}
+        ],
+    )
+
+    result = pipeline.correct(vtt)
+
+    assert result["audit"] == legacy
+    assert json.loads(legacy.read_bytes())["applied"][0]["fixed"] == "hallo"
+
+
+def test_pipeline_correct_invalid_cache_claim_leaves_no_sidecar_pair(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
+    vtt = _make_vtt(tmp_path, ["hello"])
+    claim = artifacts.artifacts_root() / "ep"
+    claim.mkdir(parents=True)
+    (claim / "source.json").write_text("invalid", encoding="utf-8")
+    monkeypatch.setattr(
+        pipeline.asrfix_mod,
+        "correct_cues",
+        lambda _payload, **_kwargs: [
+            {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "x"}
+        ],
+    )
+
+    import pytest
+
+    with pytest.raises(artifacts.ArtifactMarkerError):
+        pipeline.correct(vtt)
+
+    assert not (tmp_path / "ep.asrfix.vtt").exists()
+    assert not (tmp_path / "ep.asrfix.json").exists()
 
 
 def test_pipeline_correct_apply_overwrites_vtt_no_audit_json(tmp_path, monkeypatch):

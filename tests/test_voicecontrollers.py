@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from voxweave import pipeline, speakers
+from voxweave import artifacts, pipeline, speakers
 from voxweave.cli import cli
 from voxweave.voicebase import (
     canonical_turns_digest,
@@ -134,12 +134,14 @@ def test_matching_prefill_stays_html_only_and_mapping_empty(tmp_path, monkeypatc
 
     audition = speakers.create_speaker_audition(media, voices=store_path)
 
-    mapping = json.loads((tmp_path / "episode.speakers.json").read_text())
+    paths = artifacts.claim_paths(media)
+    mapping = json.loads(paths.speaker_mapping.read_text())
     assert mapping == {"version": 1, "speakers": {"SPEAKER_00": ""}}
     page = audition.page
     assert 'value="Aqua"' in page
     assert "machine-suggested" in page
-    suggestion = load_suggest(tmp_path / "episode.speakers.suggest.json")
+    assert audition.pristine_mapping_generation is not None
+    suggestion = load_suggest(paths.speaker_suggest)
     assert suggestion["speakers"]["SPEAKER_00"]["decision"] == "prefill"
     assert seen_sources and all(source != media for source in seen_sources)
     assert all(not source.exists() for source in seen_sources)
@@ -184,7 +186,8 @@ def test_no_match_is_manual_escape_and_mints_no_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(speakers, "MediaSnapshot", ForbiddenSnapshot)
     speakers.create_speaker_audition(media, no_match=True)
 
-    assert (tmp_path / "episode.speakers.json").exists()
+    assert artifacts.claim_paths(media).speaker_mapping.exists()
+    assert not (tmp_path / "episode.speakers.json").exists()
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
 
 
@@ -228,7 +231,8 @@ def test_explicit_corrupt_store_is_fatal_but_discovered_corrupt_store_is_manual(
     discovered.write_text("{broken", encoding="utf-8")
     audition = speakers.create_speaker_audition(media)
     assert audition.page.startswith("<!doctype html>")
-    assert (tmp_path / "episode.speakers.json").exists()
+    assert artifacts.claim_paths(media).speaker_mapping.exists()
+    assert not (tmp_path / "episode.speakers.json").exists()
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
 
 
@@ -285,7 +289,8 @@ def test_first_clip_reads_stable_snapshot_through_truncate_aba(tmp_path, monkeyp
 
     speakers.create_speaker_audition(media)
 
-    assert (tmp_path / "episode.speakers.json").exists()
+    assert artifacts.claim_paths(media).speaker_mapping.exists()
+    assert not (tmp_path / "episode.speakers.json").exists()
     assert seen and not seen[0].exists()
 
 
@@ -396,12 +401,14 @@ def test_generation_rechecks_live_media_at_mapping_install_edge(tmp_path, monkey
     store_path = tmp_path / "voices.json"
     _write_store(store_path)
     _fake_clips(monkeypatch)
+    mapping_path = artifacts.claim_paths(media).speaker_mapping
     original_mapping_write = speakers.fsio.atomic_write_text_new
     mutated = []
 
     def mutate_before_mapping_install(path, content, **kwargs):
-        media.write_bytes(b"replacement media in sampled region")
-        mutated.append(True)
+        if Path(path) == mapping_path:
+            media.write_bytes(b"replacement media in sampled region")
+            mutated.append(True)
         return original_mapping_write(path, content, **kwargs)
 
     monkeypatch.setattr(
@@ -414,7 +421,7 @@ def test_generation_rechecks_live_media_at_mapping_install_edge(tmp_path, monkey
         speakers.create_speaker_audition(media, voices=store_path)
 
     assert mutated == [True]
-    assert not (tmp_path / "episode.speakers.json").exists()
+    assert not mapping_path.exists()
     assert not (tmp_path / "episode.speakers.html").exists()
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
 

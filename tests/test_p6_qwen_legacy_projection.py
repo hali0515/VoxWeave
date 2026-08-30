@@ -104,7 +104,7 @@ def test_public_legacy_qwen_retains_separately_timed_punctuation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from voxweave import align_evidence, pipeline
+    from voxweave import align_evidence, artifacts, pipeline
 
     media_path, json_path, vtt_path = _write_qwen_episode(tmp_path)
     _stub_qwen_punctuation_result(monkeypatch, tmp_path, media_path)
@@ -114,7 +114,9 @@ def test_public_legacy_qwen_retains_separately_timed_punctuation(
     assert json_path.read_bytes() == EXPECTED_JSON
 
     evidence = json.loads(
-        (tmp_path / "episode.align-evidence.json").read_text(encoding="utf-8")
+        artifacts.claim_paths(media_path)
+        .align_evidence(vtt_path)
+        .read_text(encoding="utf-8")
     )
     call = evidence["legacy_distribution"]["calls"][0]
     raw_ids = evidence["physical_calls"][0]["raw_unit_ids"]

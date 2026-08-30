@@ -773,7 +773,6 @@ def commit_primary_outputs(
                     item
                     for item in cleanup_paths
                     if item.detail_code == "evidence-unlink"
-                    and evidence_artifact is None
                 ):
                     _cleanup_after_primary(cleanup)
                 if evidence_artifact is not None:
@@ -806,17 +805,18 @@ def commit_primary_outputs(
 
 def commit_correction(
     *,
+    episode_path: Path,
     vtt_path: Path,
     expected_vtt: FileGeneration,
     rendered_vtt_bytes: bytes,
-    evidence_path: Path,
+    evidence_paths: Sequence[Path],
 ) -> TransactionReceipt:
     """Unconditionally rewrite C1 after C0 CAS and retire changed-byte evidence."""
     target = Path(vtt_path)
     stage = _stage_primary(target, rendered_vtt_bytes, "vtt-stage")
     landed: list[Path] = []
     try:
-        with _transaction_lock(target):
+        with _transaction_lock(Path(episode_path)):
             if not same_file_generation(target, expected_vtt):
                 raise InputStaleError(
                     "correct-generation", "input changed during correction; re-run"
@@ -824,9 +824,12 @@ def commit_correction(
             _replace_primary(stage, "vtt-replace")
             landed.append(target)
             if rendered_vtt_bytes != expected_vtt.bytes_value:
-                _cleanup_after_primary(
-                    ArtifactCleanup(Path(evidence_path), "evidence-unlink")
-                )
+                for evidence_path in dict.fromkeys(
+                    Path(path) for path in evidence_paths
+                ):
+                    _cleanup_after_primary(
+                        ArtifactCleanup(evidence_path, "evidence-unlink")
+                    )
     except BaseException as exc:
         leftovers = _discard_stages((stage,))
         if leftovers:

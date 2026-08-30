@@ -217,6 +217,7 @@ def build_segmentation_selection(
     expected_vtt: FileGeneration | None,
     source_mode: ProcessSourceMode | None,
     mapping_generation: SpeakerMappingGeneration | None,
+    mapping_path: Path | None,
     shadow_enabled: bool,
     semantic_selector_enabled: bool,
 ) -> SegmentationSelection:
@@ -258,16 +259,16 @@ def build_segmentation_selection(
         effective_iso=language,
     )
     if command == "split":
-        if mapping_generation is None:
+        if mapping_generation is None or mapping_path is None:
             retire_live_context_roles(context)
             verify_context_roles_terminal(context)
             raise ValueError("split selection requires its S0 mapping generation")
         bind_split_speaker_mapping_generation(
             context,
-            _swap_ext(sibling_path, ".speakers.json"),
+            mapping_path,
             mapping_generation,
         )
-    elif mapping_generation is not None:
+    elif mapping_generation is not None or mapping_path is not None:
         retire_live_context_roles(context)
         verify_context_roles_terminal(context)
         raise ValueError("process selection cannot bind a speaker mapping generation")

@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import platform
+import stat
 import subprocess
 import threading
 from collections import Counter
@@ -18,7 +19,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 from voxweave import asrfix as asrfix_mod
-from voxweave import backend, chunking, episode_transaction, fsio, realign, songdet
+from voxweave import (
+    artifacts,
+    backend,
+    chunking,
+    episode_transaction,
+    fsio,
+    realign,
+    songdet,
+)
 from voxweave import translate as translate_mod
 from voxweave.chunking import (
     decode_to_wav,
@@ -74,6 +83,7 @@ from voxweave.voicebase import (
     validate_voiceprints_mapping,
 )
 from voxweave.vocalscache import (
+    cache_companion_path,
     cache_lock,
     cache_publish_path,
     cache_write_window,
@@ -134,9 +144,9 @@ TINY_CUE_SEC = float(os.environ.get("VOXWEAVE_TINY_CUE_SEC", "0.2"))
 TINY_CUE_TARGET = float(os.environ.get("VOXWEAVE_TINY_CUE_TARGET", "0.5"))
 
 
-# Vocals cache: <media_dir>/cache/<stem>.vocals.32k.flac (32k mono, no BGM).
+# Vocals cache: per-media artifact claim ``vocals.32k.flac`` (32k mono, no BGM).
 # Shared by process and align; PANNs eats it directly, ASR/alignment downsample to 16k.
-# Legacy <stem>.16k.flac caches are still accepted by align for backward compatibility.
+# Existing media-adjacent 32k/16k caches remain writeback/read compatibility lanes.
 # A cache hit also requires the durations to match (_vocals_cache_fresh): a replaced or
 # trimmed source silently invalidates the old separation, so it is re-run and overwritten.
 CACHE_DIRNAME = "cache"
@@ -402,9 +412,34 @@ def _progress_bridge(rep: Reporter, label: str):
 
 
 def cache_vocals_path(media_path: Path) -> Path:
-    """Return the canonical vocals cache path: <media_dir>/cache/<stem>.vocals.32k.flac."""
+    """Resolve the vocals cache, preserving an existing legacy cache pair."""
     media_path = Path(media_path)
-    return media_path.parent / CACHE_DIRNAME / f"{media_path.stem}.vocals.32k.flac"
+    legacy = media_path.parent / CACHE_DIRNAME / f"{media_path.stem}.vocals.32k.flac"
+    if (
+        artifacts.path_present(legacy)
+        or artifacts.path_present(cache_companion_path(legacy))
+        or artifacts.path_present(Path(f"{legacy.resolve()}.lock"))
+    ):
+        return legacy
+    managed = artifacts.claim_paths(media_path).vocals_cache
+    for candidate in (
+        managed,
+        Path(f"{managed}.meta.json"),
+        Path(f"{managed}.lock"),
+    ):
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise artifacts.ArtifactMarkerError(
+                f"cannot inspect managed vocals cache node {candidate}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise artifacts.ArtifactMarkerError(
+                f"managed vocals cache node is not a regular file: {candidate}"
+            )
+    return managed
 
 
 def cache_16k_path(media_path: Path) -> Path:
@@ -539,6 +574,59 @@ def _find_sibling_media(ref: Path) -> Path | None:
             matches[0][1].name,
         )
     return matches[0][1]
+
+
+def _find_subtitle_media(ref: Path) -> Path | None:
+    """Find exact-stem media, then peel closed subtitle-derived suffix tags."""
+    found = _find_sibling_media(ref)
+    if found is not None:
+        return found
+    from voxweave.mux import detect_subtitle_language
+
+    carrier = swap_ext(ref, "")
+    while carrier.suffix:
+        tag = carrier.suffix[1:].casefold()
+        if tag not in {"asrfix", "sdh"} and detect_subtitle_language(carrier) is None:
+            return None
+        found = _find_sibling_media(carrier)
+        if found is not None:
+            return found
+        carrier = swap_ext(carrier, "")
+    return None
+
+
+def _artifact_owner(reference: Path) -> Path:
+    """Return live or cache-recorded media, else the standalone source itself."""
+    value = Path(reference)
+    if value.suffix.lower() in MEDIA_EXTS:
+        return value
+    live = _find_subtitle_media(value)
+    if live is not None:
+        return live
+    from voxweave.mux import detect_subtitle_language
+
+    normalized_parent = Path(os.path.realpath(os.fspath(value.parent)))
+    carrier = swap_ext(value, "")
+    order = {suffix: index for index, suffix in enumerate(MEDIA_EXTS)}
+    while True:
+        recorded = sorted(
+            (
+                order[source.suffix.lower()],
+                str(source),
+                source,
+            )
+            for source in artifacts.claimed_sources(carrier.name)
+            if source.parent == normalized_parent and source.suffix.lower() in order
+        )
+        if recorded:
+            return recorded[0][2]
+        if not carrier.suffix:
+            break
+        tag = carrier.suffix[1:].casefold()
+        if tag not in {"asrfix", "sdh"} and detect_subtitle_language(carrier) is None:
+            break
+        carrier = swap_ext(carrier, "")
+    return value
 
 
 @overload
@@ -806,6 +894,7 @@ def transcribe(
     normalize: bool = False,
     reporter: Reporter | None = None,
     debug: bool = False,
+    debug_root: Path | None = None,
     cache_vocals: Path | None = None,
     source_fingerprint: str | None = None,
     debug_stem: str | None = None,
@@ -841,8 +930,15 @@ def transcribe(
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
+    if debug and debug_root is None:
+        debug_root = artifacts.claim_paths(media_path).debug
     dbg: DebugSink = (
-        FileDebugSink(debug_stem or media_path.stem) if debug else DebugSink()
+        FileDebugSink(
+            debug_stem or media_path.stem,
+            root=debug_root,
+        )
+        if debug
+        else DebugSink()
     )
     af = ASR_LOUDNORM if normalize else None
     tmp: list[
@@ -3872,11 +3968,66 @@ def _reconcile_word_segment_language(
 
 
 def voiceprints_path(path: Path) -> Path:
-    return swap_ext(Path(path), ".voiceprints.json")
+    return artifacts.voiceprints_path(_artifact_owner(Path(path)))
 
 
 def speakers_suggest_path(path: Path) -> Path:
-    return swap_ext(Path(path), ".speakers.suggest.json")
+    return artifacts.speaker_suggest_path(_artifact_owner(Path(path)))
+
+
+def speakers_mapping_path(path: Path, *, reference: Path | None = None) -> Path:
+    return artifacts.speaker_mapping_path(
+        _artifact_owner(Path(path)),
+        reference=reference,
+    )
+
+
+def inspect_speakers_mapping_path(
+    path: Path,
+    *,
+    reference: Path | None = None,
+) -> Path:
+    owner = _artifact_owner(Path(path))
+    if reference is not None and owner == Path(path):
+        from voxweave.mux import detect_subtitle_language
+
+        ref = Path(reference)
+        exact = swap_ext(ref, ".speakers.json")
+        if artifacts.path_present(exact):
+            return exact
+        if detect_subtitle_language(ref) is not None:
+            untagged = swap_ext(swap_ext(ref, ""), ".speakers.json")
+            if artifacts.path_present(untagged):
+                return untagged
+    return artifacts.inspect_speaker_mapping_path(
+        owner,
+        reference=reference,
+    )
+
+
+def _voiceprints_candidates(path: Path) -> tuple[Path, ...]:
+    return artifacts.fixed_candidates(
+        _artifact_owner(Path(path)),
+        ".voiceprints.json",
+        "voiceprints",
+    )
+
+
+def _speaker_suggest_candidates(path: Path) -> tuple[Path, ...]:
+    return artifacts.fixed_candidates(
+        _artifact_owner(Path(path)),
+        ".speakers.suggest.json",
+        "speaker_suggest",
+    )
+
+
+def _align_evidence_candidates(
+    subtitle: Path,
+    *,
+    media: Path | None = None,
+) -> tuple[Path, ...]:
+    owner = Path(media) if media is not None else _artifact_owner(Path(subtitle))
+    return artifacts.align_evidence_candidates(owner, Path(subtitle))
 
 
 def speakers_html_path(path: Path) -> Path:
@@ -3968,6 +4119,7 @@ def process(
     expected_vtt: episode_transaction.FileGeneration | None = None
     expected_media: str | None = None
     source_mode: episode_transaction.ProcessSourceMode | None = None
+    debug_root = artifacts.claim_paths(media_path).debug if debug else None
 
     def run_with_source(
         source_path: Path,
@@ -3991,6 +4143,7 @@ def process(
             separate=separate,
             reporter=rep,
             debug=debug,
+            debug_root=debug_root,
             normalize=normalize,
             skip_songs=skip_songs,
             keep_lyrics=keep_lyrics,
@@ -4093,6 +4246,7 @@ def _process_from_source(
     separate: bool = True,
     reporter: Reporter | None = None,
     debug: bool = False,
+    debug_root: Path | None = None,
     normalize: bool = False,
     skip_songs: bool = False,
     keep_lyrics: bool = False,
@@ -4143,6 +4297,7 @@ def _process_from_source(
                 normalize=normalize,
                 reporter=reporter,
                 debug=debug,
+                debug_root=debug_root,
                 cache_vocals=cache_vocals_path(media_path),
                 source_fingerprint=snapshot_fingerprint,
                 debug_stem=media_path.stem,
@@ -4297,27 +4452,31 @@ def _finish_process_from_units(
         expected_vtt=expected_vtt,
         source_mode=source_mode,
         mapping_generation=None,
+        mapping_path=None,
         shadow_enabled=os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1",
         semantic_selector_enabled=semantic_engine is not None,
     )
     cleanup: list[episode_transaction.ArtifactCleanup] = []
     if machine_artifact is None:
-        cleanup.append(
-            episode_transaction.ArtifactCleanup(
-                voiceprints_path(media_path), "voiceprints-unlink"
-            )
+        cleanup.extend(
+            episode_transaction.ArtifactCleanup(path, "voiceprints-unlink")
+            for path in _voiceprints_candidates(media_path)
         )
+    cleanup.extend(
+        episode_transaction.ArtifactCleanup(path, "suggest-unlink")
+        for path in _speaker_suggest_candidates(media_path)
+    )
     cleanup.extend(
         (
             episode_transaction.ArtifactCleanup(
-                speakers_suggest_path(media_path), "suggest-unlink"
-            ),
-            episode_transaction.ArtifactCleanup(
                 speakers_html_path(media_path), "html-unlink"
             ),
-            episode_transaction.ArtifactCleanup(
-                swap_ext(media_path, ".align-evidence.json"), "evidence-unlink"
-            ),
+        )
+    )
+    cleanup.extend(
+        episode_transaction.ArtifactCleanup(path, "evidence-unlink")
+        for path in _align_evidence_candidates(
+            swap_ext(media_path, ".vtt"), media=media_path
         )
     )
     try:
@@ -4441,6 +4600,7 @@ def split(
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
     json_path = swap_ext(Path(json_path), ".json")
+    artifact_owner = _artifact_owner(json_path)
     try:
         input_bytes = json_path.read_bytes()
     except OSError as exc:
@@ -4474,7 +4634,10 @@ def split(
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = _spans_in(data.get("sing_spans"))
     speaker_turns = _turns_in(data.get("speaker_turns"))
-    mapping_path = swap_ext(json_path, ".speakers.json")
+    mapping_path = artifacts.speaker_mapping_path(
+        artifact_owner,
+        reference=json_path,
+    )
     mapping_generation = episode_transaction.capture_speaker_mapping(
         mapping_path,
         known_ids={label for _start, _end, label in speaker_turns or ()},
@@ -4529,6 +4692,7 @@ def split(
         expected_vtt=None,
         source_mode=None,
         mapping_generation=mapping_generation,
+        mapping_path=mapping_path,
         shadow_enabled=os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1",
         semantic_selector_enabled=semantic_engine is not None,
     )
@@ -4536,27 +4700,29 @@ def split(
     cleanup: list[episode_transaction.ArtifactCleanup] = []
     if pair_declared and voiceprint_pair is None:
         cleanup.extend(
-            (
-                episode_transaction.ArtifactCleanup(
-                    voiceprints_path(json_path), "voiceprints-unlink"
-                ),
-                episode_transaction.ArtifactCleanup(
-                    speakers_suggest_path(json_path), "suggest-unlink"
-                ),
-                episode_transaction.ArtifactCleanup(
-                    speakers_html_path(json_path), "html-unlink"
-                ),
+            episode_transaction.ArtifactCleanup(path, "voiceprints-unlink")
+            for path in _voiceprints_candidates(artifact_owner)
+        )
+        cleanup.extend(
+            episode_transaction.ArtifactCleanup(path, "suggest-unlink")
+            for path in _speaker_suggest_candidates(artifact_owner)
+        )
+        cleanup.append(
+            episode_transaction.ArtifactCleanup(
+                speakers_html_path(json_path), "html-unlink"
             )
         )
-    cleanup.append(
-        episode_transaction.ArtifactCleanup(
-            swap_ext(json_path, ".align-evidence.json"), "evidence-unlink"
+    cleanup.extend(
+        episode_transaction.ArtifactCleanup(path, "evidence-unlink")
+        for path in _align_evidence_candidates(
+            swap_ext(json_path, ".vtt"),
+            media=artifact_owner,
         )
     )
     try:
         episode_transaction.commit_primary_outputs(
             command="split",
-            episode_path=json_path,
+            episode_path=artifact_owner,
             json_path=json_path,
             vtt_path=swap_ext(json_path, ".vtt"),
             expected_json=expected_json,
@@ -4640,23 +4806,31 @@ def _prepare_16k_for_align(
                 return wav
         if not bound:
             legacy = cache_16k_path(cache_owner)
-            with cache_lock(legacy) as legacy_handle:
-                if legacy_handle.cache_path.exists() and _vocals_cache_fresh(
-                    legacy_handle.cache_path,
-                    cache_owner,
-                ):
-                    reporter.stage("vocals cache (16k legacy)")
-                    log.info("reuse legacy 16k vocals %s", legacy_handle.cache_path)
-                    try:
-                        wav = decode_to_wav(
-                            legacy_handle.cache_path,
-                            audio_filter=af,
-                        )
-                    except BaseException as exc:
-                        classify_cache_decode_failure(exc)
-                        raise
-                    tmp.append(wav)
-                    return wav
+            if any(
+                artifacts.path_present(candidate)
+                for candidate in (
+                    legacy,
+                    cache_companion_path(legacy),
+                    Path(f"{legacy.resolve()}.lock"),
+                )
+            ):
+                with cache_lock(legacy) as legacy_handle:
+                    if legacy_handle.cache_path.exists() and _vocals_cache_fresh(
+                        legacy_handle.cache_path,
+                        cache_owner,
+                    ):
+                        reporter.stage("vocals cache (16k legacy)")
+                        log.info("reuse legacy 16k vocals %s", legacy_handle.cache_path)
+                        try:
+                            wav = decode_to_wav(
+                                legacy_handle.cache_path,
+                                audio_filter=af,
+                            )
+                        except BaseException as exc:
+                            classify_cache_decode_failure(exc)
+                            raise
+                        tmp.append(wav)
+                        return wav
         fullband, vocals, wav, voc32 = _separate_to_16k_32k(
             media, reporter=reporter, normalize=normalize
         )
@@ -5159,7 +5333,7 @@ def align(
             raise
 
     with align_runtime_activity("AO-03", "selected-media-identity"):
-        media = Path(media_path) if media_path else _find_sibling_media(vtt_path)
+        media = Path(media_path) if media_path else _find_subtitle_media(vtt_path)
         if media is None or not media.exists():
             exc = FileNotFoundError(
                 f"source media for {vtt_path.name} not found (expected sibling with same stem); "
@@ -5590,16 +5764,16 @@ def align(
         cleanup: list[episode_transaction.ArtifactCleanup] = []
         if pair_declared and not preserve_pair:
             cleanup.extend(
-                (
-                    episode_transaction.ArtifactCleanup(
-                        voiceprints_path(vtt_path), "voiceprints-unlink"
-                    ),
-                    episode_transaction.ArtifactCleanup(
-                        speakers_suggest_path(vtt_path), "suggest-unlink"
-                    ),
-                    episode_transaction.ArtifactCleanup(
-                        speakers_html_path(vtt_path), "html-unlink"
-                    ),
+                episode_transaction.ArtifactCleanup(path, "voiceprints-unlink")
+                for path in _voiceprints_candidates(media)
+            )
+            cleanup.extend(
+                episode_transaction.ArtifactCleanup(path, "suggest-unlink")
+                for path in _speaker_suggest_candidates(media)
+            )
+            cleanup.append(
+                episode_transaction.ArtifactCleanup(
+                    speakers_html_path(vtt_path), "html-unlink"
                 )
             )
 
@@ -5617,13 +5791,19 @@ def align(
                     detail_code="evidence-encode",
                 )
                 raise
+        evidence_path = artifacts.align_evidence_path(media, vtt_path)
+        cleanup.extend(
+            episode_transaction.ArtifactCleanup(path, "evidence-unlink")
+            for path in _align_evidence_candidates(vtt_path, media=media)
+            if path != evidence_path
+        )
         evidence_artifact = episode_transaction.EvidencePublication(
-            swap_ext(vtt_path, ".align-evidence.json"),
+            evidence_path,
             evidence_bytes,
         )
         episode_transaction.commit_primary_outputs(
             command="align",
-            episode_path=vtt_path,
+            episode_path=media,
             json_path=json_path,
             vtt_path=vtt_path,
             expected_json=expected_json,
@@ -5753,7 +5933,17 @@ def translate(
     payload = translate_mod.build_payload(blocks)
     # Progress sidecar: completed windows survive a mid-run failure (network,
     # rate limit), so rerunning the same command resumes instead of restarting.
-    progress_path = swap_ext(vtt_path, f".{to}.progress.json")
+    progress_owner = _artifact_owner(vtt_path)
+    progress_path = artifacts.translation_progress_path(
+        progress_owner,
+        vtt_path,
+        to,
+    )
+    progress_candidates = artifacts.translation_progress_candidates(
+        progress_owner,
+        vtt_path,
+        to,
+    )
     tx_kwargs: dict[str, Any] = dict(
         to=to,
         model=model,
@@ -5829,7 +6019,41 @@ def translate(
         )
     out_path = swap_ext(vtt_path, f".{to}{ext}")
     fsio.atomic_write_text(out_path, content)
-    progress_path.unlink(missing_ok=True)  # translation landed; sidecar done
+    try:
+        live_progress_candidates = artifacts.translation_progress_candidates(
+            progress_owner,
+            vtt_path,
+            to,
+        )
+    except (artifacts.ArtifactMarkerError, OSError) as exc:
+        live_progress_candidates = None
+        log.warning("translation progress cleanup authority changed: %s", exc)
+    cleanup_failed = live_progress_candidates != progress_candidates
+    if not cleanup_failed:
+        for candidate in (
+            path for path in progress_candidates if path != progress_path
+        ):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError as exc:
+                cleanup_failed = True
+                log.warning(
+                    "translation progress cleanup failed for %s: %s", candidate, exc
+                )
+    if cleanup_failed:
+        log.warning(
+            "translation progress cleanup is incomplete; preserving selected lane %s",
+            progress_path,
+        )
+    else:
+        try:
+            progress_path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning(
+                "translation progress cleanup failed for selected lane %s: %s",
+                progress_path,
+                exc,
+            )
     log.info("wrote %s (%d cues → %s)", out_path.name, len(blocks), to)
     return out_path
 
@@ -5851,15 +6075,19 @@ def correct(
 ) -> dict[str, Any]:
     """LLM ASR correction (run before align): send VTT to the LLM for a conservative diff.
 
-    Default (review): writes sidecar ``<stem>.asrfix.vtt`` + audit ``<stem>.asrfix.json``,
-    source untouched. ``apply``: overwrites the original VTT in place and writes **no audit
-    json** (the diff is shown in the summary). When ``align_after`` and a real change was
-    applied, immediately re-runs :func:`align` to refresh timestamps (text edits change
-    word counts) and update the sibling ``<stem>.json``.
+    Default (review): writes adjacent sidecar ``<stem>.asrfix.vtt`` plus an audit in the
+    per-media artifact cache or an existing adjacent legacy audit lane, source untouched.
+    ``apply``: overwrites the original VTT in place and writes **no audit json** (the diff is
+    shown in the summary). When ``align_after`` and a real change was applied, immediately
+    re-runs :func:`align` to refresh timestamps (text edits change word counts) and update the
+    sibling ``<stem>.json``.
 
     Returns ``{out, audit, applied, rejected, n_cues, applied_in_place, aligned}``.
     """
     vtt_path = require_vtt(Path(vtt_path))  # --apply overwrites the input as VTT
+    artifact_owner = (
+        Path(media_path) if media_path is not None else _artifact_owner(vtt_path)
+    )
     rep = reporter or Reporter()
     try:
         vtt_input_bytes = vtt_path.read_bytes()
@@ -5889,17 +6117,21 @@ def correct(
         rep.stage("overwrite VTT in place")
         rendered_bytes = rendered.encode("utf-8")
         episode_transaction.commit_correction(
+            episode_path=artifact_owner,
             vtt_path=vtt_path,
             expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
             rendered_vtt_bytes=rendered_bytes,
-            evidence_path=swap_ext(vtt_path, ".align-evidence.json"),
+            evidence_paths=artifacts.align_evidence_candidates(
+                artifact_owner,
+                vtt_path,
+            ),
         )
         out_path = vtt_path
     else:
         rep.stage("write sidecar VTT + audit json")
         out_path = swap_ext(vtt_path, ".asrfix.vtt")
+        audit_path = artifacts.asrfix_audit_path(artifact_owner, vtt_path)
         fsio.atomic_write_text(out_path, rendered)
-        audit_path = swap_ext(vtt_path, ".asrfix.json")
         try:
             fsio.atomic_write_text(
                 audit_path,
