@@ -664,7 +664,7 @@ without stray marks.
 
 ## Testing
 
-- Unit tests (models mocked, no network): `make test` (= `uv run pytest tests/`)
+- Unit tests (models mocked, no network): `make test` (= `uv run --extra $(VARIANT) pytest tests/ -v`)
 - Lint / format: `make lint`
 
 ## Support
