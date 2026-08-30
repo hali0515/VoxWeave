@@ -40,6 +40,7 @@ class ArtifactPaths:
     speaker_mapping: Path
     speaker_suggest: Path
     voiceprints: Path
+    speaker_split_undo: Path
     episode_lock: Path
     vocals_cache: Path
 
@@ -239,6 +240,7 @@ def _paths(source: Path, directory: Path) -> ArtifactPaths:
         speaker_mapping=directory / "speakers.json",
         speaker_suggest=directory / "speakers.suggest.json",
         voiceprints=directory / "voiceprints.json",
+        speaker_split_undo=directory / "speaker-split.undo.json",
         episode_lock=directory / f"{source.stem}.episode.lock",
         vocals_cache=directory / "vocals.32k.flac",
     )
@@ -397,6 +399,11 @@ def voiceprints_path(source: Path) -> Path:
     return legacy if path_present(legacy) else claim_paths(source).voiceprints
 
 
+def speaker_split_undo_path(source: Path) -> Path:
+    """Return the cache-owned, single-level speaker-split undo snapshot."""
+    return claim_paths(source).speaker_split_undo
+
+
 def translation_progress_path(source: Path, subtitle: Path, target: str) -> Path:
     legacy = _swap_ext(Path(subtitle), f".{target}.progress.json")
     return (
@@ -466,6 +473,7 @@ __all__ = [
     "legacy_path",
     "path_present",
     "speaker_mapping_path",
+    "speaker_split_undo_path",
     "speaker_suggest_path",
     "translation_progress_path",
     "translation_progress_candidates",

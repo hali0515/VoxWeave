@@ -733,10 +733,12 @@ def test_unknown_compatibility_refuses_store_creation(tmp_path):
 
 def test_purge_works_after_media_deletion(tmp_path):
     media = tmp_path / "missing.mkv"
+    split_undo = artifacts.claim_paths(media).speaker_split_undo
     targets = [
         tmp_path / "missing.voiceprints.json",
         tmp_path / "missing.speakers.suggest.json",
         tmp_path / "missing.speakers.html",
+        split_undo,
     ]
     for target in targets:
         target.write_text("sensitive", encoding="utf-8")

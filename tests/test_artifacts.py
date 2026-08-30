@@ -28,6 +28,7 @@ def test_claim_layout_keeps_transcript_and_deliverables_adjacent(tmp_path):
     assert paths.speaker_mapping.name == "speakers.json"
     assert paths.speaker_suggest.name == "speakers.suggest.json"
     assert paths.voiceprints.name == "voiceprints.json"
+    assert paths.speaker_split_undo.name == "speaker-split.undo.json"
     assert paths.episode_lock.name == "episode.episode.lock"
     assert paths.vocals_cache.name == "vocals.32k.flac"
     assert paths.align_evidence(tmp_path / "episode.vtt").name == (

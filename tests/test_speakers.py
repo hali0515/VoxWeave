@@ -624,6 +624,7 @@ def test_create_audition_returns_embedded_page_and_installs_empty_mapping(
     assert audition.speaker_ids == ("SPEAKER_00",)
     assert "data:audio/mpeg;base64," in page
     assert 'data-speaker="SPEAKER_00"' in page
+    assert 'data-split="SPEAKER_00" hidden>Split this speaker' in page
     assert "JSON.stringify" in page and "https://" not in page
     assert "fetch('serve-info'" in page
     assert "'X-VoxWeave-Token': sessionToken" in page
@@ -634,6 +635,49 @@ def test_create_audition_returns_embedded_page_and_installs_empty_mapping(
     }
     assert not (tmp_path / "episode.01.speakers.json").exists()
     assert not list(tmp_path.glob("*.html"))
+
+
+@pytest.mark.parametrize("matches", [None, {}])
+def test_audition_split_ui_contract_is_inert_until_the_server_probe(matches):
+    speaker_id = 'SPEAKER_"<00>'
+    page = speakers._render_audition_html(
+        "episode.mkv",
+        "speakers.json",
+        {
+            speaker_id: [
+                ((1.0, 3.0), "data:audio/mpeg;base64,Y2xpcA=="),
+            ]
+        },
+        matches,
+    )
+
+    escaped_id = "SPEAKER_&quot;&lt;00&gt;"
+    assert page.count('class="split-speaker"') == 1
+    assert f'data-split="{escaped_id}" hidden>Split this speaker' in page
+    assert "let splitReady = false;" in page
+    reveal = "for (const button of splitButtons) button.hidden = false;"
+    assert page.count(reveal) == 1
+    assert page.index("fetch('serve-info'") < page.index(reveal)
+
+    assert "postJSON('split', {speaker_id: speakerId})" in page
+    assert "postJSON('split-confirm', {" in page
+    assert "assignment: proposal.assignment" in page
+    assert "typeof confirmation.new_id !== 'string'" in page
+    assert "group.turn_count" in page and "group.total_duration" in page
+    assert "for (const sample of group.samples)" in page
+    assert "document.createElement('audio')" in page
+    assert "audio.src = sample.src" in page
+    assert "innerHTML" not in page
+    assert "splitErrorMessage(responsePayload" in page
+    assert "split applied — restart `voxweave speakers` to re-audition" in page
+    assert (
+        "[data-speaker], #save, .use-suggestion, .split-speaker, "
+        ".split-apply, .split-cancel" in page
+    )
+    if matches is None:
+        assert 'class="suggestions"' not in page
+    else:
+        assert 'class="suggestions"' in page
 
 
 def test_create_audition_preserves_existing_mapping_and_still_builds_page(

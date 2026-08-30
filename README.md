@@ -269,6 +269,15 @@ voxweave speakers episode.mkv
 voxweave split episode.json
 ```
 
+If pyannote merged two people under one diarizer id, select **Split this speaker** on that
+card. VoxWeave clusters the id's individual turns and lets you audition both proposed groups
+before applying the split. This action requires the episode to have been captured with
+`--voiceprints`; it refuses the proposal if the original embedding and audio provenance cannot
+be reproduced (for example, when a bound separated-vocals cache is missing or stale). A
+confirmed split rewrites `speaker_turns` and the bound voiceprint centroids, keeps a one-level
+undo snapshot, and asks you to restart `voxweave speakers` to audition and name the new id. Undo
+is refused after any rewritten input changes.
+
 Voice matching across episodes is a separate, opt-in layer. Capture centroids with
 `--diarize --voiceprints`, review the ordinary empty mapping, then enroll only those
 human-entered names into an explicitly selected show store:
@@ -656,6 +665,7 @@ artifacts/episode/
 ├── speakers.json                  # reviewed diarizer-id-to-name mapping
 ├── speakers.suggest.json          # regenerable match suggestions
 ├── voiceprints.json               # optional biometric centroids
+├── speaker-split.undo.json        # guarded one-level split undo
 ├── vocals.32k.flac                # separated-vocals cache
 ├── vocals.32k.flac.meta.json      # source-bound integrity companion, when required
 ├── vocals.32k.flac.lock           # vocals-cache lock
@@ -683,17 +693,18 @@ where the user placed it.
 
 ### Sensitive and derived speaker data
 
-Treat voiceprint artifacts, show-level voices stores, suggestion records, in-memory auditions,
-calibration reports, crash-temporary files, and media snapshots as sensitive or derived data.
+Treat voiceprint artifacts, speaker-split undo snapshots, show-level voices stores, suggestion
+records, in-memory auditions, calibration reports, crash-temporary files, and media snapshots
+as sensitive or derived data.
 The served audition contains embedded audio but is never saved by VoxWeave; a snapshot contains
 private media bytes rather than biometrics. Snapshots live under
 `${VOXWEAVE_CACHE_ROOT:-~/.cache/voxweave}/snapshots`, are mode
 `0600` in an owner-only directory, and inactive crash residue older than one hour is cleaned on
 a later snapshot creation. Active snapshots are lock-protected from that janitor.
 
-The purge command removes only the episode voiceprints, suggestion record, and any legacy
-audition HTML; it preserves the reviewed mapping, transcript, subtitles, and unrelated cache
-state. Remove a show voices store, calibration report, inactive snapshot residue, or
+The purge command removes only the episode voiceprints, suggestion record, split undo snapshot,
+and any legacy audition HTML; it preserves the reviewed mapping, transcript, subtitles, and
+unrelated cache state. Remove a show voices store, calibration report, inactive snapshot residue, or
 crash-temporary file manually when it is no longer needed. Do not remove an active snapshot.
 Backups, filesystem snapshots, synced folders, and manual copies are outside VoxWeave's control
 and are not erased by purge; delete them separately according to their retention policy.
