@@ -405,6 +405,18 @@ cli.default_cmd = (
     "--no-match", is_flag=True, help="Ignore declared voiceprints and use manual mode."
 )
 @click.option(
+    "--port",
+    type=click.IntRange(0, 65535),
+    default=0,
+    show_default=True,
+    help="Loopback HTTP port; 0 selects an available ephemeral port.",
+)
+@click.option(
+    "--no-open",
+    is_flag=True,
+    help="Do not open the speaker audition in a web browser.",
+)
+@click.option(
     "--enroll",
     is_flag=True,
     help="Enroll reviewed mapping names into the voices store.",
@@ -427,6 +439,8 @@ def cmd_speakers(
     voices: Path | None,
     show: str | None,
     no_match: bool,
+    port: int,
+    no_open: bool,
     enroll: bool,
     episode: str | None,
     replace_episode: bool,
@@ -440,7 +454,18 @@ def cmd_speakers(
     )
 
     if purge_voiceprints:
-        if any((voices, show, no_match, enroll, episode, replace_episode)):
+        if any(
+            (
+                voices,
+                show,
+                no_match,
+                port,
+                no_open,
+                enroll,
+                episode,
+                replace_episode,
+            )
+        ):
             raise click.UsageError(
                 "--purge-voiceprints is mutually exclusive with generation/enrollment options"
             )
@@ -451,6 +476,8 @@ def cmd_speakers(
     if enroll:
         if no_match:
             raise click.UsageError("--no-match cannot be combined with --enroll")
+        if port or no_open:
+            raise click.UsageError("--port/--no-open cannot be combined with --enroll")
         out = _run(
             lambda _rep: enroll_speaker_voices(
                 media,
@@ -476,6 +503,22 @@ def cmd_speakers(
                 ),
                 reporter=False,
             )
+        from voxweave.speakerserve import serve
+
+        _run(
+            lambda _rep: serve(
+                page=out.page,
+                media_path=out.media_path,
+                mapping_path=out.mapping_path,
+                sibling_path=out.sibling_json_path,
+                speaker_ids=out.speaker_ids,
+                port=port,
+                open_browser=not no_open,
+                report=click.echo,
+            ),
+            reporter=False,
+        )
+        return
     click.echo(out)
 
 

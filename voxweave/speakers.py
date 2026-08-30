@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -79,6 +80,17 @@ FFMPEG_TIMEOUT = float(os.environ.get("VOXWEAVE_FFMPEG_TIMEOUT", "3600"))
 Span = tuple[float, float]
 Turn = tuple[float, float, str]
 SpeakerLine = tuple[str | None, str]
+
+
+@dataclass(frozen=True, slots=True)
+class SpeakerAudition:
+    """One in-memory audition page and its authoritative episode paths."""
+
+    page: str
+    media_path: Path
+    sibling_json_path: Path
+    mapping_path: Path
+    speaker_ids: tuple[str, ...]
 
 
 def _read_exact_object(path: Path, max_bytes: int) -> tuple[bytes, dict[str, object]]:
@@ -793,7 +805,7 @@ def _render_audition_html(
     snippets: Mapping[str, Sequence[tuple[Span, str]]],
     matches: Mapping[str, SpeakerMatch] | None = None,
 ) -> str:
-    """Build the self-contained offline audition page."""
+    """Build the self-contained in-memory audition page."""
     cards: list[str] = []
     for speaker_id, clips in snippets.items():
         audio = []
@@ -885,22 +897,24 @@ input {{ font: inherit; padding: .6rem .75rem; border: 1px solid #8888; border-r
 figure {{ margin: 0; }} figcaption {{ font-size: .8rem; color: #777; }} audio {{ width: 100%; }}
 .empty {{ color: #777; font-style: italic; }}
 .output {{ position: sticky; bottom: 0; background: Canvas; border: 1px solid #8886; border-radius: .75rem; padding: 1rem; box-shadow: 0 0 2rem #0003; }}
-.output-head {{ display: flex; justify-content: space-between; align-items: center; gap: 1rem; }}
+.output-head, .output-actions {{ display: flex; justify-content: space-between; align-items: center; gap: 1rem; }}
 button {{ font: inherit; padding: .45rem .8rem; cursor: pointer; }}
 pre {{ overflow-x: auto; margin-bottom: 0; user-select: all; }}{matching_css}
 </style>
 </head>
 <body>
 <h1>{safe_title}</h1>
-<p class="lede">Listen, enter names, then copy the JSON into <code>{safe_mapping}</code>. Everything on this page is embedded and works offline.</p>
+<p class="lede">Listen, enter names, then save them directly to <code>{safe_mapping}</code>. The Copy button remains available as a fallback.</p>
 {"".join(cards)}
 <section class="output">
-<div class="output-head"><strong>Speaker mapping JSON</strong><button id="copy" type="button">Copy JSON</button></div>
+<div class="output-head"><strong>Speaker mapping JSON</strong><span class="output-actions"><button id="save" type="button" hidden>Save</button><button id="copy" type="button">Copy JSON</button></span></div>
 <pre id="json" aria-live="polite"></pre>
 </section>
 <script>
 const fields = [...document.querySelectorAll('[data-speaker]')];
 const output = document.querySelector('#json');
+const save = document.querySelector('#save');
+let sessionToken = '';
 function update() {{
   const speakers = {{}};
   for (const field of fields) speakers[field.dataset.speaker] = field.value;
@@ -912,17 +926,36 @@ for (const field of fields) field.addEventListener('input', update);
   catch (_) {{ const range = document.createRange(); range.selectNodeContents(output); getSelection().removeAllRanges(); getSelection().addRange(range); event.target.textContent = 'Select and copy'; }}
 }});
 update();
+fetch('serve-info', {{cache: 'no-store'}}).then(async (response) => {{
+  if (!response.ok) throw new Error(`serve-info ${{response.status}}`);
+  const info = await response.json();
+  sessionToken = info.token;
+  for (const field of fields) {{
+    if (Object.prototype.hasOwnProperty.call(info.speakers, field.dataset.speaker)) {{
+      field.value = info.speakers[field.dataset.speaker];
+    }}
+  }}
+  update();
+  save.textContent = `Save to ${{info.mapping_name}}`;
+  save.hidden = false;
+}}).catch(() => {{ save.textContent = 'Save failed'; save.hidden = false; }});
+save.addEventListener('click', async () => {{
+  save.disabled = true;
+  try {{
+    const response = await fetch('save', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json', 'X-VoxWeave-Token': sessionToken}},
+      body: output.textContent,
+    }});
+    if (!response.ok) throw new Error(`save ${{response.status}}`);
+    save.textContent = 'Saved';
+  }} catch (_) {{ save.textContent = 'Save failed'; }}
+  finally {{ save.disabled = false; }}
+}});
 </script>
 </body>
 </html>
 """
-
-
-def _mapping_exists_refusal(mapping_path: Path) -> RuntimeError:
-    return RuntimeError(
-        f"refusing to overwrite existing {mapping_path.name}; edit it directly, "
-        "or move it aside before regenerating the audition page"
-    )
 
 
 def _delete_stale_suggest_for_refusal(
@@ -955,8 +988,6 @@ def _publish_audition(
     media: Path,
     *,
     mapping_path: Path,
-    html_path: Path,
-    page: str,
     skeleton: Mapping[str, object],
     suggest_record: Mapping[str, object] | None,
     before_mapping_install: Callable[[], None] | None = None,
@@ -964,8 +995,6 @@ def _publish_audition(
     from voxweave import pipeline
 
     suggest_path = pipeline.speakers_suggest_path(media)
-    if mapping_path.exists():
-        raise _mapping_exists_refusal(mapping_path)
 
     def check_authority_before_install() -> None:
         assert before_mapping_install is not None
@@ -976,7 +1005,6 @@ def _publish_audition(
             # protected mapping. These replaceable outputs therefore remain
             # ours to remove even if another actor created a mapping meanwhile.
             delete_suggest(suggest_path)
-            html_path.unlink(missing_ok=True)
             raise
 
     try:
@@ -984,27 +1012,30 @@ def _publish_audition(
             delete_suggest(suggest_path)
         else:
             write_suggest(suggest_path, suggest_record)
-        fsio.atomic_write_text(html_path, page)
-        fsio.atomic_write_text_new(
-            mapping_path,
-            json.dumps(skeleton, ensure_ascii=False, indent=2) + "\n",
-            before_install=(
-                check_authority_before_install
-                if before_mapping_install is not None
-                else None
-            ),
-        )
-    except FileExistsError as exc:
-        delete_suggest(suggest_path)
-        html_path.unlink(missing_ok=True)
-        raise _mapping_exists_refusal(mapping_path) from exc
+        if mapping_path.exists():
+            if before_mapping_install is not None:
+                check_authority_before_install()
+            return
+        try:
+            fsio.atomic_write_text_new(
+                mapping_path,
+                json.dumps(skeleton, ensure_ascii=False, indent=2) + "\n",
+                before_install=(
+                    check_authority_before_install
+                    if before_mapping_install is not None
+                    else None
+                ),
+            )
+        except FileExistsError:
+            # A concurrent editor or generator won the protected install.
+            # Its mapping is authoritative user data and remains untouched.
+            return
     except BaseException:
         # These outputs are wholly regenerable and owned by this invocation.
         # The protected mapping either does not exist or was created atomically
         # as the final successful edge.
         if not mapping_path.exists():
             delete_suggest(suggest_path)
-            html_path.unlink(missing_ok=True)
         raise
 
 
@@ -1014,12 +1045,8 @@ def create_speaker_audition(
     voices: Path | None = None,
     show: str | None = None,
     no_match: bool = False,
-) -> Path:
-    """Create ``<stem>.speakers.html`` and a new empty mapping skeleton.
-
-    Existing mapping files are user data and cause an early refusal before
-    ffmpeg or either output writer runs.
-    """
+) -> SpeakerAudition:
+    """Build an in-memory audition and install a mapping skeleton if absent."""
     from voxweave import pipeline
 
     media = Path(media)
@@ -1027,9 +1054,6 @@ def create_speaker_audition(
         raise FileNotFoundError(f"media file not found: {media}")
     json_path = pipeline.swap_ext(media, ".json")
     mapping_path = pipeline.swap_ext(media, ".speakers.json")
-    html_path = pipeline.swap_ext(media, ".speakers.html")
-    if mapping_path.exists():
-        raise _mapping_exists_refusal(mapping_path)
     sibling_bytes: bytes | None = None
     try:
         if not json_path.exists():
@@ -1109,7 +1133,9 @@ def create_speaker_audition(
     sing_spans = pipeline._spans_in(data.get("sing_spans"))
     picks = select_snippets(turns, vad_speech, sing_spans)
 
-    def generate_from(source: Path, snapshot_fingerprint: str | None) -> Path:
+    def generate_from(
+        source: Path, snapshot_fingerprint: str | None
+    ) -> SpeakerAudition:
         if pair is not None:
             assert sidecar is not None
             assert snapshot_fingerprint is not None
@@ -1143,7 +1169,7 @@ def create_speaker_audition(
             "speakers": {speaker_id: "" for speaker_id in picks},
         }
 
-        def publish_locked(store_handle=None) -> None:
+        def publish_locked(store_handle=None) -> SpeakerAudition:
             current_data = data
             current_sidecar = sidecar
             current_sibling_bytes = json_path.read_bytes()
@@ -1206,8 +1232,6 @@ def create_speaker_audition(
                 embedded,
                 matches,
             )
-            if mapping_path.exists():
-                raise _mapping_exists_refusal(mapping_path)
 
             def recheck_media_before_mapping_install() -> None:
                 assert snapshot_fingerprint is not None
@@ -1225,23 +1249,26 @@ def create_speaker_audition(
             _publish_audition(
                 media,
                 mapping_path=mapping_path,
-                html_path=html_path,
-                page=page,
                 skeleton=skeleton,
                 suggest_record=suggest_record,
                 before_mapping_install=(
                     recheck_media_before_mapping_install if pair is not None else None
                 ),
             )
+            return SpeakerAudition(
+                page=page,
+                media_path=media,
+                sibling_json_path=json_path,
+                mapping_path=mapping_path,
+                speaker_ids=tuple(picks),
+            )
 
         with episode_lock(media):
             if pair is not None and store_stage is not None:
                 store_path, _store_bytes, _store = store_stage
                 with shared_store_lock(store_path) as lock_handle:
-                    publish_locked(lock_handle)
-            else:
-                publish_locked()
-        return html_path
+                    return publish_locked(lock_handle)
+            return publish_locked()
 
     try:
         if pair is not None:
@@ -1269,7 +1296,7 @@ def create_speaker_audition(
             sibling_bytes=sibling_bytes,
         )
         raise
-    log.info("wrote %s and %s", html_path.name, mapping_path.name)
+    log.info("prepared speaker audition for %s", mapping_path.name)
     return output
 
 
@@ -1505,6 +1532,7 @@ __all__ = [
     "MAX_SNIPPET_S",
     "MIN_SNIPPET_GAP_S",
     "MIN_SNIPPET_S",
+    "SpeakerAudition",
     "build_clip_command",
     "create_speaker_audition",
     "enroll_speaker_voices",

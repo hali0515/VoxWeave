@@ -132,11 +132,11 @@ def test_matching_prefill_stays_html_only_and_mapping_empty(tmp_path, monkeypatc
     _fake_clips(monkeypatch, seen_sources)
     monkeypatch.setenv("VOXWEAVE_VOICES_ACCEPT", "0.9")
 
-    html_path = speakers.create_speaker_audition(media, voices=store_path)
+    audition = speakers.create_speaker_audition(media, voices=store_path)
 
     mapping = json.loads((tmp_path / "episode.speakers.json").read_text())
     assert mapping == {"version": 1, "speakers": {"SPEAKER_00": ""}}
-    page = html_path.read_text(encoding="utf-8")
+    page = audition.page
     assert 'value="Aqua"' in page
     assert "machine-suggested" in page
     suggestion = load_suggest(tmp_path / "episode.speakers.suggest.json")
@@ -160,7 +160,7 @@ def test_store_names_are_context_escaped_and_vectors_never_render(
     page = speakers.create_speaker_audition(
         media,
         voices=store_path,
-    ).read_text(encoding="utf-8")
+    ).page
 
     assert "<script>alert(1)</script>" not in page
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
@@ -206,7 +206,7 @@ def test_discovery_requires_show_confirmation(tmp_path, monkeypatch):
     _write_store(tmp_path / "voxweave.voices.json")
     _fake_clips(monkeypatch)
 
-    page = speakers.create_speaker_audition(media).read_text(encoding="utf-8")
+    page = speakers.create_speaker_audition(media).page
 
     assert "machine-suggested" not in page
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
@@ -226,8 +226,8 @@ def test_explicit_corrupt_store_is_fatal_but_discovered_corrupt_store_is_manual(
 
     discovered = tmp_path / "voxweave.voices.json"
     discovered.write_text("{broken", encoding="utf-8")
-    page = speakers.create_speaker_audition(media)
-    assert page.exists()
+    audition = speakers.create_speaker_audition(media)
+    assert audition.page.startswith("<!doctype html>")
     assert (tmp_path / "episode.speakers.json").exists()
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
 
@@ -396,20 +396,18 @@ def test_generation_rechecks_live_media_at_mapping_install_edge(tmp_path, monkey
     store_path = tmp_path / "voices.json"
     _write_store(store_path)
     _fake_clips(monkeypatch)
-    html_path = tmp_path / "episode.speakers.html"
-    original_html_write = speakers.fsio.atomic_write_text
+    original_mapping_write = speakers.fsio.atomic_write_text_new
     mutated = []
 
-    def mutate_from_html_writer(path, content, **kwargs):
-        original_html_write(path, content, **kwargs)
-        if Path(path) == html_path:
-            media.write_bytes(b"replacement media in sampled region")
-            mutated.append(True)
+    def mutate_before_mapping_install(path, content, **kwargs):
+        media.write_bytes(b"replacement media in sampled region")
+        mutated.append(True)
+        return original_mapping_write(path, content, **kwargs)
 
     monkeypatch.setattr(
         speakers.fsio,
-        "atomic_write_text",
-        mutate_from_html_writer,
+        "atomic_write_text_new",
+        mutate_before_mapping_install,
     )
 
     with pytest.raises(RuntimeError, match="media changed"):
@@ -417,7 +415,7 @@ def test_generation_rechecks_live_media_at_mapping_install_edge(tmp_path, monkey
 
     assert mutated == [True]
     assert not (tmp_path / "episode.speakers.json").exists()
-    assert not html_path.exists()
+    assert not (tmp_path / "episode.speakers.html").exists()
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
 
 
@@ -433,38 +431,40 @@ def test_generation_combined_mapping_and_media_race_cleans_only_machine_outputs(
     _write_store(store_path)
     _fake_clips(monkeypatch)
     mapping_path = tmp_path / "episode.speakers.json"
-    html_path = tmp_path / "episode.speakers.html"
     suggest_path = tmp_path / "episode.speakers.suggest.json"
     human_mapping = {
         "version": 1,
         "speakers": {"SPEAKER_00": "Human-reviewed name"},
     }
     human_bytes = json.dumps(human_mapping, ensure_ascii=False).encode("utf-8")
-    original_html_write = speakers.fsio.atomic_write_text
+    original_publish = speakers._publish_audition
     race_injected = []
+    callback_calls = []
 
     def inject_race():
         mapping_path.write_bytes(human_bytes)
         media.write_bytes(b"replacement media in sampled region")
         race_injected.append(True)
 
-    def write_html_then_race(path, content, **kwargs):
-        original_html_write(path, content, **kwargs)
-        if Path(path) == html_path and install_route == "hard-link":
-            inject_race()
+    def publish_with_race(*args, **kwargs):
+        original_callback = kwargs["before_mapping_install"]
 
-    monkeypatch.setattr(
-        speakers.fsio,
-        "atomic_write_text",
-        write_html_then_race,
-    )
+        def callback_with_race():
+            callback_calls.append(True)
+            if install_route == "hard-link" or len(callback_calls) == 2:
+                inject_race()
+            original_callback()
+
+        kwargs["before_mapping_install"] = callback_with_race
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(speakers, "_publish_audition", publish_with_race)
     if install_route == "o-excl-fallback":
 
-        def unavailable_after_race(*_args, **_kwargs):
-            inject_race()
+        def hard_links_unavailable(*_args, **_kwargs):
             raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
 
-        monkeypatch.setattr(speakers.fsio.os, "link", unavailable_after_race)
+        monkeypatch.setattr(speakers.fsio.os, "link", hard_links_unavailable)
 
     with pytest.raises(RuntimeError, match="media changed"):
         speakers.create_speaker_audition(media, voices=store_path)
@@ -472,7 +472,7 @@ def test_generation_combined_mapping_and_media_race_cleans_only_machine_outputs(
     assert race_injected == [True]
     assert mapping_path.read_bytes() == human_bytes
     assert not suggest_path.exists()
-    assert not html_path.exists()
+    assert not (tmp_path / "episode.speakers.html").exists()
 
 
 def test_same_token_sidecar_content_change_aborts_revalidation(tmp_path, monkeypatch):
@@ -496,7 +496,7 @@ def test_same_token_sidecar_content_change_aborts_revalidation(tmp_path, monkeyp
     assert not suggest_path.exists()
 
 
-@pytest.mark.parametrize("failed_edge", ["suggest", "html", "mapping"])
+@pytest.mark.parametrize("failed_edge", ["suggest", "mapping"])
 def test_generation_publication_edge_failure_leaves_no_mapping_or_machine_outputs(
     tmp_path, monkeypatch, failed_edge
 ):
@@ -504,23 +504,12 @@ def test_generation_publication_edge_failure_leaves_no_mapping_or_machine_output
     store_path = tmp_path / "voices.json"
     _write_store(store_path)
     _fake_clips(monkeypatch)
-    html_path = tmp_path / "episode.speakers.html"
-    original_html_write = speakers.fsio.atomic_write_text
-
     if failed_edge == "suggest":
         monkeypatch.setattr(
             speakers,
             "write_suggest",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("suggest edge")),
         )
-    elif failed_edge == "html":
-
-        def fail_html(path, content):
-            if Path(path) == html_path:
-                raise OSError("html edge")
-            return original_html_write(path, content)
-
-        monkeypatch.setattr(speakers.fsio, "atomic_write_text", fail_html)
     else:
         monkeypatch.setattr(
             speakers.fsio,
@@ -533,7 +522,7 @@ def test_generation_publication_edge_failure_leaves_no_mapping_or_machine_output
 
     assert not (tmp_path / "episode.speakers.json").exists()
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
-    assert not html_path.exists()
+    assert not (tmp_path / "episode.speakers.html").exists()
 
 
 def test_enrollment_store_write_failure_preserves_mapping_and_no_store(

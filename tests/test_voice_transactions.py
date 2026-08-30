@@ -139,10 +139,9 @@ def test_two_speaker_generators_leave_winner_outputs_intact(tmp_path, monkeypatc
             except RuntimeError as exc:
                 outcomes.append(exc)
 
-    assert sum(isinstance(value, Path) for value in outcomes) == 1
-    assert sum(isinstance(value, RuntimeError) for value in outcomes) == 1
+    assert all(isinstance(value, speakers.SpeakerAudition) for value in outcomes)
     assert (tmp_path / "episode.speakers.json").exists()
-    assert (tmp_path / "episode.speakers.html").exists()
+    assert not (tmp_path / "episode.speakers.html").exists()
     assert load_suggest(tmp_path / "episode.speakers.suggest.json")["version"] == 1
 
 
@@ -213,7 +212,7 @@ def test_speaker_generation_and_purge_serialize_as_one_episode_set(
         generation.result(timeout=10)
         removed = purge.result(timeout=10)
 
-    assert len(removed) == 3
+    assert len(removed) == 2
     assert (tmp_path / "episode.speakers.json").exists()
     assert not (tmp_path / "episode.voiceprints.json").exists()
     assert not (tmp_path / "episode.speakers.suggest.json").exists()

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from voxweave import pipeline, speakers, translate
+from voxweave import pipeline, speakers, speakerserve, translate
 from voxweave.asrfix import render_vtt as render_corrected_vtt
 from voxweave.cli import cli
 from voxweave.export import (
@@ -595,7 +595,9 @@ def test_clip_runner_uses_devnull_and_timeout(monkeypatch):
     assert seen["timeout"] == speakers.FFMPEG_TIMEOUT
 
 
-def test_create_audition_writes_embedded_page_and_empty_mapping(tmp_path, monkeypatch):
+def test_create_audition_returns_embedded_page_and_installs_empty_mapping(
+    tmp_path, monkeypatch
+):
     media = tmp_path / "episode.01.mkv"
     media.write_bytes(b"media")
     (tmp_path / "episode.01.json").write_text(
@@ -613,21 +615,27 @@ def test_create_audition_writes_embedded_page_and_empty_mapping(tmp_path, monkey
         Path(output).write_bytes(b"clip-bytes")
 
     monkeypatch.setattr(speakers, "extract_clip", fake_extract)
-    html_path = speakers.create_speaker_audition(media)
+    audition = speakers.create_speaker_audition(media)
 
     mapping_path = tmp_path / "episode.01.speakers.json"
-    page = html_path.read_text(encoding="utf-8")
-    assert html_path.name == "episode.01.speakers.html"
+    page = audition.page
+    assert audition.mapping_path == mapping_path
+    assert audition.sibling_json_path == tmp_path / "episode.01.json"
+    assert audition.speaker_ids == ("SPEAKER_00",)
     assert "data:audio/mpeg;base64," in page
     assert 'data-speaker="SPEAKER_00"' in page
     assert "JSON.stringify" in page and "https://" not in page
+    assert "fetch('serve-info'" in page
+    assert "'X-VoxWeave-Token': sessionToken" in page
+    assert "Save failed" in page and "Copy JSON" in page
     assert json.loads(mapping_path.read_text(encoding="utf-8")) == {
         "version": 1,
         "speakers": {"SPEAKER_00": ""},
     }
+    assert not list(tmp_path.glob("*.html"))
 
 
-def test_create_audition_refuses_to_overwrite_mapping_before_ffmpeg(
+def test_create_audition_preserves_existing_mapping_and_still_builds_page(
     tmp_path, monkeypatch
 ):
     media = tmp_path / "episode.mkv"
@@ -644,15 +652,19 @@ def test_create_audition_refuses_to_overwrite_mapping_before_ffmpeg(
     mapping = tmp_path / "episode.speakers.json"
     mapping.write_text('{"version":1,"speakers":{"SPEAKER_00":"Aoi"}}')
     called = False
+    before = mapping.read_bytes()
 
-    def fake_extract(*_args):
+    def fake_extract(*args):
         nonlocal called
         called = True
+        Path(args[-1]).write_bytes(b"clip")
 
     monkeypatch.setattr(speakers, "extract_clip", fake_extract)
-    with pytest.raises(RuntimeError, match="refusing to overwrite"):
-        speakers.create_speaker_audition(media)
-    assert not called
+    audition = speakers.create_speaker_audition(media)
+
+    assert called
+    assert 'data-speaker="SPEAKER_00"' in audition.page
+    assert mapping.read_bytes() == before
     assert not (tmp_path / "episode.speakers.html").exists()
 
 
@@ -669,14 +681,32 @@ def test_create_audition_missing_turns_has_actionable_hint(tmp_path):
 def test_speakers_cli_routes_through_shared_error_wrapper(tmp_path, monkeypatch):
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"media")
-    output = tmp_path / "episode.speakers.html"
+    audition = speakers.SpeakerAudition(
+        page="<html></html>",
+        media_path=media,
+        sibling_json_path=tmp_path / "episode.json",
+        mapping_path=tmp_path / "episode.speakers.json",
+        speaker_ids=("SPEAKER_00",),
+    )
+    seen = {}
     monkeypatch.setenv("VOXWEAVE_CONFIG", str(tmp_path / "voxweave.conf"))
-    monkeypatch.setattr(speakers, "create_speaker_audition", lambda path: output)
+    monkeypatch.setattr(speakers, "create_speaker_audition", lambda path: audition)
+    monkeypatch.setattr(
+        speakerserve,
+        "serve",
+        lambda **kwargs: seen.update(kwargs) or "http://127.0.0.1:1234/",
+    )
 
-    result = CliRunner().invoke(cli, ["speakers", str(media)])
+    result = CliRunner().invoke(
+        cli,
+        ["speakers", str(media), "--port", "1234", "--no-open"],
+    )
 
     assert result.exit_code == 0, result.output
-    assert str(output) in result.output
+    assert seen["page"] == audition.page
+    assert seen["media_path"] == media
+    assert seen["port"] == 1234
+    assert seen["open_browser"] is False
 
 
 def test_speakers_cli_missing_turns_uses_error_panel(tmp_path, monkeypatch):
