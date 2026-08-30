@@ -92,7 +92,17 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
             no_store=no_store,
         )
 
+    def _host_allowed(self) -> bool:
+        # A DNS-rebinding page resolves its own hostname to 127.0.0.1 and can
+        # then read same-origin responses, so every route — not just the write
+        # path — must refuse a Host other than the bound authority (the page
+        # embeds private audio and serve-info discloses the save token).
+        return self.headers.get_all("Host", []) == [self.server.authority]
+
     def do_GET(self) -> None:
+        if not self._host_allowed():
+            self._reply(HTTPStatus.FORBIDDEN)
+            return
         if self.path == "/":
             self._reply(
                 HTTPStatus.OK,
@@ -130,7 +140,7 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         if self.path != "/save":
             self._reply(HTTPStatus.NOT_FOUND)
             return
-        if self.headers.get_all("Host", []) != [self.server.authority]:
+        if not self._host_allowed():
             self._reply(HTTPStatus.FORBIDDEN)
             return
         origins = self.headers.get_all("Origin", [])

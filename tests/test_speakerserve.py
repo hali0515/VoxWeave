@@ -161,6 +161,19 @@ def test_save_rejects_foreign_origin(tmp_path):
         assert mapping.read_bytes() == before
 
 
+def test_reads_reject_foreign_host(tmp_path):
+    with _running_server(tmp_path) as (server, _mapping, _logs):
+        for path in ("/", "/serve-info"):
+            status, _headers, body = _request(
+                server,
+                "GET",
+                path,
+                headers={"Host": "attacker.invalid"},
+            )
+            assert status == 403
+            assert server.token.encode() not in body
+
+
 def test_save_rejects_foreign_host_before_other_failures(tmp_path):
     with _running_server(tmp_path) as (server, mapping, _logs):
         before = mapping.read_bytes()
