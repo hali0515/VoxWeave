@@ -150,21 +150,22 @@ translation — is baked into the **core dependencies**. The variant selects the
   so `[cuda]` and `[mps]` are mutually exclusive — pick one per host.
 
 Speaker diarization support ships by default on both variants but remains opt-in at runtime.
-The default model stays `pyannote/speaker-diarization-3.1`, so existing users do not suddenly
-hit a 403 from the separately gated community-1 repository. Before using `--diarize`, accept
-the conditions for the model you select, then authenticate once with `hf auth login` or set
-`VOXWEAVE_HF_TOKEN` / `HF_TOKEN`.
+The default model is `pyannote/speaker-diarization-community-1`, which separates and counts
+multiple speakers noticeably better than 3.1. It is gated separately on Hugging Face: before
+using `--diarize`, accept the conditions for the model you select, then authenticate once with
+`hf auth login` or set `VOXWEAVE_HF_TOKEN` / `HF_TOKEN`. Users who have accepted only the 3.1
+gate can keep it with `--diarize-model 3.1`.
 
 Phase-0 measurements used pyannote.audio 4.0.7, the same Japanese 16 kHz test waveform, and an
 RTX PRO 4000 24 GB. Peak allocated CUDA memory was identical in that run:
 
 | Short name | Resolved pipeline | Model license | Peak allocated VRAM |
 | ---------- | ----------------- | ------------- | ------------------- |
-| `3.1` (default) | `pyannote/speaker-diarization-3.1` | MIT | 2,723.963 MiB |
-| `community-1` | `pyannote/speaker-diarization-community-1` | CC-BY-4.0 | 2,723.963 MiB |
+| `community-1` (default) | `pyannote/speaker-diarization-community-1` | CC-BY-4.0 | 2,723.963 MiB |
+| `3.1` | `pyannote/speaker-diarization-3.1` | MIT | 2,723.963 MiB |
 
-Community-1 generally improves speaker counting and is selectable per run; keeping 3.1 as the
-default preserves access for users who have accepted only the existing 3.1 gate.
+Community-1 generally improves speaker counting and separation; 3.1 stays selectable per run
+for users who have accepted only the existing 3.1 gate.
 
 **From source** (for development or pulling new code):
 
@@ -193,11 +194,11 @@ Override the detection per invocation: `make install VARIANT=mps` or
   per host (`make dev VARIANT=mps` on Apple Silicon).
 - **Diarization ships by default but runs only with `--diarize`.** Both supported pyannote
   pipelines are gated independently. Accept the
-  [`speaker-diarization-3.1`](https://hf.co/pyannote/speaker-diarization-3.1) conditions (and
-  segmentation-3.0's) for the default, or the
   [`speaker-diarization-community-1`](https://hf.co/pyannote/speaker-diarization-community-1)
-  conditions before selecting community-1. Then use `hf auth login`, `VOXWEAVE_HF_TOKEN`, or
-  `HF_TOKEN`.
+  conditions for the default, or the
+  [`speaker-diarization-3.1`](https://hf.co/pyannote/speaker-diarization-3.1) conditions (and
+  segmentation-3.0's) before selecting `--diarize-model 3.1`. Then use `hf auth login`,
+  `VOXWEAVE_HF_TOKEN`, or `HF_TOKEN`.
 - The device is auto-detected at runtime (cuda → mps → cpu); override with `VOXWEAVE_DEVICE`. On
   mps the MLX backend is selected automatically; force it either way with `VOXWEAVE_BACKEND=mlx|torch`.
 - **Development**: `make dev` (= `uv sync --extra cuda --dev`; on Apple Silicon use
@@ -214,8 +215,8 @@ voxweave episode.mkv
 # Opt in to speaker diarization (requires gated-model access; see Setup)
 voxweave interview.mkv --diarize
 
-# Select community-1 after accepting its separate model-card conditions
-voxweave interview.mkv --diarize --diarize-model community-1
+# Stay on the older 3.1 pipeline if that is the gate you have accepted
+voxweave interview.mkv --diarize --diarize-model 3.1
 
 # ...edit episode.vtt by hand (fix wording, line breaks)...
 

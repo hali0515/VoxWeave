@@ -9,9 +9,10 @@ hyphen, no space) when the language allows two lines and both halves fit one
 line, otherwise the cue splits at the speaker boundaries. ``split`` replays
 formatting from the persisted turns without re-running pyannote.
 
-The default pipeline remains ``pyannote/speaker-diarization-3.1`` for existing
-gated-model access. ``community-1`` and arbitrary Hugging Face pipeline IDs are
-selectable per invocation. Both bundled aliases run through pyannote.audio 4.x.
+The default pipeline is ``pyannote/speaker-diarization-community-1`` (better
+multi-speaker separation; separately gated on Hugging Face). ``3.1`` and
+arbitrary Hugging Face pipeline IDs are selectable per invocation. Both bundled
+aliases run through pyannote.audio 4.x.
 """
 
 from __future__ import annotations
@@ -651,9 +652,7 @@ def _call_pipeline_from_pretrained(
 
 def _is_legacy_agglomerative_plan(model: str, plan: _PipelineLoadPlan) -> bool:
     model_id, _revision = _split_model_revision(model)
-    if model_id != config.DEFAULT_DIARIZE_MODEL or not isinstance(
-        plan.checkpoint, dict
-    ):
+    if model_id != config.LEGACY_DIARIZE_MODEL or not isinstance(plan.checkpoint, dict):
         return False
     pipeline_config = plan.checkpoint.get("pipeline")
     if not isinstance(pipeline_config, Mapping):
@@ -675,7 +674,7 @@ def _without_unused_legacy_plda(
 ) -> Iterator[None]:
     """Prevent pyannote 4 from fetching c1's unused PLDA for the 3.1 pipeline."""
     model_id, _revision = _split_model_revision(model)
-    if model_id != config.DEFAULT_DIARIZE_MODEL:
+    if model_id != config.LEGACY_DIARIZE_MODEL:
         yield
         return
     if not _is_legacy_agglomerative_plan(model, plan):
@@ -862,7 +861,7 @@ def _diarize_turns_locked(
     resolved_model = config.resolve_diarize_model(model)
     token = token or config.conf_hf_token()
     if not token and resolved_model in {
-        config.DEFAULT_DIARIZE_MODEL,
+        config.LEGACY_DIARIZE_MODEL,
         COMMUNITY_DIARIZE_MODEL,
     }:
         raise _gated_model_error(resolved_model)

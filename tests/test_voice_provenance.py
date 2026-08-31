@@ -453,7 +453,7 @@ def test_inference_mutation_cannot_change_recorded_nested_identity(
     compatibility = voicematch.build_compatibility_fingerprint(first.provenance)
     assert isinstance(compatibility, voicematch.CompatibilityFingerprint)
     other_model_provenance = dict(first.provenance)
-    other_model_provenance["diarization_model"] = config.DEFAULT_DIARIZE_MODEL
+    other_model_provenance["diarization_model"] = config.LEGACY_DIARIZE_MODEL
     other_compatibility = voicematch.build_compatibility_fingerprint(
         other_model_provenance
     )

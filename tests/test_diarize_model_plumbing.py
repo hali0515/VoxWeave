@@ -55,7 +55,7 @@ def test_cli_diarize_model_precedence_matrix(
     monkeypatch.delenv("VOXWEAVE_DIARIZE_MODEL")
     (tmp_path / "voxweave.conf").unlink()
     builtin = _invoke_cli(tmp_path)
-    assert builtin.call_args.kwargs["diarize_model"] == LEGACY_MODEL
+    assert builtin.call_args.kwargs["diarize_model"] == COMMUNITY_MODEL
 
 
 def test_process_forwards_diarize_model_to_transcribe(

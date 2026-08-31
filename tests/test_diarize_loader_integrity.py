@@ -133,7 +133,7 @@ def test_default_and_community_construction_serialize_plda_and_singleton_lifecyc
 
     speaker_module = types.ModuleType(SPEAKER_MODULE)
     speaker_module.get_plda = lambda *_args, **_kwargs: original_plda
-    default_pipeline = SimpleNamespace(model=config.DEFAULT_DIARIZE_MODEL)
+    default_pipeline = SimpleNamespace(model=config.LEGACY_DIARIZE_MODEL)
     community_pipeline = SimpleNamespace(model=COMMUNITY_MODEL)
 
     class Pipeline:
@@ -165,7 +165,7 @@ def test_default_and_community_construction_serialize_plda_and_singleton_lifecyc
     def prepare(model: str, _token: str | None) -> diarize._PipelineLoadPlan:
         clustering = (
             "AgglomerativeClustering"
-            if model == config.DEFAULT_DIARIZE_MODEL
+            if model == config.LEGACY_DIARIZE_MODEL
             else "VBxClustering"
         )
         params: dict[str, object] = {"clustering": clustering}
@@ -200,7 +200,7 @@ def test_default_and_community_construction_serialize_plda_and_singleton_lifecyc
 
     default_thread = threading.Thread(
         target=load,
-        args=("default", config.DEFAULT_DIARIZE_MODEL),
+        args=("default", config.LEGACY_DIARIZE_MODEL),
         daemon=True,
     )
     community_thread = threading.Thread(

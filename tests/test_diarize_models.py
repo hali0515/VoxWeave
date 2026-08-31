@@ -47,8 +47,8 @@ def test_diarize_model_aliases_and_passthrough(value: str, expected: str) -> Non
     assert config.resolve_diarize_model(value) == expected
 
 
-def test_diarize_model_default_is_legacy_31() -> None:
-    assert config.resolve_diarize_model() == LEGACY_MODEL
+def test_diarize_model_default_is_community_1() -> None:
+    assert config.resolve_diarize_model() == COMMUNITY_MODEL
 
 
 def test_diarize_model_config_is_used_when_env_and_cli_are_absent(

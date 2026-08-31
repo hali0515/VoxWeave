@@ -21,10 +21,14 @@ DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 # 0.6B emits no punctuation, so fusion must use 1.7B.
 DEFAULT_FUSION_WHISPER = "large-v3"
 DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
-DEFAULT_DIARIZE_MODEL = "pyannote/speaker-diarization-3.1"
+# community-1 is the default (better multi-speaker separation in practice);
+# the 3.1 pipeline stays selectable via the "3.1" alias and keeps its own
+# LEGACY constant because the pyannote-4 loading guards are 3.1-specific.
+DEFAULT_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
+LEGACY_DIARIZE_MODEL = "pyannote/speaker-diarization-3.1"
 DIARIZE_MODEL_ALIASES = {
-    "3.1": DEFAULT_DIARIZE_MODEL,
-    "community-1": "pyannote/speaker-diarization-community-1",
+    "3.1": LEGACY_DIARIZE_MODEL,
+    "community-1": DEFAULT_DIARIZE_MODEL,
 }
 # Per-language aligner defaults. Unlisted languages fall back to Qwen3-ForcedAligner.
 #
@@ -94,11 +98,12 @@ _TEMPLATE = """\
 # ctc = 1        # wav2vec2 CTC emission 30s windows (en aligner)
 # mms = 4        # MMS-300m emission batch (ja aligner, ctc-forced-aligner generate_emissions)
 
-# Speaker diarization pipeline. The default remains 3.1 for compatibility with existing
-# gated-model access. Use "community-1" after accepting its separate model-card conditions,
-# or provide any full Hugging Face pipeline ID. (= --diarize-model / VOXWEAVE_DIARIZE_MODEL)
+# Speaker diarization pipeline. The default is "community-1" (better multi-speaker
+# separation); accept its model-card conditions on Hugging Face first. Use "3.1" to
+# stay on the older pipeline your existing gated access already covers, or provide
+# any full Hugging Face pipeline ID. (= --diarize-model / VOXWEAVE_DIARIZE_MODEL)
 [diarize]
-# model = "3.1"
+# model = "community-1"
 
 # Default on/off for the boolean pipeline flags. Explicit CLI flags always win
 # (e.g. separate = false here, --separate on the command line for one run).
@@ -284,7 +289,7 @@ def resolve_diarize_model(cli_value: str | None = None) -> str:
     """Resolve and normalize the diarization pipeline ID.
 
     Precedence is explicit CLI value, ``VOXWEAVE_DIARIZE_MODEL``,
-    ``[diarize].model``, then the 3.1 compatibility default. Known short names
+    ``[diarize].model``, then the community-1 default. Known short names
     map to their full Hugging Face IDs; every other non-blank value passes
     through unchanged.
     """

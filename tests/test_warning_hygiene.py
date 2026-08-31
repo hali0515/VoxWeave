@@ -67,7 +67,7 @@ def fake_pipeline(monkeypatch):
     def install(pl):
         monkeypatch.setattr(diarize, "_pipeline", pl)
         monkeypatch.setattr(
-            diarize, "_pipeline_model", diarize.config.DEFAULT_DIARIZE_MODEL
+            diarize, "_pipeline_model", diarize.config.LEGACY_DIARIZE_MODEL
         )
         return pl
 
