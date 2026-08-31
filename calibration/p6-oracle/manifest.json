@@ -537,10 +537,9 @@
     },
     "semantic-backend-unavailable": {
       "endpoint-not-configured": {
-        "status": "reachable",
-        "evidence": [
-          "source:voxweave/pipeline.py"
-        ]
+        "status": "structural-reserve",
+        "evidence": [],
+        "rationale": "The 2026-08-31 controller ruling keeps this row in the closed historical failure vocabulary for compatibility and replay after the retired selector's raising implementation was removed."
       }
     },
     "qwen-route-invalid": {
@@ -1022,10 +1021,9 @@
     },
     "segmentation-v2-invalid": {
       "semantic-selector-unmodelled": {
-        "status": "reachable",
-        "evidence": [
-          "source:voxweave/segmentation_adapter.py"
-        ]
+        "status": "structural-reserve",
+        "evidence": [],
+        "rationale": "The 2026-08-31 controller ruling keeps this row in the closed historical failure vocabulary for compatibility and replay after the retired selector's raising implementation was removed."
       },
       "named-multi-unattributed": {
         "status": "reachable",
