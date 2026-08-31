@@ -40,6 +40,20 @@ jobs:
       - name: Sync environment
         run: uv sync --extra cuda --dev --python "${{ steps.oracle-python.outputs.version }}"
 
+      - name: Diagnose huggingface_hub install
+        run: |
+          uv pip show huggingface-hub | head -3
+          HF_DIR=$(.venv/bin/python -c "import huggingface_hub, pathlib; print(pathlib.Path(huggingface_hub.__file__).parent)")
+          sha256sum "$HF_DIR/utils/__init__.py" "$HF_DIR/hf_api.py"
+          grep -c HfFolder "$HF_DIR/utils/__init__.py" || true
+          grep -n "from ._hf_folder" "$HF_DIR/utils/__init__.py" || true
+          ls "$HF_DIR/utils/_hf_folder.py" || true
+          .venv/bin/python -c "from huggingface_hub.utils import HfFolder; print('HfFolder import ok')" || true
+          .venv/bin/python -c "from huggingface_hub import hf_hub_download; print('hf_hub_download ok')" || true
+
+      - name: Run only the failing tests
+        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run pytest tests/test_runtime_errors.py tests/test_turnembed.py -q
+
       - name: Lint
         run: |
           uv run --no-project --with ruff ruff check .
