@@ -2020,13 +2020,6 @@ def _validate_evidence_value(value: object) -> dict[str, Any]:
     return root
 
 
-def _swap_ext(path: Path, new_ext: str) -> Path:
-    target = Path(path)
-    if target.suffix:
-        return target.with_name(target.name[: -len(target.suffix)] + new_ext)
-    return target.with_name(target.name + new_ext)
-
-
 def _normalized_basename(path: Path) -> str:
     return unicodedata.normalize("NFC", Path(path).name)
 
@@ -2141,8 +2134,12 @@ def verify_align_evidence(
     corpus_root: Path | None = None,
 ) -> AlignEvidenceVerification:
     """Verify canonical sidecar bytes and live selected-primary/media links."""
+    # Deferred: pipeline owns the canonical sibling-path helper, and importing it at
+    # module scope would tie this leaf verifier to the pipeline import graph.
+    from voxweave.pipeline import swap_ext
+
     target = Path(vtt_path)
-    legacy_evidence = _swap_ext(target, ".align-evidence.json")
+    legacy_evidence = swap_ext(target, ".align-evidence.json")
     artifact_media = (
         Path(explicit_media_path) if explicit_media_path is not None else None
     )
@@ -2160,7 +2157,7 @@ def verify_align_evidence(
         evidence_path = (
             legacy_evidence if cached is None else cached.align_evidence(target)
         )
-    json_path = _swap_ext(target, ".json")
+    json_path = swap_ext(target, ".json")
     try:
         encoded = evidence_path.read_bytes()
     except OSError:

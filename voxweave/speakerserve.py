@@ -822,19 +822,7 @@ def _undo_bytes(
             "mapping": _undo_record(mapping_path, mapping_before, mapping_after),
         },
     }
-    raw = (
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-        + b"\n"
-    )
-    if len(raw) > MAX_UNDO_BYTES:
-        raise SplitConflict("speaker split undo snapshot is too large")
-    return raw
+    return encode_json_bytes(value, max_bytes=MAX_UNDO_BYTES)
 
 
 def _write_bytes(path: Path, raw: bytes) -> None:
@@ -1176,26 +1164,42 @@ def _strict_json_loads(raw: bytes) -> Any:
     )
 
 
+def _validated_speakers(
+    value: object,
+    speaker_ids: Sequence[str],
+) -> dict[str, str]:
+    """Shared version/speakers schema core for both mapping readers.
+
+    Only the surrounding envelope differs between them: the POST payload must be
+    exactly ``{version, speakers}`` (see :func:`_validated_mapping`), while an
+    on-disk mapping is read tolerantly and may carry extra top-level keys.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("mapping must be an object")
+    if type(value.get("version")) is not int or value.get("version") != 1:
+        raise ValueError("mapping version must be 1")
+    speakers = value.get("speakers")
+    if not isinstance(speakers, dict):
+        raise ValueError("speakers must be an object")
+    known = set(speaker_ids)
+    if any(
+        not isinstance(key, str)
+        or key not in known
+        or not isinstance(name, str)
+        or len(name) > MAX_NAME_CHARS
+        for key, name in speakers.items()
+    ):
+        raise ValueError("mapping contains invalid speaker entries")
+    return speakers
+
+
 def _validated_mapping(
     value: object,
     speaker_ids: Sequence[str],
 ) -> dict[str, str]:
     if not isinstance(value, dict) or set(value) != {"version", "speakers"}:
         raise ValueError("mapping must contain only version and speakers")
-    if type(value["version"]) is not int or value["version"] != 1:
-        raise ValueError("mapping version must be 1")
-    speakers = value["speakers"]
-    if not isinstance(speakers, dict):
-        raise ValueError("speakers must be an object")
-    known = set(speaker_ids)
-    if any(not isinstance(key, str) or key not in known for key in speakers):
-        raise ValueError("mapping contains an unknown speaker id")
-    if any(
-        not isinstance(name, str) or len(name) > MAX_NAME_CHARS
-        for name in speakers.values()
-    ):
-        raise ValueError("speaker names must be strings of at most 500 characters")
-    return speakers
+    return _validated_speakers(value, speaker_ids)
 
 
 def _file_generation(path: Path) -> tuple[int, int, int, int]:
@@ -1216,23 +1220,7 @@ def _mapping_entries(
     after = _file_generation(path)
     if before != after:
         raise ValueError("mapping changed while reading")
-    if not isinstance(value, dict):
-        raise ValueError("mapping must be an object")
-    if type(value.get("version")) is not int or value.get("version") != 1:
-        raise ValueError("mapping version must be 1")
-    speakers = value.get("speakers")
-    if not isinstance(speakers, dict):
-        raise ValueError("speakers must be an object")
-    known = set(speaker_ids)
-    if any(
-        not isinstance(key, str)
-        or key not in known
-        or not isinstance(name, str)
-        or len(name) > MAX_NAME_CHARS
-        for key, name in speakers.items()
-    ):
-        raise ValueError("mapping contains invalid speaker entries")
-    return speakers, after
+    return _validated_speakers(value, speaker_ids), after
 
 
 def make_server(

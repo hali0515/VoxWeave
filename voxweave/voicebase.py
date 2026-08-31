@@ -268,6 +268,15 @@ def load_json_object(
     )
 
 
+def canonical_path(path: Path) -> Path:
+    """Resolve a target to its realpath so sibling lock/companion keys are stable.
+
+    Every phase-2 store derives its ``.lock``/``.meta.json`` companions from this
+    one normalization, so two aliases of the same file always take the same lock.
+    """
+    return Path(os.path.realpath(os.fspath(Path(path))))
+
+
 def canonical_json_bytes(value: object) -> bytes:
     """Encode canonical UTF-8 JSON for digests and reproducible artifacts."""
     try:
@@ -609,6 +618,7 @@ __all__ = [
     "ValidatedVoiceprints",
     "canonical_json_bytes",
     "canonical_json_digest",
+    "canonical_path",
     "canonical_turns_bytes",
     "canonical_turns_digest",
     "encode_json_bytes",

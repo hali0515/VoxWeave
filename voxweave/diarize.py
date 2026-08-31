@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Iterator, cast
 import yaml
 
 from voxweave import config
+from voxweave.backend import _sha256_file
 from voxweave.core.schema import Cue
 from voxweave.voicebase import MAX_EMBEDDING_DIM, MIN_EMBEDDING_DIM
 
@@ -135,14 +136,6 @@ class EmbeddingCheckpointChangedError(RuntimeError):
 _EMBEDDING_BINDING_ATTR = "_voxweave_embedding_checkpoint_binding"
 _EMBEDDING_MODEL_ATTR = "_voxweave_embedding_model"
 _OUTER_CONFIG_ATTR = "_voxweave_outer_config_sha256"
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _split_model_revision(model: str) -> tuple[str, str | None]:

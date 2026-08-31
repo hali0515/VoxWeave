@@ -304,7 +304,7 @@ def test_mlx_get_whisper_reloads_on_size_change(monkeypatch):
     monkeypatch.setattr(backend_mlx, "_whisper", None)
     monkeypatch.setattr(backend_mlx, "_whisper_id", None)
     monkeypatch.setattr(
-        backend_mlx, "_snapshot", lambda repo, cache: f"/snap/{repo.split('/')[-1]}"
+        backend_mlx, "_hf_snapshot", lambda repo, cache: f"/snap/{repo.split('/')[-1]}"
     )
     a = backend_mlx.get_whisper("large-v3")
     assert backend_mlx._whisper_id == "large-v3"

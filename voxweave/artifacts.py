@@ -98,12 +98,19 @@ def _absolute(path: Path) -> Path:
     return Path(os.path.realpath(os.path.abspath(os.fspath(expanded))))
 
 
-def _stem(path: Path) -> str:
-    return path.name[: -len(path.suffix)] if path.suffix else path.name
-
-
 def _swap_ext(path: Path, suffix: str) -> Path:
-    return path.with_name(f"{_stem(path)}{suffix}")
+    """Sibling rename through pipeline's canonical, dot-safe helper.
+
+    The import is deferred because pipeline imports this module at module scope;
+    reversing that at module scope would close an import cycle.
+    """
+    from voxweave.pipeline import swap_ext
+
+    return swap_ext(path, suffix)
+
+
+def _stem(path: Path) -> str:
+    return _swap_ext(path, "").name
 
 
 def _claim_digest(source: Path) -> str:

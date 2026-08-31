@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 
 from voxweave import config
+from voxweave.runtime import _hf_snapshot
 
 log = logging.getLogger("voxweave")
 
@@ -66,26 +67,14 @@ def _require(mod: str) -> RuntimeError:
 
 
 def _load(repo: str, cache_dir: str):
-    """Download repo into cache_dir (VoxWeave's own cache, matching the torch _hf_snapshot path)
+    """Download repo into cache_dir (VoxWeave's own cache, via the shared _hf_snapshot path)
     then load from the local snapshot — mlx_audio.stt.load accepts a local dir, so it won't re-fetch
     from the hub. Keeps MLX weights under ~/.cache/voxweave alongside the separator/PANNs weights."""
     try:
-        from huggingface_hub import snapshot_download
         from mlx_audio.stt import load  # pyright: ignore[reportMissingImports]
     except ModuleNotFoundError as e:
         raise _require(e.name or "mlx_audio") from e
-    local = snapshot_download(repo, cache_dir=cache_dir)
-    return load(local)
-
-
-def _snapshot(repo: str, cache_dir: str) -> str:
-    """Download repo into cache_dir and return the local snapshot dir (no mlx_audio.stt.load).
-    Used for the whisper path, which loads via mlx_whisper.transcribe(path_or_hf_repo=local_dir)."""
-    try:
-        from huggingface_hub import snapshot_download
-    except ModuleNotFoundError as e:
-        raise _require(e.name or "huggingface_hub") from e
-    return snapshot_download(repo, cache_dir=cache_dir)
+    return load(_hf_snapshot(repo, cache_dir))
 
 
 def _clear_cache() -> None:
@@ -253,7 +242,7 @@ def get_whisper(model_id: str):
     if _whisper is None:
         repo = _mlx_whisper_repo(model_id)
         log.info("loading MLX whisper=%s", repo)
-        _whisper = _MlxWhisper(_snapshot(repo, config.ASR_CACHE))
+        _whisper = _MlxWhisper(_hf_snapshot(repo, config.ASR_CACHE))
         _whisper_id = model_id
         log.info("MLX whisper ready")
     return _whisper

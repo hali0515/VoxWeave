@@ -6,17 +6,18 @@ import fcntl
 import hashlib
 import os
 import stat
-import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from voxweave import fsio
 from voxweave.align_failures import CanonicalFailure
 from voxweave.voicebase import (
     CACHE_COMPANION_MAX_BYTES,
     MAX_PROVENANCE_STRING_BYTES,
     Phase2DataError,
+    canonical_path,
     load_json_object,
     require_exact_int,
     require_mapping,
@@ -92,7 +93,8 @@ class CacheLockHandle:
 
 
 def canonical_cache_path(path: Path) -> Path:
-    return Path(os.path.realpath(os.fspath(Path(path))))
+    """Cache-side name for voicebase's shared realpath normalization."""
+    return canonical_path(path)
 
 
 def cache_companion_path(cache_path: Path) -> Path:
@@ -409,7 +411,7 @@ def cache_lock(cache_path: Path) -> Iterator[CacheLockHandle]:
     try:
         resolved = canonical_cache_path(cache_path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        lock = Path(f"{resolved}.lock")
+        lock = cache_lock_path(resolved)
         descriptor = os.open(
             lock,
             os.O_RDWR
@@ -437,7 +439,7 @@ def cache_lock(cache_path: Path) -> Iterator[CacheLockHandle]:
     try:
         yield CacheLockHandle(
             cache_path=resolved,
-            companion_path=Path(f"{resolved}.meta.json"),
+            companion_path=cache_companion_path(resolved),
             lock_path=lock,
         )
     finally:
@@ -462,45 +464,33 @@ def cache_write_window(cache_path: Path) -> Iterator[CacheLockHandle]:
 def cache_publish_path(cache_path: Path) -> Iterator[Path]:
     """Stage and atomically replace one cache file with exact edge terminals."""
     destination = canonical_cache_path(cache_path)
-    temporary: Path | None = None
+    staged = False
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, name = tempfile.mkstemp(
-            dir=destination.parent,
-            prefix=f".{destination.stem}.",
-            suffix=f".part{destination.suffix}",
-        )
-        os.close(descriptor)
-        temporary = Path(name)
-        try:
-            yield temporary
-        except BaseException as exc:
-            _classify_cache_failure(
-                exc,
-                kind="cache-operation-failed",
-                detail_code="cache-stage",
-            )
-            raise
-        try:
-            os.replace(temporary, destination)
-        except BaseException as exc:
-            _classify_cache_failure(
-                exc,
-                kind="cache-operation-failed",
-                detail_code="cache-replace",
-            )
-            raise
+        # fsio owns the staging convention (same-directory ".<stem>.*.part<suffix>"
+        # temp file, os.replace on clean exit, unlink on any failure); only the
+        # cache-specific terminal classification stays here.
+        with fsio.atomic_path(destination) as temporary:
+            staged = True
+            try:
+                yield temporary
+            except BaseException as exc:
+                _classify_cache_failure(
+                    exc,
+                    kind="cache-operation-failed",
+                    detail_code="cache-stage",
+                )
+                raise
     except BaseException as exc:
-        if temporary is None:
-            _classify_cache_failure(
-                exc,
-                kind="cache-operation-failed",
-                detail_code="cache-stage",
-            )
+        # Classification is first-write-wins, so a body failure keeps the
+        # "cache-stage" terminal attached above; only staging (no temp file yet)
+        # and the replace edge reach this untouched.
+        _classify_cache_failure(
+            exc,
+            kind="cache-operation-failed",
+            detail_code="cache-replace" if staged else "cache-stage",
+        )
         raise
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
 
 
 __all__ = [
