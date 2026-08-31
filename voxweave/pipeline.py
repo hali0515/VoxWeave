@@ -1156,7 +1156,7 @@ def transcribe(
         from voxweave.config import conf_load_strategy
 
         strategy = conf_load_strategy()
-        rep.chunks(len(chunks) * backend.chunk_pass_count(asr_model, strategy))
+        rep.chunks(len(chunks) * backend.chunk_pass_count(asr_model))
         # full_wav + bounds let CTC/MMS languages run ONE full-file alignment pass over
         # the whole audio (chunk windows as DP silence anchors) instead of N per-chunk
         # calls; Qwen-aligned languages (zh/yue) keep per-chunk inside transcribe_chunks.

@@ -127,8 +127,6 @@ class EvidencePublication:
 @dataclass(frozen=True)
 class TransactionReceipt:
     landed: tuple[Path, ...]
-    auxiliary_landed: tuple[Path, ...] = ()
-    leftovers: tuple[Path, ...] = ()
     machine_landed: tuple[Path, ...] = ()
 
 

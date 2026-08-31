@@ -217,7 +217,6 @@ def test_fuse_punct_inserts_into_gap_ja():
     # qwen per-char punctuated output (reinject ja): 。 immediately follows です → content
     # alignment inserts it after whisper's です
     text = "畑です次"
-    units = []  # content alignment does not use whisper unit timestamps
     qwen = [
         {"text": "畑", "start": 1.0, "end": 1.2},
         {"text": "で", "start": 1.2, "end": 1.4},
@@ -225,31 +224,29 @@ def test_fuse_punct_inserts_into_gap_ja():
         {"text": "。", "start": 1.6, "end": 1.6},
         {"text": "次", "start": 2.5, "end": 2.7},
     ]
-    assert realign.fuse_punct_into_text(text, units, qwen) == "畑です。次"
+    assert realign.fuse_punct_into_text(text, qwen) == "畑です。次"
 
 
 def test_fuse_punct_trailing_attaches_to_end():
     text = "畑次"
-    units = []
     qwen = [
         {"text": "畑", "start": 1.0, "end": 1.2},
         {"text": "次", "start": 2.5, "end": 2.7},
         {"text": "。", "start": 2.7, "end": 2.7},
     ]
-    assert realign.fuse_punct_into_text(text, units, qwen) == "畑次。"
+    assert realign.fuse_punct_into_text(text, qwen) == "畑次。"
 
 
 def test_fuse_punct_spaced_word_units():
     # en: punctuation as standalone unit (with content anchors on both sides) → content
     # alignment inserts it after whisper's hello
     text = "hello world"
-    units = []
     qwen = [
         {"text": "hello", "start": 0.0, "end": 1.0},
         {"text": ".", "start": 1.1, "end": 1.1},
         {"text": "world", "start": 2.0, "end": 3.0},
     ]
-    assert realign.fuse_punct_into_text(text, units, qwen) == "hello. world"
+    assert realign.fuse_punct_into_text(text, qwen) == "hello. world"
 
 
 def test_fuse_punct_content_anchored_not_time_ja():
@@ -257,7 +254,6 @@ def test_fuse_punct_content_anchored_not_time_ja():
     # どの, but どの collides with whisper's 造 on the time axis (OOV drift). Time-based
     # approach inserts 。 after 造 (番酒造。り); content approach inserts after whisper's どの.
     text = "どの番酒造りが"  # whisper transcript (accurate)
-    units = []
     qwen = [  # Qwen per-char: どの。番酒造りが (。immediately follows どの)
         {"text": "ど", "start": 9.0, "end": 9.1},
         {"text": "の", "start": 9.1, "end": 9.2},
@@ -268,7 +264,7 @@ def test_fuse_punct_content_anchored_not_time_ja():
         {"text": "り", "start": 9.6, "end": 9.7},
         {"text": "が", "start": 9.7, "end": 9.8},
     ]
-    out = realign.fuse_punct_into_text(text, units, qwen, strip_existing=False)
+    out = realign.fuse_punct_into_text(text, qwen, strip_existing=False)
     assert (
         out == "どの。番酒造りが"
     )  # 。 lands after whisper's どの, not inside 番酒造り
@@ -281,7 +277,6 @@ def test_fuse_punct_replace_region_falls_back_to_agreed_boundary():
     # → punctuation falls back to the nearest equal char (の from どの), not inside whisper's
     # 番酒造り.
     text = "どの番酒造りが"  # whisper (accurate)
-    units = []
     qwen = [  # Qwen: どのサ。チ作りが (。inside the misheard region サチ作り)
         {"text": "ど", "start": 0.0, "end": 0.1},
         {"text": "の", "start": 0.1, "end": 0.2},
@@ -292,7 +287,7 @@ def test_fuse_punct_replace_region_falls_back_to_agreed_boundary():
         {"text": "り", "start": 0.5, "end": 0.6},
         {"text": "が", "start": 0.6, "end": 0.7},
     ]
-    out = realign.fuse_punct_into_text(text, units, qwen, strip_existing=False)
+    out = realign.fuse_punct_into_text(text, qwen, strip_existing=False)
     # 。 falls back to after どの (equal-region boundary); whisper 番酒造り is not split
     assert out == "どの。番酒造りが"
     assert "番。" not in out and "造。り" not in out
@@ -302,13 +297,12 @@ def test_fuse_punct_drops_punct_in_allreplace_song():
     # OP lyrics: entire segment is a replace region (no content agreement), no equal prefix →
     # all Qwen punctuation is dropped; no per-char cue explosion.
     text = "のんびり農業して"  # whisper lyrics
-    units = []
     qwen = [  # Qwen mishears the entire segment + every char has punctuation
         #       (would cause per-char cue explosion if inserted unconditionally)
         {"text": ch, "start": i * 0.1, "end": i * 0.1 + 0.05}
         for i, ch in enumerate("ホゲ。フガ。ピヨ。")
     ]
-    out = realign.fuse_punct_into_text(text, units, qwen, strip_existing=False)
+    out = realign.fuse_punct_into_text(text, qwen, strip_existing=False)
     assert (
         out == "のんびり農業して"
     )  # no equal anchors → all punctuation dropped, whisper text unchanged
@@ -319,15 +313,11 @@ def test_fuse_punct_glued_word_units_en():
     # ("hello." not standalone "."). Old fuse only accepted standalone punct units → 100%
     # miss for English punctuation. Must be able to extract trailing punct from word units.
     text = "hello world"  # whisper transcript (no punctuation)
-    units = [
-        {"text": "hello", "start": 0.0, "end": 1.0},
-        {"text": "world", "start": 2.0, "end": 3.0},
-    ]
     qwen = [  # real reinject_punct format: punctuation glued to word
         {"text": "hello.", "start": 0.0, "end": 1.0},
         {"text": "world", "start": 2.0, "end": 3.0},
     ]
-    assert realign.fuse_punct_into_text(text, units, qwen) == "hello. world"
+    assert realign.fuse_punct_into_text(text, qwen) == "hello. world"
 
 
 def test_fuse_punct_glued_sentence_period_en():
@@ -335,30 +325,17 @@ def test_fuse_punct_glued_sentence_period_en():
     # that smart_split breaks at the sentence end (old fuse dropped the period → "BGM it's not"
     # ended up as a single cue).
     text = "BGM it's not"
-    units = [
-        {"text": "BGM", "start": 0.0, "end": 0.5},
-        {"text": "it's", "start": 1.2, "end": 1.4},  # 0.7s pause after BGM
-        {"text": "not", "start": 1.4, "end": 1.6},
-    ]
     qwen = [
         {"text": "BGM.", "start": 0.0, "end": 0.5},
         {"text": "It's", "start": 1.0, "end": 1.2},
         {"text": "not", "start": 1.2, "end": 1.4},
     ]
-    assert realign.fuse_punct_into_text(text, units, qwen) == "BGM. it's not"
+    assert realign.fuse_punct_into_text(text, qwen) == "BGM. it's not"
 
 
 def test_fuse_punct_glued_multiple_clauses_en():
     # Multiple delimiters: comma and period must both be preserved, each after its corresponding word.
     text = "okay it's loud I edit it"
-    units = [
-        {"text": "okay", "start": 0.0, "end": 0.4},
-        {"text": "it's", "start": 0.5, "end": 0.7},
-        {"text": "loud", "start": 0.7, "end": 1.0},
-        {"text": "I", "start": 1.5, "end": 1.6},
-        {"text": "edit", "start": 1.6, "end": 1.9},
-        {"text": "it", "start": 1.9, "end": 2.1},
-    ]
     qwen = [
         {"text": "Okay,", "start": 0.0, "end": 0.4},
         {"text": "it's", "start": 0.5, "end": 0.7},
@@ -367,9 +344,7 @@ def test_fuse_punct_glued_multiple_clauses_en():
         {"text": "edit", "start": 1.6, "end": 1.9},
         {"text": "it", "start": 1.9, "end": 2.1},
     ]
-    assert (
-        realign.fuse_punct_into_text(text, units, qwen) == "okay, it's loud. I edit it"
-    )
+    assert realign.fuse_punct_into_text(text, qwen) == "okay, it's loud. I edit it"
 
 
 def test_fuse_qwen_punct_authoritative_strips_whisper_own():
@@ -377,29 +352,21 @@ def test_fuse_qwen_punct_authoritative_strips_whisper_own():
     # Qwen's (fixes "double punctuation" over-splitting in fusion — whisper had 43 + Qwen 90
     # = 120 total commas, excess commas caused comma-split to shred the final sentences).
     text = "hello, world"  # whisper has its own comma
-    units = [
-        {"text": "hello", "start": 0.0, "end": 1.0},
-        {"text": "world", "start": 2.0, "end": 3.0},
-    ]
     qwen = [
         {"text": "hello", "start": 0.0, "end": 1.0},  # Qwen has no punctuation here
         {"text": "world.", "start": 2.0, "end": 3.0},  # Qwen period after world
     ]
-    assert realign.fuse_punct_into_text(text, units, qwen) == "hello world."
+    assert realign.fuse_punct_into_text(text, qwen) == "hello world."
 
 
 def test_fuse_keeps_nonpunct_symbols_when_stripping():
     # Only _FUSE_PUNCT is stripped; ・ / % / hyphens and other non-delimiter symbols are preserved.
     text = "100% rock-solid"
-    units = [
-        {"text": "100", "start": 0.0, "end": 0.5},
-        {"text": "rock-solid", "start": 0.6, "end": 1.2},
-    ]
     qwen = [
         {"text": "100", "start": 0.0, "end": 0.5},
         {"text": "rock-solid.", "start": 0.6, "end": 1.2},
     ]
-    assert realign.fuse_punct_into_text(text, units, qwen) == "100% rock-solid."
+    assert realign.fuse_punct_into_text(text, qwen) == "100% rock-solid."
 
 
 def test_fuse_strip_existing_gates_whisper_punct():
@@ -407,41 +374,22 @@ def test_fuse_strip_existing_gates_whisper_punct():
     # no-space languages strip_existing=False (keep whisper's own punctuation — char-level
     # time mapping would drift and split words if stripped).
     text = "畑です。次"  # whisper has its own period
-    units = [
-        {"text": "畑", "start": 1.0, "end": 1.2},
-        {"text": "で", "start": 1.2, "end": 1.4},
-        {"text": "す", "start": 1.4, "end": 1.6},
-        {"text": "次", "start": 2.5, "end": 2.7},
-    ]
     # CJK path: retain whisper period
-    assert (
-        realign.fuse_punct_into_text(text, units, [], strip_existing=False)
-        == "畑です。次"
-    )
+    assert realign.fuse_punct_into_text(text, [], strip_existing=False) == "畑です。次"
     # spaced-language path (default): strip whisper period (no Qwen punct to replace it → bare text)
-    assert (
-        realign.fuse_punct_into_text(text, units, [], strip_existing=True) == "畑です次"
-    )
+    assert realign.fuse_punct_into_text(text, [], strip_existing=True) == "畑です次"
 
 
 def test_fuse_punct_preserves_nakaguro_in_raw_text():
     # Key: text is preserved char-by-char; name separator ・ must not be dropped (fixes
     # "rebuilding from units drops non-alnum"); ・ is not a sentence boundary so no punct inserted.
     text = "ラスティス・ムーン"  # ・ is not alnum; not present in units
-    units = [
-        {"text": c, "start": 1.0 + i * 0.1, "end": 1.0 + i * 0.1 + 0.05}
-        for i, c in enumerate("ラスティスムーン")
-    ]  # 8 alnum characters
-    assert realign.fuse_punct_into_text(text, units, []) == "ラスティス・ムーン"
+    assert realign.fuse_punct_into_text(text, []) == "ラスティス・ムーン"
 
 
 def test_fuse_punct_no_punct_returns_text_verbatim():
     text = "私は"
-    units = [
-        {"text": "私", "start": 1.0, "end": 1.2},
-        {"text": "は", "start": 1.2, "end": 1.4},
-    ]
-    assert realign.fuse_punct_into_text(text, units, []) == "私は"
+    assert realign.fuse_punct_into_text(text, []) == "私は"
 
 
 # --------------------------------------------------------------------------- #
