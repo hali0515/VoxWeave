@@ -127,7 +127,7 @@ def test_correct_retires_cached_evidence_created_at_commit_seam(tmp_path, monkey
     media.write_bytes(b"media")
     vtt = tmp_path / "episode.vtt"
     vtt.write_text(_vtt(), encoding="utf-8")
-    cached = artifacts.artifacts_root() / "episode" / "episode.align-evidence.json"
+    cached = artifacts.artifacts_root(media) / "episode" / "episode.align-evidence.json"
     real_commit = episode_transaction.commit_correction
 
     def create_evidence_then_commit(**kwargs):

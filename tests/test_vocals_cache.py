@@ -88,7 +88,7 @@ def test_prepare_align_skips_stale_legacy_cache(tmp_path):
     media, _ = _paths(tmp_path)
     pipeline.cache_vocals_path(media).unlink()  # only the legacy 16k cache remains
     legacy = pipeline.cache_16k_path(media)
-    legacy.parent.mkdir()
+    legacy.parent.mkdir(exist_ok=True)
     legacy.write_bytes(b"l")
     parts = tuple(tmp_path / n for n in ("full.wav", "voc.flac", "16k.wav", "32k.wav"))
     with (
@@ -103,10 +103,11 @@ def test_prepare_align_skips_stale_legacy_cache(tmp_path):
     sep.assert_called_once()
 
 
-def test_fresh_vocals_miss_never_creates_adjacent_cache_directory(tmp_path):
+def test_fresh_vocals_miss_writes_into_the_adjacent_cache_claim(tmp_path):
     media = tmp_path / "ep.mkv"
     media.write_bytes(b"m")
     managed = pipeline.cache_vocals_path(media)
+    assert managed == tmp_path / "cache" / "ep" / "vocals.32k.flac"
     parts = tuple(
         tmp_path / name for name in ("full.wav", "voc.wav", "16k.wav", "32k.wav")
     )
@@ -133,7 +134,7 @@ def test_fresh_vocals_miss_never_creates_adjacent_cache_directory(tmp_path):
 
     assert managed.read_bytes() == b"flac"
     assert Path(f"{managed}.lock").is_file()
-    assert not (tmp_path / "cache").exists()
+    assert (tmp_path / "cache" / "ep").is_dir()
 
 
 def test_existing_adjacent_32k_cache_remains_the_read_writeback_lane(tmp_path):

@@ -305,7 +305,7 @@ def test_pipeline_correct_invalid_cache_claim_leaves_no_sidecar_pair(
     media = tmp_path / "ep.mp4"
     media.write_bytes(b"media")
     vtt = _make_vtt(tmp_path, ["hello"])
-    claim = artifacts.artifacts_root() / "ep"
+    claim = artifacts.artifacts_root(media) / "ep"
     claim.mkdir(parents=True)
     (claim / "source.json").write_text("invalid", encoding="utf-8")
     monkeypatch.setattr(

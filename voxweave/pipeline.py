@@ -615,8 +615,8 @@ def _artifact_owner(reference: Path) -> Path:
                 str(source),
                 source,
             )
-            for source in artifacts.claimed_sources(carrier.name)
-            if source.parent == normalized_parent and source.suffix.lower() in order
+            for source in artifacts.claimed_sources(normalized_parent, carrier.name)
+            if source.suffix.lower() in order
         )
         if recorded:
             return recorded[0][2]

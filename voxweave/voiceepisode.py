@@ -56,9 +56,7 @@ def _artifact_lock_paths(owner: Path) -> tuple[Path, tuple[Path, ...]]:
     """Return every same-directory/same-stem claim lock in stable order."""
     claimed = artifacts.claim_paths(owner)
     locks: list[Path] = []
-    for source in artifacts.claimed_sources(claimed.source.stem):
-        if source.parent != claimed.source.parent:
-            continue
+    for source in artifacts.claimed_sources(claimed.source.parent, claimed.source.stem):
         paths = artifacts.inspect_paths(source)
         if paths is not None:
             locks.append(paths.episode_lock)
@@ -130,8 +128,8 @@ def _episode_owner(path: Path) -> Path:
                 str(source),
                 source,
             )
-            for source in artifacts.claimed_sources(stem)
-            if source.parent == normalized_parent and source.suffix.lower() in order
+            for source in artifacts.claimed_sources(normalized_parent, stem)
+            if source.suffix.lower() in order
         )
         if recorded:
             return recorded[0][2]

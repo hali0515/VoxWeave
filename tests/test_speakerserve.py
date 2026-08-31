@@ -425,7 +425,7 @@ def test_legacy_mapping_save_ignores_an_unselected_poisoned_cache_claim(tmp_path
         '{"version":1,"speakers":{"SPEAKER_00":"Before"}}\n',
         encoding="utf-8",
     )
-    poisoned = artifacts.artifacts_root() / "episode"
+    poisoned = artifacts.artifacts_root(media) / "episode"
     poisoned.mkdir(parents=True)
     (poisoned / "source.json").write_text("not-json", encoding="utf-8")
 

@@ -911,7 +911,7 @@ def test_legacy_progress_success_ignores_an_unselected_poisoned_cache_claim(
     _write_vtt(vtt)
     legacy = tmp_path / "ep.zh.progress.json"
     legacy.write_text("legacy", encoding="utf-8")
-    poisoned = artifacts.artifacts_root() / "ep"
+    poisoned = artifacts.artifacts_root(vtt) / "ep"
     poisoned.mkdir(parents=True)
     marker = poisoned / "source.json"
     marker.write_text("not-json", encoding="utf-8")

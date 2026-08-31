@@ -1855,11 +1855,14 @@ def _public_artifact_path(
     episode_root: Path,
     route_evidence_path: Path,
 ) -> Path:
+    # cache_root is retained in the signature for isolation checks; since the
+    # media-adjacent cache relocation no public artifact lives under it.
+    _ = cache_root
     paths = {
         "vtt": episode_root / "episode.vtt",
         "main-json": episode_root / "episode.json",
         "align-evidence": (
-            cache_root / "artifacts" / "episode" / "episode.align-evidence.json"
+            episode_root / "cache" / "episode" / "episode.align-evidence.json"
         ),
         "route-evidence": route_evidence_path,
     }

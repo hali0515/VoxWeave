@@ -24,7 +24,7 @@ def test_claim_layout_keeps_transcript_and_deliverables_adjacent(tmp_path):
 
     paths = artifacts.claim_paths(media)
 
-    assert paths.directory == tmp_path / ".voxweave-cache/artifacts/episode"
+    assert paths.directory == tmp_path / "cache/episode"
     assert paths.speaker_mapping.name == "speakers.json"
     assert paths.speaker_suggest.name == "speakers.suggest.json"
     assert paths.voiceprints.name == "voiceprints.json"
@@ -40,24 +40,41 @@ def test_claim_layout_keeps_transcript_and_deliverables_adjacent(tmp_path):
     )
     assert not (paths.directory / "episode.json").exists()
     assert json.loads(paths.marker.read_bytes()) == {
-        "version": 1,
-        "source": str(media.resolve()),
+        "version": 2,
+        "source": "episode.mp3",
     }
 
 
-def test_cache_root_is_read_at_call_time(tmp_path, monkeypatch):
-    media = _media(tmp_path / "episode.mp3")
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    monkeypatch.setenv("VOXWEAVE_CACHE_ROOT", str(first))
-    assert artifacts.claim_paths(media).directory.parent.parent == first
-    monkeypatch.setenv("VOXWEAVE_CACHE_ROOT", str(second))
-    assert artifacts.claim_paths(media).directory.parent.parent == second
+def test_claims_survive_moving_the_media_directory(tmp_path):
+    media_dir = tmp_path / "season-one"
+    media = _media(media_dir / "episode.mp3")
+    paths = artifacts.claim_paths(media)
+    paths.voiceprints.write_text("{}", encoding="utf-8")
+
+    moved = tmp_path / "season-one-archived"
+    media_dir.rename(moved)
+
+    inspected = artifacts.inspect_paths(moved / "episode.mp3")
+    assert inspected is not None
+    assert inspected.directory == moved / "cache/episode"
+    assert inspected.voiceprints.read_text(encoding="utf-8") == "{}"
+    assert artifacts.claimed_sources(moved, "episode") == (moved / "episode.mp3",)
 
 
-def test_same_stem_collision_uses_path_digest_fallback(tmp_path):
+def test_separate_directories_never_share_a_claim(tmp_path):
     first = _media(tmp_path / "one/episode.mp3")
     second = _media(tmp_path / "two/episode.mp3")
+
+    first_paths = artifacts.claim_paths(first)
+    second_paths = artifacts.claim_paths(second)
+
+    assert first_paths.directory == tmp_path / "one/cache/episode"
+    assert second_paths.directory == tmp_path / "two/cache/episode"
+
+
+def test_same_stem_collision_uses_name_digest_fallback(tmp_path):
+    first = _media(tmp_path / "episode.mp3")
+    second = _media(tmp_path / "episode.mkv")
 
     first_paths = artifacts.claim_paths(first)
     second_paths = artifacts.claim_paths(second)
@@ -65,13 +82,9 @@ def test_same_stem_collision_uses_path_digest_fallback(tmp_path):
     assert first_paths.directory.name == "episode"
     assert second_paths.directory.name.startswith("episode--")
     assert len(second_paths.directory.name) == len("episode--") + 8
-    digest = hashlib.sha1(
-        str(second.resolve()).encode(), usedforsecurity=False
-    ).hexdigest()[:8]
+    digest = hashlib.sha1(second.name.encode(), usedforsecurity=False).hexdigest()[:8]
     assert second_paths.directory.name == f"episode--{digest}"
-    assert json.loads(second_paths.marker.read_bytes())["source"] == str(
-        second.resolve()
-    )
+    assert json.loads(second_paths.marker.read_bytes())["source"] == "episode.mkv"
 
 
 def test_concurrent_claimers_choose_one_identical_directory(tmp_path):
@@ -88,9 +101,9 @@ def test_concurrent_claimers_choose_one_identical_directory(tmp_path):
 
 
 def test_occupied_collision_fallback_fails_closed(tmp_path, monkeypatch):
-    first = _media(tmp_path / "one/episode.mp3")
-    second = _media(tmp_path / "two/episode.mp3")
-    third = _media(tmp_path / "three/episode.mp3")
+    first = _media(tmp_path / "episode.mp3")
+    second = _media(tmp_path / "episode.mkv")
+    third = _media(tmp_path / "episode.flac")
     monkeypatch.setattr(artifacts, "_claim_digest", lambda _source: "12345678")
 
     artifacts.claim_paths(first)
@@ -102,7 +115,7 @@ def test_occupied_collision_fallback_fails_closed(tmp_path, monkeypatch):
 @pytest.mark.parametrize("node_kind", ["symlink", "fifo"])
 def test_marker_rejects_nonregular_nodes(tmp_path, node_kind):
     media = _media(tmp_path / "episode.mp3")
-    directory = artifacts.artifacts_root() / "episode"
+    directory = artifacts.artifacts_root(media) / "episode"
     directory.mkdir(parents=True)
     marker = directory / "source.json"
     if node_kind == "symlink":
@@ -140,7 +153,7 @@ def test_legacy_mapping_wins_without_inspecting_poisoned_cache(tmp_path):
     media = _media(tmp_path / "episode.mp3")
     legacy = tmp_path / "episode.speakers.json"
     legacy.write_text('{"version":1,"speakers":{}}\n', encoding="utf-8")
-    directory = artifacts.artifacts_root() / "episode"
+    directory = artifacts.artifacts_root(media) / "episode"
     directory.mkdir(parents=True)
     (directory / "source.json").write_text("not-json", encoding="utf-8")
 

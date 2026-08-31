@@ -263,7 +263,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
 | `--vad-mask/--no-vad-mask`     | Suppress CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                    |
-| `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) under `${VOXWEAVE_CACHE_ROOT:-~/.cache/voxweave}/artifacts/<stem>/debug/`.                                                                                                                                              |
+| `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) under `<media directory>/cache/<stem>/debug/`.                                                                                                                                              |
 
 The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--voiceprints`, `--timestamps`,
 `--shot-snap`, `--vad-mask`) can have their defaults set persistently via the `[defaults]`
@@ -559,9 +559,11 @@ default config is written on first run (migrated automatically from a pre-rename
   and the Whisper repo tracks the Whisper size (`--model large-v3` → `mlx-community/whisper-large-v3-mlx`);
   set the matching var to hard-pin a specific quant (e.g. a 4-bit build) regardless of `--model`.
 
-Model weights (torch + MLX), private media snapshots, and per-media machine artifacts all live
-under `~/.cache/voxweave/` (override the root with `VOXWEAVE_CACHE_ROOT`), so a container only
-needs to bind-mount that one directory. Model weights are auto-downloaded under the `asr`,
+Model weights (torch + MLX) and private media snapshots live under `~/.cache/voxweave/`
+(override the root with `VOXWEAVE_CACHE_ROOT`), so a container only needs to bind-mount that
+one directory for models. Per-media machine artifacts live beside the media itself under
+`<media directory>/cache/<stem>/` (see "Files on disk" below), so they travel with the media.
+Model weights are auto-downloaded under the `asr`,
 `align`, and `audio` subdirectories on first use. Each model exposes an env override to swap the
 HF repo, or to point at an explicit local file (which, if it exists, skips the HF download):
 
@@ -680,14 +682,14 @@ Each input keeps its editable delivery set beside the media:
 - **Subtitle-family deliverables** — translated `.vtt`/`.srt`/`.ass` files and derived files
   such as `<stem>.sdh.vtt` and `<stem>.asrfix.vtt` also stay beside the media.
 
-Other episode state is stored under
-`${VOXWEAVE_CACHE_ROOT:-~/.cache/voxweave}/artifacts/<stem>/`. For `episode.mkv`, the layout is:
+Other episode state is stored beside the media, under `<media directory>/cache/<stem>/`.
+For `episode.mkv`, the layout is:
 
 ```text
-artifacts/episode/
-├── source.json                    # absolute source-path claim
+cache/episode/
+├── source.json                    # source file-name claim (never an absolute path)
 ├── episode.episode.lock           # episode transaction lock
-├── .episode-domain-<sha256>.lock  # same-directory stem collision lock
+├── .episode-domain.lock           # same-directory stem publication lock
 ├── speakers.json                  # reviewed diarizer-id-to-name mapping
 ├── speakers.suggest.json          # regenerable match suggestions
 ├── voiceprints.json               # optional biometric centroids
@@ -701,11 +703,13 @@ artifacts/episode/
 └── debug/                         # optional --debug bundle
 ```
 
-The marker normally claims the absolute media path. For a supported standalone subtitle
-command with no discoverable sibling media, it claims that absolute input path instead. If
-another source path already owns the plain stem, VoxWeave uses
-`<stem>--<sha1-of-absolute-path-first-8>/` instead. The cache root is evaluated when a command
-runs, so `VOXWEAVE_CACHE_ROOT` can select a different location per invocation.
+Because the claim records only the source file name, moving or renaming the media
+*directory* (local disk to NAS, season folder reorganizations) keeps every artifact valid —
+the cache travels with the media. The marker normally claims the media file; for a supported
+standalone subtitle command with no discoverable sibling media, it claims that input file
+instead. If another same-stem file in the same directory already owns the plain stem
+(`episode.mkv` next to `episode.mp3`), VoxWeave uses `<stem>--<sha1-of-file-name-first-8>/`
+for the second claim.
 
 Existing adjacent machine sidecars remain compatible: when an adjacent
 `<stem>.speakers.json`, `<stem>.speakers.suggest.json`, `<stem>.voiceprints.json`, translation

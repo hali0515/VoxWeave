@@ -417,7 +417,7 @@ def test_bound_align_rejects_duration_only_and_legacy_cache(tmp_path, monkeypatc
     cache.write_bytes(b"wrong unbound cache")
     cache_companion_path(cache).write_text("stale", encoding="utf-8")
     legacy = pipeline.cache_16k_path(cache_owner)
-    legacy.parent.mkdir()
+    legacy.parent.mkdir(exist_ok=True)
     legacy.write_bytes(b"legacy cache")
     parts = tuple(
         tmp_path / name

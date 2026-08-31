@@ -1,8 +1,11 @@
 """Per-source cache locations for machine-made episode artifacts.
 
 The editable transcript and subtitle deliverables remain beside the media.  All
-other generated episode state lives in one owner-only cache claim, while an
-existing adjacent sidecar remains the read and write-back lane for compatibility.
+other generated episode state lives in one owner-only claim directory under the
+media directory's own ``cache/`` root, so artifacts travel with the media when
+the directory moves.  An existing adjacent sidecar remains the read and
+write-back lane for compatibility.  Claim markers record only the source file
+name (never an absolute path) so a relocated media directory keeps its claims.
 """
 
 from __future__ import annotations
@@ -17,9 +20,9 @@ from typing import Final
 from urllib.parse import quote
 
 from voxweave import fsio
-from voxweave.mediasnapshot import default_cache_root
 
 _MARKER_MAX_BYTES: Final = 65_536
+_CACHE_DIR_NAME: Final = "cache"
 
 
 class ArtifactMarkerError(RuntimeError):
@@ -63,9 +66,9 @@ class ArtifactPaths:
         return self.directory / "debug"
 
 
-def artifacts_root() -> Path:
-    """Return the artifact root, honoring ``VOXWEAVE_CACHE_ROOT`` at call time."""
-    return default_cache_root() / "artifacts"
+def artifacts_root(source: Path) -> Path:
+    """Return the media-adjacent artifact root for one source path."""
+    return _absolute(Path(source)).parent / _CACHE_DIR_NAME
 
 
 def _ensure_private_directory(directory: Path) -> None:
@@ -76,13 +79,18 @@ def _ensure_private_directory(directory: Path) -> None:
             raise ArtifactMarkerError(
                 f"artifact directory is not a private directory: {directory}"
             )
-        os.chmod(directory, 0o700)
     except ArtifactMarkerError:
         raise
     except OSError as exc:
         raise ArtifactMarkerError(
             f"cannot create artifact directory {directory}: {exc}"
         ) from exc
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        # Network mounts may not honor chmod; privacy tightening is best-effort
+        # there, while symlink/type checks above stay strict.
+        pass
 
 
 def _absolute(path: Path) -> Path:
@@ -99,13 +107,13 @@ def _swap_ext(path: Path, suffix: str) -> Path:
 
 
 def _claim_digest(source: Path) -> str:
-    return hashlib.sha1(str(source).encode(), usedforsecurity=False).hexdigest()[:8]
+    return hashlib.sha1(source.name.encode(), usedforsecurity=False).hexdigest()[:8]
 
 
-def _marker_text(source: Path) -> str:
+def _marker_text(source_name: str) -> str:
     return (
         json.dumps(
-            {"version": 1, "source": str(source)},
+            {"version": 2, "source": source_name},
             ensure_ascii=False,
             indent=2,
         )
@@ -179,7 +187,7 @@ def _read_regular_bytes(path: Path) -> bytes:
             os.close(descriptor)
 
 
-def _read_marker(marker: Path) -> Path:
+def _read_marker(marker: Path) -> str:
     try:
         encoded = _read_regular_bytes(marker)
         raw = json.loads(
@@ -195,19 +203,26 @@ def _read_marker(marker: Path) -> Path:
         type(raw) is not dict
         or set(raw) != {"version", "source"}
         or type(raw.get("version")) is not int
-        or raw["version"] != 1
+        or raw["version"] != 2
         or type(raw.get("source")) is not str
     ):
         raise ArtifactMarkerError(f"invalid artifact source marker schema: {marker}")
-    source = Path(raw["source"])
-    if not source.is_absolute() or source != _absolute(source):
-        raise ArtifactMarkerError(f"non-normalized source in artifact marker: {marker}")
-    if encoded != _marker_text(source).encode():
+    name = raw["source"]
+    if (
+        not name
+        or name in (os.curdir, os.pardir)
+        or "/" in name
+        or (os.sep != "/" and os.sep in name)
+        or (os.altsep is not None and os.altsep in name)
+        or name != Path(name).name
+    ):
+        raise ArtifactMarkerError(f"non-name source in artifact marker: {marker}")
+    if encoded != _marker_text(name).encode():
         raise ArtifactMarkerError(f"non-canonical artifact source marker: {marker}")
-    return source
+    return name
 
 
-def _directory_owner(directory: Path) -> Path | None:
+def _directory_owner(directory: Path) -> str | None:
     try:
         metadata = directory.lstat()
     except FileNotFoundError:
@@ -256,21 +271,21 @@ def _claim_directory(source: Path, directory: Path) -> bool:
             f"cannot create artifact claim {directory}: {exc}"
         ) from exc
     try:
-        fsio.atomic_write_text_new(directory / "source.json", _marker_text(source))
+        fsio.atomic_write_text_new(directory / "source.json", _marker_text(source.name))
     except FileExistsError:
-        return _read_marker(directory / "source.json") == source
+        return _read_marker(directory / "source.json") == source.name
     return True
 
 
 def claim_paths(source: Path) -> ArtifactPaths:
     """Claim the deterministic cache directory for one media/source path."""
     absolute = _absolute(Path(source))
-    root = artifacts_root()
+    root = artifacts_root(absolute)
     _ensure_private_directory(root)
     primary = root / absolute.stem
     if _claim_directory(absolute, primary):
         return _paths(absolute, primary)
-    fallback = artifacts_root() / f"{absolute.stem}--{_claim_digest(absolute)}"
+    fallback = root / f"{absolute.stem}--{_claim_digest(absolute)}"
     if _claim_directory(absolute, fallback):
         return _paths(absolute, fallback)
     owner = _read_marker(fallback / "source.json")
@@ -282,7 +297,7 @@ def claim_paths(source: Path) -> ArtifactPaths:
 def inspect_paths(source: Path) -> ArtifactPaths | None:
     """Inspect an existing matching claim without creating cache state."""
     absolute = _absolute(Path(source))
-    root = artifacts_root()
+    root = artifacts_root(absolute)
     try:
         root.lstat()
     except FileNotFoundError:
@@ -290,22 +305,23 @@ def inspect_paths(source: Path) -> ArtifactPaths | None:
     _ensure_private_directory(root)
     primary = root / absolute.stem
     owner = _directory_owner(primary)
-    if owner == absolute:
+    if owner == absolute.name:
         return _paths(absolute, primary)
-    fallback = artifacts_root() / f"{absolute.stem}--{_claim_digest(absolute)}"
+    fallback = root / f"{absolute.stem}--{_claim_digest(absolute)}"
     fallback_owner = _directory_owner(fallback)
     if fallback_owner is None:
         return None
-    if fallback_owner == absolute:
+    if fallback_owner == absolute.name:
         return _paths(absolute, fallback)
     raise ArtifactCollisionError(
         f"artifact fallback {fallback} belongs to {fallback_owner}, not {absolute}"
     )
 
 
-def claimed_sources(stem: str) -> tuple[Path, ...]:
-    """Return canonical sources recorded by the closed claim set for one stem."""
-    root = artifacts_root()
+def claimed_sources(directory: Path, stem: str) -> tuple[Path, ...]:
+    """Return sources recorded by one media directory's closed claim set."""
+    parent = _absolute(Path(directory))
+    root = parent / _CACHE_DIR_NAME
     try:
         root.lstat()
     except FileNotFoundError:
@@ -333,21 +349,21 @@ def claimed_sources(stem: str) -> tuple[Path, ...]:
         ):
             continue
         owner = _directory_owner(entry)
-        if owner is not None and owner.stem == stem:
-            sources.append(owner)
+        if owner is not None and Path(owner).stem == stem:
+            sources.append(parent / owner)
     return tuple(dict.fromkeys(sources))
 
 
 def episode_domain_lock_path(source: Path) -> Path:
     """Return a stable lock without consulting an unselected cache marker."""
     absolute = _absolute(Path(source))
-    root = artifacts_root()
+    root = artifacts_root(absolute)
     _ensure_private_directory(root)
     lock_root = root / absolute.stem
     _ensure_private_directory(lock_root)
-    domain = absolute.parent / absolute.stem
-    digest = hashlib.sha256(str(domain).encode()).hexdigest()
-    return lock_root / f".episode-domain-{digest}.lock"
+    # The media directory itself scopes the domain, and same-stem siblings
+    # (episode.mp4 + episode.mp3) share sibling files, so they share one lock.
+    return lock_root / ".episode-domain.lock"
 
 
 def path_present(path: Path) -> bool:

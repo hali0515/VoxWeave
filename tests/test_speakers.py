@@ -733,7 +733,7 @@ def test_create_audition_legacy_mapping_ignores_unselected_poisoned_cache(
         '{"version":1,"speakers":{"SPEAKER_00":"Aoi"}}',
         encoding="utf-8",
     )
-    poisoned = artifacts.artifacts_root() / "episode"
+    poisoned = artifacts.artifacts_root(media) / "episode"
     poisoned.mkdir(parents=True)
     marker = poisoned / "source.json"
     marker.write_text("not-json", encoding="utf-8")
