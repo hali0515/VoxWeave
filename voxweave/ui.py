@@ -49,6 +49,12 @@ def install_logging(*, verbose: bool = False) -> None:
     warnings.filterwarnings("ignore", message=".*sdp_kernel.*")
     # Wav2Vec2ForCTC emits a gradient_checkpointing deprecation on load — irrelevant for inference.
     warnings.filterwarnings("ignore", message=".*gradient_checkpointing.*")
+    # pyannote.audio warns at import when torchcodec cannot load (tool venvs lack
+    # the CUDA NPP library it dlopens). Harmless here: diarization is always fed a
+    # pre-decoded in-memory waveform dict, never pyannote's built-in decoding.
+    warnings.filterwarnings(
+        "ignore", message="(?s).*torchcodec is not installed correctly.*"
+    )
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(message)s",
