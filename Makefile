@@ -107,7 +107,7 @@ P6_ORACLE_ENV = env -i PATH="$(PATH)" LANG=zh_CN.UTF-8 LC_ALL=C.UTF-8
 quality: quality-segmentation
 
 quality-segmentation:
-	uv run python scripts/calib_segmentation.py evaluate \
+	uv run --extra $(VARIANT) python scripts/calib_segmentation.py evaluate \
 	  --corpus $(SEG_CORPUS) \
 	  $(if $(wildcard $(SEG_BASELINE)),--baseline $(SEG_BASELINE),) \
 	  --json-out $(SEG_REPORT) --check
@@ -157,7 +157,7 @@ quality-shadow-segmentation-full:
 # Deliberately not part of `quality`, and never run by CI: recording a baseline is a
 # reviewed human action, or a regression can be laundered into the new normal.
 quality-record-segmentation:
-	uv run python scripts/calib_segmentation.py record-baseline \
+	uv run --extra $(VARIANT) python scripts/calib_segmentation.py record-baseline \
 	  --corpus $(SEG_CORPUS) \
 	  --report $(SEG_REPORT) \
 	  --output $(SEG_BASELINE)

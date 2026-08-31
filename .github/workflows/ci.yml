@@ -45,14 +45,17 @@ jobs:
           uv run --no-project --with ruff ruff check .
           uv run --no-project --with ruff ruff format --check .
 
+      # Every project `uv run` must name the cuda extra: the lock resolves
+      # forked dependency sets, and a bare `uv run` re-syncs to the base fork
+      # (huggingface-hub 1.x instead of the 0.x the model stack pins).
       - name: Type check
-        run: uv run pyright
+        run: uv run --extra cuda pyright
 
       # The oracle execution record also pins the ambient environment: locale
       # C.UTF-8, TZ and PYTHONHASHSEED unset. Conform here rather than in the
       # tests — the pin is the gate's contract, not an accident.
       - name: Test
-        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run pytest tests/ -q
+        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run --extra cuda pytest tests/ -q
 
   # The segmentation ruler measures output *quality* against the recorded
   # baseline (calibration/segmentation/baseline.json). Three gates are
