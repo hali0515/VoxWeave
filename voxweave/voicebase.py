@@ -15,7 +15,7 @@ import math
 import os
 import re
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -591,15 +591,6 @@ def script_json(value: object) -> str:
     except (TypeError, ValueError) as exc:
         raise Phase2DataError(f"script value cannot be encoded as JSON: {exc}") from exc
     return encoded.replace("</", "<\\/")
-
-
-def bounded_delete(path: Path, *, missing_ok: bool = True) -> None:
-    """Small explicit helper used by regenerable phase-2 artifact modules."""
-    Path(path).unlink(missing_ok=missing_ok)
-
-
-# Kept as a named type for injection points which mint ids in higher layers.
-IdFactory = Callable[[], str]
 
 
 __all__ = [

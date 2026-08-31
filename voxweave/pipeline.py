@@ -735,18 +735,6 @@ def _load_sibling_json_bytes(
     return data
 
 
-def _load_sibling_json(json_path: Path, *, require: str | None = None) -> dict:
-    """Load a sibling ``.json`` with readable failures: a corrupt file or a
-    missing required key names the file and points at regeneration instead of
-    surfacing a bare JSONDecodeError/KeyError deep in the stack."""
-    json_path = Path(json_path)
-    return _load_sibling_json_bytes(
-        json_path,
-        json_path.read_bytes(),
-        require=require,
-    )
-
-
 def _replay_voiceprint_pair(
     data: Mapping[str, object],
     raw: bytes,
@@ -1545,35 +1533,6 @@ def _sibling_json_data(
     if manifest is not None:
         data["segmentation"] = dict(manifest)
     return data
-
-
-def _encode_sibling_json_bytes(
-    *,
-    language: str,
-    segments: Sequence[Mapping[str, Any]],
-    units: list[dict],
-    vad_speech: list[tuple[float, float]] | None,
-    shot_changes: list[float] | None = None,
-    sing_spans: list[tuple[float, float]] | None = None,
-    speaker_turns: list[tuple[float, float, str]] | None = None,
-    voiceprint_capture: str | None = None,
-    voiceprint_media: str | None = None,
-    manifest: Mapping[str, Any] | None = None,
-) -> bytes:
-    """Encode the final sibling JSON bytes for a staged publication."""
-    data = _sibling_json_data(
-        language=language,
-        segments=segments,
-        units=units,
-        vad_speech=vad_speech,
-        shot_changes=shot_changes,
-        sing_spans=sing_spans,
-        speaker_turns=speaker_turns,
-        voiceprint_capture=voiceprint_capture,
-        voiceprint_media=voiceprint_media,
-        manifest=manifest,
-    )
-    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
 
 
 def _dump_sibling_json(
@@ -4852,93 +4811,6 @@ def _prepare_16k_for_align(
     wav = decode_to_wav(media, audio_filter=af)
     tmp.append(wav)
     return wav
-
-
-def _write_align_json(
-    json_path: Path,
-    blocks: list[dict],
-    spans: list[tuple[float, float]],
-    units: list[dict],
-    lang: str,
-    vad_speech: list[tuple[float, float]] | None = None,
-    shot_changes: list[float] | None = None,
-    sing_spans: list[tuple[float, float]] | None = None,
-    speaker_turns: list[tuple[float, float, str]] | None = None,
-    voiceprint_capture: str | None = None,
-    voiceprint_media: str | None = None,
-    final_voiceprint_check: Callable[[], bool] | None = None,
-    manifest: Mapping[str, Any] | None = None,
-) -> None:
-    """Update the sibling JSON with new alignment timing. Passes vad_speech,
-    shot_changes, sing_spans, and speaker_turns through so split and subsequent
-    align runs can reuse them without recomputing. Lyric flags survive on the
-    re-timed segments.
-
-    ``manifest`` is likewise a pass-through: align re-times an existing cue
-    stream and never re-segments, so it preserves whatever segmentation manifest
-    the document already carried and invents none when there is none.
-
-    A stored ``segmentation`` value that is not a mapping (hand-edited file, or a
-    shape from some future writer) is treated as ABSENT on the way in -- the
-    align call site passes ``None`` -- and therefore does not survive the
-    rewrite. That is deliberate and matches the read side:
-    :func:`resolve_segmentation_manifest` also treats a non-mapping value as
-    absent, so read and write agree that "not a mapping" means "no manifest".
-    Preserving one verbatim is impossible anyway, since :func:`_dump_sibling_json`
-    copies the manifest with ``dict()``.
-    """
-    segments = [
-        {"text": b["text"], "start": a, "end": e}
-        | ({"lyric": True} if b.get("lyric") else {})
-        for b, (a, e) in zip(blocks, spans)
-    ]
-    _dump_sibling_json(
-        json_path,
-        language=lang,
-        segments=segments,
-        units=units,
-        vad_speech=vad_speech,
-        shot_changes=shot_changes,
-        sing_spans=sing_spans,
-        speaker_turns=speaker_turns,
-        voiceprint_capture=voiceprint_capture,
-        voiceprint_media=voiceprint_media,
-        final_voiceprint_check=final_voiceprint_check,
-        manifest=manifest,
-    )
-
-
-def _encode_align_json_bytes(
-    blocks: list[dict],
-    spans: list[tuple[float, float]],
-    units: list[dict],
-    lang: str,
-    vad_speech: list[tuple[float, float]] | None = None,
-    shot_changes: list[float] | None = None,
-    sing_spans: list[tuple[float, float]] | None = None,
-    speaker_turns: list[tuple[float, float, str]] | None = None,
-    voiceprint_capture: str | None = None,
-    voiceprint_media: str | None = None,
-    manifest: Mapping[str, Any] | None = None,
-) -> bytes:
-    """Encode align's final main JSON candidate without publishing it."""
-    segments = [
-        {"text": block["text"], "start": start, "end": end}
-        | ({"lyric": True} if block.get("lyric") else {})
-        for block, (start, end) in zip(blocks, spans)
-    ]
-    return _encode_sibling_json_bytes(
-        language=lang,
-        segments=segments,
-        units=units,
-        vad_speech=vad_speech,
-        shot_changes=shot_changes,
-        sing_spans=sing_spans,
-        speaker_turns=speaker_turns,
-        voiceprint_capture=voiceprint_capture,
-        voiceprint_media=voiceprint_media,
-        manifest=manifest,
-    )
 
 
 @dataclass(frozen=True)

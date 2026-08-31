@@ -208,15 +208,6 @@ def decode_subtitle_bytes(data: bytes, name: str) -> str:
     )
 
 
-def read_subtitle_text(path: Path) -> str:
-    """Read a subtitle file tolerating the encodings found in the wild: any BOM
-    (UTF-8/16/32) decides outright, then strict UTF-8, then the fallback chain
-    (logged, since the guess can be wrong). Raises RuntimeError with a
-    convert-to-UTF-8 hint when nothing decodes."""
-    p = Path(path)
-    return decode_subtitle_bytes(p.read_bytes(), p.name)
-
-
 def sniff_format(text: str) -> str | None:
     """Guess the parser family from the first non-empty line: ``"vtt"`` for a
     WEBVTT header, ``"ass"`` for an ASS/SSA section header ([Script Info],
