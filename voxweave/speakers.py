@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from voxweave import artifacts, fsio
+from voxweave.chunking import FFMPEG_TIMEOUT
 from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
+from voxweave.songdet import subtract_spans
 from voxweave.voicebase import (
     VOICES_STORE_MAX_BYTES,
     VOICEPRINTS_MAX_BYTES,
@@ -76,7 +78,6 @@ MIN_SNIPPET_S = 2.0
 MAX_SNIPPET_S = 6.0
 MAX_SNIPPETS_PER_SPEAKER = 3
 MIN_SNIPPET_GAP_S = 1.0
-FFMPEG_TIMEOUT = float(os.environ.get("VOXWEAVE_FFMPEG_TIMEOUT", "3600"))
 
 Span = tuple[float, float]
 Turn = tuple[float, float, str]
@@ -289,24 +290,12 @@ def _intersect_spans(left: Sequence[Span], right: Sequence[Span]) -> list[Span]:
 
 
 def _subtract_spans(source: Sequence[Span], removed: Sequence[Span]) -> list[Span]:
-    """Subtract the union of ``removed`` from the union of ``source``."""
-    cuts = _merge_spans(removed)
-    out: list[Span] = []
-    for start, end in _merge_spans(source):
-        cursor = start
-        for cut_start, cut_end in cuts:
-            if cut_end <= cursor:
-                continue
-            if cut_start >= end:
-                break
-            if cut_start > cursor:
-                out.append((cursor, min(cut_start, end)))
-            cursor = max(cursor, cut_end)
-            if cursor >= end:
-                break
-        if cursor < end:
-            out.append((cursor, end))
-    return out
+    """Subtract the union of ``removed`` from the union of ``source``.
+
+    songdet.subtract_spans owns the sweep and requires both operands already
+    sorted and disjoint, so normalize each side through _merge_spans first.
+    """
+    return subtract_spans(_merge_spans(source), _merge_spans(removed))
 
 
 def _window(span: Span, target: float | None = None) -> Span:

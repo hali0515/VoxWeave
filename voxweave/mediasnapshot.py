@@ -308,11 +308,9 @@ class MediaSnapshot:
         source: Path,
         *,
         cache_root: Path | None = None,
-        janitor_age_seconds: float = SNAPSHOT_MAX_AGE_SECONDS,
     ) -> None:
         self.source = Path(source)
         self.cache_root = None if cache_root is None else Path(cache_root)
-        self.janitor_age_seconds = janitor_age_seconds
         self._snapshot_path: Path | None = None
         self._snapshot_fd: int | None = None
         self._fingerprint: str | None = None
@@ -347,7 +345,7 @@ class MediaSnapshot:
         directory = _ensure_snapshot_directory(self.cache_root)
         cleanup_stale_snapshots(
             directory,
-            max_age_seconds=self.janitor_age_seconds,
+            max_age_seconds=SNAPSHOT_MAX_AGE_SECONDS,
         )
         source_fd: int | None = None
         try:

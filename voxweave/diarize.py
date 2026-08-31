@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Iterator, cast
 import yaml
 
 from voxweave import config
+from voxweave.backend import _sha256_file
 from voxweave.core.schema import Cue
 from voxweave.voicebase import MAX_EMBEDDING_DIM, MIN_EMBEDDING_DIM
 
@@ -137,14 +138,6 @@ _EMBEDDING_MODEL_ATTR = "_voxweave_embedding_model"
 _OUTER_CONFIG_ATTR = "_voxweave_outer_config_sha256"
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _split_model_revision(model: str) -> tuple[str, str | None]:
     """Split Hugging Face ``repo@revision`` without rewriting local paths."""
     if Path(model).exists() or "@" not in model:
@@ -237,11 +230,13 @@ def _outer_config_identity(
 def _embedding_load_authority(
     raw_path: object,
     *,
-    parent_model: str | None = None,
-    parent_revision: str | None = None,
     token: str | None = None,
 ) -> _EmbeddingLoadAuthority | None:
-    """Bind one local or Hub embedding checkpoint before construction."""
+    """Bind one local or Hub embedding checkpoint before construction.
+
+    ``$model/...`` references never reach here: the only caller expands every one
+    of them into its mapping form via :func:`_expand_model_references` first.
+    """
     original_mapping = dict(raw_path) if isinstance(raw_path, Mapping) else None
     checkpoint: object = raw_path
     revision: object = None
@@ -250,10 +245,6 @@ def _embedding_load_authority(
         checkpoint = raw_path.get("checkpoint")
         revision = raw_path.get("revision")
         subfolder = raw_path.get("subfolder")
-    elif isinstance(raw_path, str) and raw_path.startswith("$model/"):
-        checkpoint = parent_model
-        revision = parent_revision
-        subfolder = raw_path.removeprefix("$model/")
 
     if not isinstance(checkpoint, (str, os.PathLike)):
         return None
@@ -480,8 +471,6 @@ def _prepare_pipeline_load(
         if isinstance(params, dict):
             authority = _embedding_load_authority(
                 params.get("embedding"),
-                parent_model=reference_model,
-                parent_revision=pinned_revision,
                 token=token,
             )
             if authority is not None:

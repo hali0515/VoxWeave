@@ -17,6 +17,11 @@ from typing import Any, overload
 import numpy as np
 
 from voxweave import config, runtime
+from voxweave.diarize import (
+    COMMUNITY_DIARIZE_MODEL,
+    _snapshot_commit,
+)
+from voxweave.diarize import _canonical_embedding_source as _canonical_source
 from voxweave.voicebase import MAX_EMBEDDING_DIM, MIN_EMBEDDING_DIM
 
 EMBEDDING_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
@@ -115,12 +120,12 @@ _inference_lock = threading.RLock()
 
 
 def _canonical_embedding_source(authority: _EmbeddingAuthority) -> str:
-    source = authority.checkpoint
-    if authority.revision is not None:
-        source = f"{source}@{authority.revision}"
-    if authority.subfolder is not None:
-        source = f"{source}#subfolder={authority.subfolder}"
-    return source
+    """Dataclass-shaped view of the shared ``checkpoint[@rev][#subfolder=]`` grammar."""
+    return _canonical_source(
+        authority.checkpoint,
+        revision=authority.revision,
+        subfolder=authority.subfolder,
+    )
 
 
 def _parse_embedding_source(source: str) -> _EmbeddingAuthority:
@@ -204,40 +209,16 @@ def _download_checkpoint(
     return Path(checkpoint)
 
 
-def _snapshot_commit(
-    cached_path: Path,
-    authority: _EmbeddingAuthority,
-) -> str | None:
-    """Extract a commit only from this model's validated HF snapshot path."""
-    absolute = cached_path.absolute()
-    expected_relative = Path(authority.subfolder or "") / EMBEDDING_CHECKPOINT_FILE
-    for snapshot in absolute.parents:
-        if snapshot.parent.name != "snapshots":
-            continue
-        repo_cache = snapshot.parent.parent
-        expected_repo_cache = f"models--{authority.checkpoint.replace('/', '--')}"
-        if repo_cache.name != expected_repo_cache:
-            return None
-        try:
-            relative = absolute.relative_to(snapshot)
-        except ValueError:
-            return None
-        if relative != expected_relative:
-            return None
-        commit = snapshot.name
-        if len(commit) != 40 or any(
-            character not in "0123456789abcdef" for character in commit
-        ):
-            return None
-        return commit
-    return None
-
-
 def _embedding_source(
     authority: _EmbeddingAuthority,
     cached_path: Path,
 ) -> str:
-    commit = _snapshot_commit(cached_path, authority)
+    commit = _snapshot_commit(
+        cached_path,
+        authority.checkpoint,
+        filename=EMBEDDING_CHECKPOINT_FILE,
+        subfolder=authority.subfolder,
+    )
     if commit is None:
         return _canonical_embedding_source(authority)
     return _canonical_embedding_source(
@@ -316,11 +297,7 @@ def _load_inference(
     if (
         not token
         and not Path(authority.checkpoint).expanduser().exists()
-        and authority.checkpoint
-        in {
-            EMBEDDING_MODEL,
-            "pyannote/speaker-diarization-community-1",
-        }
+        and authority.checkpoint in {EMBEDDING_MODEL, COMMUNITY_DIARIZE_MODEL}
     ):
         raise TurnEmbeddingError(
             "speaker splitting needs the Hugging Face token used for diarization; "

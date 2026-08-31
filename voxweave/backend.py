@@ -730,7 +730,7 @@ def _fuse_chunk(
     # Spaced langs: strip whisper's sparse punctuation and use Qwen's (word-level transplant is stable).
     # No-space langs: keep whisper's own punctuation (char-level time transplant drifts; see fuse_punct_into_text).
     fused = fuse_punct_into_text(
-        text_w, units_w, qwen_punct, strip_existing=iso not in NO_SPACE_LANGS
+        text_w, qwen_punct, strip_existing=iso not in NO_SPACE_LANGS
     )
     return det_w or det_q, fused, units_w
 
@@ -754,14 +754,13 @@ def _transcribe_fusion(
     return _fuse_chunk(w_res, q_res, language)
 
 
-def chunk_pass_count(asr_model: str | None, strategy: str = "peak") -> int:
+def chunk_pass_count(asr_model: str | None) -> int:
     """Passes per chunk for transcribe_chunks: fusion=3, others=2.
 
     The pass structure is identical for both load strategies; "sum" merely keeps the
     singletons resident between passes (peak VRAM = sum of models) instead of releasing
-    them (peak = max). The strategy parameter is kept for call-site compatibility.
+    them (peak = max), so the count never depends on the load strategy.
     """
-    del strategy
     return 3 if _select_engine(asr_model)[0] == "fusion" else 2
 
 

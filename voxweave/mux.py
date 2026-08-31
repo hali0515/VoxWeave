@@ -142,44 +142,14 @@ def track_title(iso: str | None) -> str:
     return f"VoxWeave {lang.display_name(iso)}" if iso else "VoxWeave"
 
 
-def _find_sibling_media(ref: Path) -> Path | None:
-    """Find the source media next to ``ref`` by known extension (case-insensitive).
-
-    Extension matching is case-insensitive so "ep.MP4" is found for "ep.vtt".
-    When several candidates exist the first in MEDIA_EXTS order wins and the
-    ambiguity is logged (mirrors pipeline._find_sibling_media).
-    """
-    from voxweave.pipeline import MEDIA_EXTS, swap_ext
-
-    ref = Path(ref)
-    try:
-        siblings = {p.name.lower(): p for p in ref.parent.iterdir() if p.is_file()}
-    except OSError:
-        return None
-    matches: list[Path] = []
-    for ext in MEDIA_EXTS:
-        hit = siblings.get(swap_ext(ref, ext).name.lower())
-        if hit is not None:
-            matches.append(hit)
-    if not matches:
-        return None
-    if len(matches) > 1:
-        logger.warning(
-            "multiple sibling media files for %s (%s); using %s",
-            ref.name,
-            ", ".join(m.name for m in matches),
-            matches[0].name,
-        )
-    return matches[0]
-
-
 def resolve_media(vtt: Path, media: Path | None) -> Path:
     """Return the explicit media path, or find the sibling media next to the VTT.
 
     Translated VTTs carry a language tag ("X.zh.vtt") while the media is named
     "X.<ext>", so the lookup also retries with the language token stripped.
+    Sibling lookup itself is pipeline's, the one shared implementation.
     """
-    from voxweave.pipeline import swap_ext
+    from voxweave.pipeline import _find_sibling_media, swap_ext
 
     if media is not None:
         return Path(media)

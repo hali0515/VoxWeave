@@ -189,7 +189,6 @@ _FUSE_PUNCT = set("。、！？，,.!?")
 
 def fuse_punct_into_text(
     text: str,
-    units: list[dict],
     punct_units: list[dict],
     strip_existing: bool = True,
 ) -> str:
@@ -212,8 +211,7 @@ def fuse_punct_into_text(
     large-v3 ja punctuation is reasonable; both coexist after content alignment).
 
     ``punct_units`` must carry Qwen content chars + punctuation (output of
-    :func:`reinject_punct`) so punctuation has content anchors. ``units`` is kept for API
-    compatibility only. Pure function.
+    :func:`reinject_punct`) so punctuation has content anchors. Pure function.
     """
     # Extract Qwen content-char stream + punctuation events.
     # event (idx, char): insert after the idx-th content char; idx==0 = sentence-initial.

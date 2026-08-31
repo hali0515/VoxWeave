@@ -15,7 +15,7 @@ import math
 import os
 import re
 import secrets
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -266,6 +266,15 @@ def load_json_object(
         max_bytes=max_bytes,
         source=source.name,
     )
+
+
+def canonical_path(path: Path) -> Path:
+    """Resolve a target to its realpath so sibling lock/companion keys are stable.
+
+    Every phase-2 store derives its ``.lock``/``.meta.json`` companions from this
+    one normalization, so two aliases of the same file always take the same lock.
+    """
+    return Path(os.path.realpath(os.fspath(Path(path))))
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -593,15 +602,6 @@ def script_json(value: object) -> str:
     return encoded.replace("</", "<\\/")
 
 
-def bounded_delete(path: Path, *, missing_ok: bool = True) -> None:
-    """Small explicit helper used by regenerable phase-2 artifact modules."""
-    Path(path).unlink(missing_ok=missing_ok)
-
-
-# Kept as a named type for injection points which mint ids in higher layers.
-IdFactory = Callable[[], str]
-
-
 __all__ = [
     "CACHE_COMPANION_MAX_BYTES",
     "CAPTURE_ID_RE",
@@ -618,6 +618,7 @@ __all__ = [
     "ValidatedVoiceprints",
     "canonical_json_bytes",
     "canonical_json_digest",
+    "canonical_path",
     "canonical_turns_bytes",
     "canonical_turns_digest",
     "encode_json_bytes",

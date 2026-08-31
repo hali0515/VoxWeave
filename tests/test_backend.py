@@ -1149,11 +1149,9 @@ def test_transcribe_chunks_default_strategy_is_peak(monkeypatch, tmp_path):
 
 
 def test_chunk_pass_count():
-    # pass structure no longer depends on strategy (sum only skips releases between passes)
-    assert backend.chunk_pass_count("qwen3-asr-1.7b", "peak") == 2
-    assert backend.chunk_pass_count("fusion", "peak") == 3
-    assert backend.chunk_pass_count("qwen3-asr-1.7b", "sum") == 2
-    assert backend.chunk_pass_count("fusion", "sum") == 3
+    # pass structure never depended on strategy (sum only skips releases between passes)
+    assert backend.chunk_pass_count("qwen3-asr-1.7b") == 2
+    assert backend.chunk_pass_count("fusion") == 3
 
 
 def test_get_whisper_missing_dep_raises_friendly(monkeypatch):

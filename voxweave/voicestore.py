@@ -18,6 +18,7 @@ from voxweave.voicebase import (
     VOICES_STORE_MAX_BYTES,
     Phase2DataError,
     canonical_json_digest,
+    canonical_path,
     load_json_object,
     require_capture_id,
     require_exact_int,
@@ -274,7 +275,8 @@ def load_voice_store(path: Path) -> tuple[dict[str, object], ValidatedVoiceStore
 
 
 def canonical_store_path(path: Path) -> Path:
-    return Path(os.path.realpath(os.fspath(Path(path))))
+    """Store-side name for voicebase's shared realpath normalization."""
+    return canonical_path(path)
 
 
 def store_lock_path(path: Path) -> Path:

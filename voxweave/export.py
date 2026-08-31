@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from voxweave import fsio
-from voxweave.realign import render_cues
+from voxweave.realign import fmt_ts, render_cues
 from voxweave.speakers import (
     sanitize_ass_speaker_name,
     speaker_layout,
@@ -75,12 +75,13 @@ _OTHER_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
 
 
 def _srt_ts(seconds: float) -> str:
-    """Seconds -> SRT timestamp ``HH:MM:SS,mmm``."""
-    ms = round(max(0.0, seconds) * 1000)
-    h, rem = divmod(ms, 3_600_000)
-    m, rem = divmod(rem, 60_000)
-    s, ms = divmod(rem, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+    """Seconds -> SRT timestamp ``HH:MM:SS,mmm``.
+
+    Identical to the VTT timestamp (including its round-to-whole-milliseconds
+    fix) apart from the fractional separator, so reuse realign.fmt_ts instead of
+    carrying a second copy of the divmod chain.
+    """
+    return fmt_ts(seconds).replace(".", ",", 1)
 
 
 def _ass_ts(seconds: float) -> str:

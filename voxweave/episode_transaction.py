@@ -127,8 +127,6 @@ class EvidencePublication:
 @dataclass(frozen=True)
 class TransactionReceipt:
     landed: tuple[Path, ...]
-    auxiliary_landed: tuple[Path, ...] = ()
-    leftovers: tuple[Path, ...] = ()
     machine_landed: tuple[Path, ...] = ()
 
 
@@ -555,24 +553,6 @@ def _check_primary_generations(
             raise _stale(command, detail)
 
 
-def require_primary_generations(
-    *,
-    command: TransactionCommand,
-    json_path: Path,
-    vtt_path: Path,
-    expected_json: FileGeneration,
-    expected_vtt: FileGeneration | None,
-) -> None:
-    """Run the generation check inside a lock owned by an existing writer."""
-    _check_primary_generations(
-        command=command,
-        json_path=Path(json_path),
-        vtt_path=Path(vtt_path),
-        expected_json=expected_json,
-        expected_vtt=expected_vtt,
-    )
-
-
 def require_media_generation(path: Path, expected_fingerprint: str) -> None:
     try:
         observed = media_fingerprint(Path(path))
@@ -909,7 +889,6 @@ __all__ = [
     "commit_primary_outputs",
     "release_split_speaker_mapping_generation",
     "require_media_generation",
-    "require_primary_generations",
     "same_file_generation",
     "same_speaker_mapping_generation",
     "observe_speaker_mapping_generation",
