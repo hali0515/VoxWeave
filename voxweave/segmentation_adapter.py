@@ -497,11 +497,10 @@ def run_locked_segmentation_adapter(
     issued: IssuedLegacySegmentation,
     *,
     shadow_enabled: bool,
-    semantic_selector_enabled: bool,
 ) -> SegmentationAdapterResult:
     """Consume one adapter role and produce immutable legacy/v2 delivery status."""
-    if type(shadow_enabled) is not bool or type(semantic_selector_enabled) is not bool:
-        raise TypeError("segmentation adapter switches must be exact bools")
+    if type(shadow_enabled) is not bool:
+        raise TypeError("segmentation adapter switch must be an exact bool")
     record = _legacy_record(context, issued)
     consume_context_role(
         context,
@@ -511,15 +510,6 @@ def run_locked_segmentation_adapter(
     boundary: SegmentationDelivery | None = None
     if not shadow_enabled:
         status = V2Status("not-requested", None)
-    elif semantic_selector_enabled:
-        status = V2Status(
-            "invalid",
-            CanonicalFailure(
-                "segmentation-v2-invalid",
-                "segmentation-adapter",
-                "semantic-selector-unmodelled",
-            ),
-        )
     else:
         try:
             boundary = _build_boundary_delivery(record)

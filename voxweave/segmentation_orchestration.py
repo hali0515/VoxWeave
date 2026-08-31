@@ -219,7 +219,6 @@ def build_segmentation_selection(
     mapping_generation: SpeakerMappingGeneration | None,
     mapping_path: Path | None,
     shadow_enabled: bool,
-    semantic_selector_enabled: bool,
 ) -> SegmentationSelection:
     """Run adapter, one composite encode, selection, and independent projection."""
     if command == "process" and source_mode is None:
@@ -236,7 +235,6 @@ def build_segmentation_selection(
             ),
             "speaker_mapping": _mapping_value(mapping_generation),
             "timestamps": timestamps,
-            "semantic_selector_enabled": semantic_selector_enabled,
             "speaker_turns": {
                 "present": speaker_turns.present,
                 "digest": (
@@ -305,7 +303,6 @@ def build_segmentation_selection(
             context,
             issued,
             shadow_enabled=shadow_enabled,
-            semantic_selector_enabled=semantic_selector_enabled,
         )
         candidates = segmentation_candidates.encode_segmentation_candidates(
             context, result

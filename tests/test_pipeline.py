@@ -429,14 +429,3 @@ def test_find_sibling_media_multiple_candidates_warns_and_is_deterministic(
         found = pipeline._find_sibling_media(vtt)
     assert found == mkv
     assert any("multiple" in r.getMessage().lower() for r in caplog.records)
-
-
-def test_semantic_engine_cleanup_is_best_effort(caplog):
-    class Engine:
-        @staticmethod
-        def release():
-            raise RuntimeError("worker cleanup failed")
-
-    with caplog.at_level(logging.WARNING, logger="voxweave"):
-        pipeline._release_semantic_engine(Engine())
-    assert any("cleanup" in record.getMessage() for record in caplog.records)

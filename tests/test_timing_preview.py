@@ -29,7 +29,7 @@ from voxweave.core.timing_preview import (
 
 PREVIEW = LegacyCleanupPreview()
 
-# The evidence-map probe profile (semantic-salvage.md 7.3).
+# The evidence-map probe profile used by cleanup-preview calibration.
 PROFILE = {"min_cue_s": 0.5, "max_cue_s": 7.0, "cps": 17.0, "lag_out_s": 0.25}
 
 

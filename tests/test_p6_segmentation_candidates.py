@@ -153,9 +153,7 @@ def _issued(tmp_path, *, timestamps=True):
     return context, issued
 
 
-def _result(
-    tmp_path, *, shadow_enabled=False, semantic_selector_enabled=False, timestamps=True
-):
+def _result(tmp_path, *, shadow_enabled=False, timestamps=True):
     from voxweave.segmentation_adapter import run_locked_segmentation_adapter
 
     context, issued = _issued(tmp_path, timestamps=timestamps)
@@ -163,7 +161,6 @@ def _result(
         context,
         issued,
         shadow_enabled=shadow_enabled,
-        semantic_selector_enabled=semantic_selector_enabled,
     )
     return context, result
 
@@ -264,37 +261,6 @@ def test_shadow_builds_real_p5_boundary_delivery_without_selecting_it(tmp_path):
     assert selected.engine_family == "legacy-v1"
 
 
-def test_rat6_semantic_mode_is_typed_nonselected_failure_with_no_fallback(tmp_path):
-    from voxweave.candidate_encoder import CandidateFailure, SelectedCandidateError
-    from voxweave.segmentation_candidates import (
-        _issue_simulated_boundary_row,
-        encode_segmentation_candidates,
-        select_qualified_segmentation_candidate,
-        select_segmentation_candidate,
-    )
-
-    context, result = _result(
-        tmp_path,
-        shadow_enabled=True,
-        semantic_selector_enabled=True,
-    )
-    assert result.v2_status.kind == "invalid"
-    assert result.v2_status.failure is not None
-    assert result.v2_status.failure.detail_code == "semantic-selector-unmodelled"
-    candidates = encode_segmentation_candidates(context, result)
-    boundary = candidates.outcome_for("boundary-v2")
-    assert isinstance(boundary, CandidateFailure)
-    assert (
-        select_segmentation_candidate(context, candidates).engine_family == "legacy-v1"
-    )
-    qualification = _issue_simulated_boundary_row("rat6-no-fallback")
-    with pytest.raises(SelectedCandidateError) as error:
-        select_qualified_segmentation_candidate(
-            context, candidates, qualification=qualification
-        )
-    assert error.value.failure.detail_code == "selected-candidate-missing"
-
-
 def test_simulated_row_qualification_selects_and_verifies_real_boundary_bytes(tmp_path):
     from voxweave.engine_registry import LANGUAGE_ENGINE_FAMILY
     from voxweave.segmentation_candidates import (
@@ -378,7 +344,6 @@ def test_changed_segmentation_context_registry_family_is_rejected(tmp_path):
             context,
             issued,
             shadow_enabled=False,
-            semantic_selector_enabled=False,
         )
     assert error.value.detail_code == "context-binding"
 
@@ -396,7 +361,6 @@ def test_changed_legacy_provider_ledger_is_rejected_before_adapter_consumption(
             context,
             issued,
             shadow_enabled=False,
-            semantic_selector_enabled=False,
         )
     assert role_vector(context) == ("L", "L", "L")
 
