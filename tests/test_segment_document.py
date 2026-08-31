@@ -280,7 +280,6 @@ def test_absent_optional_context_is_reported_as_empty():
     assert result.diagnostics["speaker_turn_count"] == 0
     assert result.diagnostics["speaker_formatted"] is False
     assert result.diagnostics["shot_resnapped"] is False
-    assert result.diagnostics["semantic_engine"] is False
     assert result.diagnostics["cue_count"] == len(result.cues)
     assert result.diagnostics["unit_count"] == len(result.units)
 

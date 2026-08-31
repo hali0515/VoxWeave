@@ -767,36 +767,6 @@ def test_process_selected_candidate_enters_context_bound_transaction(
     assert seen["vtt_bytes"] == out.read_bytes()
 
 
-def test_process_semantic_configuration_precedes_voiceprint_snapshot(
-    tmp_path, monkeypatch
-):
-    media = tmp_path / "episode.mkv"
-    media.write_bytes(b"media")
-    events: list[str] = []
-
-    def fail_semantic(_enabled):
-        events.append("semantic-config")
-        raise RuntimeError("semantic endpoint unavailable")
-
-    class ForbiddenSnapshot:
-        def __init__(self, _path):
-            events.append("media-snapshot")
-            raise AssertionError("snapshot ran before semantic configuration")
-
-    monkeypatch.setattr(pipeline, "_make_semantic_engine", fail_semantic)
-    monkeypatch.setattr(pipeline, "MediaSnapshot", ForbiddenSnapshot)
-
-    with pytest.raises(RuntimeError, match="semantic endpoint unavailable"):
-        pipeline.process(
-            media,
-            diarize=True,
-            voiceprints=True,
-            semantic_split=True,
-        )
-
-    assert events == ["semantic-config"]
-
-
 def test_process_output_snapshot_precedes_voiceprint_media_snapshot(
     tmp_path, monkeypatch
 ):

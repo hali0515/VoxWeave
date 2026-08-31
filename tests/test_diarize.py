@@ -240,13 +240,12 @@ def test_trailing_dropped_punctuation_entry_stays_in_the_last_piece():
 
 
 def test_char_level_word_data_against_rendered_text_survives_split():
-    """The ``--semantic-split`` shape: char-level entries against a rendered text.
+    """Char-level entries remain aligned against normalized rendered text.
 
-    ``_semantic_materialize`` keeps the raw per-character units, so the formatter
-    sees a stripped comma entry next to a ``3.75`` the text still shows. The
-    stripping rule is context-sensitive, so the stream has to be normalized
-    joined -- read entry by entry, the ``.`` looks like a sentence period and
-    every atom after it collects the wrong span.
+    The formatter sees a stripped comma entry next to a ``3.75`` the text still
+    shows. The stripping rule is context-sensitive, so the stream has to be
+    normalized joined -- read entry by entry, the ``.`` looks like a sentence
+    period and every atom after it collects the wrong span.
     """
     source = "这个,价格是3.75元"
     cue = {

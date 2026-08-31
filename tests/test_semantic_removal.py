@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
-from voxweave import config, semantic_breaks
+from voxweave import config, pipeline
 from voxweave.cli import cli, cmd_transcribe
+from voxweave.core.smart_split import smart_split_segments
 
 
 def _option_names(command) -> set[str]:
@@ -22,10 +24,21 @@ def _option_names(command) -> set[str]:
 
 def test_bundled_worker_module_and_lock_remain_absent():
     assert importlib.util.find_spec("voxweave.semantic_worker") is None
-    package_dir = Path(semantic_breaks.__file__).parent
+    assert importlib.util.find_spec("voxweave.semantic_breaks") is None
+    package_dir = Path(config.__file__).parent
     assert not (package_dir / "semantic_worker.py").exists()
     assert not (package_dir / "semantic_worker.py.lock").exists()
-    assert not hasattr(semantic_breaks, "LocalTransformersSelector")
+
+
+def test_internal_pipeline_exposes_no_retired_selector_parameters():
+    retired = {"semantic_split", "semantic_model", "semantic_engine"}
+    for function in (
+        pipeline.process,
+        pipeline.split,
+        pipeline.segment_document,
+        smart_split_segments,
+    ):
+        assert retired.isdisjoint(inspect.signature(function).parameters)
 
 
 @pytest.mark.parametrize(

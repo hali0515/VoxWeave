@@ -299,16 +299,6 @@ def _attach_vtt_decode_failure(exc: BaseException) -> None:
     )
 
 
-def _attach_semantic_configuration_failure(exc: BaseException) -> None:
-    if type(exc).__name__ == "SemanticBackendUnavailable":
-        _attach_canonical_failure(
-            exc,
-            kind="semantic-backend-unavailable",
-            phase="semantic-config",
-            detail_code="endpoint-not-configured",
-        )
-
-
 def _panns_release_failure() -> CanonicalFailure:
     return CanonicalFailure("model-release-failed", "dispose", "panns-release")
 
@@ -354,17 +344,6 @@ def _append_panns_release_secondary(
         setattr(primary, "panns_release_exception", release)
     except Exception:
         pass
-
-
-def _release_semantic_engine(engine: Any | None) -> None:
-    """Best-effort optional-model cleanup; never replace deterministic output."""
-
-    if engine is None:
-        return
-    try:
-        engine.release()
-    except Exception as exc:  # noqa: BLE001 - cleanup must not overturn baseline cues
-        log.warning("semantic splitter cleanup failed: %s", exc)
 
 
 def _select_transcript_language(
@@ -3579,8 +3558,6 @@ def segment_document(
     sing_spans: Sequence[tuple[float, float]] | None = (),
     speaker_turns: Sequence[tuple[float, float, str]] | None = (),
     thresholds: Mapping[str, Any] | None = None,
-    semantic_engine: Any | None = None,
-    semantic_model: str | None = None,
     smart_split_kwargs: Mapping[str, Any] | None = None,
     annotate_speakers: bool = False,
 ) -> SegmentationResult:
@@ -3612,9 +3589,7 @@ def segment_document(
     the cue stream, the units and the persisted manifest are byte-identical to a
     run with the flag off.
 
-    No filesystem writes, no model loads, no ASR: an already-constructed
-    ``semantic_engine`` may be passed in (its owner creates and releases it), but
-    nothing here downloads or instantiates one. Every input sequence is copied
+    No filesystem writes, no model loads, no ASR. Every input sequence is copied
     before use, so callers can reuse their own lists afterwards.
 
     ``vad_speech`` distinguishes absent (``None``/empty -> single-gap-threshold
@@ -3735,8 +3710,6 @@ def segment_document(
             speech_spans=speech_spans,
             thresholds=effective,
             shot_changes=cuts,
-            semantic_engine=semantic_engine,
-            semantic_model=semantic_model,
             **extra,
         )
         # Immediately after the v1 answer and before any overlay: the shadow
@@ -3783,7 +3756,6 @@ def segment_document(
         "shot_change_count": len(cuts or ()),
         "sing_span_count": len(sings or ()),
         "speaker_turn_count": len(turns or ()),
-        "semantic_engine": semantic_engine is not None,
         "split_cue_count": split_cue_count,
         "lyric_cue_count": sum(1 for c in cues if c.get("lyric")),
         "speaker_formatted": bool(turns),
@@ -3801,23 +3773,6 @@ def segment_document(
         document=document,
         shadow=shadow,
     )
-
-
-def _make_semantic_engine(enabled: bool) -> Any | None:
-    """Build the optional semantic break engine, or ``None`` when it is off.
-
-    Construction only resolves the configured backend; no model is loaded and no
-    request is sent.  A missing backend is therefore a configuration error, not a
-    runtime degradation, and is raised to the caller so ``--semantic-split``
-    fails before any model or audio work instead of after a full transcription.
-    The caller owns creation and release (``_release_semantic_engine``); the
-    deterministic layout stays the source of truth either way.
-    """
-    if not enabled:
-        return None
-    from voxweave.semantic_breaks import SemanticBreakEngine
-
-    return SemanticBreakEngine()
 
 
 def _reconcile_word_segment_language(
@@ -4092,8 +4047,6 @@ def process(
     shot_snap: bool = True,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
-    semantic_split: bool = False,
-    semantic_model: str | None = None,
     diarize_model: str | None = None,
 ) -> Path:
     """Full pipeline: transcribe -> smart_split -> write siblings. Return the .vtt path.
@@ -4106,18 +4059,9 @@ def process(
     non-speech event tags merged into the dialogue (main VTT/JSON untouched).
     ``diarize`` runs pyannote speaker diarization and formats multi-speaker cues
     (dual-speaker hyphens / speaker-boundary splits; turns persist to JSON).
-    ``semantic_split`` optionally lets a small model choose among legal cue
-    boundaries.  The deterministic splitter remains the source of truth and
-    automatic fallback; model output can never replace text or timestamps.
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
-    try:
-        semantic_engine = _make_semantic_engine(semantic_split)
-    except Exception as exc:
-        _attach_semantic_configuration_failure(exc)
-        raise
-    semantic_handed_off = False
     expected_json: episode_transaction.FileGeneration | None = None
     expected_vtt: episode_transaction.FileGeneration | None = None
     expected_media: str | None = None
@@ -4129,11 +4073,9 @@ def process(
         snapshot_fingerprint: str | None,
         capture_enabled: bool,
     ) -> Path:
-        nonlocal semantic_handed_off
         assert expected_json is not None
         assert expected_vtt is not None
         assert source_mode is not None
-        semantic_handed_off = True
         return _process_from_source(
             media_path,
             source_path=source_path,
@@ -4161,80 +4103,72 @@ def process(
             shot_snap=shot_snap,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
-            semantic_engine=semantic_engine,
-            semantic_model=semantic_model,
         )
 
+    if voiceprints and (not diarize or word_segments is not None):
+        raise ValueError("voiceprint capture requires a fresh diarization run")
+    if voiceprints:
+        _log_voiceprint_notice_once()
     try:
-        if voiceprints and (not diarize or word_segments is not None):
-            raise ValueError("voiceprint capture requires a fresh diarization run")
-        if voiceprints:
-            _log_voiceprint_notice_once()
-        try:
-            expected_json = episode_transaction.capture_file_generation(
-                swap_ext(media_path, ".json")
-            )
-        except OSError as exc:
-            _attach_canonical_failure(
-                exc,
-                kind="subtitle-snapshot-failed",
-                phase="snapshot",
-                detail_code="sibling-read",
-            )
-            raise
-        try:
-            expected_vtt = episode_transaction.capture_file_generation(
-                swap_ext(media_path, ".vtt")
-            )
-        except OSError as exc:
-            _attach_canonical_failure(
-                exc,
-                kind="subtitle-snapshot-failed",
-                phase="snapshot",
-                detail_code="vtt-read",
-            )
-            raise
-        source_mode = (
-            "injected-words" if word_segments is not None else "transcribed-media"
+        expected_json = episode_transaction.capture_file_generation(
+            swap_ext(media_path, ".json")
         )
-        if source_mode == "injected-words":
-            expected_media = None
+    except OSError as exc:
+        _attach_canonical_failure(
+            exc,
+            kind="subtitle-snapshot-failed",
+            phase="snapshot",
+            detail_code="sibling-read",
+        )
+        raise
+    try:
+        expected_vtt = episode_transaction.capture_file_generation(
+            swap_ext(media_path, ".vtt")
+        )
+    except OSError as exc:
+        _attach_canonical_failure(
+            exc,
+            kind="subtitle-snapshot-failed",
+            phase="snapshot",
+            detail_code="vtt-read",
+        )
+        raise
+    source_mode = "injected-words" if word_segments is not None else "transcribed-media"
+    if source_mode == "injected-words":
+        expected_media = None
+    else:
+        try:
+            expected_media = media_fingerprint(media_path)
+        except OSError as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="media-identity-invalid",
+                phase="media",
+                detail_code=(
+                    "media-not-found"
+                    if isinstance(exc, FileNotFoundError)
+                    else "media-fingerprint"
+                ),
+            )
+            raise
+    if voiceprints:
+        snapshots = ExitStack()
+        try:
+            snapshot = snapshots.enter_context(MediaSnapshot(media_path))
+        except SnapshotUnavailable as exc:
+            snapshots.close()
+            log.warning(
+                "voiceprint capture unavailable; continuing without capture: %s",
+                exc,
+            )
         else:
-            try:
-                expected_media = media_fingerprint(media_path)
-            except OSError as exc:
-                _attach_canonical_failure(
-                    exc,
-                    kind="media-identity-invalid",
-                    phase="media",
-                    detail_code=(
-                        "media-not-found"
-                        if isinstance(exc, FileNotFoundError)
-                        else "media-fingerprint"
-                    ),
+            with snapshots:
+                return run_with_source(
+                    snapshot.path,
+                    snapshot.fingerprint,
+                    True,
                 )
-                raise
-        if voiceprints:
-            snapshots = ExitStack()
-            try:
-                snapshot = snapshots.enter_context(MediaSnapshot(media_path))
-            except SnapshotUnavailable as exc:
-                snapshots.close()
-                log.warning(
-                    "voiceprint capture unavailable; continuing without capture: %s",
-                    exc,
-                )
-            else:
-                with snapshots:
-                    return run_with_source(
-                        snapshot.path,
-                        snapshot.fingerprint,
-                        True,
-                    )
-        return run_with_source(media_path, None, False)
-    finally:
-        if not semantic_handed_off:
-            _release_semantic_engine(semantic_engine)
+    return run_with_source(media_path, None, False)
 
 
 def _process_from_source(
@@ -4265,12 +4199,9 @@ def _process_from_source(
     shot_snap: bool = True,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
-    semantic_engine: Any | None = None,
-    semantic_model: str | None = None,
 ) -> Path:
     """Execute one process run against the selected immutable/live source."""
     rep = reporter or Reporter()
-    semantic_owned = True
     panns_handoff_owned = False
     vad_speech: list[tuple[float, float]] | None = None
     shot_changes: list[float] | None = None
@@ -4323,12 +4254,9 @@ def _process_from_source(
                 rep.stage("shot detection")
                 shot_changes = shotdet.detect_shot_changes(source_path)
 
-        semantic_owned = False
         publication = _finish_process_from_units(
             media_path,
             rep=rep,
-            semantic_engine=semantic_engine,
-            semantic_model=semantic_model,
             iso=iso,
             units=units,
             vad_speech=vad_speech,
@@ -4345,8 +4273,6 @@ def _process_from_source(
             sdh_enabled=sdh,
         )
     except BaseException as primary:
-        if semantic_owned:
-            _release_semantic_engine(semantic_engine)
         if panns_handoff_owned:
             try:
                 songdet.release_model()
@@ -4370,8 +4296,6 @@ def _finish_process_from_units(
     media_path: Path,
     *,
     rep: Reporter,
-    semantic_engine: Any | None,
-    semantic_model: str | None,
     iso: str,
     units: list[dict],
     vad_speech: list[tuple[float, float]] | None,
@@ -4388,22 +4312,15 @@ def _finish_process_from_units(
     sdh_enabled: bool,
 ) -> _ProcessPublication:
     """Finish segmentation and publication after source ownership is sealed."""
-    rep.stage(
-        "semantic subtitle boundaries" if semantic_engine else "smart_split layout"
+    rep.stage("smart_split layout")
+    segmented = segment_document(
+        language=iso,
+        word_segments=units,
+        vad_speech=vad_speech,
+        shot_changes=shot_changes,
+        sing_spans=sing_spans,
+        speaker_turns=speaker_turns,
     )
-    try:
-        segmented = segment_document(
-            language=iso,
-            word_segments=units,
-            vad_speech=vad_speech,
-            shot_changes=shot_changes,
-            sing_spans=sing_spans,
-            speaker_turns=speaker_turns,
-            semantic_engine=semantic_engine,
-            semantic_model=semantic_model,
-        )
-    finally:
-        _release_semantic_engine(semantic_engine)
     units, cues = segmented.units, segmented.cues
 
     rep.stage("write siblings")
@@ -4460,7 +4377,6 @@ def _finish_process_from_units(
         mapping_generation=None,
         mapping_path=None,
         shadow_enabled=os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1",
-        semantic_selector_enabled=semantic_engine is not None,
     )
     cleanup: list[episode_transaction.ArtifactCleanup] = []
     if machine_artifact is None:
@@ -4592,16 +4508,12 @@ def _write_sdh_sidecar(
 def split(
     json_path: Path,
     timestamps: bool = True,
-    semantic_split: bool = False,
-    semantic_model: str | None = None,
     **smart_split_kwargs,
 ) -> Path:
     """Re-run smart_split from persisted word_segments.
 
     Reuses ``vad_speech`` from the sibling JSON for gap splitting; falls back to gap-only
-    mode if absent. ``timestamps`` behaves as in :func:`process`.  This remains model-free
-    by default; ``semantic_split=True`` opts into the configured endpoint selector
-    and fails immediately when none is configured.
+    mode if absent. ``timestamps`` behaves as in :func:`process`.
     """
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
@@ -4650,26 +4562,16 @@ def split(
         warn=lambda message: log.warning("%s", message),
     )
     speaker_names = dict(mapping_generation.names)
-    try:
-        semantic_engine = _make_semantic_engine(semantic_split)
-    except Exception as exc:
-        _attach_semantic_configuration_failure(exc)
-        raise
-    try:
-        segmented = segment_document(
-            language=iso,
-            word_segments=units,
-            vad_speech=speech_spans,
-            shot_changes=shot_changes,
-            sing_spans=sing_spans,
-            speaker_turns=speaker_turns,
-            semantic_engine=semantic_engine,
-            semantic_model=semantic_model,
-            smart_split_kwargs=smart_split_kwargs,
-            annotate_speakers=bool(speaker_names),
-        )
-    finally:
-        _release_semantic_engine(semantic_engine)
+    segmented = segment_document(
+        language=iso,
+        word_segments=units,
+        vad_speech=speech_spans,
+        shot_changes=shot_changes,
+        sing_spans=sing_spans,
+        speaker_turns=speaker_turns,
+        smart_split_kwargs=smart_split_kwargs,
+        annotate_speakers=bool(speaker_names),
+    )
     units, cues = segmented.units, segmented.cues
     from voxweave import segmentation_orchestration
     from voxweave.align_snapshot import decode_sibling_json_snapshot
@@ -4700,7 +4602,6 @@ def split(
         mapping_generation=mapping_generation,
         mapping_path=mapping_path,
         shadow_enabled=os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1",
-        semantic_selector_enabled=semantic_engine is not None,
     )
     pair_declared = "voiceprint_capture" in data or "voiceprint_media" in data
     cleanup: list[episode_transaction.ArtifactCleanup] = []
