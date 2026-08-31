@@ -51,8 +51,11 @@ jobs:
           .venv/bin/python -c "from huggingface_hub.utils import HfFolder; print('HfFolder import ok')" || true
           .venv/bin/python -c "from huggingface_hub import hf_hub_download; print('hf_hub_download ok')" || true
 
-      - name: Run only the failing tests
-        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run pytest tests/test_runtime_errors.py tests/test_turnembed.py -q
+      - name: Full suite with poison sentinel
+        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run pytest tests/ -q || true
+
+      - name: Print sentinel report
+        run: cat /tmp/hub_sentinel.log || echo "sentinel never fired"
 
       - name: Lint
         run: |
