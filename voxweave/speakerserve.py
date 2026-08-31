@@ -43,7 +43,7 @@ from voxweave.voicematch import (
 from voxweave.vocalscache import SeparatorIdentity, validate_separator_identity
 
 HOST = "127.0.0.1"
-MAX_BODY_BYTES = 1_000_000
+MAX_BODY_BYTES = 10_000_000
 MAX_NAME_CHARS = 500
 MAX_UNDO_BYTES = 64 * 1024 * 1024
 _POST_ROUTES = frozenset({"/save", "/split", "/split-confirm", "/split-undo"})

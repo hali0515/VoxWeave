@@ -204,11 +204,12 @@ def test_save_rejects_foreign_host_before_other_failures(tmp_path):
             server,
             "POST",
             "/save",
-            body=b"x" * 1_000_001,
+            body=b"x",
             headers={
                 "Host": "attacker.invalid",
                 "Origin": "https://attacker.invalid",
                 "X-VoxWeave-Token": "wrong-token",
+                "Content-Length": str(speakerserve.MAX_BODY_BYTES + 1),
             },
         )
         assert status == 403
@@ -222,8 +223,11 @@ def test_save_checks_token_before_body_limit(tmp_path):
             server,
             "POST",
             "/save",
-            body=b"x" * 1_000_001,
-            headers={"X-VoxWeave-Token": "wrong-token"},
+            body=b"x",
+            headers={
+                "X-VoxWeave-Token": "wrong-token",
+                "Content-Length": str(speakerserve.MAX_BODY_BYTES + 1),
+            },
         )
         assert status == 403
         assert mapping.read_bytes() == before
@@ -257,8 +261,14 @@ def test_save_rejects_oversized_body_before_reading_it(tmp_path):
             server,
             "POST",
             "/save",
-            body=b"x" * 1_000_001,
-            headers={"X-VoxWeave-Token": token},
+            # Declare an oversized length instead of transmitting one: the server
+            # rejects on the declared length without reading, and actually sending
+            # the bytes races its early close into a client-side broken pipe.
+            body=b"x",
+            headers={
+                "X-VoxWeave-Token": token,
+                "Content-Length": str(speakerserve.MAX_BODY_BYTES + 1),
+            },
         )
         assert status == 413
         assert mapping.read_bytes() == before
