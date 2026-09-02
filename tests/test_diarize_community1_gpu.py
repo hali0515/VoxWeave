@@ -1,3 +1,16 @@
+"""GPU end-to-end test for the Community-1 diarization pipeline.
+
+Opt-in gates (all unset by default, so this file is a no-op in CI):
+
+- ``VOXWEAVE_RUN_DIARIZE_C1_GPU_E2E=1`` runs the test at all; otherwise it
+  is skipped.
+- ``VOXWEAVE_DIARIZE_C1_E2E_WAV`` points at a local 16kHz Japanese WAV
+  fixture with multiple speakers; the test is skipped with an explicit
+  reason naming this variable when it is unset or the file is missing.
+- ``VOXWEAVE_DIARIZE_C1_E2E_WAV_SHA256`` is an optional sha256 anchor for
+  that fixture; when set, the test asserts the file's digest matches it.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -12,13 +25,9 @@ from voxweave import config, diarize
 
 
 GPU_E2E_ENV = "VOXWEAVE_RUN_DIARIZE_C1_GPU_E2E"
+WAV_PATH_ENV = "VOXWEAVE_DIARIZE_C1_E2E_WAV"
+WAV_SHA256_ENV = "VOXWEAVE_DIARIZE_C1_E2E_WAV_SHA256"
 COMMUNITY_MODEL = "pyannote/speaker-diarization-community-1"
-JA_WAV = Path(
-    "/tmp/claude-1000/-mnt-Dev-Git-qsub/"
-    "76be7f61-2a96-4094-80b0-3b9311d0223b/scratchpad/"
-    "diarize-ab/wav/ja.16k.wav"
-)
-JA_WAV_SHA256 = "22be7401701b7d1fb317607dde25c4a251a767a136c853794b4d616aaf2c84e5"
 
 
 @pytest.mark.skipif(
@@ -29,15 +38,26 @@ def test_community1_public_diarize_turns_gpu_with_embeddings() -> None:
     import torch
 
     assert torch.cuda.is_available(), "the Community-1 E2E requires a CUDA GPU"
-    assert JA_WAV.is_file(), f"frozen Japanese fixture is missing: {JA_WAV}"
-    assert hashlib.sha256(JA_WAV.read_bytes()).hexdigest() == JA_WAV_SHA256
+    wav_path = os.environ.get(WAV_PATH_ENV)
+    if not wav_path:
+        pytest.skip(f"set {WAV_PATH_ENV} to a Japanese multi-speaker WAV fixture")
+    ja_wav = Path(wav_path)
+    if not ja_wav.is_file():
+        pytest.skip(f"{WAV_PATH_ENV} points at a missing file: {ja_wav}")
+    expected_sha256 = os.environ.get(WAV_SHA256_ENV)
+    if expected_sha256:
+        actual_sha256 = hashlib.sha256(ja_wav.read_bytes()).hexdigest()
+        assert actual_sha256 == expected_sha256, (
+            f"{WAV_PATH_ENV} content changed: expected sha256 "
+            f"{expected_sha256}, got {actual_sha256}"
+        )
     token = config.conf_hf_token()
     assert token, "authenticate with `hf auth login` or set VOXWEAVE_HF_TOKEN/HF_TOKEN"
 
     diarize.release()
     try:
         result = diarize.diarize_turns(
-            JA_WAV,
+            ja_wav,
             token=token,
             model="community-1",
             min_speakers=1,

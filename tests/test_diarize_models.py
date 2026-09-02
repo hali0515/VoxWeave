@@ -54,9 +54,9 @@ def test_diarize_model_default_is_community_1() -> None:
 def test_diarize_model_config_is_used_when_env_and_cli_are_absent(
     tmp_path: Path,
 ) -> None:
-    _write_config(tmp_path, '[diarize]\nmodel = "community-1"\n')
+    _write_config(tmp_path, '[diarize]\nmodel = "example/conf-diarizer"\n')
 
-    assert config.resolve_diarize_model() == COMMUNITY_MODEL
+    assert config.resolve_diarize_model() == "example/conf-diarizer"
 
 
 def test_diarize_model_env_beats_config(
@@ -80,10 +80,10 @@ def test_diarize_model_cli_beats_env_and_config(
 def test_blank_env_falls_through_to_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _write_config(tmp_path, '[diarize]\nmodel = "community-1"\n')
+    _write_config(tmp_path, '[diarize]\nmodel = "example/conf-diarizer"\n')
     monkeypatch.setenv("VOXWEAVE_DIARIZE_MODEL", "   ")
 
-    assert config.resolve_diarize_model() == COMMUNITY_MODEL
+    assert config.resolve_diarize_model() == "example/conf-diarizer"
 
 
 class _Segment:

@@ -114,12 +114,12 @@ def _install_fake_pyannote(
     monkeypatch.setitem(sys.modules, SPEAKER_MODULE, speaker_module)
 
 
-def test_default_and_community_construction_serialize_plda_and_singleton_lifecycle(
+def test_legacy_and_community_construction_serialize_plda_and_singleton_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    default_started = threading.Event()
+    legacy_started = threading.Event()
     community_started = threading.Event()
-    allow_default_finish = threading.Event()
+    allow_legacy_finish = threading.Event()
     events: list[str] = []
     event_lock = threading.Lock()
     community_plda: list[object] = []
@@ -133,7 +133,7 @@ def test_default_and_community_construction_serialize_plda_and_singleton_lifecyc
 
     speaker_module = types.ModuleType(SPEAKER_MODULE)
     speaker_module.get_plda = lambda *_args, **_kwargs: original_plda
-    default_pipeline = SimpleNamespace(model=config.LEGACY_DIARIZE_MODEL)
+    legacy_pipeline = SimpleNamespace(model=config.LEGACY_DIARIZE_MODEL)
     community_pipeline = SimpleNamespace(model=COMMUNITY_MODEL)
 
     class Pipeline:
@@ -142,12 +142,12 @@ def test_default_and_community_construction_serialize_plda_and_singleton_lifecyc
             assert isinstance(checkpoint, dict)
             params = checkpoint["pipeline"]["params"]
             if params["clustering"] == "AgglomerativeClustering":
-                record("default:start")
-                default_started.set()
-                assert speaker_module.get_plda("unused-default-plda") is None
-                assert allow_default_finish.wait(timeout=5.0)
-                record("default:end")
-                return default_pipeline
+                record("legacy:start")
+                legacy_started.set()
+                assert speaker_module.get_plda("unused-legacy-plda") is None
+                assert allow_legacy_finish.wait(timeout=5.0)
+                record("legacy:end")
+                return legacy_pipeline
 
             record("community:start")
             community_plda.append(
@@ -198,9 +198,9 @@ def test_default_and_community_construction_serialize_plda_and_singleton_lifecyc
         except BaseException as exc:
             errors.append(exc)
 
-    default_thread = threading.Thread(
+    legacy_thread = threading.Thread(
         target=load,
-        args=("default", config.LEGACY_DIARIZE_MODEL),
+        args=("legacy", config.LEGACY_DIARIZE_MODEL),
         daemon=True,
     )
     community_thread = threading.Thread(
@@ -208,28 +208,28 @@ def test_default_and_community_construction_serialize_plda_and_singleton_lifecyc
         args=("community", COMMUNITY_MODEL),
         daemon=True,
     )
-    default_thread.start()
-    assert default_started.wait(timeout=2.0)
+    legacy_thread.start()
+    assert legacy_started.wait(timeout=2.0)
     community_thread.start()
     overlapped = community_started.wait(timeout=0.25)
-    allow_default_finish.set()
-    default_thread.join(timeout=5.0)
+    allow_legacy_finish.set()
+    legacy_thread.join(timeout=5.0)
     community_thread.join(timeout=5.0)
 
-    assert not default_thread.is_alive()
+    assert not legacy_thread.is_alive()
     assert not community_thread.is_alive()
     assert errors == []
     assert overlapped is False
     assert events == [
-        "default:start",
-        "default:end",
+        "legacy:start",
+        "legacy:end",
         "release",
         "community:start",
         "community:end",
     ]
     assert community_plda == [original_plda]
     assert results == {
-        "default": default_pipeline,
+        "legacy": legacy_pipeline,
         "community": community_pipeline,
     }
     assert diarize._pipeline is community_pipeline

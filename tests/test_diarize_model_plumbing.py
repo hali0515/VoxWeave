@@ -40,10 +40,12 @@ def _invoke_cli(tmp_path: Path, *arguments: str):
 def test_cli_diarize_model_precedence_matrix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _write_model_config(tmp_path, "community-1")
+    _write_model_config(tmp_path, "example/conf-diarizer")
 
     default_from_config = _invoke_cli(tmp_path)
-    assert default_from_config.call_args.kwargs["diarize_model"] == COMMUNITY_MODEL
+    assert (
+        default_from_config.call_args.kwargs["diarize_model"] == "example/conf-diarizer"
+    )
 
     monkeypatch.setenv("VOXWEAVE_DIARIZE_MODEL", "example/environment-model")
     environment = _invoke_cli(tmp_path)

@@ -125,7 +125,7 @@ def test_pyannote4_loader_splits_revision_and_uses_v4_keywords(
     assert "use_auth_token" not in kwargs
 
 
-def test_default_31_suppresses_only_its_unused_community_plda_and_restores(
+def test_legacy_31_suppresses_only_its_unused_community_plda_and_restores(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -138,15 +138,10 @@ def test_default_31_suppresses_only_its_unused_community_plda_and_restores(
 
     def forbidden_get_plda(value, **_kwargs):
         forbidden_calls.append(value)
-        raise AssertionError("default 3.1 attempted to load Community-1 PLDA")
+        raise AssertionError("legacy 3.1 attempted to load Community-1 PLDA")
 
     speaker_module = _install_speaker_module(monkeypatch, forbidden_get_plda)
     _PLDAProbePipeline.plda_results = []
-    monkeypatch.setattr(
-        diarize,
-        "DIARIZE_MODEL",
-        f"{_LEGACY_MODEL}@legacy-revision",
-    )
     monkeypatch.setattr(
         diarize, "_pipeline_config_path", lambda *_args, **_kwargs: config_path
     )
@@ -168,7 +163,7 @@ def test_default_31_suppresses_only_its_unused_community_plda_and_restores(
     assert speaker_module.get_plda is forbidden_get_plda
 
 
-def test_default_31_refuses_plda_suppression_without_agglomerative_precondition(
+def test_legacy_31_refuses_plda_suppression_without_agglomerative_precondition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -184,7 +179,6 @@ def test_default_31_refuses_plda_suppression_without_agglomerative_precondition(
         raise AssertionError("unsafe 3.1 plan reached Community-1 PLDA")
 
     speaker_module = _install_speaker_module(monkeypatch, forbidden_get_plda)
-    monkeypatch.setattr(diarize, "DIARIZE_MODEL", _LEGACY_MODEL)
     monkeypatch.setattr(
         diarize, "_pipeline_config_path", lambda *_args, **_kwargs: config_path
     )
@@ -220,11 +214,6 @@ def test_community_plan_keeps_remote_model_context_for_structured_subfolders(
         calls.append((checkpoint, revision))
         return SimpleNamespace()
 
-    monkeypatch.setattr(
-        diarize,
-        "DIARIZE_MODEL",
-        f"{_COMMUNITY_MODEL}@community-revision",
-    )
     monkeypatch.setattr(
         diarize, "_pipeline_config_path", lambda *_args, **_kwargs: config_path
     )
