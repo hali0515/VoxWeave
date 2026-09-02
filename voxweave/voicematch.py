@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
+from voxweave import config
 from voxweave.voicebase import (
     MAX_PROVENANCE_STRING_BYTES,
     MAX_SIDECAR_LABEL_BYTES,
@@ -332,6 +333,128 @@ def require_known_compatibility(result: CompatibilityResult) -> str:
     return result.value
 
 
+# Provenance fields worth naming to a human when two embedding spaces differ.
+# outer_config_sha256 is deliberately absent: it is a derived digest that moves
+# with the pipeline, so printing two hashes adds noise instead of a reason.
+_REPORTED_PROVENANCE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("diarization_model", "diarization model"),
+    ("embedding_model", "embedding model"),
+    ("embedding_checkpoint", "embedding checkpoint"),
+    ("embedding_dim", "embedding dimension"),
+    ("pyannote_version", "pyannote version"),
+)
+
+LEGACY_DIARIZE_HINT = (
+    "run transcription and speakers with --diarize-model 3.1 "
+    '(or [diarize].model = "3.1") to keep matching against this store, '
+    "or re-enroll it under the new model"
+)
+
+
+def _readable_provenance_value(value: object) -> str:
+    """Render one provenance scalar for a human-facing diagnostic."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return value.strip() or "unrecorded"
+    if isinstance(value, int | float):
+        return str(value)
+    return "unrecorded"
+
+
+def _audio_summary(value: object) -> str:
+    if not isinstance(value, Mapping):
+        return "unrecorded"
+    parts = [
+        f"separated {_readable_provenance_value(value.get('separated'))}",
+        f"normalized {_readable_provenance_value(value.get('normalized'))}",
+        f"sample rate {_readable_provenance_value(value.get('sample_rate'))}",
+    ]
+    separator = value.get("separator")
+    if isinstance(separator, Mapping):
+        checkpoint = _readable_provenance_value(separator.get("checkpoint"))
+        parts.append(f"separator {checkpoint}")
+    return ", ".join(parts)
+
+
+def _provenance_differences(
+    episode_provenance: Mapping[str, object],
+    store_provenance: Mapping[str, object],
+) -> list[str]:
+    differences: list[str] = []
+    for field, label in _REPORTED_PROVENANCE_FIELDS:
+        stored = store_provenance.get(field)
+        current = episode_provenance.get(field)
+        if stored == current:
+            continue
+        differences.append(
+            f"{label}: store {_readable_provenance_value(stored)}, "
+            f"this run {_readable_provenance_value(current)}"
+        )
+    stored_audio = store_provenance.get("audio")
+    current_audio = episode_provenance.get("audio")
+    if stored_audio != current_audio:
+        differences.append(
+            f"audio profile: store {_audio_summary(stored_audio)}, "
+            f"this run {_audio_summary(current_audio)}"
+        )
+    return differences
+
+
+def _describe_unresolved(
+    *,
+    episode: CompatibilityResult,
+    store: CompatibilityResult,
+) -> str | None:
+    parts: list[str] = []
+    if isinstance(store, CompatibilityUnknown):
+        fields = ", ".join(store.unresolved_fields)
+        parts.append(f"the store records no resolved {fields}")
+    if isinstance(episode, CompatibilityUnknown):
+        fields = ", ".join(episode.unresolved_fields)
+        parts.append(f"this run records no resolved {fields}")
+    if not parts:
+        return None
+    return "compatibility is unresolved; " + "; ".join(parts)
+
+
+def legacy_diarize_recovery_hint(
+    episode_provenance: Mapping[str, object],
+    store_provenance: Mapping[str, object],
+) -> str | None:
+    """Return the way back when only the diarizer default flip separates them."""
+    if (
+        store_provenance.get("diarization_model") == config.LEGACY_DIARIZE_MODEL
+        and episode_provenance.get("diarization_model") == config.DEFAULT_DIARIZE_MODEL
+    ):
+        return LEGACY_DIARIZE_HINT
+    return None
+
+
+def describe_compatibility_mismatch(
+    episode_provenance: Mapping[str, object],
+    store_provenance: Mapping[str, object],
+    *,
+    episode: CompatibilityResult,
+    store: CompatibilityResult,
+) -> str:
+    """Say in plain words why a voices store cannot serve this episode.
+
+    Reporting only: callers pass the fingerprints they already computed, and
+    nothing here feeds the matching decision. Unresolved provenance keeps its
+    own wording because no model swap explains it.
+    """
+    unresolved = _describe_unresolved(episode=episode, store=store)
+    if unresolved is not None:
+        return unresolved
+    differences = _provenance_differences(episode_provenance, store_provenance)
+    if not differences:
+        differences = ["the recorded pipeline configuration differs"]
+    detail = "compatibility differs; " + "; ".join(differences)
+    hint = legacy_diarize_recovery_hint(episode_provenance, store_provenance)
+    return detail if hint is None else f"{detail}. {hint}"
+
+
 def _best_identity_candidates(
     centroid: tuple[int | float, ...],
     store: ValidatedVoiceStore,
@@ -617,6 +740,7 @@ __all__ = [
     "ENV_ACCEPT",
     "ENV_MARGIN",
     "ENV_SUGGEST",
+    "LEGACY_DIARIZE_HINT",
     "MAX_CANDIDATES",
     "MatchCandidate",
     "MatchThresholds",
@@ -626,6 +750,8 @@ __all__ = [
     "build_suggest_record",
     "compatibility_equal",
     "delete_suggest",
+    "describe_compatibility_mismatch",
+    "legacy_diarize_recovery_hint",
     "load_suggest",
     "match_speakers",
     "parse_thresholds",

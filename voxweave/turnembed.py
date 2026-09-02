@@ -17,10 +17,7 @@ from typing import Any, overload
 import numpy as np
 
 from voxweave import config, runtime
-from voxweave.diarize import (
-    COMMUNITY_DIARIZE_MODEL,
-    _snapshot_commit,
-)
+from voxweave.diarize import _snapshot_commit
 from voxweave.diarize import _canonical_embedding_source as _canonical_source
 from voxweave.voicebase import MAX_EMBEDDING_DIM, MIN_EMBEDDING_DIM
 
@@ -297,7 +294,7 @@ def _load_inference(
     if (
         not token
         and not Path(authority.checkpoint).expanduser().exists()
-        and authority.checkpoint in {EMBEDDING_MODEL, COMMUNITY_DIARIZE_MODEL}
+        and authority.checkpoint in {EMBEDDING_MODEL, config.COMMUNITY_DIARIZE_MODEL}
     ):
         raise TurnEmbeddingError(
             "speaker splitting needs the Hugging Face token used for diarization; "

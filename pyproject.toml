@@ -47,7 +47,7 @@ dependencies = [
   # Tracks torch ABI; lower bound only.
   "torchaudio>=2.1",
   # Speaker diarization (--diarize): pyannote.audio 4.x supports the default
-  # pyannote/speaker-diarization-3.1 pipeline and selectable community-1/custom pipelines.
+  # pyannote/speaker-diarization-community-1 pipeline plus selectable 3.1/custom pipelines.
   "pyannote-audio>=4,<5",
   # MMS-300m + uroman forced alignment (default aligner for ja/CJK; zero OOV; align_text_mms).
   # The onnxruntime build is platform-selected via the [cuda]/[mps] extras (onnxruntime-gpu on

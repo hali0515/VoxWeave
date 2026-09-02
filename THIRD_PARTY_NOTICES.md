@@ -45,6 +45,8 @@ Each is governed by its own license — verify before commercial use.
 | torchaudio WAV2VEC2_ASR_LARGE_LV60K_960H                      | EN CTC alignment         | as distributed by torchaudio                                    |
 | PANNs Cnn14                                                   | song/music detection     | Apache/MIT (verify)                                             |
 | silero-vad                                                    | voice activity detection | MIT                                                             |
+| pyannote speaker-diarization-community-1 (`pyannote/speaker-diarization-community-1`) | speaker diarization (`--diarize`, default pipeline) | CC-BY-4.0 - attribution required (gated; accept the model-card conditions on Hugging Face) |
+| pyannote speaker-diarization-3.1 (`pyannote/speaker-diarization-3.1`)                 | speaker diarization (`--diarize --diarize-model 3.1`, opt-in legacy) | MIT (gated separately; also requires accepting `pyannote/segmentation-3.0`) |
 
 Downstream model licenses are the responsibility of the deployer. For
 commercial deployment, confirm each model card's terms (some carry usage

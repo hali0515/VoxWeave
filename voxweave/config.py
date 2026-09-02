@@ -23,12 +23,17 @@ DEFAULT_FUSION_WHISPER = "large-v3"
 DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
 # community-1 is the default (better multi-speaker separation in practice);
 # the 3.1 pipeline stays selectable via the "3.1" alias and keeps its own
-# LEGACY constant because the pyannote-4 loading guards are 3.1-specific.
-DEFAULT_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
+# LEGACY constant because the pyannote-4 fail-closed guard for an unverified
+# 3.1 plan is keyed on this id (PLDA suppression itself is keyed on plan shape).
+# Both pipelines are separately gated on Hugging Face; every module that needs
+# either id binds these constants instead of repeating the string, so flipping
+# the default cannot leave a value-coincidence literal behind.
+COMMUNITY_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
 LEGACY_DIARIZE_MODEL = "pyannote/speaker-diarization-3.1"
+DEFAULT_DIARIZE_MODEL = COMMUNITY_DIARIZE_MODEL
 DIARIZE_MODEL_ALIASES = {
     "3.1": LEGACY_DIARIZE_MODEL,
-    "community-1": DEFAULT_DIARIZE_MODEL,
+    "community-1": COMMUNITY_DIARIZE_MODEL,
 }
 # Per-language aligner defaults. Unlisted languages fall back to Qwen3-ForcedAligner.
 #

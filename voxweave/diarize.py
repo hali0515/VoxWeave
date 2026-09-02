@@ -44,7 +44,11 @@ if TYPE_CHECKING:
 log = logging.getLogger("voxweave")
 
 DIARIZE_MODEL = config.DEFAULT_DIARIZE_MODEL
-COMMUNITY_DIARIZE_MODEL = "pyannote/speaker-diarization-community-1"
+COMMUNITY_DIARIZE_MODEL = config.COMMUNITY_DIARIZE_MODEL
+# The bundled pipeline ids, both gated on Hugging Face: without a token they
+# cannot load at all, so the run is refused up front with an actionable message.
+# Derived from the alias table so a new bundled alias joins the gate set with it.
+GATED_DIARIZE_MODELS = frozenset(config.DIARIZE_MODEL_ALIASES.values())
 EMBEDDING_CHECKPOINT_FILE = "pytorch_model.bin"
 
 # Atom-level speaker assignment needs at least this much absolute overlap with a
@@ -191,6 +195,23 @@ def _canonical_embedding_source(
     return source
 
 
+def _is_gated_hub_error(exc: BaseException) -> bool:
+    """True for a Hub refusal that accepting the gate / authenticating would fix.
+
+    ``GatedRepoError`` subclasses ``OSError``, so every ``except OSError`` on a
+    download path swallows it by default; a gate refusal is not a missing file
+    and must reach the loader, which translates it into :func:`_gated_model_error`.
+    """
+    try:
+        from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
+    except ImportError:
+        return False
+    if isinstance(exc, GatedRepoError):
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return isinstance(exc, HfHubHTTPError) and status in (401, 403)
+
+
 def _pipeline_config_path(model: str, token: str | None = None) -> Path | None:
     """Download or resolve the exact pipeline config inside VoxWeave's cache."""
     configured = Path(model)
@@ -211,7 +232,12 @@ def _pipeline_config_path(model: str, token: str | None = None) -> Path | None:
             token=token,
             cache_dir=config.AUDIO_CACHE,
         )
-    except (ImportError, OSError, ValueError):
+    except (ImportError, OSError, ValueError) as exc:
+        # A gate refusal here would otherwise degrade the plan to a bare id and
+        # resurface as a misleading pipeline-shape error; only a genuinely absent
+        # or unreachable config counts as "no config".
+        if _is_gated_hub_error(exc):
+            raise
         return None
     return Path(cached).absolute()
 
@@ -319,7 +345,11 @@ def _embedding_load_authority(
             )
         except EntryNotFoundError:
             return None
-        except (ImportError, OSError, ValueError):
+        except (ImportError, OSError, ValueError) as exc:
+            # Same rule as _pipeline_config_path: a gate refusal is not a missing
+            # checkpoint, and must surface as the model-card error.
+            if _is_gated_hub_error(exc):
+                raise
             return None
         cached_path = Path(cached).absolute()
         commit = _snapshot_commit(
@@ -650,11 +680,37 @@ def _call_pipeline_from_pretrained(
     )
 
 
-def _is_legacy_agglomerative_plan(model: str, plan: _PipelineLoadPlan) -> bool:
-    model_id, _revision = _split_model_revision(model)
-    if model_id != config.LEGACY_DIARIZE_MODEL or not isinstance(plan.checkpoint, dict):
+def _inspected_plan_document(checkpoint: object) -> Mapping[str, Any] | None:
+    """Read a checkpoint's pipeline document for inspection only.
+
+    A prepared plan is already the parsed document; a plan that stayed a path
+    (or a local pipeline directory) is re-read here. What gets handed to
+    ``from_pretrained`` is never this copy.
+    """
+    if isinstance(checkpoint, Mapping):
+        return checkpoint
+    if not isinstance(checkpoint, (str, os.PathLike)):
+        return None
+    path = Path(os.fspath(checkpoint))
+    if path.is_dir():
+        path = path / "config.yaml"
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    return document if isinstance(document, Mapping) else None
+
+
+def _is_agglomerative_plda_free_plan(checkpoint: object) -> bool:
+    """True for a SpeakerDiarization plan that never reads PLDA.
+
+    Keyed on the checkpoint's shape rather than its model id: a local copy or a
+    Hub mirror of the 3.1 pipeline is the same plan and needs the same handling.
+    """
+    document = _inspected_plan_document(checkpoint)
+    if document is None:
         return False
-    pipeline_config = plan.checkpoint.get("pipeline")
+    pipeline_config = document.get("pipeline")
     if not isinstance(pipeline_config, Mapping):
         return False
     if pipeline_config.get("name") != "pyannote.audio.pipelines.SpeakerDiarization":
@@ -672,16 +728,23 @@ def _without_unused_legacy_plda(
     model: str,
     plan: _PipelineLoadPlan,
 ) -> Iterator[None]:
-    """Prevent pyannote 4 from fetching c1's unused PLDA for the 3.1 pipeline."""
+    """Prevent pyannote 4 from fetching c1's unused PLDA for a 3.1-shaped plan.
+
+    pyannote 4's ``SpeakerDiarization.__init__`` calls ``get_plda`` unconditionally
+    with a class default pointing at community-1's ``plda`` subfolder, which an
+    AgglomerativeClustering plan never reads. Any such plan is suppressed, however
+    it is named. The 3.1 id itself stays fail-closed: an unrecognized shape under
+    that id means the verified plan is not the one about to be built.
+    """
     model_id, _revision = _split_model_revision(model)
-    if model_id != config.LEGACY_DIARIZE_MODEL:
+    if not _is_agglomerative_plda_free_plan(plan.checkpoint):
+        if model_id == config.LEGACY_DIARIZE_MODEL:
+            raise RuntimeError(
+                "speaker-diarization-3.1 under pyannote.audio 4 requires a verified "
+                "AgglomerativeClustering pipeline config"
+            )
         yield
         return
-    if not _is_legacy_agglomerative_plan(model, plan):
-        raise RuntimeError(
-            "speaker-diarization-3.1 under pyannote.audio 4 requires a verified "
-            "AgglomerativeClustering pipeline config"
-        )
     speaker_diarization = cast(
         Any,
         importlib.import_module("pyannote.audio.pipelines.speaker_diarization"),
@@ -748,12 +811,22 @@ def _model_card_url(model: str) -> str:
 
 
 def _gated_model_error(model: str) -> RuntimeError:
-    return RuntimeError(
+    model_id, _revision = _split_model_revision(model)
+    message = (
         f"could not load {model}: accept the model-card conditions at "
         f"{_model_card_url(model)}, then use `hf auth login` or set "
         "VOXWEAVE_HF_TOKEN / HF_TOKEN (or hf_token in "
         "~/.config/voxweave.conf)"
     )
+    if model_id == COMMUNITY_DIARIZE_MODEL:
+        # community-1 and 3.1 are gated separately, so the default can fail for a
+        # user who already accepted the other one -- name that way out.
+        message += (
+            ". If you only accepted the speaker-diarization-3.1 gate, pass "
+            '--diarize-model 3.1 (or set [diarize].model = "3.1" in '
+            "~/.config/voxweave.conf); voiceprint stores are per-model"
+        )
+    return RuntimeError(message)
 
 
 def _get_pipeline(token: str | None, model: str = DIARIZE_MODEL):
@@ -780,17 +853,7 @@ def _get_pipeline_locked(token: str | None, model: str):
         try:
             pl = _load_pipeline(Pipeline, token, model)
         except Exception as exc:
-            try:
-                from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
-
-                response = getattr(exc, "response", None)
-                status_code = getattr(response, "status_code", None)
-                gated = isinstance(exc, GatedRepoError) or (
-                    isinstance(exc, HfHubHTTPError) and status_code == 403
-                )
-            except ImportError:
-                gated = False
-            if gated:
+            if _is_gated_hub_error(exc):
                 raise _gated_model_error(model) from exc
             raise
         if pl is None:
@@ -860,10 +923,8 @@ def _diarize_turns_locked(
 ) -> DiarizationResult:
     resolved_model = config.resolve_diarize_model(model)
     token = token or config.conf_hf_token()
-    if not token and resolved_model in {
-        config.LEGACY_DIARIZE_MODEL,
-        COMMUNITY_DIARIZE_MODEL,
-    }:
+    # Compare the bare id: a pinned "<id>@<revision>" is the same gated repo.
+    if not token and _split_model_revision(resolved_model)[0] in GATED_DIARIZE_MODELS:
         raise _gated_model_error(resolved_model)
     import soundfile as sf
     import torch

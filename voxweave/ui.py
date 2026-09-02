@@ -166,6 +166,15 @@ class RichReporter(Reporter):
             self._progress.update(self._task_id, completed=done, total=total)
 
 
+# Pipeline aborts that leave nothing to write (pipeline.transcribe/split).
+_PIPELINE_ABORT_MARKERS = (
+    "no speech",
+    "no aligned",
+    "no alignment",
+    "no word segments",
+)
+
+
 def _hint_for(exc: Exception) -> str:
     if isinstance(exc, FileNotFoundError):
         return "File not found, or ffmpeg is not on PATH."
@@ -176,7 +185,21 @@ def _hint_for(exc: Exception) -> str:
             "GPU out of memory: lower VOXWEAVE_MAX_CHUNK_SEC or pick a smaller --model."
         )
     if isinstance(exc, RuntimeError):
-        return "Pipeline aborted (no speech detected or no alignment result)."
+        message = str(exc).lower()
+        if "could not load" in message and "model-card" in message:
+            hint = (
+                "Accept the model-card conditions on Hugging Face and authenticate "
+                "(hf auth login, or VOXWEAVE_HF_TOKEN / HF_TOKEN)."
+            )
+            # The escape hatch only applies when the default (community-1) gate
+            # is the one refusing; a failing 3.1 or custom id has no such way out.
+            if "speaker-diarization-community-1" in message:
+                hint += " If you only have the 3.1 gate, run with --diarize-model 3.1."
+            return hint
+        # Only the aborts this line actually describes; every other RuntimeError
+        # carries its own message and a wrong hint is worse than none.
+        if any(marker in message for marker in _PIPELINE_ABORT_MARKERS):
+            return "Pipeline aborted (no speech detected or no alignment result)."
     return ""
 
 

@@ -52,6 +52,7 @@ from voxweave.voicematch import (
     build_suggest_record,
     compatibility_equal,
     delete_suggest,
+    describe_compatibility_mismatch,
     match_speakers,
     parse_thresholds,
     write_suggest,
@@ -218,7 +219,17 @@ def _matching_record(
     left = build_compatibility_fingerprint(sidecar_provenance)
     right = build_compatibility_fingerprint(store_provenance)
     if not compatibility_equal(left, right):
-        log.warning("voice compatibility differs or is unresolved; matching skipped")
+        # One line per invocation, not per speaker: the whole store is out.
+        log.warning(
+            "matching against voices store %s skipped: %s",
+            store_path,
+            describe_compatibility_mismatch(
+                sidecar_provenance,
+                store_provenance,
+                episode=left,
+                store=right,
+            ),
+        )
         return None
     if sidecar_provenance.get("torch_version") != store_provenance.get("torch_version"):
         log.warning("voice evidence was produced by a different torch version")
@@ -1590,15 +1601,21 @@ def enroll_speaker_voices(
                         cast(Mapping[str, object], current_sidecar["provenance"]),
                     )
 
-                side_compat = build_compatibility_fingerprint(
-                    cast(Mapping[str, object], current_sidecar["provenance"])
+                episode_provenance = cast(
+                    Mapping[str, object], current_sidecar["provenance"]
                 )
-                store_compat = build_compatibility_fingerprint(
-                    cast(Mapping[str, object], store["provenance"])
-                )
+                store_provenance = cast(Mapping[str, object], store["provenance"])
+                side_compat = build_compatibility_fingerprint(episode_provenance)
+                store_compat = build_compatibility_fingerprint(store_provenance)
                 if not compatibility_equal(side_compat, store_compat):
                     raise EnrollmentRefusal(
-                        "voice compatibility differs or is unresolved; enrollment refused"
+                        "enrollment refused: "
+                        + describe_compatibility_mismatch(
+                            episode_provenance,
+                            store_provenance,
+                            episode=side_compat,
+                            store=store_compat,
+                        )
                     )
 
                 mapping = _mapping_entries_bytes(

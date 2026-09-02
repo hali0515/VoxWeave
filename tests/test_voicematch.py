@@ -4,7 +4,7 @@ import copy
 
 import pytest
 
-from voxweave import voicebase, voicematch, voicestore
+from voxweave import config, voicebase, voicematch, voicestore
 
 NOW = "2026-08-27T05:00:00Z"
 
@@ -383,6 +383,72 @@ def test_suggest_validator_never_coerces_numeric_strings():
     record["thresholds"]["suggest"] = 10**1000
     with pytest.raises(voicebase.Phase2DataError, match="finite range"):
         voicematch.validate_suggest_record(record)
+
+
+def _mismatch(episode_provenance, store_provenance):
+    return voicematch.describe_compatibility_mismatch(
+        episode_provenance,
+        store_provenance,
+        episode=voicematch.build_compatibility_fingerprint(episode_provenance),
+        store=voicematch.build_compatibility_fingerprint(store_provenance),
+    )
+
+
+def test_default_flip_mismatch_names_both_models_and_the_way_back():
+    store_provenance = _provenance()
+    store_provenance["diarization_model"] = config.LEGACY_DIARIZE_MODEL
+    episode_provenance = copy.deepcopy(store_provenance)
+    episode_provenance["diarization_model"] = config.DEFAULT_DIARIZE_MODEL
+    episode_provenance["embedding_checkpoint"] = "blob-789"
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "compatibility differs" in detail
+    assert config.LEGACY_DIARIZE_MODEL in detail
+    assert config.DEFAULT_DIARIZE_MODEL in detail
+    assert "blob-456" in detail and "blob-789" in detail
+    assert "--diarize-model 3.1" in detail
+    assert '[diarize].model = "3.1"' in detail
+    assert "re-enroll" in detail
+
+
+def test_unresolved_compatibility_keeps_its_own_wording():
+    store_provenance = _provenance()
+    store_provenance["diarization_model"] = config.LEGACY_DIARIZE_MODEL
+    episode_provenance = copy.deepcopy(store_provenance)
+    episode_provenance["diarization_model"] = config.DEFAULT_DIARIZE_MODEL
+    episode_provenance["embedding_dim"] = "unresolved"
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "unresolved" in detail
+    assert "embedding_dim" in detail
+    assert "compatibility differs" not in detail
+    assert "--diarize-model" not in detail
+
+
+def test_recovery_hint_only_points_back_from_the_new_default():
+    store_provenance = _provenance()
+    store_provenance["diarization_model"] = config.DEFAULT_DIARIZE_MODEL
+    episode_provenance = copy.deepcopy(store_provenance)
+    episode_provenance["diarization_model"] = config.LEGACY_DIARIZE_MODEL
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert config.DEFAULT_DIARIZE_MODEL in detail
+    assert config.LEGACY_DIARIZE_MODEL in detail
+    assert "--diarize-model" not in detail
+
+
+def test_unnamed_provenance_difference_still_reports_a_reason():
+    store_provenance = _provenance()
+    episode_provenance = copy.deepcopy(store_provenance)
+    episode_provenance["outer_config_sha256"] = "d" * 64
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "compatibility differs" in detail
+    assert "pipeline configuration" in detail
 
 
 def test_unknown_compatibility_cannot_build_suggest_record():

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from voxweave import artifacts, pipeline, speakers, speakerserve, translate
+from voxweave import artifacts, config, pipeline, speakers, speakerserve, translate
 from voxweave.asrfix import render_vtt as render_corrected_vtt
 from voxweave.cli import cli
 from voxweave.export import (
@@ -20,6 +20,17 @@ from voxweave.export import (
 )
 from voxweave.realign import parse_vtt_blocks, render_vtt
 from voxweave.subformats import load_subtitle_blocks, parse_ass_blocks
+from voxweave.voicebase import (
+    canonical_turns_digest,
+    media_fingerprint,
+    write_voiceprints,
+)
+from voxweave.voicestore import (
+    EnrollmentRefusal,
+    enroll_exemplar,
+    new_voice_store,
+    write_voice_store,
+)
 
 
 def _overlap(left, right):
@@ -846,3 +857,118 @@ def test_split_named_render_keeps_sibling_json_clean(tmp_path):
     assert "<v Aoi>" in vtt and "<v Ren>" in vtt
     assert "Aoi" not in sibling and "Ren" not in sibling
     assert "speaker_ids" not in sibling
+
+
+VOICE_CAPTURE = "c" + "1" * 32
+VOICE_VECTOR = [1.0, *([0.0] * 15)]
+
+
+def _diarize_provenance(model):
+    return {
+        "diarization_model": model,
+        "outer_config_sha256": "a" * 64,
+        "embedding_model": "example/embedder",
+        "embedding_checkpoint": "b" * 64,
+        "embedding_dim": 16,
+        "audio": {"separated": False, "normalized": False, "sample_rate": 16000},
+        "pyannote_version": "4.0.7",
+        "torch_version": "test",
+    }
+
+
+def _write_voice_episode(tmp_path, provenance):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"episode media")
+    turns = [[0.0, 4.0, "SPEAKER_00"]]
+    fingerprint = media_fingerprint(media)
+    (tmp_path / "episode.json").write_text(
+        json.dumps(
+            {
+                "language": "en",
+                "segments": [],
+                "word_segments": [{"text": "line", "start": 0.0, "end": 4.0}],
+                "vad_speech": [[0.0, 4.0]],
+                "speaker_turns": turns,
+                "voiceprint_capture": VOICE_CAPTURE,
+                "voiceprint_media": fingerprint,
+            }
+        ),
+        encoding="utf-8",
+    )
+    write_voiceprints(
+        tmp_path / "episode.voiceprints.json",
+        {
+            "version": 1,
+            "capture_id": VOICE_CAPTURE,
+            "provenance": provenance,
+            "binding": {
+                "turns_digest": canonical_turns_digest(turns),
+                "media_fingerprint": fingerprint,
+                "media_stem": "episode",
+                "created": "2026-08-28T00:00:00Z",
+            },
+            "speakers": {"SPEAKER_00": list(VOICE_VECTOR)},
+        },
+    )
+    (tmp_path / "episode.speakers.json").write_text(
+        json.dumps({"version": 1, "speakers": {"SPEAKER_00": "Aqua"}}),
+        encoding="utf-8",
+    )
+    return media
+
+
+def _write_legacy_store(path, provenance):
+    store = new_voice_store("Example Show", provenance)
+    store = enroll_exemplar(
+        store,
+        raw_name="Aqua",
+        capture_id="c" + "2" * 32,
+        media_fingerprint="f" * 64,
+        episode="prior",
+        vector=list(VOICE_VECTOR),
+    ).store
+    write_voice_store(path, store)
+
+
+def test_legacy_store_matching_warning_names_both_models_and_the_way_back(
+    tmp_path, caplog
+):
+    sidecar = {"provenance": _diarize_provenance(config.DEFAULT_DIARIZE_MODEL)}
+    store = new_voice_store(
+        "Example Show", _diarize_provenance(config.LEGACY_DIARIZE_MODEL)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert (
+            speakers._matching_record(sidecar, tmp_path / "voices.json", store) is None
+        )
+
+    warnings = [
+        record for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "compatibility differs" in message
+    assert config.LEGACY_DIARIZE_MODEL in message
+    assert config.DEFAULT_DIARIZE_MODEL in message
+    assert "--diarize-model 3.1" in message
+    assert "voices.json" in message
+
+
+def test_enrollment_refusal_names_both_models_and_the_way_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOXWEAVE_CONFIG", str(tmp_path / "voxweave.conf"))
+    media = _write_voice_episode(
+        tmp_path, _diarize_provenance(config.DEFAULT_DIARIZE_MODEL)
+    )
+    store_path = tmp_path / "voices.json"
+    _write_legacy_store(store_path, _diarize_provenance(config.LEGACY_DIARIZE_MODEL))
+
+    with pytest.raises(EnrollmentRefusal) as excinfo:
+        speakers.enroll_speaker_voices(media, voices=store_path, show="Example Show")
+
+    message = str(excinfo.value)
+    assert "enrollment refused" in message
+    assert config.LEGACY_DIARIZE_MODEL in message
+    assert config.DEFAULT_DIARIZE_MODEL in message
+    assert "--diarize-model 3.1" in message
+    assert '[diarize].model = "3.1"' in message

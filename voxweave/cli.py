@@ -254,9 +254,9 @@ def cli(verbose: bool) -> None:
     default=None,
     metavar="MODEL",
     help=(
-        "Diarization pipeline: 3.1 (default), community-1, or any Hugging Face "
+        "Diarization pipeline: community-1 (default), 3.1, or any Hugging Face "
         "pipeline ID. Precedence: CLI, VOXWEAVE_DIARIZE_MODEL, conf "
-        "[diarize].model, then 3.1."
+        "[diarize].model."
     ),
 )
 @click.option(
