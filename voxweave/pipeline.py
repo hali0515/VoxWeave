@@ -4260,6 +4260,8 @@ def _process_from_source(
             sing_spans = sing_spans or None
             speaker_turns = speaker_turns or None
             if shot_job is not None:
+                # The step timer measures the join only: ffmpeg itself has been
+                # running since before transcribe(), so this is normally ~0s.
                 rep.step("detect shot changes")
                 rep.stage("collect shot changes")
                 shot_changes = shot_job.result()

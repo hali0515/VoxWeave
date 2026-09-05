@@ -19,7 +19,6 @@ import os
 import re
 import subprocess
 import threading
-import time
 from pathlib import Path
 from typing import IO
 
@@ -72,7 +71,8 @@ class ShotDetectionJob:
     ``start`` launches ffmpeg and returns at once so the caller can overlap the
     pass with GPU work; ``result`` joins it with exactly the outcome
     :func:`detect_shot_changes` reports (``None`` for no ffmpeg / timeout /
-    non-zero exit, sorted unique cut times otherwise) and caches that outcome;
+    non-zero exit / unreadable stderr, sorted unique cut times otherwise) and
+    caches that outcome;
     ``cancel`` reaps the child when the caller bails out before collecting.
     A daemon thread drains stderr while ffmpeg runs -- showinfo is chatty and a
     full pipe would block ffmpeg forever. Single consumer: call ``result`` and
@@ -82,10 +82,12 @@ class ShotDetectionJob:
     def __init__(self) -> None:
         self._media: Path | None = None
         self._timeout_s = 3600
-        self._deadline = 0.0
         self._proc: subprocess.Popen[str] | None = None
         self._stderr: list[str] = []
         self._drain: threading.Thread | None = None
+        # Set by the drain thread when it could not read stderr to EOF; the
+        # buffer is then untrustworthy and ``result`` must not parse it.
+        self._drain_error: Exception | None = None
         self._outcome: list[float] | None = None
         self._finished = False
 
@@ -98,15 +100,22 @@ class ShotDetectionJob:
         """Launch the ffmpeg pass on ``media``'s first video stream and return self.
 
         ``-nostdin`` + DEVNULL per the project ffmpeg contract (a captured stdin
-        hangs looped invocations). ``timeout_s`` is wall-clock from launch, as
-        ``subprocess.run(timeout=)`` would count it. A missing ffmpeg finishes
-        the job immediately with ``None``.
+        hangs looped invocations). ``timeout_s`` is the budget ``result`` grants
+        the pass once the caller starts waiting for it, not wall-clock from
+        launch: a legitimately slow pass must not be killed just because the
+        work it overlapped took longer than the budget (``detect_shot_changes``
+        waits immediately, so for it the two readings coincide). A missing
+        ffmpeg finishes the job immediately with ``None``.
+
+        stderr is decoded as UTF-8 with undecodable bytes replaced: ffmpeg
+        echoes the input path and container tags verbatim, and a strict decode
+        would abort the drain on a non-UTF-8 filename while the ASCII
+        ``pts_time`` lines stay perfectly parseable.
         """
         if self._proc is not None or self._finished:
             raise RuntimeError("shot detection job already started")
         self._media = Path(media)
         self._timeout_s = timeout_s
-        self._deadline = time.monotonic() + timeout_s
         th = threshold if threshold is not None else _scene_threshold()
         try:
             proc = subprocess.Popen(
@@ -115,6 +124,8 @@ class ShotDetectionJob:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except FileNotFoundError:
             log.debug("ffmpeg not found; shot detection skipped")
@@ -124,7 +135,7 @@ class ShotDetectionJob:
         self._proc = proc
         self._drain = threading.Thread(
             target=self._pump_stderr,
-            args=(proc.stderr,),
+            args=(proc, proc.stderr),
             name="voxweave-shotdet-stderr",
             daemon=True,
         )
@@ -145,7 +156,7 @@ class ShotDetectionJob:
         media = self._media
         assert media is not None
         try:
-            proc.wait(timeout=max(0.0, self._deadline - time.monotonic()))
+            proc.wait(timeout=self._timeout_s)
         except subprocess.TimeoutExpired:
             log.warning("shot detection timed out after %ds; skipped", self._timeout_s)
             proc.kill()
@@ -153,6 +164,14 @@ class ShotDetectionJob:
             self._join_drain()
             return self._finish(None)
         self._join_drain()
+        if self._drain_error is not None:
+            # The buffer may be truncated; parsing it would silently drop cuts.
+            log.warning(
+                "shot detection could not read ffmpeg output for %s (%r); skipped",
+                media.name,
+                self._drain_error,
+            )
+            return self._finish(None)
         if proc.returncode != 0:
             # typical: audio-only media (no 0:v:0 stream to map)
             log.debug(
@@ -189,13 +208,17 @@ class ShotDetectionJob:
         log.debug("shot detection cancelled for %s", media.name)
         self._finish(None)
 
-    def _pump_stderr(self, stream: IO[str]) -> None:
+    def _pump_stderr(self, proc: subprocess.Popen[str], stream: IO[str]) -> None:
         try:
             self._stderr.append(stream.read())
         except (OSError, ValueError) as exc:
+            self._drain_error = exc
             log.debug("shot detection stderr drain stopped: %r", exc)
         finally:
             stream.close()
+        # EOF means ffmpeg is exiting: reap it now (best effort, non-blocking) so a
+        # fast-failing child does not sit as a zombie until the caller collects.
+        proc.poll()
 
     def _join_drain(self) -> None:
         if self._drain is not None:

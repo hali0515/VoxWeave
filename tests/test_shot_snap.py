@@ -9,6 +9,8 @@
 # media degrades to None.
 import io
 import json
+import logging
+import shutil
 import subprocess
 
 import pytest
@@ -185,21 +187,34 @@ SHOWINFO = (
 )
 
 
+class _BrokenStderr:
+    """A stderr pipe whose read fails, as a torn-down or unreadable stream would."""
+
+    def read(self):
+        raise OSError("stderr read failed")
+
+    def close(self):
+        pass
+
+
 class _FakePopen:
     """ffmpeg stand-in: exits with ``rc`` after writing ``stderr``, or hangs.
 
-    A hung fake keeps ``wait`` timing out until it is signalled; a ``stubborn``
-    one also ignores SIGTERM, so cancel has to escalate to ``kill`` exactly as it
-    would on a stuck child.
+    ``stderr`` is the text the child emits, or a ready-made stream object such as
+    :class:`_BrokenStderr`. A hung fake keeps ``wait`` timing out until it is
+    signalled; a ``stubborn`` one also ignores SIGTERM, so cancel has to escalate
+    to ``kill`` exactly as it would on a stuck child. Every ``wait`` budget is
+    recorded in ``wait_timeouts``.
     """
 
     def __init__(self, rc=0, stderr="", hang=False, stubborn=False):
         self.returncode = None
         self._rc = rc
-        self.stderr = io.StringIO(stderr)
+        self.stderr = io.StringIO(stderr) if isinstance(stderr, str) else stderr
         self.hang = hang
         self.stubborn = stubborn
         self.calls = []
+        self.wait_timeouts = []
 
     def poll(self):
         if self.hang:
@@ -208,6 +223,7 @@ class _FakePopen:
         return self.returncode
 
     def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
         if self.hang:
             raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout or 0)
         self.returncode = self._rc
@@ -272,13 +288,33 @@ def test_job_launch_follows_ffmpeg_contract(monkeypatch, tmp_path):
     shotdet.ShotDetectionJob().start(tmp_path / "v.mkv", threshold=0.42)
     (cmd, kwargs, _proc), *rest = launches
     assert not rest
-    assert cmd[:2] == ["ffmpeg", "-nostdin"]
-    assert str(tmp_path / "v.mkv") in cmd
-    assert any("gt(scene,0.42)" in arg for arg in cmd)
+    # Byte-identical to the argv the blocking detect_shot_changes built before
+    # the job existed; anything else changes what ffmpeg detects.
+    assert cmd == [
+        "ffmpeg",
+        "-nostdin",
+        "-v",
+        "info",
+        "-i",
+        str(tmp_path / "v.mkv"),
+        "-map",
+        "0:v:0",
+        "-vf",
+        "scale=320:-2,select='gt(scene,0.42)',showinfo",
+        "-an",
+        "-sn",
+        "-dn",
+        "-f",
+        "null",
+        "-",
+    ]
     assert kwargs["stdin"] is subprocess.DEVNULL
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.PIPE
     assert kwargs["text"] is True
+    # Lenient decoding: ffmpeg echoes the input path and container tags raw.
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
 
 
 def test_job_result_matches_detect_and_is_idempotent(monkeypatch, tmp_path):
@@ -287,7 +323,7 @@ def test_job_result_matches_detect_and_is_idempotent(monkeypatch, tmp_path):
     job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
     first = job.result()
     assert first == expected == [12.345, 23.4]
-    assert job.result() is first
+    assert job.result() == first
     assert len(launches) == 2
     assert launches[1][2].calls == []
     with pytest.raises(RuntimeError):
@@ -307,9 +343,50 @@ def test_job_timeout_kills_and_returns_none(monkeypatch, tmp_path):
     assert job.result() is None
     proc = launches[0][2]
     assert proc.calls == ["kill"]
+    # The budget is granted at collection time, not consumed since launch: a
+    # pass that overlapped a long transcription still gets the full timeout.
+    assert proc.wait_timeouts[0] == 1
     assert job.result() is None
     job.cancel()
     assert proc.calls == ["kill"]
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+def test_job_keeps_cuts_around_undecodable_stderr_bytes(monkeypatch, tmp_path):
+    # ffmpeg -v info echoes the input filename and container tags to stderr
+    # verbatim; a non-UTF-8 byte there must not abort the drain and turn every
+    # real cut into an empty list.
+    script = "printf 'pts_time:1.5\\n' >&2; printf '\\377\\n' >&2; printf 'pts_time:3.5\\n' >&2"
+    monkeypatch.setattr(
+        shotdet, "_ffmpeg_command", lambda _media, _th: ["sh", "-c", script]
+    )
+    job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
+    assert job.result() == [1.5, 3.5]
+    assert shotdet.detect_shot_changes(tmp_path / "v.mkv") == [1.5, 3.5]
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+def test_job_reaps_a_fast_failing_child_before_collection(monkeypatch, tmp_path):
+    # Audio-only media makes ffmpeg exit at once; the drain thread reaps it on
+    # EOF so it does not linger as a zombie for the whole transcription.
+    monkeypatch.setattr(
+        shotdet, "_ffmpeg_command", lambda _media, _th: ["sh", "-c", "exit 3"]
+    )
+    job = shotdet.ShotDetectionJob().start(tmp_path / "a.wav")
+    job._join_drain()
+    assert job._proc is not None and job._proc.returncode == 3
+    assert job.result() is None
+
+
+def test_job_drain_failure_settles_none_not_partial_cuts(monkeypatch, tmp_path, caplog):
+    # A drain that could not read to EOF leaves a truncated buffer; parsing it
+    # would silently drop cuts, so the outcome must be "undetectable" instead.
+    _install_popen(monkeypatch, rc=0, stderr=_BrokenStderr())
+    job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
+    with caplog.at_level(logging.WARNING, logger="voxweave.shotdet"):
+        assert job.result() is None
+    assert "could not read ffmpeg output" in caplog.text
+    assert job.result() is None
 
 
 def test_job_cancel_before_finish_kills_and_settles_none(monkeypatch, tmp_path):
