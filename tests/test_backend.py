@@ -732,6 +732,76 @@ def test_demix_off_is_byte_identical_to_legacy(monkeypatch):
         assert default.numpy().tobytes() == ref_bytes
 
 
+def _tiny_roformer(torch):
+    """The vendored MelBandRoformer at toy size: CPU-only, deterministic, sub-second."""
+    from voxweave.vendor.mel_band_roformer import MelBandRoformer
+
+    torch.manual_seed(0)
+    return MelBandRoformer(
+        dim=16,
+        depth=1,
+        num_bands=8,
+        dim_head=8,
+        heads=2,
+        flash_attn=False,
+        stft_n_fft=256,
+        stft_hop_length=64,
+        stft_win_length=256,
+        stereo=True,
+    ).eval()
+
+
+def test_vendored_roformer_hands_view_as_complex_fp32_under_bf16_autocast(monkeypatch):
+    # The mask estimators are Linear+GLU, so under autocast they emit bf16 and
+    # torch.view_as_complex refuses BFloat16 on CUDA (the real-model failure). CPU
+    # autocast cannot reproduce that raise: its fp32 cast-policy list includes
+    # view_as_complex, so the op upcasts internally. Assert on the dtype handed to the
+    # op instead -- the vendored patch must upcast before every view_as_complex call.
+    torch = pytest.importorskip("torch")
+    seen: list[object] = []
+    real = torch.view_as_complex
+
+    def _spy(t):
+        seen.append(t.dtype)
+        return real(t)
+
+    monkeypatch.setattr(torch, "view_as_complex", _spy)
+    model = _tiny_roformer(torch)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model(torch.randn(1, 2, 1024))
+    assert len(seen) == 2  # stft_repr, then the masks
+    assert all(dt is torch.float32 for dt in seen)
+    assert out.dtype is torch.float32 and tuple(out.shape) == (1, 2, 1024)
+
+
+def test_vendored_roformer_fp32_forward_hands_view_as_complex_fp32(monkeypatch):
+    # Without autocast the upcast is a no-op alias: the op still sees fp32 and the
+    # output stays fp32 (the default "off" separation path is unchanged by the patch).
+    torch = pytest.importorskip("torch")
+    seen: list[object] = []
+    real = torch.view_as_complex
+
+    def _spy(t):
+        seen.append(t.dtype)
+        return real(t)
+
+    monkeypatch.setattr(torch, "view_as_complex", _spy)
+    model = _tiny_roformer(torch)
+    with torch.no_grad():
+        out = model(torch.randn(1, 2, 1024))
+    assert seen == [torch.float32, torch.float32]
+    assert out.dtype is torch.float32 and tuple(out.shape) == (1, 2, 1024)
+
+
+def test_view_as_complex_rejects_bf16_outside_autocast():
+    # Documents the CUDA failure mode the vendored patch exists for: outside a CPU
+    # autocast region (as on CUDA, whose cast policy lacks view_as_complex) a bf16
+    # real/imag pair is refused outright.
+    torch = pytest.importorskip("torch")
+    with pytest.raises(RuntimeError, match="view_as_complex"):
+        torch.view_as_complex(torch.zeros(2, 2, dtype=torch.bfloat16))
+
+
 def test_resolve_asr_model():
     assert backend.resolve_asr_model(None) == backend.ASR_MODEL
     assert backend.resolve_asr_model("") == backend.ASR_MODEL

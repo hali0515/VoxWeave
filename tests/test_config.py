@@ -295,6 +295,19 @@ def test_conf_separate_autocast_valid_value_does_not_warn(
     assert not _warnings(caplog)
 
 
+def test_conf_separate_autocast_non_table_section_warns_once_and_falls_back_off(
+    conf_at, no_sep_autocast_env, caplog
+):
+    # a top-level scalar `separate = "bf16"` (typo for the [separate] table) is
+    # reported like the diarize resolver does, not silently treated as unset
+    conf_at.write_text('separate = "bf16"\n', encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_separate_autocast() == "off"
+    warned = _warnings(caplog)
+    assert len(warned) == 1
+    assert "'separate'" in warned[0].message and "expected table" in warned[0].message
+
+
 def test_separate_section_is_a_known_key(conf_at, caplog):
     conf_at.write_text('[separate]\nautocast = "off"\n', encoding="utf-8")
     with caplog.at_level(logging.WARNING, logger="voxweave"):

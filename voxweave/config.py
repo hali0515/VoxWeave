@@ -507,7 +507,9 @@ def conf_separate_autocast() -> str:
     Precedence: env VOXWEAVE_SEP_AUTOCAST > conf ``[separate].autocast`` > "off".
     Values are case-insensitive. An invalid value (unknown mode or wrong type) from
     the winning source is warned about once and falls back to "off" -- it does not
-    fall through to the next source, so a typo never silently enables autocast.
+    fall through to the next source, so a typo never silently enables autocast. A
+    non-table ``separate`` key (a scalar instead of a ``[separate]`` section) is
+    warned about the same way.
     """
     env = os.environ.get(SEP_AUTOCAST_ENV)
     if env is not None and env.strip():
@@ -515,6 +517,11 @@ def conf_separate_autocast() -> str:
         source = f"env {SEP_AUTOCAST_ENV}"
     else:
         separate = _load().get("separate")
+        if separate is not None and not isinstance(separate, dict):
+            log.warning(
+                "config key %r has wrong type (expected table), ignoring", "separate"
+            )
+            return SEP_AUTOCAST_DEFAULT
         raw = separate.get("autocast") if isinstance(separate, dict) else None
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             return SEP_AUTOCAST_DEFAULT
