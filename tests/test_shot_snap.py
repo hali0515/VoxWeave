@@ -7,6 +7,7 @@
 # a start move that would land after the cue's own first word is vetoed.
 # Detection itself is one ffmpeg pass parsed from showinfo stderr; audio-only
 # media degrades to None.
+import io
 import json
 import subprocess
 
@@ -177,44 +178,180 @@ def test_snap_disabled_when_window_zero():
 # --------------------------------------------------------------------------- #
 
 
-class _Proc:
-    def __init__(self, rc, stderr=""):
-        self.returncode = rc
-        self.stderr = stderr
+SHOWINFO = (
+    "[Parsed_showinfo_2 @ 0x1] n:   0 pts:  12345 pts_time:12.345 duration...\n"
+    "[Parsed_showinfo_2 @ 0x1] n:   1 pts:  23456 pts_time:23.4 duration...\n"
+    "frame=    2 fps=0.0 q=-0.0 Lsize=N/A\n"
+)
+
+
+class _FakePopen:
+    """ffmpeg stand-in: exits with ``rc`` after writing ``stderr``, or hangs.
+
+    A hung fake keeps ``wait`` timing out until it is signalled; a ``stubborn``
+    one also ignores SIGTERM, so cancel has to escalate to ``kill`` exactly as it
+    would on a stuck child.
+    """
+
+    def __init__(self, rc=0, stderr="", hang=False, stubborn=False):
+        self.returncode = None
+        self._rc = rc
+        self.stderr = io.StringIO(stderr)
+        self.hang = hang
+        self.stubborn = stubborn
+        self.calls = []
+
+    def poll(self):
+        if self.hang:
+            return None
+        self.returncode = self._rc
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.hang:
+            raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=timeout or 0)
+        self.returncode = self._rc
+        return self.returncode
+
+    def terminate(self):
+        self.calls.append("terminate")
+        if not self.stubborn:
+            self.hang = False
+            self._rc = -15
+
+    def kill(self):
+        self.calls.append("kill")
+        self.hang = False
+        self._rc = -9
+
+
+def _install_popen(monkeypatch, **fake_kwargs):
+    """Patch Popen with a one-shot factory and return the launches it records."""
+    launches = []
+
+    def popen(cmd, **kwargs):
+        proc = _FakePopen(**fake_kwargs)
+        launches.append((cmd, kwargs, proc))
+        return proc
+
+    monkeypatch.setattr(shotdet.subprocess, "Popen", popen)
+    return launches
+
+
+def _install_missing_ffmpeg(monkeypatch):
+    def popen(*a, **k):
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr(shotdet.subprocess, "Popen", popen)
 
 
 def test_detect_parses_showinfo(monkeypatch, tmp_path):
-    stderr = (
-        "[Parsed_showinfo_2 @ 0x1] n:   0 pts:  12345 pts_time:12.345 duration...\n"
-        "[Parsed_showinfo_2 @ 0x1] n:   1 pts:  23456 pts_time:23.4 duration...\n"
-        "frame=    2 fps=0.0 q=-0.0 Lsize=N/A\n"
-    )
-    monkeypatch.setattr(
-        shotdet.subprocess, "run", lambda *a, **k: _Proc(0, stderr=stderr)
-    )
+    _install_popen(monkeypatch, rc=0, stderr=SHOWINFO)
     cuts = shotdet.detect_shot_changes(tmp_path / "v.mkv")
     assert cuts == [12.345, 23.4]
 
 
 def test_detect_none_on_no_video(monkeypatch, tmp_path):
-    monkeypatch.setattr(shotdet.subprocess, "run", lambda *a, **k: _Proc(1))
+    _install_popen(monkeypatch, rc=1)
     assert shotdet.detect_shot_changes(tmp_path / "a.wav") is None
 
 
 def test_detect_none_on_missing_ffmpeg(monkeypatch, tmp_path):
-    def _raise(*a, **k):
-        raise FileNotFoundError("ffmpeg")
-
-    monkeypatch.setattr(shotdet.subprocess, "run", _raise)
+    _install_missing_ffmpeg(monkeypatch)
     assert shotdet.detect_shot_changes(tmp_path / "v.mkv") is None
 
 
 def test_detect_none_on_timeout(monkeypatch, tmp_path):
-    def _raise(*a, **k):
-        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=1)
+    launches = _install_popen(monkeypatch, hang=True)
+    assert shotdet.detect_shot_changes(tmp_path / "v.mkv", timeout_s=1) is None
+    assert launches[0][2].calls == ["kill"]
 
-    monkeypatch.setattr(shotdet.subprocess, "run", _raise)
-    assert shotdet.detect_shot_changes(tmp_path / "v.mkv") is None
+
+def test_job_launch_follows_ffmpeg_contract(monkeypatch, tmp_path):
+    launches = _install_popen(monkeypatch, rc=0, stderr=SHOWINFO)
+    shotdet.ShotDetectionJob().start(tmp_path / "v.mkv", threshold=0.42)
+    (cmd, kwargs, _proc), *rest = launches
+    assert not rest
+    assert cmd[:2] == ["ffmpeg", "-nostdin"]
+    assert str(tmp_path / "v.mkv") in cmd
+    assert any("gt(scene,0.42)" in arg for arg in cmd)
+    assert kwargs["stdin"] is subprocess.DEVNULL
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.PIPE
+    assert kwargs["text"] is True
+
+
+def test_job_result_matches_detect_and_is_idempotent(monkeypatch, tmp_path):
+    launches = _install_popen(monkeypatch, rc=0, stderr=SHOWINFO)
+    expected = shotdet.detect_shot_changes(tmp_path / "v.mkv")
+    job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
+    first = job.result()
+    assert first == expected == [12.345, 23.4]
+    assert job.result() is first
+    assert len(launches) == 2
+    assert launches[1][2].calls == []
+    with pytest.raises(RuntimeError):
+        job.start(tmp_path / "v.mkv")
+
+
+def test_job_result_none_on_nonzero_exit(monkeypatch, tmp_path):
+    _install_popen(monkeypatch, rc=1, stderr=SHOWINFO)
+    job = shotdet.ShotDetectionJob().start(tmp_path / "a.wav")
+    assert job.result() is None
+    assert job.result() is None
+
+
+def test_job_timeout_kills_and_returns_none(monkeypatch, tmp_path):
+    launches = _install_popen(monkeypatch, hang=True)
+    job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv", timeout_s=1)
+    assert job.result() is None
+    proc = launches[0][2]
+    assert proc.calls == ["kill"]
+    assert job.result() is None
+    job.cancel()
+    assert proc.calls == ["kill"]
+
+
+def test_job_cancel_before_finish_kills_and_settles_none(monkeypatch, tmp_path):
+    launches = _install_popen(monkeypatch, hang=True, stubborn=True)
+    job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
+    job.cancel()
+    proc = launches[0][2]
+    assert proc.calls == ["terminate", "kill"]
+    assert job.result() is None
+    job.cancel()
+    assert proc.calls == ["terminate", "kill"]
+
+
+def test_job_cancel_stops_at_terminate_when_the_child_exits(monkeypatch, tmp_path):
+    launches = _install_popen(monkeypatch, hang=True)
+    job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
+    job.cancel()
+    assert launches[0][2].calls == ["terminate"]
+    assert job.result() is None
+
+
+def test_job_cancel_is_safe_before_start_and_after_finish(monkeypatch, tmp_path):
+    launches = _install_popen(monkeypatch, rc=0, stderr=SHOWINFO)
+    job = shotdet.ShotDetectionJob()
+    job.cancel()
+    assert job.start(tmp_path / "v.mkv").result() == [12.345, 23.4]
+    job.cancel()
+    assert launches[0][2].calls == []
+    assert job.result() == [12.345, 23.4]
+
+
+def test_job_result_before_start_is_none():
+    job = shotdet.ShotDetectionJob()
+    assert job.result() is None
+
+
+def test_job_missing_ffmpeg_settles_none(monkeypatch, tmp_path):
+    _install_missing_ffmpeg(monkeypatch)
+    job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
+    assert job.result() is None
+    job.cancel()
+    assert job.result() is None
 
 
 # --------------------------------------------------------------------------- #
