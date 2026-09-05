@@ -983,10 +983,16 @@ class _AsrRes:
         self.text, self.language, self.time_stamps = text, language, None
 
 
-def _batched_asr_fake(calls: list, poison: frozenset[str] = frozenset()):
+def _batched_asr_fake(
+    calls: list,
+    poison: frozenset[str] = frozenset(),
+    garble: dict[str, str] | None = None,
+):
     """Fake torch Qwen3ASRModel: .transcribe takes one path or a list of paths and
     returns one result per item (text = "t-<stem>"); every call's (audio, kwargs) is
-    recorded. A call that touches a poisoned wav name raises, single or batched."""
+    recorded. A call that touches a poisoned wav name raises, single or batched.
+    ``garble`` maps wav names to the text a BATCHED call returns for them instead
+    (qwen-asr #207 style corruption); a single-path call is never garbled."""
 
     class _Model:
         def transcribe(self, audio, **kw):
@@ -994,6 +1000,11 @@ def _batched_asr_fake(calls: list, poison: frozenset[str] = frozenset()):
             paths = audio if isinstance(audio, list) else [audio]
             if poison & {Path(p).name for p in paths}:
                 raise RuntimeError("CUDA error: device-side assert")
+            if isinstance(audio, list) and garble:
+                return [
+                    _AsrRes(garble.get(Path(p).name, f"t-{Path(p).stem}"))
+                    for p in paths
+                ]
             return [_AsrRes(f"t-{Path(p).stem}") for p in paths]
 
     return _Model()
@@ -1222,6 +1233,91 @@ def test_transcribe_chunks_mlx_keeps_per_chunk_asr(monkeypatch, tmp_path):
     out = backend.transcribe_chunks(wavs, None, asr_model="qwen3-asr-1.7b")
     assert calls == [str(w) for w in wavs]
     assert [t for _, t, _ in out] == ["t-c0", "t-c1", "t-c2"]
+
+
+def test_asr_pass_reruns_implausibly_short_batched_result_alone(
+    monkeypatch, tmp_path, caplog
+):
+    # qwen-asr #207: the shorter item of a mixed-length batch comes back as a lone
+    # "!". That chunk alone is re-run through the legacy single-path call and takes
+    # the single call's text; the other chunk keeps its batched result, nothing is
+    # recorded as a failure, and every chunk still ticks exactly once. (The fake's
+    # healthy text has 3 alphanumeric characters, so durations stay under 6s to
+    # clear the 0.5 chars/s floor; the garbled chunk is above the 2s check floor.)
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, garble={"c0.wav": "!"}),
+    )
+    durations = {"c0.wav": 3.0, "c1.wav": 5.0}
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: durations[w.name])
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 2)
+    failures: list[Exception] = []
+    ticks: list[int] = []
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = backend._asr_pass(
+            "qwen",
+            wavs,
+            None,
+            "Qwen/Qwen3-ASR-1.7B",
+            None,
+            failures,
+            lambda: ticks.append(len(ticks)),
+        )
+    assert _asr_call_names(calls) == [["c0.wav", "c1.wav"], "c0.wav"]
+    assert [t for _, t, _ in out] == ["t-c0", "t-c1"]
+    assert failures == []
+    assert len(ticks) == 2
+    assert "chunk 1/2" in caplog.text and "qwen-asr #207" in caplog.text
+
+
+def test_asr_pass_accepts_empty_batched_result_for_tiny_chunk(monkeypatch, tmp_path):
+    # silence exemption: a sub-floor chunk (a cough, a breath) legitimately
+    # transcribes to nothing, so an empty batched result for it is kept as-is and
+    # the batched call is the only model call (5s keeps the healthy 3-character
+    # fake text above the 0.5 chars/s floor)
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, garble={"c0.wav": ""}),
+    )
+    durations = {"c0.wav": 0.4, "c1.wav": 5.0}
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: durations[w.name])
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 2)
+    failures: list[Exception] = []
+    ticks: list[int] = []
+    out = backend._asr_pass(
+        "qwen",
+        wavs,
+        None,
+        "Qwen/Qwen3-ASR-1.7B",
+        None,
+        failures,
+        lambda: ticks.append(len(ticks)),
+    )
+    assert _asr_call_names(calls) == [["c0.wav", "c1.wav"]]
+    assert [t for _, t, _ in out] == ["", "t-c1"]
+    assert out[0][2] == "en"  # empty text: align_lang placeholder, skipped by align
+    assert failures == []
+    assert len(ticks) == 2
+
+
+def test_batched_asr_suspect_floor():
+    # the guard is a chars-per-second floor over the chunk's alphanumeric content;
+    # unknown (0.0) or sub-floor durations are exempt whatever the text
+    assert backend._batched_asr_suspect("!", 30.0)
+    assert backend._batched_asr_suspect("", 118.0)
+    assert not backend._batched_asr_suspect("", 0.0)  # header unreadable
+    assert not backend._batched_asr_suspect("", 1.9)
+    assert not backend._batched_asr_suspect("そうだね、行こう。", 10.0)
+    assert not backend._batched_asr_suspect("yes", 5.0)  # 3 alnum >= 0.5 * 5
+    assert backend._batched_asr_suspect("は", 10.0)  # 1 alnum < 0.5 * 10
 
 
 # --- load strategy: sum (co-resident: same pass structure, no release between passes) ----------- #

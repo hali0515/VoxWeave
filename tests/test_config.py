@@ -198,8 +198,9 @@ def test_conf_batch_clamps_to_min_1(conf_at, no_batch_env):
 
 
 def test_conf_batch_asr_precedence(conf_at, no_batch_env, monkeypatch):
-    # Qwen ASR chunks per decode call: env VOXWEAVE_ASR_BATCH > [batch].asr > built-in 4
-    assert config.conf_batch("asr") == 4
+    # Qwen ASR chunks per decode call: env VOXWEAVE_ASR_BATCH > [batch].asr > built-in 1
+    # (batching is opt-in: batched transcripts drift ~1.5% CER from the per-chunk call)
+    assert config.conf_batch("asr") == 1
     conf_at.write_text("[batch]\nasr = 8\n", encoding="utf-8")
     assert config.conf_batch("asr") == 8
     monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
@@ -207,7 +208,7 @@ def test_conf_batch_asr_precedence(conf_at, no_batch_env, monkeypatch):
     monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "lots")
     assert config.conf_batch("asr") == 8  # non-int env -> next source
     conf_at.write_text('[batch]\nasr = "many"\n', encoding="utf-8")
-    assert config.conf_batch("asr") == 4  # non-int file too -> default
+    assert config.conf_batch("asr") == 1  # non-int file too -> default
     monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "0")
     assert config.conf_batch("asr") == 1  # clamped: 1 = the legacy per-chunk call
 
@@ -216,7 +217,8 @@ def test_default_template_has_batch_section(conf_at):
     config.ensure_default_config()
     txt = conf_at.read_text(encoding="utf-8")
     assert "[batch]" in txt and "VOXWEAVE_SEP_BATCH" in txt
-    assert "VOXWEAVE_ASR_BATCH" in txt and "# asr = 4" in txt
+    assert "VOXWEAVE_ASR_BATCH" in txt and "# asr = 1" in txt
+    assert "1.34x" in txt and "1.5% CER" in txt and "#207" in txt  # measured trade-off
 
 
 # --- hf token precedence (env > conf > huggingface_hub stored token) -------- #

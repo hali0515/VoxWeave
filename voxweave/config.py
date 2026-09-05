@@ -122,13 +122,15 @@ _TEMPLATE = """\
 # VOXWEAVE_CTC_BATCH / VOXWEAVE_MMS_BATCH / VOXWEAVE_ASR_BATCH). On an 8 GB-class card
 # batch=1 already saturates compute for separation and the CTC emission (measured: no
 # speedup at 2/4, just +~0.8 GiB VRAM per extra separation window) -- only worth raising
-# on much wider GPUs, and only after measuring. The Qwen3-ASR decoder is the exception:
-# it is memory-bandwidth-bound at batch 1, so asr decodes several chunks per call.
+# on much wider GPUs, and only after measuring.
 [batch]
 # separate = 1   # vocal separation (MelBandRoformer) 8s windows
 # ctc = 1        # wav2vec2 CTC emission 30s windows (en aligner)
 # mms = 4        # MMS-300m emission batch (ja aligner, ctc-forced-aligner generate_emissions)
-# asr = 4        # Qwen3-ASR chunks per decode call (torch backend; whisper/MLX stay per-chunk; 1 = per-chunk)
+# asr = 1        # Qwen3-ASR chunks per decode call (torch only; whisper/MLX per-chunk). Measured on
+#                # RTX PRO 4000, 1.7B greedy: 4 -> 1.34x faster / 6.4 GiB peak, 8 -> 1.49x / 8.9 GiB,
+#                # but transcripts drift ~1.5% CER vs batch 1 (bf16 batched kernels); qwen-asr #207:
+#                # mixed-length batches can corrupt the shorter item (guarded by a per-chunk re-run).
 
 # Speaker diarization pipeline. The default is "community-1" (better multi-speaker
 # separation); accept its model-card conditions on Hugging Face first. Use "3.1" to
@@ -455,11 +457,11 @@ def conf_ctc_max_dp_frames() -> int:
 # linearly with batch; same for the wav2vec2 CTC emission), so batching only costs VRAM
 # (~+0.8 GiB per extra separation window). The knob exists for much wider GPUs, where
 # per-window kernels may underfill the SMs — measure before raising. mms=4 is the
-# ctc-forced-aligner upstream default (ONNX path, pre-existing behavior). asr=4 is the
-# number of chunks per Qwen3-ASR decode call (backend._asr_pass): the autoregressive
-# decoder is memory-bandwidth-bound at batch 1, so padding a few chunks together is
-# close to free; 1 restores the legacy per-chunk call.
-_BATCH_DEFAULTS = {"separate": 1, "ctc": 1, "mms": 4, "asr": 4}
+# ctc-forced-aligner upstream default (ONNX path, pre-existing behavior). asr=1 keeps the
+# legacy per-chunk Qwen3-ASR call; batching (backend._asr_pass) is opt-in: it is faster
+# (RTX PRO 4000, 1.7B greedy: 4 -> 1.34x, 8 -> 1.49x) but its transcripts drift ~1.5% CER
+# from batch 1 and there is no truth ruler yet to judge the sign of that change.
+_BATCH_DEFAULTS = {"separate": 1, "ctc": 1, "mms": 4, "asr": 1}
 _BATCH_ENV = {
     "separate": "VOXWEAVE_SEP_BATCH",
     "ctc": "VOXWEAVE_CTC_BATCH",

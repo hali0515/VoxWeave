@@ -150,6 +150,16 @@ WHISPER_COMPUTE = os.environ.get("VOXWEAVE_WHISPER_COMPUTE", "")
 # constructor default.  Raising only the ceiling does not change ordinary greedy
 # decodes (generation still stops at EOS), but avoids silent tail truncation.
 QWEN_MAX_NEW_TOKENS = int(os.environ.get("VOXWEAVE_QWEN_MAX_NEW_TOKENS", "1024"))
+# qwen-asr #207 guard for the batched ASR pass (_asr_pass): a mixed-length batch can
+# corrupt its shorter item to a lone "!", so a batched result with fewer alphanumeric
+# characters than this many per second of chunk audio (empty text included) is re-run
+# alone through the legacy per-chunk call. Speech in a VAD chunk yields several per
+# second in every supported script, so 0.5 leaves a wide margin; chunks shorter than
+# the check floor are exempt (a cough or a breath legitimately transcribes to nothing).
+ASR_BATCH_MIN_CPS = float(os.environ.get("VOXWEAVE_ASR_BATCH_MIN_CPS", "0.5"))
+ASR_BATCH_MIN_CHECK_SEC = float(
+    os.environ.get("VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC", "2.0")
+)
 
 # ASR/alignment process-level singletons; call release() at end of episode.
 # Separator is not kept resident (self-loads, self-releases).
@@ -906,8 +916,9 @@ def _asr_chunk_safe(
     """One chunk's ASR with failure containment: an exception degrades to empty
     text (the same path as genuine silence downstream) instead of killing the
     run, so hours of prior chunks are not thrown away. This is the per-chunk unit
-    of _asr_pass: batch size 1, whisper and MLX go through it directly, and a
-    batched Qwen group whose call raised is redone chunk by chunk here."""
+    of _asr_pass: batch size 1, whisper and MLX go through it directly; a batched
+    Qwen group whose call raised is redone chunk by chunk here, as is a single
+    chunk whose batched result failed the qwen-asr #207 content floor."""
     try:
         return _asr_only(engine, wav, language, model_id, context)
     except Exception as e:  # noqa: BLE001 -- one bad chunk must not kill the run
@@ -1007,6 +1018,21 @@ def _asr_batch_size(engine: str) -> int:
     return config.conf_batch("asr")
 
 
+def _batched_asr_suspect(text: str, duration: float) -> bool:
+    """True when a batched result is implausibly short for a non-silent chunk.
+
+    qwen-asr #207: a mixed-length batch can corrupt its shorter item to a lone "!".
+    Alphanumeric content below ASR_BATCH_MIN_CPS per second of audio (empty text
+    included) is not accepted. Chunks shorter than ASR_BATCH_MIN_CHECK_SEC, or whose
+    duration is unknown (0.0), are exempt: little or no text is legitimate there.
+    """
+    from voxweave.lang import transcript_content_weight
+
+    if duration < ASR_BATCH_MIN_CHECK_SEC:
+        return False
+    return transcript_content_weight(text) < ASR_BATCH_MIN_CPS * duration
+
+
 def _asr_pass(
     engine: str,
     wav_paths: list[Path],
@@ -1019,15 +1045,22 @@ def _asr_pass(
     """All-chunks ASR pass -> [(det_lang, text, align_lang)] in input order.
 
     ``tick`` fires once per chunk after its result is in (per-chunk progress total
-    unchanged). On the torch Qwen backend with ``[batch].asr`` > 1 the chunks are
-    grouped by duration into batches of that size (near-equal lengths pad the
-    least) and every group is ONE model.transcribe(list) call: the 1.7B decoder is
-    memory-bandwidth-bound at batch 1, so decoding several chunks per step is the
-    largest ASR-stage speedup available without changing models. A group whose
-    batched call raises (or returns the wrong count) is redone chunk by chunk
-    through _asr_chunk_safe, so one poisoned chunk degrades alone and its failure
-    is recorded exactly as on the per-chunk path. Batch size 1, a group of one,
-    whisper and MLX keep the legacy single-path call shape.
+    unchanged; on the batched path ticks follow duration order, not chunk order).
+    Batch size 1 (the default), a group of one, whisper and MLX make the legacy
+    single-path call through _asr_chunk_safe. On the torch Qwen backend with
+    ``[batch].asr`` > 1 the chunks are grouped by duration into batches of that
+    size and every group is ONE model.transcribe(list) call. Batching is opt-in
+    because its output is not byte-identical to batch 1 (bf16 batched kernels
+    drift ~1.5% CER; numbers in transcribe_chunks). Duration sorting bought no
+    speed in the A/B but keeps each group's lengths close, which minimises the
+    qwen-asr #207 exposure (a mixed-length batch can corrupt its shorter item to
+    a lone "!"); against what slips through, a batched result that is empty or
+    below the ASR_BATCH_MIN_CPS content floor for a chunk of at least
+    ASR_BATCH_MIN_CHECK_SEC (_batched_asr_suspect) is not accepted: that chunk
+    alone is re-run through the legacy per-chunk call. A group whose batched call
+    raises (or returns the wrong count) is redone chunk by chunk through
+    _asr_chunk_safe, so one poisoned chunk degrades alone and its failure is
+    recorded exactly as on the per-chunk path.
     """
     n = len(wav_paths)
     out: list[tuple[str | None, str, str]] = [(None, "", "")] * n
@@ -1043,7 +1076,8 @@ def _asr_pass(
     if batch <= 1:
         _per_chunk(range(n))
         return out
-    order = sorted(range(n), key=lambda i: _wav_duration(wav_paths[i]))
+    durations = [_wav_duration(p) for p in wav_paths]
+    order = sorted(range(n), key=durations.__getitem__)
     kwargs = _qwen_asr_kwargs(language, context)
     for start in range(0, n, batch):
         group = order[start : start + batch]
@@ -1071,8 +1105,21 @@ def _asr_pass(
             _per_chunk(sorted(group))
             continue
         for i, r in zip(group, results):
+            raw_text = r.text or ""
+            if _batched_asr_suspect(raw_text, durations[i]):
+                log.warning(
+                    "batched ASR returned %d alphanumeric characters for chunk %d/%d "
+                    "(%.1fs of audio, floor %.0f); re-running it alone (qwen-asr #207)",
+                    sum(ch.isalnum() for ch in raw_text),
+                    i + 1,
+                    n,
+                    durations[i],
+                    ASR_BATCH_MIN_CPS * durations[i],
+                )
+                _per_chunk([i])
+                continue
             try:
-                out[i] = _asr_postprocess(r.language or None, r.text, language, "ASR")
+                out[i] = _asr_postprocess(r.language or None, raw_text, language, "ASR")
             except Exception as e:  # noqa: BLE001 -- same containment as _asr_chunk_safe
                 out[i] = _asr_failed(e, i, n, failures)
             tick()
@@ -1094,11 +1141,16 @@ def transcribe_chunks(
     """Transcribe a list of chunks -> [(lang, text, units)] matching the transcribe_align contract.
 
     Pass structure is fixed: all-chunks ASR pass(es), then one alignment pass (fusion:
-    whisper ASR -> Qwen ASR -> align + merge). Each ASR pass is _asr_pass: the torch
-    Qwen engine decodes chunks in duration-sorted groups of config ``[batch].asr``
-    (one model.transcribe(list) call per group, results restored to input order);
-    whisper, MLX and batch size 1 transcribe one chunk per call. strategy controls
-    model residency between passes (config.conf_load_strategy):
+    whisper ASR -> Qwen ASR -> align + merge). Each ASR pass is _asr_pass: with config
+    ``[batch].asr`` > 1 (opt-in; default 1) the torch Qwen engine decodes chunks in
+    duration-sorted groups of that size, one model.transcribe(list) call per group,
+    results restored to input order. Measured on an RTX PRO 4000 (Qwen3-ASR-1.7B,
+    greedy, 24-min episode): batch 4 = 1.34x faster at 6.4 GiB peak, batch 8 = 1.49x
+    at 8.9 GiB, but batched transcripts drift ~1.5% CER from batch 1 (bf16 batched
+    kernels; scattered small edits, no chunk lost), and qwen-asr #207 reports
+    mixed-length batches corrupting the shorter item, which _asr_pass guards with a
+    per-chunk re-run. Whisper, MLX and batch size 1 transcribe one chunk per call.
+    strategy controls model residency between passes (config.conf_load_strategy):
     - "peak" (default): singletons released between passes; peak VRAM = max(models).
     - "sum": singletons stay resident across passes; peak = sum(models); saves the
       release/reload overhead on high-VRAM cards.
@@ -1106,8 +1158,9 @@ def transcribe_chunks(
     ``full_wav`` + ``bounds`` (absolute chunk windows on full_wav) enable ONE full-file
     alignment pass for CTC/MMS file-level languages (see _full_pass_units); Qwen-aligned
     languages and callers that omit them keep per-chunk alignment. on_done(i) is called
-    per chunk per completed pass (a batched chunk ticks once its group has returned);
-    total = N * chunk_pass_count(). Aligner kept alive until release().
+    per chunk per completed pass (a batched chunk ticks once its group has returned,
+    so batched ticks follow duration order, not chunk order); total = N *
+    chunk_pass_count(). Aligner kept alive until release().
     """
     counter = [0]
 
