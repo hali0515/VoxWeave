@@ -397,6 +397,17 @@ class _NestedReporter(Reporter):
     def __init__(self, parent: Reporter) -> None:
         self.parent = parent
 
+    def step(self, label: str) -> None:
+        # Nested steps stay inside the enclosing step: its clock keeps running and
+        # the timings belong to the outer plan.
+        return
+
+    def finish(self) -> None:
+        self.parent.finish()
+
+    def timings(self) -> dict[str, float]:
+        return self.parent.timings()
+
     def stage(self, label: str) -> None:
         self.parent.stage(label)
 
@@ -1295,6 +1306,9 @@ def transcribe(
                 "detected": detected,
                 "chunks": len(chunks),
                 "units": len(all_units),
+                # Wall-clock seconds per step entered so far (the open step counts up
+                # to now); later steps (speaker identification, layout) are not in it.
+                "timings": dict(rep.timings()),
             }
         )
         speaker_turns: list[tuple[float, float, str]] = []
