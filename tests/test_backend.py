@@ -1,5 +1,9 @@
 """backend pure-logic tests + missing-dependency error paths (no real model loading)."""
 
+import contextlib
+import logging
+import warnings
+
 import pytest
 
 from voxweave import align_common, align_ctc, align_mms, backend, runtime
@@ -509,6 +513,223 @@ def test_demix_batched_matches_sequential():
     for bs in (2, 3, 64):  # 64 > window count -> single batch
         out = backend._demix(_Scale(), mix, cfg, batch=bs)
         assert torch.equal(out, ref)
+
+
+# --- separation autocast (opt-in bf16/fp16 around the roformer forward only) --- #
+_DEMIX_CFG = {"audio": {"chunk_size": 16}, "inference": {"num_overlap": 4}}
+
+
+def _autocast_probe(torch):
+    """Fake separator that records the CUDA autocast state seen inside forward."""
+
+    class _Probe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+            self.seen: list[tuple[bool, object]] = []
+
+        def forward(self, x):
+            self.seen.append(
+                (torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"))
+            )
+            return x * 0.5 + 0.1
+
+    return _Probe()
+
+
+def _legacy_demix(model, mix, cfg, batch):
+    """The pre-autocast _demix loop, verbatim: the byte-identity reference for mode 'off'."""
+    import torch
+
+    audio = cfg.get("audio", {})
+    inf = cfg.get("inference", {})
+    chunk = int(audio.get("chunk_size", 131584))
+    overlap = int(inf.get("num_overlap", 4))
+    step = max(1, chunk // overlap)
+    ch, total = mix.shape
+    window = torch.hann_window(chunk)
+    result = torch.zeros(ch, total)
+    weight = torch.zeros(total)
+    dev = next(model.parameters()).device
+    starts = list(range(0, total, step))
+    with torch.no_grad():
+        for i in range(0, len(starts), batch):
+            grp = starts[i : i + batch]
+            segs, lens = [], []
+            for start in grp:
+                seg = mix[:, start : start + chunk]
+                n = seg.shape[1]
+                lens.append(n)
+                if n < chunk:
+                    seg = torch.nn.functional.pad(seg, (0, chunk - n))
+                segs.append(seg)
+            out = model(torch.stack(segs).to(dev))
+            if out.dim() == 4:
+                out = out[:, 0]
+            out = out.float().cpu()
+            for j, (start, n) in enumerate(zip(grp, lens)):
+                w = window[:n]
+                result[:, start : start + n] += out[j, :, :n] * w
+                weight[start : start + n] += w
+    return result / weight.clamp_min(1e-8)
+
+
+@pytest.mark.parametrize("dev_name", ["cpu", "cuda"])
+def test_autocast_context_off_is_null(dev_name):
+    torch = pytest.importorskip("torch")
+    ctx = backend._autocast_context(torch.device(dev_name), "off")
+    assert isinstance(ctx, contextlib.nullcontext)
+
+
+@pytest.mark.parametrize("mode", ["bf16", "fp16"])
+def test_autocast_context_non_cuda_falls_back_to_fp32_with_debug_log(mode, caplog):
+    # CPU/MPS never enter cuda autocast: nullcontext + one debug line, no warning
+    torch = pytest.importorskip("torch")
+    with caplog.at_level(logging.DEBUG, logger="voxweave"):
+        ctx = backend._autocast_context(torch.device("cpu"), mode)
+    assert isinstance(ctx, contextlib.nullcontext)
+    hits = [r for r in caplog.records if f"autocast={mode}" in r.message]
+    assert len(hits) == 1 and hits[0].levelno == logging.DEBUG
+
+
+@pytest.mark.parametrize(
+    ("mode", "dtype_name"), [("bf16", "bfloat16"), ("fp16", "float16")]
+)
+def test_autocast_context_cuda_configures_torch_autocast(mode, dtype_name):
+    # Built, not entered: CPU-only hosts can construct a cuda autocast (torch only
+    # warns and disables it), so assert the configuration attributes instead.
+    torch = pytest.importorskip("torch")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ctx = backend._autocast_context(torch.device("cuda"), mode)
+    assert isinstance(ctx, torch.autocast)
+    assert ctx.device == "cuda"
+    assert ctx.fast_dtype == getattr(torch, dtype_name)
+
+
+def test_autocast_context_rejects_unknown_mode():
+    torch = pytest.importorskip("torch")
+    with pytest.raises(ValueError, match="fp8"):
+        backend._autocast_context(torch.device("cuda"), "fp8")
+
+
+def test_demix_off_runs_forward_without_autocast():
+    torch = pytest.importorskip("torch")
+    probe = _autocast_probe(torch)
+    backend._demix(probe, torch.randn(2, 43), _DEMIX_CFG, batch=2, autocast="off")
+    assert probe.seen and all(enabled is False for enabled, _ in probe.seen)
+
+
+def test_demix_default_reads_autocast_from_config(monkeypatch):
+    # autocast=None -> config resolver (env > conf > "off"), mirroring batch=None
+    torch = pytest.importorskip("torch")
+    calls: list[str] = []
+
+    def _resolver():
+        calls.append("hit")
+        return "off"
+
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", _resolver)
+    probe = _autocast_probe(torch)
+    backend._demix(probe, torch.randn(2, 43), _DEMIX_CFG, batch=2)
+    assert calls == ["hit"]  # resolved once per demix, not per window
+    assert all(enabled is False for enabled, _ in probe.seen)
+    calls.clear()
+    backend._demix(probe, torch.randn(2, 43), _DEMIX_CFG, batch=2, autocast="off")
+    assert calls == []  # explicit argument bypasses the config
+
+
+def test_demix_bf16_on_cpu_model_runs_fp32_path(caplog):
+    # non-CUDA model: bf16 request is a debug-logged no-op, output equals mode "off" exactly
+    torch = pytest.importorskip("torch")
+    mix = torch.randn(2, 43)
+    probe_off = _autocast_probe(torch)
+    ref = backend._demix(probe_off, mix, _DEMIX_CFG, batch=3, autocast="off")
+    probe_bf16 = _autocast_probe(torch)
+    with caplog.at_level(logging.DEBUG, logger="voxweave"):
+        out = backend._demix(probe_bf16, mix, _DEMIX_CFG, batch=3, autocast="bf16")
+    assert probe_bf16.seen and all(enabled is False for enabled, _ in probe_bf16.seen)
+    assert torch.equal(out, ref)
+    assert len([r for r in caplog.records if "autocast=bf16" in r.message]) == 1
+
+
+def test_demix_wraps_only_the_model_forward(monkeypatch):
+    # The autocast context must be entered around each forward call and nothing else:
+    # padding, the .float().cpu() cast, the overlap-add and progress all run outside it.
+    torch = pytest.importorskip("torch")
+
+    class _Recorder:
+        def __init__(self):
+            self.active = False
+            self.enters = 0
+
+        def __enter__(self):
+            assert not self.active
+            self.active = True
+            self.enters += 1
+
+        def __exit__(self, *exc):
+            self.active = False
+
+    recorder = _Recorder()
+    helper_calls: list[tuple[object, str]] = []
+
+    def _fake_ctx(dev, mode):
+        helper_calls.append((dev, mode))
+        return recorder
+
+    monkeypatch.setattr(backend, "_autocast_context", _fake_ctx)
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+            self.forwards_inside = 0
+
+        def forward(self, x):
+            assert recorder.active
+            self.forwards_inside += 1
+            return x
+
+    model = _Model()
+    progress_states: list[bool] = []
+    mix = torch.randn(2, 43)  # step=4 -> 11 windows; batch=4 -> 3 forwards
+    backend._demix(
+        model,
+        mix,
+        _DEMIX_CFG,
+        progress=lambda d, t: progress_states.append(recorder.active),
+        batch=4,
+        autocast="fp16",
+    )
+    assert helper_calls == [(next(model.parameters()).device, "fp16")]
+    assert model.forwards_inside == 3 and recorder.enters == 3
+    assert not recorder.active
+    assert progress_states and not any(progress_states)
+
+
+def test_demix_off_is_byte_identical_to_legacy(monkeypatch):
+    # Default (unset) and explicit "off" reproduce the pre-autocast loop bit for bit.
+    torch = pytest.importorskip("torch")
+    monkeypatch.delenv("VOXWEAVE_SEP_AUTOCAST", raising=False)
+
+    class _Identity(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, x):
+            return x
+
+    torch.manual_seed(0)
+    mix = torch.randn(2, 131)  # not a multiple of step: exercises the padded tail
+    for bs in (1, 3):
+        ref = _legacy_demix(_Identity(), mix, _DEMIX_CFG, batch=bs)
+        ref_bytes = ref.numpy().tobytes()
+        off = backend._demix(_Identity(), mix, _DEMIX_CFG, batch=bs, autocast="off")
+        default = backend._demix(_Identity(), mix, _DEMIX_CFG, batch=bs)
+        assert off.numpy().tobytes() == ref_bytes
+        assert default.numpy().tobytes() == ref_bytes
 
 
 def test_resolve_asr_model():

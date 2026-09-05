@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 from collections.abc import Sequence
+from contextlib import nullcontext
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import BinaryIO, Literal, overload
@@ -302,13 +303,40 @@ def _load_separator():
     return model, cfg, separator_identity
 
 
-def _demix(model, mix, cfg, progress=None, batch=None):
+def _autocast_context(dev, mode: str):
+    """Context manager for the separator forward under autocast ``mode``.
+
+    ``"off"`` returns a ``nullcontext``. ``"bf16"`` / ``"fp16"`` return a
+    ``torch.autocast`` bound to CUDA when ``dev`` is a CUDA device; on any other
+    device autocast is not attempted (logged once at debug level) and the fp32
+    path runs unchanged. Only the model forward is meant to run inside it -- the
+    overlap-add accumulation in :func:`_demix` stays fp32 either way.
+    """
+    if mode not in config.SEP_AUTOCAST_MODES:
+        raise ValueError(
+            f"unknown separator autocast mode {mode!r} "
+            f"(expected one of {'/'.join(config.SEP_AUTOCAST_MODES)})"
+        )
+    if mode == "off":
+        return nullcontext()
+    if dev.type != "cuda":
+        log.debug("separator autocast=%s ignored on %s (CUDA only)", mode, dev)
+        return nullcontext()
+    import torch
+
+    dtype = torch.bfloat16 if mode == "bf16" else torch.float16
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def _demix(model, mix, cfg, progress=None, batch=None, autocast=None):
     """Chunked overlap-add inference: mix [ch, t] float32 -> vocals [ch, t].
 
     Hann window + >=2x overlap satisfies COLA; tail normalized by window sum. num_stems=1
     output may or may not have a stem dimension -- both shapes are handled.
     Windows are stacked `batch` at a time into one forward (default conf [batch].separate;
     1 unless configured -- batch=1 already saturates 8 GB-class GPUs, see config._BATCH_DEFAULTS).
+    `autocast` ("off" | "bf16" | "fp16"; default conf [separate].autocast, "off" unless
+    configured) wraps only the model forward, and only on CUDA -- see _autocast_context.
     progress(done, total) called after each window if provided.
     """
     import torch
@@ -327,6 +355,8 @@ def _demix(model, mix, cfg, progress=None, batch=None):
     starts = list(range(0, total, step))
     nwin = len(starts)
     bs = batch if batch is not None else config.conf_batch("separate")
+    mode = autocast if autocast is not None else config.conf_separate_autocast()
+    forward_ctx = _autocast_context(dev, mode)
     with torch.no_grad():
         for i in range(0, nwin, bs):
             grp = starts[i : i + bs]
@@ -338,7 +368,8 @@ def _demix(model, mix, cfg, progress=None, batch=None):
                 if n < chunk:  # pad final segment to full chunk size
                     seg = torch.nn.functional.pad(seg, (0, chunk - n))
                 segs.append(seg)
-            out = model(torch.stack(segs).to(dev))  # [B, (stems,) ch, t]
+            with forward_ctx:
+                out = model(torch.stack(segs).to(dev))  # [B, (stems,) ch, t]
             if out.dim() == 4:  # [B, stems, ch, t] -> take first (vocals) stem
                 out = out[:, 0]
             out = out.float().cpu()  # [B, ch, chunk]
