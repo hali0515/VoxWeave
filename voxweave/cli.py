@@ -635,6 +635,38 @@ def cmd_align(
         "or the endpoint default. Use 'default' to override a configured effort."
     ),
 )
+@click.option(
+    "--concurrency",
+    type=click.IntRange(min=1),
+    default=None,
+    metavar="N",
+    help=(
+        "Translation windows in flight at once (default: VOXWEAVE_TRANSLATE_CONCURRENCY "
+        f"env, conf [llm].concurrency, or {config.DEFAULT_TRANSLATE_CONCURRENCY}). "
+        "1 = one whole-episode request with translated-tail continuity; >1 = bounded "
+        "windows in parallel with source-text context (self-hosted servers)."
+    ),
+)
+@click.option(
+    "--window",
+    "window_cues",
+    type=click.IntRange(min=1),
+    default=None,
+    metavar="N",
+    help=(
+        "Cues per window when --concurrency > 1 (default: VOXWEAVE_TRANSLATE_WINDOW_CUES "
+        f"env, conf [llm].window_cues, or {config.DEFAULT_TRANSLATE_WINDOW_CUES})."
+    ),
+)
+@click.option(
+    "--allow-partial",
+    is_flag=True,
+    default=False,
+    help=(
+        "Write the output even when cues stay untranslated after the retry (they keep "
+        "their source text). Default: fail and keep the progress file so a rerun resumes."
+    ),
+)
 def cmd_translate(
     vtt: Path,
     to: str,
@@ -644,6 +676,9 @@ def cmd_translate(
     base_url: str | None,
     api_key_env: str,
     reasoning_effort: str | None,
+    concurrency: int | None,
+    window_cues: int | None,
+    allow_partial: bool,
 ) -> None:
     """Translate after align: call an OpenAI-compatible endpoint for each subtitle cue
     (VTT/SRT/ASS), write <stem>.<to>.<ext> mirroring the input format (original unchanged)."""
@@ -661,6 +696,9 @@ def cmd_translate(
             glossary=gloss,
             api_key=api_key,
             reasoning_effort=reasoning_effort,
+            concurrency=concurrency,
+            window_cues=window_cues,
+            allow_partial=allow_partial,
             reporter=rep,
             **kwargs,
         )

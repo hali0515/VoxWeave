@@ -77,10 +77,19 @@ def endpoint(tmp_path, monkeypatch):
         client.close()
 
 
-def _config(path, *, effort=None, model=SERVED_MODEL, key_env="TEST_TRANSLATE_KEY"):
+def _config(
+    path,
+    *,
+    effort=None,
+    model=SERVED_MODEL,
+    key_env="TEST_TRANSLATE_KEY",
+    concurrency=None,
+):
     values = {"model": model, "base_url": BASE_URL, "api_key_env": key_env}
     if effort is not None:
         values["reasoning_effort"] = effort
+    if concurrency is not None:
+        values["concurrency"] = concurrency
     path.write_text(
         "[llm]\n"
         + "".join(f"{key} = {json.dumps(value)}\n" for key, value in values.items()),
@@ -123,11 +132,19 @@ def _models(model=SERVED_MODEL):
     )
 
 
-def _completion(request, translations):
+def _completion(request, translations, *, finish_reason="stop", content=None):
+    """A chat completion (or SSE stream) carrying ``translations``.
+
+    ``finish_reason`` is what the server reports for the answer; a stream ends
+    with the finish chunk servers emit before ``[DONE]`` (``None`` = no finish
+    chunk at all, the shape of a request the server dropped mid-answer).
+    ``content`` overrides the JSON body (dirty or partial text).
+    """
     body = _body(request)
-    content = json.dumps(
-        {"translations": [{"i": i, "t": text} for i, text in translations.items()]}
-    )
+    if content is None:
+        content = json.dumps(
+            {"translations": [{"i": i, "t": text} for i, text in translations.items()]}
+        )
     common = {"id": "chatcmpl-test", "created": 0, "model": body["model"]}
     if not body.get("stream"):
         return httpx.Response(
@@ -139,7 +156,7 @@ def _completion(request, translations):
                     {
                         "index": 0,
                         "message": {"role": "assistant", "content": content},
-                        "finish_reason": "stop",
+                        "finish_reason": finish_reason,
                     }
                 ],
             },
@@ -163,6 +180,14 @@ def _completion(request, translations):
         }
         for delta in deltas
     ]
+    if finish_reason is not None:
+        events.append(
+            {
+                **common,
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            }
+        )
     events.append({**common, "object": "chat.completion.chunk", "choices": []})
     stream = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
     return httpx.Response(
@@ -478,6 +503,123 @@ def test_interrupted_sdk_stream_retries_with_effort_and_closes_responses(
     assert advances == [1, 1]
 
 
+@pytest.mark.parametrize("streaming", [False, True], ids=["blocking", "streaming"])
+def test_length_finish_retries_then_drops_json_object_mode(endpoint, streaming, caplog):
+    # vLLM's structured-output grammar can abort/truncate the answer: the first
+    # attempts end with finish_reason "length"; the final attempt runs without
+    # response_format and succeeds. The stray '{"' prefix vLLM emits is salvaged.
+    conf, install, requests, sleeps = endpoint
+    _config(conf, effort="low")
+
+    def respond(request):
+        body = _body(request)
+        if "response_format" in body:
+            return _completion(
+                request, {}, finish_reason="length", content='{"translations":[{"i"'
+            )
+        return _completion(
+            request,
+            {},
+            content='{"' + json.dumps({"translations": [{"i": 0, "t": "translated"}]}),
+        )
+
+    install(respond)
+    with caplog.at_level("WARNING", logger="voxweave"):
+        result = translate.translate_cues(
+            [{"i": 0, "t": "source"}],
+            to="en",
+            model=SERVED_MODEL,
+            reporter=Reporter() if streaming else None,
+        )
+
+    assert result == {0: "translated"}
+    assert len(requests) == 3
+    bodies = [_body(r) for r in requests]
+    assert [("response_format" in b) for b in bodies] == [True, True, False]
+    assert all(b["reasoning_effort"] == "low" for b in bodies)
+    assert all(b.get("stream", False) is streaming for b in bodies)
+    assert len(sleeps) == 1  # one backoff between the two json_object attempts
+    assert any("json_object mode dropped" in r.message for r in caplog.records)
+    assert any("finish_reason='length'" in r.message for r in caplog.records)
+
+
+def test_stream_ending_without_finish_chunk_is_retried(endpoint):
+    conf, install, requests, sleeps = endpoint
+    _config(conf)
+    install(
+        lambda request: _completion(
+            request,
+            {0: "translated"},
+            finish_reason=None if len(requests) == 1 else "stop",
+        )
+    )
+
+    result = translate.translate_cues(
+        [{"i": 0, "t": "source"}],
+        to="en",
+        model=SERVED_MODEL,
+        reporter=Reporter(),
+    )
+
+    assert result == {0: "translated"}
+    assert len(requests) == 2 and len(sleeps) == 1
+    assert _body(requests[0]) == _body(requests[1])  # retried as-is (json_object)
+
+
+def test_cli_fails_and_keeps_progress_when_cues_stay_untranslated(endpoint, tmp_path):
+    conf, install, requests, _ = endpoint
+    _config(conf, concurrency=1)
+    # The model keeps answering cue 1 with a blank translation (a parseable answer,
+    # so no incomplete-response retry): it stays missing through the retry stage.
+    install(lambda request: _completion(request, {0: "first", 1: ""}))
+
+    result = CliRunner().invoke(
+        cli, ["translate", str(_subtitle(tmp_path, 2)), "--to", "en"]
+    )
+
+    assert result.exit_code == 1
+    assert "1 of 2 cues untranslated" in result.output
+    assert "--allow-partial" in result.output
+    assert [_cue_ids(r) for r in requests] == [[0, 1], [1]]
+    assert not (tmp_path / "episode.en.vtt").exists()
+    assert list(tmp_path.rglob("*.progress.json"))
+
+    requests.clear()
+    partial = CliRunner().invoke(
+        cli,
+        ["translate", str(_subtitle(tmp_path, 2)), "--to", "en", "--allow-partial"],
+    )
+
+    assert partial.exit_code == 0, partial.output
+    assert [_cue_ids(r) for r in requests] == [[0, 1], [1]]
+    output = (tmp_path / "episode.en.vtt").read_text(encoding="utf-8")
+    assert "first" in output and "source 1" in output
+    assert not list(tmp_path.rglob("*.progress.json"))
+
+
+def test_cli_concurrent_default_windows_the_episode(endpoint, tmp_path, monkeypatch):
+    # Built-in default: several bounded windows in flight with source-text context.
+    conf, install, requests, _ = endpoint
+    _config(conf)
+    monkeypatch.setenv("VOXWEAVE_TRANSLATE_WINDOW_CUES", "2")
+    install(
+        lambda request: _completion(
+            request, {i: f"entry {i}" for i in _cue_ids(request)}
+        )
+    )
+
+    result = CliRunner().invoke(
+        cli, ["translate", str(_subtitle(tmp_path, 6)), "--to", "en"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sorted(_cue_ids(r) for r in requests) == [[0, 1], [2, 3], [4, 5]]
+    later = [r for r in requests if _cue_ids(r)[0] == 4][0]
+    assert "Preceding source cues" in _body(later)["messages"][0]["content"]
+    output = (tmp_path / "episode.en.vtt").read_text(encoding="utf-8")
+    assert all(f"entry {i}" in output for i in range(6))
+
+
 @pytest.mark.parametrize(
     "changed", [None, "effort", "served-model", "endpoint", "context", "glossary"]
 )
@@ -485,7 +627,8 @@ def test_interrupted_cli_reuses_progress_only_for_the_same_request(
     endpoint, tmp_path, monkeypatch, changed
 ):
     conf, install, requests, _ = endpoint
-    _config(conf, model="auto")
+    # Sequential lane: the request order below is part of what is asserted.
+    _config(conf, model="auto", concurrency=1)
     subtitle = _subtitle(tmp_path, 2)
     glossary = tmp_path / "glossary.json"
     glossary.write_text('{"Ada": "Captain Ada"}', encoding="utf-8")

@@ -448,8 +448,9 @@ def test_pipeline_translate_ass_mirrors_format(tmp_path, monkeypatch):
 
 
 def test_pipeline_translate_fills_missing_with_retry_then_original(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
+    # allow_partial restores the source-text back-fill (with a visible warning).
     vtt = tmp_path / "ep.vtt"
     _write_vtt(vtt)
     calls = []
@@ -461,7 +462,8 @@ def test_pipeline_translate_fills_missing_with_retry_then_original(
         return {}
 
     monkeypatch.setattr(pipeline.translate_mod, "translate_cues", fake_cues)
-    out = pipeline.translate(vtt, to="zh")
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = pipeline.translate(vtt, to="zh", allow_partial=True)
     txt = out.read_text(encoding="utf-8")
     assert "你好" in txt
     assert "world" in txt
@@ -470,6 +472,50 @@ def test_pipeline_translate_fills_missing_with_retry_then_original(
     assert (
         txt.count("-->") == 2
     )  # cue count conserved (partial failure must not drop cues)
+    assert any("1 of 2 cues still untranslated" in r.message for r in caplog.records)
+
+
+def test_pipeline_translate_refuses_partial_output_by_default(tmp_path, monkeypatch):
+    # A file whose cues silently fell back to the source text is indistinguishable
+    # from success -- fail loudly instead, and keep the progress sidecar for a rerun.
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"media")
+    vtt = tmp_path / "ep.vtt"
+    _write_vtt(vtt)
+    calls = []
+
+    def fake_cues(payload, progress_path=None, progress_sig=None, **kw):
+        calls.append([c["i"] for c in payload])
+        translate.save_progress(progress_path, progress_sig, {0: "你好"})
+        return {0: "你好"} if len(calls) == 1 else {}
+
+    monkeypatch.setattr(pipeline.translate_mod, "translate_cues", fake_cues)
+    with pytest.raises(translate.PartialTranslationError) as failure:
+        pipeline.translate(vtt, to="zh")
+    assert failure.value.missing == [1]
+    assert "1 of 2 cues untranslated" in str(failure.value)
+    assert "--allow-partial" in str(failure.value)
+    assert calls == [[0, 1], [1]]  # the retry stage ran before giving up
+    assert not (tmp_path / "ep.zh.vtt").exists()
+    progress = artifacts.claim_paths(media).translation_progress(vtt, "zh")
+    assert progress.exists()  # kept: a rerun resumes from it
+
+
+def test_pipeline_translate_retry_stage_is_sequential(tmp_path, monkeypatch):
+    # The main stage may run concurrently; the missing-cue retry always runs as
+    # one sequential lane with the translated tail, keeping the operator's window.
+    vtt = tmp_path / "ep.vtt"
+    _write_vtt(vtt)
+    seen = []
+
+    def fake_cues(payload, **kw):
+        seen.append({k: kw.get(k) for k in ("concurrency", "window_cues", "batch")})
+        return {0: "你好"} if len(seen) == 1 else {1: "世界"}
+
+    monkeypatch.setattr(pipeline.translate_mod, "translate_cues", fake_cues)
+    pipeline.translate(vtt, to="zh", concurrency=4, window_cues=25)
+    assert seen[0]["concurrency"] == 4 and seen[0]["window_cues"] == 25
+    assert seen[1]["concurrency"] == 1 and seen[1]["batch"] == 25
 
 
 # --- conservation observability / input validation ---------------------------
@@ -1210,3 +1256,525 @@ def test_dash_cue_streaming_progress_counts_each_half():
     translate.translate_cues(payload, to="zh", model="m", client=client, reporter=rep)
     assert rep.total == 2  # denominator = internal unit count
     assert rep.advances == 2
+
+
+# --------------------------------------------------------------------------- #
+# Response completeness (finish_reason), json_object fallback, empty-parse retry.
+# A self-hosted vLLM aborts requests whose structured-output FSM fails; the
+# stream then ends early. That must surface as an incomplete window, never as a
+# silently accepted partial buffer.
+# --------------------------------------------------------------------------- #
+
+
+def _json_ok(indices):
+    import json as _json
+
+    return _json.dumps({"translations": [{"i": i, "t": f"tx {i}"} for i in indices]})
+
+
+class FinishClient:
+    """Non-streaming fake that exposes ``finish_reason`` like the real SDK. Each
+    queued entry is ``(content, finish_reason)``; every request's kwargs are
+    recorded so tests can see whether ``response_format`` was sent."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, *, model, messages, **kw):
+        self.calls.append({"messages": messages, **kw})
+        content, reason = self._responses.pop(0)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content), finish_reason=reason
+                )
+            ]
+        )
+
+
+class FinishStreamClient:
+    """Streaming fake with SDK-shaped chunks (``finish_reason`` on every choice,
+    ``None`` until the finish chunk). ``finish_reason=None`` ends the stream
+    without any finish chunk -- the shape of a request the server dropped."""
+
+    def __init__(self, pieces, finish_reason="stop"):
+        self._pieces = list(pieces)
+        self._finish = finish_reason
+        self.calls = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _chunks(self):
+        for piece in self._pieces:
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=piece), finish_reason=None
+                    )
+                ]
+            )
+        if self._finish is not None:
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None),
+                        finish_reason=self._finish,
+                    )
+                ]
+            )
+        yield SimpleNamespace(choices=[])  # trailing usage-only chunk
+
+    def _create(self, *, model, messages, stream=False, **kw):
+        self.calls.append({"messages": messages, "stream": stream, **kw})
+        assert stream
+        return self._chunks()
+
+
+@pytest.fixture
+def fast_retry(monkeypatch):
+    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
+    monkeypatch.setattr(translate, "_RETRY_DELAYS", (0.0,))  # two attempts
+
+
+_MSGS = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+
+
+def test_call_raises_incomplete_on_non_stop_finish_reason():
+    client = FinishClient([('{"translations":[{"i":0,"t":"cut', "length")])
+    with pytest.raises(translate.IncompleteResponse) as failure:
+        translate._call(client, "m", _MSGS)
+    exc = failure.value
+    assert exc.finish_reason == "length"
+    assert exc.chars == len('{"translations":[{"i":0,"t":"cut')
+    assert exc.tail.endswith('"cut')
+    assert "finish_reason='length'" in str(exc)
+    assert translate._retryable(exc)
+
+
+def test_call_accepts_stop_and_tolerates_shapes_without_finish_field():
+    assert translate._call(FinishClient([("{}", "stop")]), "m", _MSGS) == "{}"
+    # Minimal fakes (no finish_reason attribute at all) are trusted as complete.
+    assert translate._call(FakeClient(["{}"]), "m", _MSGS) == "{}"
+
+
+def test_call_stream_without_finish_chunk_is_incomplete():
+    pieces = ['{"translations":[', '{"i":0,"t":"甲"}']
+    with pytest.raises(translate.IncompleteResponse) as failure:
+        translate._call(
+            FinishStreamClient(pieces, finish_reason=None),
+            "m",
+            _MSGS,
+            on_entry=lambda n: None,
+        )
+    assert failure.value.finish_reason is None
+    assert failure.value.chars == len("".join(pieces))
+
+
+def test_call_stream_length_finish_is_incomplete_and_stop_is_complete():
+    pieces = ['{"translations":[', '{"i":0,"t":"甲"}]}']
+    with pytest.raises(translate.IncompleteResponse) as failure:
+        translate._call(
+            FinishStreamClient(pieces, finish_reason="length"),
+            "m",
+            _MSGS,
+            on_entry=lambda n: None,
+        )
+    assert failure.value.finish_reason == "length"
+    advances = []
+    out = translate._call(
+        FinishStreamClient(pieces, finish_reason="stop"),
+        "m",
+        _MSGS,
+        on_entry=advances.append,
+    )
+    assert out == "".join(pieces)
+    assert advances == [1]
+
+
+def test_call_without_json_mode_omits_response_format():
+    client = FinishClient([("{}", "stop")])
+    translate._call(client, "m", _MSGS, json_mode=False)
+    assert "response_format" not in client.calls[0]
+    client = FinishClient([("{}", "stop")])
+    translate._call(client, "m", _MSGS)
+    assert client.calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_incomplete_window_retries_then_drops_json_object_mode(fast_retry, caplog):
+    client = FinishClient(
+        [
+            ('{"translations":[{"i":0,"t":"cu', "length"),
+            ("", "length"),
+            (_json_ok([0]), "stop"),  # plain chat succeeds
+        ]
+    )
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = translate.translate_cues(_payload(1), to="zh", model="m", client=client)
+    assert out == {0: "tx 0"}
+    assert len(client.calls) == 3
+    assert [("response_format" in c) for c in client.calls] == [True, True, False]
+    assert any("json_object mode dropped" in r.message for r in caplog.records)
+
+
+def test_empty_parse_is_treated_as_incomplete_and_retried(fast_retry, caplog):
+    # finish_reason "stop" but nothing parseable -> retry (still json mode)
+    client = FinishClient([("Sorry, I cannot help.", "stop"), (_json_ok([0]), "stop")])
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = translate.translate_cues(_payload(1), to="zh", model="m", client=client)
+    assert out == {0: "tx 0"}
+    assert len(client.calls) == 2
+    assert all("response_format" in c for c in client.calls)
+    assert any("no parseable translations" in r.message for r in caplog.records)
+
+
+def test_only_stray_indices_counts_as_empty(fast_retry):
+    client = FinishClient(
+        [('{"translations":[{"i":9,"t":"stray"}]}', "stop"), (_json_ok([0]), "stop")]
+    )
+    out = translate.translate_cues(_payload(1), to="zh", model="m", client=client)
+    assert out == {0: "tx 0"}
+    assert len(client.calls) == 2
+
+
+def test_window_still_incomplete_after_fallback_is_left_for_retry_stage(
+    fast_retry, caplog
+):
+    client = FinishClient([("", "length")] * 3)
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = translate.translate_cues(_payload(2), to="zh", model="m", client=client)
+    assert out == {}  # no exception: the pipeline's retry stage decides
+    assert len(client.calls) == 3  # 2 json_object attempts + 1 plain chat
+    assert any(
+        "leaving its cues for the retry stage" in r.message for r in caplog.records
+    )
+
+
+def test_partial_window_coverage_is_logged_not_raised(caplog):
+    client = FinishClient([(_json_ok([0]), "stop")])
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = translate.translate_cues(_payload(3), to="zh", model="m", client=client)
+    assert out == {0: "tx 0"}
+    assert len(client.calls) == 1
+    assert any(
+        "2 of 3 cues missing from the response: 1, 2" in r.message
+        for r in caplog.records
+    )
+
+
+def test_transport_errors_still_propagate_after_retries(fast_retry):
+    client = FlakyClient([], fail_times=99)
+    with pytest.raises(ConnectionError):
+        translate.translate_cues(_payload(1), to="zh", model="m", client=client)
+    assert client.calls == 2  # json_object attempts only; no plain-chat fallback
+
+
+def test_build_messages_source_tail_is_context_only():
+    msgs = translate.build_messages(
+        [{"i": 3, "t": "x"}], to="zh", source_tail=["前の行", "その前"]
+    )
+    system = msgs[0]["content"]
+    assert "Preceding source cues" in system
+    assert "前の行\nその前" in system
+    assert "already translated" not in system
+
+
+def test_incomplete_and_partial_errors_are_runtime_errors():
+    assert issubclass(translate.IncompleteResponse, RuntimeError)
+    err = translate.PartialTranslationError(list(range(12)), 40)
+    assert isinstance(err, RuntimeError)
+    assert err.missing == list(range(12)) and err.total == 40
+    assert "12 of 40 cues untranslated" in str(err)
+    assert "0, 1, 2, 3, 4, 5, 6, 7, ..." in str(err)
+
+
+# --------------------------------------------------------------------------- #
+# Concurrent windows (concurrency > 1): bounded windows on a thread pool with
+# source-text continuity; concurrency == 1 must stay the sequential planner.
+# --------------------------------------------------------------------------- #
+
+
+class EchoClient:
+    """Thread-safe fake: translates every requested cue ``i`` as ``tx i`` (both
+    request modes), tracks the peak number of in-flight requests, and lets a
+    test fail chosen cues' windows with a finish_reason or an exception."""
+
+    def __init__(self, *, fail_cues=(), finish_reason="length", raise_exc=None):
+        import threading
+
+        self.fail_cues = set(fail_cues)
+        self.finish_reason = finish_reason
+        self.raise_exc = raise_exc
+        self.calls = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self._lock = threading.Lock()
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    @staticmethod
+    def _ids(messages):
+        import json as _json
+
+        return [c["i"] for c in _json.loads(messages[-1]["content"])["cues"]]
+
+    def _create(self, *, model, messages, stream=False, **kw):
+        import time as _time
+
+        with self._lock:
+            self.calls.append({"messages": messages, "stream": stream, **kw})
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            _time.sleep(0.02)
+            ids = self._ids(messages)
+            failing = bool(self.fail_cues & set(ids))
+            if failing and self.raise_exc is not None:
+                raise self.raise_exc
+            reason = self.finish_reason if failing else "stop"
+            content = "" if failing else _json_ok(ids)
+            if not stream:
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=content),
+                            finish_reason=reason,
+                        )
+                    ]
+                )
+            return iter(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content=content),
+                                finish_reason=None,
+                            )
+                        ]
+                    ),
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content=None),
+                                finish_reason=reason,
+                            )
+                        ]
+                    ),
+                ]
+            )
+        finally:
+            with self._lock:
+                self.in_flight -= 1
+
+
+def _system_of(call):
+    return call["messages"][0]["content"]
+
+
+def test_concurrent_windows_dispatch_merge_in_order_with_source_tails(
+    tmp_path, monkeypatch
+):
+    client = EchoClient()
+    saves = []
+    real_save = translate.save_progress
+
+    def counting_save(path, sig, trans):
+        saves.append(len(trans))
+        real_save(path, sig, trans)
+
+    monkeypatch.setattr(translate, "save_progress", counting_save)
+    rep = _RecordingReporter()
+    progress = tmp_path / "ep.zh.progress.json"
+    payload = _payload(20)
+    out = translate.translate_cues(
+        payload,
+        to="zh",
+        model="m",
+        client=client,
+        reporter=rep,
+        concurrency=4,
+        window_cues=2,
+        progress_path=progress,
+        progress_sig=translate.payload_signature(payload),
+    )
+    assert out == {i: f"tx {i}" for i in range(20)}
+    assert list(out) == list(range(20))  # merged in index order
+    assert len(client.calls) == 10  # every window dispatched exactly once
+    assert client.max_in_flight > 1  # actually parallel
+    assert all(c["stream"] for c in client.calls)  # reporter -> streaming
+    assert rep.total == 20 and rep.advances == 20
+    # progress saved after each completed window, cumulative
+    assert len(saves) == 10 and sorted(saves) == list(range(2, 21, 2))
+    effective = translate.translation_signature(
+        translate.payload_signature(payload),
+        model="m",
+        base_url="https://api.openai.com/v1",
+        to="zh",
+        context=None,
+        glossary=None,
+        reasoning_effort=None,
+    )
+    assert translate.load_progress(progress, effective) == out
+    # source-text tails: window k>0 sees the preceding CONTEXT_TAIL source cues,
+    # the first window none; no translated-tail form anywhere
+    by_first = {EchoClient._ids(c["messages"])[0]: c for c in client.calls}
+    assert "Preceding source cues" not in _system_of(by_first[0])
+    assert "already translated" not in _system_of(by_first[6])
+    assert "line 3\nline 4\nline 5" in _system_of(by_first[6])
+    assert "line 0\nline 1" in _system_of(by_first[2])  # only two precede cue 2
+
+
+def test_concurrent_window_failure_does_not_lose_the_others(
+    tmp_path, fast_retry, caplog
+):
+    client = EchoClient(fail_cues={5})  # window (4, 5) always ends "length"
+    progress = tmp_path / "ep.zh.progress.json"
+    payload = _payload(20)
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = translate.translate_cues(
+            payload,
+            to="zh",
+            model="m",
+            client=client,
+            concurrency=4,
+            window_cues=2,
+            progress_path=progress,
+            progress_sig=translate.payload_signature(payload),
+        )
+    expected = {i: f"tx {i}" for i in range(20) if i not in (4, 5)}
+    assert out == expected
+    # 9 good windows + 2 json_object attempts + 1 plain-chat fallback for the bad one
+    assert len(client.calls) == 12
+    bad = [c for c in client.calls if 5 in EchoClient._ids(c["messages"])]
+    assert [("response_format" in c) for c in bad] == [True, True, False]
+    assert any("json_object mode dropped" in r.message for r in caplog.records)
+    effective = translate.translation_signature(
+        translate.payload_signature(payload),
+        model="m",
+        base_url="https://api.openai.com/v1",
+        to="zh",
+        context=None,
+        glossary=None,
+        reasoning_effort=None,
+    )
+    assert translate.load_progress(progress, effective) == expected
+
+
+def test_concurrent_hard_error_propagates_but_keeps_completed_progress(tmp_path):
+    client = EchoClient(fail_cues={19}, raise_exc=ValueError("bad request"))
+    progress = tmp_path / "ep.zh.progress.json"
+    payload = _payload(20)
+    with pytest.raises(ValueError, match="bad request"):
+        translate.translate_cues(
+            payload,
+            to="zh",
+            model="m",
+            client=client,
+            concurrency=2,
+            window_cues=2,
+            progress_path=progress,
+            progress_sig=translate.payload_signature(payload),
+        )
+    effective = translate.translation_signature(
+        translate.payload_signature(payload),
+        model="m",
+        base_url="https://api.openai.com/v1",
+        to="zh",
+        context=None,
+        glossary=None,
+        reasoning_effort=None,
+    )
+    saved = translate.load_progress(progress, effective)
+    assert saved and all(saved[i] == f"tx {i}" for i in saved)
+    assert 19 not in saved
+
+
+def test_concurrent_resume_skips_covered_windows_and_counts_them(tmp_path):
+    payload = _payload(6)
+    progress = tmp_path / "ep.zh.progress.json"
+    effective = translate.translation_signature(
+        translate.payload_signature(payload),
+        model="m",
+        base_url="https://api.openai.com/v1",
+        to="zh",
+        context=None,
+        glossary=None,
+        reasoning_effort=None,
+    )
+    translate.save_progress(progress, effective, {0: "tx 0", 1: "tx 1"})
+    client = EchoClient()
+    rep = _RecordingReporter()
+    out = translate.translate_cues(
+        payload,
+        to="zh",
+        model="m",
+        client=client,
+        reporter=rep,
+        concurrency=3,
+        window_cues=2,
+        progress_path=progress,
+        progress_sig=translate.payload_signature(payload),
+    )
+    assert out == {i: f"tx {i}" for i in range(6)}
+    assert sorted(EchoClient._ids(c["messages"])[0] for c in client.calls) == [2, 4]
+    assert rep.advances == 6  # resumed window counted as done
+
+
+def test_concurrent_seed_tail_reaches_only_the_first_window():
+    client = EchoClient()
+    translate.translate_cues(
+        _payload(4),
+        to="zh",
+        model="m",
+        client=client,
+        concurrency=2,
+        window_cues=2,
+        tail=[("prev line", "上一句")],
+    )
+    by_first = {EchoClient._ids(c["messages"])[0]: c for c in client.calls}
+    assert "上一句" in _system_of(by_first[0])
+    assert "上一句" not in _system_of(by_first[2])
+    assert "line 0\nline 1" in _system_of(by_first[2])
+
+
+def test_concurrency_one_never_touches_the_thread_pool(monkeypatch):
+    # The sequential lane is today's planner: whole-episode batch, translated tail.
+    def boom(*a, **k):
+        raise AssertionError("ThreadPoolExecutor used in sequential mode")
+
+    monkeypatch.setattr(translate, "ThreadPoolExecutor", boom)
+    client = FakeClient([_json_ok(range(3))])
+    out = translate.translate_cues(
+        _payload(3), to="zh", model="m", client=client, concurrency=1, window_cues=1
+    )
+    assert out == {i: f"tx {i}" for i in range(3)}
+    assert len(client.calls) == 1  # window_cues ignored: batch stays 800
+
+
+def test_concurrent_mode_respects_char_budget_too():
+    client = EchoClient()
+    payload = [{"i": i, "t": f"{'x' * 49}{i}"} for i in range(4)]
+    translate.translate_cues(
+        payload,
+        to="zh",
+        model="m",
+        client=client,
+        concurrency=2,
+        window_cues=100,
+        char_budget=120,
+    )
+    assert sorted(EchoClient._ids(c["messages"]) for c in client.calls) == [
+        [0, 1],
+        [2, 3],
+    ]
+
+
+def test_translate_cues_rejects_invalid_concurrency_and_window():
+    client = FakeClient([])
+    with pytest.raises(ValueError, match="concurrency"):
+        translate.translate_cues(
+            _payload(1), to="zh", model="m", client=client, concurrency=0
+        )
+    with pytest.raises(ValueError, match="window_cues"):
+        translate.translate_cues(
+            _payload(1), to="zh", model="m", client=client, window_cues=0
+        )

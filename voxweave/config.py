@@ -29,6 +29,13 @@ DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
 DEFAULT_LLM_MODEL = "gpt-5.5"
 DEFAULT_LLM_API_KEY_ENV = "OPENAI_API_KEY"
 LLM_MODEL_AUTO = "auto"
+# `translate` windowing for a self-hosted server: several bounded windows in flight
+# instead of one whole-episode request. A thinking model burns ~1k reasoning tokens
+# per request and a single 800-cue request is both slow and a single point of
+# failure (one aborted stream loses everything). concurrency = 1 restores the
+# whole-episode single request (best cross-window continuity, the OpenAI path).
+DEFAULT_TRANSLATE_CONCURRENCY = 8
+DEFAULT_TRANSLATE_WINDOW_CUES = 100
 # community-1 is the default (better multi-speaker separation in practice);
 # the 3.1 pipeline stays selectable via the "3.1" alias and keeps its own
 # LEGACY constant because the pyannote-4 fail-closed guard for an unverified
@@ -104,11 +111,20 @@ _TEMPLATE = """\
 #   reasoning_effort = translate's optional reasoning effort (= --reasoning-effort /
 #                 VOXWEAVE_TRANSLATE_REASONING_EFFORT). Values depend on the served model.
 #                 Unset or "default" leaves the endpoint's default unchanged.
+#   concurrency = translate windows in flight at once (= --concurrency /
+#                 VOXWEAVE_TRANSLATE_CONCURRENCY; default 8, min 1). 1 = one whole-episode
+#                 request with translated-tail continuity (best consistency, OpenAI-style);
+#                 >1 = bounded windows translated in parallel with source-text context
+#                 (throughput on a self-hosted vLLM; use glossary/context for consistency).
+#   window_cues = cues per window when concurrency > 1 (= --window /
+#                 VOXWEAVE_TRANSLATE_WINDOW_CUES; default 100, min 1).
 [llm]
 # model = "gpt-5.5"
 # base_url = "http://127.0.0.1:8000/v1"
 # api_key_env = "OPENAI_API_KEY"
 # reasoning_effort = "low"
+# concurrency = 8
+# window_cues = 100
 
 # dual-ASR fusion sub-models (= CLI --hybrid; env VOXWEAVE_FUSION_WHISPER / VOXWEAVE_FUSION_QWEN).
 # whisper supplies accurate text, Qwen supplies punctuation positions (merged on a shared timeline).
@@ -334,6 +350,77 @@ def resolve_llm_reasoning_effort(cli_value: str | None) -> str | None:
         or _nonempty_str(_conf_llm("reasoning_effort"))
     )
     return value.strip() if value is not None else None
+
+
+def _positive_int(value: object, source: str) -> int | None:
+    """``value`` as an int >= 1, or None (with a warning) when it is missing or invalid.
+
+    Accepts ints and digit strings (env vars arrive as text); bools, floats,
+    zero and negatives are rejected so a typo falls through to the next source.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        parsed = None
+    elif isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            parsed = None
+    else:
+        parsed = None
+    if parsed is None or parsed < 1:
+        log.warning("%s must be an integer >= 1 (got %r); ignoring it", source, value)
+        return None
+    return parsed
+
+
+def _resolve_llm_positive_int(
+    cli_value: object, *, envvar: str, key: str, default: int
+) -> int:
+    """Shared CLI > env > conf ``[llm].<key>`` > default resolution for the two
+    translate windowing knobs; every invalid source warns and falls through."""
+    resolved = _positive_int(cli_value, f"--{key.replace('_', '-')}")
+    if resolved is not None:
+        return resolved
+    env = os.environ.get(envvar)
+    if env is not None and env.strip():
+        resolved = _positive_int(env, f"environment {envvar}")
+        if resolved is not None:
+            return resolved
+    llm = _load().get("llm")
+    if isinstance(llm, dict) and key in llm:
+        resolved = _positive_int(llm[key], f"config [llm].{key}")
+        if resolved is not None:
+            return resolved
+    return default
+
+
+def resolve_llm_concurrency(cli_value: object = None) -> int:
+    """Translate windows in flight at once. Precedence: CLI value >
+    ``VOXWEAVE_TRANSLATE_CONCURRENCY`` > conf ``[llm].concurrency`` >
+    :data:`DEFAULT_TRANSLATE_CONCURRENCY`; always >= 1 (1 = the sequential
+    whole-episode planner)."""
+    return _resolve_llm_positive_int(
+        cli_value,
+        envvar="VOXWEAVE_TRANSLATE_CONCURRENCY",
+        key="concurrency",
+        default=DEFAULT_TRANSLATE_CONCURRENCY,
+    )
+
+
+def resolve_llm_window_cues(cli_value: object = None) -> int:
+    """Cues per translate window when running concurrently. Precedence: CLI value >
+    ``VOXWEAVE_TRANSLATE_WINDOW_CUES`` > conf ``[llm].window_cues`` >
+    :data:`DEFAULT_TRANSLATE_WINDOW_CUES`; always >= 1."""
+    return _resolve_llm_positive_int(
+        cli_value,
+        envvar="VOXWEAVE_TRANSLATE_WINDOW_CUES",
+        key="window_cues",
+        default=DEFAULT_TRANSLATE_WINDOW_CUES,
+    )
 
 
 def conf_hf_token() -> str | None:

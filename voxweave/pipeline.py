@@ -5745,13 +5745,24 @@ def translate(
     base_url: str | None = None,
     api_key: str | None = None,
     reasoning_effort: str | None = None,
+    concurrency: int | None = None,
+    window_cues: int | None = None,
+    allow_partial: bool = False,
     reporter: Reporter | None = None,
 ) -> Path:
-    """Translate subtitle cues via OpenAI; write <stem>.<to>.<ext> (source untouched).
+    """Translate subtitle cues via an OpenAI-compatible endpoint; write
+    <stem>.<to>.<ext> (source untouched).
 
     Accepts VTT/SRT/ASS/SSA; the output mirrors the input format (SSA is written
-    back as ASS). Missing translations are retried once; any remaining are
-    back-filled with source text. Output cue count always equals input cue count.
+    back as ASS). Output cue count always equals input cue count.
+
+    ``concurrency`` / ``window_cues`` (None = env > conf ``[llm]`` > built-in 8 /
+    100) run bounded windows in parallel; ``concurrency=1`` is the single
+    whole-episode request with translated-tail continuity. Missing translations
+    are retried once, sequentially. Cues still missing afterwards fail the run
+    with :class:`voxweave.translate.PartialTranslationError` and keep the
+    progress sidecar so a rerun resumes; ``allow_partial=True`` writes the file
+    anyway with those cues back-filled from the source text (logged).
     """
     from voxweave.subformats import require_subtitle
 
@@ -5763,6 +5774,8 @@ def translate(
     )
     base_url = config.resolve_llm_base_url(base_url)
     reasoning_effort = config.resolve_llm_reasoning_effort(reasoning_effort)
+    concurrency = config.resolve_llm_concurrency(concurrency)
+    window_cues = config.resolve_llm_window_cues(window_cues)
     ext = ".ass" if vtt_path.suffix.lower() == ".ssa" else vtt_path.suffix.lower()
     rep = reporter or Reporter()
     rep.plan(("read subtitles", "translate cues", "write translation"))
@@ -5802,6 +5815,8 @@ def translate(
         reasoning_effort=reasoning_effort,
         progress_path=progress_path,
         progress_sig=translate_mod.payload_signature(payload),
+        concurrency=concurrency,
+        window_cues=window_cues,
     )
     rep.step("translate cues")
     rep.stage(f"translate {len(payload)} cues -> {to}")
@@ -5819,16 +5834,26 @@ def translate(
                 for j in range(missing[0])
                 if trans.get(j, "").strip()
             ][-translate_mod.CONTEXT_TAIL :]
+            # The retry stage is sequential (translated-tail continuity); after a
+            # concurrent main stage it keeps the operator's window size so a large
+            # gap is not re-requested as one oversized window.
+            retry_kwargs: dict[str, Any] = {**tx_kwargs, "concurrency": 1}
+            if concurrency > 1:
+                retry_kwargs["batch"] = window_cues
             trans.update(
                 translate_mod.translate_cues(
-                    retry_payload, **tx_kwargs, tail=tail, reporter=rep
+                    retry_payload, **retry_kwargs, tail=tail, reporter=rep
                 )
             )
             still = translate_mod.validate_and_fill(blocks, trans)
+            if still and not allow_partial:
+                raise translate_mod.PartialTranslationError(still, len(blocks))
             if still:
                 log.warning(
-                    "%d cues still untranslated, back-filling with source text: %s",
+                    "%d of %d cues still untranslated after retry; --allow-partial: "
+                    "back-filling them with source text: %s",
                     len(still),
+                    len(blocks),
                     still,
                 )
     except Exception:

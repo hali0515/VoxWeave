@@ -452,6 +452,7 @@ voxweave translate episode.vtt --target zh
 voxweave translate episode.vtt --target en --context "sci-fi, formal register" --glossary terms.json
 voxweave translate downloaded.srt -t zh               # foreign SRT in, SRT out
 voxweave translate episode.vtt --target zh --reasoning-effort low
+voxweave translate episode.vtt --target zh --concurrency 1   # one whole-episode request
 ```
 
 Translation accepts any OpenAI-compatible Chat Completions endpoint, including a
@@ -463,7 +464,24 @@ base_url = "http://127.0.0.1:8000/v1"
 model = "auto"              # or the exact served model ID from /v1/models
 api_key_env = ""            # keyless server; otherwise name an environment variable
 reasoning_effort = "low"    # translate only; omit to keep the server default
+concurrency = 8             # translate windows in flight; 1 = single whole-episode request
+window_cues = 100           # cues per window when concurrency > 1
 ```
+
+By default the episode is translated as bounded windows (`window_cues` cues each)
+with several requests in flight (`concurrency`); each window sees the preceding
+source cues as context. This trades some cross-window stylistic continuity for
+throughput and resilience on a self-hosted server -- `--glossary` and `--context`
+are the consistency tools there. `--concurrency 1` sends one whole-episode request
+(sequential windows with translated-tail continuity only past 800 cues), the best
+choice for a hosted API.
+
+Every response is checked for completeness: an answer that does not finish with
+`stop` (length cap, a server aborting its structured-output grammar) is retried,
+and the last attempt for that window runs without `response_format` (plain JSON).
+Cues still untranslated after the retry stage fail the command and keep the
+progress file, so rerunning resumes; `--allow-partial` writes the file anyway with
+those cues in source text.
 
 CLI options override environment variables, which override this configuration.
 `--model` accepts a served model name without a built-in model list. `auto` requires
@@ -489,6 +507,9 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 | `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env, `[llm].model` in the config, or `gpt-5.5`; `auto` = the endpoint's only served model). |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](#configuration)). |
 | `--reasoning-effort`           | Model-specific effort. `VOXWEAVE_TRANSLATE_REASONING_EFFORT` > `[llm].reasoning_effort` > endpoint default; `default` explicitly omits the field. |
+| `--concurrency N`              | Windows in flight at once (`VOXWEAVE_TRANSLATE_CONCURRENCY` > `[llm].concurrency` > 8). `1` = one whole-episode request with translated-tail continuity. |
+| `--window N`                   | Cues per window when `--concurrency` > 1 (`VOXWEAVE_TRANSLATE_WINDOW_CUES` > `[llm].window_cues` > 100). |
+| `--allow-partial`              | Write the output even when cues stay untranslated after the retry (they keep their source text). Default: fail and keep the progress file for a resumed rerun. |
 
 </details>
 
@@ -615,6 +636,8 @@ default config is written on first run (migrated automatically from a pre-rename
 - `OPENAI_BASE_URL` (default `[llm].base_url` in the config, else api.openai.com; same as `--base-url`)
 - `VOXWEAVE_TRANSLATE_REASONING_EFFORT` (default `[llm].reasoning_effort`, else the endpoint default;
   same as `translate --reasoning-effort`; `default` leaves the request field unset)
+- `VOXWEAVE_TRANSLATE_CONCURRENCY` / `VOXWEAVE_TRANSLATE_WINDOW_CUES` (default `[llm].concurrency` /
+  `[llm].window_cues`, else 8 / 100; same as `translate --concurrency` / `--window`)
 - `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)
 - `VOXWEAVE_BACKEND` (`mlx` | `torch`; default: `mlx` on mps, else `torch`) — picks the ASR/alignment backend
 - `VOXWEAVE_HF_TOKEN` / `HF_TOKEN` — authentication for gated models, including both pyannote
@@ -725,6 +748,8 @@ model = "auto"                           # or a model name; "auto" = the endpoin
 base_url = "http://127.0.0.1:8000/v1"    # e.g. a local vLLM; remove for api.openai.com
 api_key_env = ""                         # "" = keyless endpoint; else the env var holding the key
 # reasoning_effort = "low"               # translate only; accepted values depend on the served model
+# concurrency = 8                        # translate windows in flight; 1 = single whole-episode request
+# window_cues = 100                      # cues per window when concurrency > 1
 
 # dual-ASR fusion sub-models — only consulted when running with --hybrid.
 [fusion]
