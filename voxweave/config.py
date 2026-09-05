@@ -119,13 +119,16 @@ _TEMPLATE = """\
 # qwen = "Qwen/Qwen3-ASR-1.7B"
 
 # Inference batch sizes: windows per GPU forward pass (= env VOXWEAVE_SEP_BATCH /
-# VOXWEAVE_CTC_BATCH / VOXWEAVE_MMS_BATCH). On an 8 GB-class card batch=1 already
-# saturates compute (measured: no speedup at 2/4, just +~0.8 GiB VRAM per extra
-# separation window) -- only worth raising on much wider GPUs, and only after measuring.
+# VOXWEAVE_CTC_BATCH / VOXWEAVE_MMS_BATCH / VOXWEAVE_ASR_BATCH). On an 8 GB-class card
+# batch=1 already saturates compute for separation and the CTC emission (measured: no
+# speedup at 2/4, just +~0.8 GiB VRAM per extra separation window) -- only worth raising
+# on much wider GPUs, and only after measuring. The Qwen3-ASR decoder is the exception:
+# it is memory-bandwidth-bound at batch 1, so asr decodes several chunks per call.
 [batch]
 # separate = 1   # vocal separation (MelBandRoformer) 8s windows
 # ctc = 1        # wav2vec2 CTC emission 30s windows (en aligner)
 # mms = 4        # MMS-300m emission batch (ja aligner, ctc-forced-aligner generate_emissions)
+# asr = 4        # Qwen3-ASR chunks per decode call (torch backend; whisper/MLX stay per-chunk; 1 = per-chunk)
 
 # Speaker diarization pipeline. The default is "community-1" (better multi-speaker
 # separation); accept its model-card conditions on Hugging Face first. Use "3.1" to
@@ -452,17 +455,21 @@ def conf_ctc_max_dp_frames() -> int:
 # linearly with batch; same for the wav2vec2 CTC emission), so batching only costs VRAM
 # (~+0.8 GiB per extra separation window). The knob exists for much wider GPUs, where
 # per-window kernels may underfill the SMs — measure before raising. mms=4 is the
-# ctc-forced-aligner upstream default (ONNX path, pre-existing behavior).
-_BATCH_DEFAULTS = {"separate": 1, "ctc": 1, "mms": 4}
+# ctc-forced-aligner upstream default (ONNX path, pre-existing behavior). asr=4 is the
+# number of chunks per Qwen3-ASR decode call (backend._asr_pass): the autoregressive
+# decoder is memory-bandwidth-bound at batch 1, so padding a few chunks together is
+# close to free; 1 restores the legacy per-chunk call.
+_BATCH_DEFAULTS = {"separate": 1, "ctc": 1, "mms": 4, "asr": 4}
 _BATCH_ENV = {
     "separate": "VOXWEAVE_SEP_BATCH",
     "ctc": "VOXWEAVE_CTC_BATCH",
     "mms": "VOXWEAVE_MMS_BATCH",  # pre-[batch] env name, kept for back-compat
+    "asr": "VOXWEAVE_ASR_BATCH",
 }
 
 
 def conf_batch(key: str) -> int:
-    """Inference batch size for stage ``key`` ("separate" | "ctc" | "mms"), min 1.
+    """Inference batch size for stage ``key`` ("separate" | "ctc" | "mms" | "asr"), min 1.
 
     Precedence: env _BATCH_ENV[key] > conf ``[batch].<key>`` > _BATCH_DEFAULTS.
     Non-integer values (env or file) are ignored and fall through to the next source.

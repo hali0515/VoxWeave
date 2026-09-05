@@ -37,3 +37,24 @@ def _isolate_voxweave_config(tmp_path: Path) -> Iterator[None]:
             os.environ.pop(name, None)
         else:
             os.environ[name] = previous
+
+
+@pytest.fixture(autouse=True)
+def _per_chunk_asr_unless_opted_in() -> Iterator[None]:
+    """Pin the Qwen ASR batch to 1 unless a test sets VOXWEAVE_ASR_BATCH itself.
+
+    Tests stub the per-chunk seam (backend._asr_only) and expect transcribe_chunks
+    to call it once per chunk; the batched pass bypasses that seam and would reach
+    the real model loader. Batching tests opt in with monkeypatch.setenv; the
+    config tests clear the variable to check the built-in default.
+    """
+    name = "VOXWEAVE_ASR_BATCH"
+    previous = os.environ.get(name)
+    os.environ[name] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
