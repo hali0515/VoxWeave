@@ -2,18 +2,33 @@
 # Error-panel hints: exception type -> actionable troubleshooting line.
 
 from voxweave import ui
+import pytest
 
 
 def test_hint_for_file_not_found():
     assert "ffmpeg" in ui._hint_for(FileNotFoundError("x"))
 
 
-def test_hint_for_openai_errors():
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (401, "--api-key-env"),
+        (403, "[llm].api_key_env"),
+        (404, "--model"),
+        (400, "--reasoning-effort default"),
+        (422, "--reasoning-effort default"),
+        (500, "endpoint"),
+        (None, "endpoint"),
+    ],
+)
+def test_hint_for_openai_errors(status, expected):
     # any exception from the openai package gets an API-focused hint, without
     # importing openai here (the class is faked with the right __module__)
-    exc_cls = type("AuthenticationError", (Exception,), {"__module__": "openai"})
-    hint = ui._hint_for(exc_cls("401"))
-    assert "OPENAI_API_KEY" in hint
+    exc_cls = type(
+        "APIError", (Exception,), {"__module__": "openai", "status_code": status}
+    )
+    hint = ui._hint_for(exc_cls("request failed"))
+    assert expected in hint
 
 
 def test_hint_for_unknown_is_empty():

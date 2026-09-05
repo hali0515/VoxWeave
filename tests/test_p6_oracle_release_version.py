@@ -209,6 +209,8 @@ def test_versioned_expected_bytes_are_both_emitted_by_the_standalone_projector(
     monkeypatch.setenv("LC_ALL", "C.UTF-8")
     monkeypatch.delenv("TZ", raising=False)
     monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    # The oracle manifest pins VOXWEAVE_CONFIG unset; undo the conftest isolation.
+    monkeypatch.delenv("VOXWEAVE_CONFIG", raising=False)
     oracle = _load_oracle_runner()
     manifest = oracle._load_checked_manifest(ORACLE_MANIFEST)
     case = next(

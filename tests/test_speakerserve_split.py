@@ -948,7 +948,7 @@ def test_confirm_rewrites_bound_episode_deletes_suggest_and_terminalizes_save(
         assert paths["undo"].is_file()
         assert logs == [
             "Split SPEAKER_00 into SPEAKER_00 and SPEAKER_02",
-            "Restart `voxweave speakers` to re-audition",
+            "Restart `voxweave speakers serve` to re-audition",
         ]
 
         save_status, save_headers, save_body = _post(

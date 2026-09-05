@@ -5,6 +5,7 @@ from click.testing import CliRunner
 
 from voxweave import pipeline
 from voxweave.cli import cli
+from voxweave.ui import RichReporter
 
 
 @pytest.fixture(autouse=True)
@@ -129,9 +130,12 @@ def test_split_passes_kwargs(tmp_path):
     with patch("voxweave.pipeline.split", return_value=out) as m:
         r = CliRunner().invoke(cli, ["split", str(j), "--max-lines", "2"])
     assert r.exit_code == 0, r.output
+    reporter = m.call_args.kwargs["reporter"]
+    assert isinstance(reporter, RichReporter)
     assert m.call_args.kwargs == {
         "max_lines": 2,
         "timestamps": True,
+        "reporter": reporter,
     }
 
 

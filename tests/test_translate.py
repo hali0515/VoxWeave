@@ -773,7 +773,16 @@ def test_window_failure_persists_completed_windows(tmp_path, monkeypatch):
             progress_path=progress,
             progress_sig=sig,
         )
-    saved = translate.load_progress(progress, sig)
+    effective_sig = translate.translation_signature(
+        sig,
+        model="m",
+        base_url="https://api.openai.com/v1",
+        to="zh",
+        context=None,
+        glossary=None,
+        reasoning_effort=None,
+    )
+    saved = translate.load_progress(progress, effective_sig)
     assert saved == {0: "tx 0", 1: "tx 1"}
 
 
@@ -781,7 +790,16 @@ def test_resume_skips_completed_windows(tmp_path):
     payload = _payload(4)
     sig = translate.payload_signature(payload)
     progress = tmp_path / "ep.zh.progress.json"
-    translate.save_progress(progress, sig, {0: "tx 0", 1: "tx 1"})
+    effective_sig = translate.translation_signature(
+        sig,
+        model="m",
+        base_url="https://api.openai.com/v1",
+        to="zh",
+        context=None,
+        glossary=None,
+        reasoning_effort=None,
+    )
+    translate.save_progress(progress, effective_sig, {0: "tx 0", 1: "tx 1"})
     client = FakeClient([_resp(range(2, 4))])  # only window 2 should be called
     out = translate.translate_cues(
         payload,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 
 class Reporter:
     """Base class for pipeline progress callbacks.
@@ -16,8 +18,21 @@ class Reporter:
     ``chunks`` / ``chunk_done`` are semantic aliases for ``task`` / ``advance`` (legacy API, used for per-chunk ASR).
     """
 
+    def plan(self, steps: Sequence[str]) -> None:
+        """Declare the actual ordered workflow, before beginning its first step.
+
+        Optional work belongs in the plan only when enabled. Downloads, retries,
+        and other subtasks do not add steps or change the denominator.
+        """
+
+    def step(self, label: str) -> None:
+        """Enter a named step from the declared plan; stage/task remain subtasks."""
+
     def stage(self, label: str) -> None:
         """Enter an indeterminate stage (decode / load model / VAD / re-layout / write)."""
+
+    def status(self, label: str) -> None:
+        """Update the current task's detail without resetting progress or elapsed time."""
 
     def task(self, label: str, total: int) -> None:
         """Start a countable stage with a known total (renders a real ``x/N`` progress bar)."""

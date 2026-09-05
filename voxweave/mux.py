@@ -23,6 +23,7 @@ import tempfile
 from pathlib import Path
 
 from voxweave import fsio, lang
+from voxweave.progress import Reporter
 
 logger = logging.getLogger(__name__)
 
@@ -88,16 +89,73 @@ def _run_ffmpeg(cmd: list[str], *, capture: bool) -> None:
     except FileNotFoundError as e:
         raise _missing_binary_error(cmd[0]) from e
     if proc.returncode != 0:
-        detail = ""
-        if capture:
-            lines = (proc.stderr or "").strip().splitlines()
-            n = len(lines)
-            # keep the last 8 lines plus any "error" line, even buried earlier
-            keep = set(range(max(0, n - 8), n))
-            keep |= {i for i, ln in enumerate(lines) if "error" in ln.lower()}
-            picked = [lines[i] for i in sorted(keep)]
-            detail = ("\n" + "\n".join(picked)) if picked else ""
-        raise RuntimeError(f"{cmd[0]} failed (exit {proc.returncode}){detail}")
+        raise _ffmpeg_failure(cmd[0], proc.returncode, proc.stderr if capture else "")
+
+
+def _ffmpeg_failure(binary: str, returncode: int, stderr: str | None) -> RuntimeError:
+    lines = (stderr or "").strip().splitlines()
+    # Keep the last eight lines and earlier errors that explain the failure.
+    keep = set(range(max(0, len(lines) - 8), len(lines)))
+    keep |= {i for i, line in enumerate(lines) if "error" in line.lower()}
+    picked = [lines[i] for i in sorted(keep)]
+    detail = ("\n" + "\n".join(picked)) if picked else ""
+    return RuntimeError(f"{binary} failed (exit {returncode}){detail}")
+
+
+def _run_ffmpeg_progress(
+    cmd: list[str], reporter: Reporter, *, total_frames: int | None
+) -> None:
+    """Read real encoding progress without mixing ffmpeg output into the terminal."""
+    command = [cmd[0], "-progress", "pipe:1", "-nostats"]
+    command.extend(arg for arg in cmd[1:] if arg != "-stats")
+    if total_frames is not None:
+        reporter.task("encoding frames", total_frames)
+    else:
+        reporter.stage("encoding video")
+    frames = completed = 0
+    out_time = "00:00:00"
+    # A file drains diagnostics independently of stdout and avoids a full stderr pipe.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errors:
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise _missing_binary_error(command[0]) from exc
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                key, separator, value = line.strip().partition("=")
+                if not separator:
+                    continue
+                if key == "frame" and value.strip().isdecimal():
+                    frames = int(value)
+                elif key == "out_time" and re.fullmatch(r"\d+:\d{2}:\d{2}\.\d+", value):
+                    out_time = value.split(".", 1)[0]
+                elif key == "progress":
+                    if total_frames is not None and frames > completed:
+                        reporter.advance(frames - completed)
+                        completed = frames
+                    reporter.status(f"encoded {frames} frames, {out_time}")
+            returncode = proc.wait()
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        if returncode != 0:
+            errors.seek(0)
+            raise _ffmpeg_failure(command[0], returncode, errors.read())
 
 
 def probe_streams(media: Path) -> list[dict]:
@@ -319,9 +377,13 @@ def pack(
     media: Path | None = None,
     container: str | None = None,
     output: Path | None = None,
+    reporter: Reporter | None = None,
 ) -> Path:
     """Soft-mux one or more subtitle files (VTT/SRT/ASS) into the media as
     subtitle tracks; return the output path."""
+    rep = reporter or Reporter()
+    rep.plan(("check inputs", "pack subtitles"))
+    rep.step("check inputs")
     if not vtts:
         raise ValueError("at least one subtitle file is required")
     from voxweave.subformats import require_subtitle
@@ -340,6 +402,7 @@ def pack(
     )
     streams = probe_streams(src)
     _check_pack_compat(cont, streams)  # raise before any ffmpeg run
+    rep.step("pack subtitles")
     with fsio.atomic_path(out) as tmp_out:
         cmd = build_pack_cmd(src, vtts, tmp_out, container=cont, source_streams=streams)
         _run_ffmpeg(cmd, capture=True)
@@ -585,6 +648,7 @@ def burn(
     font: str = "Arial",
     font_size: int | None = None,
     output: Path | None = None,
+    reporter: Reporter | None = None,
 ) -> Path:
     """Burn the subtitles into the video pixels and write a clean
     (subtitle-track-free) output; return its path. VTT/SRT inputs are rendered
@@ -594,10 +658,17 @@ def burn(
     from voxweave.export import _timed_rows, ass_header, render_ass
     from voxweave.subformats import load_subtitle_blocks, require_subtitle
 
+    rep = reporter or Reporter()
+    native_ass = Path(vtt).suffix.lower() in (".ass", ".ssa")
+    steps = ["check inputs", "select encoder"]
+    if not native_ass:
+        steps.append("prepare subtitles")
+    steps.append("encode video")
+    rep.plan(steps)
+    rep.step("check inputs")
     if container not in ("mp4", "mkv"):
         raise ValueError(f"unsupported container {container!r} (choose mp4 or mkv)")
     require_subtitle(vtt)
-    native_ass = Path(vtt).suffix.lower() in (".ass", ".ssa")
     src = resolve_media(vtt, media)
     timed_blocks = None
     if native_ass:
@@ -635,6 +706,7 @@ def burn(
         if s.get("codec_type") == "audio"
     ]
 
+    rep.step("select encoder")
     enc = pick_encoder(codec, force=encoder)
     q = quality if quality is not None else _DEFAULT_QUALITY.get(enc, 23)
     out = _check_output_clear_of_source(
@@ -649,6 +721,7 @@ def burn(
             )
         ass_path = Path(vtt)
     else:
+        rep.step("prepare subtitles")
         header = ass_header(width=width, height=height, font=font, font_size=font_size)
         fd, tmp_name = tempfile.mkstemp(suffix=".ass", prefix="voxweave-burn-")
         os.close(fd)  # mkstemp fds leak one per call unless closed explicitly
@@ -660,6 +733,7 @@ def burn(
         )
         ass_path = tmp_ass
     try:
+        rep.step("encode video")
         with fsio.atomic_path(out) as tmp_out:
             cmd = build_burn_cmd(
                 src,
@@ -672,7 +746,16 @@ def burn(
                 audio_codecs=audio_codecs,
             )
             logger.info("burning with %s (quality %s, %s)", enc, q, container)
-            _run_ffmpeg(cmd, capture=False)  # ffmpeg -stats streams to the terminal
+            if reporter is None:
+                _run_ffmpeg(cmd, capture=False)
+            else:
+                frame_count = str(video.get("nb_frames") or "")
+                total_frames = (
+                    int(frame_count)
+                    if frame_count.isdecimal() and int(frame_count) > 0
+                    else None
+                )
+                _run_ffmpeg_progress(cmd, rep, total_frames=total_frames)
     finally:
         if tmp_ass is not None:
             tmp_ass.unlink(missing_ok=True)

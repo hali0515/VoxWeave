@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -8,7 +9,7 @@ import re
 import time
 from pathlib import Path
 
-from voxweave import fsio
+from voxweave import config, fsio
 from voxweave.realign import render_cues
 from voxweave.speakers import voice_text_for_block
 
@@ -20,7 +21,9 @@ _sleep = time.sleep
 # blips, short enough that a hard failure surfaces within seconds.
 _RETRY_DELAYS = (2.0, 8.0)
 
-TRANSLATE_MODEL = os.environ.get("VOXWEAVE_TRANSLATE_MODEL", "gpt-5.3-chat-latest")
+# Built-in only: env / conf [llm] are resolved at call time (config.resolve_llm_model)
+# by the CLI and pipeline, never at import (a test or library import must not read the user conf).
+TRANSLATE_MODEL = config.DEFAULT_LLM_MODEL
 # Set high (800) so a typical episode (300-500 cues) fits in one call — full-episode context
 # beats windowing: seams cause disambiguation errors and inconsistent proper-noun rendering.
 # Only very long compilations (>800 cues) fall back to sequential windows.
@@ -136,12 +139,19 @@ def _loads_salvage(raw: object) -> dict:
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError:
+        # Try every "{" in turn, not just the first: vLLM's guided decoding on
+        # Qwen3.8 emits a stray '{"' before the real object, and a prose preamble
+        # may contain braces of its own.
+        decoder = json.JSONDecoder()
+        obj = None
         start = raw.find("{")
-        if start < 0:
-            return {}
-        try:
-            obj, _ = json.JSONDecoder().raw_decode(raw[start:])
-        except json.JSONDecodeError:
+        while start >= 0:
+            try:
+                obj, _ = decoder.raw_decode(raw[start:])
+                break
+            except json.JSONDecodeError:
+                start = raw.find("{", start + 1)
+        if obj is None:
             return {}
     return obj if isinstance(obj, dict) else {}
 
@@ -369,17 +379,49 @@ def _make_client(base_url: str | None, api_key: str | None):
         raise RuntimeError(
             "translate requires openai (not installed); install with: pip install 'voxweave[translate]' or make install"
         ) from e
-    key = api_key or os.environ.get("OPENAI_API_KEY")
+    base_url = config.resolve_llm_base_url(base_url)
+    key_env = config.resolve_llm_api_key_env(None)
+    key = api_key or ("EMPTY" if key_env == "" else os.environ.get(key_env))
     if not key:
         raise RuntimeError(
-            "OPENAI_API_KEY is not set; pass api_key= or set the OPENAI_API_KEY environment variable"
+            f"{key_env} is not set; pass api_key= or set the {key_env} environment "
+            'variable ([llm].api_key_env = "" declares a keyless endpoint)'
         )
     if base_url:
         return OpenAI(api_key=key, base_url=base_url)
     return OpenAI(api_key=key)
 
 
-def _call(client, model: str, messages: list[dict], on_entry=None) -> str:
+def resolve_model(client, model: str) -> str:
+    """Turn ``"auto"`` into the endpoint's only served model; pass anything else through.
+
+    Self-hosted servers (vLLM) change their served name whenever the operator
+    swaps the weights; pinning that name in config turns every swap into a silent
+    404. ``auto`` asks ``GET /v1/models`` at run time instead and refuses to guess
+    when the endpoint serves more than one model.
+    """
+    if model != config.LLM_MODEL_AUTO:
+        return model
+    ids = [m.id for m in client.models.list()]
+    if len(ids) == 1:
+        log.info("llm model auto -> %s", ids[0])
+        return ids[0]
+    if not ids:
+        raise RuntimeError("model 'auto': the endpoint serves no models")
+    raise RuntimeError(
+        f"model 'auto': the endpoint serves {len(ids)} models ({', '.join(ids)}); "
+        "pick one with --model or [llm].model"
+    )
+
+
+def _call(
+    client,
+    model: str,
+    messages: list[dict],
+    on_entry=None,
+    *,
+    reasoning_effort: str | None = None,
+) -> str:
     """Call the model and return the JSON text.
 
     With ``on_entry``: streams and counts ``"i"`` keys as they arrive (one per cue),
@@ -387,11 +429,17 @@ def _call(client, model: str, messages: list[dict], on_entry=None) -> str:
     because index values are numbers and translated strings JSON-escape interior quotes to
     ``\\"`` — no bare ``"i"`` tokens leak through. Without ``on_entry``: single blocking call.
     """
+    request_options = (
+        {"reasoning_effort": reasoning_effort}
+        if reasoning_effort is not None and reasoning_effort != "default"
+        else {}
+    )
     if on_entry is None:
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
             response_format={"type": "json_object"},
+            **request_options,
         )
         return resp.choices[0].message.content or ""
 
@@ -402,30 +450,70 @@ def _call(client, model: str, messages: list[dict], on_entry=None) -> str:
         messages=messages,
         response_format={"type": "json_object"},
         stream=True,
+        **request_options,
     )
-    for chunk in stream:
-        if not getattr(chunk, "choices", None):
-            continue  # trailing usage-only chunks have no choices
-        piece = getattr(chunk.choices[0].delta, "content", None)
-        if not piece:
-            continue
-        buf.append(piece)
-        n = "".join(buf).count('"i"')
-        if n > seen:
-            on_entry(n - seen)
-            seen = n
+    try:
+        for chunk in stream:
+            if not getattr(chunk, "choices", None):
+                continue  # trailing usage-only chunks have no choices
+            piece = getattr(chunk.choices[0].delta, "content", None)
+            if not piece:
+                continue
+            buf.append(piece)
+            n = "".join(buf).count('"i"')
+            if n > seen:
+                on_entry(n - seen)
+                seen = n
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            close()
     return "".join(buf)
 
 
-def _call_with_retry(client, model: str, messages: list[dict], on_entry=None) -> str:
+def _retryable(exc: Exception) -> bool:
+    """Retry transport failures and transient HTTP statuses, never bad requests."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status in {408, 409, 429} or 500 <= status < 600
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    # SSE body errors escape unwrapped: SDK 2 uses httpx, SDK 3 uses httpx2.
+    for package in ("httpx", "httpx2"):
+        try:
+            transport_error = importlib.import_module(package).TransportError
+        except ImportError:
+            continue
+        if isinstance(exc, transport_error):
+            return True
+    try:
+        from openai import APIConnectionError
+    except ImportError:
+        return False
+    return isinstance(exc, APIConnectionError)
+
+
+def _call_with_retry(
+    client,
+    model: str,
+    messages: list[dict],
+    on_entry=None,
+    *,
+    reasoning_effort: str | None = None,
+) -> str:
     """:func:`_call` with exponential backoff on transient failures (network,
     rate limit, 5xx). A streamed retry re-counts entries already reported to
     ``on_entry`` — the bar may overshoot, the translations do not."""
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
         try:
-            return _call(client, model, messages, on_entry=on_entry)
+            request_options = (
+                {"reasoning_effort": reasoning_effort}
+                if reasoning_effort is not None
+                else {}
+            )
+            return _call(client, model, messages, on_entry=on_entry, **request_options)
         except Exception as e:
-            if delay is None:
+            if delay is None or not _retryable(e):
                 raise
             log.warning(
                 "translate call failed (attempt %d/%d: %s); retrying in %.0fs",
@@ -443,6 +531,30 @@ def payload_signature(payload: list[dict]) -> str:
     being replayed onto a since-edited subtitle."""
     doc = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha1(doc.encode("utf-8")).hexdigest()
+
+
+def translation_signature(
+    payload_sig: str | None,
+    *,
+    model: str,
+    base_url: str,
+    to: str,
+    context: str | None,
+    glossary: dict[str, str] | str | None,
+    reasoning_effort: str | None,
+) -> str:
+    """Bind resumed work to the effective request, excluding credentials."""
+    value = {
+        "version": 2,
+        "payload": payload_sig,
+        "model": model,
+        "base_url": base_url.rstrip("/"),
+        "to": to,
+        "context": context,
+        "glossary": glossary,
+        "reasoning_effort": None if reasoning_effort == "default" else reasoning_effort,
+    }
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def save_progress(path: Path, sig: str | None, trans: dict[int, str]) -> None:
@@ -463,7 +575,10 @@ def load_progress(path: Path, sig: str | None) -> dict[int, str]:
     except (OSError, json.JSONDecodeError):
         return {}
     if not isinstance(doc, dict) or doc.get("sig") != sig:
-        log.warning("%s does not match the current subtitle; ignoring it", p.name)
+        log.warning(
+            "%s does not match the current subtitle or translation settings; ignoring it",
+            p.name,
+        )
         return {}
     items = doc.get("translations", {})
     if not isinstance(items, dict):
@@ -537,11 +652,12 @@ def translate_cues(
     payload: list[dict],
     *,
     to: str,
-    model: str = TRANSLATE_MODEL,
+    model: str | None = None,
     context: str | None = None,
     glossary: dict[str, str] | str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
     client=None,
     batch: int = BATCH_THRESHOLD,
     char_budget: int = WINDOW_CHARS,
@@ -563,7 +679,22 @@ def translate_cues(
     """
     if not payload:
         return {}
+    model = config.resolve_llm_model(model, task_envvar="VOXWEAVE_TRANSLATE_MODEL")
+    reasoning_effort = config.resolve_llm_reasoning_effort(reasoning_effort)
     client = client or _make_client(base_url, api_key)
+    model = resolve_model(client, model)
+    if progress_path is not None:
+        progress_sig = translation_signature(
+            progress_sig or payload_signature(payload),
+            model=model,
+            base_url=str(
+                getattr(client, "base_url", base_url or "https://api.openai.com/v1")
+            ),
+            to=to,
+            context=context,
+            glossary=glossary,
+            reasoning_effort=reasoning_effort,
+        )
     # Dual-speaker dash cues expand into two per-speaker units before windowing so
     # each speaker translates in isolation; the result is collapsed back to one
     # entry per block afterwards, keeping the external cue count conserved.
@@ -587,7 +718,13 @@ def translate_cues(
                 win, to=to, context=context, glossary=glossary, tail=tail
             )
             parsed = parse_response(
-                _call_with_retry(client, model, msgs, on_entry=on_entry)
+                _call_with_retry(
+                    client,
+                    model,
+                    msgs,
+                    on_entry=on_entry,
+                    reasoning_effort=reasoning_effort,
+                )
             )
             win_ids = {c["i"] for c in win}
             stray = [i for i in parsed if i not in win_ids]

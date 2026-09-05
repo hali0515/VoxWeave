@@ -7,11 +7,20 @@ from pathlib import Path
 import rich_click as click
 
 from voxweave import artifacts, config, pipeline
+from voxweave.cli_compat import (
+    DefaultGroup,
+    DeprecatedAlias,
+    renamed_option,
+    require_media,
+)
+from voxweave.cli_speakers import build_speakers_group
+from voxweave.progress import Reporter
 from voxweave.ui import (
     RichReporter,
     correct_summary_panel,
     error_panel,
     install_logging,
+    success_panel,
     summary_panel,
     translate_summary_panel,
 )
@@ -31,6 +40,11 @@ def _run(fn, *, reporter: bool = True):
     except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
         error_panel(exc)
         sys.exit(1)
+
+
+def _report_speaker_service(message: str) -> None:
+    """Keep the service URL on stdout and session updates on stderr."""
+    click.echo(message, err=not message.startswith("http://127.0.0.1:"))
 
 
 def _flag(value: bool | None, key: str, builtin: bool) -> bool:
@@ -74,19 +88,30 @@ def _apply_vad_mask(vad_mask: bool | None) -> None:
 
 
 def llm_options(model_envvar: str, model_help: str):
-    """Stack the shared --model/--base-url/--api-key-env options for the LLM subcommands."""
+    """Stack the shared --model/--base-url/--api-key-env options for the LLM subcommands.
+
+    Every value is tri-state: an explicit option wins, then the env var, then
+    ``[llm]`` in the config file, then the built-in (see config.resolve_llm_*).
+    """
 
     def decorator(fn):
         fn = click.option(
             "--api-key-env",
-            default="OPENAI_API_KEY",
-            help="Environment variable to read the API key from (default: OPENAI_API_KEY).",
+            default=None,
+            help=(
+                "Environment variable holding the API key (default: conf "
+                f"[llm].api_key_env or {config.DEFAULT_LLM_API_KEY_ENV}; an empty "
+                "value declares a keyless endpoint such as a local vLLM)."
+            ),
         )(fn)
         fn = click.option(
             "--base-url",
             default=None,
             envvar="OPENAI_BASE_URL",
-            help="OpenAI-compatible endpoint URL.",
+            help=(
+                "OpenAI-compatible endpoint URL (default: OPENAI_BASE_URL env or "
+                "conf [llm].base_url; unset = api.openai.com)."
+            ),
         )(fn)
         fn = click.option(
             "--model", default=None, envvar=model_envvar, help=model_help
@@ -96,100 +121,145 @@ def llm_options(model_envvar: str, model_help: str):
     return decorator
 
 
+def _llm_model_help(task: str, task_envvar: str) -> str:
+    return (
+        f"{task} model (default: {task_envvar} env, conf [llm].model, or "
+        f"{config.DEFAULT_LLM_MODEL}; '{config.LLM_MODEL_AUTO}' = the endpoint's "
+        "only served model)."
+    )
+
+
+# Sent as the bearer token when the endpoint is declared keyless (api_key_env = "").
+# The OpenAI client refuses an empty key; vLLM and friends ignore the value.
+_KEYLESS_API_KEY = "EMPTY"
+
+
 def _resolve_llm(
-    api_key_env: str, model: str | None, base_url: str | None
+    api_key_env: str | None,
+    model: str | None,
+    base_url: str | None,
+    *,
+    task_envvar: str,
 ) -> tuple[str, dict]:
-    """Resolve the API key (panel + exit 1 if unset) and build the model/base_url kwargs dict."""
-    api_key = os.environ.get(api_key_env)
-    if not api_key:
-        error_panel(
-            RuntimeError(
-                f"API key not found: set env {api_key_env} (or use --api-key-env to specify another variable)"
-            )
-        )
-        sys.exit(1)
-    kwargs: dict = {}
-    if model:
-        kwargs["model"] = model
-    if base_url:
-        kwargs["base_url"] = base_url
-    return api_key, kwargs
+    """Resolve the API key (panel + exit 1 if unset) and the model/base_url kwargs.
 
-
-class DefaultGroup(click.RichGroup):
-    """`voxweave <media>` runs transcription without an explicit subcommand.
-
-    Subclasses RichGroup (not the plain re-exported click.Group) so the group and
-    its subcommands render rich help panels — rich-click only defaults to RichGroup
-    when no explicit ``cls=`` is passed.
-
-    ``default_cmd`` is not in ``self.commands`` (invisible in help, not callable as
-    `voxweave transcribe`). When the first token is not a known subcommand or group
-    option, the private token is injected at the front of ``args`` during
-    ``parse_args`` — this handles ``voxweave --debug a.mkv`` where options precede
-    the media arg (injecting at resolve_command time would choke on ``--debug`` first).
+    Each value follows CLI > env > conf [llm] > built-in. A keyless endpoint
+    (``api_key_env`` resolved to "") gets a placeholder key instead of an error.
     """
-
-    default_cmd: click.Command | None = None
-    _GROUP_OPTS = frozenset({"-h", "--help", "-v", "--verbose", "--version"})
-    # Not typeable by users; resolve_command returns cmd.name so usage strings still show "transcribe".
-    _TOKEN = "\x00voxweave-default"
-
-    def get_command(self, ctx, cmd_name):
-        if self.default_cmd is not None and cmd_name == self._TOKEN:
-            return self.default_cmd
-        return super().get_command(ctx, cmd_name)
-
-    def _needs_default(self, token: str) -> bool:
-        return (
-            self.default_cmd is not None
-            and token != self._TOKEN
-            and token not in self.commands
-            and token not in self._GROUP_OPTS
-        )
-
-    def parse_args(self, ctx, args):
-        if args and self._needs_default(args[0]):
-            args = [self._TOKEN, *args]
-        return super().parse_args(ctx, args)
-
-    def resolve_command(self, ctx, args):
-        # After group-level options are consumed a bare media arg may remain — inject default.
-        if args and not args[0].startswith("-") and self._needs_default(args[0]):
-            args = [self._TOKEN, *args]
-        cmd_name, cmd, rest = super().resolve_command(ctx, args)
-        if cmd is not None and cmd is self.default_cmd:
-            cmd_name = (
-                cmd.name
-            )  # show "transcribe" in usage strings, not the private token
-        return cmd_name, cmd, rest
+    key_env = config.resolve_llm_api_key_env(api_key_env)
+    if key_env == "":
+        api_key = _KEYLESS_API_KEY
+    else:
+        api_key = os.environ.get(key_env) or ""
+        if not api_key:
+            error_panel(
+                RuntimeError(
+                    f"API key not found: set env {key_env} (or use --api-key-env / "
+                    'conf [llm].api_key_env to name another variable; "" for a '
+                    "keyless endpoint)"
+                )
+            )
+            sys.exit(1)
+    kwargs: dict = {"model": config.resolve_llm_model(model, task_envvar=task_envvar)}
+    resolved_base_url = config.resolve_llm_base_url(base_url)
+    if resolved_base_url:
+        kwargs["base_url"] = resolved_base_url
+    return api_key, kwargs
 
 
 @click.group(
     cls=DefaultGroup,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+@click.rich_config(
+    help_config={
+        "style_option": "cyan",
+        "style_switch": "cyan",
+        "style_command": "cyan",
+        "style_options_panel_border": "dim",
+        "style_commands_panel_border": "dim",
+        "style_errors_panel_border": "red",
+        "use_click_short_help": True,
+        "command_groups": {
+            "*": [
+                {"name": "Capture", "commands": ["transcribe"]},
+                {
+                    "name": "Revise",
+                    "commands": ["correct", "align", "render", "speakers"],
+                },
+                {
+                    "name": "Deliver",
+                    "commands": ["translate", "export", "pack", "burn"],
+                },
+            ]
+        },
+        "option_groups": {
+            "*transcribe": [
+                {
+                    "name": "Recognition",
+                    "options": ["--language", "--asr-model", "--hybrid", "--context"],
+                },
+                {
+                    "name": "Audio",
+                    "options": [
+                        "--separate",
+                        "--normalize",
+                        "--skip-songs",
+                        "--keep-lyrics",
+                        "--sdh",
+                        "--vad-mask",
+                    ],
+                },
+                {
+                    "name": "Speakers",
+                    "options": [
+                        "--diarize",
+                        "--diarize-model",
+                        "--voiceprints",
+                        "--min-speakers",
+                        "--max-speakers",
+                    ],
+                },
+                {"name": "Layout", "options": ["--timestamps", "--shot-snap"]},
+                {"name": "Diagnostics", "options": ["--debug", "--help"]},
+            ]
+        },
+    }
+)
 @click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG-level logging.")
 @click.version_option(package_name="voxweave", message="voxweave %(version)s")
-def cli(verbose: bool) -> None:
-    """Qwen3 subtitle pipeline orchestrator.
+@click.pass_context
+def cli(ctx, verbose: bool) -> None:
+    """Turn media into editable subtitles and ready-to-share video.
 
-    Run `voxweave <media>` directly to transcribe (no `transcribe` subcommand needed).
-    `--debug` implies local mode.
+    Capture: transcribe. Revise: correct -> edit -> align -> render.
+    Deliver: translate -> export -> pack or burn.
+
+    Shortcut: voxweave MEDIA runs transcribe. Use COMMAND --help for options.
     """
     install_logging(verbose=verbose)
-    config.ensure_default_config()  # write default config template on first run
+    if ctx.invoked_subcommand not in {"speakers", "help"}:
+        config.ensure_default_config()  # write default config template on first run
 
 
-@click.command("transcribe")
-@click.argument("media", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.command(
+    "transcribe", short_help="Create VTT + JSON from audio or video (default)."
+)
+@click.argument(
+    "media",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    callback=require_media,
+)
 @click.option(
     "--language",
     default=None,
     help="Force language (ISO code or full name); default: auto-detect.",
 )
-@click.option(
-    "--model",
+@renamed_option(
+    "-m",
+    "--asr-model",
+    "model",
+    legacy="--model",
     default=None,
     envvar="VOXWEAVE_ASR_MODEL",
     help=(
@@ -208,8 +278,7 @@ def cli(verbose: bool) -> None:
     is_flag=True,
     default=False,
     help="Save intermediate artifacts (fullband/vocals/chunk wavs + ASR raw/alignment) under the"
-    " per-media artifact cache for inspection (implies local mode: artifacts are only written"
-    " during local orchestration).",
+    " per-media artifact cache for inspection.",
 )
 @click.option(
     "--normalize/--no-normalize",
@@ -297,7 +366,7 @@ def cli(verbose: bool) -> None:
     default=False,
     help="Dual-ASR fusion: whisper for accurate text + Qwen-1.7B for punctuation positions (merged timeline)."
     " Better text than pure Qwen for ja/en; better segmentation than pure whisper (which emits no punctuation)."
-    " Runs two ASR passes per chunk (separation only once). Overrides --model."
+    " Runs two ASR passes per chunk (separation only once). Overrides --asr-model."
     " Sub-models: env VOXWEAVE_FUSION_WHISPER / VOXWEAVE_FUSION_QWEN or conf [fusion] whisper/qwen.",
 )
 @click.option(
@@ -313,7 +382,7 @@ def cli(verbose: bool) -> None:
     help="Detect video shot changes (one downscaled ffmpeg pass) and snap nearby cue"
     " boundaries onto the cuts, so subtitles change on the cut instead of flashing across"
     " it (default: on, or conf [defaults].shot_snap; audio-only media skips automatically)."
-    " Cut times persist to the sibling JSON for `split` re-runs; window via VOXWEAVE_SHOT_SNAP_MS.",
+    " Cut times persist to the sibling JSON for `render` re-runs; window via VOXWEAVE_SHOT_SNAP_MS.",
 )
 @click.option(
     "--vad-mask/--no-vad-mask",
@@ -344,7 +413,11 @@ def cmd_transcribe(
     shot_snap: bool | None,
     vad_mask: bool | None,
 ) -> None:
-    """Media -> (vocal separation) -> VAD -> local ASR/alignment -> smart_split -> write VTT+JSON."""
+    """Transcribe audio or video into sibling VTT subtitles and timing JSON.
+
+    Runs ASR and alignment models locally. Also available as voxweave MEDIA.
+    Existing sibling outputs are replaced; preserve reviewed edits before rerunning.
+    """
     _apply_vad_mask(vad_mask)
     separate = _flag(separate, "separate", True)
     normalize = _flag(normalize, "normalize", False)
@@ -400,146 +473,18 @@ def cmd_transcribe(
     click.echo(out)  # path -> stdout for script/pipe consumption
 
 
-cli.default_cmd = (
-    cmd_transcribe  # bare `voxweave <media>` routes here; not listed in help
-)
+cli.default_cmd = cmd_transcribe
+cli.media_extensions = pipeline.MEDIA_EXTS
+cli.add_command(cmd_transcribe)
 
 
-@cli.command("speakers")
-@click.argument("media", type=click.Path(exists=False, dir_okay=False, path_type=Path))
-@click.option(
-    "--voices",
-    type=click.Path(exists=False, dir_okay=False, path_type=Path),
-    default=None,
-    help="Show-level voices store. Relative paths resolve from the current directory.",
-)
-@click.option(
-    "--show", default=None, help="Show name used to confirm a discovered store."
-)
-@click.option(
-    "--no-match", is_flag=True, help="Ignore declared voiceprints and use manual mode."
-)
-@click.option(
-    "--port",
-    type=click.IntRange(0, 65535),
-    default=0,
-    show_default=True,
-    help="Loopback HTTP port; 0 selects an available ephemeral port.",
-)
-@click.option(
-    "--no-open",
-    is_flag=True,
-    help="Do not open the speaker audition in a web browser.",
-)
-@click.option(
-    "--enroll",
-    is_flag=True,
-    help="Enroll reviewed mapping names into the voices store.",
-)
-@click.option(
-    "--episode", default=None, help="Enrollment episode label (default: media stem)."
-)
-@click.option(
-    "--replace-episode",
-    is_flag=True,
-    help="Replace the existing exemplar for the selected episode key.",
-)
-@click.option(
-    "--purge-voiceprints",
-    is_flag=True,
-    help="Delete cached/legacy voiceprints and suggestions plus any legacy audition HTML;"
-    " preserve the reviewed mapping. Media may be absent.",
-)
-def cmd_speakers(
-    media: Path,
-    voices: Path | None,
-    show: str | None,
-    no_match: bool,
-    port: int,
-    no_open: bool,
-    enroll: bool,
-    episode: str | None,
-    replace_episode: bool,
-    purge_voiceprints: bool,
-) -> None:
-    """Serve an in-memory audition, enroll reviewed names, or purge speaker biometrics."""
-    from voxweave.speakers import (
-        create_speaker_audition,
-        enroll_speaker_voices,
-        purge_voiceprints as purge,
-    )
-
-    if purge_voiceprints:
-        if any(
-            (
-                voices,
-                show,
-                no_match,
-                port,
-                no_open,
-                enroll,
-                episode,
-                replace_episode,
-            )
-        ):
-            raise click.UsageError(
-                "--purge-voiceprints is mutually exclusive with generation/enrollment options"
-            )
-        removed = _run(lambda _rep: purge(media), reporter=False)
-        for path in removed:
-            click.echo(path)
-        return
-    if enroll:
-        if no_match:
-            raise click.UsageError("--no-match cannot be combined with --enroll")
-        if port or no_open:
-            raise click.UsageError("--port/--no-open cannot be combined with --enroll")
-        out = _run(
-            lambda _rep: enroll_speaker_voices(
-                media,
-                voices=voices,
-                show=show,
-                episode=episode,
-                replace_episode=replace_episode,
-            ),
-            reporter=False,
-        )
-    else:
-        if episode is not None or replace_episode:
-            raise click.UsageError("--episode/--replace-episode require --enroll")
-        if voices is None and show is None and not no_match:
-            out = _run(lambda _rep: create_speaker_audition(media), reporter=False)
-        else:
-            out = _run(
-                lambda _rep: create_speaker_audition(
-                    media,
-                    voices=voices,
-                    show=show,
-                    no_match=no_match,
-                ),
-                reporter=False,
-            )
-        from voxweave.speakerserve import serve
-
-        _run(
-            lambda _rep: serve(
-                page=out.page,
-                media_path=out.media_path,
-                mapping_path=out.mapping_path,
-                sibling_path=out.sibling_json_path,
-                speaker_ids=out.speaker_ids,
-                pristine_mapping_generation=out.pristine_mapping_generation,
-                port=port,
-                open_browser=not no_open,
-                report=click.echo,
-            ),
-            reporter=False,
-        )
-        return
-    click.echo(out)
+cmd_speakers = build_speakers_group(_run, _report_speaker_service)
+cli.add_command(cmd_speakers)
 
 
-@cli.command("split")
+@cli.command(
+    "render", short_help="Regenerate subtitle layout from sibling JSON; no model."
+)
 @click.argument(
     "json_path",
     metavar="JSON",
@@ -561,7 +506,10 @@ def cmd_split(
     max_lines: int | None,
     timestamps: bool | None,
 ) -> None:
-    """Re-layout from <stem>.json without running a model."""
+    """Regenerate subtitle layout from sibling JSON without running a model.
+
+    Accepts JSON, VTT, or media paths. Replaces the sibling VTT and updates JSON.
+    """
     timestamps = _flag(timestamps, "timestamps", True)
     kwargs: dict = {}
     if max_line_length is not None:
@@ -569,17 +517,25 @@ def cmd_split(
     if max_lines is not None:
         kwargs["max_lines"] = max_lines
     out = _run(
-        lambda _rep: pipeline.split(
+        lambda rep: pipeline.split(
             json_path,
             timestamps=timestamps,
+            reporter=rep,
             **kwargs,
         ),
-        reporter=False,
+    )
+    success_panel(
+        "Render done", [f"VTT  : {out}", f"JSON : {pipeline.swap_ext(out, '.json')}"]
     )
     click.echo(out)
 
 
-@cli.command("align")
+cli.add_command(DeprecatedAlias("split", cmd_split))
+
+
+@cli.command(
+    "align", short_help="Re-align edited VTT against audio; overwrites VTT + JSON."
+)
 @click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
     "--media",
@@ -642,16 +598,19 @@ def cmd_align(
     click.echo(out)
 
 
-@cli.command("translate")
+@cli.command("translate", short_help="Translate subtitles into a new language sidecar.")
 @click.argument(
     "vtt",
     metavar="SUBTITLE",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
-@click.option(
-    "--to",
+@renamed_option(
+    "-t",
+    "--target",
+    "to",
+    legacy="--to",
     default="zh",
-    help="Target language code (written to <stem>.<to>.<ext>); default: zh.",
+    help="Target language code (written to <stem>.<target>.<ext>); default: zh.",
 )
 @click.option(
     "--context", default=None, help="Show/tone context injected into the prompt."
@@ -664,7 +623,17 @@ def cmd_align(
 )
 @llm_options(
     "VOXWEAVE_TRANSLATE_MODEL",
-    "Translation model (default: VOXWEAVE_TRANSLATE_MODEL env or gpt-5.3-chat-latest).",
+    _llm_model_help("Translation", "VOXWEAVE_TRANSLATE_MODEL"),
+)
+@click.option(
+    "--reasoning-effort",
+    default=None,
+    metavar="EFFORT",
+    help=(
+        "Reasoning effort accepted by the served model (e.g. low, medium, xhigh). "
+        "Default: VOXWEAVE_TRANSLATE_REASONING_EFFORT env, conf [llm].reasoning_effort, "
+        "or the endpoint default. Use 'default' to override a configured effort."
+    ),
 )
 def cmd_translate(
     vtt: Path,
@@ -674,13 +643,16 @@ def cmd_translate(
     model: str | None,
     base_url: str | None,
     api_key_env: str,
+    reasoning_effort: str | None,
 ) -> None:
-    """Translate after align: call OpenAI to translate each cue in a subtitle file
+    """Translate after align: call an OpenAI-compatible endpoint for each subtitle cue
     (VTT/SRT/ASS), write <stem>.<to>.<ext> mirroring the input format (original unchanged)."""
     from voxweave.translate import load_glossary
 
     gloss = load_glossary(glossary) if glossary else None
-    api_key, kwargs = _resolve_llm(api_key_env, model, base_url)
+    api_key, kwargs = _resolve_llm(
+        api_key_env, model, base_url, task_envvar="VOXWEAVE_TRANSLATE_MODEL"
+    )
     out = _run(
         lambda rep: pipeline.translate(
             vtt,
@@ -688,6 +660,7 @@ def cmd_translate(
             context=context,
             glossary=gloss,
             api_key=api_key,
+            reasoning_effort=reasoning_effort,
             reporter=rep,
             **kwargs,
         )
@@ -696,19 +669,21 @@ def cmd_translate(
     click.echo(out)
 
 
-@cli.command("export")
+@cli.command("export", short_help="Convert subtitles between VTT, SRT, and ASS.")
 @click.argument(
     "vtt",
     metavar="SUBTITLE",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
-@click.option(
-    "--to",
+@renamed_option(
+    "-f",
+    "--format",
     "formats",
+    legacy="--to",
     multiple=True,
     type=click.Choice(["srt", "ass", "vtt"]),
     default=("srt",),
-    help="Output format(s); repeat for several (e.g. --to srt --to ass). Default: srt.",
+    help="Output format(s); repeat for several (e.g. -f srt -f ass). Default: srt.",
 )
 def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
     """Convert between subtitle formats: VTT/SRT/ASS in, SRT/ASS/VTT out.
@@ -719,11 +694,18 @@ def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
     """
     from voxweave.export import export_subtitles
 
-    for path in export_subtitles(vtt, formats):
+    def run_export(rep: Reporter) -> list[Path]:
+        rep.plan(("export subtitles",))
+        rep.step("export subtitles")
+        return export_subtitles(vtt, formats)
+
+    paths = _run(run_export)
+    success_panel("Export done", [str(path) for path in paths])
+    for path in paths:
         click.echo(str(path))
 
 
-@cli.command("pack")
+@cli.command("pack", short_help="Add selectable subtitle tracks; no video re-encode.")
 @click.argument(
     "vtts",
     metavar="SUBTITLE...",
@@ -738,9 +720,10 @@ def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
     help="Source media (default: sibling file with the same stem; language tags"
     " like .zh are stripped for the lookup).",
 )
-@click.option(
-    "--to",
+@renamed_option(
+    "--container",
     "container",
+    legacy="--to",
     type=click.Choice(["mkv", "mp4", "webm"]),
     default=None,
     help="Output container (default: keep the source container when it can store"
@@ -772,15 +755,15 @@ def cmd_pack(
     from voxweave import mux
 
     out = _run(
-        lambda _rep: mux.pack(
-            list(vtts), media=media, container=container, output=output
+        lambda rep: mux.pack(
+            list(vtts), media=media, container=container, output=output, reporter=rep
         ),
-        reporter=False,
     )
+    success_panel("Pack done", [str(out)])
     click.echo(out)
 
 
-@cli.command("burn")
+@cli.command("burn", short_help="Burn subtitles into video pixels; re-encodes video.")
 @click.argument(
     "vtt",
     metavar="SUBTITLE",
@@ -815,9 +798,10 @@ def cmd_pack(
     " VideoToolbox -q:v 1-100, higher = better). Default per encoder: h264 19 /"
     " hevc 23 / av1 30 / VideoToolbox 65. Bitrate is never targeted.",
 )
-@click.option(
-    "--to",
+@renamed_option(
+    "--container",
     "container",
+    legacy="--to",
     type=click.Choice(["mp4", "mkv"]),
     default="mp4",
     help="Output container (default: mp4 for maximum player compatibility).",
@@ -864,7 +848,7 @@ def cmd_burn(
     from voxweave import mux
 
     out = _run(
-        lambda _rep: mux.burn(
+        lambda rep: mux.burn(
             vtt,
             media=media,
             codec=codec,
@@ -874,13 +858,16 @@ def cmd_burn(
             font=font,
             font_size=font_size,
             output=output,
+            reporter=rep,
         ),
-        reporter=False,
     )
+    success_panel("Burn done", [str(out)])
     click.echo(out)
 
 
-@cli.command("correct")
+@cli.command(
+    "correct", short_help="Suggest ASR text corrections in a reviewable sidecar."
+)
 @click.argument("vtt", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option(
     "--glossary",
@@ -909,7 +896,7 @@ def cmd_burn(
 )
 @llm_options(
     "VOXWEAVE_FIX_MODEL",
-    "Correction model (default: VOXWEAVE_FIX_MODEL env or gpt-5.3-chat-latest).",
+    _llm_model_help("Correction", "VOXWEAVE_FIX_MODEL"),
 )
 def cmd_correct(
     vtt: Path,
@@ -932,7 +919,9 @@ def cmd_correct(
     from voxweave.translate import load_glossary
 
     gloss = load_glossary(glossary) if glossary else None
-    api_key, kwargs = _resolve_llm(api_key_env, model, base_url)
+    api_key, kwargs = _resolve_llm(
+        api_key_env, model, base_url, task_envvar="VOXWEAVE_FIX_MODEL"
+    )
     res = _run(
         lambda rep: pipeline.correct(
             vtt,
@@ -947,3 +936,23 @@ def cmd_correct(
     )
     correct_summary_panel(res)
     click.echo(res["out"])
+
+
+@cli.command("help", hidden=True)
+@click.argument("commands", nargs=-1)
+@click.pass_context
+def cmd_help(ctx, commands: tuple[str, ...]) -> None:
+    """Show group or nested command help."""
+    parent = ctx.parent
+    if parent is None:
+        return
+    command = parent.command
+    for name in commands:
+        if not isinstance(command, click.Group):
+            raise click.UsageError(f"'{command.name}' has no subcommands.")
+        child = command.get_command(parent, name)
+        if child is None:
+            raise click.UsageError(f"No such command '{name}'.")
+        parent = child.context_class(child, info_name=name, parent=parent)
+        command = child
+    click.echo(command.get_help(parent))

@@ -19,8 +19,8 @@ from __future__ import annotations
 import difflib
 import json
 import logging
-import os
 
+from voxweave import config
 from voxweave.realign import render_cues
 from voxweave.speakers import voice_text_for_block
 from voxweave.translate import (
@@ -29,12 +29,14 @@ from voxweave.translate import (
     _make_client,
     build_payload,
     format_glossary,
+    resolve_model,
     restore_dash_layout,
 )
 
 log = logging.getLogger("voxweave")
 
-FIX_MODEL = os.environ.get("VOXWEAVE_FIX_MODEL", "gpt-5.3-chat-latest")
+# Built-in only; env / conf [llm] resolve at call time (see translate.TRANSLATE_MODEL).
+FIX_MODEL = config.DEFAULT_LLM_MODEL
 
 SYSTEM_PROMPT = """\
 You are an expert subtitle transcription proofreader. The input is an automatic
@@ -238,6 +240,7 @@ def correct_cues(
     if not payload:
         return []
     client = client or _make_client(base_url, api_key)
+    model = resolve_model(client, model)
     messages = build_messages(payload, glossary=glossary)
     raw = _call(client, model, messages)
     return parse_fixes(raw)

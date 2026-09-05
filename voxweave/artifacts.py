@@ -93,6 +93,23 @@ def _ensure_private_directory(directory: Path) -> None:
         pass
 
 
+def _inspect_private_directory(directory: Path) -> bool:
+    """Validate an existing artifact directory without changing its permissions."""
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ArtifactMarkerError(
+            f"cannot inspect artifact directory {directory}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ArtifactMarkerError(
+            f"artifact directory is not a private directory: {directory}"
+        )
+    return True
+
+
 def _absolute(path: Path) -> Path:
     expanded = Path(path).expanduser()
     return Path(os.path.realpath(os.path.abspath(os.fspath(expanded))))
@@ -305,11 +322,8 @@ def inspect_paths(source: Path) -> ArtifactPaths | None:
     """Inspect an existing matching claim without creating cache state."""
     absolute = _absolute(Path(source))
     root = artifacts_root(absolute)
-    try:
-        root.lstat()
-    except FileNotFoundError:
+    if not _inspect_private_directory(root):
         return None
-    _ensure_private_directory(root)
     primary = root / absolute.stem
     owner = _directory_owner(primary)
     if owner == absolute.name:
@@ -329,15 +343,8 @@ def claimed_sources(directory: Path, stem: str) -> tuple[Path, ...]:
     """Return sources recorded by one media directory's closed claim set."""
     parent = _absolute(Path(directory))
     root = parent / _CACHE_DIR_NAME
-    try:
-        root.lstat()
-    except FileNotFoundError:
+    if not _inspect_private_directory(root):
         return ()
-    except OSError as exc:
-        raise ArtifactMarkerError(
-            f"cannot inspect artifact root {root}: {exc}"
-        ) from exc
-    _ensure_private_directory(root)
     try:
         entries = tuple(root.iterdir())
     except OSError as exc:

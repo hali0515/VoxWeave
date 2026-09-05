@@ -133,9 +133,9 @@ def test_save_writes_exact_bytes_in_skeleton_order_and_can_overwrite(tmp_path):
         }
         assert logs == [
             f"Saved {mapping}",
-            f"Next: voxweave split {tmp_path / 'episode.json'}",
+            f"Next: voxweave render {tmp_path / 'episode.json'}",
             f"Saved {mapping}",
-            f"Next: voxweave split {tmp_path / 'episode.json'}",
+            f"Next: voxweave render {tmp_path / 'episode.json'}",
         ]
 
 

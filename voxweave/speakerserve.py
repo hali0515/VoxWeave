@@ -270,7 +270,7 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         if self.server.session_terminal:
             self._json_reply(
                 HTTPStatus.CONFLICT,
-                {"error": "restart voxweave speakers before saving again"},
+                {"error": "restart voxweave speakers serve before saving again"},
                 no_store=True,
             )
             return
@@ -297,14 +297,14 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         self.server.pristine_mapping_generation = None
         self.server.pristine_mapping_path = None
         self.server.report(f"Saved {mapping_path}")
-        self.server.report(f"Next: voxweave split {self.server.sibling_path}")
+        self.server.report(f"Next: voxweave render {self.server.sibling_path}")
         self._json_reply(HTTPStatus.OK, {"saved": True})
 
     def _handle_split(self, payload: object) -> None:
         if self.server.session_terminal:
             self._json_reply(
                 HTTPStatus.CONFLICT,
-                {"error": "restart voxweave speakers before another split"},
+                {"error": "restart voxweave speakers serve before another split"},
                 no_store=True,
             )
             return
@@ -985,7 +985,7 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
     server.report(
         f"Split {proposal.speaker_id} into {proposal.speaker_id} and {new_id}"
     )
-    server.report("Restart `voxweave speakers` to re-audition")
+    server.report("Restart `voxweave speakers serve` to re-audition")
     return new_id
 
 
@@ -1142,7 +1142,7 @@ def _undo_split(server: SpeakerHTTPServer) -> None:
     server.split_proposal = None
     server.session_terminal = True
     server.report("Restored the previous speaker split generation")
-    server.report("Restart `voxweave speakers` to re-audition")
+    server.report("Restart `voxweave speakers serve` to re-audition")
 
 
 def _strict_json_loads(raw: bytes) -> Any:

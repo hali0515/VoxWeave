@@ -150,30 +150,14 @@ def test_readme_describes_default_install_and_opt_in_runtime() -> None:
         assert "voxweave[diarize]" not in source.lower(), source_path
 
 
-def _extract_click_option_block(source: str, flag: str) -> str:
-    """Return the raw source of a ``@click.option(flag, ...)`` call body.
-
-    Matches from the flag's own string literal up to the following line that
-    is exactly a lone closing paren (the end of the click.option(...) call),
-    so a literal ")" inside the option's own help text (e.g. "(default)")
-    cannot truncate the match early.
-    """
-    match = re.search(rf'"{re.escape(flag)}",\n(.*?)\n\)\n', source, flags=re.DOTALL)
-    assert match, f"could not find click.option block for {flag!r} in cli.py"
-    return match.group(1)
-
-
-def _option_help_text(option_block: str) -> str:
-    """Concatenate the string-literal pieces of a ``help=(...)`` value."""
-    remainder = option_block.split("help=(", 1)[1]
-    return "".join(re.findall(r'"([^"]*)"', remainder))
-
-
 def test_diarize_model_help_names_community1_as_default_not_31() -> None:
-    cli_source = (REPO_ROOT / "voxweave" / "cli.py").read_text(encoding="utf-8")
-    help_text = _option_help_text(
-        _extract_click_option_block(cli_source, "--diarize-model")
+    from voxweave.cli import cmd_transcribe
+
+    # Inspect the actual option, not the first flag literal in help-panel metadata.
+    option = next(
+        param for param in cmd_transcribe.params if "--diarize-model" in param.opts
     )
+    help_text = option.help
 
     assert "community-1 (default)" in help_text
     assert "3.1 (default)" not in help_text

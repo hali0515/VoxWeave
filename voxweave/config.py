@@ -21,6 +21,14 @@ DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 # 0.6B emits no punctuation, so fusion must use 1.7B.
 DEFAULT_FUSION_WHISPER = "large-v3"
 DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
+# LLM behind `translate` / `correct` (any OpenAI-compatible chat-completions endpoint).
+# Always a concrete model name, never a "-latest" alias: OpenAI retired
+# gpt-5.3-chat-latest and both commands were broken out of the box until this
+# constant replaced it. "auto" resolves to the endpoint's only served model at run
+# time, for self-hosted servers (vLLM) whose served name drifts between restarts.
+DEFAULT_LLM_MODEL = "gpt-5.5"
+DEFAULT_LLM_API_KEY_ENV = "OPENAI_API_KEY"
+LLM_MODEL_AUTO = "auto"
 # community-1 is the default (better multi-speaker separation in practice);
 # the 3.1 pipeline stays selectable via the "3.1" alias and keeps its own
 # LEGACY constant because the pyannote-4 fail-closed guard for an unverified
@@ -85,6 +93,22 @@ _TEMPLATE = """\
 #   sum            = concurrent co-residence: per-chunk ASR+align in one pass;
 #                    peak VRAM = sum(models); saves two swap round-trips on large-VRAM cards.
 # load_strategy = "peak"
+
+# LLM used by `translate` and `correct`: any OpenAI-compatible chat-completions endpoint.
+#   model       = model name (= --model; env VOXWEAVE_TRANSLATE_MODEL / VOXWEAVE_FIX_MODEL
+#                 override it per command). "auto" = the endpoint's only served model,
+#                 probed at run time (self-hosted vLLM whose served name changes on restart).
+#   base_url    = endpoint URL (= --base-url / env OPENAI_BASE_URL); unset = api.openai.com.
+#   api_key_env = env var holding the API key (= --api-key-env). "" declares the endpoint
+#                 keyless (local vLLM); a placeholder key is sent instead.
+#   reasoning_effort = translate's optional reasoning effort (= --reasoning-effort /
+#                 VOXWEAVE_TRANSLATE_REASONING_EFFORT). Values depend on the served model.
+#                 Unset or "default" leaves the endpoint's default unchanged.
+[llm]
+# model = "gpt-5.5"
+# base_url = "http://127.0.0.1:8000/v1"
+# api_key_env = "OPENAI_API_KEY"
+# reasoning_effort = "low"
 
 # dual-ASR fusion sub-models (= CLI --hybrid; env VOXWEAVE_FUSION_WHISPER / VOXWEAVE_FUSION_QWEN).
 # whisper supplies accurate text, Qwen supplies punctuation positions (merged on a shared timeline).
@@ -153,6 +177,7 @@ _KNOWN_KEYS = frozenset(
         "diarize",
         "align",
         "defaults",
+        "llm",
     }
 )
 
@@ -245,6 +270,70 @@ def conf_fusion_qwen() -> str:
     Precedence: env VOXWEAVE_FUSION_QWEN > conf [fusion].qwen > default."""
     v = os.environ.get("VOXWEAVE_FUSION_QWEN") or _conf_fusion("qwen")
     return _nonempty_str(v) or DEFAULT_FUSION_QWEN
+
+
+def _conf_llm(key: str) -> str | None:
+    """``[llm].<key>`` as written (may be ""), or None if absent / not a string."""
+    llm = _load().get("llm")
+    if not isinstance(llm, dict) or key not in llm:
+        return None
+    v = llm[key]
+    if not isinstance(v, str):
+        log.warning(
+            "config key %r has wrong type (expected string), ignoring", f"[llm].{key}"
+        )
+        return None
+    return v
+
+
+def resolve_llm_model(cli_value: str | None, *, task_envvar: str) -> str:
+    """Model for an LLM command. Precedence: CLI value > ``task_envvar``
+    (VOXWEAVE_TRANSLATE_MODEL / VOXWEAVE_FIX_MODEL) > conf ``[llm].model`` >
+    :data:`DEFAULT_LLM_MODEL`. May return :data:`LLM_MODEL_AUTO`, which the
+    caller resolves against the endpoint's model list."""
+    return (
+        _nonempty_str(cli_value)
+        or _nonempty_str(os.environ.get(task_envvar))
+        or _nonempty_str(_conf_llm("model"))
+        or DEFAULT_LLM_MODEL
+    )
+
+
+def resolve_llm_base_url(cli_value: str | None) -> str | None:
+    """Endpoint URL for the LLM commands. Precedence: CLI value > env
+    ``OPENAI_BASE_URL`` > conf ``[llm].base_url``; None means the OpenAI default."""
+    return (
+        _nonempty_str(cli_value)
+        or _nonempty_str(os.environ.get("OPENAI_BASE_URL"))
+        or _nonempty_str(_conf_llm("base_url"))
+    )
+
+
+def resolve_llm_api_key_env(cli_value: str | None) -> str:
+    """Name of the env var holding the LLM API key. Precedence: CLI value > conf
+    ``[llm].api_key_env`` > :data:`DEFAULT_LLM_API_KEY_ENV`. An empty string
+    (allowed from either source) declares the endpoint keyless."""
+    if cli_value is not None:
+        return cli_value.strip()
+    conf = _conf_llm("api_key_env")
+    if conf is not None:
+        return conf.strip()
+    return DEFAULT_LLM_API_KEY_ENV
+
+
+def resolve_llm_reasoning_effort(cli_value: str | None) -> str | None:
+    """Translate effort: CLI > environment > config; absent leaves server defaults.
+
+    Keep the explicit ``default`` sentinel until the request is built, so it can
+    override a configured effort without a downstream resolver restoring it.
+    Supported effort names belong to the endpoint/model, not to this client.
+    """
+    value = (
+        _nonempty_str(cli_value)
+        or _nonempty_str(os.environ.get("VOXWEAVE_TRANSLATE_REASONING_EFFORT"))
+        or _nonempty_str(_conf_llm("reasoning_effort"))
+    )
+    return value.strip() if value is not None else None
 
 
 def conf_hf_token() -> str | None:

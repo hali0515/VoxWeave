@@ -23,6 +23,7 @@ from voxweave import (
     artifacts,
     backend,
     chunking,
+    config,
     episode_transaction,
     fsio,
     realign,
@@ -388,6 +389,28 @@ def _progress_bridge(rep: Reporter, label: str):
         rep.advance(1)
 
     return cb
+
+
+class _NestedReporter(Reporter):
+    """Forward work details without replacing the enclosing command's step plan."""
+
+    def __init__(self, parent: Reporter) -> None:
+        self.parent = parent
+
+    def stage(self, label: str) -> None:
+        self.parent.stage(label)
+
+    def status(self, label: str) -> None:
+        self.parent.status(label)
+
+    def task(self, label: str, total: int) -> None:
+        self.parent.task(label, total)
+
+    def advance(self, n: int = 1) -> None:
+        self.parent.advance(n)
+
+    def download(self, label: str, done: int, total: int | None) -> None:
+        self.parent.download(label, done, total)
 
 
 def cache_vocals_path(media_path: Path) -> Path:
@@ -917,6 +940,7 @@ def transcribe(
     # the loaded model, but never as the fallout of a failed run.
     panns_handoff = False
     try:
+        rep.step("prepare audio")
         vocals: Path | None = None
         fullband: Path | None = None
         voc32: Path | None = None  # 32k mono vocals: PANNs input + cache source
@@ -1026,6 +1050,7 @@ def transcribe(
                 )
             else:
                 try:
+                    rep.step("detect songs")
                     rep.stage("song detection (PANNs)")
                     song_spans, sing_spans, speech_spans = detect_song_spans(
                         voc32, progress=_progress_bridge(rep, "song detection (PANNs)")
@@ -1049,6 +1074,7 @@ def transcribe(
             # the two never share the card. No-op when detection never ran.
             songdet.release_model()
 
+        rep.step("find speech")
         rep.stage("VAD chunking")
         segs = vad_speech_segments(wav)
         # PANNs speech rescue, computed once against the raw silero segs (same inputs as
@@ -1124,6 +1150,7 @@ def transcribe(
         if not chunks:
             raise RuntimeError(f"no speech detected in {media_path.name}")
 
+        rep.step("transcribe and align")
         rep.stage("load ASR/alignment models")
         # Slice all chunk waveforms upfront so dual-pass (full ASR -> release -> full
         # alignment) can shave VRAM peak.
@@ -1275,6 +1302,7 @@ def transcribe(
         if diarize:
             from voxweave import diarize as diarize_mod
 
+            rep.step("identify speakers")
             rep.stage("speaker diarization (pyannote)")
             try:
                 diarization = diarize_mod.diarize_turns(
@@ -4021,6 +4049,21 @@ def process(
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
+    steps = ["inspect source"]
+    if word_segments is None:
+        steps.append("prepare audio")
+        if separate and (skip_songs or keep_lyrics):
+            steps.append("detect songs")
+        steps.extend(("find speech", "transcribe and align"))
+        if diarize:
+            steps.append("identify speakers")
+        if shot_snap:
+            steps.append("detect shot changes")
+    steps.extend(("layout subtitles", "write outputs"))
+    if sdh and word_segments is None:
+        steps.append("create SDH sidecar")
+    rep.plan(steps)
+    rep.step("inspect source")
     expected_json: episode_transaction.FileGeneration | None = None
     expected_vtt: episode_transaction.FileGeneration | None = None
     expected_media: str | None = None
@@ -4210,6 +4253,7 @@ def _process_from_source(
             if shot_snap:
                 from voxweave import shotdet
 
+                rep.step("detect shot changes")
                 rep.stage("shot detection")
                 shot_changes = shotdet.detect_shot_changes(source_path)
 
@@ -4271,6 +4315,7 @@ def _finish_process_from_units(
     sdh_enabled: bool,
 ) -> _ProcessPublication:
     """Finish segmentation and publication after source ownership is sealed."""
+    rep.step("layout subtitles")
     rep.stage("smart_split layout")
     segmented = segment_document(
         language=iso,
@@ -4282,6 +4327,7 @@ def _finish_process_from_units(
     )
     units, cues = segmented.units, segmented.cues
 
+    rep.step("write outputs")
     rep.stage("write siblings")
     from voxweave import segmentation_orchestration
 
@@ -4386,6 +4432,7 @@ def _finish_process_from_units(
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
     auxiliary_landed: tuple[Path, ...] = ()
     if sdh_enabled and source_mode == "transcribed-media":
+        rep.step("create SDH sidecar")
         committed_json = episode_transaction.capture_file_generation(
             swap_ext(media_path, ".json")
         )
@@ -4467,6 +4514,8 @@ def _write_sdh_sidecar(
 def split(
     json_path: Path,
     timestamps: bool = True,
+    *,
+    reporter: Reporter | None = None,
     **smart_split_kwargs,
 ) -> Path:
     """Re-run smart_split from persisted word_segments.
@@ -4477,6 +4526,9 @@ def split(
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
     json_path = swap_ext(Path(json_path), ".json")
+    rep = reporter or Reporter()
+    rep.plan(("read subtitle data", "layout subtitles", "write outputs"))
+    rep.step("read subtitle data")
     artifact_owner = _artifact_owner(json_path)
     try:
         input_bytes = json_path.read_bytes()
@@ -4521,6 +4573,7 @@ def split(
         warn=lambda message: log.warning("%s", message),
     )
     speaker_names = dict(mapping_generation.names)
+    rep.step("layout subtitles")
     segmented = segment_document(
         language=iso,
         word_segments=units,
@@ -4585,6 +4638,7 @@ def split(
             media=artifact_owner,
         )
     )
+    rep.step("write outputs")
     try:
         episode_transaction.commit_primary_outputs(
             command="split",
@@ -4603,7 +4657,7 @@ def split(
     finally:
         segmentation_orchestration.retire_segmentation_selection(selection)
     vtt_out = swap_ext(json_path, ".vtt")
-    log.info("re-split %s → %d cues", vtt_out.name, len(cues))
+    log.info("rendered %s → %d cues", vtt_out.name, len(cues))
     return vtt_out
 
 
@@ -5035,6 +5089,8 @@ def align(
     vtt_path = require_vtt(Path(vtt_path))  # align overwrites the input as VTT
     explicit_media_requested = media_path is not None
     rep = reporter or Reporter()
+    rep.plan(("read subtitles", "prepare audio", "align subtitles", "write outputs"))
+    rep.step("read subtitles")
     json_path = swap_ext(vtt_path, ".json")
     with align_runtime_activity("AO-01", "vtt-generation-snapshot"):
         try:
@@ -5251,6 +5307,7 @@ def align(
         else:
             acquisition_media = selected_snapshot.path
     try:
+        rep.step("prepare audio")
         with align_runtime_activity("AO-04", "prepared-audio-and-cache"):
             wav = _prepare_16k_for_align(
                 acquisition_media,
@@ -5428,6 +5485,7 @@ def align(
             with align_runtime_activity("AO-09", "legacy-time-transform"):
                 return operation()
 
+        rep.step("align subtitles")
         block_units = _align_blocks(
             wav,
             blocks,
@@ -5556,6 +5614,7 @@ def align(
                 )
             )
 
+        rep.step("write outputs")
         rep.stage("write VTT + JSON")
         from voxweave.align_evidence import encode_align_evidence
 
@@ -5682,9 +5741,10 @@ def translate(
     to: str = "zh",
     context: str | None = None,
     glossary: dict[str, str] | str | None = None,
-    model: str = translate_mod.TRANSLATE_MODEL,
+    model: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
     reporter: Reporter | None = None,
 ) -> Path:
     """Translate subtitle cues via OpenAI; write <stem>.<to>.<ext> (source untouched).
@@ -5696,8 +5756,17 @@ def translate(
     from voxweave.subformats import require_subtitle
 
     vtt_path = require_subtitle(Path(vtt_path))
+    # None = env VOXWEAVE_TRANSLATE_MODEL > conf [llm].model > built-in, read now
+    # rather than at import so a library caller sees the current config.
+    model = model or config.resolve_llm_model(
+        None, task_envvar="VOXWEAVE_TRANSLATE_MODEL"
+    )
+    base_url = config.resolve_llm_base_url(base_url)
+    reasoning_effort = config.resolve_llm_reasoning_effort(reasoning_effort)
     ext = ".ass" if vtt_path.suffix.lower() == ".ssa" else vtt_path.suffix.lower()
     rep = reporter or Reporter()
+    rep.plan(("read subtitles", "translate cues", "write translation"))
+    rep.step("read subtitles")
     blocks = _load_cues(vtt_path)
     if any(b.get("start") is None for b in blocks):
         if ext != ".vtt":
@@ -5730,9 +5799,11 @@ def translate(
         glossary=glossary,
         base_url=base_url,
         api_key=api_key,
+        reasoning_effort=reasoning_effort,
         progress_path=progress_path,
         progress_sig=translate_mod.payload_signature(payload),
     )
+    rep.step("translate cues")
     rep.stage(f"translate {len(payload)} cues -> {to}")
     try:
         trans = translate_mod.translate_cues(payload, **tx_kwargs, reporter=rep)
@@ -5769,6 +5840,7 @@ def translate(
             )
         raise
 
+    rep.step("write translation")
     rep.stage(f"write translated {ext.lstrip('.').upper()}")
     rows = translate_mod.translated_rows(
         blocks,
@@ -5841,7 +5913,7 @@ def correct(
     vtt_path: Path,
     *,
     glossary: dict[str, str] | str | None = None,
-    model: str = asrfix_mod.FIX_MODEL,
+    model: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
     apply: bool = False,
@@ -5864,10 +5936,17 @@ def correct(
     Returns ``{out, audit, applied, rejected, n_cues, applied_in_place, aligned}``.
     """
     vtt_path = require_vtt(Path(vtt_path))  # --apply overwrites the input as VTT
+    # None = env VOXWEAVE_FIX_MODEL > conf [llm].model > built-in (see translate()).
+    model = model or config.resolve_llm_model(None, task_envvar="VOXWEAVE_FIX_MODEL")
     artifact_owner = (
         Path(media_path) if media_path is not None else _artifact_owner(vtt_path)
     )
     rep = reporter or Reporter()
+    steps = ["read subtitles", "correct text", "write correction"]
+    if apply and align_after:
+        steps.append("check and refresh timing")
+    rep.plan(steps)
+    rep.step("read subtitles")
     try:
         vtt_input_bytes = vtt_path.read_bytes()
     except OSError as exc:
@@ -5883,6 +5962,7 @@ def correct(
     blocks = load_subtitle_blocks_bytes(vtt_path, vtt_input_bytes)
 
     payload = asrfix_mod.build_payload(blocks)
+    rep.step("correct text")
     rep.stage(f"LLM correction {len(payload)} cues (model={model})")
     fixes = asrfix_mod.correct_cues(
         payload, model=model, glossary=glossary, base_url=base_url, api_key=api_key
@@ -5890,6 +5970,7 @@ def correct(
     new_texts, applied, rejected = asrfix_mod.apply_fixes(blocks, fixes)
     rendered = asrfix_mod.render_vtt(blocks, new_texts)
 
+    rep.step("write correction")
     audit_path: Path | None = None
     if apply:
         # in-place edit: overwrite the original, no sidecar json (diff lives in the summary)
@@ -5936,6 +6017,10 @@ def correct(
     # apply means "change the file for real" -> refresh timing right away (only worth it
     # if something actually changed; an empty diff leaves the VTT identical).
     aligned = False
+    if apply and align_after:
+        rep.step("check and refresh timing")
+        if not applied:
+            rep.stage("no text changes; alignment not needed")
     if apply and align_after and applied:
         align(
             out_path,
@@ -5943,7 +6028,7 @@ def correct(
             separate=separate,
             normalize=normalize,
             lang_override=lang_override,
-            reporter=rep,
+            reporter=_NestedReporter(rep),
             _expected_vtt_sha256=hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
         )
         aligned = True
