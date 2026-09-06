@@ -5,9 +5,10 @@ heads-up appear here.
 
 ## 0.17.0
 
-Nothing you already run needs to change: no command, option, configuration key, or
-output file changed meaning. Two performance settings were added, both off by
-default, and successful runs gained one extra line of output.
+Two performance settings were added, both off by default, and successful runs gained
+one extra line of stderr output; neither affects an existing run. The translate
+change below is the one item here that needs your attention: it alters what an
+unchanged `translate` command does.
 
 ### Translate: windowed requests and partial output
 
@@ -54,14 +55,16 @@ A run that finishes cleanly now prints one extra muted line to stderr, after the
 progress display:
 
 ```text
-timing: prepare audio 77.2s | ... | total 3m41s
+timing: inspect source 0.4s | prepare audio 1m17s | ... | total 3m41s
 ```
 
-It lists wall-clock seconds per workflow step. Failed runs and runs without a
-declared plan print nothing extra. stdout is unchanged — result paths and the
-speaker-service URL still go there alone — so a script that reads stdout is
-unaffected; a script that captures stderr will see the new line. With `--debug`,
-the same per-step seconds are also recorded in `meta.json` under a `timings` key.
+It lists wall-clock seconds per workflow step, under a minute as seconds and above
+as `NmSSs`. Failed runs and runs without a declared plan print nothing extra. stdout
+is unchanged — result paths and the speaker-service URL still go there alone — so a
+script that reads stdout is unaffected; a script that captures stderr will see the
+new line. A transcription run with `--debug` additionally records the steps finished
+by mid-run in `debug/meta.json` under a `timings` key (a prefix of the printed line;
+no other command writes that file).
 
 Shot-change detection now runs as a background ffmpeg pass started before
 transcription instead of a serial step afterwards. No option changed; its timing

@@ -250,13 +250,16 @@ A run that finishes cleanly closes with one muted stderr line of wall-clock time
 workflow step, so "where did the time go" is answerable from any run:
 
 ```text
-timing: inspect source 0.4s | prepare audio 77.2s | detect songs 31.6s | find speech 9.1s | transcribe and align 101.1s | detect shot changes 0.1s | layout subtitles 1.2s | write outputs 0.3s | total 3m41s
+timing: inspect source 0.4s | prepare audio 1m17s | detect songs 31.6s | find speech 9.1s | transcribe and align 1m41s | detect shot changes 0.1s | layout subtitles 1.2s | write outputs 0.3s | total 3m41s
 ```
 
-A step entered more than once accumulates; `total` is the sum of the listed steps.
-Failed runs end in the error panel instead, and a run without a declared plan prints
-no summary. With `--debug`, the same per-step seconds are also written to `meta.json`
-under a `timings` key.
+Anything under a minute is printed as seconds, anything above as `NmSSs`. A step
+entered more than once accumulates; `total` is the sum of the listed steps. Failed
+runs end in the error panel instead, and a run without a declared plan prints no
+summary. A transcription run with `--debug` additionally records the steps finished
+by mid-run in `debug/meta.json` under a `timings` key — that file is written while
+`transcribe and align` is still open, so it holds a prefix of the printed line, and
+only the transcribe path writes it.
 
 ### Transcribe
 
@@ -823,10 +826,10 @@ whether the changed output is better or worse.
 | `[separate].autocast` / `VOXWEAVE_SEP_AUTOCAST` | `off` (fp32) | `bf16` → 1.35x faster separation, peak VRAM 1.69 → 1.57 GiB | The vocal stem differs slightly (~52 dB SNR against the fp32 stem), and the ASR run on it drifts ~2.3% CER |
 
 Neither has a CLI flag; precedence for both is env var > config file > built-in default.
-Both apply to the torch CUDA path only: Whisper and the Apple Silicon MLX adapter take one
-chunk per ASR call whatever `[batch].asr` says, and autocast is ignored on CPU/MPS. Raising
-`[batch].separate` above 1 bought no speedup on the same GPU (the separator is already
-compute-bound), so it stays at 1 as well.
+`[batch].asr` applies to the torch Qwen engine only — Whisper and the Apple Silicon MLX
+adapter take one chunk per ASR call whatever it says — and autocast applies to CUDA only,
+being ignored on CPU/MPS. Raising `[batch].separate` above 1 bought no speedup on the same
+GPU (the separator is already compute-bound), so it stays at 1 as well.
 
 Batched ASR is guarded against qwen-asr #207, where a mixed-length batch can corrupt its
 shorter item into a lone `!`: chunks are grouped by duration to keep each batch's lengths
