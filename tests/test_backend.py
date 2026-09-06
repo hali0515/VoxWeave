@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from voxweave import align_common, align_ctc, align_mms, backend, runtime
+from voxweave import align_common, align_ctc, align_mms, backend, runtime, vocalscache
 
 
 @pytest.fixture(autouse=True)
@@ -773,6 +773,132 @@ def test_demix_off_is_byte_identical_to_legacy(monkeypatch):
         default = backend._demix(_Identity(), mix, _DEMIX_CFG, batch=bs)
         assert off.numpy().tobytes() == ref_bytes
         assert default.numpy().tobytes() == ref_bytes
+
+
+@pytest.mark.parametrize(
+    ("device", "mode", "recorded"),
+    [
+        ("cuda:0", "off", "off"),
+        ("cuda:0", "bf16", "bf16"),
+        ("cuda:0", "fp16", "fp16"),
+        # Autocast is CUDA-only, so these hosts separate in fp32 and must say so:
+        # the media-adjacent cache is shared with whatever host opens the media.
+        ("cpu", "bf16", "off"),
+        ("mps", "bf16", "off"),
+        ("mps", "fp16", "off"),
+    ],
+)
+def test_separator_identity_records_the_effective_autocast_mode(
+    monkeypatch, tmp_path, device, mode, recorded
+):
+    # The identity is what the vocals cache is keyed on, so it must describe the
+    # numerics this run would separate with, not only the bytes it would load --
+    # and "would separate with" is device-effective, not merely configured.
+    checkpoint = tmp_path / "separator.ckpt"
+    checkpoint.write_bytes(b"separator checkpoint")
+    separator_config = tmp_path / "separator.yaml"
+    separator_config.write_text("model: {}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        backend,
+        "_resolve_separator_files",
+        lambda: (checkpoint, separator_config),
+    )
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: mode)
+    monkeypatch.setattr(backend, "get_device", lambda: device)
+
+    identity = backend.separator_identity()
+
+    assert identity["autocast"] == recorded
+    # and it stays a well-formed companion identity the cache can compare against
+    assert vocalscache.validate_separator_identity(identity).autocast == recorded
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps"])
+def test_probe_and_load_agree_on_the_fp32_path_off_cuda(monkeypatch, tmp_path, device):
+    # The probe (separator_identity) validates a cache the load edge wrote. If only
+    # one of them were device-effective, a CPU/MPS host configured bf16 would miss
+    # its own cache forever -- or claim numerics it never ran.
+    checkpoint = tmp_path / "separator.ckpt"
+    checkpoint.write_bytes(b"separator checkpoint")
+    separator_config = tmp_path / "separator.yaml"
+    separator_config.write_text("model: {}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        backend,
+        "_resolve_separator_files",
+        lambda: (checkpoint, separator_config),
+    )
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: "bf16")
+    monkeypatch.setattr(backend, "get_device", lambda: device)
+
+    probe = backend.separator_identity()["autocast"]
+    load_edge = backend._effective_autocast(
+        backend.config.conf_separate_autocast(), device
+    )
+
+    assert probe == load_edge == "off"
+
+
+@pytest.mark.parametrize(
+    ("device", "mode", "expected"),
+    [
+        ("cuda", "bf16", "bf16"),
+        ("cuda:1", "fp16", "fp16"),
+        ("cuda:0", "off", "off"),
+        ("cpu", "bf16", "off"),
+        ("mps", "fp16", "off"),
+        ("cpu", "off", "off"),
+    ],
+)
+def test_effective_autocast_is_the_one_cuda_only_rule(device, mode, expected):
+    assert backend._effective_autocast(mode, device) == expected
+
+
+@pytest.mark.parametrize("mode", ["fp8", "BF16", "", "true"])
+def test_effective_autocast_rejects_unknown_modes(mode):
+    with pytest.raises(ValueError, match="unknown separator autocast mode"):
+        backend._effective_autocast(mode, "cuda:0")
+
+
+def test_separate_vocals_resolves_autocast_once_for_forward_and_identity(
+    monkeypatch, tmp_path
+):
+    # One source of truth: the mode stamped into the identity (and from there into
+    # the cache companion) is the same value that wrapped the forward. A resolver
+    # that answers differently on a second read would be caught here.
+    torch = pytest.importorskip("torch")
+    sf = pytest.importorskip("soundfile")
+    numpy = pytest.importorskip("numpy")
+
+    reads: list[str] = []
+
+    def _drifting_resolver():
+        reads.append("bf16" if not reads else "off")
+        return reads[-1]
+
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", _drifting_resolver)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    seen: dict[str, object] = {}
+
+    def _fake_load(autocast=None):
+        seen["load"] = autocast
+        return object(), _DEMIX_CFG, {"checkpoint": "blob", "autocast": autocast}
+
+    def _fake_demix(_model, mix, _cfg, progress=None, batch=None, autocast=None):
+        seen["demix"] = autocast
+        return torch.zeros_like(mix)
+
+    monkeypatch.setattr(backend, "_load_separator", _fake_load)
+    monkeypatch.setattr(backend, "_demix", _fake_demix)
+    source = tmp_path / "fullband.wav"
+    sf.write(str(source), numpy.zeros((256, 2), dtype="float32"), 44100)
+
+    out, identity = backend.separate_vocals(source, return_identity=True)
+    try:
+        assert reads == ["bf16"]  # exactly one resolution per separation
+        assert seen == {"load": "bf16", "demix": "bf16"}
+        assert identity["autocast"] == "bf16"
+    finally:
+        out.unlink(missing_ok=True)
 
 
 def _tiny_roformer(torch):

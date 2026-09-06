@@ -286,6 +286,44 @@ def test_load_separator_leaves_tf32_alone_off_cuda(monkeypatch, tmp_path):
     assert precisions == []
 
 
+def test_load_separator_stamps_the_autocast_mode_it_is_given(monkeypatch, tmp_path):
+    # The load-bound identity keys the vocals cache, so it carries the numerics the
+    # caller is about to run the forward with, not just the checkpoint bytes.
+    _fake_separator_env(monkeypatch, tmp_path, device="cuda:0")
+    _model, _cfg, identity = backend._load_separator(autocast="fp16")
+    assert identity["autocast"] == "fp16"
+
+
+def test_load_separator_defaults_the_autocast_mode_to_the_config(monkeypatch, tmp_path):
+    # Same fallback as _demix (env > conf > "off"), for callers that do not resolve
+    # it themselves; separate_vocals resolves once and passes it to both.
+    _fake_separator_env(monkeypatch, tmp_path, device="cuda:0")
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: "bf16")
+    _model, _cfg, identity = backend._load_separator()
+    assert identity["autocast"] == "bf16"
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps"])
+@pytest.mark.parametrize("mode", ["bf16", "fp16"])
+def test_load_separator_records_the_fp32_path_off_cuda(
+    monkeypatch, tmp_path, device, mode
+):
+    # Autocast is CUDA-only, so an MPS/CPU host runs fp32 whatever it is configured
+    # with. Stamping the configured mode would let a media-adjacent cache shared
+    # with a CUDA host pass fp32 stems off as bf16 ones (and vice versa).
+    _fake_separator_env(monkeypatch, tmp_path, device=device)
+    _model, _cfg, identity = backend._load_separator(autocast=mode)
+    assert identity["autocast"] == "off"
+
+
+def test_load_separator_rejects_an_unknown_autocast_mode(monkeypatch, tmp_path):
+    # An unknown mode must never reach the identity (and from there a companion):
+    # the load edge is gated by the same rule as the forward.
+    _fake_separator_env(monkeypatch, tmp_path, device="cuda:0")
+    with pytest.raises(ValueError, match="fp8"):
+        backend._load_separator(autocast="fp8")
+
+
 def test_load_separator_refuses_checkpoint_mutation_during_load(monkeypatch, tmp_path):
     _precisions, checkpoint, torch_stub = _fake_separator_env(
         monkeypatch, tmp_path, device="cpu"

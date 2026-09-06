@@ -156,6 +156,9 @@ _TEMPLATE = """\
 #                    at the cost of tiny waveform differences in the stem. Measure before
 #                    switching (the default is decided by an A/B on real media).
 # CUDA only: on CPU / MPS the setting is ignored and the fp32 path runs.
+# The effective mode is part of the separator identity, so changing it re-separates
+# instead of reusing a vocals cache produced under the previous numerics -- and a CPU /
+# MPS host records the fp32 path it really ran, not the mode it was configured with.
 [separate]
 # autocast = "off"
 
