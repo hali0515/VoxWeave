@@ -364,8 +364,10 @@ def _hint_for(exc: Exception) -> str:
             return (
                 "The endpoint cut the answer short (finish_reason other than stop). "
                 "Check the server's structured-output (json_object) support and "
-                "max_tokens; translate retries and falls back to plain JSON "
-                "automatically, correct does not."
+                "max_tokens: translate and correct both retry and then fall back to "
+                "plain JSON automatically, and correct additionally splits the "
+                "request when the output cap is the problem, so seeing this means "
+                "every attempt failed."
             )
         if "could not load" in message and "model-card" in message:
             hint = (
