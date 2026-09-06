@@ -516,9 +516,9 @@ def test_shadow_cli_exits_two_for_a_live_misbound_finalizer_validator(
     corpus_path: Path, monkeypatch
 ) -> None:
     """Structural admission remains exit-driving even when gates are partial."""
-    from voxweave import pipeline
+    from voxweave.core import shadow_v2
 
-    real_finalizer_row = pipeline._shadow_finalizer_row
+    real_finalizer_row = shadow_v2._shadow_finalizer_row
 
     def corrupt_validator_context(*args, **kwargs):
         row, cues = real_finalizer_row(*args, **kwargs)
@@ -528,7 +528,7 @@ def test_shadow_cli_exits_two_for_a_live_misbound_finalizer_validator(
         validator["cue_count"] = int(row["cue_count"]) + 1
         return row, cues
 
-    monkeypatch.setattr(pipeline, "_shadow_finalizer_row", corrupt_validator_context)
+    monkeypatch.setattr(shadow_v2, "_shadow_finalizer_row", corrupt_validator_context)
     assert (
         _run_cli(
             [
