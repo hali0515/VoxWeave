@@ -6,10 +6,10 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import BinaryIO, Literal, overload
+from typing import Any, BinaryIO, Literal, overload
 
 from voxweave import config
 from voxweave.align_common import interp_missing as interp_missing  # re-export
@@ -150,6 +150,16 @@ WHISPER_COMPUTE = os.environ.get("VOXWEAVE_WHISPER_COMPUTE", "")
 # constructor default.  Raising only the ceiling does not change ordinary greedy
 # decodes (generation still stops at EOS), but avoids silent tail truncation.
 QWEN_MAX_NEW_TOKENS = int(os.environ.get("VOXWEAVE_QWEN_MAX_NEW_TOKENS", "1024"))
+# qwen-asr #207 guard for the batched ASR pass (_asr_pass): a mixed-length batch can
+# corrupt its shorter item to a lone "!", so a batched result with fewer alphanumeric
+# characters than this many per second of chunk audio (empty text included) is re-run
+# alone through the legacy per-chunk call. Speech in a VAD chunk yields several per
+# second in every supported script, so 0.5 leaves a wide margin; chunks shorter than
+# the check floor are exempt (a cough or a breath legitimately transcribes to nothing).
+ASR_BATCH_MIN_CPS = float(os.environ.get("VOXWEAVE_ASR_BATCH_MIN_CPS", "0.5"))
+ASR_BATCH_MIN_CHECK_SEC = float(
+    os.environ.get("VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC", "2.0")
+)
 
 # ASR/alignment process-level singletons; call release() at end of episode.
 # Separator is not kept resident (self-loads, self-releases).
@@ -420,6 +430,8 @@ def _get_asr(asr_model: str | None = None):
     Timestamps come from align_text; on ja/en paths the Qwen aligner is never loaded, saving VRAM.
     dtype kwarg (not torch_dtype) reflects transformers 4.57.6 API.
     Reloads if the model repo changes.
+    qwen_asr's max_inference_batch_size mirrors config ``[batch].asr`` so it never
+    sub-splits the chunk groups _asr_pass hands it.
     """
     if (
         _use_mlx()
@@ -429,6 +441,7 @@ def _get_asr(asr_model: str | None = None):
         return backend_mlx.get_asr(resolve_asr_model(asr_model))
     global _asr, _asr_id
     mid = resolve_asr_model(asr_model)
+    batch = config.conf_batch("asr")
     if _asr is not None and _asr_id != mid:  # model changed -> release old one
         release()
     if _asr is None:
@@ -442,14 +455,16 @@ def _get_asr(asr_model: str | None = None):
         # Use snapshot so model + processor both land in config.ASR_CACHE (see _hf_snapshot docstring).
         local = _hf_snapshot(mid, config.ASR_CACHE)
         load_kwargs = {"dtype": _model_dtype(dev), "device_map": dev}
-        if (
-            "max_new_tokens"
-            in inspect.signature(Qwen3ASRModel.from_pretrained).parameters
-        ):
+        params = inspect.signature(Qwen3ASRModel.from_pretrained).parameters
+        if "max_new_tokens" in params:
             load_kwargs["max_new_tokens"] = QWEN_MAX_NEW_TOKENS
+        if "max_inference_batch_size" in params:
+            load_kwargs["max_inference_batch_size"] = batch
         _asr = Qwen3ASRModel.from_pretrained(local, **load_kwargs)
         _asr_id = mid
         log.info("ASR ready")
+    if hasattr(_asr, "max_inference_batch_size"):  # already loaded / older signature
+        _asr.max_inference_batch_size = batch
     return _asr
 
 
@@ -577,50 +592,35 @@ def stabilize_asr_text(text: str) -> str:
     return best
 
 
-def _asr_only(
-    engine: str,
-    wav_path: Path,
-    language: str | None,
-    model_id: str,
-    context: str | None,
-) -> tuple[str | None, str, str]:
-    """Transcribe only: return (effective language, punctuated text, align_lang).
+def _qwen_asr_kwargs(language: str | None, context: str | None) -> dict:
+    """Keyword arguments for one Qwen3ASRModel.transcribe call (single path or batch).
 
-    First pass of the two-pass peak strategy: alignment deferred to pass two after ASR is released.
-    Explicit language always wins; auto-detected labels are reconciled with the
-    transcript script before choosing the aligner.
-    align_lang pre-computed here; falls back to 'en' for empty text (skipped in pass two anyway).
+    ASR-only (timestamps come from align_text); the context kwarg is omitted entirely
+    when empty to preserve legacy behavior (older qwen-asr lacks the parameter).
     """
-    from voxweave.lang import reconcile_detected_language, to_iso_or
+    kwargs: dict = {"language": language or None, "return_time_stamps": False}
+    if context:
+        kwargs["context"] = format_qwen_context(context)
+    return kwargs
 
-    if engine == "whisper":
-        model = _get_whisper(model_id)
-        lang_iso = to_iso_or(language, None)
-        if (
-            lang_iso == "yue"
-        ):  # whisper has no Cantonese code; alignment still uses yue downstream
-            lang_iso = "zh"
-        segments, info = model.transcribe(
-            str(wav_path),
-            language=lang_iso,
-            initial_prompt=context or None,
-            hotwords=whisper_hotwords(context),
-            condition_on_previous_text=False,  # prevents repetition hallucination
-            vad_filter=False,  # VAD chunking already done upstream
-            word_timestamps=False,  # hybrid uses Qwen for timestamps, not whisper
-        )
-        raw_text = "".join(s.text for s in segments)  # segments is a generator
-        raw_det = info.language
-        src = "whisper"
-    else:  # qwen
-        model = _get_asr(model_id)
-        kwargs: dict = {"language": language or None, "return_time_stamps": False}
-        if context:  # omit kwarg entirely when empty to preserve legacy behavior
-            kwargs["context"] = format_qwen_context(context)
-        r = model.transcribe(str(wav_path), **kwargs)[0]
-        raw_det = r.language or None
-        raw_text = r.text
-        src = "ASR"
+
+def _asr_postprocess(
+    raw_det: str | None,
+    raw_text: str,
+    language: str | None,
+    src: str,
+) -> tuple[str | None, str, str]:
+    """One chunk's raw engine output -> (effective language, text, align_lang).
+
+    Shared by the per-chunk (_asr_only) and batched (_asr_pass) paths so both yield
+    identical results: terminal generation loops are collapsed (stabilize_asr_text),
+    the detected label is reconciled with the transcript script (an explicit
+    ``language`` always wins) and align_lang is pre-computed, falling back to 'en'
+    for empty text (skipped by the alignment pass anyway). ``src`` is for log
+    wording only.
+    """
+    from voxweave.lang import reconcile_detected_language
+
     text = stabilize_asr_text(raw_text)
     if len(text) < len(raw_text.strip()):
         log.warning(
@@ -644,6 +644,49 @@ def _asr_only(
         )
     align_lang = _resolve_align_lang(det, src) if text.strip() else "en"
     return det, text, align_lang
+
+
+def _asr_only(
+    engine: str,
+    wav_path: Path,
+    language: str | None,
+    model_id: str,
+    context: str | None,
+) -> tuple[str | None, str, str]:
+    """Transcribe only: return (effective language, punctuated text, align_lang).
+
+    First pass of the two-pass peak strategy: alignment deferred to pass two after ASR is released.
+    The raw engine output goes through _asr_postprocess (language reconciliation,
+    align_lang), the same step the batched Qwen pass applies per result.
+    """
+    from voxweave.lang import to_iso_or
+
+    if engine == "whisper":
+        model = _get_whisper(model_id)
+        lang_iso = to_iso_or(language, None)
+        if (
+            lang_iso == "yue"
+        ):  # whisper has no Cantonese code; alignment still uses yue downstream
+            lang_iso = "zh"
+        segments, info = model.transcribe(
+            str(wav_path),
+            language=lang_iso,
+            initial_prompt=context or None,
+            hotwords=whisper_hotwords(context),
+            condition_on_previous_text=False,  # prevents repetition hallucination
+            vad_filter=False,  # VAD chunking already done upstream
+            word_timestamps=False,  # hybrid uses Qwen for timestamps, not whisper
+        )
+        raw_text = "".join(s.text for s in segments)  # segments is a generator
+        raw_det = info.language
+        src = "whisper"
+    else:  # qwen
+        model = _get_asr(model_id)
+        r = model.transcribe(str(wav_path), **_qwen_asr_kwargs(language, context))[0]
+        raw_det = r.language or None
+        raw_text = r.text
+        src = "ASR"
+    return _asr_postprocess(raw_det, raw_text, language, src)
 
 
 def _transcribe_qwen_align(
@@ -872,20 +915,30 @@ def _asr_chunk_safe(
 ) -> tuple[str | None, str, str]:
     """One chunk's ASR with failure containment: an exception degrades to empty
     text (the same path as genuine silence downstream) instead of killing the
-    run, so hours of prior chunks are not thrown away."""
+    run, so hours of prior chunks are not thrown away. This is the per-chunk unit
+    of _asr_pass: batch size 1, whisper and MLX go through it directly; a batched
+    Qwen group whose call raised is redone chunk by chunk here, as is a single
+    chunk whose batched result failed the qwen-asr #207 content floor."""
     try:
         return _asr_only(engine, wav, language, model_id, context)
     except Exception as e:  # noqa: BLE001 -- one bad chunk must not kill the run
-        failures.append(e)
-        log.warning(
-            "ASR failed on chunk %d/%d (%s: %s); continuing with empty text",
-            idx + 1,
-            total,
-            type(e).__name__,
-            e,
-        )
-        _empty_cache()
-        return (None, "", "")
+        return _asr_failed(e, idx, total, failures)
+
+
+def _asr_failed(
+    e: Exception, idx: int, total: int, failures: list[Exception]
+) -> tuple[None, str, str]:
+    """Record one chunk's ASR failure and hand back the empty-text placeholder."""
+    failures.append(e)
+    log.warning(
+        "ASR failed on chunk %d/%d (%s: %s); continuing with empty text",
+        idx + 1,
+        total,
+        type(e).__name__,
+        e,
+    )
+    _empty_cache()
+    return (None, "", "")
 
 
 def _wav_duration(wav: Path) -> float:
@@ -953,6 +1006,126 @@ def _raise_if_all_failed(failures: list[Exception], total: int) -> None:
         )
 
 
+def _asr_batch_size(engine: str) -> int:
+    """Chunks per ASR call in _asr_pass; 1 = the legacy per-chunk call.
+
+    Only the torch qwen_asr backend takes a list of audio paths. Whisper and the
+    MLX Qwen adapter (backend_mlx._MlxAsr.transcribe) take one path per call, so
+    they stay per-chunk whatever ``[batch].asr`` says.
+    """
+    if engine != "qwen" or _use_mlx():
+        return 1
+    return config.conf_batch("asr")
+
+
+def _batched_asr_suspect(text: str, duration: float) -> bool:
+    """True when a batched result is implausibly short for a non-silent chunk.
+
+    qwen-asr #207: a mixed-length batch can corrupt its shorter item to a lone "!".
+    Alphanumeric content below ASR_BATCH_MIN_CPS per second of audio (empty text
+    included) is not accepted. Chunks shorter than ASR_BATCH_MIN_CHECK_SEC, or whose
+    duration is unknown (0.0), are exempt: little or no text is legitimate there.
+    """
+    from voxweave.lang import transcript_content_weight
+
+    if duration < ASR_BATCH_MIN_CHECK_SEC:
+        return False
+    return transcript_content_weight(text) < ASR_BATCH_MIN_CPS * duration
+
+
+def _asr_pass(
+    engine: str,
+    wav_paths: list[Path],
+    language: str | None,
+    model_id: str,
+    context: str | None,
+    failures: list[Exception],
+    tick: Callable[[], None],
+) -> list[tuple[str | None, str, str]]:
+    """All-chunks ASR pass -> [(det_lang, text, align_lang)] in input order.
+
+    ``tick`` fires once per chunk after its result is in (per-chunk progress total
+    unchanged; on the batched path ticks follow duration order, not chunk order).
+    Batch size 1 (the default), a group of one, whisper and MLX make the legacy
+    single-path call through _asr_chunk_safe. On the torch Qwen backend with
+    ``[batch].asr`` > 1 the chunks are grouped by duration into batches of that
+    size and every group is ONE model.transcribe(list) call. Batching is opt-in
+    because its output is not byte-identical to batch 1 (bf16 batched kernels
+    drift ~1.5% CER; numbers in transcribe_chunks). Duration sorting bought no
+    speed in the A/B but keeps each group's lengths close, which minimises the
+    qwen-asr #207 exposure (a mixed-length batch can corrupt its shorter item to
+    a lone "!"); against what slips through, a batched result that is empty or
+    below the ASR_BATCH_MIN_CPS content floor for a chunk of at least
+    ASR_BATCH_MIN_CHECK_SEC (_batched_asr_suspect) is not accepted: that chunk
+    alone is re-run through the legacy per-chunk call. A group whose batched call
+    raises (or returns the wrong count) is redone chunk by chunk through
+    _asr_chunk_safe, so one poisoned chunk degrades alone and its failure is
+    recorded exactly as on the per-chunk path.
+    """
+    n = len(wav_paths)
+    out: list[tuple[str | None, str, str]] = [(None, "", "")] * n
+
+    def _per_chunk(indices: Sequence[int]) -> None:
+        for i in indices:
+            out[i] = _asr_chunk_safe(
+                engine, wav_paths[i], language, model_id, context, i, n, failures
+            )
+            tick()
+
+    batch = _asr_batch_size(engine)
+    if batch <= 1:
+        _per_chunk(range(n))
+        return out
+    durations = [_wav_duration(p) for p in wav_paths]
+    order = sorted(range(n), key=durations.__getitem__)
+    kwargs = _qwen_asr_kwargs(language, context)
+    for start in range(0, n, batch):
+        group = order[start : start + batch]
+        if len(group) == 1:  # nothing to pad against: legacy single-path call
+            _per_chunk(group)
+            continue
+        try:
+            # MLX is excluded by _asr_batch_size, so this is the torch Qwen3ASRModel,
+            # whose transcribe() decodes a list of paths as one padded batch
+            model: Any = _get_asr(model_id)
+            results = model.transcribe([str(wav_paths[i]) for i in group], **kwargs)
+            if len(results) != len(group):
+                raise RuntimeError(
+                    f"batched ASR returned {len(results)} results for {len(group)} chunks"
+                )
+        except Exception as e:  # noqa: BLE001 -- redo the group per chunk so one bad chunk degrades alone
+            log.warning(
+                "batched ASR failed on chunks %s of %d (%s: %s); retrying them one by one",
+                ", ".join(str(i + 1) for i in sorted(group)),
+                n,
+                type(e).__name__,
+                e,
+            )
+            _empty_cache()
+            _per_chunk(sorted(group))
+            continue
+        for i, r in zip(group, results):
+            raw_text = r.text or ""
+            if _batched_asr_suspect(raw_text, durations[i]):
+                log.warning(
+                    "batched ASR returned %d alphanumeric characters for chunk %d/%d "
+                    "(%.1fs of audio, floor %.0f); re-running it alone (qwen-asr #207)",
+                    sum(ch.isalnum() for ch in raw_text),
+                    i + 1,
+                    n,
+                    durations[i],
+                    ASR_BATCH_MIN_CPS * durations[i],
+                )
+                _per_chunk([i])
+                continue
+            try:
+                out[i] = _asr_postprocess(r.language or None, raw_text, language, "ASR")
+            except Exception as e:  # noqa: BLE001 -- same containment as _asr_chunk_safe
+                out[i] = _asr_failed(e, i, n, failures)
+            tick()
+    return out
+
+
 def transcribe_chunks(
     wav_paths: list[Path],
     language: str | None,
@@ -968,8 +1141,16 @@ def transcribe_chunks(
     """Transcribe a list of chunks -> [(lang, text, units)] matching the transcribe_align contract.
 
     Pass structure is fixed: all-chunks ASR pass(es), then one alignment pass (fusion:
-    whisper ASR -> Qwen ASR -> align + merge). strategy controls model residency between
-    passes (config.conf_load_strategy):
+    whisper ASR -> Qwen ASR -> align + merge). Each ASR pass is _asr_pass: with config
+    ``[batch].asr`` > 1 (opt-in; default 1) the torch Qwen engine decodes chunks in
+    duration-sorted groups of that size, one model.transcribe(list) call per group,
+    results restored to input order. Measured on an RTX PRO 4000 (Qwen3-ASR-1.7B,
+    greedy, 24-min episode): batch 4 = 1.34x faster at 6.4 GiB peak, batch 8 = 1.49x
+    at 8.9 GiB, but batched transcripts drift ~1.5% CER from batch 1 (bf16 batched
+    kernels; scattered small edits, no chunk lost), and qwen-asr #207 reports
+    mixed-length batches corrupting the shorter item, which _asr_pass guards with a
+    per-chunk re-run. Whisper, MLX and batch size 1 transcribe one chunk per call.
+    strategy controls model residency between passes (config.conf_load_strategy):
     - "peak" (default): singletons released between passes; peak VRAM = max(models).
     - "sum": singletons stay resident across passes; peak = sum(models); saves the
       release/reload overhead on high-VRAM cards.
@@ -977,7 +1158,9 @@ def transcribe_chunks(
     ``full_wav`` + ``bounds`` (absolute chunk windows on full_wav) enable ONE full-file
     alignment pass for CTC/MMS file-level languages (see _full_pass_units); Qwen-aligned
     languages and callers that omit them keep per-chunk alignment. on_done(i) is called
-    per completed pass; total = N * chunk_pass_count(). Aligner kept alive until release().
+    per chunk per completed pass (a batched chunk ticks once its group has returned,
+    so batched ticks follow duration order, not chunk order); total = N *
+    chunk_pass_count(). Aligner kept alive until release().
     """
     counter = [0]
 
@@ -992,26 +1175,16 @@ def transcribe_chunks(
         qid = resolve_asr_model(config.conf_fusion_qwen())
         fusion_whisper = config.conf_fusion_whisper()
         n = len(wav_paths)
-        # pass A: whisper ASR all chunks
+        # pass A: whisper ASR all chunks (always per-chunk: whisper takes one path)
         w_fail: list[Exception] = []
-        w_asr: list[tuple[str | None, str, str]] = []
-        for i, w in enumerate(wav_paths):
-            w_asr.append(
-                _asr_chunk_safe(
-                    "whisper", w, language, fusion_whisper, context, i, n, w_fail
-                )
-            )
-            _tick()
+        w_asr = _asr_pass(
+            "whisper", wav_paths, language, fusion_whisper, context, w_fail, _tick
+        )
         if release:
             _release_whisper()
-        # pass B: Qwen ASR all chunks
+        # pass B: Qwen ASR all chunks (batched on the torch backend)
         q_fail: list[Exception] = []
-        q_asr: list[tuple[str | None, str, str]] = []
-        for i, w in enumerate(wav_paths):
-            q_asr.append(
-                _asr_chunk_safe("qwen", w, language, qid, context, i, n, q_fail)
-            )
-            _tick()
+        q_asr = _asr_pass("qwen", wav_paths, language, qid, context, q_fail, _tick)
         if release:
             _release_qwen_asr()
         # both engines failing everywhere = broken run; one engine surviving
@@ -1065,12 +1238,8 @@ def transcribe_chunks(
     # qwen / whisper: ASR pass -> alignment pass (full-file where the language allows)
     n = len(wav_paths)
     failures: list[Exception] = []
-    asr_out: list[tuple[str | None, str, str]] = []  # (det_lang, text, align_lang)
-    for i, w in enumerate(wav_paths):
-        asr_out.append(
-            _asr_chunk_safe(engine, w, language, mid, context, i, n, failures)
-        )
-        _tick()
+    # (det_lang, text, align_lang) per chunk, in input order
+    asr_out = _asr_pass(engine, wav_paths, language, mid, context, failures, _tick)
     if release:
         _release_whisper() if engine == "whisper" else _release_qwen_asr()
     _raise_if_all_failed(failures, n)

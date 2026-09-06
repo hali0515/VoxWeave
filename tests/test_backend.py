@@ -1,5 +1,7 @@
 """backend pure-logic tests + missing-dependency error paths (no real model loading)."""
 
+from pathlib import Path
+
 import pytest
 
 from voxweave import align_common, align_ctc, align_mms, backend, runtime
@@ -73,6 +75,48 @@ def test_get_asr_raises_qwen_decode_ceiling_when_supported(monkeypatch):
     try:
         assert backend._get_asr("qwen3-asr-0.6b") is sentinel
         assert seen["max_new_tokens"] == 1024
+    finally:
+        backend._asr = None
+        backend._asr_id = None
+
+
+def test_get_asr_mirrors_conf_batch_into_max_inference_batch_size(monkeypatch):
+    # qwen_asr must not sub-split the groups _asr_pass hands it: the conf batch is
+    # passed at load time and refreshed on the already-loaded singleton
+    import sys
+    import types
+
+    seen: dict = {}
+
+    class _Loaded:
+        max_inference_batch_size = 32  # qwen_asr's own default
+
+    loaded = _Loaded()
+
+    class _Model:
+        @classmethod
+        def from_pretrained(
+            cls, path, *, max_new_tokens=None, max_inference_batch_size=None, **kwargs
+        ):
+            seen.update(max_inference_batch_size=max_inference_batch_size)
+            return loaded
+
+    mod = types.ModuleType("qwen_asr")
+    mod.Qwen3ASRModel = _Model
+    monkeypatch.setitem(sys.modules, "qwen_asr", mod)
+    monkeypatch.setattr(backend, "_hf_snapshot", lambda mid, cache: "/model")
+    monkeypatch.setattr(backend, "get_device", lambda: "cpu")
+    monkeypatch.setattr(backend, "_model_dtype", lambda dev: "float32")
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "6")
+    backend._asr = None
+    backend._asr_id = None
+    try:
+        assert backend._get_asr("qwen3-asr-0.6b") is loaded
+        assert seen["max_inference_batch_size"] == 6
+        assert loaded.max_inference_batch_size == 6
+        monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+        assert backend._get_asr("qwen3-asr-0.6b") is loaded  # cached, no reload
+        assert loaded.max_inference_batch_size == 2  # attribute refreshed in place
     finally:
         backend._asr = None
         backend._asr_id = None
@@ -931,6 +975,349 @@ def test_transcribe_chunks_fusion_survives_one_engine_failure(monkeypatch, tmp_p
     assert len(out) == 2
     # chunk 0: whisper side degraded to empty, qwen side intact
     assert fused[0][0][1] == "" and fused[0][1][1] == "qwen-c0.wav"
+
+
+# --- batched Qwen ASR pass ([batch].asr) ------------------------------------ #
+class _AsrRes:
+    def __init__(self, text, language="English"):
+        self.text, self.language, self.time_stamps = text, language, None
+
+
+def _batched_asr_fake(
+    calls: list,
+    poison: frozenset[str] = frozenset(),
+    garble: dict[str, str] | None = None,
+):
+    """Fake torch Qwen3ASRModel: .transcribe takes one path or a list of paths and
+    returns one result per item (text = "t-<stem>"); every call's (audio, kwargs) is
+    recorded. A call that touches a poisoned wav name raises, single or batched.
+    ``garble`` maps wav names to the text a BATCHED call returns for them instead
+    (qwen-asr #207 style corruption); a single-path call is never garbled."""
+
+    class _Model:
+        def transcribe(self, audio, **kw):
+            calls.append((audio, kw))
+            paths = audio if isinstance(audio, list) else [audio]
+            if poison & {Path(p).name for p in paths}:
+                raise RuntimeError("CUDA error: device-side assert")
+            if isinstance(audio, list) and garble:
+                return [
+                    _AsrRes(garble.get(Path(p).name, f"t-{Path(p).stem}"))
+                    for p in paths
+                ]
+            return [_AsrRes(f"t-{Path(p).stem}") for p in paths]
+
+    return _Model()
+
+
+def _asr_call_names(calls: list):
+    """Recorded audio args -> wav names: a list per batched call, a str per single call."""
+    return [
+        [Path(p).name for p in a] if isinstance(a, list) else Path(a).name
+        for a, _ in calls
+    ]
+
+
+def _stub_chunks(tmp_path, n: int) -> list[Path]:
+    wavs = [tmp_path / f"c{i}.wav" for i in range(n)]
+    for w in wavs:
+        w.write_bytes(b"x")
+    return wavs
+
+
+def test_transcribe_chunks_batches_qwen_by_duration_and_restores_order(
+    monkeypatch, tmp_path
+):
+    # [batch].asr = 2: chunks are grouped by ascending duration, each group is ONE
+    # model.transcribe(list) call with the legacy kwargs, and the results come back
+    # in input order; the odd chunk left over goes through the legacy single call
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _batched_asr_fake(calls))
+    durations = {
+        "c0.wav": 5.0,
+        "c1.wav": 1.0,
+        "c2.wav": 4.0,
+        "c3.wav": 2.0,
+        "c4.wav": 3.0,
+    }
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: durations[w.name])
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 1.0}]
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 5)
+    ticks: list[int] = []
+    out = backend.transcribe_chunks(
+        wavs,
+        None,
+        asr_model="qwen3-asr-1.7b",
+        context="艾米莉亚, 帕克",
+        on_done=lambda i: ticks.append(i),
+    )
+    assert _asr_call_names(calls) == [
+        ["c1.wav", "c3.wav"],
+        ["c4.wav", "c2.wav"],
+        "c0.wav",
+    ]
+    for _, kw in calls:  # same kwargs as the single-path call, context framed
+        assert kw == {
+            "language": None,
+            "return_time_stamps": False,
+            "context": "Proper nouns: 艾米莉亚, 帕克.",
+        }
+    assert [t for _, t, _ in out] == [f"t-c{i}" for i in range(5)]  # input order
+    assert [u[0]["text"] for _, _, u in out] == [f"t-c{i}" for i in range(5)]
+    assert ticks == list(range(10))  # still one tick per chunk: 5 ASR + 5 align
+
+
+def test_transcribe_chunks_asr_batch_1_keeps_legacy_single_path_calls(
+    monkeypatch, tmp_path
+):
+    # batch size 1 = exactly the pre-batching call shape: one model.transcribe(str)
+    # per chunk in input order, no duration probing
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "1")
+    calls: list = []
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _batched_asr_fake(calls))
+    monkeypatch.setattr(
+        backend, "_wav_duration", lambda w: pytest.fail("batch 1 must not probe")
+    )
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 1.0}]
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 3)
+    out = backend.transcribe_chunks(wavs, "Japanese", asr_model="qwen3-asr-1.7b")
+    assert [a for a, _ in calls] == [str(w) for w in wavs]
+    assert all(
+        kw == {"language": "Japanese", "return_time_stamps": False} for _, kw in calls
+    )
+    assert [t for _, t, _ in out] == ["t-c0", "t-c1", "t-c2"]
+
+
+def test_asr_pass_batch_failure_falls_back_per_chunk_for_that_group_only(
+    monkeypatch, tmp_path
+):
+    # a poisoned chunk kills its batched call; only that group is redone chunk by
+    # chunk, so the poisoned chunk alone degrades to empty text and is the only
+    # recorded failure (the healthy group's batched call is never repeated)
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, poison=frozenset({"c2.wav"})),
+    )
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: float(w.stem[1:]))
+    empties: list[str] = []
+    monkeypatch.setattr(backend, "_empty_cache", lambda: empties.append("empty"))
+    wavs = _stub_chunks(tmp_path, 4)
+    failures: list[Exception] = []
+    ticks: list[int] = []
+    out = backend._asr_pass(
+        "qwen",
+        wavs,
+        None,
+        "Qwen/Qwen3-ASR-1.7B",
+        None,
+        failures,
+        lambda: ticks.append(len(ticks)),
+    )
+    assert _asr_call_names(calls) == [
+        ["c0.wav", "c1.wav"],
+        ["c2.wav", "c3.wav"],
+        "c2.wav",
+        "c3.wav",
+    ]
+    assert [t for _, t, _ in out] == ["t-c0", "t-c1", "", "t-c3"]
+    assert out[2] == (None, "", "")
+    assert len(failures) == 1 and isinstance(failures[0], RuntimeError)
+    assert empties == [
+        "empty",
+        "empty",
+    ]  # after the failed batch, after the failed chunk
+    assert len(ticks) == 4  # every chunk still ticks exactly once
+
+
+def test_transcribe_chunks_batched_all_failed_still_raises(monkeypatch, tmp_path):
+    # every chunk poisoned: the batch fails, the per-chunk retries fail, and the
+    # run is reported broken exactly as on the per-chunk path
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, poison=frozenset({"c0.wav", "c1.wav"})),
+    )
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: 1.0)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 2)
+    with pytest.raises(RuntimeError, match="all 2 chunks"):
+        backend.transcribe_chunks(wavs, None, asr_model="qwen3-asr-1.7b")
+    assert _asr_call_names(calls) == [["c0.wav", "c1.wav"], "c0.wav", "c1.wav"]
+
+
+def test_transcribe_chunks_fusion_batches_qwen_pass_but_not_whisper(
+    monkeypatch, tmp_path
+):
+    # fusion: pass A (whisper) stays one path per call, pass B (Qwen) is one batched
+    # call; the fused pairs still line up chunk by chunk
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "4")
+    q_calls: list = []
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _batched_asr_fake(q_calls))
+    w_calls: list = []
+
+    class _Seg:
+        def __init__(self, text):
+            self.text = text
+
+    class _Info:
+        language = "en"
+
+    class _Whisper:
+        def transcribe(self, path, **kw):
+            assert isinstance(path, str)  # faster-whisper takes exactly one path
+            w_calls.append(path)
+            return iter([_Seg(f"w-{Path(path).stem}")]), _Info()
+
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: _Whisper())
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: float(w.stem[1:]))
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 0.2}]
+    )
+    fused: list[tuple] = []
+
+    def _fuse(wr, qr, lang):
+        fused.append((wr, qr))
+        return ("en", "fused", [])
+
+    monkeypatch.setattr(backend, "_fuse_chunk", _fuse)
+    monkeypatch.setattr(backend, "_release_whisper", lambda: None)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 3)
+    out = backend.transcribe_chunks(wavs, None, asr_model="fusion")
+    assert len(out) == 3
+    assert w_calls == [str(w) for w in wavs]
+    assert _asr_call_names(q_calls) == [["c0.wav", "c1.wav", "c2.wav"]]
+    assert [(wr[1], qr[1]) for wr, qr in fused] == [
+        (f"w-c{i}", f"t-c{i}") for i in range(3)
+    ]
+
+
+def test_transcribe_chunks_mlx_keeps_per_chunk_asr(monkeypatch, tmp_path):
+    # the MLX adapter takes a single path per call, so [batch].asr is ignored there
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "4")
+    monkeypatch.setattr(backend, "_use_mlx", lambda: True)
+    calls: list = []
+
+    class _Mlx:
+        def transcribe(self, wav_path, **kw):
+            assert isinstance(wav_path, str)
+            calls.append(wav_path)
+            return [_AsrRes(f"t-{Path(wav_path).stem}")]
+
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _Mlx())
+    monkeypatch.setattr(
+        backend, "_wav_duration", lambda w: pytest.fail("MLX must not batch")
+    )
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 1.0}]
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 3)
+    out = backend.transcribe_chunks(wavs, None, asr_model="qwen3-asr-1.7b")
+    assert calls == [str(w) for w in wavs]
+    assert [t for _, t, _ in out] == ["t-c0", "t-c1", "t-c2"]
+
+
+def test_asr_pass_reruns_implausibly_short_batched_result_alone(
+    monkeypatch, tmp_path, caplog
+):
+    # qwen-asr #207: the shorter item of a mixed-length batch comes back as a lone
+    # "!". That chunk alone is re-run through the legacy single-path call and takes
+    # the single call's text; the other chunk keeps its batched result, nothing is
+    # recorded as a failure, and every chunk still ticks exactly once. (The fake's
+    # healthy text has 3 alphanumeric characters, so durations stay under 6s to
+    # clear the 0.5 chars/s floor; the garbled chunk is above the 2s check floor.)
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, garble={"c0.wav": "!"}),
+    )
+    durations = {"c0.wav": 3.0, "c1.wav": 5.0}
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: durations[w.name])
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 2)
+    failures: list[Exception] = []
+    ticks: list[int] = []
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = backend._asr_pass(
+            "qwen",
+            wavs,
+            None,
+            "Qwen/Qwen3-ASR-1.7B",
+            None,
+            failures,
+            lambda: ticks.append(len(ticks)),
+        )
+    assert _asr_call_names(calls) == [["c0.wav", "c1.wav"], "c0.wav"]
+    assert [t for _, t, _ in out] == ["t-c0", "t-c1"]
+    assert failures == []
+    assert len(ticks) == 2
+    assert "chunk 1/2" in caplog.text and "qwen-asr #207" in caplog.text
+
+
+def test_asr_pass_accepts_empty_batched_result_for_tiny_chunk(monkeypatch, tmp_path):
+    # silence exemption: a sub-floor chunk (a cough, a breath) legitimately
+    # transcribes to nothing, so an empty batched result for it is kept as-is and
+    # the batched call is the only model call (5s keeps the healthy 3-character
+    # fake text above the 0.5 chars/s floor)
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, garble={"c0.wav": ""}),
+    )
+    durations = {"c0.wav": 0.4, "c1.wav": 5.0}
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: durations[w.name])
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 2)
+    failures: list[Exception] = []
+    ticks: list[int] = []
+    out = backend._asr_pass(
+        "qwen",
+        wavs,
+        None,
+        "Qwen/Qwen3-ASR-1.7B",
+        None,
+        failures,
+        lambda: ticks.append(len(ticks)),
+    )
+    assert _asr_call_names(calls) == [["c0.wav", "c1.wav"]]
+    assert [t for _, t, _ in out] == ["", "t-c1"]
+    assert out[0][2] == "en"  # empty text: align_lang placeholder, skipped by align
+    assert failures == []
+    assert len(ticks) == 2
+
+
+def test_batched_asr_suspect_floor():
+    # the guard is a chars-per-second floor over the chunk's alphanumeric content;
+    # unknown (0.0) or sub-floor durations are exempt whatever the text
+    assert backend._batched_asr_suspect("!", 30.0)
+    assert backend._batched_asr_suspect("", 118.0)
+    assert not backend._batched_asr_suspect("", 0.0)  # header unreadable
+    assert not backend._batched_asr_suspect("", 1.9)
+    assert not backend._batched_asr_suspect("そうだね、行こう。", 10.0)
+    assert not backend._batched_asr_suspect("yes", 5.0)  # 3 alnum >= 0.5 * 5
+    assert backend._batched_asr_suspect("は", 10.0)  # 1 alnum < 0.5 * 10
 
 
 # --- load strategy: sum (co-resident: same pass structure, no release between passes) ----------- #
