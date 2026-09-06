@@ -62,9 +62,10 @@ breaks) handles Chinese/Japanese/English as first-class.
   - [Pack soft subtitles (`pack`)](#pack-soft-subtitles)
   - [Burn hard subtitles (`burn`)](#burn-hard-subtitles)
 - [The edit-and-resync workflow](#the-edit-and-resync-workflow)
-- [CLI migration](MIGRATING.md)
+- [Migration notes](MIGRATING.md)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
+  - [Performance knobs](#performance-knobs)
 - [Data contract](#data-contract)
 - [Testing](#testing)
 - [Support](#support)
@@ -245,6 +246,21 @@ pulse instead of a fabricated percentage. Burn reports actual encoded frames/tim
 Non-terminal runs emit static step lines and occasional encoding updates to stderr,
 with no animation; stdout remains reserved for result paths or the speaker-service URL.
 
+A run that finishes cleanly closes with one muted stderr line of wall-clock time per
+workflow step, so "where did the time go" is answerable from any run:
+
+```text
+timing: inspect source 0.4s | prepare audio 1m17s | detect songs 31.6s | find speech 9.1s | transcribe and align 1m41s | detect shot changes 0.1s | layout subtitles 1.2s | write outputs 0.3s | total 3m41s
+```
+
+Anything under a minute is printed as seconds, anything above as `NmSSs`. A step
+entered more than once accumulates; `total` is the sum of the listed steps. Failed
+runs end in the error panel instead, and a run without a declared plan prints no
+summary. A transcription run with `--debug` additionally records the steps finished
+by mid-run in `debug/meta.json` under a `timings` key — that file is written while
+`transcribe and align` is still open, so it holds a prefix of the printed line, and
+only the transcribe path writes it.
+
 ### Transcribe
 
 `voxweave transcribe <media>` (or `voxweave <media>`) — separation → song-skip → VAD chunking → ASR + forced alignment →
@@ -263,7 +279,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 Unknown command words produce a command error. Bare subtitle or JSON paths are not
 transcribed: use `align` for edited VTT, `export` for subtitle format conversion,
 or `render` for layout from the sibling JSON. These inputs are never automatically
-routed to an in-place editing command. See [CLI migration](MIGRATING.md) for old names.
+routed to an in-place editing command. See the [migration notes](MIGRATING.md) for old names.
 
 <details>
 <summary><b>Options</b></summary>
@@ -688,6 +704,21 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
   pass is cropped to the transcribed chunk envelope during transcribe, keeping a skipped
   leading/trailing song out of the aligner's waveform)
 
+**Throughput (opt-in; see [Performance knobs](#performance-knobs))**
+
+- `VOXWEAVE_SEP_BATCH` / `VOXWEAVE_CTC_BATCH` / `VOXWEAVE_MMS_BATCH` / `VOXWEAVE_ASR_BATCH`
+  (defaults 1 / 1 / 4 / 1; same as `[batch].separate` / `.ctc` / `.mms` / `.asr`) — windows or
+  chunks per GPU forward pass. Values below 1 are clamped to 1; a non-integer value is ignored
+  and the next source in the precedence chain applies
+- `VOXWEAVE_ASR_BATCH_MIN_CPS` (default 0.5) / `VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC` (default 2.0)
+  — the qwen-asr #207 guard on the batched ASR path: a batched result with fewer than `MIN_CPS`
+  alphanumeric characters per second of audio, for a chunk of at least `MIN_CHECK_SEC`, is
+  rejected and that chunk is re-run alone. Shorter chunks are exempt (a cough legitimately
+  transcribes to nothing)
+- `VOXWEAVE_SEP_AUTOCAST` (`off` (default) | `bf16` | `fp16`; same as `[separate].autocast`) —
+  mixed precision for the vocal-separation forward pass. CUDA only; ignored on CPU/MPS. An
+  unrecognized value warns once and falls back to `off` rather than to the config file
+
 </details>
 
 <details>
@@ -713,13 +744,24 @@ asr_model = "Qwen/Qwen3-ASR-1.7B"        # built-in default: Qwen/Qwen3-ASR-0.6B
 load_strategy = "sum"
 
 # Inference batch sizes: windows per GPU forward (env: VOXWEAVE_SEP_BATCH / VOXWEAVE_CTC_BATCH /
-# VOXWEAVE_MMS_BATCH). On an 8 GB-class card batch=1 already saturates compute — measured no
-# speedup at 2/4, just ~+0.8 GiB VRAM per extra separation window — so the defaults stay at 1.
-# Only worth raising on much wider GPUs, and only after measuring.
+# VOXWEAVE_MMS_BATCH / VOXWEAVE_ASR_BATCH). On an 8 GB-class card batch=1 already saturates
+# compute — measured no speedup at 2/4, just ~+0.8 GiB VRAM per extra separation window — so the
+# defaults stay at 1. Only worth raising on much wider GPUs, and only after measuring.
 [batch]
 separate = 1                             # vocal separation (MelBandRoformer) 8s windows
 ctc      = 1                             # wav2vec2 CTC emission 30s windows (en aligner)
 mms      = 4                             # MMS-300m emission batch (ja aligner)
+asr      = 1                             # Qwen3-ASR chunks per decode call; 1 = the per-chunk call.
+                                         # Opt-in: faster but its transcripts differ from batch 1 —
+                                         # see "Performance knobs" below
+
+# Vocal separation numerics (= env VOXWEAVE_SEP_AUTOCAST). autocast wraps only the model
+# forward; the overlap-add accumulation stays fp32. CUDA only (ignored on CPU / MPS).
+#   "off" (default) — fp32 forward, the reference output, byte-identical run to run.
+#   "bf16" | "fp16" — mixed-precision forward: faster and slightly leaner, at the cost of tiny
+#                     waveform differences in the stem. See "Performance knobs" below.
+[separate]
+autocast = "off"
 
 # Diarization pipeline (= --diarize-model / env VOXWEAVE_DIARIZE_MODEL).
 # Values: "community-1" (built-in default), "3.1", or any full Hugging Face pipeline id.
@@ -770,6 +812,35 @@ ja = "mms"                                      # Japanese: MMS-300m + uroman fu
 ```
 
 </details>
+
+### Performance knobs
+
+Two GPU throughput settings are **opt-in and off by default**, because both change the
+output. They are worth enabling only on a wide GPU, and only if you have re-checked the
+result on your own material — there is no truth ruler in the pipeline that can tell you
+whether the changed output is better or worse.
+
+| Knob | Default | Measured on an RTX PRO 4000 (24 GB) | What changes |
+| --- | --- | --- | --- |
+| `[batch].asr` / `VOXWEAVE_ASR_BATCH` | `1` (per-chunk call) | 4 → 1.34x faster at 6.4 GiB peak; 8 → 1.49x at 8.9 GiB (Qwen3-ASR-1.7B, greedy, 24-min episode) | Transcripts drift ~1.5% CER from batch 1 — scattered small edits from bf16 batched kernels, no chunk lost |
+| `[separate].autocast` / `VOXWEAVE_SEP_AUTOCAST` | `off` (fp32) | `bf16` → 1.35x faster separation, peak VRAM 1.69 → 1.57 GiB | The vocal stem differs slightly (~52 dB SNR against the fp32 stem), and the ASR run on it drifts ~2.3% CER |
+
+Neither has a CLI flag; precedence for both is env var > config file > built-in default.
+`[batch].asr` applies to the torch Qwen engine only — Whisper and the Apple Silicon MLX
+adapter take one chunk per ASR call whatever it says — and autocast applies to CUDA only,
+being ignored on CPU/MPS. Raising `[batch].separate` above 1 bought no speedup on the same
+GPU (the separator is already compute-bound), so it stays at 1 as well.
+
+Batched ASR is guarded against qwen-asr #207, where a mixed-length batch can corrupt its
+shorter item into a lone `!`: chunks are grouped by duration to keep each batch's lengths
+close, and any batched result that comes back implausibly empty for its chunk's duration is
+re-run alone through the per-chunk call (thresholds: `VOXWEAVE_ASR_BATCH_MIN_CPS`,
+`VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC`). A batch whose call raises is likewise redone chunk by
+chunk, so one poisoned chunk degrades alone.
+
+Shot-change detection needs no setting: it is a CPU-only ffmpeg pass that now starts before
+transcription and is joined at its workflow step, so it overlaps the GPU stages and the
+`detect shot changes` entry in the timing line is normally ~0s.
 
 ## Data contract
 
