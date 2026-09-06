@@ -153,8 +153,11 @@ _TEMPLATE = """\
 #   off  (default) = fp32 forward (TF32 matmuls on Ampere+ unless VOXWEAVE_TF32=0); the
 #                    reference output, byte-identical run to run.
 #   bf16 | fp16    = mixed-precision forward: higher separation throughput and lower VRAM,
-#                    at the cost of tiny waveform differences in the stem. Measure before
-#                    switching (the default is decided by an A/B on real media).
+#                    at the cost of small waveform differences in the stem. Measured on an
+#                    RTX PRO 4000 (23.8 min episode): bf16 1.35x faster, peak VRAM
+#                    1.69 -> 1.57 GiB, stem SNR 52 dB vs fp32, but the downstream
+#                    transcript drifts ~2.3% CER -- so it stays off until measured on
+#                    your own content.
 # CUDA only: on CPU / MPS the setting is ignored and the fp32 path runs.
 # The effective mode is part of the separator identity, so changing it re-separates
 # instead of reusing a vocals cache produced under the previous numerics -- and a CPU /
