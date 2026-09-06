@@ -794,6 +794,13 @@ def _tiny_roformer(torch):
     ).eval()
 
 
+@pytest.mark.filterwarnings(
+    # Third-party noise raised by the toy forward, not by the code under test:
+    # rotary_embedding_torch still calls the deprecated torch.cuda.amp.autocast, and
+    # the vendored freqs probe runs torch.stft without a window on purpose.
+    "ignore:`torch.cuda.amp.autocast:FutureWarning",
+    "ignore:A window was not provided:UserWarning",
+)
 def test_vendored_roformer_hands_view_as_complex_fp32_under_bf16_autocast(monkeypatch):
     # The mask estimators are Linear+GLU, so under autocast they emit bf16 and
     # torch.view_as_complex refuses BFloat16 on CUDA (the real-model failure). CPU
