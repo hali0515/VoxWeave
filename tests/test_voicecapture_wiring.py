@@ -128,12 +128,19 @@ def test_process_routes_capture_shot_detection_through_snapshot(tmp_path, monkey
         seen["transcribe"] = Path(source)
         return "en", [dict(UNIT)], [], [], turns, _capture(turns)
 
-    def fake_shots(source):
-        seen["shots"] = Path(source)
-        return []
+    class _ShotJob:
+        def start(self, source, *_a, **_k):
+            seen["shots"] = Path(source)
+            return self
+
+        def result(self):
+            return []
+
+        def cancel(self):
+            pass
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
-    monkeypatch.setattr("voxweave.shotdet.detect_shot_changes", fake_shots)
+    monkeypatch.setattr("voxweave.shotdet.ShotDetectionJob", _ShotJob)
     pipeline.process(media, diarize=True, voiceprints=True)
 
     assert seen["transcribe"] == seen["shots"]

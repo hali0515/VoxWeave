@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 from voxweave import asrfix as asrfix_mod
 from voxweave import (
@@ -106,6 +106,9 @@ from voxweave.vocalscache import (
     publish_cache_companion,
     validate_cache_pair,
 )
+
+if TYPE_CHECKING:
+    from voxweave.shotdet import ShotDetectionJob
 
 log = logging.getLogger("voxweave")
 
@@ -2502,6 +2505,8 @@ def _process_from_source(
     sing_spans: list[tuple[float, float]] | None = None
     speaker_turns: list[tuple[float, float, str]] | None = None
     _voiceprint_capture: VoiceprintCapture | None = None
+    # A started-but-uncollected shot detection pass; reaped on any failure below.
+    shot_job: ShotDetectionJob | None = None
     try:
         if word_segments is not None:
             iso, units = word_segments
@@ -2509,6 +2514,12 @@ def _process_from_source(
                 iso, units, override=lang_override
             )
         else:
+            if shot_snap:
+                from voxweave import shotdet
+
+                # CPU-only ffmpeg pass: start it now so it overlaps the GPU stages
+                # and collect it at the "detect shot changes" step afterwards.
+                shot_job = shotdet.ShotDetectionJob().start(source_path)
             (
                 iso,
                 units,
@@ -2542,12 +2553,13 @@ def _process_from_source(
             panns_handoff_owned = sdh
             sing_spans = sing_spans or None
             speaker_turns = speaker_turns or None
-            if shot_snap:
-                from voxweave import shotdet
-
+            if shot_job is not None:
+                # The step timer measures the join only: ffmpeg itself has been
+                # running since before transcribe(), so this is normally ~0s.
                 rep.step("detect shot changes")
-                rep.stage("shot detection")
-                shot_changes = shotdet.detect_shot_changes(source_path)
+                rep.stage("collect shot changes")
+                shot_changes = shot_job.result()
+                shot_job = None
 
         publication = _finish_process_from_units(
             media_path,
@@ -2568,6 +2580,14 @@ def _process_from_source(
             sdh_enabled=sdh,
         )
     except BaseException as primary:
+        if shot_job is not None:
+            try:
+                shot_job.cancel()
+            except BaseException as cancel_error:
+                log.warning(
+                    "shot detection cancel failed after earlier process failure: %r",
+                    cancel_error,
+                )
         if panns_handoff_owned:
             try:
                 songdet.release_model()

@@ -62,6 +62,50 @@ def _subtitle(tmp_path: Path, text: str = "hello") -> Path:
     return path
 
 
+def _recording_shot_job(events: list[str], cuts: list[float] | None = None):
+    """Build a ``shotdet.ShotDetectionJob`` stand-in whose lifecycle lands in ``events``."""
+
+    class RecordingShotJob:
+        instances: list["RecordingShotJob"] = []
+
+        def __init__(self) -> None:
+            self.media: Path | None = None
+            type(self).instances.append(self)
+
+        def start(self, media, threshold=None, timeout_s=3600):
+            self.media = Path(media)
+            events.append("start")
+            return self
+
+        def result(self):
+            events.append("result")
+            return None if cuts is None else list(cuts)
+
+        def cancel(self):
+            events.append("cancel")
+
+    return RecordingShotJob
+
+
+def _canned_transcribe(events: list[str], error: Exception | None = None):
+    """Replace ``pipeline.transcribe`` with a GPU-free stub that logs its call.
+
+    Enters the steps the real function owns so a RecordingReporter's plan check
+    still holds around it.
+    """
+
+    def transcribe(*_args, reporter=None, **_kwargs):
+        events.append("transcribe")
+        if error is not None:
+            raise error
+        if reporter is not None:
+            for label in ("prepare audio", "find speech", "transcribe and align"):
+                reporter.step(label)
+        return "en", [dict(unit) for unit in UNITS], [(0.0, 1.0)], [], [], None
+
+    return transcribe
+
+
 @pytest.fixture
 def stub_transcription(tmp_path, monkeypatch):
     """Keep real process/transcribe control flow while replacing GPU/media work."""
@@ -101,7 +145,7 @@ def stub_transcription(tmp_path, monkeypatch):
     monkeypatch.setattr(backend, "release", lambda: None)
     monkeypatch.setattr(chunking, "release_silero_vad", lambda: None)
     monkeypatch.setattr(songdet, "release_model", lambda: None)
-    monkeypatch.setattr(shotdet, "detect_shot_changes", lambda _path: [])
+    monkeypatch.setattr(shotdet, "ShotDetectionJob", _recording_shot_job([], []))
     monkeypatch.setattr(
         diarize,
         "diarize_turns",
@@ -179,8 +223,10 @@ def test_transcribe_debug_meta_records_step_timings_so_far(
     assert set(rep.timings()) == set(rep.entered)
 
 
-def test_process_injected_words_omit_all_media_only_steps(tmp_path):
+def test_process_injected_words_omit_all_media_only_steps(tmp_path, monkeypatch):
     rep = RecordingReporter()
+    job_class = _recording_shot_job([])
+    monkeypatch.setattr(shotdet, "ShotDetectionJob", job_class)
     pipeline.process(
         tmp_path / "episode.mkv",
         word_segments=("en", [dict(unit) for unit in UNITS]),
@@ -191,6 +237,68 @@ def test_process_injected_words_omit_all_media_only_steps(tmp_path):
         reporter=rep,
     )
     rep.assert_complete(("inspect source", "layout subtitles", "write outputs"))
+    assert job_class.instances == []
+
+
+def test_process_starts_shot_detection_before_transcription(tmp_path, monkeypatch):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    events: list[str] = []
+    job_class = _recording_shot_job(events, [1.5, 2.25])
+    monkeypatch.setattr(shotdet, "ShotDetectionJob", job_class)
+    monkeypatch.setattr(pipeline, "transcribe", _canned_transcribe(events))
+    rep = RecordingReporter()
+
+    out = pipeline.process(media, shot_snap=True, reporter=rep)
+
+    assert events == ["start", "transcribe", "result"]
+    (job,) = job_class.instances
+    assert job.media == media
+    rep.assert_complete(
+        (
+            "inspect source",
+            "prepare audio",
+            "find speech",
+            "transcribe and align",
+            "detect shot changes",
+            "layout subtitles",
+            "write outputs",
+        )
+    )
+    assert ("stage", "collect shot changes") in rep.details
+    data = json.loads(pipeline.swap_ext(out, ".json").read_text(encoding="utf-8"))
+    assert data["shot_changes"] == [1.5, 2.25]
+
+
+def test_process_cancels_shot_detection_when_transcription_fails(tmp_path, monkeypatch):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    events: list[str] = []
+    monkeypatch.setattr(shotdet, "ShotDetectionJob", _recording_shot_job(events))
+    monkeypatch.setattr(
+        pipeline, "transcribe", _canned_transcribe(events, RuntimeError("boom"))
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        pipeline.process(media, shot_snap=True)
+
+    assert events == ["start", "transcribe", "cancel"]
+
+
+def test_process_without_shot_snap_never_starts_a_job(tmp_path, monkeypatch):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    events: list[str] = []
+    job_class = _recording_shot_job(events, [1.5])
+    monkeypatch.setattr(shotdet, "ShotDetectionJob", job_class)
+    monkeypatch.setattr(pipeline, "transcribe", _canned_transcribe(events))
+
+    out = pipeline.process(media, shot_snap=False)
+
+    assert events == ["transcribe"]
+    assert job_class.instances == []
+    data = json.loads(pipeline.swap_ext(out, ".json").read_text(encoding="utf-8"))
+    assert "shot_changes" not in data
 
 
 def test_process_cache_hit_keeps_audio_preparation_step(
