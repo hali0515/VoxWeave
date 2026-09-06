@@ -12,6 +12,7 @@ import json
 import logging
 import shutil
 import subprocess
+import time
 
 import pytest
 
@@ -374,7 +375,15 @@ def test_job_reaps_a_fast_failing_child_before_collection(monkeypatch, tmp_path)
     )
     job = shotdet.ShotDetectionJob().start(tmp_path / "a.wav")
     job._join_drain()
-    assert job._proc is not None and job._proc.returncode == 3
+    assert job._proc is not None
+    # The drain thread polls once when the pipe hits EOF; the exit status can
+    # land a few milliseconds after the child closes stderr, so the reap is
+    # best-effort and is asserted under a short deadline, not on that one poll.
+    deadline = time.monotonic() + 5.0
+    while job._proc.returncode is None and time.monotonic() < deadline:
+        job._proc.poll()
+        time.sleep(0.01)
+    assert job._proc.returncode == 3
     assert job.result() is None
 
 
