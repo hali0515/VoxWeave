@@ -110,9 +110,18 @@ def test_process_resnaps_shots_after_speaker_format(tmp_path, monkeypatch):
         "transcribe",
         lambda *a, **kw: ("en", UNITS, [(0.0, 3.6)], [], list(TURNS), None),
     )
-    monkeypatch.setattr(
-        "voxweave.shotdet.detect_shot_changes", lambda *a, **kw: list(SHOTS)
-    )
+
+    class _ShotJob:
+        def start(self, *_a, **_k):
+            return self
+
+        def result(self):
+            return list(SHOTS)
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr("voxweave.shotdet.ShotDetectionJob", _ShotJob)
 
     pipeline.process(media)
 

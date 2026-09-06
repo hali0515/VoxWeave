@@ -10,6 +10,7 @@ from typing import Any, cast
 from tests.test_calib_shadow import calib
 from tests.test_shadow_hook import _case_plain, _case_speakers, _segment
 from voxweave import pipeline
+from voxweave.core import shadow_v2
 
 
 def test_live_artifact_is_complete_schema_two(monkeypatch) -> None:
@@ -55,14 +56,14 @@ def test_live_post_assembly_validator_rejects_a_deleted_required_block(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
-    real_assembler = pipeline._shadow_v2_artifact
+    real_assembler = shadow_v2._shadow_v2_artifact
 
     def omit_authorities(*args, **kwargs):
         artifact = real_assembler(*args, **kwargs)
         artifact.pop("authorities")
         return artifact
 
-    monkeypatch.setattr(pipeline, "_shadow_v2_artifact", omit_authorities)
+    monkeypatch.setattr(shadow_v2, "_shadow_v2_artifact", omit_authorities)
     artifact = _segment(_case_plain()).shadow
     assert artifact is not None
     assert artifact["schema_version"] == 1
@@ -75,7 +76,7 @@ def test_live_admission_rejects_finalizer_validator_from_the_wrong_row(
 ) -> None:
     """A shaped check block is not evidence unless it names this stage and row."""
     monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
-    real_finalizer_row = pipeline._shadow_finalizer_row
+    real_finalizer_row = shadow_v2._shadow_finalizer_row
 
     def corrupt_validator_context(*args, **kwargs):
         row, cues = real_finalizer_row(*args, **kwargs)
@@ -85,7 +86,7 @@ def test_live_admission_rejects_finalizer_validator_from_the_wrong_row(
         validator["cue_count"] = int(row["cue_count"]) + 1
         return row, cues
 
-    monkeypatch.setattr(pipeline, "_shadow_finalizer_row", corrupt_validator_context)
+    monkeypatch.setattr(shadow_v2, "_shadow_finalizer_row", corrupt_validator_context)
     artifact = _segment(_case_plain()).shadow
     assert artifact is not None
 
@@ -475,7 +476,7 @@ def test_v1_coordinates_reconcile_on_parents_then_translate_through_origin() -> 
         {"word_data": [{"text": "charlie", "start": 0.8, "end": 1.1}]},
     ]
     # Parents 0 and 2 were refined. Parent cut 2 therefore becomes child cut 3.
-    partition, mode = pipeline._shadow_v1_partition(
+    partition, mode = shadow_v2._shadow_v1_partition(
         cast(Any, parent), (0, 0, 1, 2, 2), cast(Any, cues)
     )
     assert partition == (3,)
@@ -554,7 +555,7 @@ def test_n11_recomputes_fd7_from_phase_one_not_the_serialized_alias() -> None:
             "trace_errors": [],
         },
     }
-    classification = pipeline._shadow_diff_classification(
+    classification = shadow_v2._shadow_diff_classification(
         row,
         {"cues": [dict(cue)]},
         stream=SimpleNamespace(cues=(phase1,), profile=profile),
@@ -603,7 +604,7 @@ def test_n11_cross_checks_the_upstream_fd2_producer_fact(monkeypatch) -> None:
 def test_n11_detects_a_changed_value_outside_the_allowed_relation(monkeypatch) -> None:
     """Mutation pin: trigger eligibility alone cannot approve a corrupted value."""
     monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
-    real = pipeline._shadow_diff_classification
+    real = shadow_v2._shadow_diff_classification
     observed: dict[str, Any] = {}
 
     def inspect_corruption(finalizer_row, comparator_row, *args, **kwargs):
@@ -612,7 +613,7 @@ def test_n11_detects_a_changed_value_outside_the_allowed_relation(monkeypatch) -
         observed.update(real(corrupted, comparator_row, *args, **kwargs))
         return real(finalizer_row, comparator_row, *args, **kwargs)
 
-    monkeypatch.setattr(pipeline, "_shadow_diff_classification", inspect_corruption)
+    monkeypatch.setattr(shadow_v2, "_shadow_diff_classification", inspect_corruption)
     artifact = _segment(_case_speakers()).shadow
     assert artifact is not None and artifact["schema_version"] == 2
 

@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from voxweave import artifacts, asrfix, pipeline
 
 
@@ -239,6 +241,202 @@ def test_render_vtt_text_only_when_no_timestamps():
     blocks = [{"text": "a", "start": None, "end": None}]
     out = asrfix.render_vtt(blocks, ["A"])
     assert "-->" not in out and "A" in out
+
+
+# --------------------- correct_cues request ladder / windowing --------------------- #
+class FinishClient:
+    """Returns ``(content, finish_reason)`` pairs in order, recording each request.
+
+    Mirrors the translate test helper: ``finish_reason`` is what drives the retry /
+    plain-chat / split ladder, and ``calls`` keeps the full kwargs so a test can
+    check whether ``response_format`` was sent and which cue indices went out.
+    """
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, *, model, messages, **kw):
+        self.calls.append({"messages": messages, **kw})
+        content, finish_reason = self._responses.pop(0)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content),
+                    finish_reason=finish_reason,
+                )
+            ]
+        )
+
+    @staticmethod
+    def sent_ids(call) -> list[int]:
+        return [c["i"] for c in json.loads(call["messages"][1]["content"])["cues"]]
+
+    @staticmethod
+    def system_of(call) -> str:
+        return call["messages"][0]["content"]
+
+
+@pytest.fixture
+def single_attempt(monkeypatch):
+    """One json_object attempt per cue set (no backoff waits in the suite)."""
+    from voxweave import translate
+
+    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
+    monkeypatch.setattr(translate, "_RETRY_DELAYS", ())
+
+
+_FIX_0 = '{"fixes":[{"i":0,"orig":"a","fixed":"A","reason":"x"}]}'
+
+
+def _fix_payload(n):
+    return [{"i": i, "t": f"cue {i}"} for i in range(n)]
+
+
+def test_correct_cues_retries_transient_incomplete_then_succeeds(monkeypatch, caplog):
+    # a server-side abort mid-stream (vLLM structured-output FSM) is transient:
+    # the same json_object request is retried instead of failing the whole run.
+    from voxweave import translate
+
+    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
+    client = FinishClient([('{"fixes":[{"i":0,', None), (_FIX_0, "stop")])
+    with caplog.at_level("WARNING", logger="voxweave"):
+        fixes = asrfix.correct_cues([{"i": 0, "t": "a"}], model="m", client=client)
+    assert fixes == [{"i": 0, "orig": "a", "fixed": "A", "reason": "x"}]
+    assert len(client.calls) == 2
+    assert all("response_format" in c for c in client.calls)  # never left json mode
+
+
+def test_correct_cues_falls_back_to_plain_chat_after_json_attempts(
+    single_attempt, caplog
+):
+    client = FinishClient([("", "abort"), (_FIX_0, "stop")])
+    with caplog.at_level("WARNING", logger="voxweave"):
+        fixes = asrfix.correct_cues([{"i": 0, "t": "a"}], model="m", client=client)
+    assert fixes == [{"i": 0, "orig": "a", "fixed": "A", "reason": "x"}]
+    assert [("response_format" in c) for c in client.calls] == [True, False]
+    assert any("json_object mode dropped" in r.message for r in caplog.records)
+
+
+def test_correct_cues_unparseable_answer_is_retried_not_read_as_no_fixes(
+    single_attempt,
+):
+    # garbage that yields no "fixes" array must not be reported as "nothing to fix"
+    client = FinishClient([("Sorry, I cannot help.", "stop"), (_FIX_0, "stop")])
+    fixes = asrfix.correct_cues([{"i": 0, "t": "a"}], model="m", client=client)
+    assert fixes == [{"i": 0, "orig": "a", "fixed": "A", "reason": "x"}]
+    assert [("response_format" in c) for c in client.calls] == [True, False]
+
+
+def test_correct_cues_empty_fix_list_is_a_valid_answer(single_attempt):
+    client = FinishClient([('{"fixes":[]}', "stop")])
+    assert asrfix.correct_cues(_fix_payload(4), model="m", client=client) == []
+    assert len(client.calls) == 1  # normal transcript: exactly ONE request
+
+
+def test_correct_cues_splits_on_length_and_merges_halves(single_attempt, caplog):
+    # whole set caps out (json attempt + plain-chat fallback), then each half
+    # succeeds on its first attempt: 2 + 1 + 1 requests.
+    client = FinishClient(
+        [
+            ('{"fixes":[{"i":0,"orig"', "length"),
+            ('{"fixes":[{"i":0,"orig"', "length"),
+            ('{"fixes":[{"i":1,"orig":"cue 1","fixed":"CUE 1","reason":"a"}]}', "stop"),
+            ('{"fixes":[{"i":3,"orig":"cue 3","fixed":"CUE 3","reason":"b"}]}', "stop"),
+        ]
+    )
+    payload = _fix_payload(4)
+    with caplog.at_level("WARNING", logger="voxweave"):
+        fixes = asrfix.correct_cues(payload, model="m", client=client)
+
+    assert len(client.calls) == 4
+    assert FinishClient.sent_ids(client.calls[0]) == [0, 1, 2, 3]
+    assert FinishClient.sent_ids(client.calls[1]) == [0, 1, 2, 3]
+    assert FinishClient.sent_ids(client.calls[2]) == [0, 1]  # first half
+    assert FinishClient.sent_ids(client.calls[3]) == [2, 3]  # second half
+    # the second half carries the first half's cues as read-only context
+    assert "PRECEDING CUES" not in FinishClient.system_of(client.calls[2])
+    assert "cue 0\ncue 1" in FinishClient.system_of(client.calls[3])
+    assert any("splitting the cue set in half" in r.message for r in caplog.records)
+
+    # merged, with absolute cue indices preserved -> lands on the right cues
+    assert fixes == [
+        {"i": 1, "orig": "cue 1", "fixed": "CUE 1", "reason": "a"},
+        {"i": 3, "orig": "cue 3", "fixed": "CUE 3", "reason": "b"},
+    ]
+    blocks = _blocks([f"cue {i}" for i in range(4)])
+    new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == ["cue 0", "CUE 1", "cue 2", "CUE 3"]
+    assert len(applied) == 2 and not rejected
+
+
+def test_correct_cues_split_drops_fixes_for_cues_outside_the_half(
+    single_attempt, caplog
+):
+    # a half that renumbers or answers about a cue it was not sent must not have
+    # its fix applied to the wrong cue: out-of-request indices are dropped.
+    client = FinishClient(
+        [
+            ("", "length"),
+            ("", "length"),
+            ('{"fixes":[{"i":3,"orig":"cue 3","fixed":"CUE 3","reason":"a"}]}', "stop"),
+            ('{"fixes":[{"i":3,"orig":"cue 3","fixed":"CUE 3","reason":"a"}]}', "stop"),
+        ]
+    )
+    with caplog.at_level("WARNING", logger="voxweave"):
+        fixes = asrfix.correct_cues(_fix_payload(4), model="m", client=client)
+    assert fixes == [{"i": 3, "orig": "cue 3", "fixed": "CUE 3", "reason": "a"}]
+    assert any("out-of-request fix indices [3]" in r.message for r in caplog.records)
+
+
+def test_correct_cues_splits_recursively_until_a_half_fits(single_attempt):
+    client = FinishClient(
+        [
+            ("", "length"),  # 0-3 json
+            ("", "length"),  # 0-3 plain
+            ("", "length"),  # 0-1 json
+            ("", "length"),  # 0-1 plain
+            ('{"fixes":[]}', "stop"),  # cue 0
+            ('{"fixes":[]}', "stop"),  # cue 1
+            ('{"fixes":[]}', "stop"),  # cues 2-3
+        ]
+    )
+    assert asrfix.correct_cues(_fix_payload(4), model="m", client=client) == []
+    assert [FinishClient.sent_ids(c) for c in client.calls] == [
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+        [0, 1],
+        [0, 1],
+        [0],
+        [1],
+        [2, 3],
+    ]
+
+
+def test_correct_cues_single_cue_length_still_raises(single_attempt):
+    # a truncated fix list must never be applied as if it were the model's full
+    # review, and a one-cue request has nothing left to split.
+    from voxweave.translate import IncompleteResponse
+
+    client = FinishClient(
+        [('{"fixes":[{"i":0,"orig"', "length"), ('{"fixes":[{"i":0,"orig"', "length")]
+    )
+    with pytest.raises(IncompleteResponse) as failure:
+        asrfix.correct_cues([{"i": 0, "t": "hi"}], model="m", client=client)
+    assert failure.value.finish_reason == "length"
+    assert len(client.calls) == 2  # json attempt + plain-chat fallback, then raise
+
+
+def test_correct_cues_non_size_failure_raises_without_splitting(single_attempt):
+    # a dropped stream is not a size problem: do not fan out requests at a sick
+    # endpoint, raise once the ladder is exhausted.
+    from voxweave.translate import IncompleteResponse
+
+    client = FinishClient([("partial", None), ("partial", None)])
+    with pytest.raises(IncompleteResponse):
+        asrfix.correct_cues(_fix_payload(4), model="m", client=client)
+    assert len(client.calls) == 2
 
 
 # --------------------------- pipeline.correct (E2E with mock) --------------------------- #

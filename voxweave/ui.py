@@ -104,6 +104,14 @@ class _ElapsedColumn(TimeElapsedColumn):
         return Text(super().render(task).plain, style=_MUTED)
 
 
+def _format_duration(seconds: float) -> str:
+    """Compact wall time for the timing summary: ``12.3s`` under a minute, ``3m41s`` above."""
+    if round(seconds, 1) < 60:
+        return f"{seconds:.1f}s"
+    whole = int(round(seconds))
+    return f"{whole // 60}m{whole % 60:02d}s"
+
+
 def install_logging(*, verbose: bool = False) -> None:
     """Attach root logger to rich, sharing the console with the progress bar."""
     import warnings
@@ -228,6 +236,20 @@ class RichReporter(Reporter):
 
         set_download_reporter(None)
         self._progress.stop()
+        self.finish()
+        # One muted line on stderr answering "where did the time go" after a clean run.
+        # A failed run already ends in the error panel; a run without a declared plan
+        # (library helper, no steps) has nothing truthful to summarize.
+        if exc and exc[0] is not None:
+            return
+        timings = self.timings()
+        if not self._steps or not timings:
+            return
+        parts = [f"{label} {_format_duration(sec)}" for label, sec in timings.items()]
+        parts.append(f"total {_format_duration(sum(timings.values()))}")
+        console.print(
+            Text(f"timing: {' | '.join(parts)}", style=_MUTED), soft_wrap=True
+        )
 
     def _switch(self, label: str, total: int | None, **fields: Any) -> None:
         # remove+add rather than reset: rich treats total=None in update as "no change",
@@ -245,6 +267,7 @@ class RichReporter(Reporter):
         self._progress.heading = None
 
     def step(self, label: str) -> None:
+        super().step(label)
         if label not in self._steps:
             # A library may call a pipeline helper without an outer CLI plan.
             self.stage(label)
@@ -329,6 +352,23 @@ def _hint_for(exc: Exception) -> str:
         )
     if isinstance(exc, RuntimeError):
         message = str(exc).lower()
+        if "cues untranslated" in message:
+            return (
+                "Rerun the same command to resume: the translation progress file is "
+                "kept and already-translated cues are not re-requested. Pass "
+                "--allow-partial to write the file with the remaining cues in source "
+                "text. If the same cues keep failing, check the LLM server log "
+                "(structured-output aborts, max_tokens)."
+            )
+        if "response incomplete" in message:
+            return (
+                "The endpoint cut the answer short (finish_reason other than stop). "
+                "Check the server's structured-output (json_object) support and "
+                "max_tokens: translate and correct both retry and then fall back to "
+                "plain JSON automatically, and correct additionally splits the "
+                "request when the output cap is the problem, so seeing this means "
+                "every attempt failed."
+            )
         if "could not load" in message and "model-card" in message:
             hint = (
                 "Accept the model-card conditions on Hugging Face and authenticate "

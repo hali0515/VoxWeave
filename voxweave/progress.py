@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Sequence
 
 
@@ -16,7 +17,16 @@ class Reporter:
       total known, renders a real ``x/N`` progress bar.
 
     ``chunks`` / ``chunk_done`` are semantic aliases for ``task`` / ``advance`` (legacy API, used for per-chunk ASR).
+
+    The one piece of state the base class keeps is wall-clock accounting per step
+    (:meth:`step` starts a clock, :meth:`timings` reads it) so "where did the time go"
+    is answerable from any run, with or without a renderer. It produces no output.
     """
+
+    # Timing state is created lazily: subclasses that skip ``super().__init__()``
+    # (recording reporters, adapters) still get correct accounting.
+    _timing_open: tuple[str, float] | None = None
+    _timing_totals: dict[str, float] | None = None
 
     def plan(self, steps: Sequence[str]) -> None:
         """Declare the actual ordered workflow, before beginning its first step.
@@ -26,7 +36,43 @@ class Reporter:
         """
 
     def step(self, label: str) -> None:
-        """Enter a named step from the declared plan; stage/task remain subtasks."""
+        """Enter a named step from the declared plan; stage/task remain subtasks.
+
+        Closes the clock of the previous step and starts one for ``label``.
+        Overrides must call ``super().step(label)`` to keep :meth:`timings` accurate.
+        """
+        now = time.monotonic()
+        self._close_step(now)
+        self._timing_open = (label, now)
+
+    def finish(self) -> None:
+        """Close the open step's clock; safe to call with no step open or repeatedly."""
+        self._close_step(time.monotonic())
+
+    def timings(self) -> dict[str, float]:
+        """Wall-clock seconds per step label, in first-entry order.
+
+        A label entered more than once accumulates. The step still open counts up
+        to now, so a snapshot taken mid-run covers the work done so far.
+        """
+        totals = dict(self._timing_totals or {})
+        if self._timing_open is not None:
+            label, started = self._timing_open
+            totals[label] = totals.get(label, 0.0) + max(
+                0.0, time.monotonic() - started
+            )
+        return totals
+
+    def _close_step(self, now: float) -> None:
+        if self._timing_open is None:
+            return
+        label, started = self._timing_open
+        if self._timing_totals is None:
+            self._timing_totals = {}
+        self._timing_totals[label] = self._timing_totals.get(label, 0.0) + max(
+            0.0, now - started
+        )
+        self._timing_open = None
 
     def stage(self, label: str) -> None:
         """Enter an indeterminate stage (decode / load model / VAD / re-layout / write)."""

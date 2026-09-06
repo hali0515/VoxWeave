@@ -26,7 +26,7 @@ import pytest
 
 from voxweave import pipeline
 from voxweave.config import gap_thresholds
-from voxweave.core import boundary_lattice, boundary_v2
+from voxweave.core import boundary_lattice, boundary_v2, shadow_v2
 from voxweave.core import providers
 from voxweave.core.providers import note_degraded
 
@@ -721,7 +721,7 @@ def test_an_unprojectable_v1_stream_is_measured_without_a_v1_reference(
     trivially within margin of a reference that made no cuts.
     """
     monkeypatch.setattr(
-        pipeline,
+        shadow_v2,
         "_shadow_v1_partition",
         lambda *a, **k: (None, "surface-boundary-unresolved"),
     )

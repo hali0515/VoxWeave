@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from voxweave import fsio
+from voxweave import config, fsio
 from voxweave.align_failures import CanonicalFailure
 from voxweave.voicebase import (
     CACHE_COMPANION_MAX_BYTES,
@@ -63,10 +63,31 @@ def classify_cache_decode_failure(exc: BaseException) -> None:
 
 @dataclass(frozen=True)
 class SeparatorIdentity:
+    """What produced a set of vocals: the separator bytes *and* its numerics.
+
+    ``autocast`` is the ``[separate].autocast`` mode that actually wrapped the
+    roformer forward, which is the *effective* mode rather than the configured
+    one: autocast is CUDA-only, so a CPU/MPS host records ``"off"`` whatever it
+    is configured with (``backend._effective_autocast``, the single rule the
+    identity, the cache probe and the forward all resolve through). It belongs
+    to the identity because it changes the stems, not just the speed: bf16
+    measures 52 dB SNR against the fp32 reference and 2.3% downstream ASR CER,
+    so vocals produced under one mode must never be reused under another.
+    Companions and capture provenance written before this field existed also
+    predate the setting, so an absent value means the fp32 path: ``"off"``.
+
+    The identity covers autocast and deliberately not TF32 (``VOXWEAVE_TF32``,
+    on by default for CUDA matmuls): that difference was judged to sit below the
+    noise floor of the downstream 16k ASR, unlike bf16's measured CER cost. It
+    is a judgement about magnitude, not a claim that autocast is the only knob
+    that perturbs the stems.
+    """
+
     repo: str
     file: str
     checkpoint: str
     config_sha256: str
+    autocast: str = config.SEP_AUTOCAST_DEFAULT
 
     def as_mapping(self) -> dict[str, object]:
         return {
@@ -74,6 +95,7 @@ class SeparatorIdentity:
             "file": self.file,
             "checkpoint": self.checkpoint,
             "config_sha256": self.config_sha256,
+            "autocast": self.autocast,
         }
 
 
@@ -139,6 +161,18 @@ def validate_separator_identity(value: object) -> SeparatorIdentity:
             config_sha256,
             "separator.config_sha256",
         )
+        # Absent is not unknown: no writer omitted this field after the setting
+        # existed, so a companion without it describes an "off" (fp32) run.
+        autocast = require_string(
+            separator.get("autocast", config.SEP_AUTOCAST_DEFAULT),
+            "separator.autocast",
+            max_bytes=MAX_PROVENANCE_STRING_BYTES,
+        )
+        if autocast not in config.SEP_AUTOCAST_MODES:
+            raise CacheCompanionError(
+                "separator.autocast must be one of "
+                f"{'/'.join(config.SEP_AUTOCAST_MODES)}"
+            )
     except CacheCompanionError:
         raise
     except Phase2DataError as exc:
@@ -148,6 +182,7 @@ def validate_separator_identity(value: object) -> SeparatorIdentity:
         file=filename,
         checkpoint=checkpoint,
         config_sha256=config_hash,
+        autocast=autocast,
     )
 
 

@@ -15,6 +15,7 @@ import pytest
 from tests.test_calib_shadow import calib, cc
 from tests.test_shadow_hook import _case_speakers, _segment
 from voxweave import backend, pipeline
+from voxweave.core import shadow_v2
 
 
 def _live_speaker_artifact(monkeypatch) -> dict[str, Any]:
@@ -76,14 +77,14 @@ def test_live_post_assembly_admission_rejects_value_mutations(
     monkeypatch, mutate, _needle
 ) -> None:
     monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
-    real = pipeline._shadow_v2_artifact
+    real = shadow_v2._shadow_v2_artifact
 
     def corrupted(*args, **kwargs):
         artifact = real(*args, **kwargs)
         mutate(artifact)
         return artifact
 
-    monkeypatch.setattr(pipeline, "_shadow_v2_artifact", corrupted)
+    monkeypatch.setattr(shadow_v2, "_shadow_v2_artifact", corrupted)
     artifact = _segment(_case_speakers()).shadow
     assert isinstance(artifact, dict)
     assert artifact["schema_version"] == 1
@@ -95,14 +96,14 @@ def test_live_post_assembly_admission_rejects_value_mutations(
 def test_shadow_cli_exits_two_for_post_construction_value_mutations(
     monkeypatch, mutate, _needle
 ) -> None:
-    real = pipeline._shadow_v2_artifact
+    real = shadow_v2._shadow_v2_artifact
 
     def corrupted(*args, **kwargs):
         artifact = real(*args, **kwargs)
         mutate(artifact)
         return artifact
 
-    monkeypatch.setattr(pipeline, "_shadow_v2_artifact", corrupted)
+    monkeypatch.setattr(shadow_v2, "_shadow_v2_artifact", corrupted)
     argv = [
         "shadow",
         "--corpus",
@@ -375,7 +376,7 @@ def test_n14_nonempty_scan_requires_positive_independent_work(monkeypatch) -> No
 def test_n14_cli_rejects_live_all_zero_work_complete_matrix(
     tmp_path, monkeypatch
 ) -> None:
-    real = pipeline._shadow_v2_artifact
+    real = shadow_v2._shadow_v2_artifact
     observed = {"artifacts": 0, "canonical_chars": 0, "intervals": 0}
 
     def zeroed(*args, **kwargs):
@@ -393,7 +394,7 @@ def test_n14_cli_rejects_live_all_zero_work_complete_matrix(
         artifact["totals"]["canonical_chars"] = 0
         return payload
 
-    monkeypatch.setattr(pipeline, "_shadow_v2_artifact", zeroed)
+    monkeypatch.setattr(shadow_v2, "_shadow_v2_artifact", zeroed)
     output = tmp_path / "zero-work-shadow.json"
     argv = [
         "shadow",

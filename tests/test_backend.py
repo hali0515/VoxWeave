@@ -1,8 +1,13 @@
 """backend pure-logic tests + missing-dependency error paths (no real model loading)."""
 
+import contextlib
+import logging
+import warnings
+from pathlib import Path
+
 import pytest
 
-from voxweave import align_common, align_ctc, align_mms, backend, runtime
+from voxweave import align_common, align_ctc, align_mms, backend, runtime, vocalscache
 
 
 @pytest.fixture(autouse=True)
@@ -73,6 +78,48 @@ def test_get_asr_raises_qwen_decode_ceiling_when_supported(monkeypatch):
     try:
         assert backend._get_asr("qwen3-asr-0.6b") is sentinel
         assert seen["max_new_tokens"] == 1024
+    finally:
+        backend._asr = None
+        backend._asr_id = None
+
+
+def test_get_asr_mirrors_conf_batch_into_max_inference_batch_size(monkeypatch):
+    # qwen_asr must not sub-split the groups _asr_pass hands it: the conf batch is
+    # passed at load time and refreshed on the already-loaded singleton
+    import sys
+    import types
+
+    seen: dict = {}
+
+    class _Loaded:
+        max_inference_batch_size = 32  # qwen_asr's own default
+
+    loaded = _Loaded()
+
+    class _Model:
+        @classmethod
+        def from_pretrained(
+            cls, path, *, max_new_tokens=None, max_inference_batch_size=None, **kwargs
+        ):
+            seen.update(max_inference_batch_size=max_inference_batch_size)
+            return loaded
+
+    mod = types.ModuleType("qwen_asr")
+    mod.Qwen3ASRModel = _Model
+    monkeypatch.setitem(sys.modules, "qwen_asr", mod)
+    monkeypatch.setattr(backend, "_hf_snapshot", lambda mid, cache: "/model")
+    monkeypatch.setattr(backend, "get_device", lambda: "cpu")
+    monkeypatch.setattr(backend, "_model_dtype", lambda dev: "float32")
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "6")
+    backend._asr = None
+    backend._asr_id = None
+    try:
+        assert backend._get_asr("qwen3-asr-0.6b") is loaded
+        assert seen["max_inference_batch_size"] == 6
+        assert loaded.max_inference_batch_size == 6
+        monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+        assert backend._get_asr("qwen3-asr-0.6b") is loaded  # cached, no reload
+        assert loaded.max_inference_batch_size == 2  # attribute refreshed in place
     finally:
         backend._asr = None
         backend._asr_id = None
@@ -511,6 +558,426 @@ def test_demix_batched_matches_sequential():
         assert torch.equal(out, ref)
 
 
+# --- separation autocast (opt-in bf16/fp16 around the roformer forward only) --- #
+_DEMIX_CFG = {"audio": {"chunk_size": 16}, "inference": {"num_overlap": 4}}
+
+
+def _autocast_probe(torch):
+    """Fake separator that records the CUDA autocast state seen inside forward."""
+
+    class _Probe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+            self.seen: list[tuple[bool, object]] = []
+
+        def forward(self, x):
+            self.seen.append(
+                (torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"))
+            )
+            return x * 0.5 + 0.1
+
+    return _Probe()
+
+
+def _legacy_demix(model, mix, cfg, batch):
+    """The pre-autocast _demix loop, verbatim: the byte-identity reference for mode 'off'."""
+    import torch
+
+    audio = cfg.get("audio", {})
+    inf = cfg.get("inference", {})
+    chunk = int(audio.get("chunk_size", 131584))
+    overlap = int(inf.get("num_overlap", 4))
+    step = max(1, chunk // overlap)
+    ch, total = mix.shape
+    window = torch.hann_window(chunk)
+    result = torch.zeros(ch, total)
+    weight = torch.zeros(total)
+    dev = next(model.parameters()).device
+    starts = list(range(0, total, step))
+    with torch.no_grad():
+        for i in range(0, len(starts), batch):
+            grp = starts[i : i + batch]
+            segs, lens = [], []
+            for start in grp:
+                seg = mix[:, start : start + chunk]
+                n = seg.shape[1]
+                lens.append(n)
+                if n < chunk:
+                    seg = torch.nn.functional.pad(seg, (0, chunk - n))
+                segs.append(seg)
+            out = model(torch.stack(segs).to(dev))
+            if out.dim() == 4:
+                out = out[:, 0]
+            out = out.float().cpu()
+            for j, (start, n) in enumerate(zip(grp, lens)):
+                w = window[:n]
+                result[:, start : start + n] += out[j, :, :n] * w
+                weight[start : start + n] += w
+    return result / weight.clamp_min(1e-8)
+
+
+@pytest.mark.parametrize("dev_name", ["cpu", "cuda"])
+def test_autocast_context_off_is_null(dev_name):
+    torch = pytest.importorskip("torch")
+    ctx = backend._autocast_context(torch.device(dev_name), "off")
+    assert isinstance(ctx, contextlib.nullcontext)
+
+
+@pytest.mark.parametrize("mode", ["bf16", "fp16"])
+def test_autocast_context_non_cuda_falls_back_to_fp32_with_debug_log(mode, caplog):
+    # CPU/MPS never enter cuda autocast: nullcontext + one debug line, no warning
+    torch = pytest.importorskip("torch")
+    with caplog.at_level(logging.DEBUG, logger="voxweave"):
+        ctx = backend._autocast_context(torch.device("cpu"), mode)
+    assert isinstance(ctx, contextlib.nullcontext)
+    hits = [r for r in caplog.records if f"autocast={mode}" in r.message]
+    assert len(hits) == 1 and hits[0].levelno == logging.DEBUG
+
+
+@pytest.mark.parametrize(
+    ("mode", "dtype_name"), [("bf16", "bfloat16"), ("fp16", "float16")]
+)
+def test_autocast_context_cuda_configures_torch_autocast(mode, dtype_name):
+    # Built, not entered: CPU-only hosts can construct a cuda autocast (torch only
+    # warns and disables it), so assert the configuration attributes instead.
+    torch = pytest.importorskip("torch")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ctx = backend._autocast_context(torch.device("cuda"), mode)
+    assert isinstance(ctx, torch.autocast)
+    assert ctx.device == "cuda"
+    assert ctx.fast_dtype == getattr(torch, dtype_name)
+
+
+def test_autocast_context_rejects_unknown_mode():
+    torch = pytest.importorskip("torch")
+    with pytest.raises(ValueError, match="fp8"):
+        backend._autocast_context(torch.device("cuda"), "fp8")
+
+
+def test_demix_off_runs_forward_without_autocast():
+    torch = pytest.importorskip("torch")
+    probe = _autocast_probe(torch)
+    backend._demix(probe, torch.randn(2, 43), _DEMIX_CFG, batch=2, autocast="off")
+    assert probe.seen and all(enabled is False for enabled, _ in probe.seen)
+
+
+def test_demix_default_reads_autocast_from_config(monkeypatch):
+    # autocast=None -> config resolver (env > conf > "off"), mirroring batch=None
+    torch = pytest.importorskip("torch")
+    calls: list[str] = []
+
+    def _resolver():
+        calls.append("hit")
+        return "off"
+
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", _resolver)
+    probe = _autocast_probe(torch)
+    backend._demix(probe, torch.randn(2, 43), _DEMIX_CFG, batch=2)
+    assert calls == ["hit"]  # resolved once per demix, not per window
+    assert all(enabled is False for enabled, _ in probe.seen)
+    calls.clear()
+    backend._demix(probe, torch.randn(2, 43), _DEMIX_CFG, batch=2, autocast="off")
+    assert calls == []  # explicit argument bypasses the config
+
+
+def test_demix_bf16_on_cpu_model_runs_fp32_path(caplog):
+    # non-CUDA model: bf16 request is a debug-logged no-op, output equals mode "off" exactly
+    torch = pytest.importorskip("torch")
+    mix = torch.randn(2, 43)
+    probe_off = _autocast_probe(torch)
+    ref = backend._demix(probe_off, mix, _DEMIX_CFG, batch=3, autocast="off")
+    probe_bf16 = _autocast_probe(torch)
+    with caplog.at_level(logging.DEBUG, logger="voxweave"):
+        out = backend._demix(probe_bf16, mix, _DEMIX_CFG, batch=3, autocast="bf16")
+    assert probe_bf16.seen and all(enabled is False for enabled, _ in probe_bf16.seen)
+    assert torch.equal(out, ref)
+    assert len([r for r in caplog.records if "autocast=bf16" in r.message]) == 1
+
+
+def test_demix_wraps_only_the_model_forward(monkeypatch):
+    # The autocast context must be entered around each forward call and nothing else:
+    # padding, the .float().cpu() cast, the overlap-add and progress all run outside it.
+    torch = pytest.importorskip("torch")
+
+    class _Recorder:
+        def __init__(self):
+            self.active = False
+            self.enters = 0
+
+        def __enter__(self):
+            assert not self.active
+            self.active = True
+            self.enters += 1
+
+        def __exit__(self, *exc):
+            self.active = False
+
+    recorder = _Recorder()
+    helper_calls: list[tuple[object, str]] = []
+
+    def _fake_ctx(dev, mode):
+        helper_calls.append((dev, mode))
+        return recorder
+
+    monkeypatch.setattr(backend, "_autocast_context", _fake_ctx)
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+            self.forwards_inside = 0
+
+        def forward(self, x):
+            assert recorder.active
+            self.forwards_inside += 1
+            return x
+
+    model = _Model()
+    progress_states: list[bool] = []
+    mix = torch.randn(2, 43)  # step=4 -> 11 windows; batch=4 -> 3 forwards
+    backend._demix(
+        model,
+        mix,
+        _DEMIX_CFG,
+        progress=lambda d, t: progress_states.append(recorder.active),
+        batch=4,
+        autocast="fp16",
+    )
+    assert helper_calls == [(next(model.parameters()).device, "fp16")]
+    assert model.forwards_inside == 3 and recorder.enters == 3
+    assert not recorder.active
+    assert progress_states and not any(progress_states)
+
+
+def test_demix_off_is_byte_identical_to_legacy(monkeypatch):
+    # Default (unset) and explicit "off" reproduce the pre-autocast loop bit for bit.
+    torch = pytest.importorskip("torch")
+    monkeypatch.delenv("VOXWEAVE_SEP_AUTOCAST", raising=False)
+
+    class _Identity(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.zeros(1))
+
+        def forward(self, x):
+            return x
+
+    torch.manual_seed(0)
+    mix = torch.randn(2, 131)  # not a multiple of step: exercises the padded tail
+    for bs in (1, 3):
+        ref = _legacy_demix(_Identity(), mix, _DEMIX_CFG, batch=bs)
+        ref_bytes = ref.numpy().tobytes()
+        off = backend._demix(_Identity(), mix, _DEMIX_CFG, batch=bs, autocast="off")
+        default = backend._demix(_Identity(), mix, _DEMIX_CFG, batch=bs)
+        assert off.numpy().tobytes() == ref_bytes
+        assert default.numpy().tobytes() == ref_bytes
+
+
+@pytest.mark.parametrize(
+    ("device", "mode", "recorded"),
+    [
+        ("cuda:0", "off", "off"),
+        ("cuda:0", "bf16", "bf16"),
+        ("cuda:0", "fp16", "fp16"),
+        # Autocast is CUDA-only, so these hosts separate in fp32 and must say so:
+        # the media-adjacent cache is shared with whatever host opens the media.
+        ("cpu", "bf16", "off"),
+        ("mps", "bf16", "off"),
+        ("mps", "fp16", "off"),
+    ],
+)
+def test_separator_identity_records_the_effective_autocast_mode(
+    monkeypatch, tmp_path, device, mode, recorded
+):
+    # The identity is what the vocals cache is keyed on, so it must describe the
+    # numerics this run would separate with, not only the bytes it would load --
+    # and "would separate with" is device-effective, not merely configured.
+    checkpoint = tmp_path / "separator.ckpt"
+    checkpoint.write_bytes(b"separator checkpoint")
+    separator_config = tmp_path / "separator.yaml"
+    separator_config.write_text("model: {}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        backend,
+        "_resolve_separator_files",
+        lambda: (checkpoint, separator_config),
+    )
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: mode)
+    monkeypatch.setattr(backend, "get_device", lambda: device)
+
+    identity = backend.separator_identity()
+
+    assert identity["autocast"] == recorded
+    # and it stays a well-formed companion identity the cache can compare against
+    assert vocalscache.validate_separator_identity(identity).autocast == recorded
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps"])
+def test_probe_and_load_agree_on_the_fp32_path_off_cuda(monkeypatch, tmp_path, device):
+    # The probe (separator_identity) validates a cache the load edge wrote. If only
+    # one of them were device-effective, a CPU/MPS host configured bf16 would miss
+    # its own cache forever -- or claim numerics it never ran.
+    checkpoint = tmp_path / "separator.ckpt"
+    checkpoint.write_bytes(b"separator checkpoint")
+    separator_config = tmp_path / "separator.yaml"
+    separator_config.write_text("model: {}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        backend,
+        "_resolve_separator_files",
+        lambda: (checkpoint, separator_config),
+    )
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: "bf16")
+    monkeypatch.setattr(backend, "get_device", lambda: device)
+
+    probe = backend.separator_identity()["autocast"]
+    load_edge = backend._effective_autocast(
+        backend.config.conf_separate_autocast(), device
+    )
+
+    assert probe == load_edge == "off"
+
+
+@pytest.mark.parametrize(
+    ("device", "mode", "expected"),
+    [
+        ("cuda", "bf16", "bf16"),
+        ("cuda:1", "fp16", "fp16"),
+        ("cuda:0", "off", "off"),
+        ("cpu", "bf16", "off"),
+        ("mps", "fp16", "off"),
+        ("cpu", "off", "off"),
+    ],
+)
+def test_effective_autocast_is_the_one_cuda_only_rule(device, mode, expected):
+    assert backend._effective_autocast(mode, device) == expected
+
+
+@pytest.mark.parametrize("mode", ["fp8", "BF16", "", "true"])
+def test_effective_autocast_rejects_unknown_modes(mode):
+    with pytest.raises(ValueError, match="unknown separator autocast mode"):
+        backend._effective_autocast(mode, "cuda:0")
+
+
+def test_separate_vocals_resolves_autocast_once_for_forward_and_identity(
+    monkeypatch, tmp_path
+):
+    # One source of truth: the mode stamped into the identity (and from there into
+    # the cache companion) is the same value that wrapped the forward. A resolver
+    # that answers differently on a second read would be caught here.
+    torch = pytest.importorskip("torch")
+    sf = pytest.importorskip("soundfile")
+    numpy = pytest.importorskip("numpy")
+
+    reads: list[str] = []
+
+    def _drifting_resolver():
+        reads.append("bf16" if not reads else "off")
+        return reads[-1]
+
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", _drifting_resolver)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    seen: dict[str, object] = {}
+
+    def _fake_load(autocast=None):
+        seen["load"] = autocast
+        return object(), _DEMIX_CFG, {"checkpoint": "blob", "autocast": autocast}
+
+    def _fake_demix(_model, mix, _cfg, progress=None, batch=None, autocast=None):
+        seen["demix"] = autocast
+        return torch.zeros_like(mix)
+
+    monkeypatch.setattr(backend, "_load_separator", _fake_load)
+    monkeypatch.setattr(backend, "_demix", _fake_demix)
+    source = tmp_path / "fullband.wav"
+    sf.write(str(source), numpy.zeros((256, 2), dtype="float32"), 44100)
+
+    out, identity = backend.separate_vocals(source, return_identity=True)
+    try:
+        assert reads == ["bf16"]  # exactly one resolution per separation
+        assert seen == {"load": "bf16", "demix": "bf16"}
+        assert identity["autocast"] == "bf16"
+    finally:
+        out.unlink(missing_ok=True)
+
+
+def _tiny_roformer(torch):
+    """The vendored MelBandRoformer at toy size: CPU-only, deterministic, sub-second."""
+    from voxweave.vendor.mel_band_roformer import MelBandRoformer
+
+    torch.manual_seed(0)
+    return MelBandRoformer(
+        dim=16,
+        depth=1,
+        num_bands=8,
+        dim_head=8,
+        heads=2,
+        flash_attn=False,
+        stft_n_fft=256,
+        stft_hop_length=64,
+        stft_win_length=256,
+        stereo=True,
+    ).eval()
+
+
+@pytest.mark.filterwarnings(
+    # Third-party noise raised by the toy forward, not by the code under test:
+    # rotary_embedding_torch still calls the deprecated torch.cuda.amp.autocast, and
+    # the vendored freqs probe runs torch.stft without a window on purpose.
+    "ignore:`torch.cuda.amp.autocast:FutureWarning",
+    "ignore:A window was not provided:UserWarning",
+)
+def test_vendored_roformer_hands_view_as_complex_fp32_under_bf16_autocast(monkeypatch):
+    # The mask estimators are Linear+GLU, so under autocast they emit bf16 and
+    # torch.view_as_complex refuses BFloat16 on CUDA (the real-model failure). CPU
+    # autocast cannot reproduce that raise: its fp32 cast-policy list includes
+    # view_as_complex, so the op upcasts internally. Assert on the dtype handed to the
+    # op instead -- the vendored patch must upcast before every view_as_complex call.
+    torch = pytest.importorskip("torch")
+    seen: list[object] = []
+    real = torch.view_as_complex
+
+    def _spy(t):
+        seen.append(t.dtype)
+        return real(t)
+
+    monkeypatch.setattr(torch, "view_as_complex", _spy)
+    model = _tiny_roformer(torch)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model(torch.randn(1, 2, 1024))
+    assert len(seen) == 2  # stft_repr, then the masks
+    assert all(dt is torch.float32 for dt in seen)
+    assert out.dtype is torch.float32 and tuple(out.shape) == (1, 2, 1024)
+
+
+def test_vendored_roformer_fp32_forward_hands_view_as_complex_fp32(monkeypatch):
+    # Without autocast the upcast is a no-op alias: the op still sees fp32 and the
+    # output stays fp32 (the default "off" separation path is unchanged by the patch).
+    torch = pytest.importorskip("torch")
+    seen: list[object] = []
+    real = torch.view_as_complex
+
+    def _spy(t):
+        seen.append(t.dtype)
+        return real(t)
+
+    monkeypatch.setattr(torch, "view_as_complex", _spy)
+    model = _tiny_roformer(torch)
+    with torch.no_grad():
+        out = model(torch.randn(1, 2, 1024))
+    assert seen == [torch.float32, torch.float32]
+    assert out.dtype is torch.float32 and tuple(out.shape) == (1, 2, 1024)
+
+
+def test_view_as_complex_rejects_bf16_outside_autocast():
+    # Documents the CUDA failure mode the vendored patch exists for: outside a CPU
+    # autocast region (as on CUDA, whose cast policy lacks view_as_complex) a bf16
+    # real/imag pair is refused outright.
+    torch = pytest.importorskip("torch")
+    with pytest.raises(RuntimeError, match="view_as_complex"):
+        torch.view_as_complex(torch.zeros(2, 2, dtype=torch.bfloat16))
+
+
 def test_resolve_asr_model():
     assert backend.resolve_asr_model(None) == backend.ASR_MODEL
     assert backend.resolve_asr_model("") == backend.ASR_MODEL
@@ -931,6 +1398,349 @@ def test_transcribe_chunks_fusion_survives_one_engine_failure(monkeypatch, tmp_p
     assert len(out) == 2
     # chunk 0: whisper side degraded to empty, qwen side intact
     assert fused[0][0][1] == "" and fused[0][1][1] == "qwen-c0.wav"
+
+
+# --- batched Qwen ASR pass ([batch].asr) ------------------------------------ #
+class _AsrRes:
+    def __init__(self, text, language="English"):
+        self.text, self.language, self.time_stamps = text, language, None
+
+
+def _batched_asr_fake(
+    calls: list,
+    poison: frozenset[str] = frozenset(),
+    garble: dict[str, str] | None = None,
+):
+    """Fake torch Qwen3ASRModel: .transcribe takes one path or a list of paths and
+    returns one result per item (text = "t-<stem>"); every call's (audio, kwargs) is
+    recorded. A call that touches a poisoned wav name raises, single or batched.
+    ``garble`` maps wav names to the text a BATCHED call returns for them instead
+    (qwen-asr #207 style corruption); a single-path call is never garbled."""
+
+    class _Model:
+        def transcribe(self, audio, **kw):
+            calls.append((audio, kw))
+            paths = audio if isinstance(audio, list) else [audio]
+            if poison & {Path(p).name for p in paths}:
+                raise RuntimeError("CUDA error: device-side assert")
+            if isinstance(audio, list) and garble:
+                return [
+                    _AsrRes(garble.get(Path(p).name, f"t-{Path(p).stem}"))
+                    for p in paths
+                ]
+            return [_AsrRes(f"t-{Path(p).stem}") for p in paths]
+
+    return _Model()
+
+
+def _asr_call_names(calls: list):
+    """Recorded audio args -> wav names: a list per batched call, a str per single call."""
+    return [
+        [Path(p).name for p in a] if isinstance(a, list) else Path(a).name
+        for a, _ in calls
+    ]
+
+
+def _stub_chunks(tmp_path, n: int) -> list[Path]:
+    wavs = [tmp_path / f"c{i}.wav" for i in range(n)]
+    for w in wavs:
+        w.write_bytes(b"x")
+    return wavs
+
+
+def test_transcribe_chunks_batches_qwen_by_duration_and_restores_order(
+    monkeypatch, tmp_path
+):
+    # [batch].asr = 2: chunks are grouped by ascending duration, each group is ONE
+    # model.transcribe(list) call with the legacy kwargs, and the results come back
+    # in input order; the odd chunk left over goes through the legacy single call
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _batched_asr_fake(calls))
+    durations = {
+        "c0.wav": 5.0,
+        "c1.wav": 1.0,
+        "c2.wav": 4.0,
+        "c3.wav": 2.0,
+        "c4.wav": 3.0,
+    }
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: durations[w.name])
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 1.0}]
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 5)
+    ticks: list[int] = []
+    out = backend.transcribe_chunks(
+        wavs,
+        None,
+        asr_model="qwen3-asr-1.7b",
+        context="艾米莉亚, 帕克",
+        on_done=lambda i: ticks.append(i),
+    )
+    assert _asr_call_names(calls) == [
+        ["c1.wav", "c3.wav"],
+        ["c4.wav", "c2.wav"],
+        "c0.wav",
+    ]
+    for _, kw in calls:  # same kwargs as the single-path call, context framed
+        assert kw == {
+            "language": None,
+            "return_time_stamps": False,
+            "context": "Proper nouns: 艾米莉亚, 帕克.",
+        }
+    assert [t for _, t, _ in out] == [f"t-c{i}" for i in range(5)]  # input order
+    assert [u[0]["text"] for _, _, u in out] == [f"t-c{i}" for i in range(5)]
+    assert ticks == list(range(10))  # still one tick per chunk: 5 ASR + 5 align
+
+
+def test_transcribe_chunks_asr_batch_1_keeps_legacy_single_path_calls(
+    monkeypatch, tmp_path
+):
+    # batch size 1 = exactly the pre-batching call shape: one model.transcribe(str)
+    # per chunk in input order, no duration probing
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "1")
+    calls: list = []
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _batched_asr_fake(calls))
+    monkeypatch.setattr(
+        backend, "_wav_duration", lambda w: pytest.fail("batch 1 must not probe")
+    )
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 1.0}]
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 3)
+    out = backend.transcribe_chunks(wavs, "Japanese", asr_model="qwen3-asr-1.7b")
+    assert [a for a, _ in calls] == [str(w) for w in wavs]
+    assert all(
+        kw == {"language": "Japanese", "return_time_stamps": False} for _, kw in calls
+    )
+    assert [t for _, t, _ in out] == ["t-c0", "t-c1", "t-c2"]
+
+
+def test_asr_pass_batch_failure_falls_back_per_chunk_for_that_group_only(
+    monkeypatch, tmp_path
+):
+    # a poisoned chunk kills its batched call; only that group is redone chunk by
+    # chunk, so the poisoned chunk alone degrades to empty text and is the only
+    # recorded failure (the healthy group's batched call is never repeated)
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, poison=frozenset({"c2.wav"})),
+    )
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: float(w.stem[1:]))
+    empties: list[str] = []
+    monkeypatch.setattr(backend, "_empty_cache", lambda: empties.append("empty"))
+    wavs = _stub_chunks(tmp_path, 4)
+    failures: list[Exception] = []
+    ticks: list[int] = []
+    out = backend._asr_pass(
+        "qwen",
+        wavs,
+        None,
+        "Qwen/Qwen3-ASR-1.7B",
+        None,
+        failures,
+        lambda: ticks.append(len(ticks)),
+    )
+    assert _asr_call_names(calls) == [
+        ["c0.wav", "c1.wav"],
+        ["c2.wav", "c3.wav"],
+        "c2.wav",
+        "c3.wav",
+    ]
+    assert [t for _, t, _ in out] == ["t-c0", "t-c1", "", "t-c3"]
+    assert out[2] == (None, "", "")
+    assert len(failures) == 1 and isinstance(failures[0], RuntimeError)
+    assert empties == [
+        "empty",
+        "empty",
+    ]  # after the failed batch, after the failed chunk
+    assert len(ticks) == 4  # every chunk still ticks exactly once
+
+
+def test_transcribe_chunks_batched_all_failed_still_raises(monkeypatch, tmp_path):
+    # every chunk poisoned: the batch fails, the per-chunk retries fail, and the
+    # run is reported broken exactly as on the per-chunk path
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, poison=frozenset({"c0.wav", "c1.wav"})),
+    )
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: 1.0)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 2)
+    with pytest.raises(RuntimeError, match="all 2 chunks"):
+        backend.transcribe_chunks(wavs, None, asr_model="qwen3-asr-1.7b")
+    assert _asr_call_names(calls) == [["c0.wav", "c1.wav"], "c0.wav", "c1.wav"]
+
+
+def test_transcribe_chunks_fusion_batches_qwen_pass_but_not_whisper(
+    monkeypatch, tmp_path
+):
+    # fusion: pass A (whisper) stays one path per call, pass B (Qwen) is one batched
+    # call; the fused pairs still line up chunk by chunk
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "4")
+    q_calls: list = []
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _batched_asr_fake(q_calls))
+    w_calls: list = []
+
+    class _Seg:
+        def __init__(self, text):
+            self.text = text
+
+    class _Info:
+        language = "en"
+
+    class _Whisper:
+        def transcribe(self, path, **kw):
+            assert isinstance(path, str)  # faster-whisper takes exactly one path
+            w_calls.append(path)
+            return iter([_Seg(f"w-{Path(path).stem}")]), _Info()
+
+    monkeypatch.setattr(backend, "_get_whisper", lambda mid: _Whisper())
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: float(w.stem[1:]))
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 0.2}]
+    )
+    fused: list[tuple] = []
+
+    def _fuse(wr, qr, lang):
+        fused.append((wr, qr))
+        return ("en", "fused", [])
+
+    monkeypatch.setattr(backend, "_fuse_chunk", _fuse)
+    monkeypatch.setattr(backend, "_release_whisper", lambda: None)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 3)
+    out = backend.transcribe_chunks(wavs, None, asr_model="fusion")
+    assert len(out) == 3
+    assert w_calls == [str(w) for w in wavs]
+    assert _asr_call_names(q_calls) == [["c0.wav", "c1.wav", "c2.wav"]]
+    assert [(wr[1], qr[1]) for wr, qr in fused] == [
+        (f"w-c{i}", f"t-c{i}") for i in range(3)
+    ]
+
+
+def test_transcribe_chunks_mlx_keeps_per_chunk_asr(monkeypatch, tmp_path):
+    # the MLX adapter takes a single path per call, so [batch].asr is ignored there
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "4")
+    monkeypatch.setattr(backend, "_use_mlx", lambda: True)
+    calls: list = []
+
+    class _Mlx:
+        def transcribe(self, wav_path, **kw):
+            assert isinstance(wav_path, str)
+            calls.append(wav_path)
+            return [_AsrRes(f"t-{Path(wav_path).stem}")]
+
+    monkeypatch.setattr(backend, "_get_asr", lambda m=None: _Mlx())
+    monkeypatch.setattr(
+        backend, "_wav_duration", lambda w: pytest.fail("MLX must not batch")
+    )
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 1.0}]
+    )
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 3)
+    out = backend.transcribe_chunks(wavs, None, asr_model="qwen3-asr-1.7b")
+    assert calls == [str(w) for w in wavs]
+    assert [t for _, t, _ in out] == ["t-c0", "t-c1", "t-c2"]
+
+
+def test_asr_pass_reruns_implausibly_short_batched_result_alone(
+    monkeypatch, tmp_path, caplog
+):
+    # qwen-asr #207: the shorter item of a mixed-length batch comes back as a lone
+    # "!". That chunk alone is re-run through the legacy single-path call and takes
+    # the single call's text; the other chunk keeps its batched result, nothing is
+    # recorded as a failure, and every chunk still ticks exactly once. (The fake's
+    # healthy text has 3 alphanumeric characters, so durations stay under 6s to
+    # clear the 0.5 chars/s floor; the garbled chunk is above the 2s check floor.)
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, garble={"c0.wav": "!"}),
+    )
+    durations = {"c0.wav": 3.0, "c1.wav": 5.0}
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: durations[w.name])
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 2)
+    failures: list[Exception] = []
+    ticks: list[int] = []
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = backend._asr_pass(
+            "qwen",
+            wavs,
+            None,
+            "Qwen/Qwen3-ASR-1.7B",
+            None,
+            failures,
+            lambda: ticks.append(len(ticks)),
+        )
+    assert _asr_call_names(calls) == [["c0.wav", "c1.wav"], "c0.wav"]
+    assert [t for _, t, _ in out] == ["t-c0", "t-c1"]
+    assert failures == []
+    assert len(ticks) == 2
+    assert "chunk 1/2" in caplog.text and "qwen-asr #207" in caplog.text
+
+
+def test_asr_pass_accepts_empty_batched_result_for_tiny_chunk(monkeypatch, tmp_path):
+    # silence exemption: a sub-floor chunk (a cough, a breath) legitimately
+    # transcribes to nothing, so an empty batched result for it is kept as-is and
+    # the batched call is the only model call (5s keeps the healthy 3-character
+    # fake text above the 0.5 chars/s floor)
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    calls: list = []
+    monkeypatch.setattr(
+        backend,
+        "_get_asr",
+        lambda m=None: _batched_asr_fake(calls, garble={"c0.wav": ""}),
+    )
+    durations = {"c0.wav": 0.4, "c1.wav": 5.0}
+    monkeypatch.setattr(backend, "_wav_duration", lambda w: durations[w.name])
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    wavs = _stub_chunks(tmp_path, 2)
+    failures: list[Exception] = []
+    ticks: list[int] = []
+    out = backend._asr_pass(
+        "qwen",
+        wavs,
+        None,
+        "Qwen/Qwen3-ASR-1.7B",
+        None,
+        failures,
+        lambda: ticks.append(len(ticks)),
+    )
+    assert _asr_call_names(calls) == [["c0.wav", "c1.wav"]]
+    assert [t for _, t, _ in out] == ["", "t-c1"]
+    assert out[0][2] == "en"  # empty text: align_lang placeholder, skipped by align
+    assert failures == []
+    assert len(ticks) == 2
+
+
+def test_batched_asr_suspect_floor():
+    # the guard is a chars-per-second floor over the chunk's alphanumeric content;
+    # unknown (0.0) or sub-floor durations are exempt whatever the text
+    assert backend._batched_asr_suspect("!", 30.0)
+    assert backend._batched_asr_suspect("", 118.0)
+    assert not backend._batched_asr_suspect("", 0.0)  # header unreadable
+    assert not backend._batched_asr_suspect("", 1.9)
+    assert not backend._batched_asr_suspect("そうだね、行こう。", 10.0)
+    assert not backend._batched_asr_suspect("yes", 5.0)  # 3 alnum >= 0.5 * 5
+    assert backend._batched_asr_suspect("は", 10.0)  # 1 alnum < 0.5 * 10
 
 
 # --- load strategy: sum (co-resident: same pass structure, no release between passes) ----------- #

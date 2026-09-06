@@ -6,8 +6,12 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import TypeVar
 
 from voxweave import config, fsio
 from voxweave.realign import render_cues
@@ -24,9 +28,12 @@ _RETRY_DELAYS = (2.0, 8.0)
 # Built-in only: env / conf [llm] are resolved at call time (config.resolve_llm_model)
 # by the CLI and pipeline, never at import (a test or library import must not read the user conf).
 TRANSLATE_MODEL = config.DEFAULT_LLM_MODEL
-# Set high (800) so a typical episode (300-500 cues) fits in one call — full-episode context
-# beats windowing: seams cause disambiguation errors and inconsistent proper-noun rendering.
-# Only very long compilations (>800 cues) fall back to sequential windows.
+# Cue cap of the SEQUENTIAL planner (concurrency == 1). Set high (800) so a typical
+# episode (300-500 cues) fits in one call: with one window there are no seams, hence no
+# cross-window disambiguation errors or inconsistent proper-noun rendering, and only very
+# long compilations (>800 cues) fall back to sequential windows. Concurrency > 1 gives
+# that up on purpose -- it caps windows at WINDOW_CUES instead and relies on ``glossary``
+# and ``context`` for consistency (see :func:`translate_cues`).
 BATCH_THRESHOLD = int(os.environ.get("VOXWEAVE_TRANSLATE_BATCH", "800"))
 # Tail cues from the previous window carried into the next for stylistic continuity.
 CONTEXT_TAIL = int(os.environ.get("VOXWEAVE_TRANSLATE_CONTEXT_TAIL", "3"))
@@ -35,6 +42,66 @@ CONTEXT_TAIL = int(os.environ.get("VOXWEAVE_TRANSLATE_CONTEXT_TAIL", "3"))
 # window; CJK text runs ~1 token/char and the response echoes the input size, so
 # 60k chars keeps request+response comfortably inside current context limits.
 WINDOW_CHARS = int(os.environ.get("VOXWEAVE_TRANSLATE_WINDOW_CHARS", "60000"))
+# Concurrent-mode window size (cues per request when translate_cues runs with
+# concurrency > 1). Built-in only: env / conf [llm].window_cues resolve at call time
+# in the pipeline (config.resolve_llm_window_cues), never at import.
+WINDOW_CUES = config.DEFAULT_TRANSLATE_WINDOW_CUES
+# Characters of the response kept in an IncompleteResponse message for diagnosis.
+_INCOMPLETE_TAIL_CHARS = 120
+# Cue indices listed in a "missing cues" log line before eliding.
+_LOG_INDEX_LIMIT = 20
+
+_T = TypeVar("_T")
+
+
+class IncompleteResponse(RuntimeError):
+    """The model's answer cannot be used as a window result.
+
+    Raised when the response (streamed or not) ended with a ``finish_reason``
+    other than ``"stop"`` -- a length cap, a server-side abort (vLLM kills a
+    request whose structured-output FSM fails to advance), or a stream that
+    ended without any finish chunk -- or when the returned text carried no
+    parseable translation object at all. Retryable: the retry loop re-requests
+    the window and finally drops ``json_object`` mode (see
+    :func:`_request_window`).
+    """
+
+    def __init__(
+        self, finish_reason: str | None, text: str, *, detail: str | None = None
+    ) -> None:
+        self.finish_reason = finish_reason
+        self.chars = len(text)
+        self.tail = text[-_INCOMPLETE_TAIL_CHARS:]
+        what = detail or f"finish_reason={finish_reason!r}"
+        super().__init__(
+            f"model response incomplete ({what}; {self.chars} chars received, "
+            f"tail={self.tail!r})"
+        )
+
+
+class PartialTranslationError(RuntimeError):
+    """Some cues stayed untranslated after the retry stage and the caller did not
+    allow partial output. The progress sidecar is kept so a rerun resumes."""
+
+    def __init__(self, missing: list[int], total: int) -> None:
+        self.missing = list(missing)
+        self.total = total
+        shown = ", ".join(str(i) for i in self.missing[:8])
+        if len(self.missing) > 8:
+            shown += ", ..."
+        super().__init__(
+            f"{len(self.missing)} of {total} cues untranslated after retry (cue "
+            f"indices {shown}); translation progress is kept -- rerun the same "
+            "command to resume, or allow partial output (--allow-partial) to fill "
+            "them with source text"
+        )
+
+
+def _short_indices(indices: list[int]) -> str:
+    shown = ", ".join(str(i) for i in indices[:_LOG_INDEX_LIMIT])
+    if len(indices) > _LOG_INDEX_LIMIT:
+        shown += f", ... (+{len(indices) - _LOG_INDEX_LIMIT})"
+    return shown
 
 
 # Decorative punctuation GPT commonly produces but not covered by voxweave’s base stripper.
@@ -317,8 +384,15 @@ def build_messages(
     context: str | None = None,
     glossary: dict[str, str] | str | None = None,
     tail: list[tuple[str, str]] | None = None,
+    source_tail: list[str] | None = None,
 ) -> list[dict]:
-    """Assemble OpenAI chat messages: system (instructions + context + glossary + continuity tail) + user (numbered payload JSON)."""
+    """Assemble OpenAI chat messages: system (instructions + context + glossary + continuity tail) + user (numbered payload JSON).
+
+    ``tail`` carries already-translated preceding cues (sequential windows, the
+    missing-cue retry). ``source_tail`` carries preceding cues in the SOURCE
+    language only -- concurrent windows run before their neighbours' translations
+    exist, so the source text is the only continuity available.
+    """
     if not to or not to.strip() or "\n" in to:
         raise ValueError("target language must be a non-empty single-line string")
     parts = [
@@ -363,6 +437,13 @@ def build_messages(
             parts.append(
                 "\nPreceding context (already translated, for stylistic continuity only -- "
                 f"do not re-output):\n{tail_txt}"
+            )
+    if source_tail:
+        src_txt = "\n".join(s for s in source_tail if s)
+        if src_txt:
+            parts.append(
+                "\nPreceding source cues (context only -- do not translate or "
+                f"re-output them):\n{src_txt}"
             )
     user = json.dumps({"cues": payload}, ensure_ascii=False)
     return [
@@ -414,6 +495,27 @@ def resolve_model(client, model: str) -> str:
     )
 
 
+# Marker for "this response object does not expose finish_reason at all" (fakes,
+# minimal shims). Only a response that exposes the field can be judged incomplete;
+# the real SDK always exposes it (``None`` until the finish chunk arrives).
+_NO_FINISH_FIELD = object()
+
+
+def _check_complete(finish_reason: object, text: str) -> None:
+    """Raise :class:`IncompleteResponse` unless the response finished with ``"stop"``.
+
+    ``None`` means the stream ended without a finish chunk (the server dropped the
+    request mid-answer); ``"length"`` / ``"abort"`` / anything else means the text
+    is cut short -- a truncated JSON object never parses, so treating the window as
+    "no result" and retrying beats silently accepting a partial buffer.
+    """
+    if finish_reason is _NO_FINISH_FIELD or finish_reason == "stop":
+        return
+    raise IncompleteResponse(
+        finish_reason if isinstance(finish_reason, str) else None, text
+    )
+
+
 def _call(
     client,
     model: str,
@@ -421,6 +523,7 @@ def _call(
     on_entry=None,
     *,
     reasoning_effort: str | None = None,
+    json_mode: bool = True,
 ) -> str:
     """Call the model and return the JSON text.
 
@@ -428,27 +531,38 @@ def _call(
     calling ``on_entry(delta)`` to advance the progress bar. Counting ``"i"`` is reliable
     because index values are numbers and translated strings JSON-escape interior quotes to
     ``\\"`` — no bare ``"i"`` tokens leak through. Without ``on_entry``: single blocking call.
+
+    ``json_mode=False`` drops ``response_format={"type": "json_object"}`` (plain chat;
+    the prompt already demands JSON and :func:`_loads_salvage` copes with fences and
+    prose) -- the fallback for servers whose structured-output path aborts requests.
+
+    Both paths check the final ``finish_reason`` and raise :class:`IncompleteResponse`
+    unless it is ``"stop"``; a response that never exposes the field is trusted.
     """
-    request_options = (
+    request_options: dict = (
         {"reasoning_effort": reasoning_effort}
         if reasoning_effort is not None and reasoning_effort != "default"
         else {}
     )
+    if json_mode:
+        request_options["response_format"] = {"type": "json_object"}
     if on_entry is None:
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
-            response_format={"type": "json_object"},
             **request_options,
         )
-        return resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        text = choice.message.content or ""
+        _check_complete(getattr(choice, "finish_reason", _NO_FINISH_FIELD), text)
+        return text
 
     buf: list[str] = []
     seen = 0
+    finish_reason: object = _NO_FINISH_FIELD
     stream = client.chat.completions.create(
         model=model,
         messages=messages,
-        response_format={"type": "json_object"},
         stream=True,
         **request_options,
     )
@@ -456,7 +570,16 @@ def _call(
         for chunk in stream:
             if not getattr(chunk, "choices", None):
                 continue  # trailing usage-only chunks have no choices
-            piece = getattr(chunk.choices[0].delta, "content", None)
+            choice = chunk.choices[0]
+            reason = getattr(choice, "finish_reason", _NO_FINISH_FIELD)
+            if reason is not _NO_FINISH_FIELD and (
+                reason is not None or finish_reason is _NO_FINISH_FIELD
+            ):
+                # A non-None reason is final; None only records that the field exists
+                # so an early-terminated stream is caught, without erasing a "stop"
+                # already seen (servers may trail an empty-delta chunk).
+                finish_reason = reason
+            piece = getattr(getattr(choice, "delta", None), "content", None)
             if not piece:
                 continue
             buf.append(piece)
@@ -468,11 +591,16 @@ def _call(
         close = getattr(stream, "close", None)
         if close is not None:
             close()
-    return "".join(buf)
+    text = "".join(buf)
+    _check_complete(finish_reason, text)
+    return text
 
 
 def _retryable(exc: Exception) -> bool:
-    """Retry transport failures and transient HTTP statuses, never bad requests."""
+    """Retry transport failures, transient HTTP statuses and incomplete answers,
+    never bad requests."""
+    if isinstance(exc, IncompleteResponse):
+        return True
     status = getattr(exc, "status_code", None)
     if isinstance(status, int):
         return status in {408, 409, 429} or 500 <= status < 600
@@ -493,30 +621,19 @@ def _retryable(exc: Exception) -> bool:
     return isinstance(exc, APIConnectionError)
 
 
-def _call_with_retry(
-    client,
-    model: str,
-    messages: list[dict],
-    on_entry=None,
-    *,
-    reasoning_effort: str | None = None,
-) -> str:
-    """:func:`_call` with exponential backoff on transient failures (network,
-    rate limit, 5xx). A streamed retry re-counts entries already reported to
-    ``on_entry`` — the bar may overshoot, the translations do not."""
+def _with_retry(fn: Callable[[], _T], *, label: str = "translate call") -> _T:
+    """Run ``fn`` with exponential backoff on transient failures (network, rate
+    limit, 5xx, incomplete answers); non-retryable errors and the last attempt's
+    error propagate."""
     for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
         try:
-            request_options = (
-                {"reasoning_effort": reasoning_effort}
-                if reasoning_effort is not None
-                else {}
-            )
-            return _call(client, model, messages, on_entry=on_entry, **request_options)
+            return fn()
         except Exception as e:
             if delay is None or not _retryable(e):
                 raise
             log.warning(
-                "translate call failed (attempt %d/%d: %s); retrying in %.0fs",
+                "%s failed (attempt %d/%d: %s); retrying in %.0fs",
+                label,
                 attempt + 1,
                 len(_RETRY_DELAYS) + 1,
                 e,
@@ -524,6 +641,134 @@ def _call_with_retry(
             )
             _sleep(delay)
     raise AssertionError("unreachable")
+
+
+def _call_options(reasoning_effort: str | None, json_mode: bool) -> dict:
+    """Keyword arguments forwarded to :func:`_call`, omitting defaults so a
+    minimal ``_call`` replacement (tests) keeps working."""
+    options: dict = {}
+    if reasoning_effort is not None:
+        options["reasoning_effort"] = reasoning_effort
+    if not json_mode:
+        options["json_mode"] = False
+    return options
+
+
+def _block_index(unit_index: int) -> int:
+    """Translation-unit index -> its cue (block) index; dash halves share one cue."""
+    return unit_index % _DASH_UNIT_BASE
+
+
+def _window_label(position: int, win: list[dict]) -> str:
+    first = _block_index(win[0]["i"])
+    last = _block_index(win[-1]["i"])
+    return f"window {position + 1} (cues {first}-{last})"
+
+
+def _parse_window(raw: str, win_ids: list[int], *, label: str) -> dict[int, str]:
+    """Parse one window's response and check its coverage.
+
+    Nothing parseable (or only indices the window never asked for) raises
+    :class:`IncompleteResponse` so the retry loop runs instead of silently
+    accepting an empty window. Partial coverage is logged and returned as is --
+    the pipeline's missing-cue retry stage re-requests the gaps.
+    """
+    parsed = parse_response(raw)
+    wanted = set(win_ids)
+    stray = [i for i in parsed if i not in wanted]
+    if stray:
+        log.warning("dropping out-of-window indices %s from response", stray)
+        for i in stray:
+            del parsed[i]
+    if not parsed:
+        raise IncompleteResponse(
+            None,
+            raw if isinstance(raw, str) else "",
+            detail="no parseable translations in the response",
+        )
+    missing = [i for i in win_ids if not parsed.get(i, "").strip()]
+    if missing:
+        log.warning(
+            "%s: %d of %d cues missing from the response: %s",
+            label,
+            len(missing),
+            len(win_ids),
+            _short_indices([_block_index(i) for i in missing]),
+        )
+    return parsed
+
+
+def request_with_json_fallback(
+    attempt: Callable[[bool], _T],
+    *,
+    label: str,
+    call_label: str | None = None,
+) -> _T:
+    """Run ``attempt(json_mode=True)`` with retries, then ``attempt(json_mode=False)``
+    once when every retried attempt ended :class:`IncompleteResponse`.
+
+    vLLM's structured-output grammar can abort a request (speculative decoding +
+    reasoning parser); dropping ``response_format`` on the final attempt gets the
+    request through on such servers. The final plain-chat failure propagates -- the
+    caller decides what an unusable answer means for it.
+
+    Shared by :func:`_request_window` (translate) and :mod:`voxweave.asrfix`; both
+    request paths must behave the same in front of a flaky endpoint.
+    """
+    try:
+        return _with_retry(lambda: attempt(True), label=call_label or label)
+    except IncompleteResponse as exc:
+        log.warning(
+            "%s: json_object mode dropped after %d incomplete attempts (%s); "
+            "retrying once as plain chat -- check the server's structured-output "
+            "path (vLLM: guided decoding + speculative decoding / reasoning parser)",
+            label,
+            len(_RETRY_DELAYS) + 1,
+            exc,
+        )
+    return attempt(False)
+
+
+def _request_window(
+    client,
+    model: str,
+    messages: list[dict],
+    *,
+    win_ids: list[int],
+    label: str,
+    on_entry=None,
+    reasoning_effort: str | None = None,
+) -> dict[int, str]:
+    """Translate one window: json_object mode with retries, then one plain-chat
+    attempt when every retry ended incomplete.
+
+    A window that still comes back incomplete is logged and returned empty: its
+    cues stay untranslated for the sequential retry stage, and the caller decides
+    whether partial output is acceptable.
+    """
+
+    def attempt(json_mode: bool) -> dict[int, str]:
+        raw = _call(
+            client,
+            model,
+            messages,
+            on_entry=on_entry,
+            **_call_options(reasoning_effort, json_mode),
+        )
+        return _parse_window(raw, win_ids, label=label)
+
+    try:
+        return request_with_json_fallback(
+            attempt, label=label, call_label=f"{label} translate call"
+        )
+    except IncompleteResponse as exc:
+        log.warning(
+            "%s: still incomplete without json_object mode (%s); leaving its cues "
+            "for the retry stage",
+            label,
+            exc,
+        )
+        return {}
 
 
 def payload_signature(payload: list[dict]) -> str:
@@ -666,19 +911,40 @@ def translate_cues(
     reporter=None,
     progress_path: Path | None = None,
     progress_sig: str | None = None,
+    concurrency: int = 1,
+    window_cues: int = WINDOW_CUES,
 ) -> dict[int, str]:
     """Numbered payload -> {index: translated text}.
 
-    Single call when the whole payload fits both the cue-count cap and the char
-    budget (whole-episode context); sequential windows with continuity tail
-    otherwise. ``client`` injectable for tests. ``tail`` seeds the first window's
-    continuity context (e.g. an already-translated preceding cue on retry), the
-    same channel inter-window tails already use. With ``progress_path``, completed
-    windows are persisted after each call and fully-covered windows are skipped
-    on a rerun, so a mid-run failure costs only the window that failed.
+    ``concurrency == 1`` (library default): single call when the whole payload
+    fits both the cue-count cap and the char budget (whole-episode context);
+    sequential windows with a translated-tail continuity context otherwise.
+
+    ``concurrency > 1``: windows of at most ``window_cues`` units (the char budget
+    still applies) run on a thread pool, each with the preceding SOURCE cues as
+    context -- neighbours' translations do not exist yet. This trades cross-window
+    stylistic continuity for throughput on a self-hosted server; ``glossary`` and
+    ``context`` are the consistency tools there. Results merge in index order and
+    the progress sidecar is saved after every completed window. The pipeline
+    resolves the effective value (CLI > env > conf > built-in) before calling.
+
+    ``client`` injectable for tests. ``tail`` seeds the first window's continuity
+    context (e.g. an already-translated preceding cue on retry), the same channel
+    inter-window tails already use. With ``progress_path``, completed windows are
+    persisted after each call and fully-covered windows are skipped on a rerun, so
+    a mid-run failure costs only the window that failed.
+
+    A window whose answers stay incomplete after the retries and the plain-chat
+    fallback (see :func:`_request_window`) is left out of the result rather than
+    raising, so the caller's missing-cue retry stage can re-request it; transport
+    and HTTP errors still propagate after their own retries.
     """
     if not payload:
         return {}
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+    if window_cues < 1:
+        raise ValueError("window_cues must be >= 1")
     model = config.resolve_llm_model(model, task_envvar="VOXWEAVE_TRANSLATE_MODEL")
     reasoning_effort = config.resolve_llm_reasoning_effort(reasoning_effort)
     client = client or _make_client(base_url, api_key)
@@ -699,7 +965,13 @@ def translate_cues(
     # each speaker translates in isolation; the result is collapsed back to one
     # entry per block afterwards, keeping the external cue count conserved.
     units = _expand_to_units(payload)
-    windows = _plan_windows(units, batch=batch, char_budget=char_budget)
+    # Sequential mode keeps the whole-episode planner untouched; concurrent mode
+    # additionally caps every window at window_cues units.
+    windows = _plan_windows(
+        units,
+        batch=min(batch, window_cues) if concurrency > 1 else batch,
+        char_budget=char_budget,
+    )
     # With streaming the bar advances as entries arrive; also works for a single batch.
     on_entry = None
     if reporter is not None:
@@ -709,31 +981,117 @@ def translate_cues(
     if progress_path is not None:
         result.update(load_progress(progress_path, progress_sig))
     tail = list(tail) if tail else []
+
+    def covered(win: list[dict]) -> bool:
+        return all(result.get(c["i"], "").strip() for c in win)
+
+    def request(position: int, win: list[dict], msgs: list[dict], entry) -> dict:
+        return _request_window(
+            client,
+            model,
+            msgs,
+            win_ids=[c["i"] for c in win],
+            label=_window_label(position, win),
+            on_entry=entry,
+            reasoning_effort=reasoning_effort,
+        )
+
+    if concurrency == 1 or len(windows) == 1:
+        for position, win in enumerate(windows):
+            if covered(win):
+                if on_entry is not None:
+                    on_entry(len(win))  # resumed from progress: count it as done
+            else:
+                msgs = build_messages(
+                    win, to=to, context=context, glossary=glossary, tail=tail
+                )
+                result.update(request(position, win, msgs, on_entry))
+                if progress_path is not None:
+                    save_progress(progress_path, progress_sig, result)
+            tail = [(c["t"], result.get(c["i"], "")) for c in win[-context_tail:]]
+        return _collapse_units(payload, result)
+
+    # Concurrent lane: one lock serialises result merging, progress saves and
+    # reporter advances (rich's Progress is thread-safe, arbitrary Reporter
+    # subclasses need not be).
+    lock = threading.Lock()
+    entry: Callable[[int], None] | None = None
+    if on_entry is not None:
+        advance = on_entry
+
+        def guarded_entry(n: int) -> None:
+            with lock:
+                advance(n)
+
+        entry = guarded_entry
+    starts: list[int] = []
+    offset = 0
     for win in windows:
-        if all(result.get(c["i"], "").strip() for c in win):
+        starts.append(offset)
+        offset += len(win)
+    pending: list[int] = []
+    for position, win in enumerate(windows):
+        if covered(win):
             if on_entry is not None:
-                on_entry(len(win))  # resumed from progress: count it as done
+                on_entry(len(win))
         else:
+            pending.append(position)
+    if not pending:
+        return _collapse_units(payload, result)
+
+    def run(position: int) -> None:
+        win = windows[position]
+        start = starts[position]
+        if start == 0:
             msgs = build_messages(
                 win, to=to, context=context, glossary=glossary, tail=tail
             )
-            parsed = parse_response(
-                _call_with_retry(
-                    client,
-                    model,
-                    msgs,
-                    on_entry=on_entry,
-                    reasoning_effort=reasoning_effort,
-                )
+        else:
+            msgs = build_messages(
+                win,
+                to=to,
+                context=context,
+                glossary=glossary,
+                source_tail=[
+                    u["t"] for u in units[max(0, start - context_tail) : start]
+                ],
             )
-            win_ids = {c["i"] for c in win}
-            stray = [i for i in parsed if i not in win_ids]
-            if stray:
-                log.warning("dropping out-of-window indices %s from response", stray)
-                for i in stray:
-                    del parsed[i]
+        parsed = request(position, win, msgs, entry)
+        with lock:
             result.update(parsed)
             if progress_path is not None:
                 save_progress(progress_path, progress_sig, result)
-        tail = [(c["t"], result.get(c["i"], "")) for c in win[-context_tail:]]
+
+    hard_error: BaseException | None = None
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(pending))) as pool:
+        futures = [pool.submit(run, position) for position in pending]
+        try:
+            for future in as_completed(futures):
+                # A worker's BaseException (KeyboardInterrupt included) lands in the
+                # future rather than propagating, so read it instead of calling
+                # result(): the first failure ends the run.
+                exc = future.exception()
+                if exc is not None:
+                    hard_error = exc
+                    break
+        finally:
+            # Drop the windows that never started -- for a failure, for a
+            # KeyboardInterrupt in this thread, and harmlessly when every window
+            # already finished. Never keep consuming as_completed afterwards:
+            # cancel_futures cancels a queued future WITHOUT notifying the
+            # as_completed waiter (only set_running_or_notify_cancel does that),
+            # so the iterator would block forever waiting for them. The pool's
+            # exit then joins the in-flight windows, whose progress is persisted.
+            pool.shutdown(wait=False, cancel_futures=True)
+    if hard_error is not None:
+        # Later failures are dropped by the break above; report them so a systemic
+        # outage is not misread as one bad window.
+        for future in futures:
+            if future.cancelled():
+                continue
+            other = future.exception()
+            if other is not None and other is not hard_error:
+                log.warning("another translate window failed: %s", other)
+        raise hard_error
+    result = dict(sorted(result.items()))
     return _collapse_units(payload, result)

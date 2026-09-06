@@ -2564,7 +2564,8 @@ SHADOW_REPORT_KIND = "segmentation-shadow-report"
 #: quality run that may follow in the same process.
 SHADOW_ENV = "VOXWEAVE_SEG_V2_SHADOW"
 
-#: P5's lane/row matrix, named by ``pipeline.SHADOW_LANE_*``.
+#: P5's lane/row matrix, named by ``voxweave.core.shadow_v2.SHADOW_LANE_*``
+#: (re-exported by ``pipeline``).
 SHADOW_LANE_CORE = "core_partition_pre_overlay"
 SHADOW_LANE_DELIVERY = "delivery_v1_legacy"
 SHADOW_LANE_FINALIZER = "delivery_finalizer"

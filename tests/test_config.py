@@ -197,10 +197,153 @@ def test_conf_batch_clamps_to_min_1(conf_at, no_batch_env):
     assert config.conf_batch("separate") == 1
 
 
+def test_conf_batch_asr_precedence(conf_at, no_batch_env, monkeypatch):
+    # Qwen ASR chunks per decode call: env VOXWEAVE_ASR_BATCH > [batch].asr > built-in 1
+    # (batching is opt-in: batched transcripts drift ~1.5% CER from the per-chunk call)
+    assert config.conf_batch("asr") == 1
+    conf_at.write_text("[batch]\nasr = 8\n", encoding="utf-8")
+    assert config.conf_batch("asr") == 8
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    assert config.conf_batch("asr") == 2  # env > file
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "lots")
+    assert config.conf_batch("asr") == 8  # non-int env -> next source
+    conf_at.write_text('[batch]\nasr = "many"\n', encoding="utf-8")
+    assert config.conf_batch("asr") == 1  # non-int file too -> default
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "0")
+    assert config.conf_batch("asr") == 1  # clamped: 1 = the legacy per-chunk call
+
+
 def test_default_template_has_batch_section(conf_at):
     config.ensure_default_config()
     txt = conf_at.read_text(encoding="utf-8")
     assert "[batch]" in txt and "VOXWEAVE_SEP_BATCH" in txt
+    assert "VOXWEAVE_ASR_BATCH" in txt and "# asr = 1" in txt
+    assert "1.34x" in txt and "1.5% CER" in txt and "#207" in txt  # measured trade-off
+
+
+# --- separation autocast ([separate].autocast / VOXWEAVE_SEP_AUTOCAST) ------ #
+@pytest.fixture
+def no_sep_autocast_env(monkeypatch):
+    monkeypatch.delenv(config.SEP_AUTOCAST_ENV, raising=False)
+
+
+def _warnings(caplog):
+    return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_conf_separate_autocast_default_off(conf_at, no_sep_autocast_env):
+    assert config.conf_separate_autocast() == "off"
+
+
+def test_conf_separate_autocast_from_conf(conf_at, no_sep_autocast_env):
+    conf_at.write_text('[separate]\nautocast = "bf16"\n', encoding="utf-8")
+    assert config.conf_separate_autocast() == "bf16"
+
+
+def test_conf_separate_autocast_env_overrides_conf(
+    conf_at, no_sep_autocast_env, monkeypatch
+):
+    conf_at.write_text('[separate]\nautocast = "bf16"\n', encoding="utf-8")
+    monkeypatch.setenv("VOXWEAVE_SEP_AUTOCAST", "fp16")
+    assert config.conf_separate_autocast() == "fp16"  # env > file
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("BF16", "bf16"), (" Fp16 ", "fp16"), ("OFF", "off"), ("bF16", "bf16")],
+)
+def test_conf_separate_autocast_case_insensitive(
+    conf_at, no_sep_autocast_env, monkeypatch, raw, expected
+):
+    monkeypatch.setenv("VOXWEAVE_SEP_AUTOCAST", raw)
+    assert config.conf_separate_autocast() == expected
+    monkeypatch.delenv("VOXWEAVE_SEP_AUTOCAST")
+    conf_at.write_text(f'[separate]\nautocast = "{raw}"\n', encoding="utf-8")
+    assert config.conf_separate_autocast() == expected
+
+
+def test_conf_separate_autocast_blank_env_is_unset(
+    conf_at, no_sep_autocast_env, monkeypatch
+):
+    # a blank env var is "not set", not "invalid": the file still wins, no warning
+    monkeypatch.setenv("VOXWEAVE_SEP_AUTOCAST", "   ")
+    conf_at.write_text('[separate]\nautocast = "bf16"\n', encoding="utf-8")
+    assert config.conf_separate_autocast() == "bf16"
+
+
+def test_conf_separate_autocast_invalid_env_warns_once_and_falls_back_off(
+    conf_at, no_sep_autocast_env, monkeypatch, caplog
+):
+    # invalid env must not fall through to the file: a typo never silently enables autocast
+    conf_at.write_text('[separate]\nautocast = "bf16"\n', encoding="utf-8")
+    monkeypatch.setenv("VOXWEAVE_SEP_AUTOCAST", "fp8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_separate_autocast() == "off"
+    warned = _warnings(caplog)
+    assert len(warned) == 1
+    assert "VOXWEAVE_SEP_AUTOCAST" in warned[0].message and "'fp8'" in warned[0].message
+
+
+def test_conf_separate_autocast_invalid_conf_warns_once_and_falls_back_off(
+    conf_at, no_sep_autocast_env, caplog
+):
+    conf_at.write_text('[separate]\nautocast = "half"\n', encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_separate_autocast() == "off"
+    warned = _warnings(caplog)
+    assert len(warned) == 1
+    assert "[separate].autocast" in warned[0].message and "'half'" in warned[0].message
+
+
+def test_conf_separate_autocast_wrong_type_warns_once_and_falls_back_off(
+    conf_at, no_sep_autocast_env, caplog
+):
+    conf_at.write_text("[separate]\nautocast = true\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_separate_autocast() == "off"
+    assert len(_warnings(caplog)) == 1
+
+
+def test_conf_separate_autocast_valid_value_does_not_warn(
+    conf_at, no_sep_autocast_env, caplog
+):
+    conf_at.write_text('[separate]\nautocast = "fp16"\n', encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_separate_autocast() == "fp16"
+    assert not _warnings(caplog)
+
+
+def test_conf_separate_autocast_non_table_section_warns_once_and_falls_back_off(
+    conf_at, no_sep_autocast_env, caplog
+):
+    # a top-level scalar `separate = "bf16"` (typo for the [separate] table) is
+    # reported like the diarize resolver does, not silently treated as unset
+    conf_at.write_text('separate = "bf16"\n', encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_separate_autocast() == "off"
+    warned = _warnings(caplog)
+    assert len(warned) == 1
+    assert "'separate'" in warned[0].message and "expected table" in warned[0].message
+
+
+def test_separate_section_is_a_known_key(conf_at, caplog):
+    conf_at.write_text('[separate]\nautocast = "off"\n', encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        config._load()
+    assert not any("unknown config key" in r.message for r in caplog.records)
+
+
+def test_default_template_separate_section_resolves_off(
+    conf_at, no_sep_autocast_env, caplog
+):
+    config.ensure_default_config()
+    txt = conf_at.read_text(encoding="utf-8")
+    assert "[separate]" in txt and "VOXWEAVE_SEP_AUTOCAST" in txt
+    assert '# autocast = "off"' in txt
+    # the template's (empty) [separate] table parses and resolves to the built-in default
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_separate_autocast() == "off"
+    assert not _warnings(caplog)
 
 
 # --- hf token precedence (env > conf > huggingface_hub stored token) -------- #

@@ -110,6 +110,66 @@ def test_llm_wrong_types_fall_back(conf_at, caplog):
     assert "wrong type" in caplog.text
 
 
+# --- translate windowing: concurrency / window_cues ----------------------------
+
+
+def test_concurrency_and_window_defaults(conf_at):
+    assert config.resolve_llm_concurrency(None) == config.DEFAULT_TRANSLATE_CONCURRENCY
+    assert config.resolve_llm_window_cues(None) == config.DEFAULT_TRANSLATE_WINDOW_CUES
+    assert config.DEFAULT_TRANSLATE_CONCURRENCY == 8
+    assert config.DEFAULT_TRANSLATE_WINDOW_CUES == 100
+
+
+def test_concurrency_and_window_precedence(conf_at, monkeypatch):
+    conf_at.write_text("[llm]\nconcurrency = 3\nwindow_cues = 50\n", encoding="utf-8")
+    assert config.resolve_llm_concurrency(None) == 3
+    assert config.resolve_llm_window_cues(None) == 50
+    monkeypatch.setenv("VOXWEAVE_TRANSLATE_CONCURRENCY", "5")
+    monkeypatch.setenv("VOXWEAVE_TRANSLATE_WINDOW_CUES", "20")
+    assert config.resolve_llm_concurrency(None) == 5
+    assert config.resolve_llm_window_cues(None) == 20
+    assert config.resolve_llm_concurrency(2) == 2
+    assert config.resolve_llm_window_cues(10) == 10
+
+
+@pytest.mark.parametrize("bad", ["0", "-2", "many", "1.5"])
+def test_invalid_env_concurrency_warns_and_falls_through(
+    conf_at, monkeypatch, caplog, bad
+):
+    conf_at.write_text("[llm]\nconcurrency = 3\n", encoding="utf-8")
+    monkeypatch.setenv("VOXWEAVE_TRANSLATE_CONCURRENCY", bad)
+    with caplog.at_level("WARNING", logger="voxweave"):
+        assert config.resolve_llm_concurrency(None) == 3  # env invalid -> conf
+    assert "VOXWEAVE_TRANSLATE_CONCURRENCY must be an integer >= 1" in caplog.text
+    monkeypatch.delenv("VOXWEAVE_TRANSLATE_CONCURRENCY")
+    conf_at.write_text(
+        '[llm]\nconcurrency = "eight"\nwindow_cues = true\n', encoding="utf-8"
+    )
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="voxweave"):
+        assert (
+            config.resolve_llm_concurrency(None) == config.DEFAULT_TRANSLATE_CONCURRENCY
+        )
+        assert (
+            config.resolve_llm_window_cues(None) == config.DEFAULT_TRANSLATE_WINDOW_CUES
+        )
+    assert "[llm].concurrency must be an integer >= 1" in caplog.text
+    assert "[llm].window_cues must be an integer >= 1" in caplog.text
+
+
+def test_invalid_cli_concurrency_warns_and_falls_through(conf_at, caplog):
+    with caplog.at_level("WARNING", logger="voxweave"):
+        assert config.resolve_llm_concurrency(0) == config.DEFAULT_TRANSLATE_CONCURRENCY
+    assert "--concurrency must be an integer >= 1" in caplog.text
+
+
+def test_windowing_keys_are_documented_in_the_template(conf_at):
+    assert "# concurrency = 8" in config._TEMPLATE
+    assert "# window_cues = 100" in config._TEMPLATE
+    conf_at.write_text("[llm]\nconcurrency = 2\nwindow_cues = 5\n", encoding="utf-8")
+    assert config._load() == {"llm": {"concurrency": 2, "window_cues": 5}}
+
+
 # --- "auto": use the endpoint's only served model ----------------------------
 
 
@@ -246,6 +306,52 @@ def test_cli_correct_uses_conf_llm_without_openai_key(conf_at, tmp_path):
     assert captured["base_url"] == "http://h:1/v1"
 
 
+def test_cli_translate_passes_windowing_and_partial_options(conf_at, tmp_path):
+    conf_at.write_text('[llm]\napi_key_env = ""\n', encoding="utf-8")
+    captured = {}
+    with patch.object(
+        pipeline,
+        "translate",
+        lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
+    ):
+        res = CliRunner().invoke(
+            cli,
+            [
+                "translate",
+                str(_vtt(tmp_path)),
+                "--concurrency",
+                "4",
+                "--window",
+                "25",
+                "--allow-partial",
+            ],
+        )
+    assert res.exit_code == 0, res.output
+    assert captured["concurrency"] == 4
+    assert captured["window_cues"] == 25
+    assert captured["allow_partial"] is True
+    captured.clear()
+    with patch.object(
+        pipeline,
+        "translate",
+        lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
+    ):
+        res = CliRunner().invoke(cli, ["translate", str(_vtt(tmp_path))])
+    assert res.exit_code == 0, res.output
+    # Unset options stay None so the pipeline applies env > conf > built-in.
+    assert captured["concurrency"] is None
+    assert captured["window_cues"] is None
+    assert captured["allow_partial"] is False
+
+
+@pytest.mark.parametrize("option", ["--concurrency", "--window"])
+def test_cli_translate_rejects_non_positive_windowing(conf_at, tmp_path, option):
+    conf_at.write_text('[llm]\napi_key_env = ""\n', encoding="utf-8")
+    res = CliRunner().invoke(cli, ["translate", str(_vtt(tmp_path)), option, "0"])
+    assert res.exit_code == 2
+    assert "x>=1" in res.output
+
+
 def test_cli_translate_still_requires_key_for_openai(conf_at, tmp_path):
     res = CliRunner().invoke(cli, ["translate", str(_vtt(tmp_path))])
     assert res.exit_code == 1
@@ -268,6 +374,22 @@ def test_readme_no_longer_documents_the_retired_model():
     text = readme.read_text(encoding="utf-8")
     assert "gpt-5.3-chat-latest" not in text
     assert "[llm]" in text
+
+
+def test_readme_documents_the_windowing_options():
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+        encoding="utf-8"
+    )
+    for token in (
+        "--concurrency",
+        "--window",
+        "--allow-partial",
+        "VOXWEAVE_TRANSLATE_CONCURRENCY",
+        "VOXWEAVE_TRANSLATE_WINDOW_CUES",
+    ):
+        assert token in text, token
 
 
 def test_module_constants_never_read_the_user_conf(conf_at):

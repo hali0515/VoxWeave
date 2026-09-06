@@ -62,9 +62,10 @@ breaks) handles Chinese/Japanese/English as first-class.
   - [Pack soft subtitles (`pack`)](#pack-soft-subtitles)
   - [Burn hard subtitles (`burn`)](#burn-hard-subtitles)
 - [The edit-and-resync workflow](#the-edit-and-resync-workflow)
-- [CLI migration](MIGRATING.md)
+- [Migration notes](MIGRATING.md)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
+  - [Performance knobs](#performance-knobs)
 - [Data contract](#data-contract)
 - [Testing](#testing)
 - [Support](#support)
@@ -245,6 +246,21 @@ pulse instead of a fabricated percentage. Burn reports actual encoded frames/tim
 Non-terminal runs emit static step lines and occasional encoding updates to stderr,
 with no animation; stdout remains reserved for result paths or the speaker-service URL.
 
+A run that finishes cleanly closes with one muted stderr line of wall-clock time per
+workflow step, so "where did the time go" is answerable from any run:
+
+```text
+timing: inspect source 0.4s | prepare audio 1m17s | detect songs 31.6s | find speech 9.1s | transcribe and align 1m41s | detect shot changes 0.1s | layout subtitles 1.2s | write outputs 0.3s | total 3m41s
+```
+
+Anything under a minute is printed as seconds, anything above as `NmSSs`. A step
+entered more than once accumulates; `total` is the sum of the listed steps. Failed
+runs end in the error panel instead, and a run without a declared plan prints no
+summary. A transcription run with `--debug` additionally records the steps finished
+by mid-run in `debug/meta.json` under a `timings` key — that file is written while
+`transcribe and align` is still open, so it holds a prefix of the printed line, and
+only the transcribe path writes it.
+
 ### Transcribe
 
 `voxweave transcribe <media>` (or `voxweave <media>`) — separation → song-skip → VAD chunking → ASR + forced alignment →
@@ -263,7 +279,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 Unknown command words produce a command error. Bare subtitle or JSON paths are not
 transcribed: use `align` for edited VTT, `export` for subtitle format conversion,
 or `render` for layout from the sibling JSON. These inputs are never automatically
-routed to an in-place editing command. See [CLI migration](MIGRATING.md) for old names.
+routed to an in-place editing command. See the [migration notes](MIGRATING.md) for old names.
 
 <details>
 <summary><b>Options</b></summary>
@@ -452,6 +468,7 @@ voxweave translate episode.vtt --target zh
 voxweave translate episode.vtt --target en --context "sci-fi, formal register" --glossary terms.json
 voxweave translate downloaded.srt -t zh               # foreign SRT in, SRT out
 voxweave translate episode.vtt --target zh --reasoning-effort low
+voxweave translate episode.vtt --target zh --concurrency 1   # one whole-episode request
 ```
 
 Translation accepts any OpenAI-compatible Chat Completions endpoint, including a
@@ -463,7 +480,24 @@ base_url = "http://127.0.0.1:8000/v1"
 model = "auto"              # or the exact served model ID from /v1/models
 api_key_env = ""            # keyless server; otherwise name an environment variable
 reasoning_effort = "low"    # translate only; omit to keep the server default
+concurrency = 8             # translate windows in flight; 1 = single whole-episode request
+window_cues = 100           # cues per window when concurrency > 1
 ```
+
+By default the episode is translated as bounded windows (`window_cues` cues each)
+with several requests in flight (`concurrency`); each window sees the preceding
+source cues as context. This trades some cross-window stylistic continuity for
+throughput and resilience on a self-hosted server -- `--glossary` and `--context`
+are the consistency tools there. `--concurrency 1` sends one whole-episode request
+(sequential windows with translated-tail continuity only past 800 cues), the best
+choice for a hosted API.
+
+Every response is checked for completeness: an answer that does not finish with
+`stop` (length cap, a server aborting its structured-output grammar) is retried,
+and the last attempt for that window runs without `response_format` (plain JSON).
+Cues still untranslated after the retry stage fail the command and keep the
+progress file, so rerunning resumes; `--allow-partial` writes the file anyway with
+those cues in source text.
 
 CLI options override environment variables, which override this configuration.
 `--model` accepts a served model name without a built-in model list. `auto` requires
@@ -489,6 +523,9 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 | `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env, `[llm].model` in the config, or `gpt-5.5`; `auto` = the endpoint's only served model). |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](#configuration)). |
 | `--reasoning-effort`           | Model-specific effort. `VOXWEAVE_TRANSLATE_REASONING_EFFORT` > `[llm].reasoning_effort` > endpoint default; `default` explicitly omits the field. |
+| `--concurrency N`              | Windows in flight at once (`VOXWEAVE_TRANSLATE_CONCURRENCY` > `[llm].concurrency` > 8). `1` = one whole-episode request with translated-tail continuity. |
+| `--window N`                   | Cues per window when `--concurrency` > 1 (`VOXWEAVE_TRANSLATE_WINDOW_CUES` > `[llm].window_cues` > 100). |
+| `--allow-partial`              | Write the output even when cues stay untranslated after the retry (they keep their source text). Default: fail and keep the progress file for a resumed rerun. |
 
 </details>
 
@@ -615,6 +652,8 @@ default config is written on first run (migrated automatically from a pre-rename
 - `OPENAI_BASE_URL` (default `[llm].base_url` in the config, else api.openai.com; same as `--base-url`)
 - `VOXWEAVE_TRANSLATE_REASONING_EFFORT` (default `[llm].reasoning_effort`, else the endpoint default;
   same as `translate --reasoning-effort`; `default` leaves the request field unset)
+- `VOXWEAVE_TRANSLATE_CONCURRENCY` / `VOXWEAVE_TRANSLATE_WINDOW_CUES` (default `[llm].concurrency` /
+  `[llm].window_cues`, else 8 / 100; same as `translate --concurrency` / `--window`)
 - `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)
 - `VOXWEAVE_BACKEND` (`mlx` | `torch`; default: `mlx` on mps, else `torch`) — picks the ASR/alignment backend
 - `VOXWEAVE_HF_TOKEN` / `HF_TOKEN` — authentication for gated models, including both pyannote
@@ -665,6 +704,21 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
   pass is cropped to the transcribed chunk envelope during transcribe, keeping a skipped
   leading/trailing song out of the aligner's waveform)
 
+**Throughput (opt-in; see [Performance knobs](#performance-knobs))**
+
+- `VOXWEAVE_SEP_BATCH` / `VOXWEAVE_CTC_BATCH` / `VOXWEAVE_MMS_BATCH` / `VOXWEAVE_ASR_BATCH`
+  (defaults 1 / 1 / 4 / 1; same as `[batch].separate` / `.ctc` / `.mms` / `.asr`) — windows or
+  chunks per GPU forward pass. Values below 1 are clamped to 1; a non-integer value is ignored
+  and the next source in the precedence chain applies
+- `VOXWEAVE_ASR_BATCH_MIN_CPS` (default 0.5) / `VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC` (default 2.0)
+  — the qwen-asr #207 guard on the batched ASR path: a batched result with fewer than `MIN_CPS`
+  alphanumeric characters per second of audio, for a chunk of at least `MIN_CHECK_SEC`, is
+  rejected and that chunk is re-run alone. Shorter chunks are exempt (a cough legitimately
+  transcribes to nothing)
+- `VOXWEAVE_SEP_AUTOCAST` (`off` (default) | `bf16` | `fp16`; same as `[separate].autocast`) —
+  mixed precision for the vocal-separation forward pass. CUDA only; ignored on CPU/MPS. An
+  unrecognized value warns once and falls back to `off` rather than to the config file
+
 </details>
 
 <details>
@@ -690,13 +744,24 @@ asr_model = "Qwen/Qwen3-ASR-1.7B"        # built-in default: Qwen/Qwen3-ASR-0.6B
 load_strategy = "sum"
 
 # Inference batch sizes: windows per GPU forward (env: VOXWEAVE_SEP_BATCH / VOXWEAVE_CTC_BATCH /
-# VOXWEAVE_MMS_BATCH). On an 8 GB-class card batch=1 already saturates compute — measured no
-# speedup at 2/4, just ~+0.8 GiB VRAM per extra separation window — so the defaults stay at 1.
-# Only worth raising on much wider GPUs, and only after measuring.
+# VOXWEAVE_MMS_BATCH / VOXWEAVE_ASR_BATCH). On an 8 GB-class card batch=1 already saturates
+# compute — measured no speedup at 2/4, just ~+0.8 GiB VRAM per extra separation window — so the
+# defaults stay at 1. Only worth raising on much wider GPUs, and only after measuring.
 [batch]
 separate = 1                             # vocal separation (MelBandRoformer) 8s windows
 ctc      = 1                             # wav2vec2 CTC emission 30s windows (en aligner)
 mms      = 4                             # MMS-300m emission batch (ja aligner)
+asr      = 1                             # Qwen3-ASR chunks per decode call; 1 = the per-chunk call.
+                                         # Opt-in: faster but its transcripts differ from batch 1 —
+                                         # see "Performance knobs" below
+
+# Vocal separation numerics (= env VOXWEAVE_SEP_AUTOCAST). autocast wraps only the model
+# forward; the overlap-add accumulation stays fp32. CUDA only (ignored on CPU / MPS).
+#   "off" (default) — fp32 forward, the reference output, byte-identical run to run.
+#   "bf16" | "fp16" — mixed-precision forward: faster and slightly leaner, at the cost of tiny
+#                     waveform differences in the stem. See "Performance knobs" below.
+[separate]
+autocast = "off"
 
 # Diarization pipeline (= --diarize-model / env VOXWEAVE_DIARIZE_MODEL).
 # Values: "community-1" (built-in default), "3.1", or any full Hugging Face pipeline id.
@@ -725,6 +790,8 @@ model = "auto"                           # or a model name; "auto" = the endpoin
 base_url = "http://127.0.0.1:8000/v1"    # e.g. a local vLLM; remove for api.openai.com
 api_key_env = ""                         # "" = keyless endpoint; else the env var holding the key
 # reasoning_effort = "low"               # translate only; accepted values depend on the served model
+# concurrency = 8                        # translate windows in flight; 1 = single whole-episode request
+# window_cues = 100                      # cues per window when concurrency > 1
 
 # dual-ASR fusion sub-models — only consulted when running with --hybrid.
 [fusion]
@@ -745,6 +812,35 @@ ja = "mms"                                      # Japanese: MMS-300m + uroman fu
 ```
 
 </details>
+
+### Performance knobs
+
+Two GPU throughput settings are **opt-in and off by default**, because both change the
+output. They are worth enabling only on a wide GPU, and only if you have re-checked the
+result on your own material — there is no truth ruler in the pipeline that can tell you
+whether the changed output is better or worse.
+
+| Knob | Default | Measured on an RTX PRO 4000 (24 GB) | What changes |
+| --- | --- | --- | --- |
+| `[batch].asr` / `VOXWEAVE_ASR_BATCH` | `1` (per-chunk call) | 4 → 1.34x faster at 6.4 GiB peak; 8 → 1.49x at 8.9 GiB (Qwen3-ASR-1.7B, greedy, 24-min episode) | Transcripts drift ~1.5% CER from batch 1 — scattered small edits from bf16 batched kernels, no chunk lost |
+| `[separate].autocast` / `VOXWEAVE_SEP_AUTOCAST` | `off` (fp32) | `bf16` → 1.35x faster separation, peak VRAM 1.69 → 1.57 GiB | The vocal stem differs slightly (~52 dB SNR against the fp32 stem), and the ASR run on it drifts ~2.3% CER |
+
+Neither has a CLI flag; precedence for both is env var > config file > built-in default.
+`[batch].asr` applies to the torch Qwen engine only — Whisper and the Apple Silicon MLX
+adapter take one chunk per ASR call whatever it says — and autocast applies to CUDA only,
+being ignored on CPU/MPS. Raising `[batch].separate` above 1 bought no speedup on the same
+GPU (the separator is already compute-bound), so it stays at 1 as well.
+
+Batched ASR is guarded against qwen-asr #207, where a mixed-length batch can corrupt its
+shorter item into a lone `!`: chunks are grouped by duration to keep each batch's lengths
+close, and any batched result that comes back implausibly empty for its chunk's duration is
+re-run alone through the per-chunk call (thresholds: `VOXWEAVE_ASR_BATCH_MIN_CPS`,
+`VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC`). A batch whose call raises is likewise redone chunk by
+chunk, so one poisoned chunk degrades alone.
+
+Shot-change detection needs no setting: it is a CPU-only ffmpeg pass that now starts before
+transcription and is joined at its workflow step, so it overlaps the GPU stages and the
+`detect shot changes` entry in the timing line is normally ~0s.
 
 ## Data contract
 

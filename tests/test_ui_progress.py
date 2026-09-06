@@ -143,3 +143,84 @@ def test_summary_and_errors_preserve_literal_bracketed_values(monkeypatch):
     ui.error_panel(ValueError("invalid [llm].reasoning_effort"))
     assert "/tmp/[draft].vtt" in output.getvalue()
     assert "[llm].reasoning_effort" in output.getvalue()
+
+
+def _timed_reporter(monkeypatch, *, terminal):
+    rep, _, output = _reporter(monkeypatch, terminal=terminal)
+    now = [100.0]
+    monkeypatch.setattr(ui.time, "monotonic", lambda: now[0])
+    return rep, output, now
+
+
+_TIMING_LINE = "timing: Read 13.0s | Encode 3m20s | Write 47.0s | total 4m20s"
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_clean_exit_prints_one_timing_line_after_a_plan(monkeypatch, terminal):
+    rep, output, now = _timed_reporter(monkeypatch, terminal=terminal)
+    with rep:
+        rep.plan(["Read", "Encode", "Write"])
+        rep.step("Read")
+        now[0] += 12.34
+        rep.step("Encode")
+        now[0] += 200.0
+        rep.step("Read")
+        now[0] += 0.66
+        rep.step("Write")
+        now[0] += 47.0
+    text = output.getvalue()
+    assert text.count("timing:") == 1
+    assert _TIMING_LINE in text
+    if not terminal:
+        assert text.splitlines() == [
+            "[1/3] Read",
+            "[2/3] Encode",
+            "[1/3] Read",
+            "[3/3] Write",
+            _TIMING_LINE,
+        ]
+        assert "\x1b" not in text
+
+
+def test_no_timing_line_without_a_declared_plan(monkeypatch):
+    rep, output, now = _timed_reporter(monkeypatch, terminal=False)
+    with rep:
+        rep.step("export subtitles")
+        now[0] += 5.0
+    assert rep.timings() == {"export subtitles": 5.0}
+    assert "timing:" not in output.getvalue()
+
+
+def test_no_timing_line_when_a_plan_never_started(monkeypatch):
+    rep, output, _ = _timed_reporter(monkeypatch, terminal=False)
+    with rep:
+        rep.plan(["Read", "Encode"])
+    assert output.getvalue() == ""
+
+
+def test_no_timing_line_when_an_exception_propagates(monkeypatch):
+    rep, output, now = _timed_reporter(monkeypatch, terminal=False)
+    with pytest.raises(RuntimeError, match="boom"):
+        with rep:
+            rep.plan(["Read", "Encode"])
+            rep.step("Read")
+            now[0] += 5.0
+            raise RuntimeError("boom")
+    assert rep.timings() == {"Read": 5.0}
+    assert "timing:" not in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0.0, "0.0s"),
+        (12.34, "12.3s"),
+        (59.94, "59.9s"),
+        (59.96, "1m00s"),
+        (60.0, "1m00s"),
+        (221.4, "3m41s"),
+        (3725.0, "62m05s"),
+    ],
+)
+def test_format_duration_switches_to_minutes_at_sixty_seconds(seconds, expected):
+    assert ui._format_duration(seconds) == expected

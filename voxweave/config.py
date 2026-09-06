@@ -29,6 +29,13 @@ DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
 DEFAULT_LLM_MODEL = "gpt-5.5"
 DEFAULT_LLM_API_KEY_ENV = "OPENAI_API_KEY"
 LLM_MODEL_AUTO = "auto"
+# `translate` windowing for a self-hosted server: several bounded windows in flight
+# instead of one whole-episode request. A thinking model burns ~1k reasoning tokens
+# per request and a single 800-cue request is both slow and a single point of
+# failure (one aborted stream loses everything). concurrency = 1 restores the
+# whole-episode single request (best cross-window continuity, the OpenAI path).
+DEFAULT_TRANSLATE_CONCURRENCY = 8
+DEFAULT_TRANSLATE_WINDOW_CUES = 100
 # community-1 is the default (better multi-speaker separation in practice);
 # the 3.1 pipeline stays selectable via the "3.1" alias and keeps its own
 # LEGACY constant because the pyannote-4 fail-closed guard for an unverified
@@ -104,11 +111,20 @@ _TEMPLATE = """\
 #   reasoning_effort = translate's optional reasoning effort (= --reasoning-effort /
 #                 VOXWEAVE_TRANSLATE_REASONING_EFFORT). Values depend on the served model.
 #                 Unset or "default" leaves the endpoint's default unchanged.
+#   concurrency = translate windows in flight at once (= --concurrency /
+#                 VOXWEAVE_TRANSLATE_CONCURRENCY; default 8, min 1). 1 = one whole-episode
+#                 request with translated-tail continuity (best consistency, OpenAI-style);
+#                 >1 = bounded windows translated in parallel with source-text context
+#                 (throughput on a self-hosted vLLM; use glossary/context for consistency).
+#   window_cues = cues per window when concurrency > 1 (= --window /
+#                 VOXWEAVE_TRANSLATE_WINDOW_CUES; default 100, min 1).
 [llm]
 # model = "gpt-5.5"
 # base_url = "http://127.0.0.1:8000/v1"
 # api_key_env = "OPENAI_API_KEY"
 # reasoning_effort = "low"
+# concurrency = 8
+# window_cues = 100
 
 # dual-ASR fusion sub-models (= CLI --hybrid; env VOXWEAVE_FUSION_WHISPER / VOXWEAVE_FUSION_QWEN).
 # whisper supplies accurate text, Qwen supplies punctuation positions (merged on a shared timeline).
@@ -119,13 +135,35 @@ _TEMPLATE = """\
 # qwen = "Qwen/Qwen3-ASR-1.7B"
 
 # Inference batch sizes: windows per GPU forward pass (= env VOXWEAVE_SEP_BATCH /
-# VOXWEAVE_CTC_BATCH / VOXWEAVE_MMS_BATCH). On an 8 GB-class card batch=1 already
-# saturates compute (measured: no speedup at 2/4, just +~0.8 GiB VRAM per extra
-# separation window) -- only worth raising on much wider GPUs, and only after measuring.
+# VOXWEAVE_CTC_BATCH / VOXWEAVE_MMS_BATCH / VOXWEAVE_ASR_BATCH). On an 8 GB-class card
+# batch=1 already saturates compute for separation and the CTC emission (measured: no
+# speedup at 2/4, just +~0.8 GiB VRAM per extra separation window) -- only worth raising
+# on much wider GPUs, and only after measuring.
 [batch]
 # separate = 1   # vocal separation (MelBandRoformer) 8s windows
 # ctc = 1        # wav2vec2 CTC emission 30s windows (en aligner)
 # mms = 4        # MMS-300m emission batch (ja aligner, ctc-forced-aligner generate_emissions)
+# asr = 1        # Qwen3-ASR chunks per decode call (torch only; whisper/MLX per-chunk). Measured on
+#                # RTX PRO 4000, 1.7B greedy: 4 -> 1.34x faster / 6.4 GiB peak, 8 -> 1.49x / 8.9 GiB,
+#                # but transcripts drift ~1.5% CER vs batch 1 (bf16 batched kernels); qwen-asr #207:
+#                # mixed-length batches can corrupt the shorter item (guarded by a per-chunk re-run).
+
+# Vocal separation (MelBandRoformer) numerics (= env VOXWEAVE_SEP_AUTOCAST). autocast wraps
+# only the model forward; the overlap-add accumulation always stays fp32.
+#   off  (default) = fp32 forward (TF32 matmuls on Ampere+ unless VOXWEAVE_TF32=0); the
+#                    reference output, byte-identical run to run.
+#   bf16 | fp16    = mixed-precision forward: higher separation throughput and lower VRAM,
+#                    at the cost of small waveform differences in the stem. Measured on an
+#                    RTX PRO 4000 (23.8 min episode): bf16 1.35x faster, peak VRAM
+#                    1.69 -> 1.57 GiB, stem SNR 52 dB vs fp32, but the downstream
+#                    transcript drifts ~2.3% CER -- so it stays off until measured on
+#                    your own content.
+# CUDA only: on CPU / MPS the setting is ignored and the fp32 path runs.
+# The effective mode is part of the separator identity, so changing it re-separates
+# instead of reusing a vocals cache produced under the previous numerics -- and a CPU /
+# MPS host records the fp32 path it really ran, not the mode it was configured with.
+[separate]
+# autocast = "off"
 
 # Speaker diarization pipeline. The default is "community-1" (better multi-speaker
 # separation); accept its model-card conditions on Hugging Face first. Use "3.1" to
@@ -174,6 +212,7 @@ _KNOWN_KEYS = frozenset(
         "hf_token",
         "fusion",
         "batch",
+        "separate",
         "diarize",
         "align",
         "defaults",
@@ -336,6 +375,82 @@ def resolve_llm_reasoning_effort(cli_value: str | None) -> str | None:
     return value.strip() if value is not None else None
 
 
+def _positive_int(value: object, source: str) -> int | None:
+    """``value`` as an int >= 1, or None (with a warning) when it is missing or invalid.
+
+    Accepts ints and digit strings (env vars arrive as text); bools, floats,
+    zero and negatives are rejected so a typo falls through to the next source.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        parsed = None
+    elif isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            parsed = None
+    else:
+        parsed = None
+    if parsed is None or parsed < 1:
+        log.warning("%s must be an integer >= 1 (got %r); ignoring it", source, value)
+        return None
+    return parsed
+
+
+def _resolve_llm_positive_int(
+    cli_value: object, *, envvar: str, key: str, cli_flag: str, default: int
+) -> int:
+    """Shared CLI > env > conf ``[llm].<key>`` > default resolution for the two
+    translate windowing knobs; every invalid source warns and falls through.
+
+    ``cli_flag`` is the option a library caller should be pointed at; it is not
+    derivable from ``key`` (``window_cues`` is spelled ``--window``)."""
+    resolved = _positive_int(cli_value, cli_flag)
+    if resolved is not None:
+        return resolved
+    env = os.environ.get(envvar)
+    if env is not None and env.strip():
+        resolved = _positive_int(env, f"environment {envvar}")
+        if resolved is not None:
+            return resolved
+    llm = _load().get("llm")
+    if isinstance(llm, dict) and key in llm:
+        resolved = _positive_int(llm[key], f"config [llm].{key}")
+        if resolved is not None:
+            return resolved
+    return default
+
+
+def resolve_llm_concurrency(cli_value: object = None) -> int:
+    """Translate windows in flight at once. Precedence: CLI value >
+    ``VOXWEAVE_TRANSLATE_CONCURRENCY`` > conf ``[llm].concurrency`` >
+    :data:`DEFAULT_TRANSLATE_CONCURRENCY`; always >= 1 (1 = the sequential
+    whole-episode planner)."""
+    return _resolve_llm_positive_int(
+        cli_value,
+        envvar="VOXWEAVE_TRANSLATE_CONCURRENCY",
+        key="concurrency",
+        cli_flag="--concurrency",
+        default=DEFAULT_TRANSLATE_CONCURRENCY,
+    )
+
+
+def resolve_llm_window_cues(cli_value: object = None) -> int:
+    """Cues per translate window when running concurrently. Precedence: CLI value >
+    ``VOXWEAVE_TRANSLATE_WINDOW_CUES`` > conf ``[llm].window_cues`` >
+    :data:`DEFAULT_TRANSLATE_WINDOW_CUES`; always >= 1."""
+    return _resolve_llm_positive_int(
+        cli_value,
+        envvar="VOXWEAVE_TRANSLATE_WINDOW_CUES",
+        key="window_cues",
+        cli_flag="--window",
+        default=DEFAULT_TRANSLATE_WINDOW_CUES,
+    )
+
+
 def conf_hf_token() -> str | None:
     """Hugging Face token for gated checkpoints (pyannote diarization).
 
@@ -452,17 +567,21 @@ def conf_ctc_max_dp_frames() -> int:
 # linearly with batch; same for the wav2vec2 CTC emission), so batching only costs VRAM
 # (~+0.8 GiB per extra separation window). The knob exists for much wider GPUs, where
 # per-window kernels may underfill the SMs — measure before raising. mms=4 is the
-# ctc-forced-aligner upstream default (ONNX path, pre-existing behavior).
-_BATCH_DEFAULTS = {"separate": 1, "ctc": 1, "mms": 4}
+# ctc-forced-aligner upstream default (ONNX path, pre-existing behavior). asr=1 keeps the
+# legacy per-chunk Qwen3-ASR call; batching (backend._asr_pass) is opt-in: it is faster
+# (RTX PRO 4000, 1.7B greedy: 4 -> 1.34x, 8 -> 1.49x) but its transcripts drift ~1.5% CER
+# from batch 1 and there is no truth ruler yet to judge the sign of that change.
+_BATCH_DEFAULTS = {"separate": 1, "ctc": 1, "mms": 4, "asr": 1}
 _BATCH_ENV = {
     "separate": "VOXWEAVE_SEP_BATCH",
     "ctc": "VOXWEAVE_CTC_BATCH",
     "mms": "VOXWEAVE_MMS_BATCH",  # pre-[batch] env name, kept for back-compat
+    "asr": "VOXWEAVE_ASR_BATCH",
 }
 
 
 def conf_batch(key: str) -> int:
-    """Inference batch size for stage ``key`` ("separate" | "ctc" | "mms"), min 1.
+    """Inference batch size for stage ``key`` ("separate" | "ctc" | "mms" | "asr"), min 1.
 
     Precedence: env _BATCH_ENV[key] > conf ``[batch].<key>`` > _BATCH_DEFAULTS.
     Non-integer values (env or file) are ignored and fall through to the next source.
@@ -479,6 +598,53 @@ def conf_batch(key: str) -> int:
         if isinstance(v, int) and not isinstance(v, bool):
             return max(1, v)
     return _BATCH_DEFAULTS[key]
+
+
+# Autocast for the MelBandRoformer separation forward. "off" is the byte-identical
+# reference path (fp32 with TF32 matmuls, see backend._load_separator); bf16/fp16 trade
+# tiny stem differences for throughput. The default stays off until an A/B decides it.
+SEP_AUTOCAST_MODES = ("off", "bf16", "fp16")
+SEP_AUTOCAST_DEFAULT = "off"
+SEP_AUTOCAST_ENV = "VOXWEAVE_SEP_AUTOCAST"
+
+
+def conf_separate_autocast() -> str:
+    """Separation forward autocast mode: ``"off"`` (default) | ``"bf16"`` | ``"fp16"``.
+
+    Precedence: env VOXWEAVE_SEP_AUTOCAST > conf ``[separate].autocast`` > "off".
+    Values are case-insensitive. An invalid value (unknown mode or wrong type) from
+    the winning source is warned about once and falls back to "off" -- it does not
+    fall through to the next source, so a typo never silently enables autocast. A
+    non-table ``separate`` key (a scalar instead of a ``[separate]`` section) is
+    warned about the same way.
+    """
+    env = os.environ.get(SEP_AUTOCAST_ENV)
+    if env is not None and env.strip():
+        raw: object = env
+        source = f"env {SEP_AUTOCAST_ENV}"
+    else:
+        separate = _load().get("separate")
+        if separate is not None and not isinstance(separate, dict):
+            log.warning(
+                "config key %r has wrong type (expected table), ignoring", "separate"
+            )
+            return SEP_AUTOCAST_DEFAULT
+        raw = separate.get("autocast") if isinstance(separate, dict) else None
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return SEP_AUTOCAST_DEFAULT
+        source = "config [separate].autocast"
+    if isinstance(raw, str):
+        mode = raw.strip().casefold()
+        if mode in SEP_AUTOCAST_MODES:
+            return mode
+    log.warning(
+        "%s has invalid value %r (expected one of %s), using %r",
+        source,
+        raw,
+        "/".join(SEP_AUTOCAST_MODES),
+        SEP_AUTOCAST_DEFAULT,
+    )
+    return SEP_AUTOCAST_DEFAULT
 
 
 def conf_default_flag(key: str, builtin: bool) -> bool:

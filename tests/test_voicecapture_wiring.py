@@ -128,12 +128,19 @@ def test_process_routes_capture_shot_detection_through_snapshot(tmp_path, monkey
         seen["transcribe"] = Path(source)
         return "en", [dict(UNIT)], [], [], turns, _capture(turns)
 
-    def fake_shots(source):
-        seen["shots"] = Path(source)
-        return []
+    class _ShotJob:
+        def start(self, source, *_a, **_k):
+            seen["shots"] = Path(source)
+            return self
+
+        def result(self):
+            return []
+
+        def cancel(self):
+            pass
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
-    monkeypatch.setattr("voxweave.shotdet.detect_shot_changes", fake_shots)
+    monkeypatch.setattr("voxweave.shotdet.ShotDetectionJob", _ShotJob)
     pipeline.process(media, diarize=True, voiceprints=True)
 
     assert seen["transcribe"] == seen["shots"]
@@ -584,6 +591,62 @@ def test_capture_cache_hit_validates_pair_before_decode(tmp_path, monkeypatch):
     assert result[0] == "en"
     assert decoded == [cache.resolve()]
     assert Path(f"{cache.resolve()}.lock").exists()
+
+
+def test_capture_cache_autocast_change_reseparates_and_rebinds(tmp_path, monkeypatch):
+    # Same media, same checkpoint, different separation numerics: bf16 stems are not
+    # the fp32 stems the companion claims, so the cached vocals cannot be reused.
+    media = tmp_path / "snapshot.mkv"
+    media.write_bytes(b"source")
+    cache = tmp_path / "cache" / "episode.vocals.32k.flac"
+    cache.parent.mkdir()
+    cache.write_bytes(b"fp32 flac")
+    fingerprint = media_fingerprint(media)
+    publish_cache_companion(
+        cache,
+        media_fingerprint=fingerprint,
+        separator=SEPARATOR,  # recorded as the fp32 path
+    )
+    wav = _stub_transcribe_tail(tmp_path, monkeypatch)
+    fullband = tmp_path / "fullband.wav"
+    vocals = tmp_path / "vocals.flac"
+    voc32 = tmp_path / "voc32.wav"
+    for path in (fullband, vocals, voc32):
+        path.write_bytes(path.name.encode())
+    mixed_precision = {**SEPARATOR, "autocast": "bf16"}
+    separated_from: list[Path] = []
+
+    def fake_separate(source, **kwargs):
+        assert kwargs["return_separator_identity"] is True
+        separated_from.append(Path(source))
+        return fullband, vocals, wav, voc32, dict(mixed_precision)
+
+    monkeypatch.setattr(backend, "separator_identity", lambda: dict(mixed_precision))
+    monkeypatch.setattr(pipeline, "_separate_to_16k_32k", fake_separate)
+    monkeypatch.setattr(
+        pipeline,
+        "_encode_flac",
+        lambda _source, destination: Path(destination).write_bytes(b"bf16 flac"),
+    )
+    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+
+    pipeline.transcribe(
+        media,
+        separate=True,
+        voiceprints=True,
+        source_fingerprint=fingerprint,
+        cache_vocals=cache,
+    )
+
+    assert separated_from == [media]
+    companion, validated = load_cache_companion(Path(f"{cache.resolve()}.meta.json"))
+    assert validated.separator.autocast == "bf16"
+    validate_cache_pair(
+        companion,
+        cache,
+        media_fingerprint=fingerprint,
+        separator=mixed_precision,
+    )
 
 
 def test_capture_cache_mismatch_reseparates_and_rebinds(tmp_path, monkeypatch):

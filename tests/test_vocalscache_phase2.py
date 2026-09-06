@@ -10,12 +10,18 @@ from voxweave import voicebase, vocalscache
 
 
 def _separator():
+    """A legacy separator identity: written before ``autocast`` was recorded."""
     return {
         "repo": "audio/separator",
         "file": "model.ckpt",
         "checkpoint": "blob-123",
         "config_sha256": "c" * 64,
     }
+
+
+def _canonical_separator(autocast="off"):
+    """The same identity as stored today: numerics always spelled out."""
+    return {**_separator(), "autocast": autocast}
 
 
 def _cache(tmp_path, payload=b"fLaC fake vocals"):
@@ -47,10 +53,12 @@ def test_build_write_load_and_validate_fake_flac_pair(tmp_path):
         media_fingerprint=media,
         separator=_separator(),
     )
+    # A legacy-shaped separator input is stored canonically: absent numerics are
+    # the fp32 path, and every companion written from now on says so.
     assert companion == {
         "version": 1,
         "media_fingerprint": media,
-        "separator": _separator(),
+        "separator": _canonical_separator(),
         "cache_size": cache.stat().st_size,
         "cache_sha256": hashlib.sha256(cache.read_bytes()).hexdigest(),
     }
@@ -167,10 +175,81 @@ def test_separator_config_alias_canonicalizes_and_disagreement_refuses():
     alias = {**_separator()}
     alias["config"] = alias.pop("config_sha256")
     validated = vocalscache.validate_separator_identity(alias)
-    assert validated.as_mapping() == _separator()
+    assert validated.as_mapping() == _canonical_separator()
     alias["config_sha256"] = "d" * 64
     with pytest.raises(vocalscache.CacheCompanionError, match="disagree"):
         vocalscache.validate_separator_identity(alias)
+
+
+@pytest.mark.parametrize("mode", ("off", "bf16", "fp16"))
+def test_autocast_mode_keys_the_cache_pair(tmp_path, mode):
+    # bf16/fp16 change the stems, so the mode that produced the vocals is part of
+    # the identity: the same mode hits, any other mode re-separates.
+    cache = _cache(tmp_path)
+    produced = _canonical_separator(mode)
+    companion = vocalscache.build_cache_companion(
+        cache,
+        media_fingerprint="a" * 64,
+        separator=produced,
+    )
+    assert companion["separator"] == produced
+    assert vocalscache.cache_pair_valid(
+        companion,
+        cache,
+        media_fingerprint="a" * 64,
+        separator=produced,
+    )
+    for other in ("off", "bf16", "fp16"):
+        if other == mode:
+            continue
+        with pytest.raises(vocalscache.CacheCompanionMismatch, match="separator"):
+            vocalscache.validate_cache_pair(
+                companion,
+                cache,
+                media_fingerprint="a" * 64,
+                separator=_canonical_separator(other),
+            )
+
+
+def test_legacy_companion_without_autocast_is_an_fp32_claim(tmp_path):
+    # Companions written before the setting existed describe an fp32 run. They must
+    # stay valid for "off" -- invalidating them would re-separate every cache on disk
+    # -- and go stale only against mixed precision.
+    cache = _cache(tmp_path)
+    size, digest = vocalscache.file_size_sha256(cache)
+    legacy = {
+        "version": 1,
+        "media_fingerprint": "a" * 64,
+        "separator": _separator(),  # no "autocast" key at all
+        "cache_size": size,
+        "cache_sha256": digest,
+    }
+    path = vocalscache.cache_companion_path(cache)
+    vocalscache.write_cache_companion(path, legacy)
+    raw, validated = vocalscache.load_cache_companion(path)
+    assert "autocast" not in raw["separator"]  # bytes on disk stay untouched
+    assert validated.separator.autocast == "off"
+    for separator in (_separator(), _canonical_separator("off")):
+        assert vocalscache.cache_pair_valid(
+            raw,
+            cache,
+            media_fingerprint="a" * 64,
+            separator=separator,
+        )
+    for mode in ("bf16", "fp16"):
+        with pytest.raises(vocalscache.CacheCompanionMismatch, match="separator"):
+            vocalscache.validate_cache_pair(
+                raw,
+                cache,
+                media_fingerprint="a" * 64,
+                separator=_canonical_separator(mode),
+            )
+
+
+@pytest.mark.parametrize("autocast", ["fp8", "BF16", "", 1, True, None, ["off"]])
+def test_separator_autocast_must_be_a_known_mode(autocast):
+    with pytest.raises(vocalscache.CacheCompanionError, match="autocast"):
+        vocalscache.validate_separator_identity({**_separator(), "autocast": autocast})
 
 
 def test_unknown_top_level_companion_fields_are_forward_compatible(tmp_path):

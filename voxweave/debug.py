@@ -74,7 +74,11 @@ class DebugSink:
         """Save a named track-level unit snapshot (whole file, absolute timestamps)."""
 
     def meta(self, data: dict) -> None:
-        """Save track-level metadata."""
+        """Save track-level metadata (``meta.json``).
+
+        Besides the run options and counts, ``timings`` maps each pipeline step label
+        to its wall-clock seconds up to the point the metadata was written.
+        """
 
     def position_units(
         self,
