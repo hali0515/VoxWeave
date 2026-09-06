@@ -132,6 +132,17 @@ _TEMPLATE = """\
 #                # but transcripts drift ~1.5% CER vs batch 1 (bf16 batched kernels); qwen-asr #207:
 #                # mixed-length batches can corrupt the shorter item (guarded by a per-chunk re-run).
 
+# Vocal separation (MelBandRoformer) numerics (= env VOXWEAVE_SEP_AUTOCAST). autocast wraps
+# only the model forward; the overlap-add accumulation always stays fp32.
+#   off  (default) = fp32 forward (TF32 matmuls on Ampere+ unless VOXWEAVE_TF32=0); the
+#                    reference output, byte-identical run to run.
+#   bf16 | fp16    = mixed-precision forward: higher separation throughput and lower VRAM,
+#                    at the cost of tiny waveform differences in the stem. Measure before
+#                    switching (the default is decided by an A/B on real media).
+# CUDA only: on CPU / MPS the setting is ignored and the fp32 path runs.
+[separate]
+# autocast = "off"
+
 # Speaker diarization pipeline. The default is "community-1" (better multi-speaker
 # separation); accept its model-card conditions on Hugging Face first. Use "3.1" to
 # stay on the older pipeline your existing gated access already covers, or provide
@@ -179,6 +190,7 @@ _KNOWN_KEYS = frozenset(
         "hf_token",
         "fusion",
         "batch",
+        "separate",
         "diarize",
         "align",
         "defaults",
@@ -488,6 +500,53 @@ def conf_batch(key: str) -> int:
         if isinstance(v, int) and not isinstance(v, bool):
             return max(1, v)
     return _BATCH_DEFAULTS[key]
+
+
+# Autocast for the MelBandRoformer separation forward. "off" is the byte-identical
+# reference path (fp32 with TF32 matmuls, see backend._load_separator); bf16/fp16 trade
+# tiny stem differences for throughput. The default stays off until an A/B decides it.
+SEP_AUTOCAST_MODES = ("off", "bf16", "fp16")
+SEP_AUTOCAST_DEFAULT = "off"
+SEP_AUTOCAST_ENV = "VOXWEAVE_SEP_AUTOCAST"
+
+
+def conf_separate_autocast() -> str:
+    """Separation forward autocast mode: ``"off"`` (default) | ``"bf16"`` | ``"fp16"``.
+
+    Precedence: env VOXWEAVE_SEP_AUTOCAST > conf ``[separate].autocast`` > "off".
+    Values are case-insensitive. An invalid value (unknown mode or wrong type) from
+    the winning source is warned about once and falls back to "off" -- it does not
+    fall through to the next source, so a typo never silently enables autocast. A
+    non-table ``separate`` key (a scalar instead of a ``[separate]`` section) is
+    warned about the same way.
+    """
+    env = os.environ.get(SEP_AUTOCAST_ENV)
+    if env is not None and env.strip():
+        raw: object = env
+        source = f"env {SEP_AUTOCAST_ENV}"
+    else:
+        separate = _load().get("separate")
+        if separate is not None and not isinstance(separate, dict):
+            log.warning(
+                "config key %r has wrong type (expected table), ignoring", "separate"
+            )
+            return SEP_AUTOCAST_DEFAULT
+        raw = separate.get("autocast") if isinstance(separate, dict) else None
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return SEP_AUTOCAST_DEFAULT
+        source = "config [separate].autocast"
+    if isinstance(raw, str):
+        mode = raw.strip().casefold()
+        if mode in SEP_AUTOCAST_MODES:
+            return mode
+    log.warning(
+        "%s has invalid value %r (expected one of %s), using %r",
+        source,
+        raw,
+        "/".join(SEP_AUTOCAST_MODES),
+        SEP_AUTOCAST_DEFAULT,
+    )
+    return SEP_AUTOCAST_DEFAULT
 
 
 def conf_default_flag(key: str, builtin: bool) -> bool:

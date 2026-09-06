@@ -396,8 +396,14 @@ class MelBandRoformer(Module):
 
         stft_repr = rearrange(stft_repr, "b f t c -> b 1 f t c")
 
-        stft_repr = torch.view_as_complex(stft_repr)
-        masks = torch.view_as_complex(masks)
+        # voxweave patch: upcast the real/imag pairs to fp32 before view_as_complex. Under
+        # torch.autocast (bf16) the mask estimators (Linear + GLU) emit bfloat16 and
+        # view_as_complex rejects it ("only supported for half, float and double tensors");
+        # the .type(stft_repr.dtype) cast below already made the masks complex64, so nothing
+        # downstream changes. stft_repr is fp32 today (stft is not an autocast op), and
+        # .float() on an fp32 tensor returns the same tensor, so the fp32 path is untouched.
+        stft_repr = torch.view_as_complex(stft_repr.float())
+        masks = torch.view_as_complex(masks.float())
 
         masks = masks.type(stft_repr.dtype)
 
