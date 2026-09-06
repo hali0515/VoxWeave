@@ -1,7 +1,17 @@
 """Reporter interface contract + pipeline progress bridge (no rich / no models)."""
 
-from voxweave import pipeline
+from voxweave import pipeline, progress
 from voxweave.progress import Reporter
+
+
+class _Clock:
+    """Deterministic stand-in for ``time.monotonic``."""
+
+    def __init__(self, now: float = 100.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
 
 
 class _RecordingReporter(Reporter):
@@ -46,3 +56,67 @@ def test_progress_bridge_starts_task_once_then_advances():
     cb(3, 3)
     assert rep.tasks == [("人声分离 (Roformer)", 3)]  # task created only once
     assert rep.advances == 3  # +1 per window, reaches 3/3
+
+
+def test_base_reporter_accumulates_wall_time_per_step(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(progress.time, "monotonic", clock)
+    rep = Reporter()
+    assert rep.timings() == {}
+    rep.finish()  # nothing open: no-op
+    assert rep.timings() == {}
+
+    rep.step("prepare audio")
+    clock.now += 12.5
+    rep.step("transcribe and align")
+    clock.now += 30.0
+    rep.step("prepare audio")  # re-entering a label accumulates onto it
+    clock.now += 2.5
+    rep.finish()
+
+    assert rep.timings() == {"prepare audio": 15.0, "transcribe and align": 30.0}
+    assert list(rep.timings()) == ["prepare audio", "transcribe and align"]
+    clock.now += 100.0
+    rep.finish()  # closing twice adds nothing
+    assert rep.timings() == {"prepare audio": 15.0, "transcribe and align": 30.0}
+
+
+def test_timings_snapshot_counts_the_open_step_without_double_counting(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(progress.time, "monotonic", clock)
+    rep = Reporter()
+    rep.step("read")
+    clock.now += 3.0
+    assert rep.timings() == {"read": 3.0}
+    clock.now += 2.0
+    assert rep.timings() == {"read": 5.0}
+    rep.step("write")
+    clock.now += 1.0
+    assert rep.timings() == {"read": 5.0, "write": 1.0}
+
+
+def test_subclass_without_super_init_still_answers_timings():
+    rep = _RecordingReporter()  # never calls super().__init__()
+    assert rep.timings() == {}
+    rep.finish()
+    assert rep.timings() == {}
+
+
+def test_nested_reporter_keeps_the_clock_on_the_enclosing_step(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(progress.time, "monotonic", clock)
+    parent = Reporter()
+    nested = pipeline._NestedReporter(parent)
+    parent.step("check and refresh timing")
+    clock.now += 4.0
+    nested.plan(["read subtitles", "align subtitles"])
+    nested.step("read subtitles")
+    clock.now += 6.0
+    nested.step("align subtitles")
+    clock.now += 10.0
+    assert nested.timings() == {"check and refresh timing": 20.0}
+
+    nested.finish()
+    clock.now += 50.0
+    assert parent.timings() == {"check and refresh timing": 20.0}
+    assert nested.timings() == parent.timings()

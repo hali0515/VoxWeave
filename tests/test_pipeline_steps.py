@@ -23,6 +23,7 @@ class RecordingReporter(Reporter):
         self.planned = tuple(steps)
 
     def step(self, label: str) -> None:
+        super().step(label)  # keep the base clock so timings() stays truthful
         assert label == self.planned[len(self.entered)]
         self.entered.append(label)
 
@@ -147,6 +148,35 @@ def test_process_steps_match_enabled_work(
     rep.assert_complete(expected)
     assert out.exists()
     assert any(detail[0] == "task" for detail in rep.details)
+
+
+def test_transcribe_debug_meta_records_step_timings_so_far(
+    tmp_path, stub_transcription
+):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+
+    rep = RecordingReporter()
+    rep.plan(
+        ("prepare audio", "find speech", "transcribe and align", "identify speakers")
+    )
+    pipeline.transcribe(
+        media, reporter=rep, diarize=True, debug=True, debug_root=tmp_path / "debug"
+    )
+
+    meta = json.loads((tmp_path / "debug" / "meta.json").read_text(encoding="utf-8"))
+    # Written during "transcribe and align": every step up to and including it, in
+    # order, and nothing from the steps that only run afterwards.
+    assert list(meta["timings"]) == [
+        "prepare audio",
+        "find speech",
+        "transcribe and align",
+    ]
+    assert rep.entered[-1] == "identify speakers"
+    assert all(
+        isinstance(value, float) and value >= 0.0 for value in meta["timings"].values()
+    )
+    assert set(rep.timings()) == set(rep.entered)
 
 
 def test_process_injected_words_omit_all_media_only_steps(tmp_path):
