@@ -993,4 +993,11 @@ def cmd_help(ctx, commands: tuple[str, ...]) -> None:
             raise click.UsageError(f"No such command '{name}'.")
         parent = child.context_class(child, info_name=name, parent=parent)
         command = child
+    help_option = command.get_help_option(parent)
+    if help_option is not None and help_option.callback is not None:
+        # Run the command's own --help callback so the alias renders
+        # byte-identically: rich-click prints through its console (keeping the
+        # colour it forces on CI runners) and click.echo would strip it.
+        help_option.callback(parent, help_option, True)
+        return
     click.echo(command.get_help(parent))
