@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TypeVar
 
@@ -28,9 +28,12 @@ _RETRY_DELAYS = (2.0, 8.0)
 # Built-in only: env / conf [llm] are resolved at call time (config.resolve_llm_model)
 # by the CLI and pipeline, never at import (a test or library import must not read the user conf).
 TRANSLATE_MODEL = config.DEFAULT_LLM_MODEL
-# Set high (800) so a typical episode (300-500 cues) fits in one call — full-episode context
-# beats windowing: seams cause disambiguation errors and inconsistent proper-noun rendering.
-# Only very long compilations (>800 cues) fall back to sequential windows.
+# Cue cap of the SEQUENTIAL planner (concurrency == 1). Set high (800) so a typical
+# episode (300-500 cues) fits in one call: with one window there are no seams, hence no
+# cross-window disambiguation errors or inconsistent proper-noun rendering, and only very
+# long compilations (>800 cues) fall back to sequential windows. Concurrency > 1 gives
+# that up on purpose -- it caps windows at WINDOW_CUES instead and relies on ``glossary``
+# and ``context`` for consistency (see :func:`translate_cues`).
 BATCH_THRESHOLD = int(os.environ.get("VOXWEAVE_TRANSLATE_BATCH", "800"))
 # Tail cues from the previous window carried into the next for stylistic continuity.
 CONTEXT_TAIL = int(os.environ.get("VOXWEAVE_TRANSLATE_CONTEXT_TAIL", "3"))
@@ -651,29 +654,6 @@ def _call_options(reasoning_effort: str | None, json_mode: bool) -> dict:
     return options
 
 
-def _call_with_retry(
-    client,
-    model: str,
-    messages: list[dict],
-    on_entry=None,
-    *,
-    reasoning_effort: str | None = None,
-) -> str:
-    """:func:`_call` with exponential backoff on transient failures (network,
-    rate limit, 5xx, incomplete answers). A streamed retry re-counts entries
-    already reported to ``on_entry`` — the bar may overshoot, the translations
-    do not."""
-    return _with_retry(
-        lambda: _call(
-            client,
-            model,
-            messages,
-            on_entry=on_entry,
-            **_call_options(reasoning_effort, True),
-        )
-    )
-
-
 def _block_index(unit_index: int) -> int:
     """Translation-unit index -> its cue (block) index; dash halves share one cue."""
     return unit_index % _DASH_UNIT_BASE
@@ -1065,18 +1045,33 @@ def translate_cues(
     hard_error: BaseException | None = None
     with ThreadPoolExecutor(max_workers=min(concurrency, len(pending))) as pool:
         futures = [pool.submit(run, position) for position in pending]
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except CancelledError:
-                continue
-            except Exception as exc:
-                # First hard failure wins; windows already in flight finish (and
-                # persist their progress), queued ones are cancelled.
-                if hard_error is None:
+        try:
+            for future in as_completed(futures):
+                # A worker's BaseException (KeyboardInterrupt included) lands in the
+                # future rather than propagating, so read it instead of calling
+                # result(): the first failure ends the run.
+                exc = future.exception()
+                if exc is not None:
                     hard_error = exc
-                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+        finally:
+            # Drop the windows that never started -- for a failure, for a
+            # KeyboardInterrupt in this thread, and harmlessly when every window
+            # already finished. Never keep consuming as_completed afterwards:
+            # cancel_futures cancels a queued future WITHOUT notifying the
+            # as_completed waiter (only set_running_or_notify_cancel does that),
+            # so the iterator would block forever waiting for them. The pool's
+            # exit then joins the in-flight windows, whose progress is persisted.
+            pool.shutdown(wait=False, cancel_futures=True)
     if hard_error is not None:
+        # Later failures are dropped by the break above; report them so a systemic
+        # outage is not misread as one bad window.
+        for future in futures:
+            if future.cancelled():
+                continue
+            other = future.exception()
+            if other is not None and other is not hard_error:
+                log.warning("another translate window failed: %s", other)
         raise hard_error
     result = dict(sorted(result.items()))
     return _collapse_units(payload, result)

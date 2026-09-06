@@ -5856,11 +5856,15 @@ def translate(
                     len(blocks),
                     still,
                 )
-    except Exception:
+    except Exception as exc:
         if progress_path.exists():
+            # PartialTranslationError is not an interruption: the run finished and
+            # refused to write a part-source file.
             log.warning(
-                "translation interrupted; progress saved to %s -- rerun the same "
-                "command to resume",
+                "%s; progress saved to %s -- rerun the same command to resume",
+                "translation incomplete"
+                if isinstance(exc, translate_mod.PartialTranslationError)
+                else "translation interrupted",
                 progress_path.name,
             )
         raise

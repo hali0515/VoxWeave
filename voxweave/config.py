@@ -378,11 +378,14 @@ def _positive_int(value: object, source: str) -> int | None:
 
 
 def _resolve_llm_positive_int(
-    cli_value: object, *, envvar: str, key: str, default: int
+    cli_value: object, *, envvar: str, key: str, cli_flag: str, default: int
 ) -> int:
     """Shared CLI > env > conf ``[llm].<key>`` > default resolution for the two
-    translate windowing knobs; every invalid source warns and falls through."""
-    resolved = _positive_int(cli_value, f"--{key.replace('_', '-')}")
+    translate windowing knobs; every invalid source warns and falls through.
+
+    ``cli_flag`` is the option a library caller should be pointed at; it is not
+    derivable from ``key`` (``window_cues`` is spelled ``--window``)."""
+    resolved = _positive_int(cli_value, cli_flag)
     if resolved is not None:
         return resolved
     env = os.environ.get(envvar)
@@ -407,6 +410,7 @@ def resolve_llm_concurrency(cli_value: object = None) -> int:
         cli_value,
         envvar="VOXWEAVE_TRANSLATE_CONCURRENCY",
         key="concurrency",
+        cli_flag="--concurrency",
         default=DEFAULT_TRANSLATE_CONCURRENCY,
     )
 
@@ -419,6 +423,7 @@ def resolve_llm_window_cues(cli_value: object = None) -> int:
         cli_value,
         envvar="VOXWEAVE_TRANSLATE_WINDOW_CUES",
         key="window_cues",
+        cli_flag="--window",
         default=DEFAULT_TRANSLATE_WINDOW_CUES,
     )
 

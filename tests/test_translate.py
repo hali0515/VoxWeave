@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1499,12 +1500,13 @@ class EchoClient:
     request modes), tracks the peak number of in-flight requests, and lets a
     test fail chosen cues' windows with a finish_reason or an exception."""
 
-    def __init__(self, *, fail_cues=(), finish_reason="length", raise_exc=None):
-        import threading
-
+    def __init__(
+        self, *, fail_cues=(), finish_reason="length", raise_exc=None, delay=0.02
+    ):
         self.fail_cues = set(fail_cues)
         self.finish_reason = finish_reason
         self.raise_exc = raise_exc
+        self.delay = delay
         self.calls = []
         self.in_flight = 0
         self.max_in_flight = 0
@@ -1525,11 +1527,12 @@ class EchoClient:
             self.in_flight += 1
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
         try:
-            _time.sleep(0.02)
             ids = self._ids(messages)
             failing = bool(self.fail_cues & set(ids))
+            # A hard error surfaces at once; every other window keeps the pool busy.
             if failing and self.raise_exc is not None:
                 raise self.raise_exc
+            _time.sleep(self.delay)
             reason = self.finish_reason if failing else "stop"
             content = "" if failing else _json_ok(ids)
             if not stream:
@@ -1686,6 +1689,84 @@ def test_concurrent_hard_error_propagates_but_keeps_completed_progress(tmp_path)
     saved = translate.load_progress(progress, effective)
     assert saved and all(saved[i] == f"tx {i}" for i in saved)
     assert 19 not in saved
+
+
+def test_concurrent_early_hard_error_returns_instead_of_hanging(tmp_path):
+    # Regression: an EARLY window fails while later windows are still queued
+    # (10 windows, 2 workers). Cancelling a queued future never wakes the
+    # as_completed waiter -- draining the iterator after cancel_futures=True
+    # blocked forever, so the command stopped with no error and no traceback.
+    # The call runs on a daemon thread so a regression fails the test instead
+    # of hanging the whole suite.
+    #
+    # Warm the openai import _retryable() reaches for: a cold import there would
+    # give the two workers time to drain the queue, hiding the very state (queued,
+    # then cancelled, windows) this test exists to cover.
+    pytest.importorskip("openai")
+    client = EchoClient(fail_cues={1}, raise_exc=ValueError("bad request"), delay=0.1)
+    progress = tmp_path / "ep.zh.progress.json"
+    payload = _payload(20)
+    outcome: list[BaseException | None] = []
+
+    def call():
+        try:
+            translate.translate_cues(
+                payload,
+                to="zh",
+                model="m",
+                client=client,
+                concurrency=2,
+                window_cues=2,
+                progress_path=progress,
+                progress_sig=translate.payload_signature(payload),
+            )
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assertions
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    worker = threading.Thread(target=call, daemon=True)
+    worker.start()
+    worker.join(30)
+    assert not worker.is_alive(), "translate_cues hung on cancelled windows"
+    assert isinstance(outcome[0], ValueError)
+    # Queued windows are dropped rather than dispatched after the failure.
+    assert len(client.calls) < 10
+
+
+def test_concurrent_reports_every_failed_window(caplog):
+    # Two windows fail at the same time: the run raises the first and logs the
+    # other, so a systemic outage is not misread as one bad window.
+    barrier = threading.Barrier(2, timeout=30)
+    seen = []
+
+    class BothFail:
+        def __init__(self):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self._create)
+            )
+
+        def _create(self, *, model, messages, stream=False, **kw):
+            first = EchoClient._ids(messages)[0]
+            seen.append(first)
+            barrier.wait()  # both windows are in flight before either fails
+            raise ValueError(f"window at cue {first} refused")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        with pytest.raises(ValueError, match="refused"):
+            translate.translate_cues(
+                _payload(4),
+                to="zh",
+                model="m",
+                client=BothFail(),
+                concurrency=2,
+                window_cues=2,
+            )
+    assert sorted(seen) == [0, 2]
+    extra = [
+        r for r in caplog.records if "another translate window failed" in r.message
+    ]
+    assert len(extra) == 1
 
 
 def test_concurrent_resume_skips_covered_windows_and_counts_them(tmp_path):
