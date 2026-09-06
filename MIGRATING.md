@@ -93,3 +93,20 @@ Existing translation endpoint configuration and numbered, shared-style progress
 remain available. Progress and deprecation warnings go to stderr. Successful
 processing commands retain their result paths on stdout; speaker serving retains
 its URL output, and `speakers list --json` emits its requested inspection data.
+
+## Translate: windowed requests and partial output (after 0.16.0)
+
+`translate` now sends the episode as bounded windows with several requests in
+flight (`--concurrency`, `--window`; `[llm].concurrency` / `[llm].window_cues`;
+defaults 8 / 100). Set `concurrency = 1` to keep the previous single
+whole-episode request. Windows translated in parallel see the preceding source
+cues as context instead of their neighbours' translations; use `--glossary` and
+`--context` for cross-window consistency.
+
+A run whose cues stay untranslated after the retry stage now fails instead of
+writing a file with those cues in source text; the progress file is kept, so
+rerunning the same command resumes. Pass `--allow-partial` for the previous
+back-fill behavior. Responses that do not finish with `stop` (truncated or
+aborted by the server) are retried, and the final attempt for a window drops
+`response_format` (plain JSON) to get past structured-output failures on
+self-hosted servers.

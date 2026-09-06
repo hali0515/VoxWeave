@@ -352,6 +352,21 @@ def _hint_for(exc: Exception) -> str:
         )
     if isinstance(exc, RuntimeError):
         message = str(exc).lower()
+        if "cues untranslated" in message:
+            return (
+                "Rerun the same command to resume: the translation progress file is "
+                "kept and already-translated cues are not re-requested. Pass "
+                "--allow-partial to write the file with the remaining cues in source "
+                "text. If the same cues keep failing, check the LLM server log "
+                "(structured-output aborts, max_tokens)."
+            )
+        if "response incomplete" in message:
+            return (
+                "The endpoint cut the answer short (finish_reason other than stop). "
+                "Check the server's structured-output (json_object) support and "
+                "max_tokens; translate retries and falls back to plain JSON "
+                "automatically, correct does not."
+            )
         if "could not load" in message and "model-card" in message:
             hint = (
                 "Accept the model-card conditions on Hugging Face and authenticate "

@@ -236,6 +236,10 @@ def correct_cues(
     Single call over the whole transcript (full context ensures consistent entity
     normalization); not windowed unlike translate. No progress bar: the model emits
     only changed cues so a per-cue bar would barely move. ``client`` injectable for tests.
+
+    A response that does not finish with ``"stop"`` raises
+    :class:`voxweave.translate.IncompleteResponse` (no retry here): a truncated
+    fix list must never be applied as if it were the model's full review.
     """
     if not payload:
         return []

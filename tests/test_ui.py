@@ -35,6 +35,22 @@ def test_hint_for_unknown_is_empty():
     assert ui._hint_for(ValueError("x")) == ""
 
 
+def test_hint_for_partial_translation_points_at_resume_and_allow_partial():
+    from voxweave.translate import PartialTranslationError
+
+    hint = ui._hint_for(PartialTranslationError([3, 4], 10))
+    assert "Rerun the same command" in hint
+    assert "--allow-partial" in hint
+
+
+def test_hint_for_incomplete_response_points_at_the_server():
+    from voxweave.translate import IncompleteResponse
+
+    hint = ui._hint_for(IncompleteResponse("length", "partial text"))
+    assert "finish_reason" in hint
+    assert "json_object" in hint
+
+
 def test_hint_for_cuda_oom():
     # torch's real message is "CUDA out of memory. Tried to allocate 2.00 GiB ..."
     # but we must not import torch here -- a plain RuntimeError with matching text suffices.

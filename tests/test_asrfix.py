@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from voxweave import artifacts, asrfix, pipeline
 
 
@@ -239,6 +241,30 @@ def test_render_vtt_text_only_when_no_timestamps():
     blocks = [{"text": "a", "start": None, "end": None}]
     out = asrfix.render_vtt(blocks, ["A"])
     assert "-->" not in out and "A" in out
+
+
+def test_correct_cues_raises_on_incomplete_response():
+    # correct shares translate's _call: a truncated fix list must never be applied
+    # as if it were the model's full review (no retry/fallback here).
+    from voxweave.translate import IncompleteResponse
+
+    class TruncatingClient(FakeClient):
+        def _create(self, *, model, messages, **kw):
+            self.calls.append(messages)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"fixes":[{"i":0,"orig"'),
+                        finish_reason="length",
+                    )
+                ]
+            )
+
+    client = TruncatingClient([])
+    with pytest.raises(IncompleteResponse) as failure:
+        asrfix.correct_cues([{"i": 0, "t": "hi"}], model="m", client=client)
+    assert failure.value.finish_reason == "length"
+    assert len(client.calls) == 1
 
 
 # --------------------------- pipeline.correct (E2E with mock) --------------------------- #
