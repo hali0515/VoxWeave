@@ -226,8 +226,38 @@ def _resolve_separator_files() -> tuple[Path, Path]:
     return ckpt, conf
 
 
+def _effective_autocast(mode: str, device: str) -> str:
+    """The autocast mode that will really wrap the forward on ``device``.
+
+    Autocast here is CUDA-only (see :func:`_autocast_context`), so on CPU/MPS
+    every mode degrades to the fp32 path and the effective mode is ``"off"``.
+    The identity, the probe and the forward all resolve through this one rule,
+    so the recorded numerics are the numerics that ran: a vocals cache sitting
+    next to the media and shared between a CUDA host and a CPU/MPS host that
+    are both configured ``bf16`` would otherwise label fp32 stems ``"bf16"``
+    and reuse them across the two.
+    """
+    if mode not in config.SEP_AUTOCAST_MODES:
+        raise ValueError(
+            f"unknown separator autocast mode {mode!r} "
+            f"(expected one of {'/'.join(config.SEP_AUTOCAST_MODES)})"
+        )
+    # get_device() strings ("cuda:0"/"cpu"/"mps") and str(torch.device) ("cuda")
+    # both answer this the same way, and the model is moved to get_device(), so
+    # the load edge and the forward cannot disagree about the device.
+    return mode if device.startswith("cuda") else "off"
+
+
 def separator_identity() -> dict[str, object]:
-    """Hash the currently configured separator bytes for cache validation."""
+    """Describe the separator this run would use, for cache validation.
+
+    Hashes the currently configured bytes and records the numerics that would
+    wrap the forward on this host: ``autocast`` is part of the identity because
+    bf16/fp16 change the stems, so a cache produced under one mode must not be
+    reused under another (see ``vocalscache.SeparatorIdentity``). The mode is
+    the effective one, not the configured one -- a host that cannot run
+    autocast reports (and matches) the fp32 path it would actually take.
+    """
     checkpoint, config_path = _resolve_separator_files()
     resolved_checkpoint = checkpoint.resolve(strict=True)
     resolved_config = config_path.resolve(strict=True)
@@ -236,6 +266,7 @@ def separator_identity() -> dict[str, object]:
         "file": SEPARATOR_REPO_FILE,
         "checkpoint": _sha256_file(resolved_checkpoint),
         "config_sha256": _sha256_file(resolved_config),
+        "autocast": _effective_autocast(config.conf_separate_autocast(), get_device()),
     }
 
 
@@ -249,8 +280,15 @@ def _tf32_enabled() -> bool:
     )
 
 
-def _load_separator():
+def _load_separator(autocast: str | None = None):
     """Instantiate MelBandRoformer and return its load-bound content identity.
+
+    ``autocast`` is the mode the caller will wrap the forward with; its effective
+    value on this device (:func:`_effective_autocast`) is stamped into the
+    identity, so the identity always describes both the bytes and the numerics of
+    the vocals about to be produced. ``None`` resolves it from the config
+    (env > conf > "off"), mirroring ``_demix``; :func:`separate_vocals` resolves
+    it once and hands the same value to both.
 
     The model is not cached; the caller deletes it after separation to free VRAM.
     Uses the frozen copy from voxweave.vendor: the latest PyPI bs-roformer has
@@ -264,6 +302,13 @@ def _load_separator():
     except ModuleNotFoundError as e:
         raise _require(e.name or "torch") from e
 
+    # Resolved before the checkpoint load so an unknown mode fails fast, and reduced
+    # to what this device will really run: get_device() is cached, so the dev the
+    # model is moved to below is the same string this was resolved against.
+    mode = _effective_autocast(
+        autocast if autocast is not None else config.conf_separate_autocast(),
+        get_device(),
+    )
     ckpt, conf = _resolve_separator_files()
     resolved_checkpoint = Path(ckpt).resolve(strict=True)
     resolved_config = Path(conf).resolve(strict=True)
@@ -309,6 +354,9 @@ def _load_separator():
         "file": SEPARATOR_REPO_FILE,
         "checkpoint": checkpoint_digest,
         "config_sha256": config_digest,
+        # Already device-effective (see above), so this is the mode the forward
+        # will really run under, not merely the configured one.
+        "autocast": mode,
     }
     return model, cfg, separator_identity
 
@@ -319,22 +367,19 @@ def _autocast_context(dev, mode: str):
     ``"off"`` returns a ``nullcontext``. ``"bf16"`` / ``"fp16"`` return a
     ``torch.autocast`` bound to CUDA when ``dev`` is a CUDA device; on any other
     device autocast is not attempted (logged once at debug level) and the fp32
-    path runs unchanged. Only the model forward is meant to run inside it -- the
-    overlap-add accumulation in :func:`_demix` stays fp32 either way.
+    path runs unchanged. The CUDA gate and the mode check are
+    :func:`_effective_autocast`'s, the same rule the recorded identity uses.
+    Only the model forward is meant to run inside it -- the overlap-add
+    accumulation in :func:`_demix` stays fp32 either way.
     """
-    if mode not in config.SEP_AUTOCAST_MODES:
-        raise ValueError(
-            f"unknown separator autocast mode {mode!r} "
-            f"(expected one of {'/'.join(config.SEP_AUTOCAST_MODES)})"
-        )
-    if mode == "off":
-        return nullcontext()
-    if dev.type != "cuda":
-        log.debug("separator autocast=%s ignored on %s (CUDA only)", mode, dev)
+    effective = _effective_autocast(mode, str(dev))
+    if effective == "off":
+        if mode != "off":
+            log.debug("separator autocast=%s ignored on %s (CUDA only)", mode, dev)
         return nullcontext()
     import torch
 
-    dtype = torch.bfloat16 if mode == "bf16" else torch.float16
+    dtype = torch.bfloat16 if effective == "bf16" else torch.float16
     return torch.autocast(device_type="cuda", dtype=dtype)
 
 
@@ -422,7 +467,10 @@ def separate_vocals(
     Model is loaded and freed within this function so it doesn't co-occupy VRAM with ASR/alignment.
     progress(done, total) called per demix window if provided.
     ``return_identity=True`` also returns the identity produced at the model load
-    edge, for capture provenance.
+    edge, for capture provenance and vocals-cache validation. The autocast mode is
+    resolved exactly once here and handed to both the identity and the forward,
+    and both reduce it to its effective value the same way, so the recorded
+    numerics can never disagree with the numerics that ran.
     """
     try:
         import numpy as np
@@ -436,9 +484,11 @@ def separate_vocals(
     if mix.shape[0] == 1:  # mono -> duplicate to stereo for the stereo model
         mix = mix.repeat(2, 1)
 
-    model, cfg, separator_identity = _load_separator()
+    autocast = config.conf_separate_autocast()
+    model, cfg, separator_identity = _load_separator(autocast=autocast)
     try:
-        vocals = _demix(model, mix, cfg, progress=progress)  # [ch, t]
+        # vocals: [ch, t]
+        vocals = _demix(model, mix, cfg, progress=progress, autocast=autocast)
     finally:
         del model
         _empty_cache()
