@@ -10,8 +10,12 @@ matches the actual cue text and the replacement stays a minimal edit, rejecting
 cross-cue word splits, hallucinated quotes, no-ops, cue erasure, expansions, and
 wholesale rewrites. Enforced in code, not trusted to the prompt.
 
-Reuses OpenAI plumbing from :mod:`voxweave.translate`; only the system prompt and
-response schema differ (fixes diff instead of translations).
+Reuses OpenAI plumbing from :mod:`voxweave.translate` -- including its request
+ladder (:func:`voxweave.translate.request_with_json_fallback`: retries, then one
+plain-chat attempt) -- so a flaky endpoint behaves the same for both commands;
+only the system prompt and response schema differ (fixes diff instead of
+translations). The whole transcript still goes out as ONE request; splitting is
+a last resort for a response the endpoint truncated (see :func:`correct_cues`).
 """
 
 from __future__ import annotations
@@ -24,11 +28,14 @@ from voxweave import config
 from voxweave.realign import render_cues
 from voxweave.speakers import voice_text_for_block
 from voxweave.translate import (
+    IncompleteResponse,
     _call,
+    _call_options,
     _loads_salvage,
     _make_client,
     build_payload,
     format_glossary,
+    request_with_json_fallback,
     resolve_model,
     restore_dash_layout,
 )
@@ -37,6 +44,9 @@ log = logging.getLogger("voxweave")
 
 # Built-in only; env / conf [llm] resolve at call time (see translate.TRANSLATE_MODEL).
 FIX_MODEL = config.DEFAULT_LLM_MODEL
+# Preceding cue texts handed to a half after a split, so it keeps a little of the
+# whole-transcript context the single unsplit request has (proper-noun continuity).
+SPLIT_CONTEXT_TAIL = 3
 
 SYSTEM_PROMPT = """\
 You are an expert subtitle transcription proofreader. The input is an automatic
@@ -94,15 +104,32 @@ If nothing needs fixing, return {"fixes":[]}."""
 
 
 def build_messages(
-    payload: list[dict], *, glossary: dict[str, str] | str | None = None
+    payload: list[dict],
+    *,
+    glossary: dict[str, str] | str | None = None,
+    source_tail: list[str] | None = None,
 ) -> list[dict]:
-    """system (prompt + optional glossary) + user (numbered cue JSON)."""
+    """system (prompt + optional glossary + optional preceding cues) + user (numbered cue JSON).
+
+    ``source_tail`` carries the cue texts immediately before ``payload`` as
+    read-only context; only a split request (see :func:`correct_cues`) uses it, and
+    those cues live in the system message so they can never be mistaken for cues to
+    report fixes for.
+    """
     system = SYSTEM_PROMPT
     gl = format_glossary(glossary)
     if gl:
         system += (
             "\n\nGLOSSARY (canonical entities for THIS video — authoritative):\n" + gl
         )
+    if source_tail:
+        tail_txt = "\n".join(t for t in source_tail if t)
+        if tail_txt:
+            system += (
+                "\n\nPRECEDING CUES (context only — earlier cues of the same "
+                "transcript, for entity consistency; they are NOT in the cue list "
+                "below, so never report a fix for them):\n" + tail_txt
+            )
     user = json.dumps({"cues": payload}, ensure_ascii=False)
     return [
         {"role": "system", "content": system},
@@ -222,6 +249,145 @@ def render_vtt(blocks: list[dict], texts: list[str]) -> str:
     )
 
 
+class _UnparseableFixes(IncompleteResponse):
+    """The response carried no fix list at all — not even an empty one.
+
+    An :class:`~voxweave.translate.IncompleteResponse` on purpose, so the retry
+    ladder re-requests it: reading garbage as "the model found nothing to fix"
+    would silently pass a whole transcript through uncorrected.
+    """
+
+    def __init__(self, raw: object) -> None:
+        super().__init__(
+            None,
+            raw if isinstance(raw, str) else "",
+            detail="no parseable fix list in the response",
+        )
+
+
+def _payload_indices(payload: list[dict]) -> set[int]:
+    """Cue indices a request asks about (:func:`build_payload` numbers every entry).
+    Entries without a usable ``i`` are skipped; an entirely unnumbered payload
+    yields an empty set, which disables index filtering rather than dropping
+    every fix."""
+    out: set[int] = set()
+    for entry in payload:
+        try:
+            out.add(int(entry["i"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _request_label(payload: list[dict]) -> str:
+    ids = _payload_indices(payload)
+    if not ids:
+        return f"correct ({len(payload)} cues)"
+    return f"correct (cues {min(ids)}-{max(ids)})"
+
+
+def _parse_fix_window(raw: object, wanted: set[int], *, label: str) -> list[dict]:
+    """One response → its fix list, restricted to the cues this request asked about.
+
+    An answer with no ``fixes`` array raises :class:`_UnparseableFixes` so the
+    retry ladder runs; ``{"fixes": []}`` is a legitimate "nothing to fix" answer
+    and returns ``[]``. Indices the request never sent are dropped here so a split
+    request can never report a fix against a cue outside its own half.
+    """
+    doc = _loads_salvage(raw)
+    if not isinstance(doc.get("fixes"), list):
+        raise _UnparseableFixes(raw)
+    fixes = parse_fixes(doc)
+    if not wanted:
+        return fixes
+    stray = [f["i"] for f in fixes if f["i"] not in wanted]
+    if stray:
+        log.warning("%s: dropping out-of-request fix indices %s", label, stray)
+    return [f for f in fixes if f["i"] in wanted]
+
+
+def _request_fixes(
+    client,
+    model: str,
+    payload: list[dict],
+    *,
+    glossary: dict[str, str] | str | None,
+    source_tail: list[str] | None,
+    label: str,
+) -> list[dict]:
+    """One cue set → its fix list, using translate's request ladder (json_object
+    with retries, then a single plain-chat attempt). Still-incomplete propagates."""
+    messages = build_messages(payload, glossary=glossary, source_tail=source_tail)
+    wanted = _payload_indices(payload)
+
+    def attempt(json_mode: bool) -> list[dict]:
+        raw = _call(client, model, messages, **_call_options(None, json_mode))
+        return _parse_fix_window(raw, wanted, label=label)
+
+    return request_with_json_fallback(
+        attempt, label=label, call_label=f"{label} correct call"
+    )
+
+
+def _splittable(exc: IncompleteResponse) -> bool:
+    """Whether a smaller request could plausibly succeed where this one failed.
+
+    Only two failures are about size: the output cap (``finish_reason == "length"``
+    — retrying the same request cannot help) and an answer that stayed unparseable
+    through the plain-chat fallback. A server-side abort or a dropped stream is not
+    a size problem, so it raises instead of fanning out requests at a sick endpoint.
+    """
+    return isinstance(exc, _UnparseableFixes) or exc.finish_reason == "length"
+
+
+def _correct_window(
+    client,
+    model: str,
+    payload: list[dict],
+    *,
+    glossary: dict[str, str] | str | None,
+    source_tail: list[str] | None,
+) -> list[dict]:
+    """Request fixes for ``payload``, halving it when the answer will not fit.
+
+    Fix indices stay absolute throughout: each half keeps the ``i`` values
+    :func:`build_payload` assigned, so the merged list needs no remapping and
+    :func:`apply_fixes` stays the sole authority on what is applied.
+    """
+    label = _request_label(payload)
+    try:
+        return _request_fixes(
+            client,
+            model,
+            payload,
+            glossary=glossary,
+            source_tail=source_tail,
+            label=label,
+        )
+    except IncompleteResponse as exc:
+        if len(payload) < 2 or not _splittable(exc):
+            raise
+        log.warning(
+            "%s: still incomplete after the plain-chat fallback (%s); splitting the "
+            "cue set in half and correcting each half separately",
+            label,
+            exc,
+        )
+    mid = len(payload) // 2
+    head, tail = payload[:mid], payload[mid:]
+    fixes = _correct_window(
+        client, model, head, glossary=glossary, source_tail=source_tail
+    )
+    fixes += _correct_window(
+        client,
+        model,
+        tail,
+        glossary=glossary,
+        source_tail=[str(entry.get("t", "")) for entry in head][-SPLIT_CONTEXT_TAIL:],
+    )
+    return fixes
+
+
 def correct_cues(
     payload: list[dict],
     *,
@@ -233,25 +399,33 @@ def correct_cues(
 ) -> list[dict]:
     """Numbered payload → raw fix list (pre-gate).
 
-    Single call over the whole transcript (full context ensures consistent entity
-    normalization); not windowed unlike translate. No progress bar: the model emits
-    only changed cues so a per-cue bar would barely move. ``client`` injectable for tests.
+    Normally a single call over the whole transcript: full context and the glossary
+    are what make entity normalization consistent, so correct does NOT window by
+    default the way translate does. No progress bar: the model emits only changed
+    cues so a per-cue bar would barely move. ``client`` injectable for tests.
 
-    A response that does not finish with ``"stop"`` raises
-    :class:`voxweave.translate.IncompleteResponse` (no retry here): a truncated
-    fix list must never be applied as if it were the model's full review.
+    A response that does not finish with ``"stop"`` is never read as the model's
+    full review. It goes through translate's request ladder instead — retries in
+    ``json_object`` mode, then one plain-chat attempt for servers whose
+    structured-output path aborts (vLLM's grammar FSM). Only when that ladder ends
+    in a size failure (``finish_reason == "length"``, or still nothing parseable) is
+    the cue set halved and each half requested separately, carrying the preceding
+    cues as context; the halves keep their original cue indices and their fixes are
+    merged. A single cue that still fails raises
+    :class:`voxweave.translate.IncompleteResponse`.
     """
     if not payload:
         return []
     client = client or _make_client(base_url, api_key)
     model = resolve_model(client, model)
-    messages = build_messages(payload, glossary=glossary)
-    raw = _call(client, model, messages)
-    return parse_fixes(raw)
+    return _correct_window(
+        client, model, list(payload), glossary=glossary, source_tail=None
+    )
 
 
 __all__ = [
     "FIX_MODEL",
+    "SPLIT_CONTEXT_TAIL",
     "SYSTEM_PROMPT",
     "build_messages",
     "parse_fixes",

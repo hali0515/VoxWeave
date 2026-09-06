@@ -698,6 +698,37 @@ def _parse_window(raw: str, win_ids: list[int], *, label: str) -> dict[int, str]
     return parsed
 
 
+def request_with_json_fallback(
+    attempt: Callable[[bool], _T],
+    *,
+    label: str,
+    call_label: str | None = None,
+) -> _T:
+    """Run ``attempt(json_mode=True)`` with retries, then ``attempt(json_mode=False)``
+    once when every retried attempt ended :class:`IncompleteResponse`.
+
+    vLLM's structured-output grammar can abort a request (speculative decoding +
+    reasoning parser); dropping ``response_format`` on the final attempt gets the
+    request through on such servers. The final plain-chat failure propagates -- the
+    caller decides what an unusable answer means for it.
+
+    Shared by :func:`_request_window` (translate) and :mod:`voxweave.asrfix`; both
+    request paths must behave the same in front of a flaky endpoint.
+    """
+    try:
+        return _with_retry(lambda: attempt(True), label=call_label or label)
+    except IncompleteResponse as exc:
+        log.warning(
+            "%s: json_object mode dropped after %d incomplete attempts (%s); "
+            "retrying once as plain chat -- check the server's structured-output "
+            "path (vLLM: guided decoding + speculative decoding / reasoning parser)",
+            label,
+            len(_RETRY_DELAYS) + 1,
+            exc,
+        )
+    return attempt(False)
+
+
 def _request_window(
     client,
     model: str,
@@ -711,11 +742,9 @@ def _request_window(
     """Translate one window: json_object mode with retries, then one plain-chat
     attempt when every retry ended incomplete.
 
-    vLLM's structured-output grammar can abort a request (speculative decoding +
-    reasoning parser); dropping ``response_format`` on the final attempt gets the
-    window through on such servers. A window that still comes back incomplete is
-    logged and returned empty: its cues stay untranslated for the sequential
-    retry stage, and the caller decides whether partial output is acceptable.
+    A window that still comes back incomplete is logged and returned empty: its
+    cues stay untranslated for the sequential retry stage, and the caller decides
+    whether partial output is acceptable.
     """
 
     def attempt(json_mode: bool) -> dict[int, str]:
@@ -729,18 +758,9 @@ def _request_window(
         return _parse_window(raw, win_ids, label=label)
 
     try:
-        return _with_retry(lambda: attempt(True), label=f"{label} translate call")
-    except IncompleteResponse as exc:
-        log.warning(
-            "%s: json_object mode dropped after %d incomplete attempts (%s); "
-            "retrying once as plain chat -- check the server's structured-output "
-            "path (vLLM: guided decoding + speculative decoding / reasoning parser)",
-            label,
-            len(_RETRY_DELAYS) + 1,
-            exc,
+        return request_with_json_fallback(
+            attempt, label=label, call_label=f"{label} translate call"
         )
-    try:
-        return attempt(False)
     except IncompleteResponse as exc:
         log.warning(
             "%s: still incomplete without json_object mode (%s); leaving its cues "
