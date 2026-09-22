@@ -26,7 +26,7 @@ DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
 # gpt-5.3-chat-latest and both commands were broken out of the box until this
 # constant replaced it. "auto" resolves to the endpoint's only served model at run
 # time, for self-hosted servers (vLLM) whose served name drifts between restarts.
-DEFAULT_LLM_MODEL = "gpt-5.5"
+DEFAULT_LLM_MODEL = "gpt-5.6-luna"
 DEFAULT_LLM_API_KEY_ENV = "OPENAI_API_KEY"
 LLM_MODEL_AUTO = "auto"
 # `translate` windowing for a self-hosted server: several bounded windows in flight
@@ -119,7 +119,7 @@ _TEMPLATE = """\
 #   window_cues = cues per window when concurrency > 1 (= --window /
 #                 VOXWEAVE_TRANSLATE_WINDOW_CUES; default 100, min 1).
 [llm]
-# model = "gpt-5.5"
+# model = "gpt-5.6-luna"
 # base_url = "http://127.0.0.1:8000/v1"
 # api_key_env = "OPENAI_API_KEY"
 # reasoning_effort = "low"
