@@ -421,6 +421,15 @@ def _construct(spec: EmbedderSpec) -> LoadedEmbedder:
     )
 
 
+def embedder_lock() -> threading.RLock:
+    """The (re-entrant) lock serializing the resident embedder.
+
+    Hold it across ``get_embedder`` + inference when the loaded checkpoint must
+    be attested for exactly the vectors it produced.
+    """
+    return _lock
+
+
 def get_embedder(spec: EmbedderSpec) -> LoadedEmbedder:
     """Process-singleton embedder keyed by spec name + pinned checkpoint."""
     global _resident
@@ -756,6 +765,7 @@ __all__ = [
     "checkpoint_path",
     "decoupled_provenance",
     "embed_segments",
+    "embedder_lock",
     "get_embedder",
     "normalize_voiceprint_choice",
     "read_mono_16k",

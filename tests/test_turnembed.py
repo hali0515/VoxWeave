@@ -469,3 +469,152 @@ def test_bisect_embeddings_refuses_symmetric_tied_top_eigenspace() -> None:
                 3: [0.0, -1.0],
             }
         )
+
+
+# --------------------------------------------------------------------------
+# Decoupled lane: voiceembed provider behind the same attested contract
+# --------------------------------------------------------------------------
+
+
+class _FakeVoiceprintNetwork:
+    def __init__(self) -> None:
+        self.inputs: list[np.ndarray] = []
+
+    def __call__(self, wave):
+        import torch
+
+        samples = wave.detach().cpu().numpy()
+        self.inputs.append(samples.copy())
+        row = torch.zeros((samples.shape[0], 192), dtype=torch.float32)
+        row[:, 0] = 3.0
+        row[:, 1] = 4.0
+        return row
+
+
+def _install_fake_voiceprint_embedder(monkeypatch):
+    from voxweave import voiceembed
+
+    network = _FakeVoiceprintNetwork()
+    requested = []
+
+    def fake_get_embedder(spec):
+        requested.append(spec)
+        return voiceembed.LoadedEmbedder(
+            spec=spec,
+            checkpoint_sha256=spec.sha256,
+            network=network,
+            device="cpu",
+        )
+
+    monkeypatch.setattr(voiceembed, "get_embedder", fake_get_embedder)
+    monkeypatch.setattr(
+        turnembed,
+        "_load_inference",
+        lambda *_a, **_k: pytest.fail("the decoupled lane never loads pyannote"),
+    )
+    return network, requested
+
+
+def test_turn_minimum_is_shared_with_the_voiceprint_recipe() -> None:
+    from voxweave import voiceembed
+
+    assert turnembed.MIN_TURN_SECONDS == voiceembed.MIN_TURN_SECONDS == 2.0
+
+
+def test_decoupled_identity_embeds_turns_with_the_registered_embedder(
+    monkeypatch,
+) -> None:
+    from voxweave import voiceembed
+
+    network, requested = _install_fake_voiceprint_embedder(monkeypatch)
+    waveform = np.ones(4 * turnembed.SAMPLE_RATE, dtype=np.float32)
+    monkeypatch.setattr(turnembed, "_read_mono_16k", lambda _path: waveform)
+    identity = turnembed.EmbeddingIdentity.decoupled(
+        voiceembed.REDIMNET2_B6.name, voiceembed.REDIMNET2_B6.sha256
+    )
+    request = turnembed.AttestedTurnRequest(
+        [(0.0, 0.5, "SPEAKER_00"), (1.0, 3.5, "SPEAKER_00")],
+        identity=identity,
+    )
+
+    embeddings = turnembed.turn_embeddings(Path("unused.wav"), request)
+
+    assert embeddings.identity == identity
+    assert embeddings.identity.pyannote_version is None
+    assert list(embeddings) == [0, 1]
+    assert embeddings[0][:2] == pytest.approx([0.6, 0.8])
+    assert requested and all(spec is voiceembed.REDIMNET2_B6 for spec in requested)
+    # The short turn is repeated up to the embedder's 1 s minimum.
+    assert [sample.shape for sample in network.inputs] == [
+        (1, turnembed.SAMPLE_RATE),
+        (1, round(2.5 * turnembed.SAMPLE_RATE)),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model", "checkpoint", "message"),
+    [
+        ("unknown-embedder", "a" * 64, "not available"),
+        ("redimnet2-b6-vb2-vox2-cnc2-lm", "a" * 64, "does not match"),
+    ],
+)
+def test_decoupled_identity_refuses_unknown_or_unpinned_models(
+    monkeypatch, model, checkpoint, message
+) -> None:
+    _install_fake_voiceprint_embedder(monkeypatch)
+    monkeypatch.setattr(
+        turnembed,
+        "_read_mono_16k",
+        lambda _path: pytest.fail("identity is checked before audio"),
+    )
+    request = turnembed.AttestedTurnRequest(
+        [(0.0, 1.0, "SPEAKER_00")],
+        identity=turnembed.EmbeddingIdentity.decoupled(model, checkpoint),
+    )
+
+    with pytest.raises(turnembed.TurnEmbeddingError, match=message):
+        turnembed.turn_embeddings(Path("unused.wav"), request)
+
+
+def test_legacy_loader_refuses_a_decoupled_identity() -> None:
+    identity = turnembed.EmbeddingIdentity.decoupled("any", "a" * 64)
+
+    with pytest.raises(turnembed.TurnEmbeddingError, match="identity is invalid"):
+        turnembed._load_inference(identity)
+
+
+def test_recipe_centroids_run_centroid_v1_for_the_requested_labels(
+    monkeypatch,
+) -> None:
+    from voxweave import voiceembed
+
+    _install_fake_voiceprint_embedder(monkeypatch)
+    waveform = np.ones(12 * turnembed.SAMPLE_RATE, dtype=np.float32)
+    monkeypatch.setattr(turnembed, "_read_mono_16k", lambda _path: waveform)
+    identity = turnembed.EmbeddingIdentity.decoupled(
+        voiceembed.ANIME_VA.name, voiceembed.ANIME_VA.sha256
+    )
+    turns = [
+        (0.0, 3.0, "SPEAKER_00"),
+        (3.0, 6.0, "SPEAKER_01"),
+        (6.0, 9.0, "B"),
+        (9.0, 9.3, "SPEAKER_00"),
+    ]
+
+    centroids = turnembed.recipe_centroids(
+        Path("unused.wav"), turns, ("SPEAKER_00", "B"), identity
+    )
+
+    assert set(centroids) == {"SPEAKER_00", "B"}
+    assert centroids["B"][:2] == pytest.approx([0.6, 0.8])
+    with pytest.raises(turnembed.TurnEmbeddingError, match="identity is invalid"):
+        turnembed.recipe_centroids(
+            Path("unused.wav"),
+            turns,
+            ("SPEAKER_00",),
+            turnembed.EmbeddingIdentity(
+                model=turnembed.EMBEDDING_MODEL,
+                checkpoint_sha256="a" * 64,
+                pyannote_version="4.0.7",
+            ),
+        )

@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from voxweave import artifacts, fsio, turnembed
+from voxweave import artifacts, fsio, turnembed, voiceembed
 from voxweave.voicebase import (
     MAX_PROVENANCE_STRING_BYTES,
     VOICEPRINTS_MAX_BYTES,
@@ -63,6 +63,10 @@ class _SplitProposal:
     media_fingerprint: str
     assignment: tuple[tuple[int, str], ...]
     embeddings: tuple[tuple[int, tuple[float, ...]], ...]
+    # Decoupled lane only: the centroid-v1 voiceprints of groups "A" / "B"
+    # (a group without a usable segment is absent). None = legacy lane, whose
+    # confirm averages the per-turn embeddings above.
+    recipe_centroids: tuple[tuple[str, tuple[float, ...]], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +84,19 @@ class _StagedSplit:
     audio_separated: bool
     audio_normalized: bool
     audio_separator: SeparatorIdentity | None
+    embedding_lane: str = turnembed.LANE_LEGACY
+
+    def embedding_identity(self) -> turnembed.EmbeddingIdentity:
+        """The provider identity the bound voiceprints were captured with."""
+        if self.embedding_lane == turnembed.LANE_DECOUPLED:
+            return turnembed.EmbeddingIdentity.decoupled(
+                self.embedding_model, self.embedding_checkpoint
+            )
+        return turnembed.EmbeddingIdentity(
+            model=self.embedding_model,
+            checkpoint_sha256=self.embedding_checkpoint,
+            pyannote_version=self.pyannote_version,
+        )
 
 
 class SpeakerHTTPServer(ThreadingHTTPServer):
@@ -477,11 +494,21 @@ def _prepare_split_wav(media_path: Path, staged: _StagedSplit) -> Path:
         )
 
 
-def _staged_provenance(
-    sidecar: Mapping[str, object],
-) -> tuple[str, str, str, bool, bool, SeparatorIdentity | None]:
+@dataclass(frozen=True, slots=True)
+class _StagedProvenance:
+    embedding_lane: str
+    embedding_model: str
+    embedding_checkpoint: str
+    pyannote_version: str
+    audio_separated: bool
+    audio_normalized: bool
+    audio_separator: SeparatorIdentity | None
+
+
+def _staged_provenance(sidecar: Mapping[str, object]) -> _StagedProvenance:
     provenance = require_mapping(sidecar.get("provenance"), "provenance")
     require_known_compatibility(build_compatibility_fingerprint(provenance))
+    decoupled = provenance.get("embedding_lane") == turnembed.LANE_DECOUPLED
     embedding_model = require_string(
         provenance.get("embedding_model"),
         "provenance.embedding_model",
@@ -492,11 +519,25 @@ def _staged_provenance(
         "provenance.embedding_checkpoint",
         max_bytes=MAX_PROVENANCE_STRING_BYTES,
     )
-    pyannote_version = require_string(
-        provenance.get("pyannote_version"),
-        "provenance.pyannote_version",
-        max_bytes=MAX_PROVENANCE_STRING_BYTES,
-    )
+    if decoupled:
+        # The recipe is what split-confirm must reproduce; one this version
+        # does not implement cannot be recomputed faithfully.
+        recipe = provenance.get("embedding_recipe")
+        if recipe != voiceembed.CENTROID_RECIPE:
+            raise SplitConflict(
+                f"voiceprints use centroid recipe {recipe!r}, which this voxweave "
+                f"version cannot reproduce (it implements "
+                f"{voiceembed.CENTROID_RECIPE!r})"
+            )
+        # Informational only on this lane: pyannote never runs the embedder.
+        raw_version = provenance.get("pyannote_version")
+        pyannote_version = raw_version if isinstance(raw_version, str) else ""
+    else:
+        pyannote_version = require_string(
+            provenance.get("pyannote_version"),
+            "provenance.pyannote_version",
+            max_bytes=MAX_PROVENANCE_STRING_BYTES,
+        )
     audio = require_mapping(provenance.get("audio"), "provenance.audio")
     separated = audio.get("separated")
     normalized = audio.get("normalized")
@@ -510,13 +551,16 @@ def _staged_provenance(
     separator = (
         validate_separator_identity(audio.get("separator")) if separated else None
     )
-    return (
-        embedding_model,
-        embedding_checkpoint,
-        pyannote_version,
-        separated,
-        normalized,
-        separator,
+    return _StagedProvenance(
+        embedding_lane=(
+            turnembed.LANE_DECOUPLED if decoupled else turnembed.LANE_LEGACY
+        ),
+        embedding_model=embedding_model,
+        embedding_checkpoint=embedding_checkpoint,
+        pyannote_version=pyannote_version,
+        audio_separated=separated,
+        audio_normalized=normalized,
+        audio_separator=separator,
     )
 
 
@@ -562,14 +606,7 @@ def _stage_split_inputs(
             sibling,
             fingerprint,
         )
-        (
-            embedding_model,
-            embedding_checkpoint,
-            pyannote_version,
-            audio_separated,
-            audio_normalized,
-            audio_separator,
-        ) = _staged_provenance(sidecar)
+        staged = _staged_provenance(sidecar)
         return _StagedSplit(
             sibling_bytes=sibling_bytes,
             voiceprints_path=sidecar_path,
@@ -578,12 +615,13 @@ def _stage_split_inputs(
             turns=turns,
             selected_indices=selected,
             embedding_dim=validated.embedding_dim,
-            embedding_model=embedding_model,
-            embedding_checkpoint=embedding_checkpoint,
-            pyannote_version=pyannote_version,
-            audio_separated=audio_separated,
-            audio_normalized=audio_normalized,
-            audio_separator=audio_separator,
+            embedding_model=staged.embedding_model,
+            embedding_checkpoint=staged.embedding_checkpoint,
+            pyannote_version=staged.pyannote_version,
+            audio_separated=staged.audio_separated,
+            audio_normalized=staged.audio_normalized,
+            audio_separator=staged.audio_separator,
+            embedding_lane=staged.embedding_lane,
         )
 
 
@@ -657,13 +695,56 @@ def _require_embedding_identity(
         )
     identity = embeddings.identity
     if (
-        identity.model != staged.embedding_model
+        identity.lane != staged.embedding_lane
+        or identity.model != staged.embedding_model
         or identity.checkpoint_sha256 != staged.embedding_checkpoint
-        or identity.pyannote_version != staged.pyannote_version
+        # pyannote's version is part of the identity only on the legacy lane,
+        # where pyannote itself runs the embedding checkpoint.
+        or (
+            staged.embedding_lane == turnembed.LANE_LEGACY
+            and identity.pyannote_version != staged.pyannote_version
+        )
     ):
         raise SplitConflict(
             "the turn embedding provider does not match the voiceprint capture"
         )
+
+
+# Stand-in label for group B while its centroid-v1 segments are computed: the
+# real SPEAKER_NN id is only minted at confirm time, and the recipe needs no
+# more than "a speaker other than A and everyone else".
+_SPLIT_B_PLACEHOLDER = "\x00split-group-b"
+
+
+def _split_recipe_centroids(
+    wav_path: Path,
+    staged: _StagedSplit,
+    speaker_id: str,
+    assignment: Mapping[int, str],
+    identity: turnembed.EmbeddingIdentity,
+) -> tuple[tuple[str, tuple[float, ...]], ...]:
+    """centroid-v1 voiceprints of both split groups, as capture would compute them."""
+    relabeled = [
+        (start, end, _SPLIT_B_PLACEHOLDER if assignment.get(index) == "B" else label)
+        for index, (start, end, label) in enumerate(staged.turns)
+    ]
+    centroids = turnembed.recipe_centroids(
+        wav_path,
+        relabeled,
+        (speaker_id, _SPLIT_B_PLACEHOLDER),
+        identity,
+    )
+    groups: list[tuple[str, tuple[float, ...]]] = []
+    for group, label in (("A", speaker_id), ("B", _SPLIT_B_PLACEHOLDER)):
+        vector = centroids.get(label)
+        if vector is None:
+            continue
+        if len(vector) != staged.embedding_dim:
+            raise turnembed.TurnEmbeddingError(
+                "recomputed voiceprints do not match the bound voiceprint dimension"
+            )
+        groups.append((group, tuple(float(value) for value in vector)))
+    return tuple(groups)
 
 
 def _build_split_proposal(
@@ -672,13 +753,10 @@ def _build_split_proposal(
 ) -> tuple[_SplitProposal, dict[str, object]]:
     staged = _stage_split_inputs(server, speaker_id)
     selected_turns = [staged.turns[index] for index in staged.selected_indices]
+    identity = staged.embedding_identity()
     embedding_request = turnembed.AttestedTurnRequest(
         selected_turns,
-        identity=turnembed.EmbeddingIdentity(
-            model=staged.embedding_model,
-            checkpoint_sha256=staged.embedding_checkpoint,
-            pyannote_version=staged.pyannote_version,
-        ),
+        identity=identity,
     )
     wav_path = _prepare_split_wav(server.media_path, staged)
     try:
@@ -710,6 +788,11 @@ def _build_split_proposal(
             )
             for local_index in sorted(local_embeddings)
         }
+        recipe = (
+            _split_recipe_centroids(wav_path, staged, speaker_id, assignment, identity)
+            if staged.embedding_lane == turnembed.LANE_DECOUPLED
+            else None
+        )
         groups = _proposal_groups(wav_path, staged.turns, assignment)
     finally:
         wav_path.unlink(missing_ok=True)
@@ -723,6 +806,7 @@ def _build_split_proposal(
         media_fingerprint=staged.media_fingerprint,
         assignment=ordered_assignment,
         embeddings=tuple(sorted(embeddings.items())),
+        recipe_centroids=recipe,
     )
     response: dict[str, object] = {
         "speaker_id": speaker_id,
@@ -901,8 +985,26 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
             len(vector) != validated.embedding_dim for vector in (*group_a, *group_b)
         ):
             raise SplitConflict("split proposal embedding dimension changed")
-        centroid_a = turnembed.normalized_centroid(group_a)
-        centroid_b = turnembed.normalized_centroid(group_b)
+        if proposal.recipe_centroids is None:
+            # Legacy lane: the mean of the whole-turn pyannote embeddings.
+            group_centroids: dict[str, list[float] | None] = {
+                "A": turnembed.normalized_centroid(group_a),
+                "B": turnembed.normalized_centroid(group_b),
+            }
+        else:
+            # Decoupled lane: the centroid-v1 voiceprints the proposal computed
+            # with the capture's embedder, so the split sidecar matches what a
+            # fresh capture of the relabelled turns would write.
+            recipe = dict(proposal.recipe_centroids)
+            group_centroids = {
+                group: (list(recipe[group]) if group in recipe else None)
+                for group in ("A", "B")
+            }
+            if any(
+                vector is not None and len(vector) != validated.embedding_dim
+                for vector in group_centroids.values()
+            ):
+                raise SplitConflict("split proposal embedding dimension changed")
 
         updated_sibling = copy.deepcopy(sibling)
         raw_turns = updated_sibling.get("speaker_turns")
@@ -923,8 +1025,13 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
             updated_binding, dict
         ):
             raise Phase2DataError("voiceprints speakers and binding must be objects")
-        updated_speakers[proposal.speaker_id] = centroid_a
-        updated_speakers[new_id] = centroid_b
+        for group, label in (("A", proposal.speaker_id), ("B", new_id)):
+            centroid = group_centroids[group]
+            if centroid is None:
+                # Same rule as capture: no usable segment, no voiceprint.
+                updated_speakers.pop(label, None)
+            else:
+                updated_speakers[label] = centroid
         updated_binding["turns_digest"] = canonical_turns_digest(updated_turns)
         validate_voiceprint_conjunction(
             updated_sidecar,
