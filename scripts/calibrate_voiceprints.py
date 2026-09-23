@@ -26,17 +26,30 @@ Audio: the separated-vocals cache ``voxweave transcribe`` left next to the
 media is used when present (the same signal captured voiceprints are computed
 on); otherwise the original mix is decoded, with a warning.
 
-Models (``--models``, comma separated):
+Models (``--models``, comma separated; default
+``redimnet2,anime-va,pyannote-community-1``):
 
 * ``redimnet2``, ``anime-va``: the registered voiceembed checkpoints.
-* ``pyannote-embedding``: the WeSpeaker ResNet34 embedding of the diarization
-  pipeline, loaded standalone the way the split feature loads it (needs the
-  Hugging Face token used for diarization).
+* ``pyannote-community-1`` (the default baseline): the embedding submodel of
+  the default diarization pipeline, ``embedding/pytorch_model.bin`` of the
+  ``pyannote/speaker-diarization-community-1`` snapshot -- what the legacy
+  ``pyannote`` voiceprint lane stores with the default diarizer.
+* ``pyannote-embedding``: the standalone WeSpeaker ResNet34 checkpoint
+  ``pyannote/wespeaker-voxceleb-resnet34-LM`` the 3.1 pipeline embeds with. It
+  is a different file (different SHA-256) from community-1's submodel; keep it
+  for comparisons with voice stores built under ``--diarize-model 3.1``. (At
+  community-1 revision 3533c8c and WeSpeaker revision 837717d the two files
+  hold bit-identical weights and differ only in their pyannote metadata, so
+  their scores match; the report still names the checkpoint that was scored.)
+
+Both pyannote baselines load standalone the way the split feature loads them
+and need the Hugging Face token used for diarization. The report records the
+resolved checkpoint (revision and SHA-256) of each.
 
 Usage::
 
     python scripts/calibrate_voiceprints.py ep01.mkv ep02.mkv \\
-        --models redimnet2,anime-va,pyannote-embedding --out voiceprints-calib.json
+        --models redimnet2,anime-va,pyannote-community-1 --out voiceprints-calib.json
 
 Exit codes: 0 = report written, 2 = invalid input.
 """
@@ -62,8 +75,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from voxweave import voiceembed  # noqa: E402
 
+PYANNOTE_COMMUNITY_1 = "pyannote-community-1"
 PYANNOTE_EMBEDDING = "pyannote-embedding"
-DEFAULT_MODELS = ("redimnet2", "anime-va", PYANNOTE_EMBEDDING)
+PYANNOTE_BASELINES = (PYANNOTE_COMMUNITY_1, PYANNOTE_EMBEDDING)
+DEFAULT_MODELS = ("redimnet2", "anime-va", PYANNOTE_COMMUNITY_1)
 # Segments per speaker fed to the target split (longest first, then back to
 # time order); more than the capture cap so odd/even halves stay meaningful.
 DEFAULT_MAX_SEGMENTS = 40
@@ -219,7 +234,10 @@ def _voiceembed_embedder(alias: str) -> Embedder:
     choice = voiceembed.normalize_voiceprint_choice(alias, source="--models")
     spec = voiceembed.spec_by_name(choice)
     if spec is None:
-        raise ValueError(f"--models entry {alias!r} is not a dedicated embedder")
+        raise ValueError(
+            f"--models entry {alias!r} is not a dedicated embedder; the pyannote "
+            f"baselines are {', '.join(PYANNOTE_BASELINES)}"
+        )
     return Embedder(
         name=alias,
         embed=lambda waveform, spans: voiceembed.embed_segments(waveform, spans, spec),
@@ -228,17 +246,37 @@ def _voiceembed_embedder(alias: str) -> Embedder:
     )
 
 
-def _pyannote_embedder() -> Embedder:
+def pyannote_source(name: str) -> str:
+    """Embedding checkpoint of a pyannote baseline, in turnembed's source grammar."""
+    from voxweave import config, turnembed
+
+    if name == PYANNOTE_COMMUNITY_1:
+        return f"{config.COMMUNITY_DIARIZE_MODEL}#subfolder=embedding"
+    if name == PYANNOTE_EMBEDDING:
+        return turnembed.EMBEDDING_MODEL
+    raise ValueError(f"--models entry {name!r} is not a pyannote baseline")
+
+
+def _pyannote_embedder(name: str) -> Embedder:
     from voxweave import turnembed
 
+    source = pyannote_source(name)
     state: dict[str, Any] = {}
+    # Filled in with the resolved revision and checkpoint once loaded.
+    identity: dict[str, object] = {"source": source}
 
     def load() -> tuple[Any, int]:
         if "inference" not in state:
-            inference, identity = turnembed._load_inference(None)
+            inference, loaded = turnembed._load_inference(None, source=source)
             state["inference"] = inference
             state["minimum"] = turnembed._minimum_samples(inference)
-            state["identity"] = identity
+            identity.update(
+                {
+                    "model": loaded.model,
+                    "checkpoint_sha256": loaded.checkpoint_sha256,
+                    "pyannote_version": loaded.pyannote_version,
+                }
+            )
         return state["inference"], state["minimum"]
 
     def embed(waveform: np.ndarray, spans: Sequence[Span]) -> np.ndarray:
@@ -277,17 +315,12 @@ def _pyannote_embedder() -> Embedder:
         except ModuleNotFoundError:
             pass
 
-    return Embedder(
-        name=PYANNOTE_EMBEDDING,
-        embed=embed,
-        release=release,
-        identity={"model": turnembed.EMBEDDING_MODEL},
-    )
+    return Embedder(name=name, embed=embed, release=release, identity=identity)
 
 
 def build_embedder(name: str) -> Embedder:
-    if name == PYANNOTE_EMBEDDING:
-        return _pyannote_embedder()
+    if name in PYANNOTE_BASELINES:
+        return _pyannote_embedder(name)
     return _voiceembed_embedder(name)
 
 

@@ -165,3 +165,96 @@ def test_unknown_model_is_an_input_error(tmp_path, capsys):
 
     assert code == 2
     assert "unknown voiceprint model" in capsys.readouterr().err
+
+
+def test_the_default_pyannote_baseline_is_community_1():
+    assert calib.DEFAULT_MODELS == ("redimnet2", "anime-va", "pyannote-community-1")
+    assert calib.pyannote_source("pyannote-community-1") == (
+        "pyannote/speaker-diarization-community-1#subfolder=embedding"
+    )
+    # The 3.1-era standalone WeSpeaker checkpoint stays available by name.
+    assert calib.pyannote_source("pyannote-embedding") == (
+        "pyannote/wespeaker-voxceleb-resnet34-LM"
+    )
+
+
+class _FakePyannoteInference:
+    min_num_samples = 400
+
+    def __init__(self) -> None:
+        self.shapes: list[tuple[int, ...]] = []
+
+    def __call__(self, tensor):
+        self.shapes.append(tuple(tensor.shape))
+        return np.array([[3.0, 4.0]])
+
+
+@pytest.mark.parametrize(
+    ("name", "source"),
+    [
+        (
+            "pyannote-community-1",
+            "pyannote/speaker-diarization-community-1#subfolder=embedding",
+        ),
+        ("pyannote-embedding", "pyannote/wespeaker-voxceleb-resnet34-LM"),
+    ],
+)
+def test_pyannote_baselines_load_their_own_checkpoint(monkeypatch, name, source):
+    from voxweave import turnembed
+
+    inference = _FakePyannoteInference()
+    requested: list[tuple[object, object]] = []
+
+    def fake_load(expected_identity=None, *, source=None):
+        requested.append((expected_identity, source))
+        return inference, turnembed.EmbeddingIdentity(
+            model=f"{source}@rev",
+            checkpoint_sha256="a" * 64,
+            pyannote_version="4.0.7",
+        )
+
+    monkeypatch.setattr(turnembed, "_load_inference", fake_load)
+    embedder = calib.build_embedder(name)
+    assert embedder.name == name
+    assert embedder.identity == {"source": source}
+
+    rows = embedder.embed(np.ones(3 * 16000, dtype=np.float32), [(0.0, 2.5)])
+
+    assert requested == [(None, source)]
+    assert rows.shape == (1, 2)
+    assert rows[0] == pytest.approx([0.6, 0.8])
+    assert embedder.identity == {
+        "source": source,
+        "model": f"{source}@rev",
+        "checkpoint_sha256": "a" * 64,
+        "pyannote_version": "4.0.7",
+    }
+    embedder.release()
+
+
+def test_turnembed_loads_the_community_1_embedding_submodel(monkeypatch):
+    from voxweave import turnembed
+
+    downloads: list[object] = []
+
+    def fake_download(authority, token):
+        downloads.append((authority, token))
+        raise turnembed.TurnEmbeddingError("stop after resolving the authority")
+
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
+    monkeypatch.setattr(turnembed, "_download_checkpoint", fake_download)
+
+    with pytest.raises(turnembed.TurnEmbeddingError, match="stop after"):
+        turnembed._load_inference(
+            None, source=calib.pyannote_source("pyannote-community-1")
+        )
+    with pytest.raises(turnembed.TurnEmbeddingError, match="either"):
+        turnembed._load_inference(
+            turnembed.EmbeddingIdentity("m", "a" * 64, "4.0.7"), source="m"
+        )
+
+    ((authority, token),) = downloads
+    assert authority.checkpoint == "pyannote/speaker-diarization-community-1"
+    assert authority.subfolder == "embedding"
+    assert authority.revision is None
+    assert token == "hf_test_token"

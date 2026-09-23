@@ -299,10 +299,24 @@ def _construct_bound_checkpoint(
 
 def _load_inference(
     expected_identity: EmbeddingIdentity | None = None,
+    *,
+    source: str | None = None,
 ) -> tuple[Any, EmbeddingIdentity]:
-    """Load the production embedding family lazily on the best torch device."""
+    """Load the production embedding family lazily on the best torch device.
+
+    ``source`` (only without ``expected_identity``) names another pyannote
+    embedding checkpoint in the canonical ``checkpoint[@rev][#subfolder=]``
+    grammar, e.g. the community-1 pipeline's ``#subfolder=embedding`` model;
+    the default is the standalone WeSpeaker ResNet34 checkpoint.
+    """
+    if expected_identity is not None and source is not None:
+        raise TurnEmbeddingError("pass either an expected identity or a source")
     if expected_identity is None:
-        authority = _EmbeddingAuthority(EMBEDDING_MODEL, None, None)
+        authority = (
+            _EmbeddingAuthority(EMBEDDING_MODEL, None, None)
+            if source is None
+            else _parse_embedding_source(source)
+        )
     else:
         if (
             expected_identity.lane != LANE_LEGACY
