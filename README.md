@@ -423,7 +423,11 @@ it read and otherwise stops ("re-run the command"), so a missing lock cannot sil
 update, only make one of two simultaneous writers fail. Files are replaced by an atomic rename
 within the directory. File-sync services are not a lock and can produce conflicting copies; use
 a real network mount. A library directory created by VoxWeave is private (`0700`, files
-`0600`); a directory you created beforehand keeps its permissions.
+`0600`); a directory you created beforehand keeps its permissions. Only the built-in location
+gets missing parent directories created: for `--voices-dir`, `VOXWEAVE_VOICES_DIR` or
+`[voices].dir` the parent must already exist, so an unmounted share (an empty mount point) makes
+`speakers enroll` fail instead of starting a second library on the local disk, and
+`speakers serve` warns that the library is missing.
 
 **Privacy.** The library holds voice biometrics of the people you name; the first write into a
 new library prints a notice saying so. `voxweave voices list` and `voxweave voices show ID|NAME`

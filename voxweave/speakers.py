@@ -311,7 +311,7 @@ def _library_matching(
     sidecar: Mapping[str, object],
     *,
     media: Path,
-    root: Path,
+    location: voicelibrary.LibraryLocation,
     scope: str,
     folder_scope: bool,
 ) -> tuple[dict[str, SpeakerMatch], dict[str, object]] | None:
@@ -323,12 +323,22 @@ def _library_matching(
     the scope is this folder (or equals the store's show), else tier 2, and
     identities the library already holds are left to the library copy.
     """
+    root = location.root
     provenance = cast(Mapping[str, object], sidecar["provenance"])
     try:
         space_name, fingerprint = voicelibrary.space_identity(provenance)
     except Phase2DataError as exc:
         log.warning("voice library matching skipped: %s", exc)
         return None
+    if not location.default and not root.is_dir():
+        # A missing default library is simply empty; a configured one that
+        # is missing is usually a network share that is not mounted.
+        log.warning(
+            "voice library %s (set by %s) does not exist; is a network share "
+            "not mounted? Suggestions come only from a per-folder store",
+            root,
+            location.source,
+        )
     try:
         with voicelibrary.library_lock(root, exclusive=False):
             state = voicelibrary.read_state(root, spaces=[space_name])
@@ -1519,7 +1529,7 @@ def create_speaker_audition(
                 f"--diarize --voiceprints or use --no-match: {exc}"
             ) from exc
 
-    library_root: Path | None = None
+    library_location: voicelibrary.LibraryLocation | None = None
     library_scope: str | None = None
     try:
         if no_match or voices is None:
@@ -1527,7 +1537,7 @@ def create_speaker_audition(
         else:
             store_stage = _load_generation_store(media, voices=voices, show=show)
         if not no_match and voices is None:
-            library_root = voicelibrary.resolve_voices_dir(voices_dir).root
+            library_location = voicelibrary.resolve_voices_dir(voices_dir)
             library_scope = voicelibrary.episode_scope(media, show)
     except (OSError, RuntimeError, Phase2DataError):
         _delete_stale_suggest_for_refusal(
@@ -1644,14 +1654,14 @@ def create_speaker_audition(
                     matched = None
                 if matched is not None:
                     matches, suggest_record, _thresholds = matched
-            elif library_root is not None and pair is not None:
+            elif library_location is not None and pair is not None:
                 assert current_sidecar is not None
                 assert library_scope is not None
                 try:
                     library_matched = _library_matching(
                         current_sidecar,
                         media=media,
-                        root=library_root,
+                        location=library_location,
                         scope=library_scope,
                         folder_scope=show is None,
                     )
@@ -2138,7 +2148,8 @@ def _enroll_into_library(
 ) -> Path:
     """Enroll into the global voice library under the episode's scope."""
     paths = _enrollment_paths(media)
-    root = voicelibrary.resolve_voices_dir(voices_dir).root
+    location = voicelibrary.resolve_voices_dir(voices_dir)
+    root = location.root
     scope = voicelibrary.episode_scope(media, show)
     episode_key = normalize_episode(episode or media.stem)
     staged = _stage_enrollment(paths)
@@ -2149,7 +2160,9 @@ def _enroll_into_library(
         raise RuntimeError(f"cannot snapshot media for enrollment: {exc}") from exc
     try:
         with episode_lock(media):
-            with voicelibrary.library_lock(root, exclusive=True):
+            with voicelibrary.library_lock(
+                root, exclusive=True, create_parents=location.default
+            ):
                 evidence = _recheck_enrollment(media, staged, snapshot.fingerprint)
                 provenance = cast(Mapping[str, object], evidence.sidecar["provenance"])
                 try:

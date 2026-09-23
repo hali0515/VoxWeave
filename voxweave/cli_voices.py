@@ -239,8 +239,11 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
             space_name, _fingerprint = voicelibrary.space_identity(
                 cast(Mapping[str, object], store["provenance"])
             )
-            root = voicelibrary.resolve_voices_dir(voices_dir).root
-            with voicelibrary.library_lock(root, exclusive=True):
+            location = voicelibrary.resolve_voices_dir(voices_dir)
+            root = location.root
+            with voicelibrary.library_lock(
+                root, exclusive=True, create_parents=location.default
+            ):
                 state = voicelibrary.read_state(root, spaces=[space_name])
                 change, summary = voicelibrary.import_store(
                     state,

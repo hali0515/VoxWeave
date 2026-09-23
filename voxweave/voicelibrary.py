@@ -135,10 +135,17 @@ class UnknownIdentity(LookupError):
 
 @dataclass(frozen=True)
 class LibraryLocation:
-    """The resolved library directory and the precedence layer that chose it."""
+    """The resolved library directory and the precedence layer that chose it.
+
+    ``default`` marks the built-in location, the only one whose missing
+    parent directories a writer creates: a configured location may sit on a
+    network share, and creating its parents under an unmounted mount point
+    would start a second, local library that the share later hides.
+    """
 
     root: Path
     source: str
+    default: bool = False
 
 
 def default_voices_dir(environ: Mapping[str, str] | None = None) -> LibraryLocation:
@@ -153,10 +160,14 @@ def default_voices_dir(environ: Mapping[str, str] | None = None) -> LibraryLocat
     xdg = values.get("XDG_DATA_HOME", "").strip()
     if xdg and Path(xdg).is_absolute():
         return LibraryLocation(
-            Path(xdg) / "voxweave" / "voices", "built-in default ($XDG_DATA_HOME)"
+            Path(xdg) / "voxweave" / "voices",
+            "built-in default ($XDG_DATA_HOME)",
+            default=True,
         )
     return LibraryLocation(
-        Path.home() / ".local" / "share" / "voxweave" / "voices", "built-in default"
+        Path.home() / ".local" / "share" / "voxweave" / "voices",
+        "built-in default",
+        default=True,
     )
 
 
@@ -574,32 +585,45 @@ def _chmod_best_effort(path: Path, mode: int) -> None:
         pass
 
 
-def _ensure_private_dir(path: Path) -> None:
-    """Create ``path`` (and parents); only a directory created here gets 0o700.
+def _ensure_private_dir(path: Path, *, parents: bool = False) -> None:
+    """Create ``path``; only a directory created here gets 0o700.
 
     A pre-existing directory keeps its mode, so a NAS share prepared for
     several users or machines is never narrowed behind the owner's back.
+    Missing parents are created only with ``parents`` (the built-in
+    location); otherwise they are refused, since a missing parent of a
+    configured library usually is a network share that is not mounted.
     """
     if path.is_dir():
         return
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        path.mkdir(parents=parents, exist_ok=True, mode=0o700)
+    except FileNotFoundError as exc:
+        raise VoiceLibraryError(
+            f"cannot create the voice library {path}: its parent directory "
+            f"{path.parent} does not exist (is a network share not mounted?); "
+            "create the parent directory first if this location is intended"
+        ) from exc
     _chmod_best_effort(path, 0o700)
 
 
 @contextmanager
-def library_lock(root: Path, *, exclusive: bool) -> Iterator[bool]:
+def library_lock(
+    root: Path, *, exclusive: bool, create_parents: bool = False
+) -> Iterator[bool]:
     """Hold the library-wide flock; yield whether a lock is actually held.
 
-    ``exclusive`` creates the library directory and its 0o600 lock file. A
+    ``exclusive`` creates the library directory (and, with
+    ``create_parents``, its missing parents) and its 0o600 lock file. A
     shared lock never creates the directory: a missing library, or a
     read-only one that never had a lock file, is read without a lock (no
     locking writer can have written it). flock on NFSv4 (and on NFSv3 with
     NLM) is emulated with byte-range locks; a ``nolock`` mount makes it
-    local-only, which the compare-and-swap in :func:`commit` still detects.
+    local-only (see :func:`commit` for what that still catches).
     """
     paths = LibraryPaths(Path(root))
     if exclusive:
-        _ensure_private_dir(paths.root)
+        _ensure_private_dir(paths.root, parents=create_parents)
         descriptor = os.open(paths.lock, os.O_RDWR | os.O_CREAT, 0o600)
     else:
         if not paths.root.is_dir():

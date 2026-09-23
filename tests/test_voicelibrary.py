@@ -582,6 +582,34 @@ def test_shared_lock_never_creates_a_missing_library(tmp_path):
     assert not root.exists()
 
 
+def test_a_configured_library_never_creates_missing_parents(tmp_path):
+    # An empty mount point: the NAS share holding the library is not mounted.
+    mount = tmp_path / "nas"
+    mount.mkdir()
+    root = mount / "voxweave" / "voices"
+    with pytest.raises(voicelibrary.VoiceLibraryError, match="not mounted"):
+        with voicelibrary.library_lock(root, exclusive=True):
+            pass
+    assert list(mount.iterdir()) == []
+    # Only the leaf is created when its parent exists.
+    (mount / "voxweave").mkdir()
+    with voicelibrary.library_lock(root, exclusive=True):
+        pass
+    assert root.is_dir()
+    # The built-in default location creates its parents.
+    default = tmp_path / "data" / "voxweave" / "voices"
+    with voicelibrary.library_lock(default, exclusive=True, create_parents=True):
+        pass
+    assert default.is_dir()
+
+
+def test_only_the_built_in_location_is_marked_default(tmp_path, monkeypatch):
+    assert voicelibrary.resolve_voices_dir().default
+    assert not voicelibrary.resolve_voices_dir(tmp_path / "cli").default
+    monkeypatch.setenv("VOXWEAVE_VOICES_DIR", str(tmp_path / "env"))
+    assert not voicelibrary.resolve_voices_dir().default
+
+
 def test_existing_shared_directory_keeps_its_mode(tmp_path):
     root = tmp_path / "shared"
     root.mkdir(mode=0o770)

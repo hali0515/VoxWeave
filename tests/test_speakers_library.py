@@ -140,6 +140,7 @@ def test_enroll_defaults_to_the_library_scoped_by_folder(tmp_path):
 
 def test_show_names_the_scope_and_voices_dir_moves_the_library(tmp_path):
     media = _episode(tmp_path / "S01", names={"SPEAKER_00": "Aqua"})
+    (tmp_path / "nas").mkdir()
     root = tmp_path / "nas" / "voices"
 
     assert (
@@ -149,6 +150,22 @@ def test_show_names_the_scope_and_voices_dir_moves_the_library(tmp_path):
     [identity] = _library(root).identity_map.values()
     assert identity["scopes"] == ["KonoSuba"]
     assert not _library().identity_map  # the default library stays untouched
+
+
+def test_an_unmounted_configured_library_is_refused_and_warned(tmp_path, caplog):
+    media = _episode(tmp_path / "S01", names={"SPEAKER_00": "Aqua"})
+    mount = tmp_path / "nas"  # the share is not mounted: an empty directory
+    mount.mkdir()
+    root = mount / "voxweave" / "voices"
+
+    with pytest.raises(voicelibrary.VoiceLibraryError, match="not mounted"):
+        speakers.enroll_speaker_voices(media, voices_dir=root)
+    assert list(mount.iterdir()) == []
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        speakers.create_speaker_audition(media, voices_dir=root)
+    assert "does not exist; is a network share not mounted?" in caplog.text
+    assert list(mount.iterdir()) == []
 
 
 def test_voices_and_voices_dir_are_exclusive(tmp_path):
@@ -300,7 +317,7 @@ def test_imported_legacy_store_stops_the_hint_and_the_library_copy_wins(
     media = _episode(tmp_path / "Show")
     legacy_path, store = _legacy_folder_store(tmp_path / "Show")
     root = voicelibrary.resolve_voices_dir().root
-    with voicelibrary.library_lock(root, exclusive=True):
+    with voicelibrary.library_lock(root, exclusive=True, create_parents=True):
         state = voicelibrary.read_state(
             root, spaces=[voicelibrary.space_identity(PROVENANCE)[0]]
         )
