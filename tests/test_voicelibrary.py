@@ -785,6 +785,102 @@ def test_import_is_idempotent_and_keeps_ids(tmp_path):
     assert [row["action"] for row in _history(root)].count("import") == 1
 
 
+def _dated_legacy_store(identity_count_dates, *, first_number=100):
+    """One legacy identity "Aqua" with one exemplar per given ``added`` date."""
+    store = voicestore.new_voice_store("Legacy", _decoupled())
+    for offset, added in enumerate(identity_count_dates):
+        number = first_number + offset
+        store = voicestore.enroll_exemplar(
+            store,
+            raw_name="Aqua",
+            capture_id=f"c{number:032x}",
+            media_fingerprint=f"{number:064x}",
+            episode=f"legacy{offset}",
+            vector=_unit(offset % 16),
+            at=added,
+        ).store
+    [identity_id] = store["identities"]
+    return store, identity_id
+
+
+def _enroll_dated(root, identity_id, dates, *, first_number=200):
+    ids = _Ids()
+    ids.exemplar = first_number
+    for offset, added in enumerate(dates):
+        number = first_number + offset
+        _enroll(
+            root,
+            [_entry(identity_id=identity_id, vector=_unit(offset % 16))],
+            scope="Legacy",
+            source=_source(number, episode=f"new{offset}"),
+            ids=ids,
+            at=added,
+        )
+
+
+def _added_stamps(root, identity_id):
+    state = _read(root)
+    [name] = state.spaces
+    return sorted(item["added"] for item in state.space_exemplars(name)[identity_id])
+
+
+def test_importing_older_samples_into_a_full_identity_changes_nothing(tmp_path):
+    root = tmp_path / "voices"
+    legacy_dates = [f"2025-01-0{day}T00:00:00Z" for day in range(1, 6)]
+    library_dates = [f"2026-09-0{day}T00:00:00Z" for day in range(1, 6)]
+    store, identity_id = _dated_legacy_store(legacy_dates)
+    # The library already knows the identity (adopted from a suggestion).
+    _enroll_dated(root, identity_id, library_dates)
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    for _attempt in range(2):
+        change, summary = _import(root, store, scope="Legacy")
+        assert change.empty
+        assert (summary.exemplars_added, summary.exemplars_superseded) == (0, 5)
+        assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+    assert _added_stamps(root, identity_id) == library_dates
+
+
+def test_import_keeps_the_newest_samples_of_the_union_once(tmp_path):
+    root = tmp_path / "voices"
+    legacy_dates = [f"2025-01-0{day}T00:00:00Z" for day in range(1, 6)]
+    library_dates = [f"2026-09-0{day}T00:00:00Z" for day in range(1, 4)]
+    store, identity_id = _dated_legacy_store(legacy_dates)
+    _enroll_dated(root, identity_id, library_dates)
+
+    _change, summary = _import(root, store, scope="Legacy")
+    assert (summary.exemplars_added, summary.exemplars_superseded) == (2, 3)
+    assert _added_stamps(root, identity_id) == sorted(
+        [*legacy_dates[-2:], *library_dates]
+    )
+    # Nothing was swapped in and out again within the import.
+    assert not [row for row in _history(root) if row["action"] == "evict"]
+    again, second = _import(root, store, scope="Legacy")
+    assert again.empty
+    assert (second.exemplars_present, second.exemplars_superseded) == (2, 3)
+
+
+def test_the_import_hint_stops_once_newer_samples_supersede_the_store(tmp_path):
+    root = tmp_path / "voices"
+    store, identity_id = _dated_legacy_store(
+        ["2025-01-01T00:00:00Z", "2025-01-02T00:00:00Z"]
+    )
+    _import(root, store, scope="Legacy")
+    _enroll_dated(
+        root, identity_id, [f"2026-09-0{day}T00:00:00Z" for day in range(1, 6)]
+    )
+    name, _ = voicelibrary.space_identity(store["provenance"])
+    state = _read(root, spaces=[name])
+    pools = voicelibrary.matching_pools(state, name, "Legacy")
+    _pools, unimported = voicelibrary.add_legacy_store(
+        pools, store, state=state, space_name=name, in_scope=True
+    )
+    assert not unimported
+    # Following a hint anyway changes nothing.
+    change, _summary = _import(root, store, scope="Legacy")
+    assert change.empty
+
+
 def test_reimport_after_rename_keeps_the_library_name(tmp_path):
     root = tmp_path / "voices"
     store = _legacy_store(tmp_path / "legacy.json", names=("Aqua",))

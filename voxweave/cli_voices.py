@@ -257,11 +257,16 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
         root, summary = run(apply, reporter=False)
         for message in summary.refused:
             click.echo(f"skipped {message}", err=True)
+        superseded = (
+            f", {summary.exemplars_superseded} older than the samples already kept"
+            if summary.exemplars_superseded
+            else ""
+        )
         click.echo(
             f"imported {summary.identities_created} identities and "
             f"{summary.exemplars_added} voice sample(s) into {root} "
             f"(scope {summary.scope!r}, space {summary.space}); "
-            f"{summary.exemplars_present} already present"
+            f"{summary.exemplars_present} already present{superseded}"
         )
 
     @group.command("where", short_help="Print the voice library directory.")

@@ -1351,6 +1351,21 @@ def forget_identity(
     return change, removed
 
 
+def _older_than_retained(
+    keys: Sequence[ExemplarKey], added: str, exemplar_id: str
+) -> bool:
+    """Whether an exemplar stamped ``added`` would itself be the one displaced.
+
+    At the cap the oldest exemplar (by ``added``, then id) gives way. One
+    older than every retained exemplar would be displaced at once, so it
+    counts as already superseded instead of evicting a newer one: merging
+    old voice samples keeps the newest MAX_EXEMPLARS of the union.
+    """
+    if len(keys) < MAX_EXEMPLARS:
+        return False
+    return (added, exemplar_id) < min((key.added, key.id) for key in keys)
+
+
 @dataclass(frozen=True)
 class ImportSummary:
     space: str
@@ -1359,6 +1374,8 @@ class ImportSummary:
     exemplars_added: int
     exemplars_present: int
     refused: tuple[str, ...] = ()
+    # Older than every sample an identity at the cap already keeps.
+    exemplars_superseded: int = 0
 
 
 def import_store(
@@ -1378,6 +1395,9 @@ def import_store(
     library names. Exemplars go into the space of the store's frozen
     provenance and follow the same per-identity relation and cap as
     enrollment; one that contradicts the library is reported and skipped.
+    Newest first, so an identity at the cap keeps the newest samples of the
+    union: an older legacy sample is superseded, never swapped in for a
+    newer library one (which the next import would then swap back).
     """
     validated = validate_voice_store(store)
     scope = normalize_scope(scope)
@@ -1390,7 +1410,7 @@ def import_store(
     used_exemplars = _used_exemplar_ids(space)
     history: list[dict[str, object]] = []
     refused: list[str] = []
-    created_count = added_count = present_count = 0
+    created_count = added_count = present_count = superseded_count = 0
     identities_changed = space_changed = False
 
     for identity_id in sorted(validated.identities):
@@ -1400,6 +1420,7 @@ def import_store(
         legacy_exemplars = sorted(
             cast(list[Mapping[str, object]], legacy["exemplars"]),
             key=lambda item: (cast(str, item["added"]), cast(str, item["id"])),
+            reverse=True,
         )
         for legacy_exemplar in legacy_exemplars:
             episode = normalize_episode(legacy_exemplar["episode"])
@@ -1413,6 +1434,13 @@ def import_store(
             ):
                 # Imported before, possibly under another --scope.
                 present_count += 1
+                continue
+            if _older_than_retained(
+                keys,
+                cast(str, legacy_exemplar["added"]),
+                cast(str, legacy_exemplar["id"]),
+            ):
+                superseded_count += 1
                 continue
             try:
                 plan = plan_indexed_enrollment(
@@ -1497,6 +1525,7 @@ def import_store(
         exemplars_added=added_count,
         exemplars_present=present_count,
         refused=tuple(refused),
+        exemplars_superseded=superseded_count,
     )
     if space_changed and _list_space(identities_document, space_name):
         identities_changed = True
@@ -1668,7 +1697,9 @@ def add_legacy_store(
     Identities the library already holds are skipped (the library copy wins).
     Returns the new pools and whether the store holds anything the library
     lacks: an identity it does not have, or a capture that is not in this
-    space yet (the cue to suggest ``voxweave voices import``).
+    space yet and that an import would keep (the cue to suggest
+    ``voxweave voices import``); a capture older than every sample of an
+    identity at the cap is superseded, not missing.
     """
     validated = validate_voice_store(store)
     show = normalize_scope(validated.show)
@@ -1680,11 +1711,15 @@ def add_legacy_store(
         identity = cast(Mapping[str, object], raw)
         exemplars = cast(list[Mapping[str, object]], identity["exemplars"])
         if identity_id in state.identity_map:
-            present = {
-                cast(Mapping[str, object], item["source"])["capture_id"]
-                for item in library_exemplars.get(identity_id, [])
-            }
-            if any(item["capture_id"] not in present for item in exemplars):
+            keys = _exemplar_keys(library_exemplars.get(identity_id, []))
+            present = {key.capture_id for key in keys}
+            if any(
+                item["capture_id"] not in present
+                and not _older_than_retained(
+                    keys, cast(str, item["added"]), cast(str, item["id"])
+                )
+                for item in exemplars
+            ):
                 unimported = True
             continue
         unimported = True
