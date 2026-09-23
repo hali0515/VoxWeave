@@ -68,6 +68,36 @@ your own diarized episodes.
 **Split this speaker** embeds turns with whichever embedder the episode's voiceprints
 were captured with, so legacy episodes keep splitting as before.
 
+### Enrolled voices go to a global voice library
+
+`speakers enroll` without `--voices` used to need a per-folder `voxweave.voices.json`
+(created with `--voices PATH --show NAME`). It now saves into one voice library shared by
+every media folder, by default `~/.local/share/voxweave/voices` (or
+`$XDG_DATA_HOME/voxweave/voices`); `--voices-dir`, `VOXWEAVE_VOICES_DIR` or `[voices].dir`
+move it, for example onto a NAS shared by several machines. `voxweave voices where` shows
+which directory is in use. The first enrollment prints a notice that the library holds
+voice biometrics; `voxweave voices forget ID` removes one person.
+
+`speakers serve` suggests names from the library in two tiers: voices enrolled under the
+episode's scope (`--show`, else the media folder's name) as before, and voices of every
+other scope only above a stricter threshold (`VOXWEAVE_VOICES_GLOBAL_SUGGEST`), labelled
+with where they were heard and never prefilled.
+
+What stays the same, and what to do:
+
+- `--voices FILE` still selects a per-show store explicitly and behaves exactly as before;
+  it cannot be combined with `--voices-dir`.
+- An existing `voxweave.voices.json` beside the media is still used for suggestions, now
+  without `--show`, but is never written again. Merge it once with
+  `voxweave voices import path/to/voxweave.voices.json` (optionally `--scope NAME`; the
+  default is the store's show). Importing keeps its ids, so running it again adds nothing,
+  and the file is left untouched; delete it yourself once you no longer need it.
+- `--show` now also names the scope of an enrollment. Folder names such as `Season 1`
+  exist in many shows; pass `--show` there to keep shows apart.
+- Enrolling a name does not merge it with a same-named person of another scope unless you
+  used that person's suggestion on the review page; use `voxweave voices list`,
+  `show`, `rename` and `forget` to curate the result.
+
 ## 0.17.0
 
 Two performance settings were added, both off by default, and successful runs gained

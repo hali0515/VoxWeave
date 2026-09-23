@@ -359,28 +359,92 @@ is refused after any rewritten input changes.
 
 Voice matching across episodes is a separate, opt-in layer. Capture centroids with
 `--diarize --voiceprints`, review the ordinary empty mapping, then enroll only those
-human-entered names into an explicitly selected show store:
+human-entered names into your voice library:
 
 ```bash
 voxweave episode.mkv --diarize --voiceprints
 voxweave speakers serve episode.mkv
 # Save reviewed names in the browser first
-voxweave speakers enroll episode.mkv \
-  --voices ./example-show.voices.json --show "Example Show"
+voxweave speakers enroll episode.mkv
 
-# Later episodes: suggestions appear in the served page and a regenerable cache record.
-voxweave speakers serve episode-02.mkv --voices ./example-show.voices.json
+# Later episodes, in this folder or any other: suggestions appear in the served page and a
+# regenerable cache record.
+voxweave speakers serve ../season-2/episode-01.mkv
 ```
 
-A store belongs to one embedding space (see the voiceprint embedders under [Setup](#setup)):
-episodes captured with another embedder are skipped with a warning that names both spaces, and
-enrollment into such a store is refused. A store built before the dedicated embedders keeps
-working with `--voiceprint-model pyannote` (see [MIGRATING.md](MIGRATING.md)).
+#### Voice library
 
-A missing store is created only by `speakers enroll` with both explicit `--voices` and `--show`.
-Use `speakers enroll --replace` to replace this episode's prior contribution to that store.
-For reuse-only discovery, name it `voxweave.voices.json` beside the media and pass an equal
-normalized `--show`; discovery without `--show` reports the store but stays in manual mode.
+`speakers enroll` saves voices into one library shared by every media folder, so a voice
+enrolled in one season, show or folder of recordings can be suggested in another. The library
+directory is chosen by, first match wins:
+
+1. `--voices-dir DIR` (on `speakers serve`, `speakers enroll` and every `voices` command);
+2. `VOXWEAVE_VOICES_DIR`;
+3. `dir` under `[voices]` in `~/.config/voxweave.conf` (relative to that file's directory);
+4. `$XDG_DATA_HOME/voxweave/voices`, else `~/.local/share/voxweave/voices` (every platform).
+
+`voxweave voices where` prints the directory and which of these chose it. The library is plain
+JSON, one file per concern, and never holds audio:
+
+```
+identities.json              names, aliases and scopes of every identity
+spaces/<model>-<fp12>.json   the voice vectors of one embedding space
+history.jsonl                append-only log of changes (ids, scopes, episodes, counts; never vectors or people's names)
+.library.lock                one lock for the whole library
+```
+
+Each identity has a random id; names are attributes, so two identities may both be called
+"Alex". Names are shared by every embedding space (a rename applies everywhere), while vectors
+are kept per space: an episode captured with `redimnet2` is only compared with `redimnet2`
+vectors, and switching embedders starts a new space in the same library. A voice sample keeps a
+pointer to its source (media path, media fingerprint, capture id, speaker label, episode) so a
+future re-embedding can find the media again.
+
+**Scopes and tiers.** Every enrollment is tagged with a scope: `--show NAME`, else the name of
+the media's folder. When you review an episode, identities of its own scope are suggested as
+before (tier 1). Identities of every other scope (the same voice actor in another work, the same
+person in another folder of recordings) are suggested only above a stricter similarity bar
+(tier 2: `VOXWEAVE_VOICES_GLOBAL_SUGGEST`), are never prefilled, and are labelled with the scopes
+they come from. The bar is stricter because false suggestions grow with the library: if one
+unrelated voice clears it with probability *p*, a library of *N* unrelated voices produces at
+least one false suggestion with probability 1 - (1 - *p*)^*N*. Generic folder names such as
+`Season 1` are shared by many shows; pass `--show` to keep them apart.
+
+A name you enter links to an existing identity only when you used that identity's suggestion
+button, or when an identity of the same scope carries that name. Otherwise enrollment creates a
+new identity, even if another scope has someone of the same name; if a name is ambiguous within
+a scope, enrollment stops and asks you to rename one (`voxweave voices rename ID NAME`).
+
+**Sharing on a NAS.** Several machines can point `[voices].dir` at the same directory on a NAS.
+Writes take an exclusive `flock` on `.library.lock`; Linux NFS clients emulate it with byte-range
+locks, which works on NFSv4 and on NFSv3 with the lock manager, but a `nolock` mount keeps each
+lock local to its machine. Every write also checks that each file it replaces still holds what
+it read and otherwise stops ("re-run the command"), so a missing lock cannot silently lose an
+update, only make one of two simultaneous writers fail. Files are replaced by an atomic rename
+within the directory. File-sync services are not a lock and can produce conflicting copies; use
+a real network mount. A library directory created by VoxWeave is private (`0700`, files
+`0600`); a directory you created beforehand keeps its permissions.
+
+**Privacy.** The library holds voice biometrics of the people you name; the first write into a
+new library prints a notice saying so. `voxweave voices list` and `voxweave voices show ID|NAME`
+inspect it, `voxweave voices forget ID` removes one person from every space (the history keeps its
+entries about that id, which hold no name and no voice data), and deleting the directory removes
+everyone.
+
+**Per-show stores from earlier versions.** A `voxweave.voices.json` next to the media is still
+read for suggestions, never written, with a one-time hint to merge it with
+`voxweave voices import PATH [--scope NAME]` (default scope: the store's show). Import keeps the
+store's ids, so importing it again adds nothing, and leaves the file unchanged. `--voices FILE`
+still selects a per-show store explicitly, with its previous behavior (a missing one is created
+only with both `--voices` and `--show`); it cannot be combined with `--voices-dir`.
+
+A space belongs to one embedding model (see the voiceprint embedders under [Setup](#setup));
+a per-show store captured with another embedder is skipped with a warning that names both
+spaces, and enrollment into such a store is refused. A store built before the dedicated
+embedders keeps working with `--voiceprint-model pyannote` (see [MIGRATING.md](MIGRATING.md)).
+
+Use `speakers enroll --replace` to replace this episode's prior contribution (the same episode
+label within the same scope, or the same media).
 The shipped matching policy is **suggest-only**: `VOXWEAVE_VOICES_ACCEPT` defaults to `off`,
 so stored names appear as review buttons and never become authoritative mapping values.
 Even when an operator configures a finite accept threshold, a machine prefill exists only in
@@ -407,7 +471,7 @@ the human-edited mapping.
 
 `voxweave speakers list episode.mkv` inspects that episode's speaker turns, reviewed
 mapping, and voiceprint state without changing them. Add `--json` for machine-readable
-output. It does not list or select a show-level voices store.
+output. It does not read the voice library; use `voxweave voices list` for that.
 
 ### Re-align after editing
 
@@ -726,6 +790,12 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
   uses its own default: `0.45` / `0.05` for `redimnet2` and the legacy `pyannote` lane,
   `0.35` / `0.05` for `anime-va` (whose same-speaker cosines run lower). The dedicated
   embedders' values are provisional; measure yours with `scripts/calibrate_voiceprints.py`
+- `VOXWEAVE_VOICES_GLOBAL_SUGGEST` (the stricter bar for voice-library suggestions from other
+  scopes; unset: `0.60` for `redimnet2` and `pyannote`, `0.50` for `anime-va`, all provisional;
+  never below the suggest threshold)
+- `VOXWEAVE_VOICES_DIR` (the voice library directory; same as `--voices-dir`, default
+  `[voices].dir` in the config, else `$XDG_DATA_HOME/voxweave/voices` or
+  `~/.local/share/voxweave/voices`)
 
 - `VOXWEAVE_MAX_CHUNK_SEC` (default 120; shorter chunks reduce ASR repetition loops on long segments)
 - `VOXWEAVE_LOUDNORM` (default `loudnorm=I=-16:TP=-1.5:LRA=11`; the `-af` filter for `--normalize`)
@@ -816,6 +886,13 @@ model = "community-1"
 # Voice stores are per embedding space; changing the diarizer does not affect redimnet2/anime-va.
 [voiceprint]
 model = "auto"
+
+# Voice library (= --voices-dir / env VOXWEAVE_VOICES_DIR): where `speakers enroll` saves named
+# voices, shared by every media folder. Default: $XDG_DATA_HOME/voxweave/voices, else
+# ~/.local/share/voxweave/voices. May be a NAS path shared by several machines (needs working
+# NFS locking, see "Voice library"). A relative path is relative to this file's directory.
+[voices]
+# dir = "/mnt/nas/voxweave/voices"
 
 # Default on/off for the boolean pipeline flags. An explicit CLI flag always wins
 # (e.g. separate = false here, --separate on the command line for one run).
