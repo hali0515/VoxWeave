@@ -21,14 +21,27 @@ def _isolate_voxweave_cache(tmp_path: Path) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_voiceprint_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Never inherit a developer's voiceprint embedder selection or checkpoints."""
-    for name in (
+def _isolate_voiceprint_model_env() -> Iterator[None]:
+    """Never inherit a developer's voiceprint embedder selection or checkpoints.
+
+    Plain os.environ bookkeeping on purpose: requesting ``monkeypatch`` from an
+    autouse conftest fixture would instantiate it before every module-level
+    autouse fixture and change their teardown order.
+    """
+    names = (
         "VOXWEAVE_VOICEPRINT_MODEL",
         "VOXWEAVE_REDIMNET2_CKPT",
         "VOXWEAVE_ANIME_VA_CKPT",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    )
+    previous = {name: os.environ.pop(name, None) for name in names}
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 @pytest.fixture(autouse=True)
