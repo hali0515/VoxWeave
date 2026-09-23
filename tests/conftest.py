@@ -69,6 +69,28 @@ def _offline_voiceprint_prefetch(request: pytest.FixtureRequest) -> Iterator[Non
 
 
 @pytest.fixture(autouse=True)
+def _isolate_voice_library(tmp_path: Path) -> Iterator[None]:
+    """Never read or write the developer's real voice library.
+
+    The built-in library location follows ``XDG_DATA_HOME``, so pointing it
+    at the test's temporary root keeps the default layer exercised while an
+    inherited ``VOXWEAVE_VOICES_DIR`` (or tier-2 threshold) cannot leak in.
+    Plain os.environ bookkeeping for the fixture-ordering reason above.
+    """
+    names = ("VOXWEAVE_VOICES_DIR", "VOXWEAVE_VOICES_GLOBAL_SUGGEST", "XDG_DATA_HOME")
+    previous = {name: os.environ.pop(name, None) for name in names}
+    os.environ["XDG_DATA_HOME"] = str(tmp_path / ".xdg-data")
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@pytest.fixture(autouse=True)
 def _isolate_voxweave_config(tmp_path: Path) -> Iterator[None]:
     """Never let a test read the developer's real ~/.config/voxweave.conf.
 

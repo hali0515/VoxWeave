@@ -186,6 +186,16 @@ _TEMPLATE = """\
 [voiceprint]
 # model = "auto"
 
+# Voice library (= --voices-dir / VOXWEAVE_VOICES_DIR): where `speakers enroll` stores the
+# named voices and `speakers serve` looks them up, across every media folder. Default:
+# $XDG_DATA_HOME/voxweave/voices, else ~/.local/share/voxweave/voices. It holds voice
+# biometrics of the people you name; `voxweave voices forget ID` removes one person.
+# It may point at a NAS path shared by several machines (plain JSON files plus one flock;
+# needs an NFSv4 or lock-enabled mount, not `nolock`). A relative path is relative to
+# this file's directory.
+[voices]
+# dir = "/mnt/nas/voxweave/voices"
+
 # Default on/off for the boolean pipeline flags. Explicit CLI flags always win
 # (e.g. separate = false here, --separate on the command line for one run).
 [defaults]
@@ -229,6 +239,7 @@ _KNOWN_KEYS = frozenset(
         "separate",
         "diarize",
         "voiceprint",
+        "voices",
         "align",
         "defaults",
         "llm",
@@ -549,6 +560,33 @@ def conf_voiceprint_model() -> str | None:
         )
         return None
     return _nonempty_str(raw)
+
+
+def conf_voices_dir() -> Path | None:
+    """Return ``[voices].dir`` as an absolute path, or None when unset.
+
+    ``~`` is expanded, and a relative value is taken relative to the config
+    file's directory (not the working directory, which changes per command).
+    Precedence against ``--voices-dir`` / ``VOXWEAVE_VOICES_DIR`` is resolved
+    by :func:`voxweave.voicelibrary.resolve_voices_dir`.
+    """
+    section = _load().get("voices")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        log.warning("config key %r has wrong type (expected table), ignoring", "voices")
+        return None
+    raw = section.get("dir")
+    if raw is not None and not isinstance(raw, str):
+        log.warning("config [voices].dir has wrong type (expected string), ignoring")
+        return None
+    value = _nonempty_str(raw)
+    if value is None:
+        return None
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        path = config_path().expanduser().absolute().parent / path
+    return path
 
 
 _LOAD_STRATEGIES = ("peak", "sum")
