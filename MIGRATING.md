@@ -89,8 +89,10 @@ What stays the same, and what to do:
   it cannot be combined with `--voices-dir`.
 - An existing `voxweave.voices.json` beside the media is still used for suggestions, now
   without `--show`, but is never written again. Merge it once with
-  `voxweave voices import path/to/voxweave.voices.json` (optionally `--scope NAME`; the
-  default is the store's show). Importing keeps its ids, so running it again adds nothing,
+  `voxweave voices import path/to/voxweave.voices.json`. Its voices keep both scopes the
+  file served before, its folder's and its show's, so the same suggestions stay in the
+  first tier (`--scope NAME` picks one scope instead; importing again with another
+  `--scope` adds it). Importing keeps its ids, so running it again adds nothing,
   and the file is left untouched; delete it yourself once you no longer need it. Such a
   file keeps the vectors of everyone in it: `voxweave voices forget ID` stops VoxWeave
   from reading them for that person and lists the files that still hold them, but only

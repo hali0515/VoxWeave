@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -273,7 +274,7 @@ def _warn_legacy_store_once(path: Path) -> None:
         "but new voices go to the voice library. Run `voxweave voices import %s` "
         "to merge it",
         path,
-        path,
+        shlex.quote(str(path)),
     )
 
 
@@ -334,8 +335,8 @@ def _library_matching(
         # A missing default library is simply empty; a configured one that
         # is missing is usually a network share that is not mounted.
         log.warning(
-            "voice library %s (set by %s) does not exist; is a network share "
-            "not mounted? Suggestions come only from a per-folder store",
+            "voice library %s (set by %s) does not exist yet, or its network "
+            "share is not mounted; suggestions come only from a per-folder store",
             root,
             location.source,
         )

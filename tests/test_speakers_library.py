@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import shlex
 from pathlib import Path
 
 import pytest
@@ -164,7 +165,7 @@ def test_an_unmounted_configured_library_is_refused_and_warned(tmp_path, caplog)
 
     with caplog.at_level(logging.WARNING, logger="voxweave"):
         speakers.create_speaker_audition(media, voices_dir=root)
-    assert "does not exist; is a network share not mounted?" in caplog.text
+    assert "does not exist yet, or its network share is not mounted" in caplog.text
     assert list(mount.iterdir()) == []
 
 
@@ -361,6 +362,48 @@ def test_legacy_folder_store_is_read_only_with_a_one_time_hint(tmp_path, caplog)
     assert "Aqua (1.00) [use]" in page  # tier 1: the store lives in this folder
     assert legacy_path.read_bytes() == before
     assert not (voicelibrary.resolve_voices_dir().root / "identities.json").exists()
+
+
+def test_importing_a_folder_store_keeps_its_suggestions_in_tier_one(tmp_path, caplog):
+    folder = tmp_path / "Show A"
+    near = [0.5, 0.75**0.5, *([0.0] * 14)]  # cosine 0.5: tier-1 bar only
+    media = _episode(folder, vectors={"SPEAKER_00": near})
+    legacy_path, store = _legacy_folder_store(folder)
+    [identity_id] = store["identities"]
+
+    def tier_one():
+        speakers.create_speaker_audition(media)
+        match = load_suggest(artifacts.claim_paths(media).speaker_suggest)["speakers"][
+            "SPEAKER_00"
+        ]
+        return [c["identity"] for c in match["candidates"]]
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert tier_one() == [identity_id]
+    # The hint is a command that works when pasted: the folder has a space.
+    quoted = shlex.quote(str(legacy_path.resolve()))
+    assert f"voxweave voices import {quoted}`" in caplog.text
+
+    # What the hinted `voxweave voices import PATH` does by default.
+    scopes = voicelibrary.default_import_scopes(legacy_path, store["show"])
+    root = voicelibrary.resolve_voices_dir().root
+    with voicelibrary.library_lock(root, exclusive=True, create_parents=True):
+        state = voicelibrary.read_state(
+            root, spaces=[voicelibrary.space_identity(PROVENANCE)[0]]
+        )
+        change, _summary = voicelibrary.import_store(
+            state,
+            store,
+            scope=scopes[0],
+            also_scopes=scopes[1:],
+            source_label=str(legacy_path),
+        )
+        voicelibrary.commit(state, change)
+
+    assert tier_one() == [identity_id]  # not demoted to the stricter tier 2
+    _name(media, {"SPEAKER_00": "Aqua"})
+    speakers.enroll_speaker_voices(media)
+    assert list(_library().identity_map) == [identity_id]  # no second "Aqua"
 
 
 def test_imported_legacy_store_stops_the_hint_and_the_library_copy_wins(

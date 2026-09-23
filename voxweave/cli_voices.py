@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -231,7 +232,10 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
         type=click.Path(exists=True, dir_okay=False, path_type=Path),
     )
     @click.option(
-        "--scope", help="Scope for the imported voices (default: the store's show)."
+        "--scope",
+        help="Scope for the imported voices (default: for a voxweave.voices.json, "
+        "its folder's scope and the store's show; otherwise the store's show). "
+        "Importing again with another scope adds it.",
     )
     @_voices_dir_option
     def import_command(
@@ -240,7 +244,8 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
         """Merge a voxweave.voices.json store into the voice library.
 
         Ids are kept, so importing the same store again adds nothing. The
-        store itself is left unchanged.
+        store itself is left unchanged. By default its voices keep the
+        scopes under which the store already served suggestions.
         """
         from voxweave import voicelibrary
         from voxweave.voicestore import load_voice_store, shared_store_lock
@@ -251,6 +256,13 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
             space_name, _fingerprint = voicelibrary.space_identity(
                 cast(Mapping[str, object], store["provenance"])
             )
+            scopes = (
+                (scope,)
+                if scope is not None
+                else voicelibrary.default_import_scopes(
+                    Path(os.path.abspath(store_path)), validated.show
+                )
+            )
             location = voicelibrary.resolve_voices_dir(voices_dir)
             root = location.root
             with voicelibrary.library_lock(
@@ -260,7 +272,8 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
                 change, summary = voicelibrary.import_store(
                     state,
                     store,
-                    scope=scope if scope is not None else validated.show,
+                    scope=scopes[0],
+                    also_scopes=scopes[1:],
                     source_label=str(handle.store_path),
                 )
                 voicelibrary.commit(state, change)
@@ -280,11 +293,19 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
             if summary.exemplars_superseded
             else ""
         )
+        scopes_added = (
+            f"; {summary.scopes_added} scope(s) added to existing identities"
+            if summary.scopes_added
+            else ""
+        )
+        scope_list = ("scope " if len(summary.scopes) == 1 else "scopes ") + ", ".join(
+            repr(item) for item in summary.scopes
+        )
         click.echo(
             f"imported {summary.identities_created} identities and "
             f"{summary.exemplars_added} voice sample(s) into {root} "
-            f"(scope {summary.scope!r}, space {summary.space}); "
-            f"{summary.exemplars_present} already present{superseded}"
+            f"({scope_list}, space {summary.space}); "
+            f"{summary.exemplars_present} already present{superseded}{scopes_added}"
         )
 
     @group.command("where", short_help="Print the voice library directory.")

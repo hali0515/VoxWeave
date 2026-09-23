@@ -1750,6 +1750,24 @@ class ImportSummary:
     exemplars_superseded: int = 0
     # Identities of the store that `voices forget` removed: never re-imported.
     forgotten: tuple[str, ...] = ()
+    # Every scope the store's identities now carry, and how many were new.
+    scopes: tuple[str, ...] = ()
+    scopes_added: int = 0
+
+
+def default_import_scopes(store_path: Path, show: str) -> tuple[str, ...]:
+    """The scopes under which a per-show store already served suggestions.
+
+    A ``voxweave.voices.json`` found beside the media served tier 1 both to
+    episodes of its folder (without ``--show``) and under its show, so its
+    identities keep both scopes, the folder's first (the scope its voice
+    samples are filed under). A store with another name was only ever used
+    with ``--voices`` and ``--show``: its show.
+    """
+    show_scope = normalize_scope(show)
+    if Path(store_path).name != LEGACY_STORE_NAME:
+        return (show_scope,)
+    return tuple(dict.fromkeys([episode_scope(Path(store_path)), show_scope]))
 
 
 def import_store(
@@ -1758,6 +1776,7 @@ def import_store(
     *,
     scope: str,
     source_label: str,
+    also_scopes: Sequence[str] = (),
     at: str | datetime | None = None,
     exemplar_id_factory: Callable[[], str] = _default_exemplar_id,
 ) -> tuple[LibraryChange, ImportSummary]:
@@ -1767,14 +1786,20 @@ def import_store(
     finds every capture already present and changes nothing; an identity the
     library already has (imported before, then maybe renamed) keeps its
     library names. Exemplars go into the space of the store's frozen
-    provenance and follow the same per-identity relation and cap as
-    enrollment; one that contradicts the library is reported and skipped.
-    Newest first, so an identity at the cap keeps the newest samples of the
-    union: an older legacy sample is superseded, never swapped in for a
-    newer library one (which the next import would then swap back).
+    provenance, filed under ``scope``, and follow the same per-identity
+    relation and cap as enrollment; one that contradicts the library is
+    reported and skipped. Newest first, so an identity at the cap keeps the
+    newest samples of the union: an older legacy sample is superseded, never
+    swapped in for a newer library one (which the next import would then
+    swap back). Every identity of the store gains ``scope`` and
+    ``also_scopes``, also on a re-import (the way to add a scope).
     """
     validated = validate_voice_store(store)
     scope = normalize_scope(scope)
+    import_scopes = list(
+        dict.fromkeys([scope, *(normalize_scope(extra) for extra in also_scopes)])
+    )
+    scopes_added = 0
     event_at = _event_time(at)
     provenance = cast(Mapping[str, object], store["provenance"])
     space_name, space = _space_for(state, provenance)
@@ -1876,19 +1901,21 @@ def import_store(
             identities[identity_id] = {
                 "display_name": legacy["display_name"],
                 "aliases": list(cast(list[str], legacy["aliases"])),
-                "scopes": [scope],
+                "scopes": list(import_scopes),
                 "created": event_at,
                 "updated": event_at,
             }
             created_count += 1
             identities_changed = True
-        elif added_here:
+        else:
             identity = identities[identity_id]
             scopes = cast(list[str], identity["scopes"])
-            if scope not in scopes:
-                identity["scopes"] = [*scopes, scope]
+            missing = [item for item in import_scopes if item not in scopes]
+            if missing:
+                identity["scopes"] = [*scopes, *missing]
                 identity["updated"] = event_at
                 identities_changed = True
+                scopes_added += len(missing)
         if added_here:
             exemplars_by_identity[identity_id] = current
             added_count += added_here
@@ -1903,6 +1930,8 @@ def import_store(
         refused=tuple(refused),
         exemplars_superseded=superseded_count,
         forgotten=tuple(skipped_forgotten),
+        scopes=tuple(import_scopes),
+        scopes_added=scopes_added,
     )
     if space_changed and _list_space(identities_document, space_name):
         identities_changed = True
@@ -1917,10 +1946,11 @@ def import_store(
             "import",
             event_at,
             source=source_label,
-            scope=scope,
+            scopes=list(import_scopes),
             space=space_name,
             identities_created=created_count,
             exemplars_added=added_count,
+            scopes_added=scopes_added,
         )
     )
     change = LibraryChange(
@@ -2162,6 +2192,7 @@ __all__ = [
     "VoiceLibraryError",
     "add_legacy_store",
     "commit",
+    "default_import_scopes",
     "default_voices_dir",
     "describe_identity",
     "empty_identities",
@@ -2174,6 +2205,7 @@ __all__ = [
     "identities_named",
     "identity_summary",
     "import_store",
+    "is_generic_folder_name",
     "legacy_store_candidates",
     "legacy_store_path",
     "legacy_stores_holding",

@@ -1095,9 +1095,53 @@ def test_reimport_after_rename_keeps_the_library_name(tmp_path):
         voicelibrary.commit(
             state, voicelibrary.rename_identity(state, identity_id, "Amamiya")
         )
-    _import(root, store, scope="Other")
+    _change, summary = _import(root, store, scope="Other")
     assert _read(root).identity_map[identity_id]["display_name"] == "Amamiya"
-    assert _read(root).identity_map[identity_id]["scopes"] == ["Example Show"]
+    # Importing again under another scope adds that scope (and records it),
+    # without copying the voice samples again.
+    assert _read(root).identity_map[identity_id]["scopes"] == ["Example Show", "Other"]
+    assert (summary.exemplars_added, summary.scopes_added) == (0, 1)
+    assert _history(root)[-1]["scopes_added"] == 1
+    again, _summary = _import(root, store, scope="Other")
+    assert again.empty
+
+
+def test_default_import_scopes_follow_where_the_store_served_suggestions(
+    tmp_path,
+):
+    beside_media = tmp_path / "Show A" / "voxweave.voices.json"
+    assert voicelibrary.default_import_scopes(beside_media, "Example Show") == (
+        "Show A",
+        "Example Show",
+    )
+    season = tmp_path / "Show A" / "Season 1" / "voxweave.voices.json"
+    assert voicelibrary.default_import_scopes(season, "Show A / Season 1") == (
+        "Show A / Season 1",
+    )
+    explicit = tmp_path / "stores" / "show-b.voices.json"
+    assert voicelibrary.default_import_scopes(explicit, "Show B") == ("Show B",)
+
+
+def test_import_files_samples_under_the_first_scope_and_adds_the_rest(tmp_path):
+    root = tmp_path / "voices"
+    store = _legacy_store(tmp_path / "legacy.json", names=("Aqua",))
+    [identity_id] = store["identities"]
+    name, _ = voicelibrary.space_identity(LEGACY)
+    with voicelibrary.library_lock(root, exclusive=True):
+        state = voicelibrary.read_state(root, spaces=[name])
+        change, summary = voicelibrary.import_store(
+            state,
+            store,
+            scope="Show A",
+            also_scopes=["Example Show"],
+            source_label="legacy.json",
+        )
+        voicelibrary.commit(state, change)
+    assert summary.scopes == ("Show A", "Example Show")
+    state = _read(root)
+    assert state.identity_map[identity_id]["scopes"] == ["Show A", "Example Show"]
+    [exemplar] = state.space_exemplars(name)[identity_id]
+    assert exemplar["scope"] == "Show A"
 
 
 def test_matching_pools_split_by_scope_and_legacy_coverage(tmp_path):

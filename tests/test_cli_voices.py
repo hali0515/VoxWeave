@@ -210,18 +210,27 @@ def test_import_is_idempotent_and_leaves_the_store_alone(tmp_path, invoke):
     first = invoke("voices", "import", legacy, "--voices-dir", root)
     assert first.exit_code == 0, first.output
     assert "imported 1 identities and 1 voice sample(s)" in first.output
-    assert "scope 'Example Show'" in first.output
+    # A voxweave.voices.json served its own folder and its show before.
+    assert "scopes 'old', 'Example Show'" in first.output
+    repeat = invoke("voices", "import", legacy, "--voices-dir", root)
+    assert repeat.exit_code == 0, repeat.output
+    assert "imported 0 identities and 0 voice sample(s)" in repeat.output
+    assert "1 already present" in repeat.output
     second = invoke(
         "voices", "import", legacy, "--scope", "Other", "--voices-dir", root
     )
     assert second.exit_code == 0, second.output
     assert "imported 0 identities and 0 voice sample(s)" in second.output
-    assert "1 already present" in second.output
+    assert "1 already present; 1 scope(s) added" in second.output
     assert legacy.read_bytes() == before
     history = [
         json.loads(line) for line in (root / "history.jsonl").read_text().splitlines()
     ]
-    assert [row["action"] for row in history].count("import") == 1
+    assert [row["action"] for row in history].count("import") == 2
+    shown = json.loads(invoke("voices", "list", "--json", "--voices-dir", root).stdout)[
+        "identities"
+    ]
+    assert shown[0]["scopes"] == ["old", "Example Show", "Other"]
 
 
 def test_forget_names_per_folder_stores_that_still_hold_the_id(tmp_path, invoke):

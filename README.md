@@ -451,8 +451,12 @@ imports, the imported file's path, all of which can name people too.
 
 **Per-show stores from earlier versions.** A `voxweave.voices.json` next to the media is still
 read for suggestions, never written, with a one-time hint to merge it with
-`voxweave voices import PATH [--scope NAME]` (default scope: the store's show). Import keeps the
-store's ids, so importing it again adds nothing, and leaves the file unchanged. `--voices FILE`
+`voxweave voices import PATH`. By default the imported voices keep the scopes under which the
+store already served suggestions: its folder's scope and the store's show (a store with another
+file name, only ever used with `--voices`, keeps its show). `--scope NAME` imports them under
+that scope instead, and importing again with another `--scope` adds that scope. Import keeps the
+store's ids, so importing it again adds no voice samples, skips samples older than the five an
+identity already keeps, and leaves the file unchanged. `--voices FILE`
 still selects a per-show store explicitly, with its previous behavior (a missing one is created
 only with both `--voices` and `--show`); it cannot be combined with `--voices-dir`.
 
