@@ -103,7 +103,9 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
 
         The library holds voice biometrics of the people you name, shared by
         every media folder (and by every machine that points at the same
-        directory). `forget` removes one person from it completely.
+        directory). `forget` removes one person from it for good; per-folder
+        stores of earlier versions that still hold them are listed, not
+        edited.
         """
 
     @group.command("list", short_help="List saved identities.")
