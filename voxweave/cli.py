@@ -15,6 +15,7 @@ from voxweave.cli_compat import (
     require_media,
 )
 from voxweave.cli_speakers import build_speakers_group
+from voxweave.cli_voices import build_voices_group
 from voxweave.progress import Reporter
 from voxweave.ui import (
     RichReporter,
@@ -186,7 +187,7 @@ def _resolve_llm(
                 {"name": "Capture", "commands": ["transcribe"]},
                 {
                     "name": "Revise",
-                    "commands": ["correct", "align", "render", "speakers"],
+                    "commands": ["correct", "align", "render", "speakers", "voices"],
                 },
                 {
                     "name": "Deliver",
@@ -240,7 +241,7 @@ def cli(ctx, verbose: bool) -> None:
     Shortcut: voxweave MEDIA runs transcribe. Use COMMAND --help for options.
     """
     install_logging(verbose=verbose)
-    if ctx.invoked_subcommand not in {"speakers", "help"}:
+    if ctx.invoked_subcommand not in {"speakers", "voices", "help"}:
         config.ensure_default_config()  # write default config template on first run
 
 
@@ -516,6 +517,7 @@ cli.add_command(cmd_transcribe)
 
 cmd_speakers = build_speakers_group(_run, _report_speaker_service)
 cli.add_command(cmd_speakers)
+cli.add_command(build_voices_group(_run))
 
 
 @cli.command(
