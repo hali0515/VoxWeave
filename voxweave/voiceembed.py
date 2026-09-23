@@ -677,6 +677,52 @@ def _padded(segment: np.ndarray, minimum: int) -> np.ndarray:
     return np.resize(segment, minimum)
 
 
+def _mono_samples(waveform: Any) -> np.ndarray:
+    """The 1-D float32 samples of a mono waveform; anything else is refused.
+
+    Flattening a ``[channels, samples]`` array would silently interleave the
+    channels into one garbled signal, so only 1-D input is accepted.
+    """
+    if hasattr(waveform, "detach"):
+        waveform = waveform.detach().cpu().numpy()
+    samples = np.asarray(waveform, dtype=np.float32)
+    if samples.ndim != 1:
+        raise VoiceEmbeddingError(
+            f"voiceprint audio must be 1-D mono samples, got shape {samples.shape}"
+        )
+    if samples.size == 0:
+        raise VoiceEmbeddingError("audio is empty")
+    return samples
+
+
+def _embed_span(
+    embedder: LoadedEmbedder,
+    spec: EmbedderSpec,
+    samples: np.ndarray,
+    start: float,
+    end: float,
+    *,
+    index: int,
+) -> np.ndarray:
+    """One span -> one unit vector (window by window, re-weighted by length)."""
+    minimum = max(1, math.ceil(spec.min_seconds * SAMPLE_RATE))
+    first, last = _span_samples(samples, float(start), float(end), index=index)
+    windows = window_bounds(first, last)
+    vectors = []
+    weights = []
+    for low, high in windows:
+        try:
+            vectors.append(embedder.embed_samples(_padded(samples[low:high], minimum)))
+        except VoiceEmbeddingError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- inference errors (OOM, ...)
+            raise VoiceEmbeddingError(
+                f"{spec.name} inference failed for segment {index}: {exc}"
+            ) from exc
+        weights.append(float(high - low))
+    return weighted_unit_mean(vectors, weights)
+
+
 def embed_segments(
     waveform: Any,
     spans: Sequence[tuple[float, float]],
@@ -686,42 +732,22 @@ def embed_segments(
 
     Rows are L2-normalized. Each span is its own forward pass (window by
     window for long spans): ReDimNet2's attentive pooling has no padding mask,
-    so mixed lengths are never batched together.
+    so mixed lengths are never batched together. Any span that fails raises:
+    callers that need one row per span (speaker splitting) get all or nothing.
     """
-    if hasattr(waveform, "detach"):
-        waveform = waveform.detach().cpu().numpy()
-    samples = np.asarray(waveform, dtype=np.float32).reshape(-1)
-    if samples.size == 0:
-        raise VoiceEmbeddingError("audio is empty")
-    minimum = max(1, math.ceil(spec.min_seconds * SAMPLE_RATE))
+    samples = _mono_samples(waveform)
     rows: list[np.ndarray] = []
     with _lock:
         embedder = get_embedder(spec)
         for index, (start, end) in enumerate(spans):
-            first, last = _span_samples(samples, float(start), float(end), index=index)
-            windows = window_bounds(first, last)
-            vectors = []
-            weights = []
-            for low, high in windows:
-                try:
-                    vectors.append(
-                        embedder.embed_samples(_padded(samples[low:high], minimum))
-                    )
-                except VoiceEmbeddingError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 -- inference errors (OOM, ...)
-                    raise VoiceEmbeddingError(
-                        f"{spec.name} inference failed for segment {index}: {exc}"
-                    ) from exc
-                weights.append(float(high - low))
-            rows.append(weighted_unit_mean(vectors, weights))
+            rows.append(_embed_span(embedder, spec, samples, start, end, index=index))
     if not rows:
         return np.zeros((0, spec.embedding_dim), dtype=np.float64)
     return np.stack(rows)
 
 
 def weighted_unit_mean(
-    vectors: Sequence[Sequence[float]] | np.ndarray,
+    vectors: Sequence[Sequence[float]] | Sequence[np.ndarray] | np.ndarray,
     weights: Sequence[float],
 ) -> np.ndarray:
     """Weighted mean of unit vectors, re-normalized to unit length."""
@@ -801,25 +827,76 @@ def speaker_centroids(
     """centroid-v1 voiceprints for ``labels`` (default: every turn label).
 
     A centroid is the duration-weighted mean of the unit vectors of the
-    speaker's centroid segments, re-normalized. Speakers without a segment, or
-    whose centroid fails the shared vector law, are left out.
+    speaker's centroid segments, re-normalized. Speakers without a segment are
+    left out.
+
+    One bad segment (non-finite or zero output, an inference error, a span
+    outside the audio) is dropped on its own and the centroid is built from
+    the rest; a speaker is left out only when none of its segments survives
+    (or its centroid fails the shared vector law). The drops are logged once
+    per call. If every speaker that had segments fails, this raises
+    :class:`VoiceEmbeddingError`: there is nothing left to capture. A model
+    that cannot be loaded at all raises before any segment is tried.
     """
     wanted = sorted({label for _s, _e, label in turns} if labels is None else labels)
-    centroids: dict[str, list[float]] = {}
+    plan: list[tuple[str, list[tuple[float, float]]]] = []
     for label in wanted:
         segments = centroid_segments(turns, label)
-        if not segments:
+        if segments:
+            plan.append((label, segments))
+        else:
             log.debug("speaker %s has no voiceprint segment", label)
-            continue
-        vectors = embed_segments(waveform, segments, spec)
-        centroid = weighted_unit_mean(vectors, [end - start for start, end in segments])
-        values = [float(value) for value in centroid]
-        try:
-            validate_vector(values, dim=spec.embedding_dim, field=f"speakers.{label}")
-        except Phase2DataError as exc:
-            log.warning("dropping voiceprint for speaker %s: %s", label, exc)
-            continue
-        centroids[label] = values
+    if not plan:
+        return {}
+    samples = _mono_samples(waveform)
+    centroids: dict[str, list[float]] = {}
+    failed: list[str] = []
+    dropped = 0
+    first_error: str | None = None
+    with _lock:
+        embedder = get_embedder(spec)
+        for label, segments in plan:
+            vectors: list[np.ndarray] = []
+            weights: list[float] = []
+            for index, (start, end) in enumerate(segments):
+                try:
+                    vectors.append(
+                        _embed_span(embedder, spec, samples, start, end, index=index)
+                    )
+                except VoiceEmbeddingError as exc:
+                    dropped += 1
+                    if first_error is None:
+                        first_error = (
+                            f"speaker {label} segment {start:.2f}-{end:.2f}s: {exc}"
+                        )
+                    continue
+                weights.append(end - start)
+            if not vectors:
+                failed.append(label)
+                continue
+            values = [float(value) for value in weighted_unit_mean(vectors, weights)]
+            try:
+                validate_vector(
+                    values, dim=spec.embedding_dim, field=f"speakers.{label}"
+                )
+            except Phase2DataError as exc:
+                failed.append(label)
+                if first_error is None:
+                    first_error = f"speaker {label}: {exc}"
+                continue
+            centroids[label] = values
+    if dropped or failed:
+        log.warning(
+            "voiceprints: skipped %d segment(s) that could not be embedded; "
+            "speakers left without a voiceprint: %s (first problem: %s)",
+            dropped,
+            ", ".join(failed) or "none",
+            first_error,
+        )
+    if not centroids:
+        raise VoiceEmbeddingError(
+            f"no speaker's voiceprint could be computed ({first_error})"
+        )
     return centroids
 
 

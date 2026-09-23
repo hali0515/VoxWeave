@@ -353,6 +353,140 @@ def test_embed_segments_refuses_out_of_range_spans(monkeypatch):
         voiceembed.embed_segments(waveform, [(0.5, 0.5)], voiceembed.REDIMNET2_B6)
 
 
+def test_embed_segments_refuses_anything_but_1d_mono(monkeypatch):
+    import torch
+
+    _install_fake_embedder(monkeypatch)
+    rate = voiceembed.SAMPLE_RATE
+    stereo = np.ones((2, 2 * rate), dtype=np.float32)
+
+    with pytest.raises(voiceembed.VoiceEmbeddingError, match="1-D mono"):
+        voiceembed.embed_segments(stereo, [(0.0, 1.0)], voiceembed.REDIMNET2_B6)
+    with pytest.raises(voiceembed.VoiceEmbeddingError, match="1-D mono"):
+        voiceembed.embed_segments(
+            torch.ones(1, 2 * rate), [(0.0, 1.0)], voiceembed.REDIMNET2_B6
+        )
+    rows = voiceembed.embed_segments(
+        torch.ones(2 * rate), [(0.0, 1.0)], voiceembed.REDIMNET2_B6
+    )
+    assert rows.shape == (1, 192)
+
+
+class _FlakyNetwork(_FakeNetwork):
+    """Fails by signal level: 0.3 -> NaN, 0.4 -> all zeros, 0.6 -> raises."""
+
+    def __call__(self, wave):
+        row = super().__call__(wave)
+        level = float(np.abs(self.inputs[-1]).mean())
+        if math.isclose(level, 0.3, abs_tol=1e-3):
+            row[:, 0] = float("nan")
+        elif math.isclose(level, 0.4, abs_tol=1e-3):
+            row[:] = 0.0
+        elif math.isclose(level, 0.6, abs_tol=1e-3):
+            raise RuntimeError("CUDA out of memory")
+        return row
+
+
+def _install_flaky_embedder(monkeypatch):
+    network = _FlakyNetwork()
+    loaded = voiceembed.LoadedEmbedder(
+        spec=voiceembed.REDIMNET2_B6,
+        checkpoint_sha256=voiceembed.REDIMNET2_B6.sha256,
+        network=network,
+        device="cpu",
+    )
+    monkeypatch.setattr(voiceembed, "get_embedder", lambda _spec: loaded)
+    return network
+
+
+def _levels(spans: dict[tuple[int, int], float], seconds: int = 40) -> np.ndarray:
+    rate = voiceembed.SAMPLE_RATE
+    waveform = np.zeros(seconds * rate, dtype=np.float32)
+    for (start, end), level in spans.items():
+        waveform[start * rate : end * rate] = level
+    return waveform
+
+
+def test_a_bad_segment_is_dropped_instead_of_voiding_the_capture(monkeypatch, caplog):
+    _install_flaky_embedder(monkeypatch)
+    waveform = _levels(
+        {
+            (0, 3): 0.9,  # A: fine
+            (5, 7): 0.3,  # A: NaN embedding
+            (10, 13): 0.6,  # A: inference error
+            (20, 23): 0.4,  # B: zero embedding, its only segment
+            (30, 33): 0.5,  # C: fine
+        }
+    )
+    turns = [
+        (0.0, 3.0, "A"),
+        (5.0, 7.0, "A"),
+        (10.0, 13.0, "A"),
+        (20.0, 23.0, "B"),
+        (30.0, 33.0, "C"),
+    ]
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        centroids = voiceembed.speaker_centroids(
+            waveform, turns, voiceembed.REDIMNET2_B6
+        )
+
+    assert set(centroids) == {"A", "C"}
+    # A's centroid is built from its one surviving segment alone.
+    expected = np.array([0.9, 1.0]) / math.hypot(0.9, 1.0)
+    assert centroids["A"][:2] == pytest.approx(list(expected))
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "skipped 3 segment(s)" in message
+    assert "without a voiceprint: B" in message
+
+
+def test_capture_fails_only_when_every_speaker_fails(tmp_path, monkeypatch):
+    import soundfile as sf
+
+    _install_flaky_embedder(monkeypatch)
+    waveform = _levels({(0, 3): 0.3, (5, 8): 0.6})
+    turns = [(0.0, 3.0, "A"), (5.0, 8.0, "B")]
+
+    with pytest.raises(voiceembed.VoiceEmbeddingError, match="no speaker's voiceprint"):
+        voiceembed.speaker_centroids(waveform, turns, voiceembed.REDIMNET2_B6)
+
+    wav = tmp_path / "speech.wav"
+    sf.write(wav, waveform, voiceembed.SAMPLE_RATE)
+    with pytest.raises(voiceembed.VoiceEmbeddingError, match="no speaker's voiceprint"):
+        voiceembed.capture_voiceprints(wav, turns, voiceembed.REDIMNET2_B6, {})
+
+
+def test_speakers_without_segments_never_load_the_model(monkeypatch):
+    monkeypatch.setattr(
+        voiceembed,
+        "get_embedder",
+        lambda _spec: pytest.fail("no segment, no model"),
+    )
+
+    assert (
+        voiceembed.speaker_centroids(
+            np.zeros(16_000, dtype=np.float32),
+            [(0.0, 0.3, "A")],
+            voiceembed.REDIMNET2_B6,
+        )
+        == {}
+    )
+
+
+def test_a_model_that_cannot_load_still_fails_the_whole_capture(monkeypatch):
+    def unavailable(_spec):
+        raise voiceembed.VoiceEmbeddingError("checkpoint missing")
+
+    monkeypatch.setattr(voiceembed, "get_embedder", unavailable)
+
+    with pytest.raises(voiceembed.VoiceEmbeddingError, match="checkpoint missing"):
+        voiceembed.speaker_centroids(
+            _levels({(0, 3): 0.9}), [(0.0, 3.0, "A")], voiceembed.REDIMNET2_B6
+        )
+
+
 def test_loaded_embedder_refuses_a_wrong_output_dimension():
     loaded = voiceembed.LoadedEmbedder(
         spec=voiceembed.REDIMNET2_B6,
