@@ -187,15 +187,25 @@ stores are per embedding space: a store built by one embedder never matches anot
 dedicated embedders are independent of the diarizer, switching `--diarize-model` no longer
 orphans a store built by `redimnet2` or `anime-va`.
 
-**Voiceprint speaker clustering.** By default, `--diarize` keeps pyannote's own answer to *who
-is who*. With `--speaker-clustering voiceprint` (or `VOXWEAVE_DIARIZE_CLUSTERING` /
-`[diarize].clustering`), pyannote still finds the speaker turns (who speaks when, including
-overlaps), but the turns are regrouped by voiceprint with the `redimnet2` checkpoint from the
-table above, whatever the episode's language: the same download and cache, and the same
-**CC BY-NC-SA 4.0 (non-commercial)** weights licence. Turns the voiceprints cannot attribute
-confidently (background voices, noise, fragments too short to tell) are dropped from
-`speaker_turns`; the subtitle words they covered stay with the surrounding speaker. If this
-stage fails (a download, out of memory), the run warns and keeps pyannote's speakers. With
+**Voiceprint speaker clustering (opt-in).** By default, `--diarize` keeps pyannote's own answer
+to *who is who*. Enable the alternative with `--speaker-clustering voiceprint` (or
+`VOXWEAVE_DIARIZE_CLUSTERING=voiceprint`, or `[diarize].clustering = "voiceprint"` in the
+config). pyannote still finds the speaker turns (who speaks when, including overlaps); the
+`voiceprint-v1` recipe then regroups them with the `redimnet2` checkpoint from the table above,
+whatever the episode's language: the same download and cache, and the same
+**CC BY-NC-SA 4.0 (non-commercial)** weights licence. The recipe embeds the speech of each turn
+that no other speaker talks over, clusters the turns with at least 1 s of such speech (turns
+that mostly overlap in time never share a speaker, and a cluster needs 6 s of that speech to count as
+a speaker), then gives every other turn to the closest voice nearby, or drops it from
+`speaker_turns` when no voice is close enough (background voices, noise, fragments too short
+to tell); the subtitle words a dropped turn covered stay with the surrounding speaker.
+Measured against pyannote's clustering, it confused speakers less on three of four public test
+sets (AliMeeting, VoxConverse and JVS-conv; slightly more on AMI) and attributed short
+backchannels in an online meeting correctly more often (37 of 40 clips under 1 s, against 32),
+but it can split one person into more speakers than pyannote does, and a speaker who talks
+very little may be merged into others or dropped. `--min-speakers`/`--max-speakers` bind this
+stage too. If it fails (a download, out of memory), cannot meet those bounds, or finds no turn
+long enough to anchor a voiceprint, the run warns and keeps pyannote's speakers. With
 `--voiceprint-model pyannote` the run keeps pyannote's clustering, because those legacy
 voiceprints are keyed by pyannote's labels. The setting never changes which voice stores an
 episode's voiceprints match.
@@ -329,7 +339,7 @@ routed to an in-place editing command. See the [migration notes](MIGRATING.md) f
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
 | `--diarize`                    | Opt in to the default-installed pyannote speaker diarizer: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). The gated checkpoint requires `VOXWEAVE_HF_TOKEN`, `HF_TOKEN`, config `hf_token`, or a prior `hf auth login`. Speaker turns persist to the sibling JSON, so `voxweave render` replays the formatting without re-running the model. |
 | `--diarize-model`              | Select `community-1` (the default), `3.1`, or any full Hugging Face pipeline id. The same setting is available as `VOXWEAVE_DIARIZE_MODEL` or `[diarize].model`; precedence is CLI > env > config > default. |
-| `--speaker-clustering`         | How `--diarize` groups its turns into speakers: `pyannote` (the default: the pipeline's own clustering) or `voiceprint` (regroup with ReDimNet2 voiceprints; turns nobody can be attributed to are dropped and their words stay with the surrounding speaker). The same setting is available as `VOXWEAVE_DIARIZE_CLUSTERING` or `[diarize].clustering`; precedence is CLI > env > config > default, and an unknown value is an error. See [Setup](#setup) for the model and its licence. |
+| `--speaker-clustering`         | How `--diarize` groups its turns into speakers: `pyannote` (the default: the pipeline's own clustering) or `voiceprint` (opt-in: regroup with ReDimNet2 voiceprints, recipe `voiceprint-v1`; turns nobody can be attributed to are dropped and their words stay with the surrounding speaker). The same setting is available as `VOXWEAVE_DIARIZE_CLUSTERING` or `[diarize].clustering`; precedence is CLI > env > config > default, and an unknown value is an error. See [Setup](#setup) for the model, its licence and the measured trade-offs. |
 | `--voiceprints/--no-voiceprints` | Opt in to a voice-biometric centroid sidecar for reviewed cross-episode speaker suggestions. Requires a fresh `--diarize` run and is off by default. Precedence: CLI, `VOXWEAVE_VOICEPRINTS`, `[defaults].voiceprints`, then off. |
 | `--voiceprint-model`           | Speaker-embedding model for `--voiceprints`: `auto` (default: `anime-va` for Japanese, `redimnet2` otherwise), `redimnet2`, `anime-va`, or `pyannote` (legacy: the diarization pipeline's own embeddings, which matches pre-existing voice stores). Precedence: CLI, `VOXWEAVE_VOICEPRINT_MODEL`, `[voiceprint].model`, then `auto`; an unknown value is an error, and the CLI value is validated (with a no-effect warning) even when voiceprints are off. See [Setup](#setup) for the models and their licences. |
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |

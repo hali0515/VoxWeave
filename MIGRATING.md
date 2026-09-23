@@ -22,14 +22,21 @@ run; re-runs from an existing cache are unchanged.
 ### Opt-in voiceprint speaker clustering
 
 `--diarize` can group the speaker turns by voiceprint instead of by pyannote's own
-clustering: `--speaker-clustering voiceprint`, `VOXWEAVE_DIARIZE_CLUSTERING=voiceprint` or
-`[diarize].clustering = "voiceprint"`. pyannote still finds who speaks when; ReDimNet2-B6
-(the `redimnet2` voiceprint model: weights CC BY-NC-SA 4.0, a 51 MB download on first use)
-decides who is who, and turns it cannot attribute confidently are dropped from
-`speaker_turns`, so their words stay with the surrounding speaker. The default stays
-`pyannote`, whose output is unchanged. If the voiceprint stage fails (download, out of
-memory), the run warns and keeps pyannote's speakers. `--voiceprint-model pyannote` always
-keeps pyannote's clustering, because its voiceprints are keyed by pyannote's labels.
+clustering. It is opt-in: `--speaker-clustering voiceprint`,
+`VOXWEAVE_DIARIZE_CLUSTERING=voiceprint` or `[diarize].clustering = "voiceprint"`. pyannote
+still finds who speaks when; the `voiceprint-v1` recipe decides who is who with ReDimNet2-B6
+(the `redimnet2` voiceprint model: weights CC BY-NC-SA 4.0, a 51 MB download on first use).
+It clusters the turns that hold at least 1 s of speech nobody talks over (turns overlapping
+in time for most of their length never share a speaker), gives the other turns to the
+closest voice nearby, and drops from `speaker_turns` the turns no voice is close enough to,
+so their words stay with the surrounding speaker. In our measurements it confused speakers less than pyannote on three of
+four public test sets and got more short backchannels right in an online meeting, but it can
+report more speakers than there are, and a speaker who talks very little may be merged into
+others or dropped; that is why the default stays `pyannote`, whose output is unchanged.
+`--min-speakers`/`--max-speakers` bind the voiceprint stage too. If it fails (download, out of
+memory), cannot meet those bounds, or finds no turn long enough to anchor a voiceprint, the
+run warns and keeps pyannote's speakers. `--voiceprint-model pyannote` always keeps
+pyannote's clustering, because its voiceprints are keyed by pyannote's labels.
 
 ### Voiceprints come from a dedicated embedder
 
