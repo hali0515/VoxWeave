@@ -44,7 +44,7 @@ def _run(fn, *, reporter: bool = True):
 
 def _report_speaker_service(message: str) -> None:
     """Keep the service URL on stdout and session updates on stderr."""
-    click.echo(message, err=not message.startswith("http://127.0.0.1:"))
+    click.echo(message, err=not message.startswith("http://"))
 
 
 def _flag(value: bool | None, key: str, builtin: bool) -> bool:

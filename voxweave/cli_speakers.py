@@ -216,12 +216,24 @@ def build_speakers_group(
     )
     @click.option("--no-match", is_flag=True, hidden=True)
     @click.option(
+        "--host",
+        type=click.Choice(["127.0.0.1", "0.0.0.0"]),
+        default="127.0.0.1",
+        show_default=True,
+        help="HTTP bind address; 0.0.0.0 allows access from other devices.",
+    )
+    @click.option(
+        "--ngrok",
+        is_flag=True,
+        help="Discover this port's public URLs from the local ngrok agent automatically.",
+    )
+    @click.option(
         "--port",
         type=click.IntRange(0, 65535),
         default=0,
         metavar="PORT",
         show_default=True,
-        help="Loopback HTTP port; 0 selects an available port.",
+        help="HTTP port; 0 selects an available port.",
     )
     @click.option(
         "--open/--no-open",
@@ -241,6 +253,8 @@ def build_speakers_group(
         show: str | None,
         manual: bool,
         no_match: bool,
+        host: str,
+        ngrok: bool,
         port: int,
         open_browser: bool,
         enroll: bool,
@@ -263,6 +277,8 @@ def build_speakers_group(
                     voices,
                     show,
                     manual,
+                    host != "127.0.0.1",
+                    ngrok,
                     port,
                     not open_browser,
                     enroll,
@@ -281,9 +297,9 @@ def build_speakers_group(
         if enroll:
             if manual:
                 raise click.UsageError("manual mode cannot be combined with --enroll")
-            if port or not open_browser:
+            if host != "127.0.0.1" or ngrok or port or not open_browser:
                 raise click.UsageError(
-                    "--port/--no-open cannot be combined with --enroll"
+                    "--host/--ngrok/--port/--no-open cannot be combined with --enroll"
                 )
             warn_deprecated("--enroll is deprecated; use speakers enroll EPISODE")
             ctx.invoke(
@@ -318,6 +334,8 @@ def build_speakers_group(
                 sibling_path=audition.sibling_json_path,
                 speaker_ids=audition.speaker_ids,
                 pristine_mapping_generation=audition.pristine_mapping_generation,
+                host=host,
+                ngrok=ngrok,
                 port=port,
                 open_browser=open_browser,
                 report=report,

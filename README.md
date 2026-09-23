@@ -313,12 +313,22 @@ section of `~/.config/voxweave.conf` — an explicit CLI flag always wins for th
 ### Label speakers
 
 After a diarized transcription, `voxweave speakers serve <media>` prepares an audition page in
-memory, serves it on `127.0.0.1`, and opens it in your browser. The page embeds up to three
+memory, serves it on `127.0.0.1` by default, and opens it in your browser. The page embeds up to three
 clean, non-overlapping speech clips per diarizer id. Listen, enter names, then select **Save**
 to write them directly to the episode's speaker mapping. The server runs until Ctrl+C; use
-`--no-open` to print the URL without opening a browser, or `--port N` to choose its loopback
+`--no-open` to print the URL without opening a browser, or `--port N` to choose its HTTP
 port. No audition HTML is written to disk. `voxweave speakers <media>` is the supported
 shorthand for `serve`; `--manual` disables voice matching for that session.
+
+To access the audition from another device, use
+`voxweave speakers serve episode.mkv --host 0.0.0.0 --port 8765 --no-open`, then open
+`http://<server-ip>:8765/` using the server's IP address. This binds all IPv4 interfaces.
+
+For an ngrok tunnel on the same machine, run
+`voxweave speakers episode.mkv --port 9999 --no-open --ngrok` and, in another terminal,
+`ngrok http http://127.0.0.1:9999`. No public domain needs to be supplied: VoxWeave reads
+the local agent API at `127.0.0.1:4040` and refreshes the accepted URLs as tunnels change.
+Only tunnels forwarding to this local port are accepted, including HTTPS access and saves.
 
 ```bash
 voxweave episode.mkv --diarize
