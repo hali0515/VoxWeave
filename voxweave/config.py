@@ -172,6 +172,20 @@ _TEMPLATE = """\
 [diarize]
 # model = "community-1"
 
+# Voiceprint embedder (= --voiceprint-model / VOXWEAVE_VOICEPRINT_MODEL); only used with
+# --voiceprints. pyannote still finds the speaker turns; the per-speaker voiceprints come
+# from a separate speaker-embedding model:
+#   auto (default) = anime-va for Japanese, redimnet2 for every other language
+#   redimnet2      = ReDimNet2-B6 (vb2+vox2+cnc2, large-margin); weights are
+#                    non-commercial (CC BY-NC-SA 4.0, VoxBlink2 training data)
+#   anime-va       = anime voice-actor ECAPA-TDNN (Japanese only)
+#   pyannote       = legacy: the diarization pipeline's own embeddings; keeps matching
+#                    voice stores built before the dedicated embedders
+# Voice stores are per embedding space: a store built by one embedder never matches
+# another. Changing [diarize].model no longer orphans a store built by redimnet2/anime-va.
+[voiceprint]
+# model = "auto"
+
 # Default on/off for the boolean pipeline flags. Explicit CLI flags always win
 # (e.g. separate = false here, --separate on the command line for one run).
 [defaults]
@@ -214,6 +228,7 @@ _KNOWN_KEYS = frozenset(
         "batch",
         "separate",
         "diarize",
+        "voiceprint",
         "align",
         "defaults",
         "llm",
@@ -511,6 +526,29 @@ def resolve_diarize_model(cli_value: str | None = None) -> str:
         selected = DEFAULT_DIARIZE_MODEL
     selected = selected.strip()
     return DIARIZE_MODEL_ALIASES.get(selected.lower(), selected)
+
+
+def conf_voiceprint_model() -> str | None:
+    """Return ``[voiceprint].model`` when it is a non-blank string.
+
+    The value is resolved (aliases, per-language ``auto`` routing, validation) by
+    :func:`voxweave.voiceembed.resolve_voiceprint_choice`; this only reads it.
+    """
+    section = _load().get("voiceprint")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        log.warning(
+            "config key %r has wrong type (expected table), ignoring", "voiceprint"
+        )
+        return None
+    raw = section.get("model")
+    if raw is not None and not isinstance(raw, str):
+        log.warning(
+            "config [voiceprint].model has wrong type (expected string), ignoring"
+        )
+        return None
+    return _nonempty_str(raw)
 
 
 _LOAD_STRATEGIES = ("peak", "sum")

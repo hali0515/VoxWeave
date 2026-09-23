@@ -21,6 +21,17 @@ def _isolate_voxweave_cache(tmp_path: Path) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_voiceprint_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never inherit a developer's voiceprint embedder selection or checkpoints."""
+    for name in (
+        "VOXWEAVE_VOICEPRINT_MODEL",
+        "VOXWEAVE_REDIMNET2_CKPT",
+        "VOXWEAVE_ANIME_VA_CKPT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_voxweave_config(tmp_path: Path) -> Iterator[None]:
     """Never let a test read the developer's real ~/.config/voxweave.conf.
 
