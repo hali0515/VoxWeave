@@ -268,7 +268,7 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
             with voicelibrary.library_lock(
                 root, exclusive=True, create_parents=location.default
             ):
-                state = voicelibrary.read_state(root, spaces=[space_name])
+                state = voicelibrary.read_state(root, include=[space_name])
                 change, summary = voicelibrary.import_store(
                     state,
                     store,

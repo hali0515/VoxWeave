@@ -2197,7 +2197,7 @@ def _enroll_into_library(
                     space_name, _fingerprint = voicelibrary.space_identity(provenance)
                 except voicelibrary.VoiceLibraryError as exc:
                     raise EnrollmentRefusal(f"enrollment refused: {exc}") from exc
-                state = voicelibrary.read_state(root, spaces=[space_name])
+                state = voicelibrary.read_state(root, include=[space_name])
                 named = _named_speakers(evidence, paths.mapping_path)
                 offered = _accepted_suggestions(media, evidence.sidecar)
                 durations = _speaker_durations(evidence.sibling)

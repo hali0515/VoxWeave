@@ -1229,6 +1229,64 @@ def _space_for(
     return name, document
 
 
+def _add_scopes(
+    state: LibraryState,
+    identity_id: str,
+    identity: dict[str, object],
+    new_scopes: Sequence[str],
+    *,
+    space_name: str,
+    space_exemplars: Mapping[str, Sequence[Mapping[str, object]]],
+    event_at: str,
+) -> int:
+    """Add ``new_scopes`` to ``identity`` (in place); return how many were new.
+
+    Scopes accumulate as voices are enrolled in new folders while only
+    MAX_EXEMPLARS samples per space stay, so past MAX_SCOPES the oldest
+    scopes that no retained sample (in any space) carries are dropped
+    rather than refusing the enrollment. That needs every space loaded.
+    """
+    scopes = cast(list[str], identity["scopes"])
+    missing = [scope for scope in new_scopes if scope not in scopes]
+    if not missing:
+        return 0
+    merged = [*scopes, *missing]
+    excess = len(merged) - MAX_SCOPES
+    if excess > 0:
+        if not state.all_spaces:
+            raise VoiceLibraryError(
+                f"identity {identity_id} has {MAX_SCOPES} scopes; pruning them "
+                "must read every embedding space first"
+            )
+        keep = set(new_scopes)
+        for name in state.spaces:
+            items = (
+                space_exemplars.get(identity_id, [])
+                if name == space_name
+                else state.space_exemplars(name).get(identity_id, [])
+            )
+            keep.update(cast(str, item["scope"]) for item in items)
+        if space_name not in state.spaces:
+            keep.update(
+                cast(str, item["scope"])
+                for item in space_exemplars.get(identity_id, [])
+            )
+        pruned: list[str] = []
+        for scope in merged:  # oldest first
+            if excess > 0 and scope not in keep:
+                excess -= 1
+                continue
+            pruned.append(scope)
+        if excess > 0:
+            raise VoiceLibraryError(
+                f"identity {identity_id} cannot hold more than {MAX_SCOPES} scopes"
+            )
+        merged = pruned
+    identity["scopes"] = merged
+    identity["updated"] = event_at
+    return len(missing)
+
+
 @dataclass(frozen=True)
 class LibraryPlan:
     """:class:`voicestore.IndexedPlan` plus ``rescope``: the same capture,
@@ -1471,13 +1529,16 @@ def enroll_entries(
                 history_row("create", event_at, identity=identity_id, scope=scope)
             )
             identities_changed = True
-        else:
-            identity = identities[identity_id]
-            scopes = cast(list[str], identity["scopes"])
-            if scope not in scopes:
-                identity["scopes"] = [*scopes, scope]
-                identity["updated"] = event_at
-                identities_changed = True
+        elif _add_scopes(
+            state,
+            identity_id,
+            identities[identity_id],
+            [scope],
+            space_name=space_name,
+            space_exemplars=exemplars_by_identity,
+            event_at=event_at,
+        ):
+            identities_changed = True
 
         if plan.outcome == "rescope":
             # The same voice sample, now filed under the new scope; it keeps
@@ -1897,6 +1958,10 @@ def import_store(
             )
             added_here += 1
 
+        if added_here:
+            exemplars_by_identity[identity_id] = current
+            added_count += added_here
+            space_changed = True
         if identity_id not in identities:
             identities[identity_id] = {
                 "display_name": legacy["display_name"],
@@ -1908,18 +1973,18 @@ def import_store(
             created_count += 1
             identities_changed = True
         else:
-            identity = identities[identity_id]
-            scopes = cast(list[str], identity["scopes"])
-            missing = [item for item in import_scopes if item not in scopes]
-            if missing:
-                identity["scopes"] = [*scopes, *missing]
-                identity["updated"] = event_at
+            added_scopes = _add_scopes(
+                state,
+                identity_id,
+                identities[identity_id],
+                import_scopes,
+                space_name=space_name,
+                space_exemplars=exemplars_by_identity,
+                event_at=event_at,
+            )
+            if added_scopes:
                 identities_changed = True
-                scopes_added += len(missing)
-        if added_here:
-            exemplars_by_identity[identity_id] = current
-            added_count += added_here
-            space_changed = True
+                scopes_added += added_scopes
 
     summary = ImportSummary(
         space=space_name,

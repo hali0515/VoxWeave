@@ -443,6 +443,52 @@ def test_a_split_capture_is_replaced_only_with_replace(tmp_path):
         _enroll(root, [corrupt], source=split, ids=ids, replace=True)
 
 
+def test_scopes_past_the_cap_drop_the_oldest_without_samples(tmp_path):
+    # A prolific voice actor enrolled in MAX_SCOPES season folders over time
+    # keeps only a few samples; the next folder must still enroll.
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry()], scope="Show 0", ids=ids)
+    identities = root / "identities.json"
+    document = json.loads(identities.read_text())
+    stale = [f"Old {index}" for index in range(voicelibrary.MAX_SCOPES - 1)]
+    # "Show 0" (which still has a sample) is the oldest scope of all.
+    document["identities"]["v000000000001"]["scopes"] = ["Show 0", *stale]
+    identities.write_text(json.dumps(document))
+
+    name, _ = voicelibrary.space_identity(_decoupled())
+    with voicelibrary.library_lock(root, exclusive=True):
+        state = voicelibrary.read_state(root, include=[name])
+        change, outcomes = voicelibrary.enroll_entries(
+            state,
+            provenance=_decoupled(),
+            scope="New Show",
+            source=_source(2, episode="ep02"),
+            entries=[_entry(identity_id="v000000000001", vector=_unit(1))],
+            at=LATER,
+            identity_id_factory=ids.identity_id,
+            exemplar_id_factory=ids.exemplar_id,
+        )
+        voicelibrary.commit(state, change)
+    assert [o.outcome for o in outcomes] == ["enroll"]
+    scopes = _read(root).identity_map["v000000000001"]["scopes"]
+    assert len(scopes) == voicelibrary.MAX_SCOPES
+    assert scopes[0] == "Show 0" and scopes[-1] == "New Show"
+    assert "Old 0" not in scopes and "Old 1" in scopes
+
+    # Pruning must see every space, or it could drop a scope another holds.
+    with voicelibrary.library_lock(root, exclusive=True):
+        partial = voicelibrary.read_state(root, spaces=[name])
+        with pytest.raises(voicelibrary.VoiceLibraryError, match="every embedding"):
+            voicelibrary.enroll_entries(
+                partial,
+                provenance=_decoupled(),
+                scope="Newer Show",
+                source=_source(3, episode="ep03"),
+                entries=[_entry(identity_id="v000000000001", vector=_unit(2))],
+            )
+
+
 def test_exemplar_cap_and_eviction_are_per_space(tmp_path):
     root = tmp_path / "voices"
     ids = _Ids()
