@@ -1,6 +1,8 @@
 import os
+import shutil
 import subprocess
 
+import numpy as np
 import pytest
 
 from voxweave import chunking
@@ -164,6 +166,100 @@ def test_decode_to_wav_passes_timeout_and_captures_stderr(tmp_path, monkeypatch)
     chunking.decode_to_wav(media)
     assert "timeout" in captured
     assert captured.get("stderr") != subprocess.DEVNULL
+
+
+def test_decode_command_pins_the_channel_count(tmp_path):
+    media = tmp_path / "clip.mkv"
+    out = tmp_path / "out.wav"
+
+    mono = chunking.decode_command(media, out, audio_filter="loudnorm")
+    assert mono == [
+        "ffmpeg", "-nostdin", "-y", "-i", str(media),
+        "-af", "loudnorm",
+        "-ac", "1",
+        "-ar", "16000", "-f", "wav", str(out),
+    ]  # fmt: skip
+
+    # Full band for separation: a 5.1 / 7.1 source is downmixed to stereo
+    # before it can reach the stereo-only Roformer.
+    fullband = chunking.decode_command(media, out, sample_rate=44100, mono=False)
+    assert fullband == [
+        "ffmpeg", "-nostdin", "-y", "-i", str(media),
+        "-af", "aformat=channel_layouts=mono|stereo",
+        "-ar", "44100", "-f", "wav", str(out),
+    ]  # fmt: skip
+    assert chunking.STEREO_CAP_FILTER == "aformat=channel_layouts=mono|stereo"
+
+    filtered = chunking.decode_command(
+        media, out, sample_rate=44100, mono=False, audio_filter="loudnorm"
+    )
+    assert filtered[filtered.index("-af") + 1] == (
+        "loudnorm,aformat=channel_layouts=mono|stereo"
+    )
+    assert "-ac" not in filtered
+
+
+def test_decode_to_wav_runs_the_decode_command(tmp_path, monkeypatch):
+    media = tmp_path / "clip.mkv"
+    media.write_bytes(b"x")
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(chunking.subprocess, "run", fake_run)
+    out = chunking.decode_to_wav(media, sample_rate=44100, mono=False)
+    try:
+        assert commands == [
+            chunking.decode_command(media, out, sample_rate=44100, mono=False)
+        ]
+    finally:
+        out.unlink(missing_ok=True)
+
+
+_FFMPEG_TOOLS = shutil.which("ffmpeg") is not None and shutil.which("ffprobe")
+
+
+@pytest.mark.skipif(not _FFMPEG_TOOLS, reason="needs ffmpeg and ffprobe")
+@pytest.mark.parametrize(
+    ("layout", "codec", "channels"),
+    [("5.1", "eac3", 2), ("7.1", "pcm_s16le", 2), ("stereo", "pcm_s16le", 2),
+     ("mono", "pcm_s16le", 1)],
+)  # fmt: skip
+def test_real_ffmpeg_caps_the_fullband_decode_at_stereo(
+    tmp_path, layout, codec, channels
+):
+    import soundfile as sf
+
+    source = tmp_path / f"tone.{'mka' if codec == 'eac3' else 'wav'}"
+    subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-f", "lavfi",
+            "-i", f"aevalsrc=0.2*sin(2*PI*440*t):c={layout}:s=48000:d=0.3",
+            "-c:a", codec, str(source),
+        ],
+        check=True, stdin=subprocess.DEVNULL, timeout=60,
+    )  # fmt: skip
+    probed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=channels", "-of", "csv=p=0", str(source),
+        ],
+        check=True, capture_output=True, text=True, timeout=60,
+    )  # fmt: skip
+    assert int(probed.stdout.strip()) == {"5.1": 6, "7.1": 8}.get(layout, channels)
+
+    wav = chunking.decode_to_wav(source, sample_rate=44100, mono=False)
+    try:
+        data, rate = sf.read(str(wav), always_2d=True)
+    finally:
+        wav.unlink(missing_ok=True)
+
+    assert rate == 44100
+    assert data.shape[1] == channels
+    # Mono stays at unity (no -3 dB upmix); the downmix keeps the tone audible.
+    assert np.abs(data).max() > 0.15
 
 
 def test_ffmpeg_timeout_constant_is_positive_and_env_overridable(monkeypatch):

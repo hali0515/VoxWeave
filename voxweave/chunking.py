@@ -15,6 +15,13 @@ SAMPLE_RATE = 16000
 VAD_MIN_SILENCE_MS = int(os.environ.get("VOXWEAVE_VAD_MIN_SILENCE_MS", "300"))
 # Wall-clock cap for a single ffmpeg decode; overridable via VOXWEAVE_FFMPEG_TIMEOUT.
 FFMPEG_TIMEOUT = float(os.environ.get("VOXWEAVE_FFMPEG_TIMEOUT", "3600"))
+# Non-mono decodes (the separator's full-band input) are capped at stereo. For
+# 3+ channels the negotiated conversion is ffmpeg's standard downmix, sample for
+# sample what `-ac 2` produces (centre and surrounds folded into left/right).
+# Unlike `-ac 2`, a mono source stays mono instead of being upmixed at -3 dB:
+# separate_vocals duplicates it at unity, exactly as before this cap existed.
+# Stereo passes through untouched.
+STEREO_CAP_FILTER = "aformat=channel_layouts=mono|stereo"
 
 
 def pack_speech_segments(segments: list[dict], max_sec: float) -> list[dict]:
@@ -163,6 +170,42 @@ def plan_dp_chunks(
     return chunks
 
 
+def decode_command(
+    media_path: Path,
+    out: Path,
+    *,
+    sample_rate: int = SAMPLE_RATE,
+    mono: bool = True,
+    audio_filter: str | None = None,
+) -> list[str]:
+    """The ffmpeg argv :func:`decode_to_wav` runs.
+
+    ``mono`` forces one channel (``-ac 1``). Otherwise the output is capped at
+    stereo (:data:`STEREO_CAP_FILTER`): left alone, ffmpeg keeps the source
+    layout, so a 5.1 / 7.1 track (most TV and film rips) would reach the
+    stereo-only separator with 6 or 8 channels.
+    """
+    filters = [audio_filter] if audio_filter else []
+    channels: list[str] = ["-ac", "1"] if mono else []
+    if not mono:
+        filters.append(STEREO_CAP_FILTER)
+    af = ["-af", ",".join(filters)] if filters else []
+    return [
+        "ffmpeg",
+        "-nostdin",
+        "-y",
+        "-i",
+        str(media_path),
+        *af,
+        *channels,
+        "-ar",
+        str(sample_rate),
+        "-f",
+        "wav",
+        str(out),
+    ]
+
+
 def decode_to_wav(
     media_path: Path,
     *,
@@ -173,29 +216,21 @@ def decode_to_wav(
     """Decode media to a temp WAV via ffmpeg; caller is responsible for deletion.
 
     Default: 16k mono for VAD/ASR. For separation, use sample_rate=44100, mono=False
-    (full-band stereo). ``audio_filter`` inserts an ``-af`` stage (e.g. loudnorm).
+    (full-band, at most stereo: multichannel sources are downmixed, see
+    :func:`decode_command`). ``audio_filter`` inserts an ``-af`` stage (e.g. loudnorm).
     """
     fd, path = tempfile.mkstemp(suffix=".wav", prefix="voxweave_")
     os.close(fd)
     out = Path(path)
-    ac = ["-ac", "1"] if mono else []
-    af = ["-af", audio_filter] if audio_filter else []
     try:
         subprocess.run(
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-y",
-                "-i",
-                str(media_path),
-                *af,
-                *ac,
-                "-ar",
-                str(sample_rate),
-                "-f",
-                "wav",
-                str(out),
-            ],
+            decode_command(
+                media_path,
+                out,
+                sample_rate=sample_rate,
+                mono=mono,
+                audio_filter=audio_filter,
+            ),
             check=True,
             timeout=FFMPEG_TIMEOUT,
             stdin=subprocess.DEVNULL,
