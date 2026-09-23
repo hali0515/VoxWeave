@@ -1000,6 +1000,7 @@ def transcribe(
     min_speakers: int | None = None,
     max_speakers: int | None = None,
     release_panns: bool = True,
+    speaker_clustering: str | None = None,
 ) -> tuple[
     str,
     list[dict],
@@ -1022,7 +1023,10 @@ def transcribe(
     :func:`voxweave.voiceembed.resolve_voiceprint_model`); only its ``pyannote``
     legacy lane reads the diarization pipeline's own embeddings; its checkpoint(s)
     are fetched and verified before any audio work, and if that fails voiceprints
-    are off for the run (warning) while everything else proceeds. All models run
+    are off for the run (warning) while everything else proceeds.
+    ``speaker_clustering`` picks how diarization groups its turns into speakers
+    (:func:`voxweave.config.resolve_diarize_clustering`; resolved and validated
+    before any audio work). All models run
     in-process (weights are fetched once into the voxweave cache). smart_split and
     file writing are handled by :func:`process`.
 
@@ -1033,6 +1037,9 @@ def transcribe(
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
+    if diarize:
+        # Fail on a bad env/conf value now, not after separation and ASR.
+        speaker_clustering = config.resolve_diarize_clustering(speaker_clustering)
     if debug and debug_root is None:
         debug_root = artifacts.claim_paths(media_path).debug
     dbg: DebugSink = (
@@ -1432,55 +1439,70 @@ def transcribe(
                 if voiceprints
                 else None
             )
+            # Voiceprint clustering embeds with ReDimNet2; when the capture below
+            # uses the same model, keep it resident across the two stages. The
+            # capture releases it, and so does the finally below on any path
+            # that never reaches the capture.
+            reuse_clustering_embedder = (
+                speaker_clustering == config.DIARIZE_CLUSTERING_VOICEPRINT
+                and isinstance(voiceprint_target, voiceembed.EmbedderSpec)
+                and voiceprint_target.name == voiceembed.REDIMNET2_B6.name
+            )
             rep.stage("speaker diarization (pyannote)")
             try:
-                diarization = diarize_mod.diarize_turns(
-                    wav,
-                    model=diarize_model,
-                    min_speakers=min_speakers,
-                    max_speakers=max_speakers,
-                    # Only the legacy lane reads the pipeline's own embeddings;
-                    # a dedicated embedder computes its voiceprints below.
-                    want_embeddings=voiceprint_target is voiceembed.LEGACY,
-                    audio_profile={
-                        "separated": separate,
-                        "normalized": normalize,
-                        "sample_rate": 16000,
-                        **(
-                            {
-                                "separator": {
-                                    **(
-                                        separator_identity
-                                        or {
-                                            "repo": backend.SEPARATOR_REPO,
-                                            "file": backend.SEPARATOR_REPO_FILE,
-                                            "checkpoint": "unresolved",
-                                            "config_sha256": "unresolved",
-                                        }
-                                    ),
+                try:
+                    diarization = diarize_mod.diarize_turns(
+                        wav,
+                        model=diarize_model,
+                        min_speakers=min_speakers,
+                        max_speakers=max_speakers,
+                        clustering=speaker_clustering,
+                        release_embedder=not reuse_clustering_embedder,
+                        # Only the legacy lane reads the pipeline's own embeddings;
+                        # a dedicated embedder computes its voiceprints below.
+                        want_embeddings=voiceprint_target is voiceembed.LEGACY,
+                        audio_profile={
+                            "separated": separate,
+                            "normalized": normalize,
+                            "sample_rate": 16000,
+                            **(
+                                {
+                                    "separator": {
+                                        **(
+                                            separator_identity
+                                            or {
+                                                "repo": backend.SEPARATOR_REPO,
+                                                "file": backend.SEPARATOR_REPO_FILE,
+                                                "checkpoint": "unresolved",
+                                                "config_sha256": "unresolved",
+                                            }
+                                        ),
+                                    }
                                 }
-                            }
-                            if separate
-                            else {}
-                        ),
-                    },
-                )
+                                if separate
+                                else {}
+                            ),
+                        },
+                    )
+                finally:
+                    diarize_mod.release()
+                speaker_turns = diarization.turns
+                if isinstance(voiceprint_target, voiceembed.EmbedderSpec):
+                    voiceprint_capture = _decoupled_voiceprint_capture(
+                        wav,
+                        diarization,
+                        voiceprint_target,
+                        reporter=rep,
+                    )
+                elif voiceprint_target is voiceembed.LEGACY and diarization.centroids:
+                    voiceprint_capture = VoiceprintCapture(
+                        centroids=diarization.centroids,
+                        provenance=diarization.provenance,
+                        turns=diarization.turns,
+                    )
             finally:
-                diarize_mod.release()
-            speaker_turns = diarization.turns
-            if isinstance(voiceprint_target, voiceembed.EmbedderSpec):
-                voiceprint_capture = _decoupled_voiceprint_capture(
-                    wav,
-                    diarization,
-                    voiceprint_target,
-                    reporter=rep,
-                )
-            elif voiceprint_target is voiceembed.LEGACY and diarization.centroids:
-                voiceprint_capture = VoiceprintCapture(
-                    centroids=diarization.centroids,
-                    provenance=diarization.provenance,
-                    turns=diarization.turns,
-                )
+                if reuse_clustering_embedder:
+                    voiceembed.release()  # idempotent after the capture's own
         panns_handoff = not release_panns
         return (
             iso,
@@ -2443,6 +2465,7 @@ def process(
     max_speakers: int | None = None,
     diarize_model: str | None = None,
     voiceprint_model: str | None = None,
+    speaker_clustering: str | None = None,
 ) -> Path:
     """Full pipeline: transcribe -> smart_split -> write siblings. Return the .vtt path.
 
@@ -2453,7 +2476,9 @@ def process(
     ``sdh`` additionally writes a ``<stem>.sdh.vtt`` sidecar with PANNs-detected
     non-speech event tags merged into the dialogue (main VTT/JSON untouched).
     ``diarize`` runs pyannote speaker diarization and formats multi-speaker cues
-    (dual-speaker hyphens / speaker-boundary splits; turns persist to JSON).
+    (dual-speaker hyphens / speaker-boundary splits; turns persist to JSON);
+    ``speaker_clustering`` (``"pyannote"``/``"voiceprint"``, ``None`` = configured)
+    picks how its turns are grouped into speakers.
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
@@ -2507,6 +2532,7 @@ def process(
             diarize_model=diarize_model,
             voiceprints=capture_enabled,
             voiceprint_model=voiceprint_model,
+            speaker_clustering=speaker_clustering,
             word_segments=word_segments,
             asr_model=asr_model,
             context=context,
@@ -2613,6 +2639,7 @@ def _process_from_source(
     diarize_model: str | None = None,
     voiceprints: bool = False,
     voiceprint_model: str | None = None,
+    speaker_clustering: str | None = None,
     word_segments: tuple[str, list[dict]] | None = None,
     asr_model: str | None = None,
     context: str | None = None,
@@ -2661,6 +2688,7 @@ def _process_from_source(
                 diarize_model=diarize_model,
                 voiceprints=voiceprints,
                 voiceprint_model=voiceprint_model,
+                speaker_clustering=speaker_clustering,
                 normalize=normalize,
                 reporter=reporter,
                 debug=debug,

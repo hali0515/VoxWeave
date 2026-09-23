@@ -19,6 +19,18 @@ change its speaker turns. A first run now derives its 16 kHz input from the 32 k
 vocals too, exactly as a re-run does. Expect small differences against a 0.17.0 first
 run; re-runs from an existing cache are unchanged.
 
+### Opt-in voiceprint speaker clustering
+
+`--diarize` can group the speaker turns by voiceprint instead of by pyannote's own
+clustering: `--speaker-clustering voiceprint`, `VOXWEAVE_DIARIZE_CLUSTERING=voiceprint` or
+`[diarize].clustering = "voiceprint"`. pyannote still finds who speaks when; ReDimNet2-B6
+(the `redimnet2` voiceprint model: weights CC BY-NC-SA 4.0, a 51 MB download on first use)
+decides who is who, and turns it cannot attribute confidently are dropped from
+`speaker_turns`, so their words stay with the surrounding speaker. The default stays
+`pyannote`, whose output is unchanged. If the voiceprint stage fails (download, out of
+memory), the run warns and keeps pyannote's speakers. `--voiceprint-model pyannote` always
+keeps pyannote's clustering, because its voiceprints are keyed by pyannote's labels.
+
 ### Voiceprints come from a dedicated embedder
 
 `--voiceprints` used to store the diarization pipeline's own speaker embeddings. It now

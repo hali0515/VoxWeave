@@ -582,6 +582,38 @@ def test_lanes_never_share_a_fingerprint():
     assert not voicematch.compatibility_equal(legacy, decoupled)
 
 
+_CLUSTERING_BLOCKS = [
+    {
+        "method": "voiceprint",
+        "recipe": "voiceprint-v1",
+        "embedder": "redimnet2-b6-vb2-vox2-cnc2-lm",
+        "embedder_checkpoint": "9" * 64,
+        "params": {"anchor_seconds": 1.5, "tau": 0.5},
+        "audit": {"anchors": 12, "abstained_turns": 3, "abstained_seconds": 2.4},
+    },
+    {
+        "method": "pyannote",
+        "requested": "voiceprint",
+        "reason": "VoiceEmbeddingError: could not download voiceprint model",
+    },
+]
+
+
+@pytest.mark.parametrize("block", _CLUSTERING_BLOCKS)
+def test_fingerprints_ignore_the_speaker_clustering_block(block):
+    # Clustering regroups the turns; it never changes an embedding space, so
+    # neither lane's fingerprint may read the diarization "clustering" block.
+    assert voicematch.build_compatibility_fingerprint(
+        {**LEGACY_SEPARATED, "clustering": block}
+    ) == voicematch.CompatibilityFingerprint(
+        "0376adb94f19be9eb102af5538c32b0e089c80f5b7972374f1092ef482b9ff2e"
+    )
+    assert voicematch.compatibility_equal(
+        voicematch.build_compatibility_fingerprint(_decoupled(clustering=block)),
+        voicematch.build_compatibility_fingerprint(_decoupled()),
+    )
+
+
 @pytest.mark.parametrize(
     "field",
     [

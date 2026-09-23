@@ -9,6 +9,11 @@ hyphen, no space) when the language allows two lines and both halves fit one
 line, otherwise the cue splits at the speaker boundaries. ``split`` replays
 formatting from the persisted turns without re-running pyannote.
 
+With ``[diarize].clustering = "voiceprint"`` the raw pyannote turns are regrouped
+by ReDimNet2 voiceprints (:mod:`voxweave.speakercluster`) before smoothing;
+turns the recipe cannot attribute are dropped, and formatting folds their words
+into the surrounding speaker's run (an atom with no turn inherits).
+
 The default pipeline is ``pyannote/speaker-diarization-community-1`` (better
 multi-speaker separation; separately gated on Hugging Face). ``3.1`` and
 arbitrary Hugging Face pipeline IDs are selectable per invocation. Both bundled
@@ -27,7 +32,7 @@ import threading
 import warnings
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, cast
 
@@ -36,7 +41,11 @@ import yaml
 from voxweave import config
 from voxweave.backend import _sha256_file
 from voxweave.core.schema import Cue
-from voxweave.voicebase import MAX_EMBEDDING_DIM, MIN_EMBEDDING_DIM
+from voxweave.voicebase import (
+    MAX_EMBEDDING_DIM,
+    MAX_SIDECAR_LABEL_BYTES,
+    MIN_EMBEDDING_DIM,
+)
 
 if TYPE_CHECKING:
     from voxweave.core.smart_split import SplitThresholds
@@ -897,8 +906,20 @@ def diarize_turns(
     max_speakers: int | None = None,
     want_embeddings: bool = False,
     audio_profile: Mapping[str, object] | None = None,
+    clustering: str | None = None,
+    release_embedder: bool = True,
 ) -> DiarizationResult:
-    """Run diarization and optionally return normalized, label-keyed centroids."""
+    """Run diarization and optionally return normalized, label-keyed centroids.
+
+    ``clustering`` picks who-is-who grouping (``config.resolve_diarize_clustering``:
+    CLI value, env, conf, built-in default). ``"voiceprint"`` regroups the raw
+    turns with ReDimNet2 voiceprints (:mod:`voxweave.speakercluster`) before
+    smoothing; any failure of that stage keeps pyannote's turns with a warning.
+    The legacy voiceprint lane (``want_embeddings``) always keeps pyannote's
+    clustering, because its centroids are keyed by pyannote's labels. The
+    ReDimNet2 embedder is released before returning unless ``release_embedder``
+    is false (the caller embeds with the same model right after and releases it).
+    """
     with _pipeline_lock:
         return _diarize_turns_locked(
             wav_path,
@@ -908,7 +929,169 @@ def diarize_turns(
             max_speakers=max_speakers,
             want_embeddings=want_embeddings,
             audio_profile=audio_profile,
+            clustering=clustering,
+            release_embedder=release_embedder,
         )
+
+
+# Longest failure reason recorded in provenance (bytes, UTF-8): voiceprint
+# provenance strings are capped at voicebase.MAX_PROVENANCE_STRING_BYTES.
+_REASON_MAX_BYTES = 300
+
+
+def _provenance_reason(text: str) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _REASON_MAX_BYTES:
+        return text
+    return encoded[: _REASON_MAX_BYTES - 3].decode("utf-8", "ignore") + "..."
+
+
+def _provenance_value(value: object) -> object:
+    """A strict-JSON copy of ``value`` (tuples become lists, oddities strings)."""
+    if value is None or isinstance(value, (bool, int, str)):
+        return _provenance_reason(value) if isinstance(value, str) else value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, Mapping):
+        return {str(key): _provenance_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_provenance_value(item) for item in value]
+    item = getattr(value, "item", None)  # numpy scalars
+    if callable(item):
+        return _provenance_value(item())
+    return _provenance_reason(str(value))
+
+
+def _audit_counts(audit: Mapping[str, object]) -> dict[str, object]:
+    """The scalar entries of a clustering audit, strict-JSON safe.
+
+    Nested audit detail (per-cluster anchor seconds, ...) stays in the debug
+    log; provenance keeps the counts and thresholds.
+    """
+    counts: dict[str, object] = {}
+    for key, value in audit.items():
+        if isinstance(value, (Mapping, list, tuple)):
+            continue
+        counts[str(key)] = _provenance_value(value)
+    return counts
+
+
+def _clustering_samples(waveform: Any, sample_rate: int) -> Any:
+    """The 1-D float32 16 kHz samples of the ``(1, T)`` waveform pyannote saw."""
+    import numpy as np
+
+    from voxweave import voiceembed
+
+    mono = waveform[0] if getattr(waveform, "ndim", 1) == 2 else waveform
+    if hasattr(mono, "detach"):
+        mono = mono.detach().cpu().numpy()
+    samples = np.ascontiguousarray(mono, dtype=np.float32)
+    if sample_rate != voiceembed.SAMPLE_RATE:
+        import torch
+        import torchaudio.functional as audio_functional
+
+        samples = np.ascontiguousarray(
+            audio_functional.resample(
+                torch.from_numpy(samples), sample_rate, voiceembed.SAMPLE_RATE
+            ).numpy(),
+            dtype=np.float32,
+        )
+    return samples
+
+
+def _checked_cluster_turns(turns: object) -> list[Turn]:
+    """Validate the clustering output before it replaces pyannote's turns."""
+    if not isinstance(turns, list):
+        raise ValueError("clustering returned turns that are not a list")
+    checked: list[Turn] = []
+    for turn in turns:
+        if not isinstance(turn, tuple) or len(turn) != 3:
+            raise ValueError(f"clustering returned a malformed turn {turn!r}")
+        start, end, label = turn
+        if not isinstance(label, str) or not label:
+            raise ValueError(f"clustering returned a turn without a label {turn!r}")
+        if len(label.encode("utf-8")) > MAX_SIDECAR_LABEL_BYTES:
+            raise ValueError(f"clustering returned an oversized label {label[:80]!r}")
+        start, end = float(start), float(end)
+        if not (math.isfinite(start) and math.isfinite(end)) or not 0 <= start < end:
+            raise ValueError(f"clustering returned an invalid span {turn!r}")
+        checked.append((start, end, label))
+    return sorted(checked, key=lambda turn: (turn[0], turn[1], turn[2]))
+
+
+def _voiceprint_clustering(
+    turns: list[Turn],
+    waveform: Any,
+    sample_rate: int,
+    *,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    release_embedder: bool,
+) -> tuple[list[Turn], dict[str, object]]:
+    """Regroup raw pyannote turns by ReDimNet2 voiceprints.
+
+    Returns the new turns and the provenance ``clustering`` block. Every
+    failure (checkpoint download or hash, OOM, a malformed result, ...) keeps
+    pyannote's ``turns`` and records the fallback: diarization never fails
+    because of this stage.
+    """
+    from voxweave import speakercluster, voiceembed
+
+    spec = voiceembed.REDIMNET2_B6
+    attested: list[str] = []
+    params = speakercluster.ClusteringParams()
+    try:
+        samples = _clustering_samples(waveform, sample_rate)
+
+        def embed(spans: Sequence[tuple[float, float]]) -> Any:
+            # Hold the embedder lock across inference and attestation so the
+            # recorded checkpoint is the one that produced these rows.
+            with voiceembed.embedder_lock():
+                rows = voiceembed.embed_segments(samples, spans, spec)
+                if not attested:
+                    attested.append(voiceembed.get_embedder(spec).checkpoint_sha256)
+            return rows
+
+        result = speakercluster.cluster_turns(
+            turns,
+            embed,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            params=params,
+        )
+        clustered = _checked_cluster_turns(result.turns)
+        audit = dict(result.audit)
+        record: dict[str, object] = {
+            "method": config.DIARIZE_CLUSTERING_VOICEPRINT,
+            "recipe": _provenance_value(audit.get("recipe", speakercluster.RECIPE)),
+            "embedder": spec.name,
+            # The pin is the identity: voiceembed refuses any other bytes.
+            "embedder_checkpoint": attested[0] if attested else spec.sha256,
+            "params": _provenance_value(asdict(params)),
+            "audit": _audit_counts(audit),
+        }
+    except Exception as exc:  # noqa: BLE001 -- any failure keeps pyannote's turns
+        reason = f"{type(exc).__name__}: {exc}"
+        log.warning(
+            "voiceprint speaker clustering failed; keeping pyannote's speakers: %s",
+            reason,
+        )
+        return turns, {
+            "method": config.DIARIZE_CLUSTERING_PYANNOTE,
+            "requested": config.DIARIZE_CLUSTERING_VOICEPRINT,
+            "reason": _provenance_reason(reason),
+        }
+    finally:
+        if release_embedder:
+            voiceembed.release()
+    log.debug("voiceprint clustering audit: %r", audit)
+    log.info(
+        "voiceprint clustering: %d raw turn(s) -> %d turn(s), %d speaker(s)",
+        len(turns),
+        len(clustered),
+        len({label for _start, _end, label in clustered}),
+    )
+    return clustered, record
 
 
 def _diarize_turns_locked(
@@ -920,8 +1103,11 @@ def _diarize_turns_locked(
     max_speakers: int | None,
     want_embeddings: bool,
     audio_profile: Mapping[str, object] | None,
+    clustering: str | None = None,
+    release_embedder: bool = True,
 ) -> DiarizationResult:
     resolved_model = config.resolve_diarize_model(model)
+    resolved_clustering = config.resolve_diarize_clustering(clustering)
     token = token or config.conf_hf_token()
     # Compare the bare id: a pinned "<id>@<revision>" is the same gated repo.
     if not token and _split_model_revision(resolved_model)[0] in GATED_DIARIZE_MODELS:
@@ -1006,6 +1192,30 @@ def _diarize_turns_locked(
         (float(seg.start), float(seg.end), str(label))
         for seg, _, label in annotation_view.itertracks(yield_label=True)
     ]
+    clustering_record: dict[str, object] | None = None
+    if resolved_clustering == config.DIARIZE_CLUSTERING_VOICEPRINT:
+        if want_embeddings:
+            # The legacy lane's centroids are the pipeline's own, keyed by its
+            # labels: regrouping the turns would orphan them.
+            log.info(
+                "legacy pyannote voiceprints requested: speakers keep pyannote's "
+                "clustering instead of voiceprint clustering"
+            )
+            clustering_record = {
+                "method": config.DIARIZE_CLUSTERING_PYANNOTE,
+                "requested": config.DIARIZE_CLUSTERING_VOICEPRINT,
+                "reason": "legacy pyannote voiceprint lane",
+            }
+        else:
+            # Raw turns, before smoothing, on the exact waveform pyannote saw.
+            turns, clustering_record = _voiceprint_clustering(
+                turns,
+                wav,
+                int(sr),
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                release_embedder=release_embedder,
+            )
     turns = _smooth_turns(turns)
     if centroids is not None:
         persisted_labels = {label for _start, _end, label in turns}
@@ -1028,6 +1238,10 @@ def _diarize_turns_locked(
         audio_profile=audio_profile,
         torch_version=str(torch.__version__),
     )
+    if clustering_record is not None:
+        # Descriptive only: neither compatibility fingerprint reads it
+        # (clustering changes the turns, not the embedding space).
+        provenance["clustering"] = clustering_record
     return DiarizationResult(
         turns=turns,
         centroids=centroids,
