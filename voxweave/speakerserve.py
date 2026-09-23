@@ -1,4 +1,4 @@
-"""Local-only HTTP serving for the speaker audition page."""
+"""HTTP serving for the speaker audition page, with loopback binding by default."""
 
 from __future__ import annotations
 
@@ -19,8 +19,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from voxweave import artifacts, fsio, turnembed, voiceembed
+from voxweave.ngrok import NgrokOrigins
 from voxweave.voicebase import (
     MAX_PROVENANCE_STRING_BYTES,
     VOICEPRINTS_MAX_BYTES,
@@ -100,7 +102,7 @@ class _StagedSplit:
 
 
 class SpeakerHTTPServer(ThreadingHTTPServer):
-    """A loopback server carrying one in-memory audition session."""
+    """An HTTP server carrying one in-memory audition session."""
 
     daemon_threads = True
 
@@ -115,7 +117,11 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         pristine_mapping_generation: fsio.FileGeneration | None,
         port: int,
         report: Callable[[str], None],
+        host: str = HOST,
+        ngrok: bool = False,
     ) -> None:
+        if host not in (HOST, "0.0.0.0"):
+            raise ValueError("host must be 127.0.0.1 or 0.0.0.0")
         self.page_bytes = page.encode("utf-8")
         self.media_path = Path(media_path)
         self.mapping_path = Path(mapping_path)
@@ -130,11 +136,12 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         self.action_lock = threading.Lock()
         self.split_proposal: _SplitProposal | None = None
         self.session_terminal = False
-        super().__init__((HOST, port), _SpeakerRequestHandler)
+        super().__init__((host, port), _SpeakerRequestHandler)
+        self.ngrok_origins = NgrokOrigins(self.server_port) if ngrok else None
 
     @property
     def authority(self) -> str:
-        return f"{HOST}:{self.server_port}"
+        return f"{self.server_address[0]}:{self.server_port}"
 
     @property
     def origin(self) -> str:
@@ -180,16 +187,45 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
             no_store=no_store,
         )
 
-    def _host_allowed(self) -> bool:
-        # A DNS-rebinding page resolves its own hostname to 127.0.0.1 and can
-        # then read same-origin responses, so every route — not just the write
-        # path — must refuse a Host other than the bound authority (the page
-        # embeds private audio and serve-info discloses the save token).
-        return self.headers.get_all("Host", []) == [self.server.authority]
+    def _allowed_origins(self) -> set[str]:
+        # Every route checks Host because the page embeds audio and serve-info
+        # discloses the save token. Wildcard binding also accepts the connection's
+        # local IP, never arbitrary hostnames that could enable DNS rebinding.
+        authorities = {self.server.authority}
+        if self.server.server_address[0] == "0.0.0.0":
+            local_host = self.connection.getsockname()[0]
+            authorities.add(f"{local_host}:{self.server.server_port}")
+        if self.server.ngrok_origins is not None:
+            authorities.add(f"localhost:{self.server.server_port}")
+        hosts = self.headers.get_all("Host", [])
+        if len(hosts) != 1:
+            return set()
+        host = hosts[0]
+        local = host in authorities
+        origins = {f"http://{host}"} if local else set()
+        if self.server.ngrok_origins is not None and (
+            not local
+            or any(o not in origins for o in self.headers.get_all("Origin", []))
+        ):
+            origins.update(
+                origin
+                for origin in self.server.ngrok_origins.get()
+                if local or urlsplit(origin).netloc == host
+            )
+        return origins
 
     def do_GET(self) -> None:
-        if not self._host_allowed():
-            self._reply(HTTPStatus.FORBIDDEN)
+        if not self._allowed_origins():
+            message = (
+                b"No matching ngrok endpoint. Check the local agent at 127.0.0.1:4040 "
+                b"and forward it to this server's port.\n"
+                if self.server.ngrok_origins is not None
+                else b"Host is not allowed. For a local ngrok tunnel, start speakers with --ngrok.\n"
+            )
+            self._reply(
+                HTTPStatus.FORBIDDEN,
+                message,
+            )
             return
         if self.path == "/":
             self._reply(
@@ -253,11 +289,12 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
                 self._handle_split_undo(payload)
 
     def _guarded_json_body(self) -> object:
-        if not self._host_allowed():
+        allowed_origins = self._allowed_origins()
+        if not allowed_origins:
             self._reply(HTTPStatus.FORBIDDEN)
             return _INVALID_BODY
         origins = self.headers.get_all("Origin", [])
-        if len(origins) > 1 or (origins and origins[0] != self.server.origin):
+        if len(origins) > 1 or (origins and origins[0] not in allowed_origins):
             self._reply(HTTPStatus.FORBIDDEN)
             return _INVALID_BODY
         tokens = self.headers.get_all("X-VoxWeave-Token", [])
@@ -1355,10 +1392,12 @@ def make_server(
     sibling_path: Path,
     speaker_ids: Sequence[str],
     pristine_mapping_generation: fsio.FileGeneration | None = None,
+    host: str = HOST,
+    ngrok: bool = False,
     port: int = 0,
     report: Callable[[str], None] = print,
 ) -> SpeakerHTTPServer:
-    """Bind and return one loopback-only audition server."""
+    """Bind and return one audition server."""
     return SpeakerHTTPServer(
         page=page,
         media_path=media_path,
@@ -1366,6 +1405,8 @@ def make_server(
         sibling_path=sibling_path,
         speaker_ids=speaker_ids,
         pristine_mapping_generation=pristine_mapping_generation,
+        host=host,
+        ngrok=ngrok,
         port=port,
         report=report,
     )
@@ -1379,11 +1420,13 @@ def serve(
     sibling_path: Path,
     speaker_ids: Sequence[str],
     pristine_mapping_generation: fsio.FileGeneration | None = None,
+    host: str = HOST,
+    ngrok: bool = False,
     port: int = 0,
     open_browser: bool = True,
     report: Callable[[str], None] = print,
 ) -> str:
-    """Serve an audition until interrupted and return its loopback URL."""
+    """Serve an audition until interrupted and return its listening URL."""
     server = make_server(
         page=page,
         media_path=media_path,
@@ -1391,14 +1434,22 @@ def serve(
         sibling_path=sibling_path,
         speaker_ids=speaker_ids,
         pristine_mapping_generation=pristine_mapping_generation,
+        host=host,
+        ngrok=ngrok,
         port=port,
         report=report,
     )
     url = f"{server.origin}/"
     report(url)
+    if ngrok:
+        report("ngrok discovery enabled via the local agent on 127.0.0.1:4040.")
+    if host == "0.0.0.0":
+        report(
+            "For access from another device, replace 0.0.0.0 with this machine's IP address."
+        )
     if open_browser:
         try:
-            webbrowser.open(url)
+            webbrowser.open(url.replace("//0.0.0.0:", f"//{HOST}:"))
         except Exception:
             pass
     try:
