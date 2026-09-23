@@ -387,7 +387,7 @@ directory is chosen by, first match wins:
 JSON, one file per concern, and never holds audio:
 
 ```
-identities.json              names, aliases and scopes of every identity
+identities.json              names, aliases and scopes of every identity; the list of space files
 spaces/<model>-<fp12>.json   the voice vectors of one embedding space
 history.jsonl                append-only log of changes (ids, scopes, episodes, counts; never vectors or people's names)
 .library.lock                one lock for the whole library
@@ -418,11 +418,16 @@ a scope, enrollment stops and asks you to rename one (`voxweave voices rename ID
 **Sharing on a NAS.** Several machines can point `[voices].dir` at the same directory on a NAS.
 Writes take an exclusive `flock` on `.library.lock`; Linux NFS clients emulate it with byte-range
 locks, which works on NFSv4 and on NFSv3 with the lock manager, but a `nolock` mount keeps each
-lock local to its machine. Every write also checks that each file it replaces still holds what
-it read and otherwise stops ("re-run the command"), so a missing lock cannot silently lose an
-update, only make one of two simultaneous writers fail. Files are replaced by an atomic rename
-within the directory. File-sync services are not a lock and can produce conflicting copies; use
-a real network mount. A library directory created by VoxWeave is private (`0700`, files
+lock local to its machine, so use a mount with working locks. Every write also checks, just
+before replacing each file, that it still holds what the write read, and otherwise stops
+("re-run the command"). That check narrows the window but is not atomic: without working locks,
+two simultaneous writers can both pass it and one update can be lost. Voice samples such a race
+leaves behind for an identity that no longer exists are ignored by every reader and deleted by
+the next write. `identities.json` lists every space file, so `voices forget` finds all of them
+even when an NFS client's cached directory listing is a minute old, and stops (asking you to
+re-run) if a listed file is not visible yet. Files are replaced by an atomic rename within the
+directory. File-sync services are not a lock and can produce conflicting copies; use a real
+network mount. A library directory created by VoxWeave is private (`0700`, files
 `0600`); a directory you created beforehand keeps its permissions. Only the built-in location
 gets missing parent directories created: for `--voices-dir`, `VOXWEAVE_VOICES_DIR` or
 `[voices].dir` the parent must already exist, so an unmounted share (an empty mount point) makes

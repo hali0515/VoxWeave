@@ -21,12 +21,21 @@ pointer to its source media, so a future re-embedding can find the media
 again; audio is never stored.
 
 Writers hold the exclusive lock, re-read every file they change, apply a pure
-transition, then replace each changed file atomically only if its bytes are
-still the ones they read (a compare-and-swap that also catches a mount where
-flock silently does nothing), and append the history row last. Readers hold
-the shared lock. Nothing relies on inode identity or hard links, both of which
-are unreliable on network filesystems; a rename within one directory is atomic
-on the server.
+transition, then replace each changed file atomically, checking just before
+each rename that its bytes are still the ones they read, and append the
+history row last. Readers hold the shared lock. The check is a read followed
+by a rename, not an atomic compare-and-swap: it catches most writers that
+raced past a lock that does nothing (a ``nolock`` NFS mount), but two such
+writers can both pass it, so correctness relies on the lock. What such a race
+(or a manual edit) can leave behind, vectors of an identity that no longer
+exists, is skipped by every reader and deleted by the next writer.
+
+``identities.json`` lists every space file, written before a new space file
+is created, so a reader that must see every space (``forget``) does not
+depend on a directory listing, which an NFS client may serve from a stale
+cache for a minute. Nothing relies on inode identity or hard links, both of
+which are unreliable on network filesystems; a rename within one directory
+is atomic on the server.
 """
 
 from __future__ import annotations
@@ -98,12 +107,23 @@ LEGACY_STORE_NAME = "voxweave.voices.json"
 IDENTITIES_MAX_BYTES = 16 * 1024 * 1024
 SPACE_MAX_BYTES = 64 * 1024 * 1024
 MAX_LIBRARY_IDENTITIES = 10_000
+MAX_SPACES = 1024
 MAX_SCOPES = 256
 MAX_MEDIA_PATH_BYTES = 4096
 MAX_SLUG_CHARS = 48
 DEFAULT_SCOPE = "default"
 HISTORY_ACTIONS = frozenset(
-    {"create", "enroll", "replace", "evict", "rename", "forget", "import", "split"}
+    {
+        "create",
+        "enroll",
+        "replace",
+        "evict",
+        "rename",
+        "forget",
+        "import",
+        "split",
+        "orphan",
+    }
 )
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -275,7 +295,21 @@ def space_identity(provenance: Mapping[str, object]) -> tuple[str, str]:
 
 
 def empty_identities() -> dict[str, object]:
-    return {"version": 1, "revision": 0, "identities": {}}
+    return {"version": 1, "revision": 0, "identities": {}, "spaces": []}
+
+
+def listed_spaces(identities: Mapping[str, object]) -> list[str]:
+    """The space names ``identities.json`` lists (absent in early libraries)."""
+    return list(cast(list[str], identities.get("spaces", [])))
+
+
+def _list_space(identities: dict[str, object], space_name: str) -> bool:
+    """List ``space_name`` in ``identities`` (in place); report whether it changed."""
+    listed = listed_spaces(identities)
+    if space_name in listed:
+        return False
+    identities["spaces"] = sorted([*listed, space_name])
+    return True
 
 
 def new_space(provenance: Mapping[str, object]) -> dict[str, object]:
@@ -341,6 +375,18 @@ def validate_identities(value: object) -> Mapping[str, Mapping[str, object]]:
                 raise VoiceLibraryError(f"{prefix}.scopes contains duplicates")
             require_utc_timestamp(identity.get("created"), f"{prefix}.created")
             require_utc_timestamp(identity.get("updated"), f"{prefix}.updated")
+        if "spaces" in root:
+            spaces = _require_list(root.get("spaces"), "spaces")
+            if len(spaces) > MAX_SPACES:
+                raise VoiceLibraryError(f"spaces may list at most {MAX_SPACES} files")
+            for position, name in enumerate(spaces):
+                if (
+                    not isinstance(name, str)
+                    or _SPACE_NAME_RE.fullmatch(name) is None
+                ):
+                    raise VoiceLibraryError(f"spaces[{position}] is not a space name")
+            if len(set(cast(list[str], spaces))) != len(spaces):
+                raise VoiceLibraryError("spaces contains duplicates")
     except Phase2DataError as exc:
         raise _as_library_error(exc, IDENTITIES_NAME) from exc
     return cast(Mapping[str, Mapping[str, object]], identities)
@@ -466,6 +512,11 @@ class LibraryState:
     (``all_spaces`` says whether every space file was loaded); ``observed``
     maps every file that was looked at to its bytes (None when absent), the
     compare-and-swap baseline of a later :func:`commit`.
+
+    ``orphans`` counts, per space, the exemplars of identities that do not
+    exist, which were dropped from ``spaces`` on read (the next commit
+    deletes them from disk); ``missing_spaces`` names spaces that
+    ``identities.json`` lists but that could not be found.
     """
 
     paths: LibraryPaths
@@ -473,6 +524,8 @@ class LibraryState:
     spaces: dict[str, dict[str, object]]
     observed: dict[Path, bytes | None] = field(default_factory=dict)
     all_spaces: bool = False
+    orphans: dict[str, dict[str, int]] = field(default_factory=dict)
+    missing_spaces: tuple[str, ...] = ()
 
     @property
     def identity_map(self) -> dict[str, dict[str, object]]:
@@ -538,9 +591,42 @@ def validate_relations(state: LibraryState) -> None:
                 )
 
 
-def read_state(root: Path, *, spaces: Iterable[str] | None = None) -> LibraryState:
+def _drop_orphans(
+    identities: Mapping[str, object], spaces: Mapping[str, dict[str, object]]
+) -> dict[str, dict[str, int]]:
+    """Remove, in place, the exemplars of identities that do not exist.
+
+    They can only be left by an interrupted or unlocked writer (or a manual
+    edit); refusing to read the library over them would also block the
+    ``forget`` that removes them, so readers skip them and writers delete them.
+    """
+    known = cast(Mapping[str, object], identities["identities"])
+    dropped: dict[str, dict[str, int]] = {}
+    for name, document in spaces.items():
+        exemplars = cast(dict[str, list[object]], document["exemplars"])
+        for identity_id in sorted(set(exemplars) - set(known)):
+            dropped.setdefault(name, {})[identity_id] = len(exemplars.pop(identity_id))
+        if name in dropped:
+            log.warning(
+                "voice library space %s holds voice samples of %d unknown "
+                "identities (left by an interrupted or unlocked writer); they are "
+                "ignored, and the next change to the library deletes them",
+                name,
+                len(dropped[name]),
+            )
+    return dropped
+
+
+def read_state(
+    root: Path,
+    *,
+    spaces: Iterable[str] | None = None,
+    include: Iterable[str] = (),
+) -> LibraryState:
     """Read and validate the library; ``spaces=None`` loads every space.
 
+    Every space means every space ``identities.json`` lists, every space file
+    found in the directory, and ``include`` (spaces a writer may create).
     Call it while holding :func:`library_lock`. A missing library reads as an
     empty one.
     """
@@ -554,20 +640,42 @@ def read_state(root: Path, *, spaces: Iterable[str] | None = None) -> LibrarySta
         else _decode(raw, source=IDENTITIES_NAME, max_bytes=IDENTITIES_MAX_BYTES)
     )
     validate_identities(identities)
-    names = list_space_names(paths) if spaces is None else list(dict.fromkeys(spaces))
+    listed = listed_spaces(identities)
+    if spaces is None:
+        names = sorted({*listed, *list_space_names(paths), *include})
+    else:
+        names = list(dict.fromkeys([*spaces, *include]))
     loaded: dict[str, dict[str, object]] = {}
+    missing: list[str] = []
     for name in names:
         path = paths.space(name)
         raw_space = _read_bounded(path, SPACE_MAX_BYTES)
         observed[path] = raw_space
         if raw_space is None:
+            if name in listed:
+                missing.append(name)
             continue
         document = _decode(
             raw_space, source=f"{SPACES_DIRNAME}/{name}.json", max_bytes=SPACE_MAX_BYTES
         )
         validate_space(document, name=name)
         loaded[name] = document
-    state = LibraryState(paths, identities, loaded, observed, spaces is None)
+    if missing:
+        log.warning(
+            "voice library %s lists space file(s) that cannot be found: %s",
+            paths.root,
+            ", ".join(missing),
+        )
+    orphans = _drop_orphans(identities, loaded)
+    state = LibraryState(
+        paths,
+        identities,
+        loaded,
+        observed,
+        spaces is None,
+        orphans=orphans,
+        missing_spaces=tuple(missing),
+    )
     validate_relations(state)
     return state
 
@@ -762,6 +870,31 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
     if change.empty:
         return
     paths = state.paths
+    healed_spaces: dict[str, dict[str, object]] = {}
+    healed_history: list[dict[str, object]] = []
+    for name, dropped in sorted(state.orphans.items()):
+        # Delete what read_state skipped: vectors of identities that do not
+        # exist (a space the change rewrites anyway was read without them).
+        healed_history.append(
+            history_row(
+                "orphan",
+                utc_timestamp(),
+                space=name,
+                identities=sorted(dropped),
+                exemplars=sum(dropped.values()),
+            )
+        )
+        if name not in change.spaces:
+            document = copy.deepcopy(state.spaces[name])
+            document["revision"] = cast(int, document["revision"]) + 1
+            healed_spaces[name] = document
+    if healed_spaces or healed_history:
+        change = LibraryChange(
+            identities=change.identities,
+            spaces={**change.spaces, **healed_spaces},
+            history=(*healed_history, *change.history),
+            identities_first=change.identities_first,
+        )
     for row in change.history:
         _reject_vectors(row)
     identities = change.identities or state.identities
@@ -1122,6 +1255,8 @@ def enroll_entries(
             )
         )
 
+    if space_changed and _list_space(identities_document, space_name):
+        identities_changed = True
     if identities_changed:
         identities_document["revision"] = cast(int, identities_document["revision"]) + 1
     if space_changed:
@@ -1180,6 +1315,16 @@ def forget_identity(
     _identity_or_raise(state, identity_id)
     if not state.all_spaces:
         raise VoiceLibraryError("forget must read every embedding space first")
+    if state.missing_spaces:
+        # Forgetting without them could leave this person's vectors behind.
+        raise VoiceLibraryError(
+            "identities.json lists space file(s) that cannot be found: "
+            + ", ".join(state.missing_spaces)
+            + ". Another machine may have just created them on a network share "
+            "whose directory cache is stale: re-run in a minute. If a file was "
+            "deleted on purpose, remove its name from the \"spaces\" list in "
+            "identities.json"
+        )
     event_at = _event_time(at)
     identities = copy.deepcopy(state.identities)
     del cast(dict[str, object], identities["identities"])[identity_id]
@@ -1353,6 +1498,8 @@ def import_store(
         exemplars_present=present_count,
         refused=tuple(refused),
     )
+    if space_changed and _list_space(identities_document, space_name):
+        identities_changed = True
     if not (identities_changed or space_changed):
         return LibraryChange(), summary
     if identities_changed:
@@ -1611,6 +1758,7 @@ __all__ = [
     "library_lock",
     "list_identities",
     "list_space_names",
+    "listed_spaces",
     "match_input_digest",
     "matching_pools",
     "new_space",

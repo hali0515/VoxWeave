@@ -618,23 +618,111 @@ def test_existing_shared_directory_keeps_its_mode(tmp_path):
     assert stat.S_IMODE(root.stat().st_mode) == 0o770
 
 
-def test_orphan_exemplars_and_misfiled_spaces_are_rejected(tmp_path):
+def test_misfiled_spaces_are_rejected(tmp_path):
     root = tmp_path / "voices"
     _enroll(root, [_entry()])
-    state = _read(root)
-    [name] = state.spaces
-    identities = root / "identities.json"
-    document = json.loads(identities.read_text())
-    document["identities"] = {}
-    identities.write_text(json.dumps(document))
-    with pytest.raises(voicelibrary.VoiceLibraryError, match="unknown identity"):
-        _read(root)
-
+    [name] = _read(root).spaces
     misfiled = root / "spaces" / "pyannote-000000000000.json"
     (root / "spaces" / f"{name}.json").rename(misfiled)
-    identities.write_text(json.dumps(state.identities))
     with pytest.raises(voicelibrary.VoiceLibraryError, match="holds space"):
-        _read(root)
+        _read(root, spaces=["pyannote-000000000000"])
+
+
+def test_orphan_exemplars_are_skipped_on_read_and_deleted_by_a_writer(
+    tmp_path, caplog
+):
+    # What a forget racing an enrollment on a mount without working locks
+    # leaves behind: vectors of an identity identities.json no longer has.
+    root = tmp_path / "voices"
+    _enroll(root, [_entry(), _entry("Kazuma", _unit(1), label="SPEAKER_01")])
+    [name] = _read(root).spaces
+    identities = root / "identities.json"
+    document = json.loads(identities.read_text())
+    del document["identities"]["v000000000002"]
+    identities.write_text(json.dumps(document))
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        for spaces in (None, [name]):  # voices list/show/forget; enroll/serve
+            state = _read(root, spaces=spaces)
+            assert list(state.space_exemplars(name)) == ["v000000000001"]
+            assert state.orphans == {name: {"v000000000002": 1}}
+    assert "unknown identities" in caplog.text
+    assert b"v000000000002" in (root / "spaces" / f"{name}.json").read_bytes()
+
+    # Any write deletes them: here, forgetting the only remaining person.
+    with voicelibrary.library_lock(root, exclusive=True):
+        state = voicelibrary.read_state(root)
+        change, removed = voicelibrary.forget_identity(state, "v000000000001")
+        voicelibrary.commit(state, change)
+    assert removed == {name: 1}
+    assert b"vector" not in (root / "spaces" / f"{name}.json").read_bytes()
+    assert _read(root).orphans == {}
+    orphan_row = next(r for r in _history(root) if r["action"] == "orphan")
+    assert orphan_row["space"] == name
+    assert orphan_row["identities"] == ["v000000000002"]
+    assert orphan_row["exemplars"] == 1
+
+
+def test_identities_json_lists_every_space_file(tmp_path):
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry()], ids=ids)
+    _enroll(
+        root,
+        [_entry(identity_id="v000000000001")],
+        provenance=_decoupled("anime-va-ecapa-gn"),
+        source=_source(2, episode="ep02"),
+        ids=ids,
+    )
+    listed = json.loads((root / "identities.json").read_text())["spaces"]
+    assert listed == sorted(p.stem for p in (root / "spaces").glob("*.json"))
+    assert len(listed) == 2
+
+
+def test_forget_finds_spaces_a_stale_directory_listing_hides(tmp_path, monkeypatch):
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry()], ids=ids)
+    _enroll(
+        root,
+        [_entry(identity_id="v000000000001")],
+        provenance=_decoupled("anime-va-ecapa-gn"),
+        source=_source(2, episode="ep02"),
+        ids=ids,
+    )
+    # An NFS client serving readdir from its directory cache (acdirmin=60)
+    # does not see a space file another machine just created.
+    monkeypatch.setattr(voicelibrary, "list_space_names", lambda _paths: [])
+    with voicelibrary.library_lock(root, exclusive=True):
+        state = voicelibrary.read_state(root)
+        change, removed = voicelibrary.forget_identity(state, "v000000000001")
+        voicelibrary.commit(state, change)
+    assert sorted(removed.values()) == [1, 1]
+    for path in (root / "spaces").iterdir():
+        assert b"v000000000001" not in path.read_bytes()
+
+
+def test_forget_refuses_while_a_listed_space_cannot_be_found(tmp_path, caplog):
+    root = tmp_path / "voices"
+    _enroll(root, [_entry()])
+    [name] = _read(root).spaces
+    hidden = root / "spaces" / f"{name}.json"
+    moved = tmp_path / "elsewhere.json"
+    hidden.rename(moved)  # listed, but not visible to this client yet
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        state = _read(root)  # list/show still work, with a warning
+    assert state.missing_spaces == (name,)
+    assert "cannot be found" in caplog.text
+    with voicelibrary.library_lock(root, exclusive=True):
+        state = voicelibrary.read_state(root)
+        with pytest.raises(voicelibrary.VoiceLibraryError, match="re-run in a minute"):
+            voicelibrary.forget_identity(state, "v000000000001")
+    moved.rename(hidden)
+    with voicelibrary.library_lock(root, exclusive=True):
+        state = voicelibrary.read_state(root)
+        change, _removed = voicelibrary.forget_identity(state, "v000000000001")
+        voicelibrary.commit(state, change)
+    assert b"vector" not in hidden.read_bytes()
 
 
 # --------------------------------------------------------------------------
