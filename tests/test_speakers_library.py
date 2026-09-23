@@ -364,6 +364,74 @@ def test_imported_legacy_store_stops_the_hint_and_the_library_copy_wins(
     assert len(match["candidates"]) == 1  # not duplicated by the legacy copy
 
 
+def _forget(identity_id):
+    root = voicelibrary.resolve_voices_dir().root
+    with voicelibrary.library_lock(root, exclusive=True):
+        state = voicelibrary.read_state(root)
+        change, _removed = voicelibrary.forget_identity(state, identity_id)
+        voicelibrary.commit(state, change)
+
+
+def test_a_review_page_older_than_a_forget_cannot_bring_the_id_back(tmp_path):
+    first = _episode(tmp_path / "Season 1", names={"SPEAKER_00": "Aqua"})
+    speakers.enroll_speaker_voices(first)
+    [forgotten] = _library().identity_map
+    second = _episode(tmp_path / "Season 2", capture_digit="2")
+    speakers.create_speaker_audition(second)  # the page offers `forgotten`
+    _forget(forgotten)
+    _name(second, {"SPEAKER_00": "Aqua"})  # the reviewer used that suggestion
+
+    with pytest.raises(EnrollmentRefusal, match="forgotten since"):
+        speakers.enroll_speaker_voices(second)
+    assert _library().identity_map == {}
+
+    # A fresh review no longer offers the forgotten person.
+    page = speakers.create_speaker_audition(second).page
+    assert "Aqua (" not in page  # no suggestion button
+    assert not artifacts.path_present(artifacts.claim_paths(second).speaker_suggest)
+
+
+def test_a_forgotten_id_stays_out_of_the_folder_store_suggestions(tmp_path, caplog):
+    media = _episode(tmp_path / "Show")
+    legacy_path, store = _legacy_folder_store(tmp_path / "Show")
+    [identity_id] = store["identities"]
+    root = voicelibrary.resolve_voices_dir().root
+    with voicelibrary.library_lock(root, exclusive=True, create_parents=True):
+        state = voicelibrary.read_state(
+            root, spaces=[voicelibrary.space_identity(PROVENANCE)[0]]
+        )
+        change, _summary = voicelibrary.import_store(
+            state, store, scope="Show", source_label=str(legacy_path)
+        )
+        voicelibrary.commit(state, change)
+    _forget(identity_id)
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        page = speakers.create_speaker_audition(media).page
+
+    assert "Aqua (" not in page  # no suggestion button
+    assert "voxweave voices import" not in caplog.text
+    assert not artifacts.path_present(artifacts.claim_paths(media).speaker_suggest)
+
+
+def test_a_folder_store_suggestion_is_adopted_by_its_id(tmp_path):
+    media = _episode(tmp_path / "Show")
+    _legacy_path, store = _legacy_folder_store(tmp_path / "Show")
+    [identity_id] = store["identities"]
+    speakers.create_speaker_audition(media)
+    match = load_suggest(artifacts.claim_paths(media).speaker_suggest)["speakers"][
+        "SPEAKER_00"
+    ]
+    assert [(c["identity"], c["origin"]) for c in match["candidates"]] == [
+        (identity_id, "legacy")
+    ]
+    _name(media, {"SPEAKER_00": "Aqua"})
+
+    speakers.enroll_speaker_voices(media)
+
+    assert list(_library().identity_map) == [identity_id]
+
+
 def test_unusable_library_leaves_the_review_manual(tmp_path, caplog):
     media = _episode(tmp_path / "Show")
     root = voicelibrary.resolve_voices_dir().root

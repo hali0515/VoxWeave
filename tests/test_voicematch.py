@@ -906,6 +906,32 @@ def test_library_record_round_trips_tiers_and_rejects_a_prefilled_tier_two():
         voicematch.validate_suggest_record(tampered)
 
 
+def test_library_candidates_record_where_their_identity_came_from():
+    library = {"display_name": "Aqua", "origin": "library", "exemplars": []}
+    legacy = {"display_name": "Kazuma", "origin": "legacy", "exemplars": []}
+    library["exemplars"] = [{"id": "x00000001", "vector": _unit()}]
+    legacy["exemplars"] = [{"id": "x00000002", "vector": _unit()}]
+    matches = voicematch.match_tiers(
+        {"SPEAKER_00": _unit()},
+        in_scope={"v000000000001": library, "v000000000002": legacy},
+        other_scopes={},
+        scopes={"v000000000001": ("Show A",), "v000000000002": ("Show A",)},
+        embedding_dim=16,
+        thresholds=_thresholds(),
+        global_suggest=0.6,
+    )
+    record = _library_record(matches)
+    candidates = record["speakers"]["SPEAKER_00"]["candidates"]
+    assert {c["identity"]: c["origin"] for c in candidates} == {
+        "v000000000001": "library",
+        "v000000000002": "legacy",
+    }
+    tampered = copy.deepcopy(record)
+    tampered["speakers"]["SPEAKER_00"]["candidates"][0]["origin"] = "elsewhere"
+    with pytest.raises(voicebase.Phase2DataError, match="origin"):
+        voicematch.validate_suggest_record(tampered)
+
+
 def test_per_show_records_keep_their_single_tier_shape():
     record = _record()
     assert "secondary" not in record["speakers"]["SPEAKER_00"]

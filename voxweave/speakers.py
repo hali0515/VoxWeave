@@ -2060,9 +2060,9 @@ def _enroll_into_store(
 
 def _accepted_suggestions(
     media: Path, sidecar: Mapping[str, object]
-) -> dict[str, list[tuple[str, str, int]]]:
-    """Per local speaker, the ``(identity, display name, tier)`` suggestions the
-    review page offered for this exact capture.
+) -> dict[str, list[tuple[str, str, int, str | None]]]:
+    """Per local speaker, the ``(identity, display name, tier, origin)``
+    suggestions the review page offered for this exact capture.
 
     Only a record bound to the current capture and voiceprints is trusted; any
     other record is stale and ignored (enrollment then falls back to names).
@@ -2081,7 +2081,7 @@ def _accepted_suggestions(
         "voiceprints_digest"
     ) != voiceprints_digest(sidecar):
         return {}
-    offered: dict[str, list[tuple[str, str, int]]] = {}
+    offered: dict[str, list[tuple[str, str, int, str | None]]] = {}
     for local_id, raw_match in cast(Mapping[str, object], record["speakers"]).items():
         match = cast(Mapping[str, object], raw_match)
         rows = offered.setdefault(local_id, [])
@@ -2091,7 +2091,12 @@ def _accepted_suggestions(
         for tier, tier_match in tiers:
             for raw in cast(list[Mapping[str, object]], tier_match["candidates"]):
                 rows.append(
-                    (cast(str, raw["identity"]), cast(str, raw["display_name"]), tier)
+                    (
+                        cast(str, raw["identity"]),
+                        cast(str, raw["display_name"]),
+                        tier,
+                        cast("str | None", raw.get("origin")),
+                    )
                 )
     return offered
 
@@ -2101,7 +2106,7 @@ def _library_identity_for(
     raw_name: str,
     *,
     scope: str,
-    offered: Sequence[tuple[str, str, int]],
+    offered: Sequence[tuple[str, str, int, str | None]],
 ) -> str | None:
     """Resolve the library identity a reviewed name refers to, or None to create.
 
@@ -2110,24 +2115,46 @@ def _library_identity_for(
     entered (tier 1 preferred). Otherwise the name resolves among the
     identities of this scope, and a name no identity of this scope carries
     becomes a new identity even if another scope has an identity of that
-    name. A suggested id the library does not hold yet (from a per-folder
-    store not imported yet) is adopted, so a later import merges into it.
+    name. A suggested id the library does not hold yet is adopted only when
+    it came from a per-folder store not imported yet, so a later import
+    merges into it; a suggestion of an identity that has been forgotten, or
+    that left the library since the page was made, is refused.
     """
     key = normalize_speaker_key(raw_name)
     accepted = [
-        (tier, identity_id)
-        for identity_id, display_name, tier in offered
+        (tier, identity_id, origin)
+        for identity_id, display_name, tier, origin in offered
         if normalize_speaker_key(display_name) == key
     ]
     if accepted:
-        best = min(tier for tier, _identity in accepted)
-        ids = sorted({identity for tier, identity in accepted if tier == best})
-        if len(ids) == 1:
-            return ids[0]
-        raise EnrollmentRefusal(
-            f"speaker name {raw_name!r} matches several suggested identities "
-            f"({', '.join(ids)}); rename one with `voxweave voices rename`"
-        )
+        best = min(tier for tier, _identity, _origin in accepted)
+        chosen = {
+            identity: origin for tier, identity, origin in accepted if tier == best
+        }
+        ids = sorted(chosen)
+        if len(ids) > 1:
+            raise EnrollmentRefusal(
+                f"speaker name {raw_name!r} matches several suggested identities "
+                f"({', '.join(ids)}); rename one with `voxweave voices rename`"
+            )
+        [identity_id] = ids
+        if identity_id in state.identity_map:
+            return identity_id
+        if identity_id in state.forgotten:
+            raise EnrollmentRefusal(
+                f"speaker name {raw_name!r} was taken from a suggestion of "
+                f"identity {identity_id}, which has been forgotten since "
+                "(`voxweave voices forget`); run `voxweave speakers serve` again "
+                "and review this speaker"
+            )
+        if chosen[identity_id] == "library":
+            raise EnrollmentRefusal(
+                f"speaker name {raw_name!r} was taken from a suggestion of "
+                f"identity {identity_id}, which is no longer in the voice "
+                "library; run `voxweave speakers serve` again and review this "
+                "speaker"
+            )
+        return identity_id
     in_scope = voicelibrary.identities_named(state, raw_name, scope=scope)
     if len(in_scope) > 1:
         raise EnrollmentRefusal(

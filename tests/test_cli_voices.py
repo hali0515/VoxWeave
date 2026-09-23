@@ -224,6 +224,37 @@ def test_import_is_idempotent_and_leaves_the_store_alone(tmp_path, invoke):
     assert [row["action"] for row in history].count("import") == 1
 
 
+def test_forget_names_per_folder_stores_that_still_hold_the_id(tmp_path, invoke):
+    store = voicestore.new_voice_store("Example Show", LEGACY)
+    store = voicestore.enroll_exemplar(
+        store,
+        raw_name="Aqua",
+        capture_id="c" + "5" * 32,
+        media_fingerprint="5" * 64,
+        episode="ep05",
+        vector=_unit(5),
+        at="2026-09-01T00:00:00Z",
+    ).store
+    [identity_id] = store["identities"]
+    legacy = tmp_path / "Show A" / "voxweave.voices.json"
+    legacy.parent.mkdir()
+    voicestore.write_voice_store(legacy, store)
+    root = tmp_path / "library"
+    assert invoke("voices", "import", legacy, "--voices-dir", root).exit_code == 0
+
+    result = invoke("voices", "forget", identity_id, "--yes", "--voices-dir", root)
+    assert result.exit_code == 0, result.output
+    assert f"per-folder store {legacy.resolve()} still holds 1 voice" in result.stderr
+    assert "deleted" in result.stderr
+
+    again = invoke("voices", "import", legacy, "--voices-dir", root)
+    assert again.exit_code == 0, again.output
+    assert f"skipped {identity_id}: forgotten" in again.stderr
+    assert "imported 0 identities and 0 voice sample(s)" in again.stdout
+    listed = invoke("voices", "list", "--json", "--voices-dir", root)
+    assert json.loads(listed.stdout)["identities"] == []
+
+
 def test_speakers_rejects_both_store_kinds(tmp_path, invoke):
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"media")

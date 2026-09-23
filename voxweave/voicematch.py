@@ -113,6 +113,10 @@ class MatchCandidate:
     exemplar_id: str
     # Library scopes the identity was enrolled under; None for a per-show store.
     scopes: tuple[str, ...] | None = None
+    # A library match says where the identity came from: "library", or
+    # "legacy" for a per-folder store read beside it (whose id enrollment may
+    # adopt); None for a per-show store.
+    origin: str | None = None
 
     def as_mapping(self) -> dict[str, object]:
         mapping: dict[str, object] = {
@@ -123,6 +127,8 @@ class MatchCandidate:
         }
         if self.scopes is not None:
             mapping["scopes"] = list(self.scopes)
+        if self.origin is not None:
+            mapping["origin"] = self.origin
         return mapping
 
 
@@ -757,6 +763,7 @@ def _best_identity_candidates(
             ):
                 best = choice
         if best is not None:
+            origin = identity.get("origin")
             scores.append(
                 MatchCandidate(
                     identity_id=identity_id,
@@ -764,6 +771,7 @@ def _best_identity_candidates(
                     similarity=best[0],
                     exemplar_id=best[1],
                     scopes=None if scopes is None else scopes.get(identity_id, ()),
+                    origin=origin if isinstance(origin, str) else None,
                 )
             )
     return sorted(scores, key=lambda item: (-item.similarity, item.identity_id))
@@ -952,6 +960,7 @@ _TIER_ONE_DECISIONS = frozenset({"prefill", "suggest", "collision", "none"})
 # Tier 2 is suggest-only by construction: it is never prefilled.
 _TIER_TWO_DECISIONS = frozenset({"suggest", "collision", "none"})
 MAX_RECORD_SCOPES = 256
+CANDIDATE_ORIGINS = frozenset({"library", "legacy"})
 
 
 def _validate_record_match(
@@ -993,6 +1002,8 @@ def _validate_record_match(
                     f"{candidate_field}.scopes[{position}]",
                     max_bytes=MAX_NAME_BYTES,
                 )
+        if "origin" in candidate and candidate.get("origin") not in CANDIDATE_ORIGINS:
+            raise Phase2DataError(f"{candidate_field}.origin is invalid")
         ordering.append((-similarity, identity_id))
     if ordering != sorted(ordering):
         raise Phase2DataError(f"{field}.candidates are not deterministically ordered")

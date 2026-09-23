@@ -6,7 +6,7 @@ SQLite's locking and WAL are unsafe)::
     <voices_dir>/
       identities.json               identities shared by every embedding space
       spaces/<model>-<fp12>.json    the vectors of one embedding space
-      history.jsonl                 append-only audit; never holds vectors
+      history.jsonl                 audit log; never holds vectors or names
       .library.lock                 one library-wide flock
 
 An identity id is a random ``v`` + 12 hex key; display names are attributes,
@@ -41,7 +41,10 @@ is atomic on the server.
 from __future__ import annotations
 
 import copy
+import dataclasses
+import errno
 import fcntl
+import json
 import logging
 import os
 import re
@@ -89,9 +92,12 @@ from voxweave.voicestore import (
     CrossIndexRefusal,
     EnrollmentRefusal,
     ExemplarKey,
+    canonical_store_path,
+    load_voice_store,
     normalize_episode,
     normalize_speaker_key,
     plan_indexed_enrollment,
+    store_lock_path,
     validate_voice_store,
 )
 
@@ -108,6 +114,8 @@ LEGACY_STORE_NAME = "voxweave.voices.json"
 IDENTITIES_MAX_BYTES = 16 * 1024 * 1024
 SPACE_MAX_BYTES = 64 * 1024 * 1024
 MAX_LIBRARY_IDENTITIES = 10_000
+# Tombstones of forgotten ids; past the cap the oldest are dropped.
+MAX_FORGOTTEN = 100_000
 MAX_SPACES = 1024
 MAX_SCOPES = 256
 MAX_MEDIA_PATH_BYTES = 4096
@@ -239,6 +247,40 @@ def legacy_store_path(media: Path) -> Path:
     return Path(os.path.abspath(media)).parent / LEGACY_STORE_NAME
 
 
+def read_legacy_store(path: Path) -> tuple[Path, dict[str, object]]:
+    """Read and validate a per-show store without needing write access to it.
+
+    The store's shared lock is taken when its lock file can be opened for
+    writing (created if missing, as voicestore does); in a read-only place (a
+    snapshot, a read-only mount or copy) an existing lock file is opened
+    read-only, and without one the store is read unlocked, which is safe
+    because nothing can write there either. Returns the resolved path.
+    """
+    resolved = canonical_store_path(path)
+    lock_path = store_lock_path(path)
+    descriptor: int | None
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise
+        try:
+            descriptor = os.open(lock_path, os.O_RDONLY)
+        except OSError:
+            descriptor = None
+    try:
+        if descriptor is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+        store, _validated = load_voice_store(resolved)
+        return resolved, store
+    finally:
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+
 # --------------------------------------------------------------------------
 # Scopes and embedding spaces
 # --------------------------------------------------------------------------
@@ -297,12 +339,27 @@ def space_identity(provenance: Mapping[str, object]) -> tuple[str, str]:
 
 
 def empty_identities() -> dict[str, object]:
-    return {"version": 1, "revision": 0, "identities": {}, "spaces": []}
+    return {
+        "version": 1,
+        "revision": 0,
+        "identities": {},
+        "spaces": [],
+        "forgotten": [],
+    }
 
 
 def listed_spaces(identities: Mapping[str, object]) -> list[str]:
     """The space names ``identities.json`` lists (absent in early libraries)."""
     return list(cast(list[str], identities.get("spaces", [])))
+
+
+def forgotten_ids(identities: Mapping[str, object]) -> list[str]:
+    """Ids removed by ``voices forget``, oldest first: id-only tombstones.
+
+    A forgotten id is never offered, imported or adopted again, although a
+    per-folder store from an earlier version may still hold its vectors.
+    """
+    return list(cast(list[str], identities.get("forgotten", [])))
 
 
 def _list_space(identities: dict[str, object], space_name: str) -> bool:
@@ -389,6 +446,20 @@ def validate_identities(value: object) -> Mapping[str, Mapping[str, object]]:
                     raise VoiceLibraryError(f"spaces[{position}] is not a space name")
             if len(set(cast(list[str], spaces))) != len(spaces):
                 raise VoiceLibraryError("spaces contains duplicates")
+        if "forgotten" in root:
+            forgotten = _require_list(root.get("forgotten"), "forgotten")
+            if len(forgotten) > MAX_FORGOTTEN:
+                raise VoiceLibraryError(
+                    f"forgotten may list at most {MAX_FORGOTTEN} ids"
+                )
+            for position, identity_id in enumerate(forgotten):
+                require_identity_id(identity_id, f"forgotten[{position}]")
+                if identity_id in identities:
+                    raise VoiceLibraryError(
+                        f"forgotten identity {identity_id} is still in identities"
+                    )
+            if len(set(cast(list[str], forgotten))) != len(forgotten):
+                raise VoiceLibraryError("forgotten contains duplicates")
     except Phase2DataError as exc:
         raise _as_library_error(exc, IDENTITIES_NAME) from exc
     return cast(Mapping[str, Mapping[str, object]], identities)
@@ -532,6 +603,10 @@ class LibraryState:
     @property
     def identity_map(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], self.identities["identities"])
+
+    @property
+    def forgotten(self) -> frozenset[str]:
+        return frozenset(forgotten_ids(self.identities))
 
     def space_exemplars(self, name: str) -> dict[str, list[dict[str, object]]]:
         space = self.spaces.get(name)
@@ -777,6 +852,8 @@ class LibraryChange:
     spaces: Mapping[str, dict[str, object]] = field(default_factory=dict)
     history: Sequence[Mapping[str, object]] = ()
     identities_first: bool = True
+    # Strip the labels (scopes, episodes) of this identity's history rows.
+    redact_identity: str | None = None
 
     @property
     def empty(self) -> bool:
@@ -860,6 +937,65 @@ def _append_history(paths: LibraryPaths, rows: Sequence[Mapping[str, object]]) -
         os.close(descriptor)
 
 
+# History fields that can carry what a person is called: folder and show
+# names (scopes) and media stems (episode labels).
+_REDACTED_HISTORY_FIELDS = frozenset({"scope", "old_scope", "episode"})
+
+
+def read_history(paths: LibraryPaths) -> list[dict[str, object]]:
+    """The parsed history rows; unreadable lines are skipped."""
+    try:
+        raw = paths.history.read_bytes()
+    except FileNotFoundError:
+        return []
+    rows: list[dict[str, object]] = []
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(row, dict):
+            rows.append(cast(dict[str, object], row))
+    return rows
+
+
+def _rewrite_history_redacted(
+    paths: LibraryPaths, identity_id: str, rows: Sequence[Mapping[str, object]]
+) -> None:
+    """Replace the history with ``identity_id``'s labels stripped, plus ``rows``.
+
+    Under the exclusive lock no other writer appends meanwhile. Lines that do
+    not parse are kept byte for byte.
+    """
+    try:
+        raw = paths.history.read_bytes()
+    except FileNotFoundError:
+        raw = b""
+    kept: list[bytes] = []
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, ValueError):
+            kept.append(line)
+            continue
+        if isinstance(row, dict) and row.get("identity") == identity_id:
+            row = {
+                key: value
+                for key, value in row.items()
+                if key not in _REDACTED_HISTORY_FIELDS
+            }
+            kept.append(canonical_json_bytes(row))
+        else:
+            kept.append(line)
+    kept.extend(canonical_json_bytes(row) for row in rows)
+    payload = b"".join(line + b"\n" for line in kept)
+    with fsio.atomic_path(paths.history) as temporary:
+        with open(temporary, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
 def commit(state: LibraryState, change: LibraryChange) -> None:
     """Write ``change`` under the exclusive lock ``state`` was read with.
 
@@ -891,11 +1027,10 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
             document["revision"] = cast(int, document["revision"]) + 1
             healed_spaces[name] = document
     if healed_spaces or healed_history:
-        change = LibraryChange(
-            identities=change.identities,
+        change = dataclasses.replace(
+            change,
             spaces={**change.spaces, **healed_spaces},
             history=(*healed_history, *change.history),
-            identities_first=change.identities_first,
         )
     for row in change.history:
         _reject_vectors(row)
@@ -938,7 +1073,10 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
     for path, payload in writes:
         _write_cas(path, payload, expected=state.observed[path])
     try:
-        _append_history(paths, change.history)
+        if change.redact_identity is not None:
+            _rewrite_history_redacted(paths, change.redact_identity, change.history)
+        else:
+            _append_history(paths, change.history)
     except OSError as exc:
         log.error(
             "voice library change committed, but its history row could not be "
@@ -1249,6 +1387,11 @@ def enroll_entries(
             )
         else:
             identity_id = require_identity_id(entry.identity_id)
+            if identity_id in state.forgotten:
+                raise EnrollmentRefusal(
+                    f"identity {identity_id} was forgotten (`voxweave voices "
+                    "forget`) and cannot be enrolled again"
+                )
         if identity_id in targets:
             raise EnrollmentRefusal(
                 f"two speakers of one episode resolve to identity {identity_id}"
@@ -1449,8 +1592,12 @@ def forget_identity(
 ) -> tuple[LibraryChange, dict[str, int]]:
     """Remove an identity from identities.json and from every space.
 
-    ``state`` must have been read with every space loaded. The history row
-    records the id and per-space counts only: no name, no vector.
+    ``state`` must have been read with every space loaded. The id stays as a
+    tombstone in ``forgotten``, so neither a per-folder store from an
+    earlier version nor a review page generated before the forget can bring
+    it back. The history row records the id and per-space counts only, and
+    the id's earlier rows lose their scopes and episode labels, which are
+    often a person's name (a folder of home recordings, a media stem).
     """
     _identity_or_raise(state, identity_id)
     if not state.all_spaces:
@@ -1468,6 +1615,9 @@ def forget_identity(
     event_at = _event_time(at)
     identities = copy.deepcopy(state.identities)
     del cast(dict[str, object], identities["identities"])[identity_id]
+    identities["forgotten"] = [*forgotten_ids(identities), identity_id][
+        -MAX_FORGOTTEN:
+    ]
     identities["revision"] = cast(int, identities["revision"]) + 1
     spaces: dict[str, dict[str, object]] = {}
     removed: dict[str, int] = {}
@@ -1487,8 +1637,51 @@ def forget_identity(
             history_row("forget", event_at, identity=identity_id, exemplars=removed),
         ),
         identities_first=False,
+        redact_identity=identity_id,
     )
     return change, removed
+
+
+def legacy_store_candidates(state: LibraryState, identity_id: str) -> list[Path]:
+    """Per-folder stores that may still hold ``identity_id``'s vectors.
+
+    The stores ``voices import`` read (its history rows) and the
+    ``voxweave.voices.json`` beside every media file one of the identity's
+    samples came from. ``forget`` does not edit them (they belong to earlier
+    versions and are only read); it names the ones that still hold the id.
+    """
+    candidates: dict[str, Path] = {}
+    for row in read_history(state.paths):
+        source = row.get("source")
+        if row.get("action") == "import" and isinstance(source, str):
+            candidates.setdefault(source, Path(source))
+    for name in sorted(state.spaces):
+        for item in state.space_exemplars(name).get(identity_id, []):
+            media_path = cast(Mapping[str, object], item["source"]).get("media_path")
+            if isinstance(media_path, str):
+                path = legacy_store_path(Path(media_path))
+                candidates.setdefault(str(path), path)
+    return list(candidates.values())
+
+
+def legacy_stores_holding(
+    paths: Iterable[Path], identity_id: str
+) -> list[tuple[Path, int]]:
+    """The stores among ``paths`` that hold ``identity_id``, with its sample count."""
+    holding: list[tuple[Path, int]] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            resolved, store = read_legacy_store(path)
+        except (OSError, Phase2DataError) as exc:
+            log.warning("could not check per-folder store %s: %s", path, exc)
+            continue
+        identity = cast(Mapping[str, object], store["identities"]).get(identity_id)
+        if identity is not None:
+            exemplars = cast(Mapping[str, object], identity)["exemplars"]
+            holding.append((resolved, len(cast(list[object], exemplars))))
+    return holding
 
 
 def _older_than_retained(
@@ -1516,6 +1709,8 @@ class ImportSummary:
     refused: tuple[str, ...] = ()
     # Older than every sample an identity at the cap already keeps.
     exemplars_superseded: int = 0
+    # Identities of the store that `voices forget` removed: never re-imported.
+    forgotten: tuple[str, ...] = ()
 
 
 def import_store(
@@ -1552,8 +1747,10 @@ def import_store(
     refused: list[str] = []
     created_count = added_count = present_count = superseded_count = 0
     identities_changed = space_changed = False
+    tombstones = state.forgotten
+    skipped_forgotten = sorted(set(validated.identities) & tombstones)
 
-    for identity_id in sorted(validated.identities):
+    for identity_id in sorted(set(validated.identities) - tombstones):
         legacy = cast(Mapping[str, object], validated.identities[identity_id])
         current = list(exemplars_by_identity.get(identity_id, []))
         added_here = 0
@@ -1666,6 +1863,7 @@ def import_store(
         exemplars_present=present_count,
         refused=tuple(refused),
         exemplars_superseded=superseded_count,
+        forgotten=tuple(skipped_forgotten),
     )
     if space_changed and _list_space(identities_document, space_name):
         identities_changed = True
@@ -1815,6 +2013,7 @@ def matching_pools(state: LibraryState, space_name: str, scope: str) -> MatchPoo
         identity_scopes = tuple(cast(list[str], identity["scopes"]))
         entry: dict[str, object] = {
             "display_name": identity["display_name"],
+            "origin": "library",
             "exemplars": [
                 {"id": item["id"], "vector": item["vector"]} for item in items
             ],
@@ -1834,12 +2033,13 @@ def add_legacy_store(
 ) -> tuple[MatchPools, bool]:
     """Add a read-only pre-library store's identities to ``pools``.
 
-    Identities the library already holds are skipped (the library copy wins).
-    Returns the new pools and whether the store holds anything the library
-    lacks: an identity it does not have, or a capture that is not in this
-    space yet and that an import would keep (the cue to suggest
-    ``voxweave voices import``); a capture older than every sample of an
-    identity at the cap is superseded, not missing.
+    Identities the library already holds are skipped (the library copy wins),
+    and so are identities forgotten in this library. Returns the new pools
+    and whether the store holds anything the library lacks: an identity it
+    does not have, or a capture that is not in this space yet and that an
+    import would keep (the cue to suggest ``voxweave voices import``); a
+    capture older than every sample of an identity at the cap is
+    superseded, not missing.
     """
     validated = validate_voice_store(store)
     show = normalize_scope(validated.show)
@@ -1847,7 +2047,10 @@ def add_legacy_store(
     target = dict(pools.in_scope if in_scope else pools.other_scopes)
     scopes = dict(pools.scopes)
     unimported = False
+    tombstones = state.forgotten
     for identity_id, raw in validated.identities.items():
+        if identity_id in tombstones:
+            continue  # forgotten in this library: never offered again
         identity = cast(Mapping[str, object], raw)
         exemplars = cast(list[Mapping[str, object]], identity["exemplars"])
         if identity_id in state.identity_map:
@@ -1867,6 +2070,7 @@ def add_legacy_store(
             continue
         target[identity_id] = {
             "display_name": identity["display_name"],
+            "origin": "legacy",
             "exemplars": [
                 {"id": item["id"], "vector": item["vector"]} for item in exemplars
             ],
@@ -1926,11 +2130,14 @@ __all__ = [
     "episode_scope",
     "find_identities",
     "forget_identity",
+    "forgotten_ids",
     "history_row",
     "identities_named",
     "identity_summary",
     "import_store",
+    "legacy_store_candidates",
     "legacy_store_path",
+    "legacy_stores_holding",
     "library_lock",
     "list_identities",
     "list_space_names",
@@ -1940,6 +2147,8 @@ __all__ = [
     "new_space",
     "normalize_scope",
     "plan_library_enrollment",
+    "read_history",
+    "read_legacy_store",
     "read_state",
     "rename_identity",
     "require_same_space",

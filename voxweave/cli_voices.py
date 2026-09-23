@@ -181,8 +181,11 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
     def forget_command(identity_id: str, yes: bool, voices_dir: Path | None) -> None:
         """Remove an identity and every voice sample of it, in every space.
 
-        The history file keeps an entry that the id was forgotten, with no
-        name and no voice data.
+        The id stays as a tombstone, so it is never suggested, imported or
+        enrolled again. The history keeps entries about the id, with no name,
+        no scope or episode label and no voice data. Per-folder stores from
+        earlier versions are not edited: any that still hold the id are
+        listed, to be deleted by hand.
         """
         from voxweave import voicelibrary
 
@@ -199,18 +202,27 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
                 abort=True,
             )
 
-        def apply(_rep: object) -> dict[str, int]:
+        def apply(_rep: object) -> tuple[dict[str, int], list[Path]]:
             root = voicelibrary.resolve_voices_dir(voices_dir).root
             with voicelibrary.library_lock(root, exclusive=True):
                 state = voicelibrary.read_state(root)
+                candidates = voicelibrary.legacy_store_candidates(state, identity_id)
                 change, removed = voicelibrary.forget_identity(state, identity_id)
                 voicelibrary.commit(state, change)
-                return removed
+                return removed, candidates
 
-        removed = run(apply, reporter=False)
+        removed, candidates = run(apply, reporter=False)
         click.echo(
             f"forgot {identity_id}: {sum(removed.values())} voice sample(s) removed"
         )
+        for path, count in voicelibrary.legacy_stores_holding(candidates, identity_id):
+            click.echo(
+                f"warning: the per-folder store {path} still holds {count} voice "
+                f"sample(s) of {identity_id}. VoxWeave no longer reads them for "
+                "this id, but they stay on disk until that file is deleted (it "
+                "may hold other people too).",
+                err=True,
+            )
 
     @group.command("import", short_help="Merge a per-show voices store.")
     @click.argument(
@@ -257,6 +269,12 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
         root, summary = run(apply, reporter=False)
         for message in summary.refused:
             click.echo(f"skipped {message}", err=True)
+        for forgotten_id in summary.forgotten:
+            click.echo(
+                f"skipped {forgotten_id}: forgotten in this library "
+                "(`voxweave voices forget`)",
+                err=True,
+            )
         superseded = (
             f", {summary.exemplars_superseded} older than the samples already kept"
             if summary.exemplars_superseded

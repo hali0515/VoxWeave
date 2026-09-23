@@ -91,7 +91,10 @@ What stays the same, and what to do:
   without `--show`, but is never written again. Merge it once with
   `voxweave voices import path/to/voxweave.voices.json` (optionally `--scope NAME`; the
   default is the store's show). Importing keeps its ids, so running it again adds nothing,
-  and the file is left untouched; delete it yourself once you no longer need it.
+  and the file is left untouched; delete it yourself once you no longer need it. Such a
+  file keeps the vectors of everyone in it: `voxweave voices forget ID` stops VoxWeave
+  from reading them for that person and lists the files that still hold them, but only
+  deleting those files removes the vectors from disk.
 - `--show` now also names the scope of an enrollment. Folder names such as `Season 1`
   exist in many shows; pass `--show` there to keep shows apart.
 - Enrolling a name does not merge it with a same-named person of another scope unless you

@@ -526,6 +526,73 @@ def test_forget_removes_every_trace_across_spaces(tmp_path):
     assert "Aqua" not in json.dumps(row)
 
 
+def _forget(root, identity_id, at=LATER):
+    with voicelibrary.library_lock(root, exclusive=True):
+        state = voicelibrary.read_state(root)
+        change, removed = voicelibrary.forget_identity(state, identity_id, at=at)
+        voicelibrary.commit(state, change)
+    return removed
+
+
+def test_forget_leaves_an_id_only_tombstone_that_blocks_every_way_back(tmp_path):
+    root = tmp_path / "voices"
+    store = _legacy_store(tmp_path / "legacy.json", names=("Aqua",))
+    [identity_id] = store["identities"]
+    _import(root, store)
+    _forget(root, identity_id)
+
+    state = _read(root)
+    assert state.forgotten == {identity_id}
+    assert identity_id not in state.identity_map
+    assert b"Aqua" not in (root / "identities.json").read_bytes()
+
+    # The per-folder store still holds the vectors, but they are never
+    # offered again and do not bring back the import hint...
+    name, _ = voicelibrary.space_identity(LEGACY)
+    pools, unimported = voicelibrary.add_legacy_store(
+        voicelibrary.matching_pools(state, name, "Example Show"),
+        store,
+        state=state,
+        space_name=name,
+        in_scope=True,
+    )
+    assert pools.in_scope == {} and not unimported
+    # ...an import skips the id...
+    change, summary = _import(root, store)
+    assert change.empty and summary.forgotten == (identity_id,)
+    assert identity_id not in _read(root).identity_map
+    # ...and enrolling into it (a stale suggestion) is refused.
+    with pytest.raises(voicestore.EnrollmentRefusal, match="forgotten"):
+        _enroll(
+            root,
+            [_entry(identity_id=identity_id)],
+            provenance=LEGACY,
+            source=_source(5, episode="ep05"),
+        )
+
+
+def test_forget_strips_the_labels_of_its_history_rows(tmp_path):
+    # Scopes and episode labels are often a person's name (a folder of home
+    # recordings, a media stem); forgetting removes them from the history.
+    root = tmp_path / "voices"
+    _enroll(
+        root,
+        [_entry("Alex"), _entry("Sam", _unit(1), label="SPEAKER_01")],
+        scope="Alex birthday",
+        source=_source(1, episode="alex-2024"),
+    )
+    _forget(root, "v000000000001")
+    rows = _history(root)
+    forgotten_rows = [r for r in rows if r.get("identity") == "v000000000001"]
+    assert [r["action"] for r in forgotten_rows] == ["create", "enroll", "forget"]
+    for row in forgotten_rows:
+        assert not {"scope", "episode", "old_scope"} & set(row)
+    kept = [r for r in rows if r.get("identity") == "v000000000002"]
+    assert kept[0]["scope"] == "Alex birthday"
+    assert kept[1]["episode"] == "alex-2024"
+    assert stat.S_IMODE((root / "history.jsonl").stat().st_mode) == 0o600
+
+
 def test_find_identities_by_id_or_any_name(tmp_path):
     root = tmp_path / "voices"
     _enroll(root, [_entry("Alex"), _entry("Alex", _unit(1), label="SPEAKER_01")])

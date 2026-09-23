@@ -387,9 +387,9 @@ directory is chosen by, first match wins:
 JSON, one file per concern, and never holds audio:
 
 ```
-identities.json              names, aliases and scopes of every identity; the list of space files
+identities.json              names, aliases and scopes of every identity; space files; forgotten ids
 spaces/<model>-<fp12>.json   the voice vectors of one embedding space
-history.jsonl                append-only log of changes (ids, scopes, episodes, counts; never vectors or people's names)
+history.jsonl                log of changes (ids, scopes, episode labels, counts; never vectors or display names)
 .library.lock                one lock for the whole library
 ```
 
@@ -436,9 +436,15 @@ gets missing parent directories created: for `--voices-dir`, `VOXWEAVE_VOICES_DI
 
 **Privacy.** The library holds voice biometrics of the people you name; the first write into a
 new library prints a notice saying so. `voxweave voices list` and `voxweave voices show ID|NAME`
-inspect it, `voxweave voices forget ID` removes one person from every space (the history keeps its
-entries about that id, which hold no name and no voice data), and deleting the directory removes
-everyone.
+inspect it, and deleting the directory removes everyone. `voxweave voices forget ID` removes one
+person from every space and keeps only the id as a tombstone, so that person is never suggested,
+imported or enrolled again, not even from a review page made before the forget or from a
+per-folder store of an earlier version. It does not edit those per-folder stores: it lists the
+ones that still hold the person (the stores you imported, and the ones next to their media), and
+their vectors stay on disk until you delete those files. The history keeps the forgotten id's
+entries without their scopes and episode labels. It never holds voice data or display names, but
+other entries keep scopes (folder or show names), episode labels (media file names) and, for
+imports, the imported file's path, all of which can name people too.
 
 **Per-show stores from earlier versions.** A `voxweave.voices.json` next to the media is still
 read for suggestions, never written, with a one-time hint to merge it with
