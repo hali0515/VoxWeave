@@ -159,6 +159,57 @@ def test_show_lists_candidates_for_an_ambiguous_name(library, invoke):
     assert missing.exit_code != 0 and "no saved identity" in missing.output
 
 
+def test_show_json_lists_ambiguous_candidates_as_json(library, invoke):
+    result = invoke("voices", "show", "Alex", "--json", "--voices-dir", library)
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["ambiguous"] is True and payload["query"] == "Alex"
+    assert [row["id"] for row in payload["candidates"]] == [
+        "v000000000001",
+        "v000000000002",
+    ]
+    assert "names 2 identities" in result.stderr
+
+
+def test_an_empty_voices_dir_is_refused_not_read_as_the_cwd(tmp_path, invoke):
+    for args in (
+        ("voices", "where"),
+        ("voices", "list"),
+        ("speakers", "enroll", tmp_path / "episode.mkv"),
+        ("speakers", "serve", tmp_path / "episode.mkv"),
+    ):
+        result = invoke(*args, "--voices-dir", "")
+        assert result.exit_code == 2, (args, result.output)
+        assert "must not be empty" in result.output
+
+
+def test_import_reads_a_store_it_cannot_write_beside(tmp_path, invoke):
+    store = voicestore.new_voice_store("Example Show", LEGACY)
+    store = voicestore.enroll_exemplar(
+        store,
+        raw_name="Aqua",
+        capture_id="c" + "5" * 32,
+        media_fingerprint="5" * 64,
+        episode="ep05",
+        vector=_unit(5),
+        at="2026-09-01T00:00:00Z",
+    ).store
+    folder = tmp_path / "snapshot"
+    folder.mkdir()
+    legacy = folder / "voxweave.voices.json"
+    voicestore.write_voice_store(legacy, store)
+    lock = legacy.with_name(legacy.name + ".lock")
+    lock.unlink(missing_ok=True)  # a copy without its lock file
+    folder.chmod(0o555)
+    try:
+        result = invoke("voices", "import", legacy, "--voices-dir", tmp_path / "lib")
+    finally:
+        folder.chmod(0o755)
+    assert result.exit_code == 0, result.output
+    assert "imported 1 identities and 1 voice sample(s)" in result.output
+    assert not lock.exists()
+
+
 def test_rename_by_id(library, invoke):
     result = invoke(
         "voices", "rename", "v000000000002", "Alex (B)", "--voices-dir", library

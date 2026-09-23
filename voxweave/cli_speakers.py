@@ -13,6 +13,7 @@ from rich.table import Table
 
 from voxweave import artifacts, pipeline
 from voxweave.cli_compat import DefaultGroup, warn_deprecated
+from voxweave.cli_voices import VoicesDirPath
 
 
 class SpeakersGroup(DefaultGroup):
@@ -135,7 +136,7 @@ def build_speakers_group(
 
     episode_type = click.Path(exists=False, dir_okay=False, path_type=Path)
     voices_type = click.Path(exists=False, dir_okay=False, path_type=Path)
-    voices_dir_type = click.Path(exists=False, file_okay=False, path_type=Path)
+    voices_dir_type = VoicesDirPath()
 
     def library_kwargs(
         voices: Path | None, voices_dir: Path | None

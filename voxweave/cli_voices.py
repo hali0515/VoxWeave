@@ -18,12 +18,24 @@ _DIR_HELP = (
 )
 
 
+class VoicesDirPath(click.Path):
+    """A ``--voices-dir`` value. An empty one is refused: click would read it
+    as ``.``, silently making the current directory the voice library (an
+    unset shell variable in ``--voices-dir "$VOICES"``)."""
+
+    def __init__(self) -> None:
+        super().__init__(exists=False, file_okay=False, path_type=Path)
+
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> Any:
+        if isinstance(value, str) and not value.strip():
+            self.fail("must not be empty", param, ctx)
+        return super().convert(value, param, ctx)
+
+
 def _voices_dir_option(fn: Callable[..., Any]) -> Callable[..., Any]:
-    return click.option(
-        "--voices-dir",
-        type=click.Path(exists=False, file_okay=False, path_type=Path),
-        help=_DIR_HELP,
-    )(fn)
+    return click.option("--voices-dir", type=VoicesDirPath(), help=_DIR_HELP)(fn)
 
 
 def _read(voices_dir: Path | None, *, spaces: Sequence[str] | None = None) -> Any:
@@ -142,10 +154,14 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
             click.echo(
                 f"{query!r} names {len(matches)} identities; pass one id:", err=True
             )
-            _print_rows(
-                [voicelibrary.identity_summary(state, item) for item in matches],
-                title="Candidates",
-            )
+            candidates = [
+                voicelibrary.identity_summary(state, item) for item in matches
+            ]
+            if as_json:
+                payload = {"ambiguous": True, "query": query, "candidates": candidates}
+                click.echo(json.dumps(payload, ensure_ascii=False))
+            else:
+                _print_rows(candidates, title="Candidates")
             ctx.exit(1)
         detail = voicelibrary.describe_identity(state, matches[0])
         if as_json:
@@ -248,11 +264,12 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
         scopes under which the store already served suggestions.
         """
         from voxweave import voicelibrary
-        from voxweave.voicestore import load_voice_store, shared_store_lock
+        from voxweave.voicestore import validate_voice_store
 
         def apply(_rep: object) -> tuple[Path, Any]:
-            with shared_store_lock(store_path) as handle:
-                store, validated = load_voice_store(handle.store_path)
+            # Only read: a store on a read-only copy or snapshot imports too.
+            resolved, store = voicelibrary.read_legacy_store(store_path)
+            validated = validate_voice_store(store)
             space_name, _fingerprint = voicelibrary.space_identity(
                 cast(Mapping[str, object], store["provenance"])
             )
@@ -274,7 +291,7 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
                     store,
                     scope=scopes[0],
                     also_scopes=scopes[1:],
-                    source_label=str(handle.store_path),
+                    source_label=str(resolved),
                 )
                 voicelibrary.commit(state, change)
             return root, summary

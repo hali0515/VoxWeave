@@ -285,9 +285,8 @@ def _read_legacy_store(
     if not artifacts.path_present(path):
         return None
     try:
-        with shared_store_lock(path) as handle:
-            _raw, store = _read_exact_object(handle.store_path, VOICES_STORE_MAX_BYTES)
-            validate_voice_store(store)
+        # Read-only is enough (a media folder on a read-only share still counts).
+        _resolved, store = voicelibrary.read_legacy_store(path)
     except (OSError, Phase2DataError) as exc:
         log.warning(
             "per-folder voices store %s is unusable; ignoring it: %s", path, exc
