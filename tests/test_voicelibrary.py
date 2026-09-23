@@ -530,6 +530,49 @@ def test_writes_use_rename_only_never_hard_links(tmp_path, monkeypatch):
     assert _read(root).identity_map
 
 
+def test_a_size_refusal_changes_no_file(tmp_path, monkeypatch):
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry()], ids=ids)
+    [name] = _read(root).spaces
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    space_size = (root / "spaces" / f"{name}.json").stat().st_size
+    # The next exemplar no longer fits the space file; the new identity and
+    # the new scope must not reach identities.json either.
+    monkeypatch.setattr(voicelibrary, "SPACE_MAX_BYTES", space_size + 16)
+    with pytest.raises(Phase2DataError, match="limit"):
+        _enroll(
+            root,
+            [
+                _entry(identity_id="v000000000001"),
+                _entry("Kazuma", _unit(1), label="SPEAKER_01"),
+            ],
+            scope="Show C",
+            source=_source(2, episode="ep02"),
+            ids=ids,
+        )
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+
+
+def test_a_dead_writers_temp_file_does_not_outlive_forget(tmp_path):
+    root = tmp_path / "voices"
+    _enroll(root, [_entry()])
+    [name] = _read(root).spaces
+    space = root / "spaces" / f"{name}.json"
+    # A writer killed between its temp write and the rename leaves these.
+    stale_space = root / "spaces" / f".{name}.k3j2h1ab.part.json"
+    stale_space.write_bytes(space.read_bytes())
+    stale_identities = root / ".identities.zz9q8w7e.part.json"
+    stale_identities.write_bytes((root / "identities.json").read_bytes())
+    with voicelibrary.library_lock(root, exclusive=True):
+        state = voicelibrary.read_state(root)
+        change, _removed = voicelibrary.forget_identity(state, "v000000000001")
+        voicelibrary.commit(state, change)
+    assert not stale_space.exists() and not stale_identities.exists()
+    assert (root / ".library.lock").exists()
+    assert not any(b"vector" in p.read_bytes() for p in (root / "spaces").iterdir())
+
+
 def test_shared_lock_never_creates_a_missing_library(tmp_path):
     root = tmp_path / "absent"
     with voicelibrary.library_lock(root, exclusive=False) as held:

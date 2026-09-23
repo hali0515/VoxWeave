@@ -669,11 +669,7 @@ def history_row(action: str, at: str, **fields: object) -> dict[str, object]:
     return row
 
 
-def _write_cas(
-    path: Path, value: Mapping[str, object], *, expected: bytes | None, max_bytes: int
-) -> None:
-    payload = encode_json_bytes(value, max_bytes=max_bytes).decode("utf-8")
-
+def _write_cas(path: Path, payload: str, *, expected: bytes | None) -> None:
     def still_expected() -> None:
         try:
             current: bytes | None = path.read_bytes()
@@ -686,6 +682,33 @@ def _write_cas(
             )
 
     fsio.atomic_write_text(path, payload, before_replace=still_expected)
+
+
+# fsio.atomic_path names its temp files ``.<stem>.<random>.part<suffix>``.
+_TEMP_FILE_RE = re.compile(r"^\..+\.part\.jsonl?$")
+
+
+def _sweep_temp_files(paths: LibraryPaths) -> None:
+    """Delete temp files that a killed writer left in the library.
+
+    Only called under the exclusive lock, where no live writer can own one.
+    A temp file of a space holds every vector of that space, so leaving it
+    would let a forgotten person's voice outlive ``voices forget``.
+    """
+    for directory in (paths.root, paths.spaces_dir):
+        try:
+            entries = os.listdir(directory)
+        except FileNotFoundError:
+            continue
+        for entry in entries:
+            if _TEMP_FILE_RE.fullmatch(entry) is None:
+                continue
+            try:
+                (directory / entry).unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                log.info("removed a stale temp file %s from the voice library", entry)
 
 
 def _append_history(paths: LibraryPaths, rows: Sequence[Mapping[str, object]]) -> None:
@@ -708,7 +731,9 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
 
     Each changed file is replaced only if its bytes still equal the ones
     ``state`` observed; history is appended after every data file is in
-    place. The first write into an empty library logs a biometrics notice.
+    place. Every document is validated and encoded before the first file is
+    replaced, so a refusal (a size limit included) changes nothing. The
+    first write into an empty library logs a biometrics notice.
     """
     if change.empty:
         return
@@ -723,25 +748,36 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
         merged_spaces[name] = document
     validate_relations(LibraryState(paths, identities, merged_spaces, state.observed))
 
-    writes: list[tuple[Path, Mapping[str, object], int]] = []
+    writes: list[tuple[Path, str]] = []
     if change.identities is not None:
-        writes.append((paths.identities, change.identities, IDENTITIES_MAX_BYTES))
+        writes.append(
+            (
+                paths.identities,
+                encode_json_bytes(
+                    change.identities, max_bytes=IDENTITIES_MAX_BYTES
+                ).decode("utf-8"),
+            )
+        )
     space_writes = [
-        (paths.space(name), document, SPACE_MAX_BYTES)
+        (
+            paths.space(name),
+            encode_json_bytes(document, max_bytes=SPACE_MAX_BYTES).decode("utf-8"),
+        )
         for name, document in sorted(change.spaces.items())
     ]
     writes = writes + space_writes if change.identities_first else space_writes + writes
-    for path, _document, _cap in writes:
+    for path, _payload in writes:
         if path not in state.observed:
             raise VoiceLibraryError(f"{path} was not read before being written")
 
     first_write = (
         state.observed.get(paths.identities) is None and not paths.history.exists()
     )
+    _sweep_temp_files(paths)
     if space_writes:
         _ensure_private_dir(paths.spaces_dir)
-    for path, document, cap in writes:
-        _write_cas(path, document, expected=state.observed[path], max_bytes=cap)
+    for path, payload in writes:
+        _write_cas(path, payload, expected=state.observed[path])
     try:
         _append_history(paths, change.history)
     except OSError as exc:
