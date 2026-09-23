@@ -981,6 +981,43 @@ def test_cli_voiceprint_model_is_validated_and_reaches_process(tmp_path, monkeyp
     assert "unknown voiceprint model" in bad.output
 
 
+def test_cli_voiceprint_model_is_validated_even_without_voiceprints(
+    tmp_path, monkeypatch, caplog
+):
+    from click.testing import CliRunner
+
+    from voxweave.cli import cli
+
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    calls: list[dict[str, object]] = []
+
+    def fake_process(_media, **kwargs):
+        calls.append(kwargs)
+        return tmp_path / "episode.vtt"
+
+    monkeypatch.setattr(pipeline, "process", fake_process)
+    # install_logging(force=True) would detach caplog's root handler.
+    monkeypatch.setattr("voxweave.cli.install_logging", lambda **_kwargs: None)
+    bad = CliRunner().invoke(cli, ["--voiceprint-model", "ecapa", str(media)])
+    assert bad.exit_code != 0
+    assert "unknown voiceprint model" in bad.output
+    assert calls == []
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        ok = CliRunner().invoke(cli, ["--voiceprint-model", "anime-va", str(media)])
+    assert ok.exit_code == 0, ok.output
+    assert calls[0]["voiceprints"] is False
+    assert "--voiceprint-model has no effect" in caplog.text
+    assert "add --voiceprints" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="voxweave"):
+        quiet = CliRunner().invoke(cli, [str(media)])
+    assert quiet.exit_code == 0, quiet.output
+    assert "--voiceprint-model" not in caplog.text
+
+
 # --------------------------------------------------------------------------
 # Checkpoint prefetch at the start of the run
 # --------------------------------------------------------------------------

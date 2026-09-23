@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -348,7 +349,8 @@ def cli(ctx, verbose: bool) -> None:
         "Japanese, redimnet2 otherwise), redimnet2, anime-va, or pyannote (legacy: "
         "the diarization pipeline's own embeddings, matches pre-existing voice "
         "stores). Precedence: CLI, VOXWEAVE_VOICEPRINT_MODEL, conf "
-        "[voiceprint].model."
+        "[voiceprint].model. Always validated; without --voiceprints it has no "
+        "effect (warning)."
     ),
 )
 @click.option(
@@ -453,15 +455,25 @@ def cmd_transcribe(
             f"{voiceprints_source}, but diarization is off from {diarize_source}; "
             "enable --diarize or disable voiceprints"
         )
-    if voiceprints:
-        from voxweave import voiceembed
+    from voxweave import voiceembed
 
-        try:
+    try:
+        if voiceprint_model is not None:
+            # An explicit --voiceprint-model is validated even when it cannot
+            # take effect, so a typo never goes unnoticed.
+            voiceprint_model = voiceembed.normalize_voiceprint_choice(voiceprint_model)
+        if voiceprints:
             # Validate now; the per-language routing of "auto" happens once the
             # language is detected.
             voiceprint_model = voiceembed.resolve_voiceprint_choice(voiceprint_model)
-        except ValueError as exc:
-            raise click.UsageError(str(exc)) from exc
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if voiceprint_model is not None and not voiceprints:
+        logging.getLogger("voxweave").warning(
+            "--voiceprint-model has no effect: voiceprint capture is off (from %s); "
+            "add --voiceprints to capture voiceprints",
+            voiceprints_source,
+        )
     timestamps = _flag(timestamps, "timestamps", True)
     shot_snap = _flag(shot_snap, "shot_snap", True)
     out = _run(
