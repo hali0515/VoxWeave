@@ -268,6 +268,34 @@ def test_same_scope_name_resolves_and_repeat_is_a_noop(tmp_path):
     assert len(_library().space_exemplars(space)[identity_id]) == 2
 
 
+def test_re_enrolling_after_a_speaker_split_needs_replace(tmp_path):
+    folder = tmp_path / "Show"
+    media = _episode(folder, names={"SPEAKER_00": "Aqua"})
+    speakers.enroll_speaker_voices(media)
+    # A confirmed split rewrites the centroids and speaker turns of the same
+    # capture (same capture id, same media).
+    resplit = [0.8, 0.6, *([0.0] * 14)]
+    _episode(
+        folder,
+        vectors={"SPEAKER_00": resplit, "SPEAKER_01": list(OTHER)},
+        names={"SPEAKER_00": "Aqua", "SPEAKER_01": "Kazuma"},
+    )
+
+    with pytest.raises(EnrollmentRefusal, match="use --replace"):
+        speakers.enroll_speaker_voices(media)
+    speakers.enroll_speaker_voices(media, replace_episode=True)
+
+    state = _library()
+    [space] = state.spaces
+    vectors = {
+        state.identity_map[identity_id]["display_name"]: [
+            item["vector"] for item in items
+        ]
+        for identity_id, items in state.space_exemplars(space).items()
+    }
+    assert vectors == {"Aqua": [resplit], "Kazuma": [list(OTHER)]}
+
+
 def test_unresolved_space_is_refused_before_touching_the_library(tmp_path):
     provenance = copy.deepcopy(PROVENANCE)
     provenance["outer_config_sha256"] = "unresolved"

@@ -86,6 +86,7 @@ from voxweave.voicestore import (
     MAX_ALIASES,
     MAX_EXEMPLARS,
     MAX_NAME_BYTES,
+    CrossIndexRefusal,
     EnrollmentRefusal,
     ExemplarKey,
     normalize_episode,
@@ -123,6 +124,7 @@ HISTORY_ACTIONS = frozenset(
         "import",
         "split",
         "orphan",
+        "rescope",
     }
 )
 
@@ -1052,6 +1054,111 @@ def _space_for(
 
 
 @dataclass(frozen=True)
+class LibraryPlan:
+    """:class:`voicestore.IndexedPlan` plus ``rescope``: the same capture,
+    unchanged, moved to another scope (``target`` indexes it)."""
+
+    outcome: Literal["enroll", "replace", "noop", "rescope"]
+    target: int | None = None
+    evict: int | None = None
+
+
+def plan_library_enrollment(
+    current: Sequence[Mapping[str, object]],
+    *,
+    capture_id: str,
+    media_fingerprint: str,
+    scope: str,
+    episode: str,
+    vector: Sequence[int | float],
+    turns_digest: str | None,
+    replace_episode: bool,
+) -> LibraryPlan:
+    """Decide what one incoming voice does to one identity's exemplars.
+
+    The per-show relation (voicestore.plan_indexed_enrollment, with the
+    episode index scoped) decides, except for two changes it cannot tell
+    apart from corruption, both about a capture or media the identity
+    already holds under the same episode label:
+
+    - another scope (the folder was renamed, or ``--show`` changed): the
+      unchanged capture moves to the new scope (``rescope``, no flag
+      needed); a new capture of the same media replaces it with
+      ``replace_episode``;
+    - the same capture with a new vector and new speaker turns (a speaker
+      split rewrote the centroids but keeps the capture id): a replacement
+      that ``replace_episode`` authorizes.
+    """
+    keys = _exemplar_keys(current)
+    scoped = scoped_episode(scope, episode)
+    capture_hit = next(
+        (i for i, key in enumerate(keys) if key.capture_id == capture_id), None
+    )
+    media_hit = next(
+        (i for i, key in enumerate(keys) if key.media_fingerprint == media_fingerprint),
+        None,
+    )
+    hit = capture_hit if capture_hit is not None else media_hit
+    if hit is not None:
+        stored = current[hit]
+        stored_scope = cast(str, stored["scope"])
+        stored_source = cast(Mapping[str, object], stored["source"])
+        vector_changed = capture_hit is not None and list(keys[hit].vector) != list(
+            vector
+        )
+        if stored_scope != scope or vector_changed:
+            episode_hit = next(
+                (i for i, key in enumerate(keys) if key.episode == scoped), None
+            )
+            hits = {i for i in (capture_hit, media_hit, episode_hit) if i is not None}
+            if len(hits) > 1:
+                raise CrossIndexRefusal(
+                    "enrollment evidence resolves different exemplars across "
+                    "indexes: " + ", ".join(sorted(keys[i].id for i in hits))
+                )
+            what = f"capture {capture_id}" if capture_hit is not None else "source media"
+            if keys[hit].media_fingerprint != media_fingerprint:
+                raise EnrollmentRefusal(
+                    f"capture integrity failure for {capture_id}: media differs"
+                )
+            stored_label = normalize_episode(stored_source["episode"])
+            if stored_label != episode:
+                raise EnrollmentRefusal(
+                    f"{what} is already enrolled as {stored_label!r} "
+                    f"in scope {stored_scope!r}"
+                )
+            if capture_hit is not None and not vector_changed:
+                return LibraryPlan("rescope", target=hit)
+            if vector_changed and (
+                turns_digest is None or stored_source.get("turns_digest") == turns_digest
+            ):
+                # The same speaker turns cannot yield another centroid.
+                raise EnrollmentRefusal(
+                    f"capture integrity failure for {capture_id}: vector differs"
+                )
+            if not replace_episode:
+                if vector_changed:
+                    raise EnrollmentRefusal(
+                        f"the voices of capture {capture_id} changed since it was "
+                        "enrolled (a speaker was split); use --replace to update it"
+                    )
+                raise EnrollmentRefusal(
+                    f"source media for {episode!r} is already enrolled in scope "
+                    f"{stored_scope!r}; use --replace to move it to {scope!r}"
+                )
+            return LibraryPlan("replace", target=hit)
+    plan = plan_indexed_enrollment(
+        keys,
+        capture_id=capture_id,
+        media_fingerprint=media_fingerprint,
+        episode=scoped,
+        vector=vector,
+        replace_episode=replace_episode,
+    )
+    return LibraryPlan(plan.outcome, target=plan.target, evict=plan.evict)
+
+
+@dataclass(frozen=True)
 class EpisodeSource:
     """Where one enrolled voice came from (a pointer, never audio)."""
 
@@ -1075,7 +1182,7 @@ class EnrollEntry:
 @dataclass(frozen=True)
 class EnrollOutcome:
     identity_id: str
-    outcome: Literal["enroll", "replace", "noop"]
+    outcome: Literal["enroll", "replace", "noop", "rescope"]
     exemplar_id: str
     evicted_exemplar_id: str | None = None
     created: bool = False
@@ -1096,10 +1203,10 @@ def enroll_entries(
     """Enroll one episode's named speakers into the space of ``provenance``.
 
     Each identity keeps the per-show store's relation within one space (see
-    voicestore.plan_indexed_enrollment): the same capture is a no-op, the same
-    media or episode needs ``replace_episode``, and at most MAX_EXEMPLARS stay
-    per identity, the oldest displaced. An identity gains ``scope`` only when
-    one of its exemplars actually changes.
+    :func:`plan_library_enrollment`): the same capture is a no-op (or moves
+    to a new scope), the same media or episode needs ``replace_episode``, and
+    at most MAX_EXEMPLARS stay per identity, the oldest displaced. An
+    identity gains ``scope`` only when one of its exemplars actually changes.
     """
     if type(replace_episode) is not bool:
         raise EnrollmentRefusal("replace_episode must be a boolean")
@@ -1148,12 +1255,14 @@ def enroll_entries(
             )
         targets.add(identity_id)
         current = list(exemplars_by_identity.get(identity_id, []))
-        plan = plan_indexed_enrollment(
-            _exemplar_keys(current),
+        plan = plan_library_enrollment(
+            current,
             capture_id=capture,
             media_fingerprint=media_hash,
-            episode=scoped_episode(scope, episode),
+            scope=scope,
+            episode=episode,
             vector=vector,
+            turns_digest=turns_digest,
             replace_episode=replace_episode,
         )
         if plan.outcome == "noop":
@@ -1185,6 +1294,37 @@ def enroll_entries(
                 identity["scopes"] = [*scopes, scope]
                 identity["updated"] = event_at
                 identities_changed = True
+
+        if plan.outcome == "rescope":
+            # The same voice sample, now filed under the new scope; it keeps
+            # its id, vector and age.
+            assert plan.target is not None
+            moved = copy.deepcopy(current[plan.target])
+            old_scope = moved["scope"]
+            moved["scope"] = scope
+            moved_source = cast(dict[str, object], moved["source"])
+            if media_path is not None:
+                moved_source["media_path"] = media_path
+            moved_source["speaker_label"] = entry.speaker_label
+            current[plan.target] = moved
+            exemplars_by_identity[identity_id] = current
+            space_changed = True
+            history.append(
+                history_row(
+                    "rescope",
+                    event_at,
+                    identity=identity_id,
+                    space=space_name,
+                    exemplar=moved["id"],
+                    old_scope=old_scope,
+                    scope=scope,
+                    episode=episode,
+                )
+            )
+            outcomes.append(
+                EnrollOutcome(identity_id, "rescope", cast(str, moved["id"]))
+            )
+            continue
 
         exemplar_id = _mint(
             exemplar_id_factory, used_exemplars, require_exemplar_id, "exemplar"
@@ -1771,6 +1911,7 @@ __all__ = [
     "LibraryConflict",
     "LibraryLocation",
     "LibraryPaths",
+    "LibraryPlan",
     "LibraryState",
     "MatchPools",
     "UnknownIdentity",
@@ -1798,6 +1939,7 @@ __all__ = [
     "matching_pools",
     "new_space",
     "normalize_scope",
+    "plan_library_enrollment",
     "read_state",
     "rename_identity",
     "require_same_space",

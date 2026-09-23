@@ -304,6 +304,106 @@ def test_an_episode_label_repeats_freely_across_scopes(tmp_path):
     assert identity["updated"] == LATER
 
 
+def test_the_same_capture_moves_to_a_renamed_scope(tmp_path):
+    # The folder "Frieren S1" became "Frieren (2023) S1" (or --show changed).
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry()], scope="Frieren S1", source=_source(7), ids=ids)
+    moved = voicelibrary.EpisodeSource(
+        media_path="/media/Frieren (2023) S1/ep07.mkv",
+        media_fingerprint=f"{7:064x}",
+        capture_id=f"c{7:032x}",
+        turns_digest=f"{107:064x}",
+        episode="ep01",
+    )
+    outcomes = _enroll(
+        root,
+        [_entry(identity_id="v000000000001")],
+        scope="Frieren (2023) S1",
+        source=moved,
+        ids=ids,
+        at=LATER,
+    )
+    assert [o.outcome for o in outcomes] == ["rescope"]
+    state = _read(root)
+    [name] = state.spaces
+    [exemplar] = state.space_exemplars(name)["v000000000001"]
+    assert exemplar["id"] == "x00000001" and exemplar["added"] == NOW
+    assert exemplar["scope"] == "Frieren (2023) S1"
+    assert exemplar["source"]["media_path"] == "/media/Frieren (2023) S1/ep07.mkv"
+    assert state.identity_map["v000000000001"]["scopes"] == [
+        "Frieren S1",
+        "Frieren (2023) S1",
+    ]
+    assert _history(root)[-1]["action"] == "rescope"
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    again = _enroll(
+        root,
+        [_entry(identity_id="v000000000001")],
+        scope="Frieren (2023) S1",
+        source=moved,
+        ids=ids,
+        replace=True,
+    )
+    assert [o.outcome for o in again] == ["noop"]
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+
+
+def test_a_new_capture_of_the_same_media_in_a_renamed_scope_needs_replace(tmp_path):
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry()], scope="Frieren S1", source=_source(7), ids=ids)
+    recaptured = voicelibrary.EpisodeSource(
+        media_path="/media/Frieren (2023) S1/ep07.mkv",
+        media_fingerprint=f"{7:064x}",
+        capture_id="c" + "e" * 32,
+        turns_digest=None,
+        episode="ep01",
+    )
+    entry = _entry(identity_id="v000000000001", vector=_unit(3))
+    with pytest.raises(voicestore.EnrollmentRefusal, match="use --replace to move"):
+        _enroll(root, [entry], scope="Frieren (2023) S1", source=recaptured, ids=ids)
+    outcomes = _enroll(
+        root, [entry], scope="Frieren (2023) S1", source=recaptured, ids=ids, replace=True
+    )
+    assert [o.outcome for o in outcomes] == ["replace"]
+    state = _read(root)
+    [name] = state.spaces
+    [exemplar] = state.space_exemplars(name)["v000000000001"]
+    assert exemplar["scope"] == "Frieren (2023) S1"
+    assert exemplar["source"]["capture_id"] == "c" + "e" * 32
+
+
+def test_a_split_capture_is_replaced_only_with_replace(tmp_path):
+    # A confirmed speaker split rewrites the centroids and the turns digest
+    # but keeps the capture id.
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry()], source=_source(9), ids=ids)
+    split = voicelibrary.EpisodeSource(
+        media_path="/media/show/ep09.mkv",
+        media_fingerprint=f"{9:064x}",
+        capture_id=f"c{9:032x}",
+        turns_digest="d" * 64,
+        episode="ep01",
+    )
+    entry = _entry(identity_id="v000000000001", vector=[0.6, 0.8, *([0.0] * 14)])
+    with pytest.raises(voicestore.EnrollmentRefusal, match="split"):
+        _enroll(root, [entry], source=split, ids=ids)
+    outcomes = _enroll(root, [entry], source=split, ids=ids, replace=True)
+    assert [o.outcome for o in outcomes] == ["replace"]
+    [name] = _read(root).spaces
+    [exemplar] = _read(root).space_exemplars(name)["v000000000001"]
+    assert exemplar["vector"] == [0.6, 0.8, *([0.0] * 14)]
+    assert exemplar["source"]["turns_digest"] == "d" * 64
+
+    # The same turns cannot produce another centroid: still an integrity
+    # failure, even with --replace.
+    corrupt = _entry(identity_id="v000000000001", vector=_unit(5))
+    with pytest.raises(voicestore.EnrollmentRefusal, match="integrity"):
+        _enroll(root, [corrupt], source=split, ids=ids, replace=True)
+
+
 def test_exemplar_cap_and_eviction_are_per_space(tmp_path):
     root = tmp_path / "voices"
     ids = _Ids()

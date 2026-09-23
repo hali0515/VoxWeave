@@ -453,7 +453,11 @@ spaces, and enrollment into such a store is refused. A store built before the de
 embedders keeps working with `--voiceprint-model pyannote` (see [MIGRATING.md](MIGRATING.md)).
 
 Use `speakers enroll --replace` to replace this episode's prior contribution (the same episode
-label within the same scope, or the same media).
+label within the same scope, or the same media). Enrolling an already enrolled capture again
+after its folder was renamed, or with another `--show`, moves its voice samples to the new scope
+without `--replace`; a new capture of the same media in the new scope needs `--replace`, and so
+does enrolling again after a confirmed speaker split, which changes the voices of a capture that
+keeps its id.
 The shipped matching policy is **suggest-only**: `VOXWEAVE_VOICES_ACCEPT` defaults to `off`,
 so stored names appear as review buttons and never become authoritative mapping values.
 Even when an operator configures a finite accept threshold, a machine prefill exists only in
