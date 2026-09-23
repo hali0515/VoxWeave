@@ -67,6 +67,46 @@ def test_prepare_align_reuses_fresh_cache(tmp_path):
     sep.assert_not_called()
 
 
+@pytest.mark.parametrize("normalize", [True, False])
+def test_first_run_16k_decode_matches_a_cache_hit(tmp_path, normalize, monkeypatch):
+    # A cache hit decodes vocals.32k.flac (the 32k mono vocals, losslessly) to 16k;
+    # a first run must decode the same 32k vocals with the same options, or the two
+    # runs feed ASR/diarization differently normalized audio.
+    media, cache = _paths(tmp_path)
+    with (
+        _durations({media.name: 100.0, cache.name: 100.0}),
+        patch("voxweave.pipeline.decode_to_wav", return_value=tmp_path / "o") as dec,
+    ):
+        pipeline._prepare_16k_for_align(
+            media,
+            separate=True,
+            normalize=normalize,
+            reporter=pipeline.Reporter(),
+            tmp=[],
+        )
+    ((hit_source,), hit_kwargs) = dec.call_args
+    assert hit_source == cache
+
+    decoded: list[tuple[Path, dict]] = []
+
+    def fake_decode(source, **kwargs):
+        out = tmp_path / f"d{len(decoded)}.wav"
+        decoded.append((Path(source), kwargs))
+        return out
+
+    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(
+        pipeline.backend, "separate_vocals", lambda *_a, **_k: tmp_path / "v.wav"
+    )
+    _full, _vocals, wav, voc32 = pipeline._separate_to_16k_32k(
+        media, reporter=pipeline.Reporter(), normalize=normalize
+    )
+    first_source, first_kwargs = decoded[-1]
+    assert wav == tmp_path / f"d{len(decoded) - 1}.wav"
+    assert first_source == voc32  # the file the cache stores
+    assert first_kwargs == hit_kwargs
+
+
 def test_prepare_align_reseparates_and_overwrites_stale_cache(tmp_path):
     media, cache = _paths(tmp_path)
     parts = tuple(tmp_path / n for n in ("full.wav", "voc.flac", "16k.wav", "32k.wav"))

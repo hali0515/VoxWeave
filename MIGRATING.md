@@ -5,8 +5,19 @@ heads-up appear here.
 
 ## 0.18.0 (unreleased)
 
-This only concerns `--voiceprints` (cross-episode voice matching and **Split this
-speaker**); transcription, diarization turns and subtitles are unchanged.
+Most of this release concerns `--voiceprints` (cross-episode voice matching and **Split
+this speaker**). One fix changes the audio a first run transcribes and diarizes, so a
+first run's subtitles can differ slightly from 0.17.0.
+
+### First runs hear the same audio as re-runs
+
+With vocal separation on (the default), a first run used to normalize the full-band
+stereo vocals for ASR and diarization, while every later run of the same media, which
+reuses the cached `vocals.32k.flac`, normalized the 32 kHz mono copy. The two inputs
+differed by about 2.5 dB and 10-14% of diarization frames, so re-running an episode could
+change its speaker turns. A first run now derives its 16 kHz input from the 32 kHz mono
+vocals too, exactly as a re-run does. Expect small differences against a 0.17.0 first
+run; re-runs from an existing cache are unchanged.
 
 ### Voiceprints come from a dedicated embedder
 

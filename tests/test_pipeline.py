@@ -334,6 +334,74 @@ def test_separate_self_cleans_partial_temps_on_failure(tmp_path, monkeypatch):
     assert created and not created[0].exists()
 
 
+@pytest.mark.parametrize("normalize", [True, False])
+def test_separate_derives_16k_input_from_32k_vocals(tmp_path, monkeypatch, normalize):
+    # Regression: a first run must build the 16k ASR/diarization input exactly like a
+    # vocals-cache hit does (decode the 32k mono vocals, loudnorm on the way to 16k).
+    # Normalizing the 44.1k stereo stem instead made a first run and a re-run of the same
+    # media differ by ~2.5 dB and ~10-14% of diarization frames.
+    calls: list[tuple[str, dict]] = []
+
+    def fake_decode(media, **kw):
+        name = f"d{len(calls)}.wav"
+        calls.append((Path(media).name, kw))
+        p = tmp_path / name
+        p.write_bytes(b"x")
+        return p
+
+    def fake_separate(fullband, **kw):
+        p = tmp_path / "vocals.wav"
+        p.write_bytes(b"x")
+        return p
+
+    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(backend, "separate_vocals", fake_separate)
+
+    fullband, vocals, wav, voc32 = pipeline._separate_to_16k_32k(
+        tmp_path / "m.mkv", reporter=pipeline.Reporter(), normalize=normalize
+    )
+
+    af = pipeline.ASR_LOUDNORM if normalize else None
+    assert calls == [
+        ("m.mkv", {"sample_rate": 44100, "mono": False}),
+        ("vocals.wav", {"sample_rate": pipeline.SONGDET_SR}),
+        (voc32.name, {"audio_filter": af}),
+    ]
+    assert (fullband.name, vocals.name, voc32.name, wav.name) == (
+        "d0.wav",
+        "vocals.wav",
+        "d1.wav",
+        "d2.wav",
+    )
+
+
+def test_separate_cleans_32k_vocals_when_16k_decode_fails(tmp_path, monkeypatch):
+    created: list[Path] = []
+
+    def fake_decode(media, **kw):
+        if kw.get("audio_filter", "unset") != "unset":
+            raise RuntimeError("ffmpeg failed")
+        p = tmp_path / f"f{len(created)}.wav"
+        p.write_bytes(b"x")
+        created.append(p)
+        return p
+
+    def fake_separate(fullband, **kw):
+        p = tmp_path / "vocals.wav"
+        p.write_bytes(b"x")
+        created.append(p)
+        return p
+
+    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(backend, "separate_vocals", fake_separate)
+
+    with pytest.raises(RuntimeError, match="ffmpeg failed"):
+        pipeline._separate_to_16k_32k(
+            tmp_path / "m.mkv", reporter=pipeline.Reporter(), normalize=True
+        )
+    assert len(created) == 3 and not any(p.exists() for p in created)
+
+
 # --- #18: _spans_in / _turns_in must skip malformed persisted entries instead of crashing ---
 
 

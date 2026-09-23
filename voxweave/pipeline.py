@@ -763,6 +763,12 @@ def _separate_to_16k_32k(
     downsampling to 16k/32k happens only after separation. Callers own temp bookkeeping,
     debug dumps, and caching of the returned paths.
 
+    The 16k ASR/diarization input is derived from the 32k mono vocals, never from the
+    44.1k stereo stem: ``voc32`` is exactly what the vocals cache stores, so a first run
+    and a later cache hit (which decodes ``vocals.32k.flac`` with the same filter) feed
+    loudnorm the same samples. Normalizing the stereo stem instead measured 2.5-2.6 dB
+    louder and moved ~10-14% of diarization frames between the two runs.
+
     On a clean return the caller registers the paths in its own ``tmp`` list (cleaned in its
     ``finally``). Since that registration only runs after this returns, the helper self-cleans
     its partial outputs if a later step raises — otherwise an OOM/ffmpeg failure mid-separation
@@ -788,11 +794,13 @@ def _separate_to_16k_32k(
             )
         created.append(vocals)
         reporter.stage("resample 16k")
-        wav = decode_to_wav(vocals, audio_filter=af)
-        created.append(wav)
         voc32 = decode_to_wav(
             vocals, sample_rate=SONGDET_SR
         )  # 32k mono: PANNs + cache source
+        created.append(voc32)
+        # Same source and filter as a vocals-cache hit (32k mono -> 16k mono).
+        wav = decode_to_wav(voc32, audio_filter=af)
+        created.append(wav)
         if return_separator_identity:
             return fullband, vocals, wav, voc32, separator_identity
         return fullband, vocals, wav, voc32
