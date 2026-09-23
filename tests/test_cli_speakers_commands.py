@@ -147,6 +147,39 @@ def test_enroll_preserves_options(
     assert ("deprecated" in result.stderr) is legacy
 
 
+def test_voices_dir_reaches_serve_and_enroll(
+    speaker_group, audition, monkeypatch, tmp_path
+):
+    media, seen = audition
+    library = tmp_path / "nas" / "voices"
+    served = CliRunner().invoke(
+        speaker_group, ["serve", str(media), "--voices-dir", str(library), "--no-open"]
+    )
+    assert served.exit_code == 0, served.output
+    assert seen["create"] == [
+        (
+            media,
+            {"voices": None, "show": None, "no_match": False, "voices_dir": library},
+        )
+    ]
+
+    enrolled = {}
+    monkeypatch.setattr(
+        speakers,
+        "enroll_speaker_voices",
+        lambda path, **kwargs: enrolled.update(path=path, **kwargs) or library,
+    )
+    result = CliRunner().invoke(
+        speaker_group,
+        ["enroll", str(media), "--voices-dir", str(library), "--show", "KonoSuba"],
+    )
+    assert result.exit_code == 0, result.output
+    assert enrolled["voices_dir"] == library
+    assert enrolled["voices"] is None
+    assert enrolled["show"] == "KonoSuba"
+    assert result.stdout == f"{library}\n"
+
+
 @pytest.mark.parametrize(
     "args",
     [

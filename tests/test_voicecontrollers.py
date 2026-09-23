@@ -216,14 +216,20 @@ def test_declared_missing_sidecar_refuses_without_mapping(tmp_path, monkeypatch)
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
 
 
-def test_discovery_requires_show_confirmation(tmp_path, monkeypatch):
+def test_discovered_folder_store_suggests_read_only_without_show(tmp_path, monkeypatch):
     media, _sibling, _sidecar = _write_episode(tmp_path)
-    _write_store(tmp_path / "voxweave.voices.json")
+    discovered = tmp_path / "voxweave.voices.json"
+    _write_store(discovered)
+    before = discovered.read_bytes()
     _fake_clips(monkeypatch)
 
     page = speakers.create_speaker_audition(media).page
 
+    # Since the voice library, a per-folder store is a read-only suggestion
+    # source; it is never written and never prefilled by default.
+    assert "Aqua (1.00) [use]" in page
     assert "machine-suggested" not in page
+    assert discovered.read_bytes() == before
     assert not (tmp_path / "episode.speakers.suggest.json").exists()
 
 

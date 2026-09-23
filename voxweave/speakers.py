@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from voxweave import artifacts, fsio
+from voxweave import artifacts, fsio, voicelibrary
 from voxweave.chunking import FFMPEG_TIMEOUT
 from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
 from voxweave.songdet import subtract_spans
@@ -31,6 +31,7 @@ from voxweave.voicebase import (
     VOICES_STORE_MAX_BYTES,
     VOICEPRINTS_MAX_BYTES,
     Phase2DataError,
+    ValidatedVoiceprints,
     html_attribute,
     html_text,
     media_fingerprint,
@@ -45,15 +46,21 @@ from voxweave.voicebase import (
 from voxweave.voiceepisode import episode_lock
 from voxweave.voicematch import (
     CompatibilityError,
+    MatchCandidate,
     MatchThresholds,
     SpeakerMatch,
     ThresholdError,
     build_compatibility_fingerprint,
+    build_library_suggest_record,
     build_suggest_record,
     compatibility_equal,
     delete_suggest,
     describe_compatibility_mismatch,
+    embedding_space_label,
+    load_suggest,
     match_speakers,
+    match_tiers,
+    parse_global_suggest,
     parse_thresholds,
     write_suggest,
 )
@@ -252,6 +259,150 @@ def _matching_record(
         store=store,
     )
     return matches, record, thresholds
+
+
+_WARNED_LEGACY_STORES: set[Path] = set()
+
+
+def _warn_legacy_store_once(path: Path) -> None:
+    if path in _WARNED_LEGACY_STORES:
+        return
+    _WARNED_LEGACY_STORES.add(path)
+    log.warning(
+        "found a per-folder voices store %s; it is still read for suggestions, "
+        "but new voices go to the voice library. Run `voxweave voices import %s` "
+        "to merge it",
+        path,
+        path,
+    )
+
+
+def _read_legacy_store(
+    path: Path, sidecar_provenance: Mapping[str, object]
+) -> dict[str, object] | None:
+    """Read a pre-library per-folder store read-only, if it can serve matching."""
+    if not artifacts.path_present(path):
+        return None
+    try:
+        with shared_store_lock(path) as handle:
+            _raw, store = _read_exact_object(handle.store_path, VOICES_STORE_MAX_BYTES)
+            validate_voice_store(store)
+    except (OSError, Phase2DataError) as exc:
+        log.warning(
+            "per-folder voices store %s is unusable; ignoring it: %s", path, exc
+        )
+        return None
+    store_provenance = cast(Mapping[str, object], store["provenance"])
+    left = build_compatibility_fingerprint(sidecar_provenance)
+    right = build_compatibility_fingerprint(store_provenance)
+    if not compatibility_equal(left, right):
+        log.warning(
+            "matching against voices store %s skipped: %s",
+            path,
+            describe_compatibility_mismatch(
+                sidecar_provenance, store_provenance, episode=left, store=right
+            ),
+        )
+        return None
+    return store
+
+
+def _library_matching(
+    sidecar: Mapping[str, object],
+    *,
+    media: Path,
+    root: Path,
+    scope: str,
+    folder_scope: bool,
+) -> tuple[dict[str, SpeakerMatch], dict[str, object]] | None:
+    """Two-tier suggestions from the voice library (plus a legacy folder store).
+
+    Tier 1 holds identities enrolled under ``scope``; tier 2 every other
+    scope, above the stricter global bar. A pre-library ``voxweave.voices.json``
+    beside the media is read, never written: its identities join tier 1 when
+    the scope is this folder (or equals the store's show), else tier 2, and
+    identities the library already holds are left to the library copy.
+    """
+    provenance = cast(Mapping[str, object], sidecar["provenance"])
+    try:
+        space_name, fingerprint = voicelibrary.space_identity(provenance)
+    except Phase2DataError as exc:
+        log.warning("voice library matching skipped: %s", exc)
+        return None
+    try:
+        with voicelibrary.library_lock(root, exclusive=False):
+            state = voicelibrary.read_state(root, spaces=[space_name])
+            voicelibrary.require_same_space(state, space_name, fingerprint)
+            other_spaces = [
+                name
+                for name in voicelibrary.list_space_names(
+                    voicelibrary.LibraryPaths(root)
+                )
+                if name != space_name
+            ]
+    except (OSError, Phase2DataError) as exc:
+        log.warning(
+            "voice library %s is unusable; library matching skipped: %s", root, exc
+        )
+        state = voicelibrary.LibraryState(
+            voicelibrary.LibraryPaths(root), voicelibrary.empty_identities(), {}
+        )
+        other_spaces = []
+    if space_name not in state.spaces and other_spaces:
+        log.warning(
+            "voice library %s holds no voices captured with %s (it has: %s); "
+            "enroll this episode to start that space",
+            root,
+            embedding_space_label(provenance),
+            ", ".join(other_spaces),
+        )
+
+    pools = voicelibrary.matching_pools(state, space_name, scope)
+    legacy_path = canonical_store_path(voicelibrary.legacy_store_path(media))
+    legacy_store = _read_legacy_store(legacy_path, provenance)
+    if legacy_store is not None:
+        legacy_show = voicelibrary.normalize_scope(legacy_store["show"])
+        pools, unimported = voicelibrary.add_legacy_store(
+            pools,
+            legacy_store,
+            state=state,
+            space_name=space_name,
+            in_scope=folder_scope or legacy_show == scope,
+        )
+        if unimported:
+            _warn_legacy_store_once(legacy_path)
+    if not pools.in_scope and not pools.other_scopes:
+        return None
+    try:
+        thresholds = parse_thresholds(provenance=provenance)
+        global_suggest = parse_global_suggest(
+            provenance=provenance, suggest=thresholds.suggest
+        )
+    except ThresholdError as exc:
+        log.warning("voice matching thresholds are invalid; matching skipped: %s", exc)
+        return None
+    matches = match_tiers(
+        cast(Mapping[str, object], sidecar["speakers"]),
+        in_scope=pools.in_scope,
+        other_scopes=pools.other_scopes,
+        scopes=pools.scopes,
+        embedding_dim=cast(int, provenance["embedding_dim"]),
+        thresholds=thresholds,
+        global_suggest=global_suggest,
+    )
+    record = build_library_suggest_record(
+        matches,
+        capture_id=cast(str, sidecar["capture_id"]),
+        voiceprints_content_digest=voiceprints_digest(sidecar),
+        compatibility=build_compatibility_fingerprint(provenance),
+        thresholds=thresholds,
+        global_suggest=global_suggest,
+        library_path=root,
+        scope=scope,
+        revision=voicelibrary.space_revision(state, space_name),
+        content_digest=voicelibrary.match_input_digest(state, space_name, legacy_store),
+    )
+    return matches, record
 
 
 _VOICE_WRAP_RE = re.compile(
@@ -803,13 +954,59 @@ def extract_clip(media: Path, start: float, end: float, output: Path) -> None:
         run_clip_command(build_clip_command(media, start, end, tmp))
 
 
+def _suggestion_button(candidate: MatchCandidate, *, show_scopes: bool) -> str:
+    where = ""
+    if show_scopes and candidate.scopes:
+        where = " from " + ", ".join(candidate.scopes)
+    return (
+        '<button type="button" class="use-suggestion" '
+        f'data-use="{html_attribute(candidate.display_name)}">'
+        f"{html_text(candidate.display_name)} ({candidate.similarity:.2f})"
+        f"{html_text(where)} [use]"
+        "</button>"
+    )
+
+
+def _tiered_suggestions(match: SpeakerMatch | None, scope: str) -> str:
+    """Tier 1 (this scope) and tier 2 (other scopes, labelled) suggestion rows."""
+    primary = match.candidates if match is not None else ()
+    secondary = (
+        match.secondary.candidates
+        if match is not None and match.secondary is not None
+        else ()
+    )
+    rows = [
+        '<div class="suggestions" data-tier="1">'
+        f'<span class="tier">This scope ({html_text(scope)})</span>'
+        + (
+            "".join(_suggestion_button(c, show_scopes=False) for c in primary)
+            or '<span class="no-suggestion">No stored match.</span>'
+        )
+        + "</div>"
+    ]
+    if secondary:
+        rows.append(
+            '<div class="suggestions" data-tier="2">'
+            '<span class="tier">Other scopes (stricter match)</span>'
+            + "".join(_suggestion_button(c, show_scopes=True) for c in secondary)
+            + "</div>"
+        )
+    return "".join(rows)
+
+
 def _render_audition_html(
     title: str,
     mapping_name: str,
     snippets: Mapping[str, Sequence[tuple[Span, str]]],
     matches: Mapping[str, SpeakerMatch] | None = None,
+    *,
+    scope: str | None = None,
 ) -> str:
-    """Build the self-contained in-memory audition page."""
+    """Build the self-contained in-memory audition page.
+
+    ``scope`` marks a voice-library match: suggestions are then split into the
+    episode's own scope and the other scopes, each labelled.
+    """
     cards: list[str] = []
     for speaker_id, clips in snippets.items():
         audio = []
@@ -848,15 +1045,18 @@ def _render_audition_html(
             if match is not None and match.decision == "prefill" and candidates
             else ""
         )
-        suggestion_buttons = "".join(
-            '<button type="button" class="use-suggestion" '
-            f'data-use="{html_attribute(candidate.display_name)}">'
-            f"{html_text(candidate.display_name)} ({candidate.similarity:.2f}) [use]"
-            "</button>"
-            for candidate in candidates
-        )
-        if not suggestion_buttons:
-            suggestion_buttons = '<span class="no-suggestion">No stored match.</span>'
+        if scope is not None:
+            suggestion_rows = _tiered_suggestions(match, scope)
+        else:
+            suggestion_buttons = "".join(
+                _suggestion_button(candidate, show_scopes=False)
+                for candidate in candidates
+            )
+            if not suggestion_buttons:
+                suggestion_buttons = (
+                    '<span class="no-suggestion">No stored match.</span>'
+                )
+            suggestion_rows = f'<div class="suggestions">{suggestion_buttons}</div>'
         machine_mark = (
             '<span class="machine-mark">machine-suggested; review before saving</span>'
             if prefill
@@ -868,7 +1068,7 @@ def _render_audition_html(
             f'<input type="text" data-speaker="{sid}" aria-label="Name for {sid}" '
             f'value="{html_attribute(prefill)}" placeholder="Enter display name" '
             f'autocomplete="off">{machine_mark}</div>'
-            f'<div class="suggestions">{suggestion_buttons}</div>'
+            f"{suggestion_rows}"
             f'{split_controls}<div class="clips">{"".join(audio)}</div></section>'
         )
 
@@ -876,7 +1076,8 @@ def _render_audition_html(
     safe_mapping = html.escape(mapping_name)
     matching_css = (
         "\n.suggestions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }"
-        "\n.machine-mark, .no-suggestion { color: #777; font-size: .8rem; }"
+        "\n.machine-mark, .no-suggestion, .tier { color: #777; font-size: .8rem; }"
+        "\n.tier { align-self: center; }"
         if matches is not None
         else ""
     )
@@ -1248,12 +1449,21 @@ def create_speaker_audition(
     media: Path,
     *,
     voices: Path | None = None,
+    voices_dir: Path | None = None,
     show: str | None = None,
     no_match: bool = False,
 ) -> SpeakerAudition:
-    """Build an in-memory audition and install a mapping skeleton if absent."""
+    """Build an in-memory audition and install a mapping skeleton if absent.
+
+    Suggestions come from the voice library (``voices_dir``, else its
+    configured location) under the episode's scope (``show``, else the media
+    folder's name), unless ``voices`` names an explicit per-show store, which
+    keeps its pre-library behavior.
+    """
     from voxweave import pipeline
 
+    if voices is not None and voices_dir is not None:
+        raise ValueError("use either a voices store or a voice library, not both")
     media = Path(media)
     if not media.is_file():
         raise FileNotFoundError(f"media file not found: {media}")
@@ -1309,12 +1519,16 @@ def create_speaker_audition(
                 f"--diarize --voiceprints or use --no-match: {exc}"
             ) from exc
 
+    library_root: Path | None = None
+    library_scope: str | None = None
     try:
-        store_stage = (
-            None
-            if no_match
-            else _load_generation_store(media, voices=voices, show=show)
-        )
+        if no_match or voices is None:
+            store_stage = None
+        else:
+            store_stage = _load_generation_store(media, voices=voices, show=show)
+        if not no_match and voices is None:
+            library_root = voicelibrary.resolve_voices_dir(voices_dir).root
+            library_scope = voicelibrary.episode_scope(media, show)
     except (OSError, RuntimeError, Phase2DataError):
         _delete_stale_suggest_for_refusal(
             media,
@@ -1430,6 +1644,22 @@ def create_speaker_audition(
                     matched = None
                 if matched is not None:
                     matches, suggest_record, _thresholds = matched
+            elif library_root is not None and pair is not None:
+                assert current_sidecar is not None
+                assert library_scope is not None
+                try:
+                    library_matched = _library_matching(
+                        current_sidecar,
+                        media=media,
+                        root=library_root,
+                        scope=library_scope,
+                        folder_scope=show is None,
+                    )
+                except (CompatibilityError, Phase2DataError) as exc:
+                    log.warning("voice matching skipped: %s", exc)
+                    library_matched = None
+                if library_matched is not None:
+                    matches, suggest_record = library_matched
 
             def recheck_media_before_mapping_install() -> None:
                 assert snapshot_fingerprint is not None
@@ -1458,6 +1688,7 @@ def create_speaker_audition(
                 active_mapping_path.name,
                 embedded,
                 matches,
+                scope=library_scope if store_handle is None else None,
             )
             return SpeakerAudition(
                 page=page,
@@ -1505,27 +1736,196 @@ def create_speaker_audition(
     return output
 
 
+@dataclass(frozen=True)
+class _StagedEnrollment:
+    """The episode evidence paths and the bytes read before any lock."""
+
+    json_path: Path
+    sidecar_path: Path
+    mapping_path: Path
+    sibling_bytes: bytes = b""
+    sidecar_bytes: bytes = b""
+    mapping_bytes: bytes = b""
+
+
+@dataclass(frozen=True)
+class _EnrollmentEvidence:
+    """The authoritative in-lock observation of one episode's evidence."""
+
+    sibling: dict[str, object]
+    sidecar: dict[str, object]
+    voiceprints: ValidatedVoiceprints
+    mapping_bytes: bytes
+
+
+def _enrollment_paths(media: Path) -> _StagedEnrollment:
+    from voxweave import pipeline
+
+    if not media.is_file():
+        raise FileNotFoundError(f"media file not found: {media}")
+    staged = _StagedEnrollment(
+        json_path=pipeline.swap_ext(media, ".json"),
+        sidecar_path=pipeline.voiceprints_path(media),
+        mapping_path=pipeline.speakers_mapping_path(media),
+    )
+    if not staged.mapping_path.exists():
+        raise FileNotFoundError(
+            f"speaker mapping {staged.mapping_path.name} not found; "
+            "generate and review it first"
+        )
+    return staged
+
+
+def _stage_enrollment(paths: _StagedEnrollment) -> _StagedEnrollment:
+    try:
+        sibling_bytes, sibling = _read_sibling_exact(paths.json_path)
+        pair = _declared_voiceprint_pair(sibling)
+        if pair is None:
+            raise Phase2DataError("sibling does not declare voiceprint evidence")
+        sidecar_bytes, _sidecar = _load_voiceprints_exact(paths.sidecar_path)
+        mapping_bytes = paths.mapping_path.read_bytes()
+    except (OSError, Phase2DataError) as exc:
+        raise RuntimeError(f"cannot stage enrollment evidence: {exc}") from exc
+    return _StagedEnrollment(
+        json_path=paths.json_path,
+        sidecar_path=paths.sidecar_path,
+        mapping_path=paths.mapping_path,
+        sibling_bytes=sibling_bytes,
+        sidecar_bytes=sidecar_bytes,
+        mapping_bytes=mapping_bytes,
+    )
+
+
+def _recheck_enrollment(
+    media: Path, staged: _StagedEnrollment, snapshot_fingerprint: str
+) -> _EnrollmentEvidence:
+    """Re-read the staged evidence under the locks and bind it to the media."""
+    current_sibling_bytes = staged.json_path.read_bytes()
+    if current_sibling_bytes != staged.sibling_bytes:
+        raise RuntimeError("input changed during enrollment; re-run")
+    current_sidecar_bytes = staged.sidecar_path.read_bytes()
+    if current_sidecar_bytes != staged.sidecar_bytes:
+        raise RuntimeError("input changed during enrollment; re-run")
+    current_mapping_bytes = staged.mapping_path.read_bytes()
+    if current_mapping_bytes != staged.mapping_bytes:
+        raise RuntimeError("input changed during enrollment; re-run")
+
+    current_sibling = strict_json_object_loads(
+        current_sibling_bytes,
+        max_bytes=max(1, len(current_sibling_bytes)),
+        source=staged.json_path.name,
+    )
+    current_sidecar = _voiceprints_from_bytes(
+        current_sidecar_bytes,
+        source=staged.sidecar_path.name,
+    )
+    validated_sidecar = validate_voiceprint_conjunction(
+        current_sidecar,
+        current_sibling,
+        snapshot_fingerprint,
+    )
+    if media_fingerprint(media) != snapshot_fingerprint:
+        raise RuntimeError("media changed during enrollment; re-run")
+    return _EnrollmentEvidence(
+        sibling=current_sibling,
+        sidecar=current_sidecar,
+        voiceprints=validated_sidecar,
+        mapping_bytes=current_mapping_bytes,
+    )
+
+
+def _named_speakers(
+    evidence: _EnrollmentEvidence, mapping_path: Path
+) -> dict[str, str]:
+    mapping = _mapping_entries_bytes(evidence.mapping_bytes, source=mapping_path.name)
+    named = {
+        str(local_id): raw_name
+        for local_id, raw_name in mapping.items()
+        if isinstance(raw_name, str) and raw_name.strip()
+    }
+    if not named:
+        raise EnrollmentRefusal("speaker mapping has no human-entered names to enroll")
+    for raw_name in named.values():
+        normalize_speaker_key(raw_name)
+    return named
+
+
+def _speaker_durations(sibling: Mapping[str, object]) -> dict[str, float]:
+    durations: dict[str, float] = {}
+    for start, end, local_id in strict_turn_projection(sibling.get("speaker_turns")):
+        durations[local_id] = durations.get(local_id, 0.0) + end - start
+    return durations
+
+
+_Candidate = tuple[str, str, tuple[int | float, ...], float]
+
+
+def _group_winners(
+    groups: Mapping[tuple[str, str], list[_Candidate]],
+) -> list[tuple[str, str, tuple[int | float, ...]]]:
+    """Keep the longest-speaking local id of each over-split identity."""
+    selected: list[tuple[str, str, tuple[int | float, ...]]] = []
+    for candidates in groups.values():
+        winner = min(candidates, key=lambda item: (-item[3], item[0]))
+        selected.append((winner[0], winner[1], winner[2]))
+        for skipped in sorted(
+            local_id for local_id, *_rest in candidates if local_id != winner[0]
+        ):
+            log.info(
+                "skipping over-split local speaker %s in favor of %s",
+                skipped,
+                winner[0],
+            )
+    return selected
+
+
 def enroll_speaker_voices(
     media: Path,
     *,
     voices: Path | None = None,
+    voices_dir: Path | None = None,
     show: str | None = None,
     episode: str | None = None,
     replace_episode: bool = False,
 ) -> Path:
-    """Enroll human-named, bound episode centroids into one show store."""
-    from voxweave import pipeline
+    """Enroll human-named, bound episode centroids.
 
+    The voices go to the global voice library (``voices_dir``, else its
+    configured location) under the episode's scope, which is ``show`` or else
+    the media folder's name; the library directory is returned. An explicit
+    ``voices`` per-show store keeps its pre-library behavior instead and its
+    path is returned.
+    """
+    if voices is not None and voices_dir is not None:
+        raise ValueError("use either a voices store or a voice library, not both")
     media = Path(media)
-    if not media.is_file():
-        raise FileNotFoundError(f"media file not found: {media}")
-    json_path = pipeline.swap_ext(media, ".json")
-    mapping_path = pipeline.speakers_mapping_path(media)
-    sidecar_path = pipeline.voiceprints_path(media)
-    if not mapping_path.exists():
-        raise FileNotFoundError(
-            f"speaker mapping {mapping_path.name} not found; generate and review it first"
+    if voices is None:
+        return _enroll_into_library(
+            media,
+            voices_dir=voices_dir,
+            show=show,
+            episode=episode,
+            replace_episode=replace_episode,
         )
+    return _enroll_into_store(
+        media,
+        voices=voices,
+        show=show,
+        episode=episode,
+        replace_episode=replace_episode,
+    )
+
+
+def _enroll_into_store(
+    media: Path,
+    *,
+    voices: Path,
+    show: str | None,
+    episode: str | None,
+    replace_episode: bool,
+) -> Path:
+    """Enroll into one explicit per-show store (the pre-library behavior)."""
+    paths = _enrollment_paths(media)
     store_path, explicit = _resolved_voices_path(media, voices)
     create_store = not store_path.exists()
     if create_store and (not explicit or show is None):
@@ -1539,16 +1939,7 @@ def enroll_speaker_voices(
     if create_store:
         store_path.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        sibling_bytes, sibling = _read_sibling_exact(json_path)
-        pair = _declared_voiceprint_pair(sibling)
-        if pair is None:
-            raise Phase2DataError("sibling does not declare voiceprint evidence")
-        sidecar_bytes, _sidecar = _load_voiceprints_exact(sidecar_path)
-        mapping_bytes = mapping_path.read_bytes()
-    except (OSError, Phase2DataError) as exc:
-        raise RuntimeError(f"cannot stage enrollment evidence: {exc}") from exc
-
+    staged = _stage_enrollment(paths)
     try:
         snapshot_context = MediaSnapshot(media)
         snapshot = snapshot_context.__enter__()
@@ -1557,32 +1948,9 @@ def enroll_speaker_voices(
     try:
         with episode_lock(media):
             with exclusive_store_lock(store_path) as lock_handle:
-                current_sibling_bytes = json_path.read_bytes()
-                if current_sibling_bytes != sibling_bytes:
-                    raise RuntimeError("input changed during enrollment; re-run")
-                current_sidecar_bytes = sidecar_path.read_bytes()
-                if current_sidecar_bytes != sidecar_bytes:
-                    raise RuntimeError("input changed during enrollment; re-run")
-                current_mapping_bytes = mapping_path.read_bytes()
-                if current_mapping_bytes != mapping_bytes:
-                    raise RuntimeError("input changed during enrollment; re-run")
-
-                current_sibling = strict_json_object_loads(
-                    current_sibling_bytes,
-                    max_bytes=max(1, len(current_sibling_bytes)),
-                    source=json_path.name,
-                )
-                current_sidecar = _voiceprints_from_bytes(
-                    current_sidecar_bytes,
-                    source=sidecar_path.name,
-                )
-                validated_sidecar = validate_voiceprint_conjunction(
-                    current_sidecar,
-                    current_sibling,
-                    snapshot.fingerprint,
-                )
-                if media_fingerprint(media) != snapshot.fingerprint:
-                    raise RuntimeError("media changed during enrollment; re-run")
+                evidence = _recheck_enrollment(media, staged, snapshot.fingerprint)
+                current_sidecar = evidence.sidecar
+                validated_sidecar = evidence.voiceprints
 
                 if lock_handle.store_path.exists():
                     _store_bytes, store = _read_exact_object(
@@ -1620,32 +1988,9 @@ def enroll_speaker_voices(
                         )
                     )
 
-                mapping = _mapping_entries_bytes(
-                    current_mapping_bytes,
-                    source=mapping_path.name,
-                )
-                named = {
-                    str(local_id): raw_name
-                    for local_id, raw_name in mapping.items()
-                    if isinstance(raw_name, str) and raw_name.strip()
-                }
-                if not named:
-                    raise EnrollmentRefusal(
-                        "speaker mapping has no human-entered names to enroll"
-                    )
-                for raw_name in named.values():
-                    normalize_speaker_key(raw_name)
-
-                durations: dict[str, float] = {}
-                for start, end, local_id in strict_turn_projection(
-                    current_sibling.get("speaker_turns")
-                ):
-                    durations[local_id] = durations.get(local_id, 0.0) + end - start
-
-                groups: dict[
-                    tuple[str, str],
-                    list[tuple[str, str, tuple[int | float, ...], float]],
-                ] = {}
+                named = _named_speakers(evidence, paths.mapping_path)
+                durations = _speaker_durations(evidence.sibling)
+                groups: dict[tuple[str, str], list[_Candidate]] = {}
                 for local_id, raw_name in named.items():
                     vector = validated_sidecar.speakers.get(local_id)
                     if vector is None:
@@ -1665,21 +2010,7 @@ def enroll_speaker_voices(
                     )
                 if not groups:
                     raise EnrollmentRefusal("nothing to enroll")
-
-                selected: list[tuple[str, str, tuple[int | float, ...]]] = []
-                for candidates in groups.values():
-                    winner = min(candidates, key=lambda item: (-item[3], item[0]))
-                    selected.append((winner[0], winner[1], winner[2]))
-                    for skipped in sorted(
-                        local_id
-                        for local_id, *_rest in candidates
-                        if local_id != winner[0]
-                    ):
-                        log.info(
-                            "skipping over-split local speaker %s in favor of %s",
-                            skipped,
-                            winner[0],
-                        )
+                selected = _group_winners(groups)
 
                 episode_key = normalize_episode(episode or media.stem)
                 working = store
@@ -1713,6 +2044,188 @@ def enroll_speaker_voices(
                 else:  # defensive: selected is nonempty and every transition is total
                     raise EnrollmentRefusal("nothing to enroll")
                 return lock_handle.store_path
+    finally:
+        snapshot_context.__exit__(None, None, None)
+
+
+def _accepted_suggestions(
+    media: Path, sidecar: Mapping[str, object]
+) -> dict[str, list[tuple[str, str, int]]]:
+    """Per local speaker, the ``(identity, display name, tier)`` suggestions the
+    review page offered for this exact capture.
+
+    Only a record bound to the current capture and voiceprints is trusted; any
+    other record is stale and ignored (enrollment then falls back to names).
+    """
+    from voxweave import pipeline
+
+    path = pipeline.speakers_suggest_path(media)
+    try:
+        record = load_suggest(path)
+    except FileNotFoundError:
+        return {}
+    except (OSError, Phase2DataError) as exc:
+        log.info("ignoring an unusable suggestion record %s: %s", path, exc)
+        return {}
+    if record.get("capture_id") != sidecar.get("capture_id") or record.get(
+        "voiceprints_digest"
+    ) != voiceprints_digest(sidecar):
+        return {}
+    offered: dict[str, list[tuple[str, str, int]]] = {}
+    for local_id, raw_match in cast(Mapping[str, object], record["speakers"]).items():
+        match = cast(Mapping[str, object], raw_match)
+        rows = offered.setdefault(local_id, [])
+        tiers: list[tuple[int, Mapping[str, object]]] = [(1, match)]
+        if "secondary" in match:
+            tiers.append((2, cast(Mapping[str, object], match["secondary"])))
+        for tier, tier_match in tiers:
+            for raw in cast(list[Mapping[str, object]], tier_match["candidates"]):
+                rows.append(
+                    (cast(str, raw["identity"]), cast(str, raw["display_name"]), tier)
+                )
+    return offered
+
+
+def _library_identity_for(
+    state: voicelibrary.LibraryState,
+    raw_name: str,
+    *,
+    scope: str,
+    offered: Sequence[tuple[str, str, int]],
+) -> str | None:
+    """Resolve the library identity a reviewed name refers to, or None to create.
+
+    Display names are not keys, so a name alone never links scopes: the
+    reviewer links one only by using a suggestion, whose name is what they
+    entered (tier 1 preferred). Otherwise the name resolves among the
+    identities of this scope, and a name no identity of this scope carries
+    becomes a new identity even if another scope has an identity of that
+    name. A suggested id the library does not hold yet (from a per-folder
+    store not imported yet) is adopted, so a later import merges into it.
+    """
+    key = normalize_speaker_key(raw_name)
+    accepted = [
+        (tier, identity_id)
+        for identity_id, display_name, tier in offered
+        if normalize_speaker_key(display_name) == key
+    ]
+    if accepted:
+        best = min(tier for tier, _identity in accepted)
+        ids = sorted({identity for tier, identity in accepted if tier == best})
+        if len(ids) == 1:
+            return ids[0]
+        raise EnrollmentRefusal(
+            f"speaker name {raw_name!r} matches several suggested identities "
+            f"({', '.join(ids)}); rename one with `voxweave voices rename`"
+        )
+    in_scope = voicelibrary.identities_named(state, raw_name, scope=scope)
+    if len(in_scope) > 1:
+        raise EnrollmentRefusal(
+            f"speaker name {raw_name!r} belongs to several identities in scope "
+            f"{scope!r} ({', '.join(in_scope)}); rename one with "
+            "`voxweave voices rename`"
+        )
+    return in_scope[0] if in_scope else None
+
+
+def _enroll_into_library(
+    media: Path,
+    *,
+    voices_dir: Path | None,
+    show: str | None,
+    episode: str | None,
+    replace_episode: bool,
+) -> Path:
+    """Enroll into the global voice library under the episode's scope."""
+    paths = _enrollment_paths(media)
+    root = voicelibrary.resolve_voices_dir(voices_dir).root
+    scope = voicelibrary.episode_scope(media, show)
+    episode_key = normalize_episode(episode or media.stem)
+    staged = _stage_enrollment(paths)
+    try:
+        snapshot_context = MediaSnapshot(media)
+        snapshot = snapshot_context.__enter__()
+    except SnapshotUnavailable as exc:
+        raise RuntimeError(f"cannot snapshot media for enrollment: {exc}") from exc
+    try:
+        with episode_lock(media):
+            with voicelibrary.library_lock(root, exclusive=True):
+                evidence = _recheck_enrollment(media, staged, snapshot.fingerprint)
+                provenance = cast(Mapping[str, object], evidence.sidecar["provenance"])
+                try:
+                    space_name, _fingerprint = voicelibrary.space_identity(provenance)
+                except voicelibrary.VoiceLibraryError as exc:
+                    raise EnrollmentRefusal(f"enrollment refused: {exc}") from exc
+                state = voicelibrary.read_state(root, spaces=[space_name])
+                named = _named_speakers(evidence, paths.mapping_path)
+                offered = _accepted_suggestions(media, evidence.sidecar)
+                durations = _speaker_durations(evidence.sibling)
+                groups: dict[tuple[str, str], list[_Candidate]] = {}
+                for local_id, raw_name in named.items():
+                    vector = evidence.voiceprints.speakers.get(local_id)
+                    if vector is None:
+                        log.info(
+                            "skipping named local speaker %s without a usable centroid",
+                            local_id,
+                        )
+                        continue
+                    identity_id = _library_identity_for(
+                        state,
+                        raw_name,
+                        scope=scope,
+                        offered=offered.get(local_id, ()),
+                    )
+                    group_key = (
+                        ("identity", identity_id)
+                        if identity_id is not None
+                        else ("name", normalize_speaker_key(raw_name))
+                    )
+                    groups.setdefault(group_key, []).append(
+                        (local_id, raw_name, vector, durations.get(local_id, 0.0))
+                    )
+                if not groups:
+                    raise EnrollmentRefusal("nothing to enroll")
+                identity_of = {
+                    local_id: key[1] if key[0] == "identity" else None
+                    for key, candidates in groups.items()
+                    for local_id, *_rest in candidates
+                }
+                entries = [
+                    voicelibrary.EnrollEntry(
+                        identity_id=identity_of[local_id],
+                        raw_name=raw_name,
+                        speaker_label=local_id,
+                        vector=vector,
+                    )
+                    for local_id, raw_name, vector in _group_winners(groups)
+                ]
+                change, outcomes = voicelibrary.enroll_entries(
+                    state,
+                    provenance=provenance,
+                    scope=scope,
+                    source=voicelibrary.EpisodeSource(
+                        media_path=os.path.abspath(media),
+                        media_fingerprint=evidence.voiceprints.media_fingerprint,
+                        capture_id=evidence.voiceprints.capture_id,
+                        turns_digest=evidence.voiceprints.turns_digest,
+                        episode=episode_key,
+                    ),
+                    entries=entries,
+                    replace_episode=replace_episode,
+                )
+                voicelibrary.commit(state, change)
+                mutations = sum(outcome.outcome != "noop" for outcome in outcomes)
+                if mutations:
+                    log.info(
+                        "enrolled %d voice exemplar(s) into the voice library %s "
+                        "(scope %r)",
+                        mutations,
+                        root,
+                        scope,
+                    )
+                else:
+                    log.info("already enrolled; voice library unchanged")
+                return root
     finally:
         snapshot_context.__exit__(None, None, None)
 
