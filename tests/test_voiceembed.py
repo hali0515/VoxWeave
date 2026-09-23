@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import io
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1011,9 +1012,12 @@ def test_anime_va_network_swaps_every_batchnorm_and_scales_the_waveform(
         for module in reference.modules()
         if isinstance(module, torch.nn.GroupNorm)
     ]
-    assert groups and all(
-        module.num_groups == voiceembed_models.ANIME_VA_NORM_GROUPS for module in groups
-    )
+    # The state dict carries no group count (GroupNorm's affine parameters are
+    # per channel), so a wrong count would still load strictly: pin the literal
+    # from the model card here. The opt-in real-weights golden below proves it
+    # against the published checkpoint.
+    assert voiceembed_models.ANIME_VA_NORM_GROUPS == 32
+    assert groups and all(module.num_groups == 32 for module in groups)
 
     network, declared = voiceembed_models.build_anime_va(state)
     network.eval()
@@ -1043,3 +1047,87 @@ def test_anime_va_builder_refuses_a_foreign_state_dict():
         voiceembed_models.build_anime_va({"backbone.unrelated": 1})
     with pytest.raises(voiceembed_models.CheckpointLayoutError):
         voiceembed_models.build_redimnet2({"state_dict": {}})
+
+
+# --------------------------------------------------------------------------
+# Opt-in: the published checkpoints themselves (VOXWEAVE_REAL_WEIGHT_TESTS=1)
+# --------------------------------------------------------------------------
+
+REAL_WEIGHT_ENV = "VOXWEAVE_REAL_WEIGHT_TESTS"
+# First 8 dims of the embedding of golden_input() over (0 s, 3 s), CPU, float32
+# network, recorded 2026-09-23 from the pinned checkpoints (torch 2.12 CPU).
+# A GroupNorm group count other than 32 moves these anime-va dims by up to ~0.13
+# (16 groups: 0.026939, -0.011793, 0.084344, ...), far outside the tolerance;
+# CUDA runs drift by up to ~2e-3, which is why the test pins the CPU.
+REAL_WEIGHT_GOLDENS = {
+    voiceembed.REDIMNET2_B6.name: [
+        -0.104167,
+        0.008472,
+        -0.069837,
+        -0.109166,
+        -0.096987,
+        0.024624,
+        -0.050231,
+        0.015373,
+    ],
+    voiceembed.ANIME_VA.name: [
+        0.029435,
+        -0.038319,
+        0.032941,
+        0.183498,
+        0.031868,
+        -0.043582,
+        0.000575,
+        0.067589,
+    ],
+}
+
+
+def golden_input() -> np.ndarray:
+    """3 s of a deterministic voiced-like signal (harmonics, vibrato, syllables)."""
+    rate = voiceembed.SAMPLE_RATE
+    t = np.arange(3 * rate, dtype=np.float64) / rate
+    f0 = 140.0 + 30.0 * np.sin(2.0 * math.pi * 0.5 * t)
+    phase = 2.0 * math.pi * np.cumsum(f0) / rate
+    voiced = sum(np.sin(k * phase) / k for k in range(1, 13))
+    envelope = 0.5 * (1.0 - np.cos(2.0 * math.pi * t / 3.0))
+    syllables = 0.6 + 0.4 * np.sin(2.0 * math.pi * 4.0 * t)
+    signal = voiced * envelope * syllables
+    return (0.3 * signal / np.abs(signal).max()).astype(np.float32)
+
+
+def _cached_real_checkpoint(spec: voiceembed.EmbedderSpec) -> Path | None:
+    """The pinned checkpoint already in the audio cache; never downloads."""
+    if spec.url is not None:
+        path = Path(config.AUDIO_CACHE) / (spec.cache_subdir or spec.name)
+        path = path / spec.filename
+        return path if path.is_file() else None
+    from huggingface_hub import try_to_load_from_cache
+
+    assert spec.hf_repo is not None
+    found = try_to_load_from_cache(
+        spec.hf_repo,
+        spec.filename,
+        cache_dir=config.AUDIO_CACHE,
+        revision=spec.hf_revision,
+    )
+    return Path(found) if isinstance(found, str) else None
+
+
+@pytest.mark.parametrize("spec", [voiceembed.REDIMNET2_B6, voiceembed.ANIME_VA])
+def test_real_weights_reproduce_the_recorded_golden_embedding(spec, monkeypatch):
+    if os.environ.get(REAL_WEIGHT_ENV) != "1":
+        pytest.skip(f"set {REAL_WEIGHT_ENV}=1 to run against the real checkpoints")
+    checkpoint = _cached_real_checkpoint(spec)
+    if checkpoint is None:
+        pytest.skip(f"{spec.name} checkpoint is not in {config.AUDIO_CACHE}")
+    monkeypatch.setenv(spec.checkpoint_env, str(checkpoint))
+    monkeypatch.setattr(voiceembed.runtime, "get_device", lambda: "cpu")
+    voiceembed.release()
+    try:
+        rows = voiceembed.embed_segments(golden_input(), [(0.0, 3.0)], spec)
+    finally:
+        voiceembed.release()
+
+    assert rows.shape == (1, 192)
+    assert list(rows[0][:8]) == pytest.approx(REAL_WEIGHT_GOLDENS[spec.name], abs=1e-3)
