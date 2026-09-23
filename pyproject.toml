@@ -150,6 +150,9 @@ include = ["voxweave*"]
 # Separator config bundled with the package (must match the frozen MelBandRoformer
 # architecture vendored in voxweave.vendor).
 "voxweave.vendor" = ["*.yaml"]
+# Upstream license texts of the vendored speaker-embedding model code.
+"voxweave.vendor.redimnet2" = ["LICENSE"]
+"voxweave.vendor.speechbrain_ecapa" = ["LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
