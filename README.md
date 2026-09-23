@@ -169,6 +169,22 @@ RTX PRO 4000 24 GB. Peak allocated CUDA memory was identical in that run:
 Community-1 generally improves speaker counting and separation; 3.1 stays selectable per run
 for users who have accepted only the existing 3.1 gate.
 
+**Voiceprint embedders.** With `--voiceprints`, pyannote still finds the speaker turns, but the
+per-speaker voiceprints (cross-episode matching and **Split this speaker**) come from a
+dedicated speaker-embedding model chosen per language. Each checkpoint is downloaded once into
+`~/.cache/voxweave/audio/`, pinned by SHA-256, and verified before it is loaded:
+
+| `--voiceprint-model` | Checkpoint | Languages | Dim | Weights licence / caveats |
+| -------------------- | ---------- | --------- | --- | ------------------------- |
+| `redimnet2` (default for every language but Japanese) | ReDimNet2-B6 `b6-vb2+vox2+cnc2_v0-lm.pt` ([PalabraAI/redimnet2](https://github.com/PalabraAI/redimnet2) release v1.0.0) | any | 192 | Code MIT; the weights are trained on VoxBlink2, so treat them as **CC BY-NC-SA 4.0 (non-commercial)**. |
+| `anime-va` (default for Japanese) | [`litagin/anime_speaker_embedding_by_va_ecapa_tdnn_groupnorm`](https://huggingface.co/litagin/anime_speaker_embedding_by_va_ecapa_tdnn_groupnorm) (pinned revision) | Japanese only | 192 | Model card says MIT; the training data (a visual-novel voice corpus) has **unclear provenance**. Trained to tell voice actors apart, not characters. |
+| `pyannote` (legacy) | the diarization pipeline's own embedding head | any | 256 | Keeps matching voice stores built before the dedicated embedders. |
+
+`auto` (the default) picks `anime-va` for Japanese episodes and `redimnet2` otherwise. Voice
+stores are per embedding space: a store built by one embedder never matches another. Because the
+dedicated embedders are independent of the diarizer, switching `--diarize-model` no longer
+orphans a store built by `redimnet2` or `anime-va`.
+
 **From source** (for development or pulling new code):
 
 ```bash
@@ -299,6 +315,7 @@ routed to an in-place editing command. See the [migration notes](MIGRATING.md) f
 | `--diarize`                    | Opt in to the default-installed pyannote speaker diarizer: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). The gated checkpoint requires `VOXWEAVE_HF_TOKEN`, `HF_TOKEN`, config `hf_token`, or a prior `hf auth login`. Speaker turns persist to the sibling JSON, so `voxweave render` replays the formatting without re-running the model. |
 | `--diarize-model`              | Select `community-1` (the default), `3.1`, or any full Hugging Face pipeline id. The same setting is available as `VOXWEAVE_DIARIZE_MODEL` or `[diarize].model`; precedence is CLI > env > config > default. |
 | `--voiceprints/--no-voiceprints` | Opt in to a voice-biometric centroid sidecar for reviewed cross-episode speaker suggestions. Requires a fresh `--diarize` run and is off by default. Precedence: CLI, `VOXWEAVE_VOICEPRINTS`, `[defaults].voiceprints`, then off. |
+| `--voiceprint-model`           | Speaker-embedding model for `--voiceprints`: `auto` (default: `anime-va` for Japanese, `redimnet2` otherwise), `redimnet2`, `anime-va`, or `pyannote` (legacy: the diarization pipeline's own embeddings, which matches pre-existing voice stores). Precedence: CLI, `VOXWEAVE_VOICEPRINT_MODEL`, `[voiceprint].model`, then `auto`; an unknown value is an error. See [Setup](#setup) for the models and their licences. |
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
 | `--vad-mask/--no-vad-mask`     | Suppress CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                    |
@@ -330,9 +347,11 @@ voxweave render episode.json
 If pyannote merged two people under one diarizer id, select **Split this speaker** on that
 card. VoxWeave clusters the id's individual turns and lets you audition both proposed groups
 before applying the split. This action requires the episode to have been captured with
-`--voiceprints`; it refuses the proposal if the original embedding and audio provenance cannot
+`--voiceprints`; the turns are embedded with the same embedder (and checkpoint) the voiceprints
+were captured with, and the proposal is refused if that embedder or the audio provenance cannot
 be reproduced (for example, when a bound separated-vocals cache is missing or stale). A
-confirmed split rewrites `speaker_turns` and the bound voiceprint centroids, keeps a one-level
+confirmed split rewrites `speaker_turns` and the bound voiceprint centroids (recomputed with the
+capture's centroid recipe), keeps a one-level
 undo snapshot, and asks you to restart `voxweave speakers serve` to audition and name the new id. Undo
 is refused after any rewritten input changes.
 
@@ -350,6 +369,11 @@ voxweave speakers enroll episode.mkv \
 # Later episodes: suggestions appear in the served page and a regenerable cache record.
 voxweave speakers serve episode-02.mkv --voices ./example-show.voices.json
 ```
+
+A store belongs to one embedding space (see the voiceprint embedders under [Setup](#setup)):
+episodes captured with another embedder are skipped with a warning that names both spaces, and
+enrollment into such a store is refused. A store built before the dedicated embedders keeps
+working with `--voiceprint-model pyannote` (see [MIGRATING.md](MIGRATING.md)).
 
 A missing store is created only by `speakers enroll` with both explicit `--voices` and `--show`.
 Use `speakers enroll --replace` to replace this episode's prior contribution to that store.
@@ -647,6 +671,8 @@ default config is written on first run (migrated automatically from a pre-rename
 - `VOXWEAVE_ALIGNER_MODEL` (default `Qwen/Qwen3-ForcedAligner-0.6B`)
 - `VOXWEAVE_DIARIZE_MODEL` (default `pyannote/speaker-diarization-community-1`; short names `3.1`
   and `community-1`, or any full Hugging Face pipeline id; same as `--diarize-model`)
+- `VOXWEAVE_VOICEPRINT_MODEL` (default `[voiceprint].model` in the config, else `auto`; one of
+  `auto`, `redimnet2`, `anime-va`, `pyannote`; same as `--voiceprint-model`)
 - `VOXWEAVE_TRANSLATE_MODEL` / `VOXWEAVE_FIX_MODEL` (default `[llm].model` in the config, else
   `gpt-5.6-luna`; same as `--model` on `translate` / `correct`; `auto` = the endpoint's only served model)
 - `OPENAI_BASE_URL` (default `[llm].base_url` in the config, else api.openai.com; same as `--base-url`)
@@ -680,14 +706,21 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
 - `VOXWEAVE_MMS_REPO` / `VOXWEAVE_MMS_REPO_FILE` (default `deskpai/ctc_forced_aligner` /
   `04ac86b67129634da93aea76e0147ef3.onnx`), or `VOXWEAVE_MMS_MODEL` for an explicit onnx path
   (Japanese/CJK MMS-300m aligner)
+- `VOXWEAVE_REDIMNET2_CKPT` / `VOXWEAVE_ANIME_VA_CKPT` — an explicit local copy of the
+  `redimnet2` / `anime-va` voiceprint checkpoint (offline hosts). Unlike the overrides above,
+  the file must still be the pinned checkpoint: its SHA-256 is verified, because the
+  checkpoint defines the voice-store embedding space
 
 **Tuning**
 
 - `VOXWEAVE_VOICEPRINTS` (`1/0`, `true/false`, `yes/no`, or `on/off`; opt-in capture,
   overridden by the explicit CLI flag)
 - `VOXWEAVE_VOICES_ACCEPT` (default `off`; finite `[-1,1]` enables reviewed audition-page prefills)
-- `VOXWEAVE_VOICES_SUGGEST` (default `0.45`; minimum similarity shown as a suggestion)
-- `VOXWEAVE_VOICES_MARGIN` (default `0.05`; minimum top-two margin for a prefill)
+- `VOXWEAVE_VOICES_SUGGEST` (minimum similarity shown as a suggestion) and
+  `VOXWEAVE_VOICES_MARGIN` (minimum top-two margin for a prefill). Unset, each embedding space
+  uses its own default: `0.45` / `0.05` for `redimnet2` and the legacy `pyannote` lane,
+  `0.35` / `0.05` for `anime-va` (whose same-speaker cosines run lower). The dedicated
+  embedders' values are provisional; measure yours with `scripts/calibrate_voiceprints.py`
 
 - `VOXWEAVE_MAX_CHUNK_SEC` (default 120; shorter chunks reduce ASR repetition loops on long segments)
 - `VOXWEAVE_LOUDNORM` (default `loudnorm=I=-16:TP=-1.5:LRA=11`; the `-af` filter for `--normalize`)
@@ -765,10 +798,19 @@ autocast = "off"
 
 # Diarization pipeline (= --diarize-model / env VOXWEAVE_DIARIZE_MODEL).
 # Values: "community-1" (built-in default), "3.1", or any full Hugging Face pipeline id.
-# Voiceprint stores are per-model: centroids captured under one pipeline do not match under
-# the other (different embedding space), so switching models starts a fresh voiceprint store.
+# Only legacy (voiceprint model "pyannote") stores depend on it: their centroids come from the
+# pipeline's own embeddings, so switching pipelines starts a fresh legacy store.
 [diarize]
 model = "community-1"
+
+# Voiceprint embedder (= --voiceprint-model / env VOXWEAVE_VOICEPRINT_MODEL); used with --voiceprints.
+#   "auto" (default) — anime-va for Japanese, redimnet2 for every other language
+#   "redimnet2"      — ReDimNet2-B6; weights non-commercial (CC BY-NC-SA 4.0)
+#   "anime-va"       — anime voice-actor ECAPA-TDNN; Japanese only, unclear data provenance
+#   "pyannote"       — legacy: the diarization pipeline's embeddings (matches older stores)
+# Voice stores are per embedding space; changing the diarizer does not affect redimnet2/anime-va.
+[voiceprint]
+model = "auto"
 
 # Default on/off for the boolean pipeline flags. An explicit CLI flag always wins
 # (e.g. separate = false here, --separate on the command line for one run).
@@ -947,3 +989,7 @@ MIT — see [LICENSE](LICENSE).
   [PySBD](https://github.com/nipunsadvilkar/pySBD) — CJK/sentence line-break.
 - [PANNs](https://github.com/qiuqiangkong/audioset_tagging_cnn) — song/music detection.
 - [Silero VAD](https://github.com/snakers4/silero-vad) — voice activity detection.
+- [ReDimNet2](https://github.com/PalabraAI/redimnet2) (Palabra.ai) — the default voiceprint
+  embedder; [SpeechBrain](https://github.com/speechbrain/speechbrain) ECAPA-TDNN with the
+  [anime voice-actor weights](https://huggingface.co/litagin/anime_speaker_embedding_by_va_ecapa_tdnn_groupnorm)
+  (litagin) — the Japanese one.

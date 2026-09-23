@@ -3,6 +3,61 @@
 What changed per release, newest first. Only releases that need an action or a
 heads-up appear here.
 
+## 0.18.0 (unreleased)
+
+This only concerns `--voiceprints` (cross-episode voice matching and **Split this
+speaker**); transcription, diarization turns and subtitles are unchanged.
+
+### Voiceprints come from a dedicated embedder
+
+`--voiceprints` used to store the diarization pipeline's own speaker embeddings. It now
+keeps pyannote for the speaker turns but computes the voiceprints with a separate
+speaker-embedding model chosen per language (`--voiceprint-model` /
+`VOXWEAVE_VOICEPRINT_MODEL` / `[voiceprint].model`, default `auto`):
+
+- `auto`: `anime-va` for Japanese, `redimnet2` for every other language;
+- `redimnet2`: ReDimNet2-B6 (weights non-commercial, CC BY-NC-SA 4.0);
+- `anime-va`: anime voice-actor ECAPA-TDNN (Japanese only);
+- `pyannote`: the previous behavior.
+
+The first run downloads the selected checkpoint (51 MB or 83 MB) into
+`~/.cache/voxweave/audio/` and verifies its SHA-256. For an offline host, copy the file
+there or point `VOXWEAVE_REDIMNET2_CKPT` / `VOXWEAVE_ANIME_VA_CKPT` at it.
+
+**Existing voiceprints and voice stores do not match new captures.** A voice store is
+tied to one embedding space, and the new embedders define new ones. Nothing is rewritten
+or deleted, but with the new default:
+
+- `speakers serve` skips an existing store with a warning that names both spaces
+  (`store was built with pyannote embeddings (...); this run uses redimnet2-... embeddings`);
+- `speakers enroll` refuses to add a new episode to it.
+
+To keep using an existing store, capture new episodes on the legacy lane:
+
+```bash
+voxweave episode.mkv --diarize --voiceprints --voiceprint-model pyannote
+```
+
+or set it once in `~/.config/voxweave.conf`:
+
+```toml
+[voiceprint]
+model = "pyannote"
+```
+
+Alternatively start a new store with the new embedder: re-run the reviewed episodes with
+`--diarize --voiceprints` and `speakers enroll` them into a new `--voices` file.
+
+In exchange, a store built by `redimnet2` or `anime-va` no longer depends on the
+diarization pipeline: switching `--diarize-model` keeps it matching. The default
+matching thresholds now follow the embedding space (`anime-va` uses a lower suggest
+threshold, 0.35); `VOXWEAVE_VOICES_SUGGEST` / `VOXWEAVE_VOICES_MARGIN` still override
+them. Those defaults are provisional; `scripts/calibrate_voiceprints.py` measures them on
+your own diarized episodes.
+
+**Split this speaker** embeds turns with whichever embedder the episode's voiceprints
+were captured with, so legacy episodes keep splitting as before.
+
 ## 0.17.0
 
 Two performance settings were added, both off by default, and successful runs gained
