@@ -151,7 +151,7 @@ include = ["voxweave*"]
 # architecture vendored in voxweave.vendor).
 "voxweave.vendor" = ["*.yaml"]
 # Upstream license texts of the vendored speaker-embedding model code.
-"voxweave.vendor.redimnet2" = ["LICENSE"]
+"voxweave.vendor.redimnet2" = ["LICENSE", "LICENSE.Apache-2.0"]
 "voxweave.vendor.speechbrain_ecapa" = ["LICENSE"]
 
 [tool.pytest.ini_options]

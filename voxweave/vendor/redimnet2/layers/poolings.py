@@ -1,6 +1,8 @@
 # Vendored from https://github.com/PalabraAI/redimnet2 at commit c5bbe0b76e37df698c403f8844e41304ceab6307
-# (MIT; see LICENSE in voxweave/vendor/redimnet2). Local change: imports are
-# package-relative instead of the upstream top-level `redimnet2` package.
+# This file is Apache-2.0 (upstream notice below), NOT covered by the MIT LICENSE
+# of voxweave/vendor/redimnet2; the full license text ships as
+# voxweave/vendor/redimnet2/LICENSE.Apache-2.0. Unmodified apart from this header.
+#
 # Copyright (c) 2021 Shuai Wang (wsstriving@gmail.com)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

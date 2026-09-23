@@ -1040,6 +1040,29 @@ def test_anime_va_network_swaps_every_batchnorm_and_scales_the_waveform(
     assert seen == pytest.approx([0.5 * 32768.0, 32768.0])
 
 
+def test_vendored_model_code_ships_the_license_of_every_file():
+    import tomllib
+
+    vendor = Path(voiceembed.__file__).parent / "vendor" / "redimnet2"
+    apache = (vendor / "LICENSE.Apache-2.0").read_text(encoding="utf-8")
+    assert "Apache License" in apache and "Version 2.0, January 2004" in apache
+    header = (vendor / "layers" / "poolings.py").read_text(encoding="utf-8")
+    header = header.split('"""', 1)[0]
+    assert "Licensed under the Apache License, Version 2.0" in header
+    assert "LICENSE.Apache-2.0" in header
+    assert "(MIT;" not in header
+    pyproject = tomllib.loads(
+        (Path(voiceembed.__file__).parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    package_data = pyproject["tool"]["setuptools"]["package-data"]
+    assert set(package_data["voxweave.vendor.redimnet2"]) == {
+        "LICENSE",
+        "LICENSE.Apache-2.0",
+    }
+
+
 def test_anime_va_builder_refuses_a_foreign_state_dict():
     from voxweave import voiceembed_models
 

@@ -31,8 +31,9 @@ the model definition from [PalabraAI/redimnet2](https://github.com/PalabraAI/red
 at commit `c5bbe0b76e37df698c403f8844e41304ceab6307` (imports made
 package-relative; nothing else changed). The upstream MIT license text is shipped
 as `voxweave/vendor/redimnet2/LICENSE`. Most `layers/` files carry an MIT notice
-of ID R&D, Inc.; `layers/poolings.py` is Apache-2.0 (Shuai Wang, wespeaker) and
-keeps its header.
+of ID R&D, Inc.; `layers/poolings.py` is Apache License 2.0 (Shuai Wang,
+wespeaker), keeps its upstream notice, and is not covered by the MIT license: its
+license text is shipped as `voxweave/vendor/redimnet2/LICENSE.Apache-2.0`.
 
 ### SpeechBrain ECAPA-TDNN + Fbank — `voxweave/vendor/speechbrain_ecapa/`
 
