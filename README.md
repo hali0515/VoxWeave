@@ -187,6 +187,19 @@ stores are per embedding space: a store built by one embedder never matches anot
 dedicated embedders are independent of the diarizer, switching `--diarize-model` no longer
 orphans a store built by `redimnet2` or `anime-va`.
 
+**Voiceprint speaker clustering.** By default, `--diarize` keeps pyannote's own answer to *who
+is who*. With `--speaker-clustering voiceprint` (or `VOXWEAVE_DIARIZE_CLUSTERING` /
+`[diarize].clustering`), pyannote still finds the speaker turns (who speaks when, including
+overlaps), but the turns are regrouped by voiceprint with the `redimnet2` checkpoint from the
+table above, whatever the episode's language: the same download and cache, and the same
+**CC BY-NC-SA 4.0 (non-commercial)** weights licence. Turns the voiceprints cannot attribute
+confidently (background voices, noise, fragments too short to tell) are dropped from
+`speaker_turns`; the subtitle words they covered stay with the surrounding speaker. If this
+stage fails (a download, out of memory), the run warns and keeps pyannote's speakers. With
+`--voiceprint-model pyannote` the run keeps pyannote's clustering, because those legacy
+voiceprints are keyed by pyannote's labels. The setting never changes which voice stores an
+episode's voiceprints match.
+
 **From source** (for development or pulling new code):
 
 ```bash
@@ -316,6 +329,7 @@ routed to an in-place editing command. See the [migration notes](MIGRATING.md) f
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
 | `--diarize`                    | Opt in to the default-installed pyannote speaker diarizer: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). The gated checkpoint requires `VOXWEAVE_HF_TOKEN`, `HF_TOKEN`, config `hf_token`, or a prior `hf auth login`. Speaker turns persist to the sibling JSON, so `voxweave render` replays the formatting without re-running the model. |
 | `--diarize-model`              | Select `community-1` (the default), `3.1`, or any full Hugging Face pipeline id. The same setting is available as `VOXWEAVE_DIARIZE_MODEL` or `[diarize].model`; precedence is CLI > env > config > default. |
+| `--speaker-clustering`         | How `--diarize` groups its turns into speakers: `pyannote` (the default: the pipeline's own clustering) or `voiceprint` (regroup with ReDimNet2 voiceprints; turns nobody can be attributed to are dropped and their words stay with the surrounding speaker). The same setting is available as `VOXWEAVE_DIARIZE_CLUSTERING` or `[diarize].clustering`; precedence is CLI > env > config > default, and an unknown value is an error. See [Setup](#setup) for the model and its licence. |
 | `--voiceprints/--no-voiceprints` | Opt in to a voice-biometric centroid sidecar for reviewed cross-episode speaker suggestions. Requires a fresh `--diarize` run and is off by default. Precedence: CLI, `VOXWEAVE_VOICEPRINTS`, `[defaults].voiceprints`, then off. |
 | `--voiceprint-model`           | Speaker-embedding model for `--voiceprints`: `auto` (default: `anime-va` for Japanese, `redimnet2` otherwise), `redimnet2`, `anime-va`, or `pyannote` (legacy: the diarization pipeline's own embeddings, which matches pre-existing voice stores). Precedence: CLI, `VOXWEAVE_VOICEPRINT_MODEL`, `[voiceprint].model`, then `auto`; an unknown value is an error, and the CLI value is validated (with a no-effect warning) even when voiceprints are off. See [Setup](#setup) for the models and their licences. |
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
@@ -763,6 +777,8 @@ default config is written on first run (migrated automatically from a pre-rename
 - `VOXWEAVE_ALIGNER_MODEL` (default `Qwen/Qwen3-ForcedAligner-0.6B`)
 - `VOXWEAVE_DIARIZE_MODEL` (default `pyannote/speaker-diarization-community-1`; short names `3.1`
   and `community-1`, or any full Hugging Face pipeline id; same as `--diarize-model`)
+- `VOXWEAVE_DIARIZE_CLUSTERING` (default `[diarize].clustering` in the config, else `pyannote`;
+  `pyannote` or `voiceprint`; same as `--speaker-clustering`)
 - `VOXWEAVE_VOICEPRINT_MODEL` (default `[voiceprint].model` in the config, else `auto`; one of
   `auto`, `redimnet2`, `anime-va`, `pyannote`; same as `--voiceprint-model`)
 - `VOXWEAVE_TRANSLATE_MODEL` / `VOXWEAVE_FIX_MODEL` (default `[llm].model` in the config, else
@@ -901,8 +917,13 @@ autocast = "off"
 # Values: "community-1" (built-in default), "3.1", or any full Hugging Face pipeline id.
 # Only legacy (voiceprint model "pyannote") stores depend on it: their centroids come from the
 # pipeline's own embeddings, so switching pipelines starts a fresh legacy store.
+# clustering: who is who once the pipeline has found the turns (= --speaker-clustering /
+# env VOXWEAVE_DIARIZE_CLUSTERING). "pyannote" (built-in default) = the pipeline's own
+# clustering; "voiceprint" = regroup with ReDimNet2 (CC BY-NC-SA 4.0 weights) and drop
+# turns nobody can be attributed to.
 [diarize]
 model = "community-1"
+clustering = "pyannote"
 
 # Voiceprint embedder (= --voiceprint-model / env VOXWEAVE_VOICEPRINT_MODEL); used with --voiceprints.
 #   "auto" (default) — anime-va for Japanese, redimnet2 for every other language
