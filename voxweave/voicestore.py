@@ -7,7 +7,7 @@ import fcntl
 import os
 import secrets
 import unicodedata
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -82,6 +82,37 @@ class EnrollmentResult:
     identity_id: str
     exemplar_id: str
     evicted_exemplar_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ExemplarKey:
+    """The indexed fields of one stored exemplar, whatever its on-disk layout.
+
+    ``episode`` is already normalized. Both the per-show store and the global
+    voice library project their exemplars onto this shape so they share one
+    enrollment relation (:func:`plan_indexed_enrollment`).
+    """
+
+    id: str
+    capture_id: str
+    media_fingerprint: str
+    episode: str
+    vector: Sequence[int | float]
+    added: str
+
+
+@dataclass(frozen=True)
+class IndexedPlan:
+    """What one incoming exemplar does to one identity's exemplar list.
+
+    ``target`` indexes the capture hit of a no-op or the exemplar a replacement
+    overwrites; ``evict`` indexes the oldest exemplar an enrollment at the cap
+    displaces. Both are positions in the list the plan was computed from.
+    """
+
+    outcome: Literal["enroll", "replace", "noop"]
+    target: int | None = None
+    evict: int | None = None
 
 
 def _raise(message: str) -> None:
@@ -388,6 +419,87 @@ def _append_log(log: list[object], row: dict[str, object]) -> None:
         del log[: len(log) - MAX_LOG_ROWS]
 
 
+def plan_indexed_enrollment(
+    existing: Sequence[ExemplarKey],
+    *,
+    capture_id: str,
+    media_fingerprint: str,
+    episode: str,
+    vector: Sequence[int | float],
+    replace_episode: bool,
+    max_exemplars: int = MAX_EXEMPLARS,
+) -> IndexedPlan:
+    """Decide the capture -> source-media -> episode relation for one identity.
+
+    Pure: ``existing`` is one identity's exemplars, the incoming values are
+    already validated and ``episode`` normalized. A capture already stored is a
+    no-op only when its vector, media and episode all agree; the same media or
+    episode under a new capture is a replacement that ``replace_episode`` must
+    authorize; anything else enrolls, displacing the oldest exemplar (by
+    ``added`` then id) once ``max_exemplars`` are stored.
+    """
+    by_capture = {item.capture_id: index for index, item in enumerate(existing)}
+    by_media = {item.media_fingerprint: index for index, item in enumerate(existing)}
+    by_episode = {item.episode: index for index, item in enumerate(existing)}
+    capture_hit = by_capture.get(capture_id)
+    media_hit = by_media.get(media_fingerprint)
+    episode_hit = by_episode.get(episode)
+    hit_ids = {
+        existing[index].id
+        for index in (capture_hit, media_hit, episode_hit)
+        if index is not None
+    }
+    if len(hit_ids) > 1:
+        raise CrossIndexRefusal(
+            "enrollment evidence resolves different exemplars across indexes: "
+            + ", ".join(sorted(hit_ids))
+        )
+
+    if capture_hit is not None:
+        stored = existing[capture_hit]
+        if (
+            list(stored.vector) != list(vector)
+            or stored.media_fingerprint != media_fingerprint
+        ):
+            raise EnrollmentRefusal(
+                f"capture integrity failure for {capture_id}: vector or media differs"
+            )
+        if stored.episode != episode:
+            raise EnrollmentRefusal(
+                f"capture {capture_id} is already enrolled as {stored.episode!r}"
+            )
+        return IndexedPlan("noop", target=capture_hit)
+
+    if media_hit is not None:
+        stored_episode = existing[media_hit].episode
+        if stored_episode != episode:
+            raise EnrollmentRefusal(
+                f"same source media is already enrolled as {stored_episode!r}"
+            )
+        if not replace_episode:
+            raise EnrollmentRefusal(
+                f"source media for {episode!r} is already enrolled; "
+                "use --replace-episode"
+            )
+        return IndexedPlan("replace", target=media_hit)
+    if episode_hit is not None:
+        if not replace_episode:
+            old_capture = existing[episode_hit].capture_id
+            raise EnrollmentRefusal(
+                f"episode {episode!r} already has capture {old_capture}; "
+                "use --replace-episode"
+            )
+        return IndexedPlan("replace", target=episode_hit)
+
+    evict: int | None = None
+    if len(existing) >= max_exemplars:
+        evict = min(
+            range(len(existing)),
+            key=lambda index: (existing[index].added, existing[index].id),
+        )
+    return IndexedPlan("enroll", evict=evict)
+
+
 def enroll_exemplar(
     store: Mapping[str, object],
     *,
@@ -443,62 +555,33 @@ def enroll_exemplar(
 
     identity = cast(dict[str, object], identities[identity_id])
     exemplars = cast(list[dict[str, object]], identity["exemplars"])
-    by_capture = {cast(str, item["capture_id"]): item for item in exemplars}
-    by_media = {cast(str, item["media_fingerprint"]): item for item in exemplars}
-    by_episode = {normalize_episode(item["episode"]): item for item in exemplars}
-    capture_hit = by_capture.get(incoming_capture)
-    media_hit = by_media.get(incoming_media)
-    episode_hit = by_episode.get(incoming_episode)
-    indexed_hits = [
-        hit for hit in (capture_hit, media_hit, episode_hit) if hit is not None
-    ]
-    hit_ids = {cast(str, hit["id"]) for hit in indexed_hits}
-    if len(hit_ids) > 1:
-        raise CrossIndexRefusal(
-            "enrollment evidence resolves different exemplars across indexes: "
-            + ", ".join(sorted(hit_ids))
-        )
-
-    if capture_hit is not None:
-        stored_vector = cast(list[object], capture_hit["vector"])
-        stored_media = cast(str, capture_hit["media_fingerprint"])
-        stored_episode = normalize_episode(capture_hit["episode"])
-        if stored_vector != incoming_vector or stored_media != incoming_media:
-            raise EnrollmentRefusal(
-                f"capture integrity failure for {incoming_capture}: vector or media differs"
+    plan = plan_indexed_enrollment(
+        [
+            ExemplarKey(
+                id=cast(str, item["id"]),
+                capture_id=cast(str, item["capture_id"]),
+                media_fingerprint=cast(str, item["media_fingerprint"]),
+                episode=normalize_episode(item["episode"]),
+                vector=cast(list[int | float], item["vector"]),
+                added=cast(str, item["added"]),
             )
-        if stored_episode != incoming_episode:
-            raise EnrollmentRefusal(
-                f"capture {incoming_capture} is already enrolled as {stored_episode!r}"
-            )
+            for item in exemplars
+        ],
+        capture_id=incoming_capture,
+        media_fingerprint=incoming_media,
+        episode=incoming_episode,
+        vector=incoming_vector,
+        replace_episode=replace_episode,
+    )
+    if plan.outcome == "noop":
+        assert plan.target is not None
         return EnrollmentResult(
             store=result_store,
             outcome="noop",
             identity_id=identity_id,
-            exemplar_id=cast(str, capture_hit["id"]),
+            exemplar_id=cast(str, exemplars[plan.target]["id"]),
         )
-
-    replacement: dict[str, object] | None = None
-    if media_hit is not None:
-        stored_episode = normalize_episode(media_hit["episode"])
-        if stored_episode != incoming_episode:
-            raise EnrollmentRefusal(
-                f"same source media is already enrolled as {stored_episode!r}"
-            )
-        if not replace_episode:
-            raise EnrollmentRefusal(
-                f"source media for {incoming_episode!r} is already enrolled; "
-                "use --replace-episode"
-            )
-        replacement = media_hit
-    elif episode_hit is not None:
-        if not replace_episode:
-            old_capture = cast(str, episode_hit["capture_id"])
-            raise EnrollmentRefusal(
-                f"episode {incoming_episode!r} already has capture {old_capture}; "
-                "use --replace-episode"
-            )
-        replacement = episode_hit
+    replacement = exemplars[plan.target] if plan.target is not None else None
 
     used_exemplar_ids = _active_exemplar_ids(identities)
     new_exemplar_id = _mint_unique_id(
@@ -519,12 +602,10 @@ def enroll_exemplar(
     evicted_id: str | None = None
 
     if replacement is not None:
+        assert plan.target is not None
         old_id = cast(str, replacement["id"])
         old_capture = cast(str, replacement["capture_id"])
-        replace_index = next(
-            index for index, exemplar in enumerate(exemplars) if exemplar is replacement
-        )
-        exemplars[replace_index] = new_exemplar
+        exemplars[plan.target] = new_exemplar
         _append_log(
             log,
             {
@@ -540,12 +621,8 @@ def enroll_exemplar(
         )
         outcome: Literal["enroll", "replace"] = "replace"
     else:
-        if len(exemplars) >= MAX_EXEMPLARS:
-            oldest = min(
-                exemplars,
-                key=lambda item: (cast(str, item["added"]), cast(str, item["id"])),
-            )
-            exemplars.remove(oldest)
+        if plan.evict is not None:
+            oldest = exemplars.pop(plan.evict)
             evicted_id = cast(str, oldest["id"])
             _append_log(
                 log,
@@ -585,6 +662,8 @@ __all__ = [
     "CrossIndexRefusal",
     "EnrollmentRefusal",
     "EnrollmentResult",
+    "ExemplarKey",
+    "IndexedPlan",
     "MAX_ALIASES",
     "MAX_EPISODE_BYTES",
     "MAX_EXEMPLARS",
@@ -602,6 +681,7 @@ __all__ = [
     "normalize_episode",
     "normalize_show",
     "normalize_speaker_key",
+    "plan_indexed_enrollment",
     "resolve_identity_id",
     "shared_store_lock",
     "store_lock",
