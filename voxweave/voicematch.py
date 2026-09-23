@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, TypeAlias, cast
 
@@ -35,7 +35,6 @@ from voxweave.voicebase import (
 from voxweave.voiceembed import ALIASES, AUTO, LANE_DECOUPLED, spec_by_name
 from voxweave.voicestore import (
     MAX_NAME_BYTES,
-    ValidatedVoiceStore,
     validate_voice_store,
     voice_store_digest,
 )
@@ -43,12 +42,21 @@ from voxweave.voicestore import (
 ENV_ACCEPT = "VOXWEAVE_VOICES_ACCEPT"
 ENV_SUGGEST = "VOXWEAVE_VOICES_SUGGEST"
 ENV_MARGIN = "VOXWEAVE_VOICES_MARGIN"
+ENV_GLOBAL_SUGGEST = "VOXWEAVE_VOICES_GLOBAL_SUGGEST"
 
 DEFAULT_ACCEPT = "off"
 # Defaults of the legacy pyannote lane; decoupled embedders carry their own
 # (voiceembed registry, see threshold_defaults).
 DEFAULT_SUGGEST = 0.45
 DEFAULT_MARGIN = 0.05
+# Tier 2 of the global voice library: identities enrolled under other scopes
+# (other shows, other folders) are suggested only above a stricter bar.
+# Open-set false suggestions grow with library size: if one impostor identity
+# clears the bar with probability FAR, a library holding N impostors yields at
+# least one false suggestion with probability 1 - (1 - FAR)^N (a FAR of 0.1%
+# over 1000 identities is already 63%). Tier 1 (the episode's own scope) stays
+# small, so it keeps the plain suggest threshold.
+DEFAULT_GLOBAL_SUGGEST = 0.60  # provisional: calibrate
 MAX_CANDIDATES = 5
 
 Decision = Literal["prefill", "suggest", "collision", "none"]
@@ -103,14 +111,19 @@ class MatchCandidate:
     display_name: str
     similarity: float
     exemplar_id: str
+    # Library scopes the identity was enrolled under; None for a per-show store.
+    scopes: tuple[str, ...] | None = None
 
     def as_mapping(self) -> dict[str, object]:
-        return {
+        mapping: dict[str, object] = {
             "identity": self.identity_id,
             "display_name": self.display_name,
             "similarity": self.similarity,
             "exemplar": self.exemplar_id,
         }
+        if self.scopes is not None:
+            mapping["scopes"] = list(self.scopes)
+        return mapping
 
 
 @dataclass(frozen=True)
@@ -120,13 +133,19 @@ class SpeakerMatch:
     decision: Decision
     top_identity_id: str | None
     top_similarity: float | None
+    # Tier 2 of a library match (other scopes, stricter bar, never prefilled);
+    # None for a per-show store, which has a single tier.
+    secondary: SpeakerMatch | None = None
 
     def as_mapping(self) -> dict[str, object]:
-        return {
+        mapping: dict[str, object] = {
             "candidates": [candidate.as_mapping() for candidate in self.candidates],
             "truncated": self.truncated,
             "decision": self.decision,
         }
+        if self.secondary is not None:
+            mapping["secondary"] = self.secondary.as_mapping()
+        return mapping
 
 
 def _finite_float(raw: object, field: str) -> float:
@@ -173,6 +192,38 @@ def threshold_defaults(
         if spec is not None:
             return spec.suggest, spec.margin
     return DEFAULT_SUGGEST, DEFAULT_MARGIN
+
+
+def global_suggest_default(provenance: Mapping[str, object] | None = None) -> float:
+    """Built-in tier-2 (other scopes) suggest bar for ``provenance``'s space."""
+    if provenance is not None and provenance.get("embedding_lane") == LANE_DECOUPLED:
+        spec = spec_by_name(provenance.get("embedding_model"))
+        if spec is not None:
+            return spec.global_suggest
+    return DEFAULT_GLOBAL_SUGGEST
+
+
+def parse_global_suggest(
+    env: Mapping[str, str] | None = None,
+    *,
+    provenance: Mapping[str, object] | None = None,
+    suggest: float,
+) -> float:
+    """Resolve the tier-2 suggest bar: ``VOXWEAVE_VOICES_GLOBAL_SUGGEST`` or the
+    embedding space's default.
+
+    Tier 2 is never looser than tier 1: the result is at least ``suggest``, so
+    lowering only ``VOXWEAVE_VOICES_SUGGEST`` cannot widen cross-scope matching.
+    """
+    values = os.environ if env is None else env
+    raw = values.get(ENV_GLOBAL_SUGGEST)
+    if raw is None or not raw.strip():
+        value = global_suggest_default(provenance)
+    else:
+        value = _finite_float(raw, ENV_GLOBAL_SUGGEST)
+    if not -1.0 <= value <= 1.0:
+        raise ThresholdError(f"{ENV_GLOBAL_SUGGEST} must be between -1 and 1")
+    return max(value, _finite_float(suggest, ENV_SUGGEST))
 
 
 def parse_thresholds(
@@ -676,11 +727,17 @@ def describe_compatibility_mismatch(
 
 def _best_identity_candidates(
     centroid: tuple[int | float, ...],
-    store: ValidatedVoiceStore,
+    identities: Mapping[str, object],
+    scopes: Mapping[str, tuple[str, ...]] | None = None,
 ) -> list[MatchCandidate]:
+    """Score every identity by its best exemplar, in deterministic order.
+
+    ``identities`` maps ids to ``{"display_name", "exemplars": [{"id",
+    "vector"}]}``: the per-show store's identities or one library tier.
+    """
     scores: list[MatchCandidate] = []
     centroid_floats = tuple(float(value) for value in centroid)
-    for identity_id, raw_identity in store.identities.items():
+    for identity_id, raw_identity in identities.items():
         identity = cast(Mapping[str, object], raw_identity)
         display_name = cast(str, identity["display_name"])
         exemplars = cast(list[Mapping[str, object]], identity["exemplars"])
@@ -706,44 +763,54 @@ def _best_identity_candidates(
                     display_name=display_name,
                     similarity=best[0],
                     exemplar_id=best[1],
+                    scopes=None if scopes is None else scopes.get(identity_id, ()),
                 )
             )
     return sorted(scores, key=lambda item: (-item.similarity, item.identity_id))
 
 
-def match_speakers(
-    centroids: Mapping[str, object],
-    store: Mapping[str, object],
-    thresholds: MatchThresholds,
-) -> dict[str, SpeakerMatch]:
-    """Apply max-dot scoring, deterministic order, margin, and collision law."""
-    validated_store = validate_voice_store(store)
-    resolved_thresholds = validate_thresholds(thresholds)
+def _validated_centroids(
+    centroids: Mapping[str, object], embedding_dim: int
+) -> dict[str, tuple[int | float, ...]]:
     if len(centroids) > 64:
         raise Phase2DataError("centroids may contain at most 64 speakers")
-    provisional: dict[str, SpeakerMatch] = {}
-    eligible_top_owners: dict[str, list[str]] = {}
-
+    validated: dict[str, tuple[int | float, ...]] = {}
     for local_id in sorted(centroids):
         require_string(
             local_id,
             "local speaker id",
             max_bytes=MAX_SIDECAR_LABEL_BYTES,
         )
-        centroid = validate_vector(
+        validated[local_id] = validate_vector(
             centroids[local_id],
-            dim=validated_store.embedding_dim,
+            dim=embedding_dim,
             field=f"centroids.{local_id}",
         )
-        all_scores = _best_identity_candidates(centroid, validated_store)
+    return validated
+
+
+def _match_pool(
+    centroids: Mapping[str, tuple[int | float, ...]],
+    identities: Mapping[str, object],
+    *,
+    suggest: float,
+    margin: float,
+    accept: float | None,
+    scopes: Mapping[str, tuple[str, ...]] | None = None,
+) -> dict[str, SpeakerMatch]:
+    """Max-dot scoring, deterministic order, margin, and collision law for
+    one pool of identities (validated centroids and identities)."""
+    provisional: dict[str, SpeakerMatch] = {}
+    eligible_top_owners: dict[str, list[str]] = {}
+
+    for local_id in sorted(centroids):
+        all_scores = _best_identity_candidates(centroids[local_id], identities, scopes)
         qualifying = [
-            candidate
-            for candidate in all_scores
-            if candidate.similarity >= resolved_thresholds.suggest
+            candidate for candidate in all_scores if candidate.similarity >= suggest
         ]
         kept = tuple(qualifying[:MAX_CANDIDATES])
         truncated = max(0, len(qualifying) - len(kept))
-        if not all_scores or all_scores[0].similarity < resolved_thresholds.suggest:
+        if not all_scores or all_scores[0].similarity < suggest:
             decision: Decision = "none"
             top_id: str | None = None
             top_similarity: float | None = None
@@ -753,13 +820,9 @@ def match_speakers(
             top_similarity = top.similarity
             eligible_top_owners.setdefault(top_id, []).append(local_id)
             margin_ok = len(all_scores) == 1 or (
-                top.similarity - all_scores[1].similarity >= resolved_thresholds.margin
+                top.similarity - all_scores[1].similarity >= margin
             )
-            if (
-                resolved_thresholds.accept is not None
-                and top.similarity >= resolved_thresholds.accept
-                and margin_ok
-            ):
+            if accept is not None and top.similarity >= accept and margin_ok:
                 decision = "prefill"
             else:
                 decision = "suggest"
@@ -778,15 +841,73 @@ def match_speakers(
         for local_id in owners
     }
     for local_id in collisions:
-        match = provisional[local_id]
-        provisional[local_id] = SpeakerMatch(
-            candidates=match.candidates,
-            truncated=match.truncated,
-            decision="collision",
-            top_identity_id=match.top_identity_id,
-            top_similarity=match.top_similarity,
-        )
+        provisional[local_id] = replace(provisional[local_id], decision="collision")
     return provisional
+
+
+def match_speakers(
+    centroids: Mapping[str, object],
+    store: Mapping[str, object],
+    thresholds: MatchThresholds,
+) -> dict[str, SpeakerMatch]:
+    """Apply max-dot scoring, deterministic order, margin, and collision law."""
+    validated_store = validate_voice_store(store)
+    resolved_thresholds = validate_thresholds(thresholds)
+    validated = _validated_centroids(centroids, validated_store.embedding_dim)
+    return _match_pool(
+        validated,
+        validated_store.identities,
+        suggest=resolved_thresholds.suggest,
+        margin=resolved_thresholds.margin,
+        accept=resolved_thresholds.accept,
+    )
+
+
+def match_tiers(
+    centroids: Mapping[str, object],
+    *,
+    in_scope: Mapping[str, object],
+    other_scopes: Mapping[str, object],
+    scopes: Mapping[str, tuple[str, ...]],
+    embedding_dim: int,
+    thresholds: MatchThresholds,
+    global_suggest: float,
+) -> dict[str, SpeakerMatch]:
+    """Two-tier suggest-only matching against a voice library.
+
+    Tier 1 (``in_scope``: identities enrolled under the episode's scope) keeps
+    the plain thresholds, including an operator's accept/prefill. Tier 2
+    (``other_scopes``) uses the stricter ``global_suggest`` bar, is never
+    prefilled, and carries each identity's scopes so the review page can say
+    where the voice was heard. Collision law applies within each tier only.
+    Both pools must already be validated library identities of one embedding
+    space with ``embedding_dim``-long vectors.
+    """
+    resolved = validate_thresholds(thresholds)
+    bar = _finite_float(global_suggest, ENV_GLOBAL_SUGGEST)
+    if not resolved.suggest <= bar <= 1.0:
+        raise ThresholdError("thresholds must satisfy suggest <= global suggest <= 1")
+    validated = _validated_centroids(centroids, embedding_dim)
+    primary = _match_pool(
+        validated,
+        in_scope,
+        suggest=resolved.suggest,
+        margin=resolved.margin,
+        accept=resolved.accept,
+        scopes=scopes,
+    )
+    secondary = _match_pool(
+        validated,
+        other_scopes,
+        suggest=bar,
+        margin=resolved.margin,
+        accept=None,
+        scopes=scopes,
+    )
+    return {
+        local_id: replace(primary[local_id], secondary=secondary[local_id])
+        for local_id in primary
+    }
 
 
 def _validate_record_thresholds(value: object) -> None:
@@ -796,7 +917,7 @@ def _validate_record_thresholds(value: object) -> None:
         accept = None
     else:
         accept = _exact_record_float(raw_accept, "thresholds.accept")
-    validate_thresholds(
+    resolved = validate_thresholds(
         MatchThresholds(
             accept=accept,
             suggest=_exact_record_float(
@@ -805,6 +926,14 @@ def _validate_record_thresholds(value: object) -> None:
             margin=_exact_record_float(thresholds.get("margin"), "thresholds.margin"),
         )
     )
+    if "global_suggest" in thresholds:
+        bar = _exact_record_float(
+            thresholds.get("global_suggest"), "thresholds.global_suggest"
+        )
+        if not resolved.suggest <= bar <= 1.0:
+            raise Phase2DataError(
+                "thresholds.global_suggest must lie between suggest and 1"
+            )
 
 
 def _exact_record_float(raw: object, field: str) -> float:
@@ -819,8 +948,65 @@ def _exact_record_float(raw: object, field: str) -> float:
     return value
 
 
+_TIER_ONE_DECISIONS = frozenset({"prefill", "suggest", "collision", "none"})
+# Tier 2 is suggest-only by construction: it is never prefilled.
+_TIER_TWO_DECISIONS = frozenset({"suggest", "collision", "none"})
+MAX_RECORD_SCOPES = 256
+
+
+def _validate_record_match(
+    match: Mapping[str, object], field: str, *, decisions: frozenset[str]
+) -> None:
+    candidates = match.get("candidates")
+    if not isinstance(candidates, list):
+        raise Phase2DataError(f"{field}.candidates must be an array")
+    if len(candidates) > MAX_CANDIDATES:
+        raise Phase2DataError(
+            f"{field}.candidates may contain at most {MAX_CANDIDATES}"
+        )
+    ordering: list[tuple[float, str]] = []
+    for index, raw_candidate in enumerate(candidates):
+        candidate_field = f"{field}.candidates[{index}]"
+        candidate = require_mapping(raw_candidate, candidate_field)
+        identity_id = require_identity_id(
+            candidate.get("identity"), f"{candidate_field}.identity"
+        )
+        require_string(
+            candidate.get("display_name"),
+            f"{candidate_field}.display_name",
+            max_bytes=MAX_NAME_BYTES,
+        )
+        similarity = _exact_record_float(
+            candidate.get("similarity"), f"{candidate_field}.similarity"
+        )
+        require_exemplar_id(candidate.get("exemplar"), f"{candidate_field}.exemplar")
+        if "scopes" in candidate:
+            scopes = candidate.get("scopes")
+            if not isinstance(scopes, list) or len(scopes) > MAX_RECORD_SCOPES:
+                raise Phase2DataError(
+                    f"{candidate_field}.scopes must be an array of at most "
+                    f"{MAX_RECORD_SCOPES} names"
+                )
+            for position, scope in enumerate(scopes):
+                require_string(
+                    scope,
+                    f"{candidate_field}.scopes[{position}]",
+                    max_bytes=MAX_NAME_BYTES,
+                )
+        ordering.append((-similarity, identity_id))
+    if ordering != sorted(ordering):
+        raise Phase2DataError(f"{field}.candidates are not deterministically ordered")
+    require_exact_int(match.get("truncated"), f"{field}.truncated", minimum=0)
+    if match.get("decision") not in decisions:
+        raise Phase2DataError(f"{field}.decision is invalid")
+
+
 def validate_suggest_record(value: object) -> None:
-    """Validate a reproducible v1 suggestion record and its stable ordering."""
+    """Validate a reproducible v1 suggestion record and its stable ordering.
+
+    A voice-library record additionally carries each speaker's tier-2
+    ``secondary`` match, candidate ``scopes`` and ``thresholds.global_suggest``.
+    """
     root = require_mapping(value, "suggest record")
     require_version_one(root.get("version"))
     require_utc_timestamp(root.get("generated"), "generated")
@@ -839,47 +1025,49 @@ def validate_suggest_record(value: object) -> None:
         raise Phase2DataError("suggest record may contain at most 64 speakers")
     for local_id, raw_match in speakers.items():
         require_string(local_id, "local speaker id", max_bytes=MAX_SIDECAR_LABEL_BYTES)
-        match = require_mapping(raw_match, f"speakers.{local_id}")
-        candidates = match.get("candidates")
-        if not isinstance(candidates, list):
-            raise Phase2DataError(f"speakers.{local_id}.candidates must be an array")
-        if len(candidates) > MAX_CANDIDATES:
-            raise Phase2DataError(
-                f"speakers.{local_id}.candidates may contain at most {MAX_CANDIDATES}"
+        field = f"speakers.{local_id}"
+        match = require_mapping(raw_match, field)
+        _validate_record_match(match, field, decisions=_TIER_ONE_DECISIONS)
+        if "secondary" in match:
+            secondary = require_mapping(match.get("secondary"), f"{field}.secondary")
+            if "secondary" in secondary:
+                raise Phase2DataError(f"{field}.secondary cannot nest another tier")
+            _validate_record_match(
+                secondary, f"{field}.secondary", decisions=_TIER_TWO_DECISIONS
             )
-        ordering: list[tuple[float, str]] = []
-        for index, raw_candidate in enumerate(candidates):
-            field = f"speakers.{local_id}.candidates[{index}]"
-            candidate = require_mapping(raw_candidate, field)
-            identity_id = require_identity_id(
-                candidate.get("identity"), f"{field}.identity"
-            )
-            require_string(
-                candidate.get("display_name"),
-                f"{field}.display_name",
-                max_bytes=MAX_NAME_BYTES,
-            )
-            similarity = _exact_record_float(
-                candidate.get("similarity"), f"{field}.similarity"
-            )
-            require_exemplar_id(candidate.get("exemplar"), f"{field}.exemplar")
-            ordering.append((-similarity, identity_id))
-        if ordering != sorted(ordering):
-            raise Phase2DataError(
-                f"speakers.{local_id}.candidates are not deterministically ordered"
-            )
-        require_exact_int(
-            match.get("truncated"),
-            f"speakers.{local_id}.truncated",
-            minimum=0,
-        )
-        if match.get("decision") not in {
-            "prefill",
-            "suggest",
-            "collision",
-            "none",
-        }:
-            raise Phase2DataError(f"speakers.{local_id}.decision is invalid")
+
+
+def _suggest_record(
+    matches: Mapping[str, SpeakerMatch],
+    *,
+    capture_id: str,
+    voiceprints_content_digest: str,
+    compatibility: CompatibilityResult | str,
+    thresholds: Mapping[str, object],
+    voices: Mapping[str, object],
+    generated: str | None,
+) -> dict[str, object]:
+    if isinstance(compatibility, str):
+        compatibility_hash = require_sha256(compatibility, "compatibility fingerprint")
+    else:
+        compatibility_hash = require_known_compatibility(compatibility)
+    record: dict[str, object] = {
+        "version": 1,
+        "generated": generated or utc_timestamp(),
+        "capture_id": require_capture_id(capture_id),
+        "voiceprints_digest": require_sha256(
+            voiceprints_content_digest,
+            "voiceprints_digest",
+        ),
+        "voices": dict(voices),
+        "compat_fingerprint": compatibility_hash,
+        "thresholds": dict(thresholds),
+        "speakers": {
+            local_id: matches[local_id].as_mapping() for local_id in sorted(matches)
+        },
+    }
+    validate_suggest_record(record)
+    return record
 
 
 def build_suggest_record(
@@ -896,19 +1084,13 @@ def build_suggest_record(
     """Build the full provenance record for one reproducible match run."""
     validated_store = validate_voice_store(store)
     resolved_thresholds = validate_thresholds(thresholds)
-    if isinstance(compatibility, str):
-        compatibility_hash = require_sha256(compatibility, "compatibility fingerprint")
-    else:
-        compatibility_hash = require_known_compatibility(compatibility)
-    record: dict[str, object] = {
-        "version": 1,
-        "generated": generated or utc_timestamp(),
-        "capture_id": require_capture_id(capture_id),
-        "voiceprints_digest": require_sha256(
-            voiceprints_content_digest,
-            "voiceprints_digest",
-        ),
-        "voices": {
+    return _suggest_record(
+        matches,
+        capture_id=capture_id,
+        voiceprints_content_digest=voiceprints_content_digest,
+        compatibility=compatibility,
+        thresholds=resolved_thresholds.as_mapping(),
+        voices={
             "path": require_string(
                 os.fspath(store_path),
                 "voices.path",
@@ -918,14 +1100,52 @@ def build_suggest_record(
             "revision": validated_store.revision,
             "content_digest": voice_store_digest(store),
         },
-        "compat_fingerprint": compatibility_hash,
-        "thresholds": resolved_thresholds.as_mapping(),
-        "speakers": {
-            local_id: matches[local_id].as_mapping() for local_id in sorted(matches)
+        generated=generated,
+    )
+
+
+def build_library_suggest_record(
+    matches: Mapping[str, SpeakerMatch],
+    *,
+    capture_id: str,
+    voiceprints_content_digest: str,
+    compatibility: CompatibilityResult | str,
+    thresholds: MatchThresholds,
+    global_suggest: float,
+    library_path: Path,
+    scope: str,
+    revision: int,
+    content_digest: str,
+    generated: str | None = None,
+) -> dict[str, object]:
+    """Build the record of one two-tier match run against a voice library.
+
+    ``voices.show`` holds the episode's scope, ``revision`` the embedding
+    space's revision and ``content_digest`` the digest of every library input
+    the match read, so the record stays reproducible like a per-show one.
+    """
+    resolved_thresholds = validate_thresholds(thresholds)
+    return _suggest_record(
+        matches,
+        capture_id=capture_id,
+        voiceprints_content_digest=voiceprints_content_digest,
+        compatibility=compatibility,
+        thresholds={
+            **resolved_thresholds.as_mapping(),
+            "global_suggest": _finite_float(global_suggest, ENV_GLOBAL_SUGGEST),
         },
-    }
-    validate_suggest_record(record)
-    return record
+        voices={
+            "path": require_string(
+                os.fspath(library_path),
+                "voices.path",
+                max_bytes=4096,
+            ),
+            "show": require_string(scope, "voices.show", max_bytes=MAX_NAME_BYTES),
+            "revision": require_exact_int(revision, "voices.revision", minimum=0),
+            "content_digest": require_sha256(content_digest, "voices.content_digest"),
+        },
+        generated=generated,
+    )
 
 
 def suggest_bytes(value: Mapping[str, object]) -> bytes:
@@ -955,9 +1175,11 @@ __all__ = [
     "CompatibilityUnknown",
     "DECOUPLED_FIELDS",
     "DEFAULT_ACCEPT",
+    "DEFAULT_GLOBAL_SUGGEST",
     "DEFAULT_MARGIN",
     "DEFAULT_SUGGEST",
     "ENV_ACCEPT",
+    "ENV_GLOBAL_SUGGEST",
     "ENV_MARGIN",
     "ENV_SUGGEST",
     "LEGACY_DIARIZE_HINT",
@@ -968,15 +1190,19 @@ __all__ = [
     "SpeakerMatch",
     "ThresholdError",
     "build_compatibility_fingerprint",
+    "build_library_suggest_record",
     "build_suggest_record",
     "compatibility_equal",
     "delete_suggest",
     "describe_compatibility_mismatch",
     "embedding_space_label",
     "embedding_space_recovery_hint",
+    "global_suggest_default",
     "legacy_diarize_recovery_hint",
     "load_suggest",
     "match_speakers",
+    "match_tiers",
+    "parse_global_suggest",
     "parse_thresholds",
     "require_known_compatibility",
     "suggest_bytes",

@@ -708,3 +708,209 @@ def test_environment_thresholds_still_win_over_embedder_defaults():
 
     assert (defaults.suggest, defaults.margin) == voicematch.threshold_defaults(anime)
     assert (overridden.suggest, overridden.margin) == (0.6, 0.1)
+
+
+# --------------------------------------------------------------------------
+# Two-tier library matching
+# --------------------------------------------------------------------------
+
+
+def test_global_suggest_follows_the_space_and_is_never_looser_than_tier_one():
+    from voxweave import voiceembed
+
+    anime = _decoupled(embedding_model="anime-va-ecapa-gn")
+    assert voicematch.global_suggest_default(None) == voicematch.DEFAULT_GLOBAL_SUGGEST
+    assert voicematch.global_suggest_default(LEGACY_SEPARATED) == (
+        voicematch.DEFAULT_GLOBAL_SUGGEST
+    )
+    assert voicematch.global_suggest_default(_decoupled()) == (
+        voiceembed.REDIMNET2_B6.global_suggest
+    )
+    assert (
+        voicematch.global_suggest_default(anime) == voiceembed.ANIME_VA.global_suggest
+    )
+    assert voicematch.parse_global_suggest({}, provenance=anime, suggest=0.35) == (
+        voiceembed.ANIME_VA.global_suggest
+    )
+    env = {voicematch.ENV_GLOBAL_SUGGEST: "0.8"}
+    assert voicematch.parse_global_suggest(env, provenance=anime, suggest=0.35) == 0.8
+    # A global bar below tier 1 is raised to it rather than widening tier 2.
+    low = {voicematch.ENV_GLOBAL_SUGGEST: "0.1"}
+    assert voicematch.parse_global_suggest(low, suggest=0.45) == 0.45
+    for raw in ("nan", "1.5", "loose"):
+        with pytest.raises(voicematch.ThresholdError):
+            voicematch.parse_global_suggest(
+                {voicematch.ENV_GLOBAL_SUGGEST: raw}, suggest=0.45
+            )
+
+
+def _pool(entries):
+    """``{identity: (name, vector)}`` -> library-tier identities."""
+    return {
+        identity_id: {
+            "display_name": name,
+            "exemplars": [{"id": f"x{index:08x}", "vector": vector}],
+        }
+        for index, (identity_id, (name, vector)) in enumerate(
+            sorted(entries.items()), start=1
+        )
+    }
+
+
+def _tiers(centroids, in_scope, other, scopes, *, accept=None, global_suggest=0.6):
+    return voicematch.match_tiers(
+        centroids,
+        in_scope=_pool(in_scope),
+        other_scopes=_pool(other),
+        scopes=scopes,
+        embedding_dim=16,
+        thresholds=_thresholds(accept=accept),
+        global_suggest=global_suggest,
+    )
+
+
+def test_tier_two_is_stricter_never_prefilled_and_carries_scopes():
+    near = [0.7, (1 - 0.7**2) ** 0.5, *([0.0] * 14)]
+    matches = _tiers(
+        {"SPEAKER_00": _unit(), "SPEAKER_01": _unit(2)},
+        {"v000000000001": ("Aqua", _unit())},
+        {
+            "v000000000002": ("Kazuma", _unit(2)),
+            # 0.70 >= 0.6: suggested, but only as a secondary candidate.
+            "v000000000003": ("Aqua VA", near),
+        },
+        {
+            "v000000000001": ("Show A",),
+            "v000000000002": ("Show B", "Show C"),
+            "v000000000003": ("Show B",),
+        },
+        accept=0.9,
+    )
+
+    first = matches["SPEAKER_00"]
+    assert first.decision == "prefill"
+    assert [c.identity_id for c in first.candidates] == ["v000000000001"]
+    assert first.candidates[0].scopes == ("Show A",)
+    assert first.secondary is not None
+    assert first.secondary.decision == "suggest"
+    assert [c.display_name for c in first.secondary.candidates] == ["Aqua VA"]
+    assert first.secondary.candidates[0].scopes == ("Show B",)
+
+    second = matches["SPEAKER_01"]
+    assert second.decision == "none"
+    assert second.secondary is not None
+    # A perfect cross-scope hit still only suggests: prefill is tier 1 only.
+    assert second.secondary.decision == "suggest"
+    assert second.secondary.candidates[0].scopes == ("Show B", "Show C")
+
+
+def test_collision_is_decided_within_each_tier():
+    # Equidistant from both speakers: cosine 0.707 with each.
+    shared = [0.5**0.5, 0.5**0.5, *([0.0] * 14)]
+    matches = _tiers(
+        {"SPEAKER_A": _unit(), "SPEAKER_B": _unit(1)},
+        {"v000000000001": ("A", _unit()), "v000000000002": ("B", _unit(1))},
+        {"v000000000009": ("Everyone", shared)},
+        {},
+    )
+    for local_id in ("SPEAKER_A", "SPEAKER_B"):
+        match = matches[local_id]
+        # Tier 1 tops differ, so tier 1 never collides...
+        assert match.decision == "suggest"
+        # ...while both speakers share the same tier-2 top identity.
+        assert match.secondary is not None
+        assert match.secondary.decision == "collision"
+
+
+def _at_similarity(similarity, rng):
+    """A 16-d unit vector whose dot with e0 is exactly ``similarity``."""
+    tail = [rng.gauss(0.0, 1.0) for _ in range(15)]
+    norm = sum(value * value for value in tail) ** 0.5
+    scale = (1.0 - similarity * similarity) ** 0.5 / norm
+    return [similarity, *(value * scale for value in tail)]
+
+
+def test_large_library_impostors_do_not_reach_the_secondary_suggestions():
+    import random
+
+    rng = random.Random(20260923)
+    impostors = {
+        f"v{index:012x}": (f"Impostor {index}", _at_similarity(sim, rng))
+        for index, sim in enumerate(
+            (0.30 + 0.29 * rng.random() for _ in range(2000)), start=1
+        )
+    }
+    true_id = "v0000000fffff"
+    other = {**impostors, true_id: ("Same VA", _at_similarity(0.9, rng))}
+    tier_one_bar = _thresholds().suggest
+    passing_tier_one_bar = sum(
+        1 for _name, vector in impostors.values() if vector[0] >= tier_one_bar
+    )
+    # Hundreds of impostors would be suggested at the same-scope bar ...
+    assert passing_tier_one_bar > 100
+
+    matches = _tiers({"SPEAKER_00": _unit()}, {}, other, {}, global_suggest=0.6)
+
+    secondary = matches["SPEAKER_00"].secondary
+    assert secondary is not None
+    # ... while the stricter cross-scope bar keeps only the real voice.
+    assert [c.identity_id for c in secondary.candidates] == [true_id]
+    assert secondary.truncated == 0
+    assert matches["SPEAKER_00"].decision == "none"
+
+
+def test_tier_thresholds_must_be_ordered():
+    with pytest.raises(voicematch.ThresholdError):
+        _tiers({"S": _unit()}, {}, {}, {}, global_suggest=0.2)
+
+
+def _library_record(matches, *, global_suggest=0.6):
+    return voicematch.build_library_suggest_record(
+        matches,
+        capture_id="c" + "f" * 32,
+        voiceprints_content_digest="d" * 64,
+        compatibility="e" * 64,
+        thresholds=_thresholds(),
+        global_suggest=global_suggest,
+        library_path=voicestore.canonical_store_path("voices"),
+        scope="Show A",
+        revision=4,
+        content_digest="a" * 64,
+        generated=NOW,
+    )
+
+
+def test_library_record_round_trips_tiers_and_rejects_a_prefilled_tier_two():
+    matches = _tiers(
+        {"SPEAKER_00": _unit()},
+        {"v000000000001": ("Aqua", _unit())},
+        {"v000000000002": ("Aqua VA", _unit())},
+        {"v000000000001": ("Show A",), "v000000000002": ("Show B",)},
+    )
+    record = _library_record(matches)
+
+    speaker = record["speakers"]["SPEAKER_00"]
+    assert speaker["candidates"][0]["scopes"] == ["Show A"]
+    assert speaker["secondary"]["candidates"][0]["scopes"] == ["Show B"]
+    assert record["thresholds"]["global_suggest"] == 0.6
+    assert record["voices"]["show"] == "Show A"
+    voicematch.validate_suggest_record(record)
+
+    tampered = copy.deepcopy(record)
+    tampered["speakers"]["SPEAKER_00"]["secondary"]["decision"] = "prefill"
+    with pytest.raises(voicebase.Phase2DataError, match="secondary.decision"):
+        voicematch.validate_suggest_record(tampered)
+    tampered = copy.deepcopy(record)
+    tampered["thresholds"]["global_suggest"] = 0.1
+    with pytest.raises(voicebase.Phase2DataError, match="global_suggest"):
+        voicematch.validate_suggest_record(tampered)
+
+
+def test_per_show_records_keep_their_single_tier_shape():
+    record = _record()
+    assert "secondary" not in record["speakers"]["SPEAKER_00"]
+    assert "global_suggest" not in record["thresholds"]
+    assert all(
+        "scopes" not in candidate
+        for candidate in record["speakers"]["SPEAKER_00"]["candidates"]
+    )

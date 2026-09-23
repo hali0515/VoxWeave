@@ -88,9 +88,12 @@ class EmbedderSpec:
 
     ``name`` is the stable id recorded as ``embedding_model`` in voiceprint
     provenance; together with ``sha256`` it defines an embedding space.
-    ``suggest``/``margin`` are the matching defaults for that space. ``size``
-    is the pinned checkpoint's exact byte count: a file of any other size is
-    refused before a single byte of it is read.
+    ``suggest``/``margin`` are the matching defaults for that space;
+    ``global_suggest`` is the stricter bar for voices enrolled under another
+    scope of the global voice library (see voicematch.DEFAULT_GLOBAL_SUGGEST
+    for why it must be stricter). ``size`` is the pinned checkpoint's exact
+    byte count: a file of any other size is refused before a single byte of it
+    is read.
     """
 
     name: str
@@ -100,6 +103,7 @@ class EmbedderSpec:
     min_seconds: float
     suggest: float
     margin: float
+    global_suggest: float
     sha256: str
     size: int
     filename: str
@@ -150,6 +154,7 @@ REDIMNET2_B6 = EmbedderSpec(
     min_seconds=1.0,
     suggest=0.45,  # provisional: calibrate with scripts/calibrate_voiceprints.py
     margin=0.05,  # provisional: calibrate with scripts/calibrate_voiceprints.py
+    global_suggest=0.60,  # provisional: calibrate
     sha256="287365f6f485b19e65e5176554f8f7123bfa8d85185f3d2c040eab51acec9868",
     size=51_152_991,
     filename="b6-vb2+vox2+cnc2_v0-lm.pt",
@@ -174,6 +179,7 @@ ANIME_VA = EmbedderSpec(
     # models', hence the lower bar.
     suggest=0.35,  # provisional: calibrate with scripts/calibrate_voiceprints.py
     margin=0.05,  # provisional: calibrate with scripts/calibrate_voiceprints.py
+    global_suggest=0.50,  # provisional: calibrate
     sha256="41d5ad6b5c758a03e46ab53388f42394f40bf115aa9d9df25d4adff6e21072ef",
     size=83_136_305,
     filename="embedding_model.pth",

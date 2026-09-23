@@ -209,6 +209,8 @@ def test_registry_pins_both_checkpoints():
         assert spec.embedding_dim == 192
         assert 0.0 < spec.suggest < 1.0
         assert spec.margin >= 0.0
+        # The cross-scope bar is stricter than the same-scope one.
+        assert spec.suggest < spec.global_suggest < 1.0
 
 
 def test_import_touches_neither_torch_nor_the_network():
@@ -596,6 +598,7 @@ def _spec_for(payload: bytes, **changes) -> voiceembed.EmbedderSpec:
         "min_seconds": 1.0,
         "suggest": 0.5,
         "margin": 0.05,
+        "global_suggest": 0.65,
         "sha256": hashlib.sha256(payload).hexdigest(),
         "size": len(payload),
         "filename": "test.pt",
