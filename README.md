@@ -172,7 +172,9 @@ for users who have accepted only the existing 3.1 gate.
 **Voiceprint embedders.** With `--voiceprints`, pyannote still finds the speaker turns, but the
 per-speaker voiceprints (cross-episode matching and **Split this speaker**) come from a
 dedicated speaker-embedding model chosen per language. Each checkpoint is downloaded once into
-`~/.cache/voxweave/audio/`, pinned by SHA-256, and verified before it is loaded:
+`~/.cache/voxweave/audio/`, pinned by size and SHA-256, and verified at the start of a
+`--voiceprints` run, before any audio work (with `auto` and no `--lang`, both checkpoints). If
+that fails, the run warns and continues without voiceprints:
 
 | `--voiceprint-model` | Checkpoint | Languages | Dim | Weights licence / caveats |
 | -------------------- | ---------- | --------- | --- | ------------------------- |
@@ -315,7 +317,7 @@ routed to an in-place editing command. See the [migration notes](MIGRATING.md) f
 | `--diarize`                    | Opt in to the default-installed pyannote speaker diarizer: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). The gated checkpoint requires `VOXWEAVE_HF_TOKEN`, `HF_TOKEN`, config `hf_token`, or a prior `hf auth login`. Speaker turns persist to the sibling JSON, so `voxweave render` replays the formatting without re-running the model. |
 | `--diarize-model`              | Select `community-1` (the default), `3.1`, or any full Hugging Face pipeline id. The same setting is available as `VOXWEAVE_DIARIZE_MODEL` or `[diarize].model`; precedence is CLI > env > config > default. |
 | `--voiceprints/--no-voiceprints` | Opt in to a voice-biometric centroid sidecar for reviewed cross-episode speaker suggestions. Requires a fresh `--diarize` run and is off by default. Precedence: CLI, `VOXWEAVE_VOICEPRINTS`, `[defaults].voiceprints`, then off. |
-| `--voiceprint-model`           | Speaker-embedding model for `--voiceprints`: `auto` (default: `anime-va` for Japanese, `redimnet2` otherwise), `redimnet2`, `anime-va`, or `pyannote` (legacy: the diarization pipeline's own embeddings, which matches pre-existing voice stores). Precedence: CLI, `VOXWEAVE_VOICEPRINT_MODEL`, `[voiceprint].model`, then `auto`; an unknown value is an error. See [Setup](#setup) for the models and their licences. |
+| `--voiceprint-model`           | Speaker-embedding model for `--voiceprints`: `auto` (default: `anime-va` for Japanese, `redimnet2` otherwise), `redimnet2`, `anime-va`, or `pyannote` (legacy: the diarization pipeline's own embeddings, which matches pre-existing voice stores). Precedence: CLI, `VOXWEAVE_VOICEPRINT_MODEL`, `[voiceprint].model`, then `auto`; an unknown value is an error, and the CLI value is validated (with a no-effect warning) even when voiceprints are off. See [Setup](#setup) for the models and their licences. |
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
 | `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
 | `--vad-mask/--no-vad-mask`     | Suppress CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                    |
@@ -709,7 +711,10 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
 - `VOXWEAVE_REDIMNET2_CKPT` / `VOXWEAVE_ANIME_VA_CKPT` — an explicit local copy of the
   `redimnet2` / `anime-va` voiceprint checkpoint (offline hosts). Unlike the overrides above,
   the file must still be the pinned checkpoint: its SHA-256 is verified, because the
-  checkpoint defines the voice-store embedding space
+  checkpoint defines the voice-store embedding space. For `anime-va` this variable is the
+  offline route: its cache entry uses the Hugging Face hub layout, so a file copied into
+  `~/.cache/voxweave/audio/` is not picked up (`redimnet2` also accepts a copy at
+  `~/.cache/voxweave/audio/redimnet2/b6-vb2+vox2+cnc2_v0-lm.pt`)
 
 **Tuning**
 

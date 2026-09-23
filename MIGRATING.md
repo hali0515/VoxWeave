@@ -20,9 +20,19 @@ speaker-embedding model chosen per language (`--voiceprint-model` /
 - `anime-va`: anime voice-actor ECAPA-TDNN (Japanese only);
 - `pyannote`: the previous behavior.
 
-The first run downloads the selected checkpoint (51 MB or 83 MB) into
-`~/.cache/voxweave/audio/` and verifies its SHA-256. For an offline host, copy the file
-there or point `VOXWEAVE_REDIMNET2_CKPT` / `VOXWEAVE_ANIME_VA_CKPT` at it.
+A `--voiceprints` run fetches the checkpoint it may need (51 MB for `redimnet2`, 83 MB
+for `anime-va`; with `auto` and no `--lang`, both) into `~/.cache/voxweave/audio/` and
+verifies its SHA-256 before any audio work. If that fails (no network, a stalled
+download), the run warns and continues without voiceprints; the subtitles are written as
+usual. For an offline host:
+
+- `redimnet2`: copy `b6-vb2+vox2+cnc2_v0-lm.pt` into `~/.cache/voxweave/audio/redimnet2/`,
+  or point `VOXWEAVE_REDIMNET2_CKPT` at the file;
+- `anime-va`: point `VOXWEAVE_ANIME_VA_CKPT` at `embedding_model.pth`. Its cache entry
+  uses the Hugging Face hub layout (`models--litagin--.../snapshots/<revision>/`), so a
+  file copied into `~/.cache/voxweave/audio/` is not found.
+
+Either way the file must be the pinned checkpoint; its size and SHA-256 are verified.
 
 **Existing voiceprints and voice stores do not match new captures.** A voice store is
 tied to one embedding space, and the new embedders define new ones. Nothing is rewritten
