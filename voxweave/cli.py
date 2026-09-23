@@ -216,6 +216,7 @@ def _resolve_llm(
                         "--diarize",
                         "--diarize-model",
                         "--voiceprints",
+                        "--voiceprint-model",
                         "--min-speakers",
                         "--max-speakers",
                     ],
@@ -339,6 +340,18 @@ def cli(ctx, verbose: bool) -> None:
     ),
 )
 @click.option(
+    "--voiceprint-model",
+    default=None,
+    metavar="MODEL",
+    help=(
+        "Speaker-embedding model for --voiceprints: auto (default: anime-va for "
+        "Japanese, redimnet2 otherwise), redimnet2, anime-va, or pyannote (legacy: "
+        "the diarization pipeline's own embeddings, matches pre-existing voice "
+        "stores). Precedence: CLI, VOXWEAVE_VOICEPRINT_MODEL, conf "
+        "[voiceprint].model."
+    ),
+)
+@click.option(
     "--min-speakers",
     type=int,
     default=None,
@@ -405,6 +418,7 @@ def cmd_transcribe(
     diarize: bool | None,
     diarize_model: str | None,
     voiceprints: bool | None,
+    voiceprint_model: str | None,
     min_speakers: int | None,
     max_speakers: int | None,
     context: str | None,
@@ -439,6 +453,15 @@ def cmd_transcribe(
             f"{voiceprints_source}, but diarization is off from {diarize_source}; "
             "enable --diarize or disable voiceprints"
         )
+    if voiceprints:
+        from voxweave import voiceembed
+
+        try:
+            # Validate now; the per-language routing of "auto" happens once the
+            # language is detected.
+            voiceprint_model = voiceembed.resolve_voiceprint_choice(voiceprint_model)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
     timestamps = _flag(timestamps, "timestamps", True)
     shot_snap = _flag(shot_snap, "shot_snap", True)
     out = _run(
@@ -455,6 +478,7 @@ def cmd_transcribe(
             diarize=diarize,
             diarize_model=diarize_model,
             voiceprints=voiceprints,
+            voiceprint_model=voiceprint_model,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
             asr_model="fusion" if hybrid else (model or config.conf_asr_model()),

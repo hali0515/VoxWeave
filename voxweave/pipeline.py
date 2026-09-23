@@ -194,6 +194,50 @@ class VoiceprintCapture:
     turns: list[tuple[float, float, str]]
 
 
+def _decoupled_voiceprint_capture(
+    wav: Path,
+    diarization: Any,
+    spec: Any,
+    *,
+    reporter: Reporter,
+) -> VoiceprintCapture | None:
+    """Voiceprints from a dedicated embedder over the audio pyannote heard.
+
+    ``wav`` is the exact 16 kHz mono file the diarizer was fed, so the centroids
+    describe the signal the provenance ``audio`` block records. The embedder is
+    released before returning. A failure to fetch or run it drops the capture
+    with a warning (the subtitles are the primary output); it never falls back
+    to another embedding space.
+    """
+    from voxweave import voiceembed
+
+    if not diarization.turns:
+        return None
+    reporter.stage(f"speaker voiceprints ({spec.name})")
+    try:
+        captured = voiceembed.capture_voiceprints(
+            wav,
+            diarization.turns,
+            spec,
+            diarization.provenance,
+        )
+    except (voiceembed.VoiceEmbeddingError, OSError) as exc:
+        log.warning(
+            "voiceprint capture unavailable; continuing without capture: %s", exc
+        )
+        return None
+    finally:
+        voiceembed.release()
+    if captured is None:
+        return None
+    centroids, provenance = captured
+    return VoiceprintCapture(
+        centroids=centroids,
+        provenance=provenance,
+        turns=diarization.turns,
+    )
+
+
 @dataclass(frozen=True)
 class _ProcessPublication:
     path: Path
@@ -905,6 +949,7 @@ def transcribe(
     diarize: bool = False,
     diarize_model: str | None = None,
     voiceprints: bool = False,
+    voiceprint_model: str | None = None,
     normalize: bool = False,
     reporter: Reporter | None = None,
     debug: bool = False,
@@ -934,8 +979,12 @@ def transcribe(
     through ASR/alignment like dialogue, and the detected singing spans come back so
     :func:`process` can flag lyric cues (empty unless keep_lyrics). ``diarize`` runs
     pyannote on the separated-vocals wav and returns the speaker turns (empty unless
-    set). All models run in-process (no network calls). smart_split and file writing
-    are handled by :func:`process`.
+    set). With ``voiceprints`` the per-speaker centroids come from the embedder
+    ``voiceprint_model`` resolves to for the detected language (see
+    :func:`voxweave.voiceembed.resolve_voiceprint_model`); only its ``pyannote``
+    legacy lane reads the diarization pipeline's own embeddings. All models run
+    in-process (weights are fetched once into the voxweave cache). smart_split and
+    file writing are handled by :func:`process`.
 
     ``release_panns=False`` keeps the PANNs singleton resident on return: the caller
     has a second detection pass queued (the ``--sdh`` sidecar tags the ORIGINAL mix
@@ -1327,8 +1376,16 @@ def transcribe(
         voiceprint_capture: VoiceprintCapture | None = None
         if diarize:
             from voxweave import diarize as diarize_mod
+            from voxweave import voiceembed
 
             rep.step("identify speakers")
+            voiceprint_target: (
+                voiceembed.EmbedderSpec | voiceembed.LegacyLane | None
+            ) = (
+                voiceembed.resolve_voiceprint_model(voiceprint_model, iso)
+                if voiceprints
+                else None
+            )
             rep.stage("speaker diarization (pyannote)")
             try:
                 diarization = diarize_mod.diarize_turns(
@@ -1336,7 +1393,9 @@ def transcribe(
                     model=diarize_model,
                     min_speakers=min_speakers,
                     max_speakers=max_speakers,
-                    want_embeddings=voiceprints,
+                    # Only the legacy lane reads the pipeline's own embeddings;
+                    # a dedicated embedder computes its voiceprints below.
+                    want_embeddings=voiceprint_target is voiceembed.LEGACY,
                     audio_profile={
                         "separated": separate,
                         "normalized": normalize,
@@ -1363,7 +1422,14 @@ def transcribe(
             finally:
                 diarize_mod.release()
             speaker_turns = diarization.turns
-            if voiceprints and diarization.centroids:
+            if isinstance(voiceprint_target, voiceembed.EmbedderSpec):
+                voiceprint_capture = _decoupled_voiceprint_capture(
+                    wav,
+                    diarization,
+                    voiceprint_target,
+                    reporter=rep,
+                )
+            elif voiceprint_target is voiceembed.LEGACY and diarization.centroids:
                 voiceprint_capture = VoiceprintCapture(
                     centroids=diarization.centroids,
                     provenance=diarization.provenance,
@@ -2330,6 +2396,7 @@ def process(
     min_speakers: int | None = None,
     max_speakers: int | None = None,
     diarize_model: str | None = None,
+    voiceprint_model: str | None = None,
 ) -> Path:
     """Full pipeline: transcribe -> smart_split -> write siblings. Return the .vtt path.
 
@@ -2393,6 +2460,7 @@ def process(
             diarize=diarize,
             diarize_model=diarize_model,
             voiceprints=capture_enabled,
+            voiceprint_model=voiceprint_model,
             word_segments=word_segments,
             asr_model=asr_model,
             context=context,
@@ -2405,6 +2473,11 @@ def process(
     if voiceprints and (not diarize or word_segments is not None):
         raise ValueError("voiceprint capture requires a fresh diarization run")
     if voiceprints:
+        from voxweave import voiceembed
+
+        # Fail on a bad --voiceprint-model / env / conf value before any audio
+        # work; the per-language routing itself waits for the detected language.
+        voiceembed.resolve_voiceprint_choice(voiceprint_model)
         _log_voiceprint_notice_once()
     try:
         expected_json = episode_transaction.capture_file_generation(
@@ -2489,6 +2562,7 @@ def _process_from_source(
     diarize: bool = False,
     diarize_model: str | None = None,
     voiceprints: bool = False,
+    voiceprint_model: str | None = None,
     word_segments: tuple[str, list[dict]] | None = None,
     asr_model: str | None = None,
     context: str | None = None,
@@ -2536,6 +2610,7 @@ def _process_from_source(
                 diarize=diarize,
                 diarize_model=diarize_model,
                 voiceprints=voiceprints,
+                voiceprint_model=voiceprint_model,
                 normalize=normalize,
                 reporter=reporter,
                 debug=debug,
