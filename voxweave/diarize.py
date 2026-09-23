@@ -962,15 +962,21 @@ def _provenance_value(value: object) -> object:
     return _provenance_reason(str(value))
 
 
-def _audit_counts(audit: Mapping[str, object]) -> dict[str, object]:
-    """The scalar entries of a clustering audit, strict-JSON safe.
+# Flat summary mappings of the recipe audit that provenance keeps; other nested
+# detail (per-cluster anchor seconds, ...) stays in the debug log, and the
+# params are recorded on their own.
+_AUDIT_SUMMARY_KEYS = frozenset({"counts", "seconds", "speaker_bounds"})
 
-    Nested audit detail (per-cluster anchor seconds, ...) stays in the debug
-    log; provenance keeps the counts and thresholds.
-    """
+
+def _audit_counts(audit: Mapping[str, object]) -> dict[str, object]:
+    """The scalar entries and summary counts of a clustering audit, strict-JSON safe."""
     counts: dict[str, object] = {}
     for key, value in audit.items():
-        if isinstance(value, (Mapping, list, tuple)):
+        if isinstance(value, Mapping):
+            if key in _AUDIT_SUMMARY_KEYS:
+                counts[str(key)] = _provenance_value(value)
+            continue
+        if isinstance(value, (list, tuple)):
             continue
         counts[str(key)] = _provenance_value(value)
     return counts
@@ -1019,6 +1025,20 @@ def _checked_cluster_turns(turns: object) -> list[Turn]:
     return sorted(checked, key=lambda turn: (turn[0], turn[1], turn[2]))
 
 
+def _check_speaker_bounds(
+    turns: Sequence[Turn], min_speakers: int | None, max_speakers: int | None
+) -> None:
+    """Refuse a clustering whose speaker count breaks the requested bounds."""
+    speakers = len({label for _start, _end, label in turns})
+    if (min_speakers is not None and speakers < min_speakers) or (
+        max_speakers is not None and speakers > max_speakers
+    ):
+        raise ValueError(
+            f"clustering returned {speakers} speaker(s), outside the requested "
+            f"bounds (min {min_speakers}, max {max_speakers})"
+        )
+
+
 def _voiceprint_clustering(
     turns: list[Turn],
     waveform: Any,
@@ -1031,9 +1051,11 @@ def _voiceprint_clustering(
     """Regroup raw pyannote turns by ReDimNet2 voiceprints.
 
     Returns the new turns and the provenance ``clustering`` block. Every
-    failure (checkpoint download or hash, OOM, a malformed result, ...) keeps
-    pyannote's ``turns`` and records the fallback: diarization never fails
-    because of this stage.
+    failure (checkpoint download or hash, OOM, a malformed result, speaker
+    bounds the recipe cannot meet, a recipe that passed pyannote's labels
+    through because nothing could anchor a voiceprint, ...) keeps pyannote's
+    ``turns`` and records the fallback: diarization never fails because of
+    this stage, and a pass-through is never reported as a voiceprint result.
     """
     from voxweave import speakercluster, voiceembed
 
@@ -1059,8 +1081,13 @@ def _voiceprint_clustering(
             max_speakers=max_speakers,
             params=params,
         )
-        clustered = _checked_cluster_turns(result.turns)
         audit = dict(result.audit)
+        passthrough = audit.get(speakercluster.PASSTHROUGH)
+        if passthrough:
+            # pyannote's own labels handed back: not a voiceprint clustering.
+            raise speakercluster.ClusteringError(f"recipe passthrough: {passthrough}")
+        clustered = _checked_cluster_turns(result.turns)
+        _check_speaker_bounds(clustered, min_speakers, max_speakers)
         record: dict[str, object] = {
             "method": config.DIARIZE_CLUSTERING_VOICEPRINT,
             "recipe": _provenance_value(audit.get("recipe", speakercluster.RECIPE)),

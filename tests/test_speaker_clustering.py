@@ -58,45 +58,39 @@ def _write_config(tmp_path: Path, text: str) -> None:
     (tmp_path / "voxweave.conf").write_text(text, encoding="utf-8")
 
 
+# Raw pyannote turns long enough to anchor voiceprints (every turn >= 4 s).
+LONG = [
+    (0.0, 4.0, "B"),
+    (4.5, 9.0, "A"),
+    (9.5, 14.0, "B"),
+    (14.5, 19.0, "A"),
+]
+
+
 # --------------------------------------------------------------------------
-# speakercluster placeholder contract
+# speakercluster contract as the provenance sees it
 # --------------------------------------------------------------------------
 
 
-def test_placeholder_relabels_by_first_appearance_and_unions_overlaps():
-    def never(_spans):
-        raise AssertionError("the placeholder does not embed")
+def test_recipe_params_and_audit_are_provenance_safe():
+    def same_voice(spans):
+        rows = np.zeros((len(spans), 192))
+        rows[:, 0] = 1.0
+        return rows
 
-    result = speakercluster.cluster_turns(
-        [
-            (3.0, 4.0, "X"),
-            (0.0, 2.0, "Y"),
-            (1.5, 2.5, "Y"),  # overlaps the previous Y turn -> unioned
-            (2.5, 3.0, "Y"),  # touches, does not overlap -> kept apart
-            (1.0, 1.2, "X"),
-        ],
-        never,
-        min_speakers=1,
-        max_speakers=4,
-    )
+    result = speakercluster.cluster_turns(LONG, same_voice, min_speakers=1)
 
-    assert result.turns == [
-        (0.0, 2.5, "SPEAKER_00"),
-        (1.0, 1.2, "SPEAKER_01"),
-        (2.5, 3.0, "SPEAKER_00"),
-        (3.0, 4.0, "SPEAKER_01"),
-    ]
-    assert result.audit["recipe"] == speakercluster.RECIPE
-    assert result.audit["turns_in"] == 5
-    assert result.audit["speakers"] == 2
+    assert result.turns == [(start, end, "SPEAKER_00") for start, end, _ in LONG]
+    assert result.audit["recipe"] == speakercluster.RECIPE == "voiceprint-v1"
+    assert speakercluster.PASSTHROUGH not in result.audit
     canonical_json_bytes(result.audit)  # strict-JSON serializable
     canonical_json_bytes(asdict(speakercluster.ClusteringParams()))
 
 
-def test_placeholder_accepts_empty_input():
+def test_recipe_passes_through_when_nothing_anchors():
     result = speakercluster.cluster_turns([], lambda _spans: np.zeros((0, 192)))
     assert result.turns == []
-    assert result.audit["speakers"] == 0
+    assert speakercluster.PASSTHROUGH in result.audit
 
 
 # --------------------------------------------------------------------------
@@ -239,8 +233,8 @@ def _wav(tmp_path: Path, *, sample_rate: int = 16000) -> Path:
     return path
 
 
-def _install_pipeline(monkeypatch, *, embeddings=False) -> _FakePipeline:
-    fake = _FakePipeline(RAW, embeddings=embeddings)
+def _install_pipeline(monkeypatch, *, embeddings=False, turns=RAW) -> _FakePipeline:
+    fake = _FakePipeline(turns, embeddings=embeddings)
     monkeypatch.setattr(diarize, "_get_pipeline", lambda _token, _model: fake)
     monkeypatch.setattr(diarize, "_package_version", lambda _name: "4.0.7")
     return fake
@@ -287,6 +281,9 @@ class _ClusterSpy:
         "abstained_turns": 1,
         "abstained_seconds": 0.9,
         "anchor_seconds": {"SPEAKER_00": 2.0, "SPEAKER_01": 1.5},
+        "counts": {"anchors": 2, "clusters": 2},
+        "speaker_bounds": {"min": 1, "max": None, "satisfied": True},
+        "clusters": [{"label": "SPEAKER_00", "anchors": 1}],
     }
 
     def __init__(self, monkeypatch, *, result_turns=None, error=None) -> None:
@@ -415,39 +412,133 @@ def test_voiceprint_provenance_records_the_clustering_block(
         "embedder": voiceembed.REDIMNET2_B6.name,
         "embedder_checkpoint": ATTESTED,
         "params": asdict(speakercluster.ClusteringParams()),
-        # Scalar counts only; the nested per-cluster detail stays in the log.
+        # Scalars and the summary counts; per-cluster detail stays in the log.
         "audit": {
             "recipe": "test-recipe",
             "anchors": 2,
             "abstained_turns": 1,
             "abstained_seconds": 0.9,
+            "counts": {"anchors": 2, "clusters": 2},
+            "speaker_bounds": {"min": 1, "max": None, "satisfied": True},
         },
     }
     canonical_json_bytes(result.provenance)
 
 
-def test_real_placeholder_recipe_is_wired_end_to_end(
+def test_real_recipe_is_wired_end_to_end(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    _install_pipeline(monkeypatch)
-    embedder = _EmbedderSpy(monkeypatch)
+    _install_pipeline(monkeypatch, turns=LONG)
+    embedder = _EmbedderSpy(monkeypatch)  # one voice for every span
     monkeypatch.setenv(ENV, "voiceprint")  # env layer, no argument
 
     result = diarize.diarize_turns(_wav(tmp_path), token="hf_test", model=MODEL)
 
-    # First appearance: B -> SPEAKER_00, A -> SPEAKER_01.
-    assert result.turns == [
-        (0.0, 2.0, "SPEAKER_00"),
-        (2.5, 4.0, "SPEAKER_01"),
-        (4.1, 5.0, "SPEAKER_00"),
-    ]
+    # pyannote said two speakers; the voiceprints say one.
+    assert result.turns == [(start, end, "SPEAKER_00") for start, end, _ in LONG]
+    ((_waveform, spans, _spec),) = embedder.calls
+    assert spans == speakercluster.embedding_spans(LONG)
     block = result.provenance["clustering"]
     assert block["method"] == "voiceprint"
-    assert block["recipe"] == speakercluster.RECIPE
-    # Never embedded: the pinned identity is recorded.
-    assert block["embedder_checkpoint"] == voiceembed.REDIMNET2_B6.sha256
-    assert embedder.calls == []
+    assert block["recipe"] == "voiceprint-v1"
+    assert block["embedder_checkpoint"] == ATTESTED
+    assert block["params"] == asdict(speakercluster.ClusteringParams())
+    audit = block["audit"]
+    assert audit["recipe"] == "voiceprint-v1"
+    assert audit["counts"]["anchors"] == 4
+    assert audit["counts"]["clusters"] == 1
+    assert audit["speaker_bounds"] == {"min": 1, "max": None, "satisfied": True}
+    assert "clusters" not in audit  # per-cluster detail stays in the log
+    canonical_json_bytes(result.provenance)
     assert embedder.released == 1
+
+
+def test_recipe_passthrough_is_recorded_as_a_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    # RAW's anchors hold 3.4 s of speech, under the 6 s a speaker needs: the
+    # recipe hands pyannote's labels back, which is not a voiceprint result.
+    _install_pipeline(monkeypatch)
+    embedder = _EmbedderSpy(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        result = diarize.diarize_turns(
+            _wav(tmp_path), token="hf_test", model=MODEL, clustering="voiceprint"
+        )
+
+    assert len(embedder.calls) == 1  # the recipe did run
+    assert result.turns == PYANNOTE_TURNS
+    provenance = dict(result.provenance)
+    block = provenance.pop("clustering")
+    assert provenance == _expected_base_provenance()
+    assert block == {
+        "method": "pyannote",
+        "requested": "voiceprint",
+        "reason": "ClusteringError: recipe passthrough: no anchor cluster "
+        "survived; pyannote labels kept",
+    }
+    assert "keeping pyannote's speakers" in caplog.text
+    assert embedder.released == 1
+
+
+@pytest.mark.parametrize(
+    ("bounds", "reason"),
+    [
+        ({"min_speakers": 3}, "ClusteringError: min_speakers 3 cannot be met"),
+        # The recipe meets it; pyannote's own call gets the same bounds.
+        ({"max_speakers": 1}, None),
+    ],
+)
+def test_speaker_bounds_reach_the_recipe_and_fall_back_when_unmet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bounds: dict[str, int],
+    reason: str | None,
+):
+    fake = _install_pipeline(monkeypatch, turns=LONG)
+    _EmbedderSpy(monkeypatch)
+
+    result = diarize.diarize_turns(
+        _wav(tmp_path), token="hf_test", model=MODEL, clustering="voiceprint", **bounds
+    )
+
+    assert fake.calls == [bounds]
+    block = result.provenance["clustering"]
+    if reason is None:
+        assert block["method"] == "voiceprint"
+        assert {label for _s, _e, label in result.turns} == {"SPEAKER_00"}
+        return
+    assert result.turns == diarize._smooth_turns(LONG)
+    assert block["method"] == "pyannote"
+    assert block["requested"] == "voiceprint"
+    assert str(block["reason"]).startswith(reason)
+
+
+@pytest.mark.parametrize(
+    ("bounds", "speakers"),
+    [({"max_speakers": 1}, 2), ({"min_speakers": 3}, 2)],
+)
+def test_out_of_bounds_clustering_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bounds: dict[str, int],
+    speakers: int,
+):
+    _install_pipeline(monkeypatch)
+    _EmbedderSpy(monkeypatch)
+    _ClusterSpy(monkeypatch)  # always returns two speakers
+
+    result = diarize.diarize_turns(
+        _wav(tmp_path), token="hf_test", model=MODEL, clustering="voiceprint", **bounds
+    )
+
+    assert result.turns == PYANNOTE_TURNS
+    block = result.provenance["clustering"]
+    assert block["method"] == "pyannote"
+    assert str(block["reason"]).startswith(
+        f"ValueError: clustering returned {speakers} speaker(s), outside the "
+        "requested bounds"
+    )
 
 
 def test_waveform_at_another_rate_is_resampled_to_16k(
