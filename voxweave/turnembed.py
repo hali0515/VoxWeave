@@ -49,6 +49,15 @@ class UnsplittableSpeakerError(TurnEmbeddingError):
     """The supplied turns do not contain evidence for two distinct clusters."""
 
 
+class EmbeddingIdentityMismatch(TurnEmbeddingError):
+    """This installation cannot reproduce the embedder a capture recorded.
+
+    The capture is intact; the local embedder differs (a model this version
+    does not register, another pinned checkpoint, another pyannote.audio
+    version). A conflict with the capture, not a server fault.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class EmbeddingIdentity:
     """Exact embedding model and checkpoint bytes bound during construction.
@@ -275,7 +284,7 @@ def _construct_bound_checkpoint(
         ) from exc
     before = hashlib.sha256(payload).hexdigest()
     if expected_sha256 is not None and before != expected_sha256:
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             "speaker embedding checkpoint does not match requested identity"
         )
     checkpoint_buffer = io.BytesIO(payload)
@@ -313,7 +322,7 @@ def _load_inference(
         expected_identity is not None
         and pyannote_version != expected_identity.pyannote_version
     ):
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             "installed pyannote.audio version does not match requested identity"
         )
     token = config.conf_hf_token()
@@ -329,7 +338,7 @@ def _load_inference(
     checkpoint = _download_checkpoint(authority, token)
     embedding_source = _embedding_source(authority, checkpoint)
     if expected_identity is not None and embedding_source != expected_identity.model:
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             "resolved speaker embedding model does not match requested identity"
         )
     try:
@@ -401,7 +410,7 @@ def _load_inference(
         pyannote_version=pyannote_version,
     )
     if expected_identity is not None and identity != expected_identity:
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             "loaded speaker embedding does not match requested identity"
         )
     return inference, identity
@@ -583,12 +592,12 @@ def _decoupled_spec(identity: EmbeddingIdentity) -> voiceembed.EmbedderSpec:
         raise TurnEmbeddingError("speaker embedding identity is invalid")
     spec = voiceembed.spec_by_name(identity.model)
     if spec is None:
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             f"speaker embedding model {identity.model} is not available in this "
             "voxweave version"
         )
     if identity.checkpoint_sha256 != spec.sha256:
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             "speaker embedding checkpoint does not match requested identity"
         )
     return spec
@@ -644,7 +653,7 @@ def recipe_centroids(
             if voiceembed.get_embedder(spec).checkpoint_sha256 != (
                 identity.checkpoint_sha256
             ):
-                raise TurnEmbeddingError(
+                raise EmbeddingIdentityMismatch(
                     "loaded speaker embedding does not match requested identity"
                 )
             return voiceembed.speaker_centroids(
@@ -753,6 +762,7 @@ __all__ = [
     "AttestedTurnEmbeddings",
     "AttestedTurnRequest",
     "EmbeddingIdentity",
+    "EmbeddingIdentityMismatch",
     "TurnEmbeddingError",
     "LANE_DECOUPLED",
     "LANE_LEGACY",

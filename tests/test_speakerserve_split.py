@@ -1451,3 +1451,103 @@ def test_legacy_split_does_not_run_the_recipe(
         proposal = _preview_split(server)
         assert _confirm_split(server, proposal) == (200, {"new_id": "SPEAKER_02"})
         assert observations["embedding_request_identity"].lane == "legacy"
+
+
+# The real provider, captured before any fixture replaces it.
+_REAL_TURN_EMBEDDINGS = turnembed.turn_embeddings
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        # A model a newer voxweave registered, unknown to this one.
+        ({"embedding_model": "future-embedder-v9"}, "not available in this"),
+        # A registered model whose pinned checkpoint moved since the capture.
+        ({"embedding_checkpoint": "1" * 64}, "checkpoint does not match"),
+    ],
+)
+def test_decoupled_split_answers_an_unreproducible_embedder_with_409(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changes: dict[str, str],
+    reason: str,
+) -> None:
+    provenance = {**DECOUPLED_PROVENANCE, **changes}
+    identity = turnembed.EmbeddingIdentity.decoupled(
+        provenance["embedding_model"], provenance["embedding_checkpoint"]
+    )
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=provenance,
+        provider_identity=identity,
+    ) as (server, paths, originals, _logs, observations):
+        monkeypatch.setattr(
+            speakerserve.turnembed, "turn_embeddings", _REAL_TURN_EMBEDDINGS
+        )
+        monkeypatch.setattr(
+            "voxweave.voiceembed.get_embedder",
+            lambda _spec: pytest.fail("an unreproducible embedder is never loaded"),
+        )
+
+        status, headers, body = _post(
+            server,
+            "/split",
+            {"speaker_id": "SPEAKER_00"},
+            token=server.token,
+        )
+
+        error = json.loads(body)["error"]
+        assert status == 409
+        assert headers["Cache-Control"] == "no-store"
+        assert "does not match the voiceprint capture" in error
+        assert reason in error
+        assert "bisect_embeddings" not in observations
+        assert paths["sidecar"].read_bytes() == originals["sidecar"]
+        assert server.split_proposal is None
+
+
+def test_decoupled_split_answers_a_recipe_checkpoint_mismatch_with_409(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    from voxweave import voiceembed
+
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=DECOUPLED_PROVENANCE,
+        provider_identity=DECOUPLED_IDENTITY,
+    ) as (server, paths, originals, _logs, observations):
+        # The resident embedder turns out to be another checkpoint by the time
+        # the recipe runs: turnembed refuses it as an identity mismatch.
+        monkeypatch.setattr(
+            turnembed,
+            "_read_mono_16k",
+            lambda _path: np.zeros(16_000 * 10, dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            voiceembed,
+            "get_embedder",
+            lambda spec: voiceembed.LoadedEmbedder(
+                spec=spec,
+                checkpoint_sha256="2" * 64,
+                network=None,
+                device="cpu",
+            ),
+        )
+
+        status, _headers, body = _post(
+            server,
+            "/split",
+            {"speaker_id": "SPEAKER_00"},
+            token=server.token,
+        )
+
+        assert status == 409
+        assert "does not match the voiceprint capture" in json.loads(body)["error"]
+        assert "bisect_embeddings" in observations  # the mismatch came late
+        assert paths["sidecar"].read_bytes() == originals["sidecar"]
+        assert server.split_proposal is None

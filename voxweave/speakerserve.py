@@ -728,12 +728,15 @@ def _split_recipe_centroids(
         (start, end, _SPLIT_B_PLACEHOLDER if assignment.get(index) == "B" else label)
         for index, (start, end, label) in enumerate(staged.turns)
     ]
-    centroids = turnembed.recipe_centroids(
-        wav_path,
-        relabeled,
-        (speaker_id, _SPLIT_B_PLACEHOLDER),
-        identity,
-    )
+    try:
+        centroids = turnembed.recipe_centroids(
+            wav_path,
+            relabeled,
+            (speaker_id, _SPLIT_B_PLACEHOLDER),
+            identity,
+        )
+    except turnembed.EmbeddingIdentityMismatch as exc:
+        raise _capture_mismatch(exc) from exc
     groups: list[tuple[str, tuple[float, ...]]] = []
     for group, label in (("A", speaker_id), ("B", _SPLIT_B_PLACEHOLDER)):
         vector = centroids.get(label)
@@ -745,6 +748,17 @@ def _split_recipe_centroids(
             )
         groups.append((group, tuple(float(value) for value in vector)))
     return tuple(groups)
+
+
+def _capture_mismatch(exc: turnembed.EmbeddingIdentityMismatch) -> SplitConflict:
+    """The 409 for an embedder this installation cannot reproduce.
+
+    Same answer as :func:`_require_embedding_identity`: the capture is intact,
+    the local embedder differs from the one it recorded.
+    """
+    return SplitConflict(
+        f"the turn embedding provider does not match the voiceprint capture: {exc}"
+    )
 
 
 def _build_split_proposal(
@@ -760,7 +774,10 @@ def _build_split_proposal(
     )
     wav_path = _prepare_split_wav(server.media_path, staged)
     try:
-        provider_embeddings = turnembed.turn_embeddings(wav_path, embedding_request)
+        try:
+            provider_embeddings = turnembed.turn_embeddings(wav_path, embedding_request)
+        except turnembed.EmbeddingIdentityMismatch as exc:
+            raise _capture_mismatch(exc) from exc
         _require_embedding_identity(staged, provider_embeddings)
         expected = set(range(len(selected_turns)))
         if set(provider_embeddings) != expected:
