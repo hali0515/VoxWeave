@@ -455,7 +455,6 @@ def test_capture_voiceprints_reads_the_diarized_wav(tmp_path, monkeypatch):
 def _spec_for(payload: bytes, **changes) -> voiceembed.EmbedderSpec:
     values = {
         "name": "test-embedder",
-        "label": "test",
         "languages": None,
         "embedding_dim": 16,
         "sample_rate": voiceembed.SAMPLE_RATE,
@@ -491,41 +490,135 @@ def test_env_override_names_an_explicit_local_checkpoint(tmp_path, monkeypatch):
         voiceembed.checkpoint_path(spec)
 
 
-def test_release_asset_downloads_into_the_audio_cache_with_its_hash(
+class _FakeResponse:
+    """A streaming HTTP response: hands out ``payload`` in small reads."""
+
+    def __init__(self, payload: bytes, *, fail_after: int | None = None) -> None:
+        self.payload = payload
+        self.offset = 0
+        self.fail_after = fail_after
+        self.reads: list[int] = []
+        self.closed = False
+
+    def read(self, size: int) -> bytes:
+        self.reads.append(size)
+        if self.fail_after is not None and self.offset >= self.fail_after:
+            raise TimeoutError("timed out")
+        chunk = self.payload[self.offset : self.offset + 3]
+        self.offset += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.closed = True
+
+
+def _serve(monkeypatch, response):
+    calls: list[tuple[str, float]] = []
+
+    def fake_open(url, timeout):
+        calls.append((url, timeout))
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    monkeypatch.setattr(voiceembed, "_open_url", fake_open)
+    return calls
+
+
+def _cache_leftovers(root: Path) -> list[str]:
+    return sorted(path.name for path in root.rglob("*") if path.is_file())
+
+
+def test_release_asset_streams_into_the_audio_cache_with_a_timeout(
     tmp_path, monkeypatch
 ):
-    spec = _spec_for(b"weights")
-    calls = []
-
-    def fake_download(url, destination, *, hash_prefix, progress):
-        calls.append((url, destination, hash_prefix, progress))
-        Path(destination).write_bytes(b"weights")
-
+    spec = _spec_for(b"pinned weights")
+    response = _FakeResponse(b"pinned weights")
+    calls = _serve(monkeypatch, response)
     monkeypatch.setattr(voiceembed.config, "AUDIO_CACHE", str(tmp_path / "audio"))
-    monkeypatch.setattr("torch.hub.download_url_to_file", fake_download)
 
     path = voiceembed.checkpoint_path(spec)
 
     assert path == tmp_path / "audio" / "test-embedder" / "test.pt"
-    assert calls == [(spec.url, str(path), spec.sha256, False)]
+    assert path.read_bytes() == b"pinned weights"
+    assert calls == [(spec.url, voiceembed.DOWNLOAD_TIMEOUT_SECONDS)]
+    assert 0 < voiceembed.DOWNLOAD_TIMEOUT_SECONDS <= 120
+    assert len(response.reads) > 2  # streamed, not slurped
+    assert response.closed
+    assert _cache_leftovers(tmp_path / "audio") == ["test.pt"]
     # A cached asset is reused without touching the network again.
     assert voiceembed.checkpoint_path(spec) == path
     assert len(calls) == 1
 
 
-def test_download_failure_names_the_manual_route(tmp_path, monkeypatch):
-    spec = _spec_for(b"weights")
-
-    def failing_download(*_args, **_kwargs):
-        raise RuntimeError("invalid hash value (expected x, got y)")
-
+@pytest.mark.parametrize(
+    ("served", "reason"),
+    [
+        (b"pinned weightz", "SHA-256"),  # same size, other bytes
+        (b"pinned weights and more", "more than the pinned"),
+        (b"pinned", "stopped after 6 of 14 bytes"),
+    ],
+)
+def test_a_foreign_download_never_lands_in_the_cache(
+    tmp_path, monkeypatch, served, reason
+):
+    spec = _spec_for(b"pinned weights")
+    _serve(monkeypatch, _FakeResponse(served))
     monkeypatch.setattr(voiceembed.config, "AUDIO_CACHE", str(tmp_path / "audio"))
-    monkeypatch.setattr("torch.hub.download_url_to_file", failing_download)
 
     with pytest.raises(voiceembed.VoiceEmbeddingError) as caught:
         voiceembed.checkpoint_path(spec)
-    assert "invalid hash value" in str(caught.value)
+
+    assert reason in str(caught.value)
     assert spec.checkpoint_env in str(caught.value)
+    assert _cache_leftovers(tmp_path / "audio") == []
+
+
+def test_a_stalled_download_fails_with_the_manual_route_and_no_partial_file(
+    tmp_path, monkeypatch
+):
+    spec = _spec_for(b"pinned weights")
+    _serve(monkeypatch, _FakeResponse(b"pinned weights", fail_after=6))
+    monkeypatch.setattr(voiceembed.config, "AUDIO_CACHE", str(tmp_path / "audio"))
+
+    with pytest.raises(voiceembed.VoiceEmbeddingError) as caught:
+        voiceembed.checkpoint_path(spec)
+
+    message = str(caught.value)
+    assert "could not download voiceprint model test-embedder" in message
+    assert "timed out" in message
+    assert spec.checkpoint_env in message
+    assert _cache_leftovers(tmp_path / "audio") == []
+
+
+def test_an_unreachable_host_names_the_manual_route(tmp_path, monkeypatch):
+    import urllib.error
+
+    spec = _spec_for(b"pinned weights")
+    _serve(monkeypatch, urllib.error.URLError("Name or service not known"))
+    monkeypatch.setattr(voiceembed.config, "AUDIO_CACHE", str(tmp_path / "audio"))
+
+    with pytest.raises(voiceembed.VoiceEmbeddingError) as caught:
+        voiceembed.checkpoint_path(spec)
+    assert "Name or service not known" in str(caught.value)
+    assert spec.source in str(caught.value)
+
+
+def test_open_url_passes_the_timeout_to_urlopen(monkeypatch):
+    seen = {}
+
+    def fake_urlopen(request, *, timeout):
+        seen["url"] = request.full_url
+        seen["timeout"] = timeout
+        return "response"
+
+    monkeypatch.setattr(voiceembed.urllib.request, "urlopen", fake_urlopen)
+
+    assert voiceembed._open_url("https://example.invalid/x.pt", 12.5) == "response"
+    assert seen == {"url": "https://example.invalid/x.pt", "timeout": 12.5}
 
 
 def test_hub_checkpoint_downloads_the_pinned_revision_into_the_audio_cache(
@@ -556,14 +649,116 @@ def test_hub_checkpoint_downloads_the_pinned_revision_into_the_audio_cache(
 def test_hash_mismatch_refuses_before_deserializing(tmp_path, monkeypatch):
     spec = _spec_for(b"expected bytes")
     local = tmp_path / "tampered.pt"
-    local.write_bytes(b"other bytes")
+    local.write_bytes(b"tampered bytes")  # same size, other content
     monkeypatch.setenv(spec.checkpoint_env, str(local))
     monkeypatch.setattr(
         "torch.load", lambda *_a, **_k: pytest.fail("must not deserialize")
     )
 
-    with pytest.raises(voiceembed.VoiceEmbeddingError, match="is pinned to"):
+    with pytest.raises(voiceembed.VoiceEmbeddingError, match="has SHA-256"):
         voiceembed._construct(spec)
+
+
+def test_a_wrong_size_checkpoint_is_refused_before_it_is_read(tmp_path, monkeypatch):
+    spec = _spec_for(b"expected bytes")
+    huge = tmp_path / "huge.pt"
+    with open(huge, "wb") as handle:
+        handle.truncate(4 * 1024**3)  # sparse: nothing is allocated or read
+    reads = []
+    real_open = open
+
+    def spy_open(path, mode="r", *args, **kwargs):
+        handle = real_open(path, mode, *args, **kwargs)
+        if Path(path) == huge:
+            original_read = handle.read
+
+            def read(*read_args):
+                reads.append(read_args)
+                return original_read(*read_args)
+
+            handle.read = read
+        return handle
+
+    monkeypatch.setattr("builtins.open", spy_open)
+
+    with pytest.raises(voiceembed.VoiceEmbeddingError) as caught:
+        voiceembed.verify_checkpoint(spec, huge)
+
+    assert f"is {4 * 1024**3} bytes" in str(caught.value)
+    assert "pinned to a 14-byte file" in str(caught.value)
+    assert spec.checkpoint_env in str(caught.value)
+    assert reads == []
+
+
+def test_verified_reads_return_exactly_the_pinned_bytes(tmp_path):
+    payload = bytes(range(256)) * 9000  # several read chunks
+    spec = _spec_for(payload)
+    local = tmp_path / "weights.pt"
+    local.write_bytes(payload)
+
+    assert voiceembed.verify_checkpoint(spec, local) is None
+    verified = voiceembed.read_verified_checkpoint(spec, local)
+    assert bytes(verified) == payload
+
+
+# --------------------------------------------------------------------------
+# Prefetch at the start of a run
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("choice", "language", "expected"),
+    [
+        (None, None, ("redimnet2-b6-vb2-vox2-cnc2-lm", "anime-va-ecapa-gn")),
+        (None, "ja", ("anime-va-ecapa-gn",)),
+        (None, "en", ("redimnet2-b6-vb2-vox2-cnc2-lm",)),
+        ("anime-va", None, ("anime-va-ecapa-gn",)),
+        ("redimnet2", "ja", ("redimnet2-b6-vb2-vox2-cnc2-lm",)),
+        ("pyannote", None, ()),
+    ],
+)
+def test_prefetch_covers_every_route_the_run_may_take(choice, language, expected):
+    specs = voiceembed.prefetch_specs(choice, language)
+
+    assert tuple(spec.name for spec in specs) == expected
+    if language is not None and specs:
+        assert specs == (voiceembed.resolve_voiceprint_model(choice, language),)
+
+
+@pytest.mark.real_voiceprint_prefetch
+def test_prefetch_downloads_and_verifies_each_needed_checkpoint(monkeypatch):
+    fetched = []
+    verified = []
+
+    def fake_path(spec):
+        fetched.append(spec.name)
+        return Path(f"/weights/{spec.name}")
+
+    monkeypatch.setattr(voiceembed, "checkpoint_path", fake_path)
+    monkeypatch.setattr(
+        voiceembed,
+        "verify_checkpoint",
+        lambda spec, path: verified.append((spec.name, path)),
+    )
+
+    specs = voiceembed.prefetch_checkpoints(None, None)
+
+    assert specs == (voiceembed.REDIMNET2_B6, voiceembed.ANIME_VA)
+    assert fetched == [voiceembed.REDIMNET2_B6.name, voiceembed.ANIME_VA.name]
+    assert verified == [(name, Path(f"/weights/{name}")) for name in fetched]
+
+
+@pytest.mark.real_voiceprint_prefetch
+def test_prefetch_surfaces_a_download_failure(tmp_path, monkeypatch):
+    import urllib.error
+
+    _serve(monkeypatch, urllib.error.URLError("network is unreachable"))
+    monkeypatch.setattr(voiceembed.config, "AUDIO_CACHE", str(tmp_path / "audio"))
+
+    with pytest.raises(voiceembed.VoiceEmbeddingError, match="network is unreachable"):
+        voiceembed.prefetch_checkpoints("redimnet2", None)
+    with pytest.raises(ValueError, match="unknown voiceprint model"):
+        voiceembed.prefetch_checkpoints("ecapa", None)
 
 
 def _saved(value: object) -> bytes:

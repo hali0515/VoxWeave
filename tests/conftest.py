@@ -45,6 +45,30 @@ def _isolate_voiceprint_model_env() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _offline_voiceprint_prefetch(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Keep process()/transcribe() from fetching or hashing real checkpoints.
+
+    A voiceprint run prefetches its embedder checkpoints before any audio work,
+    which would hit the network (or hash the developer's cache) in every test
+    that enables ``voiceprints``. The prefetch becomes a no-op here; tests that
+    exercise it opt back in with ``@pytest.mark.real_voiceprint_prefetch`` and
+    fake the network themselves. Plain attribute bookkeeping for the same
+    fixture-ordering reason as above.
+    """
+    if request.node.get_closest_marker("real_voiceprint_prefetch") is not None:
+        yield
+        return
+    from voxweave import voiceembed
+
+    original = voiceembed.prefetch_checkpoints
+    voiceembed.prefetch_checkpoints = lambda *_args, **_kwargs: ()  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        voiceembed.prefetch_checkpoints = original
+
+
+@pytest.fixture(autouse=True)
 def _isolate_voxweave_config(tmp_path: Path) -> Iterator[None]:
     """Never let a test read the developer's real ~/.config/voxweave.conf.
 

@@ -156,6 +156,9 @@ include = ["voxweave*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "real_voiceprint_prefetch: run the real voiceprint checkpoint prefetch instead of the offline no-op (tests/conftest.py)",
+]
 
 [tool.pyright]
 # Production code only: tests are monkeypatch-heavy and would drown the signal.

@@ -12,9 +12,11 @@ pipeline's own embedding head:
 - ``pyannote``: the legacy lane -- the diarization pipeline's own embeddings,
   kept so an existing legacy voice store can still be matched.
 
-Every checkpoint is pinned by SHA-256 and verified before it is deserialized;
-the weights live under ``config.AUDIO_CACHE`` and nothing here touches the GPU
-or the network at import time.
+Every checkpoint is pinned by size and SHA-256 and verified before it is
+deserialized; the weights live under ``config.AUDIO_CACHE`` and nothing here
+touches the GPU or the network at import time. A voiceprint run fetches and
+verifies what it needs up front (:func:`prefetch_checkpoints`) instead of at
+the capture step.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ import logging
 import math
 import os
 import threading
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +35,7 @@ from typing import Any
 
 import numpy as np
 
-from voxweave import config, runtime
+from voxweave import config, fsio, runtime
 from voxweave.voicebase import (
     MAX_EMBEDDING_DIM,
     MIN_EMBEDDING_DIM,
@@ -67,6 +70,13 @@ MAX_SEGMENTS_PER_SPEAKER = 20
 # cannot dominate memory or drown the pooling statistics.
 WINDOW_SECONDS = 10.0
 
+# Checkpoint downloads: urlopen's timeout bounds every connect and every read,
+# so a stalled network fails within this many seconds instead of hanging the
+# run (a slow but live transfer never trips it).
+DOWNLOAD_TIMEOUT_SECONDS = 30.0
+# Read size for streaming downloads and checkpoint hashing.
+_IO_CHUNK_BYTES = 1 << 20
+
 
 class VoiceEmbeddingError(RuntimeError):
     """A voiceprint embedder could not be resolved, loaded or run."""
@@ -78,11 +88,12 @@ class EmbedderSpec:
 
     ``name`` is the stable id recorded as ``embedding_model`` in voiceprint
     provenance; together with ``sha256`` it defines an embedding space.
-    ``suggest``/``margin`` are the matching defaults for that space.
+    ``suggest``/``margin`` are the matching defaults for that space. ``size``
+    is the pinned checkpoint's exact byte count: a file of any other size is
+    refused before a single byte of it is read.
     """
 
     name: str
-    label: str
     languages: tuple[str, ...] | None
     embedding_dim: int
     sample_rate: int
@@ -129,9 +140,10 @@ def _load_anime_va(checkpoint: object) -> tuple[Any, int]:
     return voiceembed_models.build_anime_va(checkpoint)
 
 
+# ReDimNet2-B6 trained on VoxBlink2 + VoxCeleb2 + CN-Celeb2, large-margin
+# fine-tuned.
 REDIMNET2_B6 = EmbedderSpec(
     name="redimnet2-b6-vb2-vox2-cnc2-lm",
-    label="ReDimNet2-B6 (VoxBlink2 + VoxCeleb2 + CN-Celeb2, large-margin)",
     languages=None,
     embedding_dim=192,
     sample_rate=SAMPLE_RATE,
@@ -151,9 +163,9 @@ REDIMNET2_B6 = EmbedderSpec(
     cache_subdir="redimnet2",
 )
 
+# Anime voice-actor ECAPA-TDNN (GroupNorm), Japanese only.
 ANIME_VA = EmbedderSpec(
     name="anime-va-ecapa-gn",
-    label="anime voice-actor ECAPA-TDNN (GroupNorm), Japanese only",
     languages=("ja",),
     embedding_dim=192,
     sample_rate=SAMPLE_RATE,
@@ -254,17 +266,56 @@ def spec_by_name(name: object) -> EmbedderSpec | None:
 # --------------------------------------------------------------------------
 
 
-def _download_url(url: str, target: Path, sha256: str) -> None:
-    """Fetch a release asset; torch.hub verifies the hash before the file lands."""
-    try:
-        from torch.hub import download_url_to_file
-    except ImportError as exc:
-        raise VoiceEmbeddingError("voiceprint embedders require torch") from exc
+def _open_url(url: str, timeout: float) -> Any:
+    """Open ``url`` for streaming (the network boundary tests replace)."""
+    request = urllib.request.Request(url, headers={"User-Agent": "voxweave"})
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def _download_url(spec: EmbedderSpec, target: Path) -> None:
+    """Stream ``spec.url`` into ``target``, hashing the bytes as they arrive.
+
+    Every connect and read is bounded by DOWNLOAD_TIMEOUT_SECONDS. The bytes go
+    to a temp file next to ``target`` that is renamed onto it only once their
+    size and SHA-256 match the pin, so an interrupted, stalled or tampered
+    download never leaves a partial or foreign file in the cache.
+    """
+    if spec.url is None:
+        raise VoiceEmbeddingError(f"voiceprint model {spec.name} has no URL")
     target.parent.mkdir(parents=True, exist_ok=True)
-    download_url_to_file(url, os.fspath(target), hash_prefix=sha256, progress=False)
+    digest = hashlib.sha256()
+    received = 0
+    with fsio.atomic_path(target) as partial:
+        with (
+            _open_url(spec.url, DOWNLOAD_TIMEOUT_SECONDS) as response,
+            open(partial, "wb") as sink,
+        ):
+            while True:
+                chunk = response.read(_IO_CHUNK_BYTES)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > spec.size:
+                    raise VoiceEmbeddingError(
+                        f"the server sent more than the pinned {spec.size} bytes"
+                    )
+                digest.update(chunk)
+                sink.write(chunk)
+        if received != spec.size:
+            raise VoiceEmbeddingError(
+                f"the download stopped after {received} of {spec.size} bytes"
+            )
+        if digest.hexdigest() != spec.sha256:
+            raise VoiceEmbeddingError(
+                f"the download has SHA-256 {digest.hexdigest()}, but "
+                f"{spec.name} is pinned to {spec.sha256}"
+            )
 
 
 def _download_hf(repo: str, filename: str, revision: str | None) -> Path:
+    # huggingface_hub bounds its own requests (HF_HUB_DOWNLOAD_TIMEOUT /
+    # HF_HUB_ETAG_TIMEOUT) and resolves a cached pinned commit without the
+    # network.
     from huggingface_hub import hf_hub_download
 
     return Path(
@@ -302,10 +353,8 @@ def checkpoint_path(spec: EmbedderSpec) -> Path:
             return target
         log.info("downloading voiceprint model %s -> %s", spec.name, target)
         try:
-            _download_url(spec.url, target, spec.sha256)
-        except VoiceEmbeddingError:
-            raise
-        except Exception as exc:  # noqa: BLE001 -- network/hash failures, one message
+            _download_url(spec, target)
+        except Exception as exc:  # noqa: BLE001 -- network/size/hash failures, one message
             raise VoiceEmbeddingError(
                 f"could not download voiceprint model {spec.name}: {exc}; {manual}"
             ) from exc
@@ -320,22 +369,104 @@ def checkpoint_path(spec: EmbedderSpec) -> Path:
         ) from exc
 
 
-def read_verified_checkpoint(spec: EmbedderSpec, path: Path) -> bytes:
-    """Read ``path`` once and prove its bytes are the pinned checkpoint."""
+def _read_pinned(spec: EmbedderSpec, path: Path, *, keep: bool) -> bytearray | None:
+    """Stream ``path`` through SHA-256 and prove it is the pinned checkpoint.
+
+    The size is checked against the pin before anything is read, so a wrong
+    (possibly huge) file is refused up front; at most ``spec.size`` bytes are
+    ever buffered. With ``keep`` the verified bytes are returned.
+    """
+    repair = (
+        f"delete the file to re-download it, or point {spec.checkpoint_env} at "
+        "the pinned checkpoint"
+    )
+    digest = hashlib.sha256()
+    payload: bytearray | None = None
+    offset = 0
     try:
-        payload = Path(path).read_bytes()
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size != spec.size:
+                raise VoiceEmbeddingError(
+                    f"voiceprint checkpoint {path} is {size} bytes, but "
+                    f"{spec.name} is pinned to a {spec.size}-byte file; {repair}"
+                )
+            if keep:
+                payload = bytearray(spec.size)
+            while True:
+                chunk = handle.read(_IO_CHUNK_BYTES)
+                if not chunk:
+                    break
+                end = offset + len(chunk)
+                if end > spec.size:
+                    raise VoiceEmbeddingError(
+                        f"voiceprint checkpoint {path} grew while it was read"
+                    )
+                digest.update(chunk)
+                if payload is not None:
+                    payload[offset:end] = chunk
+                offset = end
     except (MemoryError, OSError) as exc:
         raise VoiceEmbeddingError(
             f"could not read voiceprint checkpoint {path}: {exc}"
         ) from exc
-    digest = hashlib.sha256(payload).hexdigest()
-    if digest != spec.sha256:
+    if offset != spec.size:
         raise VoiceEmbeddingError(
-            f"voiceprint checkpoint {path} has SHA-256 {digest}, but {spec.name} "
-            f"is pinned to {spec.sha256}; delete the file to re-download it, or "
-            f"point {spec.checkpoint_env} at the pinned checkpoint"
+            f"voiceprint checkpoint {path} shrank while it was read"
+        )
+    if digest.hexdigest() != spec.sha256:
+        raise VoiceEmbeddingError(
+            f"voiceprint checkpoint {path} has SHA-256 {digest.hexdigest()}, but "
+            f"{spec.name} is pinned to {spec.sha256}; {repair}"
         )
     return payload
+
+
+def verify_checkpoint(spec: EmbedderSpec, path: Path) -> None:
+    """Prove ``path`` is the pinned checkpoint without keeping its bytes."""
+    _read_pinned(spec, Path(path), keep=False)
+
+
+def read_verified_checkpoint(spec: EmbedderSpec, path: Path) -> bytearray:
+    """Read ``path`` once and prove its bytes are the pinned checkpoint."""
+    payload = _read_pinned(spec, Path(path), keep=True)
+    assert payload is not None
+    return payload
+
+
+def prefetch_specs(
+    cli_value: str | None, language_iso: str | None
+) -> tuple[EmbedderSpec, ...]:
+    """The embedders a voiceprint run may need, before its language is detected.
+
+    ``auto`` needs both routes unless the language is already fixed (``--lang``);
+    an explicit embedder needs only itself; the legacy lane needs none.
+    """
+    choice = resolve_voiceprint_choice(cli_value)
+    if choice == LEGACY.name:
+        return ()
+    if choice != AUTO:
+        return (EMBEDDERS[choice],)
+    language = (language_iso or "").strip().lower()
+    if language:
+        return (ANIME_VA if language == "ja" else REDIMNET2_B6,)
+    return (REDIMNET2_B6, ANIME_VA)
+
+
+def prefetch_checkpoints(
+    cli_value: str | None, language_iso: str | None
+) -> tuple[EmbedderSpec, ...]:
+    """Download (when missing) and verify every checkpoint the run may need.
+
+    Meant for the start of a run: a missing network then fails in seconds,
+    before minutes of separation and ASR, instead of at the capture step. A
+    cached checkpoint is only re-hashed. Raises :class:`VoiceEmbeddingError`;
+    an invalid model choice raises ``ValueError``.
+    """
+    specs = prefetch_specs(cli_value, language_iso)
+    for spec in specs:
+        verify_checkpoint(spec, checkpoint_path(spec))
+    return specs
 
 
 # --------------------------------------------------------------------------
@@ -415,7 +546,8 @@ def _construct(spec: EmbedderSpec) -> LoadedEmbedder:
     log.info("loaded voiceprint model %s on %s", spec.name, device)
     return LoadedEmbedder(
         spec=spec,
-        checkpoint_sha256=hashlib.sha256(payload).hexdigest(),
+        # read_verified_checkpoint proved these exact bytes hash to the pin.
+        checkpoint_sha256=spec.sha256,
         network=network,
         device=device,
     )
@@ -747,6 +879,7 @@ __all__ = [
     "AUTO",
     "CENTROID_RECIPE",
     "CHOICES",
+    "DOWNLOAD_TIMEOUT_SECONDS",
     "EMBEDDERS",
     "ENV_MODEL",
     "EmbedderSpec",
@@ -768,6 +901,8 @@ __all__ = [
     "embedder_lock",
     "get_embedder",
     "normalize_voiceprint_choice",
+    "prefetch_checkpoints",
+    "prefetch_specs",
     "read_mono_16k",
     "read_verified_checkpoint",
     "release",
@@ -776,6 +911,7 @@ __all__ = [
     "speaker_centroids",
     "spec_by_name",
     "unit_vector",
+    "verify_checkpoint",
     "weighted_unit_mean",
     "window_bounds",
 ]

@@ -194,6 +194,36 @@ class VoiceprintCapture:
     turns: list[tuple[float, float, str]]
 
 
+def _prefetch_voiceprint_models(
+    voiceprint_model: str | None,
+    lang_override: str | None,
+    reporter: Reporter,
+) -> bool:
+    """Fetch and verify the voiceprint checkpoint(s) before any audio work.
+
+    The capture itself only runs after separation, ASR and diarization; a
+    missing or stalled download discovered there would waste the whole run.
+    ``auto`` needs both embedders unless ``--lang`` already fixes the language
+    (resolved to ISO exactly as :func:`transcribe` resolves it). ``False``
+    (after a warning) means voiceprints are off for this run; the subtitles are
+    still produced. An invalid model choice raises ``ValueError``.
+    """
+    from voxweave import voiceembed
+
+    forced = lang_override.strip() if lang_override else ""
+    language_iso = to_iso_or(forced, "en") if forced else None
+    reporter.stage("voiceprint models")
+    try:
+        voiceembed.prefetch_checkpoints(voiceprint_model, language_iso)
+    except voiceembed.VoiceEmbeddingError as exc:
+        log.warning(
+            "voiceprint models unavailable; continuing without voiceprint capture: %s",
+            exc,
+        )
+        return False
+    return True
+
+
 def _decoupled_voiceprint_capture(
     wav: Path,
     diarization: Any,
@@ -982,7 +1012,9 @@ def transcribe(
     set). With ``voiceprints`` the per-speaker centroids come from the embedder
     ``voiceprint_model`` resolves to for the detected language (see
     :func:`voxweave.voiceembed.resolve_voiceprint_model`); only its ``pyannote``
-    legacy lane reads the diarization pipeline's own embeddings. All models run
+    legacy lane reads the diarization pipeline's own embeddings; its checkpoint(s)
+    are fetched and verified before any audio work, and if that fails voiceprints
+    are off for the run (warning) while everything else proceeds. All models run
     in-process (weights are fetched once into the voxweave cache). smart_split and
     file writing are handled by :func:`process`.
 
@@ -1013,6 +1045,12 @@ def transcribe(
     panns_handoff = False
     try:
         rep.step("prepare audio")
+        if voiceprints:
+            # Idempotent after process()'s own prefetch: a cached checkpoint is
+            # only re-verified. A failure turns voiceprints off for this run.
+            voiceprints = _prefetch_voiceprint_models(
+                voiceprint_model, lang_override, rep
+            )
         vocals: Path | None = None
         fullband: Path | None = None
         voc32: Path | None = None  # 32k mono vocals: PANNs input + cache source
@@ -2472,6 +2510,7 @@ def process(
 
     if voiceprints and (not diarize or word_segments is not None):
         raise ValueError("voiceprint capture requires a fresh diarization run")
+    capture_ready = False
     if voiceprints:
         from voxweave import voiceembed
 
@@ -2479,6 +2518,9 @@ def process(
         # work; the per-language routing itself waits for the detected language.
         voiceembed.resolve_voiceprint_choice(voiceprint_model)
         _log_voiceprint_notice_once()
+        capture_ready = _prefetch_voiceprint_models(
+            voiceprint_model, lang_override, rep
+        )
     try:
         expected_json = episode_transaction.capture_file_generation(
             swap_ext(media_path, ".json")
@@ -2521,7 +2563,7 @@ def process(
                 ),
             )
             raise
-    if voiceprints:
+    if capture_ready:
         snapshots = ExitStack()
         try:
             snapshot = snapshots.enter_context(MediaSnapshot(media_path))

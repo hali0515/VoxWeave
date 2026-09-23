@@ -979,3 +979,127 @@ def test_cli_voiceprint_model_is_validated_and_reaches_process(tmp_path, monkeyp
     assert seen["voiceprint_model"] == "anime-va-ecapa-gn"
     assert bad.exit_code != 0
     assert "unknown voiceprint model" in bad.output
+
+
+# --------------------------------------------------------------------------
+# Checkpoint prefetch at the start of the run
+# --------------------------------------------------------------------------
+
+
+def test_prefetch_failure_turns_capture_off_but_keeps_the_subtitles(
+    tmp_path, monkeypatch, caplog
+):
+    from voxweave import voiceembed
+
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    seen: dict[str, object] = {}
+
+    def unavailable(cli_value, language_iso):
+        seen["prefetch"] = (cli_value, language_iso)
+        raise voiceembed.VoiceEmbeddingError(
+            "could not download voiceprint model redimnet2: timed out"
+        )
+
+    def fake_transcribe(source, **kwargs):
+        assert "prefetch" in seen, "the prefetch must run before any audio work"
+        seen["source"] = Path(source)
+        seen["voiceprints"] = kwargs["voiceprints"]
+        return "en", [dict(UNIT)], [(0.0, 1.0)], [], [TURN], None
+
+    monkeypatch.setattr(voiceembed, "prefetch_checkpoints", unavailable)
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    monkeypatch.setattr(
+        pipeline,
+        "MediaSnapshot",
+        lambda *_a, **_k: pytest.fail("no private snapshot without a capture"),
+    )
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+
+    sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
+    assert out.exists()
+    assert seen["prefetch"] == (None, None)
+    assert seen["source"] == media
+    assert seen["voiceprints"] is False
+    assert sibling["speaker_turns"] == [list(TURN)]
+    assert "voiceprint_capture" not in sibling
+    assert not artifacts.claim_paths(media).voiceprints.exists()
+    assert "voiceprint models unavailable" in caplog.text
+    assert "timed out" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("lang_override", "expected"),
+    [
+        (None, None),
+        ("  ", None),
+        ("ja", "ja"),
+        ("Japanese", "ja"),
+        ("xx-unknown", "en"),
+    ],
+)
+def test_prefetch_follows_a_forced_language(
+    tmp_path, monkeypatch, lang_override, expected
+):
+    from voxweave import voiceembed
+
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    calls: list[tuple[object, object]] = []
+
+    def fake_prefetch(cli_value, language_iso):
+        calls.append((cli_value, language_iso))
+        return ()
+
+    def fake_transcribe(_source, **kwargs):
+        assert kwargs["voiceprints"] is True
+        turns = [TURN]
+        return "en", [dict(UNIT)], [], [], turns, _capture(turns)
+
+    monkeypatch.setattr(voiceembed, "prefetch_checkpoints", fake_prefetch)
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+
+    pipeline.process(
+        media,
+        lang_override=lang_override,
+        diarize=True,
+        voiceprints=True,
+        voiceprint_model="auto",
+        shot_snap=False,
+    )
+
+    assert calls == [("auto", expected)]
+
+
+def test_transcribe_prefetch_failure_skips_the_capture(tmp_path, monkeypatch, caplog):
+    from voxweave import voiceembed
+
+    _wav, seen = _stub_decoupled_transcribe(tmp_path, monkeypatch, language="Japanese")
+    requested, _network = _install_fake_voiceprint_embedder(monkeypatch)
+    prefetched: list[tuple[object, object]] = []
+
+    def unavailable(cli_value, language_iso):
+        prefetched.append((cli_value, language_iso))
+        raise voiceembed.VoiceEmbeddingError("anime-va checkpoint is not reachable")
+
+    monkeypatch.setattr(voiceembed, "prefetch_checkpoints", unavailable)
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"source")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        result = pipeline.transcribe(
+            media,
+            lang_override="ja",
+            separate=False,
+            diarize=True,
+            voiceprints=True,
+        )
+
+    assert prefetched == [(None, "ja")]
+    assert result[4] == [(0.0, 3.0, "SPEAKER_00")]
+    assert result[5] is None
+    assert seen["want_embeddings"] is False
+    assert requested == []
+    assert "voiceprint models unavailable" in caplog.text
