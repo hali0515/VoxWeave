@@ -234,7 +234,9 @@ def _matching_record(
     if sidecar_provenance.get("torch_version") != store_provenance.get("torch_version"):
         log.warning("voice evidence was produced by a different torch version")
     try:
-        thresholds = parse_thresholds()
+        # Both sides share one embedding space here, so the sidecar's
+        # provenance picks that space's default thresholds.
+        thresholds = parse_thresholds(provenance=sidecar_provenance)
     except ThresholdError as exc:
         log.warning("voice matching thresholds are invalid; matching skipped: %s", exc)
         return None

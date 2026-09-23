@@ -32,6 +32,7 @@ from voxweave.voicebase import (
     validate_vector,
     write_json_object,
 )
+from voxweave.voiceembed import ALIASES, AUTO, LANE_DECOUPLED, spec_by_name
 from voxweave.voicestore import (
     MAX_NAME_BYTES,
     ValidatedVoiceStore,
@@ -44,6 +45,8 @@ ENV_SUGGEST = "VOXWEAVE_VOICES_SUGGEST"
 ENV_MARGIN = "VOXWEAVE_VOICES_MARGIN"
 
 DEFAULT_ACCEPT = "off"
+# Defaults of the legacy pyannote lane; decoupled embedders carry their own
+# (voiceembed registry, see threshold_defaults).
 DEFAULT_SUGGEST = 0.45
 DEFAULT_MARGIN = 0.05
 MAX_CANDIDATES = 5
@@ -155,16 +158,42 @@ def validate_thresholds(thresholds: MatchThresholds) -> MatchThresholds:
     return MatchThresholds(accept=accept, suggest=suggest, margin=margin)
 
 
-def parse_thresholds(env: Mapping[str, str] | None = None) -> MatchThresholds:
-    """Resolve the frozen environment policy without invalid-value defaults."""
+def threshold_defaults(
+    provenance: Mapping[str, object] | None = None,
+) -> tuple[float, float]:
+    """Built-in ``(suggest, margin)`` for the embedding space ``provenance`` names.
+
+    Cosine scales differ between embedders, so each registered decoupled
+    embedder carries its own defaults; the legacy pyannote lane (and any
+    embedder this version does not know) keeps :data:`DEFAULT_SUGGEST` /
+    :data:`DEFAULT_MARGIN`.
+    """
+    if provenance is not None and provenance.get("embedding_lane") == LANE_DECOUPLED:
+        spec = spec_by_name(provenance.get("embedding_model"))
+        if spec is not None:
+            return spec.suggest, spec.margin
+    return DEFAULT_SUGGEST, DEFAULT_MARGIN
+
+
+def parse_thresholds(
+    env: Mapping[str, str] | None = None,
+    *,
+    provenance: Mapping[str, object] | None = None,
+) -> MatchThresholds:
+    """Resolve the frozen environment policy without invalid-value defaults.
+
+    ``VOXWEAVE_VOICES_*`` always win; unset ones fall back to the defaults of the
+    embedding space ``provenance`` describes (see :func:`threshold_defaults`).
+    """
     values = os.environ if env is None else env
+    default_suggest, default_margin = threshold_defaults(provenance)
     raw_accept = values.get(ENV_ACCEPT, DEFAULT_ACCEPT)
     if raw_accept.strip().lower() == "off":
         accept: float | None = None
     else:
         accept = _finite_float(raw_accept, ENV_ACCEPT)
-    suggest = _finite_float(values.get(ENV_SUGGEST, str(DEFAULT_SUGGEST)), ENV_SUGGEST)
-    margin = _finite_float(values.get(ENV_MARGIN, str(DEFAULT_MARGIN)), ENV_MARGIN)
+    suggest = _finite_float(values.get(ENV_SUGGEST, str(default_suggest)), ENV_SUGGEST)
+    margin = _finite_float(values.get(ENV_MARGIN, str(default_margin)), ENV_MARGIN)
     return validate_thresholds(
         MatchThresholds(accept=accept, suggest=suggest, margin=margin)
     )
@@ -215,10 +244,127 @@ def _strict_int(
     )
 
 
+def _strict_audio(
+    provenance: Mapping[str, object],
+    unresolved: list[str],
+) -> dict[str, object]:
+    """The audio profile both lanes hash: what signal the embedder heard."""
+    audio = require_mapping(provenance.get("audio"), "audio")
+    separated = audio.get("separated")
+    normalized = audio.get("normalized")
+    if type(separated) is not bool or type(normalized) is not bool:
+        raise CompatibilityError("audio separated/normalized must be booleans")
+    sample_rate = _strict_int(
+        audio.get("sample_rate"),
+        "audio.sample_rate",
+        unresolved,
+        minimum=1,
+    )
+    strict_audio: dict[str, object] = {
+        "separated": separated,
+        "normalized": normalized,
+        "sample_rate": sample_rate,
+    }
+    if separated:
+        separator = require_mapping(audio.get("separator"), "audio.separator")
+        config_value = separator.get("config_sha256", separator.get("config"))
+        strict_audio["separator"] = {
+            "repo": _strict_string(
+                separator.get("repo"),
+                "audio.separator.repo",
+                unresolved,
+            ),
+            "file": _strict_string(
+                separator.get("file"),
+                "audio.separator.file",
+                unresolved,
+            ),
+            "checkpoint": _strict_string(
+                separator.get("checkpoint"),
+                "audio.separator.checkpoint",
+                unresolved,
+            ),
+            "config_sha256": _strict_sha(
+                config_value,
+                "audio.separator.config_sha256",
+                unresolved,
+            ),
+        }
+    return strict_audio
+
+
+# Decoupled-lane fields that define the embedding space, in reporting order.
+DECOUPLED_FIELDS: tuple[str, ...] = (
+    "embedding_model",
+    "embedding_checkpoint",
+    "embedding_dim",
+    "embedding_recipe",
+)
+
+
+def _decoupled_fingerprint(provenance: Mapping[str, object]) -> CompatibilityResult:
+    """Hash only what defines a dedicated embedder's space.
+
+    The diarization pipeline, its config digest and the pyannote version are
+    deliberately excluded: they choose the turns, not the vector space, so
+    switching the diarizer must not orphan a voice store.
+    """
+    unresolved: list[str] = []
+    try:
+        for field in DECOUPLED_FIELDS:
+            if provenance.get(field) is None:
+                unresolved.append(field)
+        model = provenance.get("embedding_model")
+        if model is not None:
+            _strict_string(model, "embedding_model", unresolved)
+        checkpoint = provenance.get("embedding_checkpoint")
+        if checkpoint is not None:
+            _strict_sha(checkpoint, "embedding_checkpoint", unresolved)
+        raw_dim = provenance.get("embedding_dim")
+        if raw_dim == "unresolved":
+            unresolved.append("embedding_dim")
+        elif raw_dim is not None:
+            require_dimension(raw_dim)
+        recipe = provenance.get("embedding_recipe")
+        if recipe is not None:
+            _strict_string(recipe, "embedding_recipe", unresolved)
+        strict_audio: dict[str, object] | None = None
+        if provenance.get("audio") is None:
+            unresolved.append("audio")
+        else:
+            strict_audio = _strict_audio(provenance, unresolved)
+    except CompatibilityError:
+        raise
+    except Phase2DataError as exc:
+        raise CompatibilityError(str(exc)) from exc
+    if unresolved:
+        return CompatibilityUnknown(tuple(sorted(set(unresolved))))
+    strict = {
+        "embedding_lane": LANE_DECOUPLED,
+        "embedding_model": model,
+        "embedding_checkpoint": checkpoint,
+        "embedding_dim": raw_dim,
+        "embedding_recipe": recipe,
+        "audio": strict_audio,
+    }
+    return CompatibilityFingerprint(canonical_json_digest(strict))
+
+
 def build_compatibility_fingerprint(
     provenance: Mapping[str, object],
 ) -> CompatibilityResult:
-    """Hash resolved embedding-space provenance, excluding descriptive torch."""
+    """Hash resolved embedding-space provenance, excluding descriptive torch.
+
+    Provenance without ``embedding_lane`` is the legacy pyannote lane and keeps
+    its original digest byte for byte; ``embedding_lane: "decoupled"`` hashes
+    only the dedicated embedder's space (see :func:`_decoupled_fingerprint`).
+    Any other lane value is unknown and never compatible.
+    """
+    if "embedding_lane" in provenance:
+        lane = provenance.get("embedding_lane")
+        if lane == LANE_DECOUPLED:
+            return _decoupled_fingerprint(provenance)
+        return CompatibilityUnknown(("embedding_lane",))
     unresolved: list[str] = []
     try:
         outer_model = _strict_string(
@@ -257,47 +403,7 @@ def build_compatibility_fingerprint(
             "torch_version",
             max_bytes=MAX_PROVENANCE_STRING_BYTES,
         )
-        audio = require_mapping(provenance.get("audio"), "audio")
-        separated = audio.get("separated")
-        normalized = audio.get("normalized")
-        if type(separated) is not bool or type(normalized) is not bool:
-            raise CompatibilityError("audio separated/normalized must be booleans")
-        sample_rate = _strict_int(
-            audio.get("sample_rate"),
-            "audio.sample_rate",
-            unresolved,
-            minimum=1,
-        )
-        strict_audio: dict[str, object] = {
-            "separated": separated,
-            "normalized": normalized,
-            "sample_rate": sample_rate,
-        }
-        if separated:
-            separator = require_mapping(audio.get("separator"), "audio.separator")
-            config_value = separator.get("config_sha256", separator.get("config"))
-            strict_audio["separator"] = {
-                "repo": _strict_string(
-                    separator.get("repo"),
-                    "audio.separator.repo",
-                    unresolved,
-                ),
-                "file": _strict_string(
-                    separator.get("file"),
-                    "audio.separator.file",
-                    unresolved,
-                ),
-                "checkpoint": _strict_string(
-                    separator.get("checkpoint"),
-                    "audio.separator.checkpoint",
-                    unresolved,
-                ),
-                "config_sha256": _strict_sha(
-                    config_value,
-                    "audio.separator.config_sha256",
-                    unresolved,
-                ),
-            }
+        strict_audio = _strict_audio(provenance, unresolved)
     except CompatibilityError:
         raise
     except Phase2DataError as exc:
@@ -377,10 +483,87 @@ def _audio_summary(value: object) -> str:
     return ", ".join(parts)
 
 
+_DECOUPLED_REPORTED_FIELDS: tuple[tuple[str, str], ...] = (
+    ("embedding_checkpoint", "embedding checkpoint"),
+    ("embedding_dim", "embedding dimension"),
+    ("embedding_recipe", "centroid recipe"),
+)
+
+LEGACY_VOICEPRINT_HINT = (
+    "run transcription with --voiceprint-model pyannote "
+    '(or [voiceprint].model = "pyannote") to keep matching against this legacy '
+    "store, or re-enroll it with the new embedder"
+)
+
+
+def _is_decoupled(provenance: Mapping[str, object]) -> bool:
+    return provenance.get("embedding_lane") == LANE_DECOUPLED
+
+
+def embedding_space_label(provenance: Mapping[str, object]) -> str:
+    """Name the embedding space a provenance record describes, for humans."""
+    model = _readable_provenance_value(provenance.get("embedding_model"))
+    if _is_decoupled(provenance):
+        return f"{model} embeddings"
+    if "embedding_lane" in provenance:
+        lane = _readable_provenance_value(provenance.get("embedding_lane"))
+        return f"an unknown embedding lane ({lane})"
+    return f"pyannote embeddings ({model})"
+
+
+def _audio_difference(
+    episode_provenance: Mapping[str, object],
+    store_provenance: Mapping[str, object],
+) -> list[str]:
+    stored_audio = store_provenance.get("audio")
+    current_audio = episode_provenance.get("audio")
+    if stored_audio == current_audio:
+        return []
+    return [
+        f"audio profile: store {_audio_summary(stored_audio)}, "
+        f"this run {_audio_summary(current_audio)}"
+    ]
+
+
+def _space_differences(
+    episode_provenance: Mapping[str, object],
+    store_provenance: Mapping[str, object],
+) -> list[str] | None:
+    """Differences once either side is outside the legacy lane, else ``None``."""
+    episode_lane = episode_provenance.get("embedding_lane")
+    store_lane = store_provenance.get("embedding_lane")
+    if episode_lane is None and store_lane is None:
+        return None
+    space = (
+        f"store was built with {embedding_space_label(store_provenance)}; "
+        f"this run uses {embedding_space_label(episode_provenance)}"
+    )
+    if episode_lane != store_lane:
+        return [space]
+    differences: list[str] = []
+    if store_provenance.get("embedding_model") != episode_provenance.get(
+        "embedding_model"
+    ):
+        differences.append(space)
+    for field, label in _DECOUPLED_REPORTED_FIELDS:
+        stored = store_provenance.get(field)
+        current = episode_provenance.get(field)
+        if stored == current:
+            continue
+        differences.append(
+            f"{label}: store {_readable_provenance_value(stored)}, "
+            f"this run {_readable_provenance_value(current)}"
+        )
+    return differences + _audio_difference(episode_provenance, store_provenance)
+
+
 def _provenance_differences(
     episode_provenance: Mapping[str, object],
     store_provenance: Mapping[str, object],
 ) -> list[str]:
+    space = _space_differences(episode_provenance, store_provenance)
+    if space is not None:
+        return space
     differences: list[str] = []
     for field, label in _REPORTED_PROVENANCE_FIELDS:
         stored = store_provenance.get(field)
@@ -391,14 +574,7 @@ def _provenance_differences(
             f"{label}: store {_readable_provenance_value(stored)}, "
             f"this run {_readable_provenance_value(current)}"
         )
-    stored_audio = store_provenance.get("audio")
-    current_audio = episode_provenance.get("audio")
-    if stored_audio != current_audio:
-        differences.append(
-            f"audio profile: store {_audio_summary(stored_audio)}, "
-            f"this run {_audio_summary(current_audio)}"
-        )
-    return differences
+    return differences + _audio_difference(episode_provenance, store_provenance)
 
 
 def _describe_unresolved(
@@ -422,12 +598,53 @@ def legacy_diarize_recovery_hint(
     episode_provenance: Mapping[str, object],
     store_provenance: Mapping[str, object],
 ) -> str | None:
-    """Return the way back when only the diarizer default flip separates them."""
+    """Return the way back when only the diarizer default flip separates them.
+
+    Only the legacy lane depends on the diarizer: a store in a dedicated
+    embedder's space never needs the old pipeline back.
+    """
     if (
-        store_provenance.get("diarization_model") == config.LEGACY_DIARIZE_MODEL
+        "embedding_lane" not in store_provenance
+        and store_provenance.get("diarization_model") == config.LEGACY_DIARIZE_MODEL
         and episode_provenance.get("diarization_model") == config.DEFAULT_DIARIZE_MODEL
     ):
         return LEGACY_DIARIZE_HINT
+    return None
+
+
+def _voiceprint_alias(model: object) -> str:
+    """The ``--voiceprint-model`` value that selects a recorded embedder."""
+    for alias, name in ALIASES.items():
+        if name == model and alias != AUTO:
+            return alias
+    return _readable_provenance_value(model)
+
+
+def embedding_space_recovery_hint(
+    episode_provenance: Mapping[str, object],
+    store_provenance: Mapping[str, object],
+) -> str | None:
+    """Return the way back when the voiceprint embedder separates them."""
+    episode_lane = episode_provenance.get("embedding_lane")
+    store_lane = store_provenance.get("embedding_lane")
+    if store_lane is None and episode_lane == LANE_DECOUPLED:
+        hint = LEGACY_VOICEPRINT_HINT
+        diarize_hint = legacy_diarize_recovery_hint(
+            episode_provenance, store_provenance
+        )
+        if diarize_hint is not None:
+            hint = (
+                f"{hint}; the store also predates the diarizer default: {diarize_hint}"
+            )
+        return hint
+    if store_lane == LANE_DECOUPLED and store_provenance.get(
+        "embedding_model"
+    ) != episode_provenance.get("embedding_model"):
+        alias = _voiceprint_alias(store_provenance.get("embedding_model"))
+        return (
+            f"run transcription with --voiceprint-model {alias} to keep matching "
+            "against this store, or re-enroll it with the new embedder"
+        )
     return None
 
 
@@ -451,7 +668,9 @@ def describe_compatibility_mismatch(
     if not differences:
         differences = ["the recorded pipeline configuration differs"]
     detail = "compatibility differs; " + "; ".join(differences)
-    hint = legacy_diarize_recovery_hint(episode_provenance, store_provenance)
+    hint = embedding_space_recovery_hint(
+        episode_provenance, store_provenance
+    ) or legacy_diarize_recovery_hint(episode_provenance, store_provenance)
     return detail if hint is None else f"{detail}. {hint}"
 
 
@@ -734,6 +953,7 @@ __all__ = [
     "CompatibilityFingerprint",
     "CompatibilityResult",
     "CompatibilityUnknown",
+    "DECOUPLED_FIELDS",
     "DEFAULT_ACCEPT",
     "DEFAULT_MARGIN",
     "DEFAULT_SUGGEST",
@@ -741,6 +961,7 @@ __all__ = [
     "ENV_MARGIN",
     "ENV_SUGGEST",
     "LEGACY_DIARIZE_HINT",
+    "LEGACY_VOICEPRINT_HINT",
     "MAX_CANDIDATES",
     "MatchCandidate",
     "MatchThresholds",
@@ -751,12 +972,15 @@ __all__ = [
     "compatibility_equal",
     "delete_suggest",
     "describe_compatibility_mismatch",
+    "embedding_space_label",
+    "embedding_space_recovery_hint",
     "legacy_diarize_recovery_hint",
     "load_suggest",
     "match_speakers",
     "parse_thresholds",
     "require_known_compatibility",
     "suggest_bytes",
+    "threshold_defaults",
     "validate_suggest_record",
     "validate_thresholds",
     "write_suggest",

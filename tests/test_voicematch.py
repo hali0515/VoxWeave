@@ -466,3 +466,245 @@ def test_unknown_compatibility_cannot_build_suggest_record():
             store=_store(),
             generated=NOW,
         )
+
+
+# --------------------------------------------------------------------------
+# Embedding lanes: legacy digest pin, decoupled fingerprint, reporting
+# --------------------------------------------------------------------------
+
+# Digests of legacy (pyannote-lane) provenance computed before the decoupled
+# lane existed. Every sidecar and voice store in the wild fingerprints like
+# this; a change here orphans all of them.
+LEGACY_PLAIN = {
+    "diarization_model": "pyannote/speaker-diarization-community-1",
+    "outer_config_sha256": "a" * 64,
+    "embedding_model": (
+        "pyannote/speaker-diarization-community-1@"
+        "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee#subfolder=embedding"
+    ),
+    "embedding_checkpoint": (
+        "6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929"
+    ),
+    "embedding_dim": 256,
+    "audio": {"separated": False, "normalized": False, "sample_rate": 16000},
+    "pyannote_version": "4.0.7",
+    "torch_version": "2.11.0",
+}
+LEGACY_SEPARATED = {
+    **LEGACY_PLAIN,
+    "audio": {
+        "separated": True,
+        "normalized": True,
+        "sample_rate": 16000,
+        "separator": {
+            "repo": "KimberleyJSN/melbandroformer",
+            "file": "MelBandRoformer.ckpt",
+            "checkpoint": "b" * 64,
+            "config_sha256": "c" * 64,
+        },
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("provenance", "digest"),
+    [
+        (
+            LEGACY_PLAIN,
+            "bdfcde76bf029e051a7e453b8355fcce0233c5774c15b84b4e08cf2c748a7302",
+        ),
+        (
+            LEGACY_SEPARATED,
+            "0376adb94f19be9eb102af5538c32b0e089c80f5b7972374f1092ef482b9ff2e",
+        ),
+    ],
+)
+def test_legacy_fingerprint_is_byte_identical_to_the_pre_decoupling_digest(
+    provenance, digest
+):
+    assert voicematch.build_compatibility_fingerprint(provenance) == (
+        voicematch.CompatibilityFingerprint(digest)
+    )
+
+
+def _decoupled(**changes):
+    provenance = {
+        **LEGACY_SEPARATED,
+        "embedding_lane": "decoupled",
+        "embedding_model": "redimnet2-b6-vb2-vox2-cnc2-lm",
+        "embedding_checkpoint": "e" * 64,
+        "embedding_dim": 192,
+        "embedding_recipe": "centroid-v1",
+    }
+    provenance.update(changes)
+    return provenance
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"diarization_model": config.LEGACY_DIARIZE_MODEL},
+        {"outer_config_sha256": "unresolved"},
+        {"pyannote_version": "5.0.0"},
+        {"torch_version": "3.0.0"},
+    ],
+)
+def test_decoupled_fingerprint_ignores_the_diarization_pipeline(changes):
+    base = voicematch.build_compatibility_fingerprint(_decoupled())
+    other = voicematch.build_compatibility_fingerprint(_decoupled(**changes))
+
+    assert isinstance(base, voicematch.CompatibilityFingerprint)
+    assert voicematch.compatibility_equal(base, other)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"embedding_model": "anime-va-ecapa-gn"},
+        {"embedding_checkpoint": "f" * 64},
+        {"embedding_dim": 256},
+        {"embedding_recipe": "centroid-v2"},
+        {"audio": LEGACY_PLAIN["audio"]},
+    ],
+)
+def test_decoupled_fingerprint_tracks_the_embedding_space(changes):
+    base = voicematch.build_compatibility_fingerprint(_decoupled())
+    other = voicematch.build_compatibility_fingerprint(_decoupled(**changes))
+
+    assert isinstance(other, voicematch.CompatibilityFingerprint)
+    assert not voicematch.compatibility_equal(base, other)
+
+
+def test_lanes_never_share_a_fingerprint():
+    legacy = voicematch.build_compatibility_fingerprint(LEGACY_SEPARATED)
+    decoupled = voicematch.build_compatibility_fingerprint(_decoupled())
+
+    assert not voicematch.compatibility_equal(legacy, decoupled)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "embedding_model",
+        "embedding_checkpoint",
+        "embedding_dim",
+        "embedding_recipe",
+        "audio",
+    ],
+)
+def test_missing_decoupled_field_is_unknown(field):
+    provenance = _decoupled()
+    del provenance[field]
+
+    result = voicematch.build_compatibility_fingerprint(provenance)
+
+    assert isinstance(result, voicematch.CompatibilityUnknown)
+    assert field in result.unresolved_fields
+
+
+def test_unresolved_decoupled_values_are_unknown_and_malformed_ones_refused():
+    unresolved = voicematch.build_compatibility_fingerprint(
+        _decoupled(embedding_checkpoint="unresolved", embedding_dim="unresolved")
+    )
+    assert isinstance(unresolved, voicematch.CompatibilityUnknown)
+    assert unresolved.unresolved_fields == (
+        "embedding_checkpoint",
+        "embedding_dim",
+    )
+    with pytest.raises(voicematch.CompatibilityError):
+        voicematch.build_compatibility_fingerprint(
+            _decoupled(embedding_checkpoint="not-a-sha")
+        )
+    with pytest.raises(voicematch.CompatibilityError):
+        voicematch.build_compatibility_fingerprint(_decoupled(embedding_dim=4))
+
+
+def test_unknown_embedding_lane_is_never_compatible():
+    result = voicematch.build_compatibility_fingerprint(
+        _decoupled(embedding_lane="future")
+    )
+
+    assert isinstance(result, voicematch.CompatibilityUnknown)
+    assert result.unresolved_fields == ("embedding_lane",)
+
+
+def test_legacy_store_against_decoupled_run_names_both_spaces_and_the_way_back():
+    store_provenance = copy.deepcopy(LEGACY_SEPARATED)
+    episode_provenance = _decoupled()
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "store was built with pyannote embeddings (" in detail
+    assert "this run uses redimnet2-b6-vb2-vox2-cnc2-lm embeddings" in detail
+    assert "--voiceprint-model pyannote" in detail
+    assert '[voiceprint].model = "pyannote"' in detail
+    assert "--diarize-model" not in detail
+
+
+def test_legacy_31_store_against_decoupled_run_also_names_the_diarizer_way_back():
+    store_provenance = {
+        **copy.deepcopy(LEGACY_SEPARATED),
+        "diarization_model": config.LEGACY_DIARIZE_MODEL,
+    }
+    episode_provenance = _decoupled(diarization_model=config.DEFAULT_DIARIZE_MODEL)
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "--voiceprint-model pyannote" in detail
+    assert "--diarize-model 3.1" in detail
+
+
+def test_decoupled_store_from_another_embedder_names_its_alias():
+    store_provenance = _decoupled(
+        embedding_model="anime-va-ecapa-gn", embedding_checkpoint="f" * 64
+    )
+    episode_provenance = _decoupled()
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "store was built with anime-va-ecapa-gn embeddings" in detail
+    assert "this run uses redimnet2-b6-vb2-vox2-cnc2-lm embeddings" in detail
+    assert "--voiceprint-model anime-va" in detail
+    assert "pyannote version" not in detail
+    assert "diarization model" not in detail
+
+
+def test_decoupled_audio_difference_is_reported_without_a_model_hint():
+    store_provenance = _decoupled(audio=LEGACY_PLAIN["audio"])
+    episode_provenance = _decoupled()
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "audio profile" in detail
+    assert "store was built with" not in detail
+    assert "--voiceprint-model" not in detail
+
+
+def test_threshold_defaults_follow_the_embedding_space():
+    from voxweave import voiceembed
+
+    assert voicematch.threshold_defaults(None) == (0.45, 0.05)
+    assert voicematch.threshold_defaults(LEGACY_SEPARATED) == (0.45, 0.05)
+    assert voicematch.threshold_defaults(_decoupled()) == (
+        voiceembed.REDIMNET2_B6.suggest,
+        voiceembed.REDIMNET2_B6.margin,
+    )
+    assert voicematch.threshold_defaults(
+        _decoupled(embedding_model="anime-va-ecapa-gn")
+    ) == (voiceembed.ANIME_VA.suggest, voiceembed.ANIME_VA.margin)
+    assert voicematch.threshold_defaults(
+        _decoupled(embedding_model="future-embedder")
+    ) == (0.45, 0.05)
+
+
+def test_environment_thresholds_still_win_over_embedder_defaults():
+    anime = _decoupled(embedding_model="anime-va-ecapa-gn")
+
+    defaults = voicematch.parse_thresholds({}, provenance=anime)
+    overridden = voicematch.parse_thresholds(
+        {"VOXWEAVE_VOICES_SUGGEST": "0.6", "VOXWEAVE_VOICES_MARGIN": "0.1"},
+        provenance=anime,
+    )
+
+    assert (defaults.suggest, defaults.margin) == voicematch.threshold_defaults(anime)
+    assert (overridden.suggest, overridden.margin) == (0.6, 0.1)
