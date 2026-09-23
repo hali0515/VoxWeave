@@ -194,9 +194,43 @@ def test_space_names_follow_model_and_fingerprint():
 
 
 def test_episode_scope_is_show_or_media_folder(tmp_path):
-    media = tmp_path / "Season 2" / "ep01.mkv"
-    assert voicelibrary.episode_scope(media) == "Season 2"
+    media = tmp_path / "Frieren" / "ep01.mkv"
+    assert voicelibrary.episode_scope(media) == "Frieren"
     assert voicelibrary.episode_scope(media, "  My\tShow ") == "My Show"
+
+
+@pytest.mark.parametrize(
+    "folder",
+    [
+        "Season 1",
+        "season 02",
+        "S01",
+        "S1",
+        "Series 3",
+        "Disc 2",
+        "Vol.3",
+        "Part 2",
+        "2023",
+        "Specials",
+        "Extras",
+        "OVA",
+        "\u7b2c2\u5b63",  # season 2
+        "\u7b2c\u4e09\u671f",  # third period (cour)
+        "\u7b2c\uff11\u90e8",  # part 1, full-width digit
+    ],
+)
+def test_generic_folder_names_are_qualified_with_their_parent(tmp_path, folder):
+    media = tmp_path / "Show A" / folder / "S01E01.mkv"
+    assert voicelibrary.episode_scope(media) == f"Show A / {folder}"
+    # --show is used as given.
+    assert voicelibrary.episode_scope(media, "Show A") == "Show A"
+
+
+def test_distinctive_folder_names_stay_bare(tmp_path):
+    for folder in ("Frieren", "Season 1 (2023)", "1080p", "Alex birthday"):
+        media = tmp_path / "anime" / folder / "ep.mkv"
+        assert voicelibrary.episode_scope(media) == folder
+    assert voicelibrary.episode_scope(Path("/Season 1/ep.mkv")) == "Season 1"
 
 
 # --------------------------------------------------------------------------
@@ -364,7 +398,12 @@ def test_a_new_capture_of_the_same_media_in_a_renamed_scope_needs_replace(tmp_pa
     with pytest.raises(voicestore.EnrollmentRefusal, match="use --replace to move"):
         _enroll(root, [entry], scope="Frieren (2023) S1", source=recaptured, ids=ids)
     outcomes = _enroll(
-        root, [entry], scope="Frieren (2023) S1", source=recaptured, ids=ids, replace=True
+        root,
+        [entry],
+        scope="Frieren (2023) S1",
+        source=recaptured,
+        ids=ids,
+        replace=True,
     )
     assert [o.outcome for o in outcomes] == ["replace"]
     state = _read(root)
@@ -795,9 +834,7 @@ def test_misfiled_spaces_are_rejected(tmp_path):
         _read(root, spaces=["pyannote-000000000000"])
 
 
-def test_orphan_exemplars_are_skipped_on_read_and_deleted_by_a_writer(
-    tmp_path, caplog
-):
+def test_orphan_exemplars_are_skipped_on_read_and_deleted_by_a_writer(tmp_path, caplog):
     # What a forget racing an enrollment on a mount without working locks
     # leaves behind: vectors of an identity identities.json no longer has.
     root = tmp_path / "voices"

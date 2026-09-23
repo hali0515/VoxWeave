@@ -95,8 +95,10 @@ What stays the same, and what to do:
   file keeps the vectors of everyone in it: `voxweave voices forget ID` stops VoxWeave
   from reading them for that person and lists the files that still hold them, but only
   deleting those files removes the vectors from disk.
-- `--show` now also names the scope of an enrollment. Folder names such as `Season 1`
-  exist in many shows; pass `--show` there to keep shows apart.
+- `--show` now also names the scope of an enrollment. Without it, the scope is the media
+  folder's name, qualified with its parent for generic names such as `Season 1`, `S02`,
+  `Disc 1` or `Specials` (`Frieren / Season 1`); pass `--show` where two unrelated folders
+  share a distinctive name.
 - Enrolling a name does not merge it with a same-named person of another scope unless you
   used that person's suggestion on the review page; use `voxweave voices list`,
   `show`, `rename` and `forget` to curate the result.

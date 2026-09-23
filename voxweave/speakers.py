@@ -1902,9 +1902,9 @@ def enroll_speaker_voices(
 
     The voices go to the global voice library (``voices_dir``, else its
     configured location) under the episode's scope, which is ``show`` or else
-    the media folder's name; the library directory is returned. An explicit
-    ``voices`` per-show store keeps its pre-library behavior instead and its
-    path is returned.
+    the media folder's name (see voicelibrary.episode_scope); the library
+    directory is returned. An explicit ``voices`` per-show store keeps its
+    pre-library behavior instead and its path is returned.
     """
     if voices is not None and voices_dir is not None:
         raise ValueError("use either a voices store or a voice library, not both")

@@ -119,7 +119,7 @@ def _library(root=None):
 
 
 def test_enroll_defaults_to_the_library_scoped_by_folder(tmp_path):
-    media = _episode(tmp_path / "Season 1", names={"SPEAKER_00": "Aqua"})
+    media = _episode(tmp_path / "Show" / "Season 1", names={"SPEAKER_00": "Aqua"})
     mapping = artifacts.claim_paths(media).speaker_mapping.read_bytes()
 
     root = speakers.enroll_speaker_voices(media)
@@ -128,14 +128,14 @@ def test_enroll_defaults_to_the_library_scoped_by_folder(tmp_path):
     state = _library(root)
     [(identity_id, identity)] = state.identity_map.items()
     assert identity["display_name"] == "Aqua"
-    assert identity["scopes"] == ["Season 1"]
+    assert identity["scopes"] == ["Show / Season 1"]
     [space] = state.spaces
     [exemplar] = state.space_exemplars(space)[identity_id]
     assert exemplar["source"]["media_path"] == str(media)
     assert exemplar["source"]["speaker_label"] == "SPEAKER_00"
     assert exemplar["source"]["episode"] == "episode"
     assert artifacts.claim_paths(media).speaker_mapping.read_bytes() == mapping
-    assert not (tmp_path / "Season 1" / "voxweave.voices.json").exists()
+    assert not (tmp_path / "Show" / "Season 1" / "voxweave.voices.json").exists()
 
 
 def test_show_names_the_scope_and_voices_dir_moves_the_library(tmp_path):
@@ -181,9 +181,9 @@ def test_voices_and_voices_dir_are_exclusive(tmp_path):
 
 
 def test_other_folder_gets_a_labelled_tier_two_suggestion(tmp_path):
-    first = _episode(tmp_path / "Season 1", names={"SPEAKER_00": "Aqua"})
+    first = _episode(tmp_path / "Show" / "Season 1", names={"SPEAKER_00": "Aqua"})
     speakers.enroll_speaker_voices(first)
-    second = _episode(tmp_path / "Season 2", capture_digit="2")
+    second = _episode(tmp_path / "Show" / "Season 2", capture_digit="2")
 
     page = speakers.create_speaker_audition(second).page
 
@@ -193,13 +193,13 @@ def test_other_folder_gets_a_labelled_tier_two_suggestion(tmp_path):
     assert match["decision"] == "none"
     [candidate] = match["secondary"]["candidates"]
     assert candidate["display_name"] == "Aqua"
-    assert candidate["scopes"] == ["Season 1"]
-    assert suggest["voices"]["show"] == "Season 2"
+    assert candidate["scopes"] == ["Show / Season 1"]
+    assert suggest["voices"]["show"] == "Show / Season 2"
     assert "global_suggest" in suggest["thresholds"]
     assert 'data-tier="2"' in page
     assert "Other scopes" in page
-    assert "Aqua (1.00) from Season 1 [use]" in page
-    assert "This scope (Season 2)" in page
+    assert "Aqua (1.00) from Show / Season 1 [use]" in page
+    assert "This scope (Show / Season 2)" in page
     assert "machine-suggested" not in page
 
 
@@ -218,16 +218,16 @@ def test_same_scope_is_tier_one(tmp_path):
 
 
 def test_using_a_suggestion_links_the_identity_across_scopes(tmp_path):
-    first = _episode(tmp_path / "Season 1", names={"SPEAKER_00": "Aqua"})
+    first = _episode(tmp_path / "Show" / "Season 1", names={"SPEAKER_00": "Aqua"})
     speakers.enroll_speaker_voices(first)
-    second = _episode(tmp_path / "Season 2", capture_digit="2")
+    second = _episode(tmp_path / "Show" / "Season 2", capture_digit="2")
     speakers.create_speaker_audition(second)
     _name(second, {"SPEAKER_00": "Aqua"})
 
     speakers.enroll_speaker_voices(second)
 
     [(identity_id, identity)] = _library().identity_map.items()
-    assert identity["scopes"] == ["Season 1", "Season 2"]
+    assert identity["scopes"] == ["Show / Season 1", "Show / Season 2"]
     [space] = _library().spaces
     assert len(_library().space_exemplars(space)[identity_id]) == 2
 
@@ -248,6 +248,30 @@ def test_a_bare_name_never_links_scopes(tmp_path):
     identities = _library().identity_map
     assert len(identities) == 2
     assert sorted(i["scopes"][0] for i in identities.values()) == ["Show A", "Show B"]
+
+
+def test_season_folders_of_different_shows_are_different_scopes(tmp_path):
+    # "Season 1" exists in every show: a typed name must not link the two
+    # narrators, and the same media stem must not collide.
+    first = _episode(
+        tmp_path / "Show A" / "Season 1", "S01E01", names={"SPEAKER_00": "Narrator"}
+    )
+    speakers.enroll_speaker_voices(first)
+    second = _episode(
+        tmp_path / "Show B" / "Season 1",
+        "S01E01",
+        capture_digit="2",
+        vectors={"SPEAKER_00": list(OTHER)},
+        names={"SPEAKER_00": "Narrator"},
+    )
+
+    speakers.enroll_speaker_voices(second)
+
+    identities = _library().identity_map
+    assert sorted(i["scopes"] for i in identities.values()) == [
+        ["Show A / Season 1"],
+        ["Show B / Season 1"],
+    ]
 
 
 def test_same_scope_name_resolves_and_repeat_is_a_noop(tmp_path):
@@ -373,10 +397,10 @@ def _forget(identity_id):
 
 
 def test_a_review_page_older_than_a_forget_cannot_bring_the_id_back(tmp_path):
-    first = _episode(tmp_path / "Season 1", names={"SPEAKER_00": "Aqua"})
+    first = _episode(tmp_path / "Show" / "Season 1", names={"SPEAKER_00": "Aqua"})
     speakers.enroll_speaker_voices(first)
     [forgotten] = _library().identity_map
-    second = _episode(tmp_path / "Season 2", capture_digit="2")
+    second = _episode(tmp_path / "Show" / "Season 2", capture_digit="2")
     speakers.create_speaker_audition(second)  # the page offers `forgotten`
     _forget(forgotten)
     _name(second, {"SPEAKER_00": "Aqua"})  # the reviewer used that suggestion

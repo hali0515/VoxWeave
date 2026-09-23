@@ -174,8 +174,9 @@ def build_speakers_group(
     )
     @click.option(
         "--show",
-        help="Scope of these voices (default: the media folder's name); with "
-        "--voices, the store's show name.",
+        help="Scope of these voices (default: the media folder's name, prefixed "
+        "with its parent's for generic folders like 'Season 1'); with --voices, "
+        "the store's show name.",
     )
     @click.option("--episode", help="Enrollment label (default: media stem).")
     @click.option(
@@ -250,7 +251,8 @@ def build_speakers_group(
     )
     @click.option(
         "--show",
-        help="Scope for suggestions (default: the media folder's name): voices "
+        help="Scope for suggestions (default: the media folder's name, prefixed with "
+        "its parent's for generic folders like 'Season 1'): voices "
         "of this scope first, other scopes only on a stricter match.",
     )
     @click.option(

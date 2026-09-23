@@ -407,8 +407,11 @@ person in another folder of recordings) are suggested only above a stricter simi
 (tier 2: `VOXWEAVE_VOICES_GLOBAL_SUGGEST`), are never prefilled, and are labelled with the scopes
 they come from. The bar is stricter because false suggestions grow with the library: if one
 unrelated voice clears it with probability *p*, a library of *N* unrelated voices produces at
-least one false suggestion with probability 1 - (1 - *p*)^*N*. Generic folder names such as
-`Season 1` are shared by many shows; pass `--show` to keep them apart.
+least one false suggestion with probability 1 - (1 - *p*)^*N*. A generic folder name, one that
+many shows share (a season, disc, part or year number such as `Season 1`, `S02`, `Disc 1` or
+`2023`, or `Specials`), is qualified with its parent folder: episodes in `Frieren/Season 1` get
+the scope `Frieren / Season 1`. Other folder names are used as they are, so two unrelated
+folders with the same name (say `Recordings`) share a scope; pass `--show` to keep them apart.
 
 A name you enter links to an existing identity only when you used that identity's suggestion
 button, or when an identity of the same scope carries that name. Otherwise enrollment creates a

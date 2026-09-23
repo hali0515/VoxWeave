@@ -291,11 +291,52 @@ def normalize_scope(raw: object) -> str:
     return normalize_speaker_key(raw, field="scope")
 
 
+# Folder names that many shows share: a season, disc, part or year number, or
+# a bonus-material folder. They only name a scope together with their parent.
+_NUMBERED_FOLDER_RE = re.compile(
+    r"(?:(?:season|series|staffel|saison|temporada|stagione|seizoen|s|disc|disk|"
+    r"cd|dvd|bd|part|pt|vol|volume|book|cour)[\s._-]*)?\d+",
+    re.IGNORECASE,
+)
+_BONUS_FOLDER_RE = re.compile(
+    r"specials?|extras?|bonus|featurettes?|ovas?|sp", re.IGNORECASE
+)
+# A CJK season or part number: DI (U+7B2C), a number in ASCII, full-width or
+# CJK digits, then season, period or part (U+5B63, U+671F, U+90E8).
+_CJK_SEASON_RE = re.compile(
+    "\u7b2c\\s*[0-9\uff10-\uff19"
+    "\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+"
+    "\\s*[\u5b63\u671f\u90e8]"
+)
+
+
+def is_generic_folder_name(name: str) -> bool:
+    """Whether a folder name (``Season 1``, ``S02``, ``Disc 1``, ``2023``,
+    ``Specials``, a CJK season number) is shared by many shows."""
+    text = name.strip()
+    return any(
+        pattern.fullmatch(text) is not None
+        for pattern in (_NUMBERED_FOLDER_RE, _BONUS_FOLDER_RE, _CJK_SEASON_RE)
+    )
+
+
 def episode_scope(media: Path, show: str | None = None) -> str:
-    """``--show`` when given, else the name of the media's directory."""
+    """``--show`` when given, else the name of the media's directory.
+
+    A generic directory name (``Season 1``, ``Disc 2``, ``Specials``) is
+    qualified with its parent's (``Frieren / Season 1``): a bare ``Season 1``
+    would put every show's first season in one scope, where a typed name
+    alone links identities and episode labels collide.
+    """
     if show is not None:
         return normalize_scope(show)
-    name = Path(os.path.abspath(media)).parent.name
+    folder = Path(os.path.abspath(media)).parent
+    name = folder.name
+    if is_generic_folder_name(name) and folder.parent.name:
+        try:
+            return normalize_scope(f"{folder.parent.name} / {name}")
+        except Phase2DataError:
+            pass  # too long together: fall back to the folder's own name
     try:
         return normalize_scope(name)
     except Phase2DataError:
@@ -439,10 +480,7 @@ def validate_identities(value: object) -> Mapping[str, Mapping[str, object]]:
             if len(spaces) > MAX_SPACES:
                 raise VoiceLibraryError(f"spaces may list at most {MAX_SPACES} files")
             for position, name in enumerate(spaces):
-                if (
-                    not isinstance(name, str)
-                    or _SPACE_NAME_RE.fullmatch(name) is None
-                ):
+                if not isinstance(name, str) or _SPACE_NAME_RE.fullmatch(name) is None:
                     raise VoiceLibraryError(f"spaces[{position}] is not a space name")
             if len(set(cast(list[str], spaces))) != len(spaces):
                 raise VoiceLibraryError("spaces contains duplicates")
@@ -1254,7 +1292,9 @@ def plan_library_enrollment(
                     "enrollment evidence resolves different exemplars across "
                     "indexes: " + ", ".join(sorted(keys[i].id for i in hits))
                 )
-            what = f"capture {capture_id}" if capture_hit is not None else "source media"
+            what = (
+                f"capture {capture_id}" if capture_hit is not None else "source media"
+            )
             if keys[hit].media_fingerprint != media_fingerprint:
                 raise EnrollmentRefusal(
                     f"capture integrity failure for {capture_id}: media differs"
@@ -1268,7 +1308,8 @@ def plan_library_enrollment(
             if capture_hit is not None and not vector_changed:
                 return LibraryPlan("rescope", target=hit)
             if vector_changed and (
-                turns_digest is None or stored_source.get("turns_digest") == turns_digest
+                turns_digest is None
+                or stored_source.get("turns_digest") == turns_digest
             ):
                 # The same speaker turns cannot yield another centroid.
                 raise EnrollmentRefusal(
@@ -1609,15 +1650,13 @@ def forget_identity(
             + ", ".join(state.missing_spaces)
             + ". Another machine may have just created them on a network share "
             "whose directory cache is stale: re-run in a minute. If a file was "
-            "deleted on purpose, remove its name from the \"spaces\" list in "
+            'deleted on purpose, remove its name from the "spaces" list in '
             "identities.json"
         )
     event_at = _event_time(at)
     identities = copy.deepcopy(state.identities)
     del cast(dict[str, object], identities["identities"])[identity_id]
-    identities["forgotten"] = [*forgotten_ids(identities), identity_id][
-        -MAX_FORGOTTEN:
-    ]
+    identities["forgotten"] = [*forgotten_ids(identities), identity_id][-MAX_FORGOTTEN:]
     identities["revision"] = cast(int, identities["revision"]) + 1
     spaces: dict[str, dict[str, object]] = {}
     removed: dict[str, int] = {}
