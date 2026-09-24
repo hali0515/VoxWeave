@@ -455,6 +455,8 @@ def test_min_speakers_out_of_reach_raises_instead_of_passing_through(min_speaker
     # back pyannote's labels.
     truth = _alternating(["alice", "bob"], 12)
     turns = [(s, e, "A" if who == "alice" else "B") for s, e, who in truth]
+    # A floor above the voices present is met by dividing them, as pyannote
+    # does under the same bound (the recipe measured less harm doing so).
     reached = vp.cluster_turns(turns, FakeEmbed(truth), min_speakers=4)
     assert _speakers(reached) == 4
     assert vp.PASSTHROUGH not in reached.audit
@@ -464,8 +466,11 @@ def test_min_speakers_out_of_reach_raises_instead_of_passing_through(min_speaker
 
 def test_bounded_ahc_never_degrades_to_passthrough():
     # One 10 s voice and two 3.5 s voices too far apart to merge at the cut:
-    # min_speakers=2 has no answer (splitting only dissolves), which used to
-    # come back as an unflagged-looking pass-through of pyannote's labels.
+    # the cut keeps one cluster (the 10 s voice). Undoing merges only
+    # dissolves it, so no level on the walk towards fewer merges has two
+    # clusters. Merging the two small voices past the cut would give two, but
+    # as one made-up speaker, and the min walk never merges more. This used
+    # to come back as an unflagged-looking pass-through of pyannote's labels.
     vectors = {0.0: _basis(0), 6.0: _basis(0)}
     for start, sign in ((12.0, 1.0), (16.0, -1.0)):
         v = _basis(1) + sign * 0.8 * _basis(2)
@@ -476,7 +481,10 @@ def test_bounded_ahc_never_degrades_to_passthrough():
         return np.stack([vectors[start] for start, _end in spans])
 
     assert _speakers(vp.cluster_turns(turns, embed)) == 1
-    with pytest.raises(vp.ClusteringError, match="min_speakers 2 "):
+    with pytest.raises(
+        vp.ClusteringError,
+        match="min_speakers 2 cannot be met: from the cut down to no merges, at most 1 ",
+    ):
         vp.cluster_turns(turns, embed, min_speakers=2)
 
 

@@ -33,11 +33,20 @@ Pipeline (``cluster_turns``):
    Clusters holding fewer than ``dissolve_seconds`` of anchor speech are
    dissolved: their anchors are assigned like any other turn. ``min_speakers``
    / ``max_speakers`` are hard bounds on the number of surviving clusters:
-   ``ahc`` takes the merge level nearest its cut that satisfies them, and when
-   no clustering does (cannot-link keeping more than ``max_speakers`` anchor
-   groups apart, too little anchor speech for ``min_speakers`` clusters),
-   :class:`ClusteringError` is raised rather than returning a count outside
-   the bounds. Every method is held to the bounds the same way.
+   ``ahc`` walks from its cut towards the bound it misses (more merges for
+   ``max_speakers``, fewer for ``min_speakers``) and takes the first level that
+   satisfies them; when the walk finds none (cannot-link keeping more than
+   ``max_speakers`` anchor groups apart, too little anchor speech for
+   ``min_speakers`` clusters), :class:`ClusteringError` is raised rather than
+   returning a count outside the bounds. Every method is held to the bounds
+   the same way. A ``min_speakers`` above the cut's count is met by dividing
+   the voices the cut found, because a person with less than
+   ``dissolve_seconds`` of anchor speech never holds a cluster: that costs
+   accuracy against the unbounded result, but less than pyannote's own
+   clustering under the same bound (the true speaker count, on the 33
+   VoxConverse and JVS-conv dev+test recordings where the cut finds fewer;
+   recipe run on pyannote's unbounded turns: collar-0 DER 0.234, against 0.302
+   for pyannote with the bound and 0.194 for the unbounded recipe).
 4. **Centroids**: duration-weighted unit mean of each cluster's anchors.
 5. **Assignment** of every other turn: the best *local* cluster (an anchor
    within ``local_seconds`` or ``local_turns`` turns) when its cosine is at
@@ -680,17 +689,20 @@ def _fit_count(
     hi: int | None,
     start: int,
 ) -> np.ndarray:
-    """The candidate nearest ``start`` whose surviving cluster count fits [lo, hi].
+    """The first candidate from ``start`` towards the missed bound that fits [lo, hi].
 
-    Walks from ``start`` towards the bounds: more merges when there are too
-    many clusters, fewer when there are too few. Every candidate on the way is
-    tested, since dissolving makes the count non-monotonic in the number of
-    merges. The walk never goes the other way: fewer merges can only lower
-    the count by dissolving whole speakers, which is no answer to
-    ``max_speakers``. Raises :class:`ClusteringError` when nothing on the walk
-    fits (cannot-link blocking the merges ``max_speakers`` needs, too little
-    anchor speech for ``min_speakers`` clusters), instead of returning a count
-    outside the bounds.
+    Walks from ``start`` (the cut) in one direction: more merges when there
+    are too many clusters, fewer when there are too few. Every candidate on
+    the way is tested, since dissolving makes the count non-monotonic in the
+    number of merges. The walk never goes the other way, even when a level
+    there would fit: for ``max_speakers``, fewer merges can only lower the
+    count by dissolving whole speakers; for ``min_speakers``, more merges can
+    only raise it by joining small clusters the cut holds apart (voices below
+    ``minimum`` seconds each) into one made-up speaker. Raises
+    :class:`ClusteringError` when nothing on the walk fits (cannot-link
+    blocking the merges ``max_speakers`` needs, too little anchor speech for
+    ``min_speakers`` clusters), instead of returning a count outside the
+    bounds.
     """
 
     def fits(count: int) -> bool:
@@ -718,8 +730,9 @@ def _fit_count(
             "speakers apart"
         )
     raise ClusteringError(
-        f"min_speakers {lo} cannot be met: at most {max(reachable)} anchor "
-        f"cluster(s) hold the {minimum:g} s of anchor speech a speaker needs"
+        f"min_speakers {lo} cannot be met: from the cut down to no merges, at "
+        f"most {max(reachable)} anchor cluster(s) hold the {minimum:g} s of "
+        "anchor speech a speaker needs"
     )
 
 
