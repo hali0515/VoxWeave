@@ -9,15 +9,19 @@ Most of this release concerns `--voiceprints` (cross-episode voice matching and 
 this speaker**). One fix changes the audio a first run transcribes and diarizes, so a
 first run's subtitles can differ slightly from 0.17.0.
 
-### First runs hear the same audio as re-runs
+### First runs transcribe and diarize the same audio as re-runs
 
-With vocal separation on (the default), a first run used to normalize the full-band
-stereo vocals for ASR and diarization, while every later run of the same media, which
-reuses the cached `vocals.32k.flac`, normalized the 32 kHz mono copy. The two inputs
-differed by about 2.5 dB and 10-14% of diarization frames, so re-running an episode could
-change its speaker turns. A first run now derives its 16 kHz input from the 32 kHz mono
-vocals too, exactly as a re-run does. Expect small differences against a 0.17.0 first
-run; re-runs from an existing cache are unchanged.
+With vocal separation on (the default), a first run used to derive its 16 kHz ASR and
+diarization input straight from the 44.1 kHz stereo vocals, while every later run of the
+same media decodes the cached 32 kHz mono copy (`vocals.32k.flac`). A first run now goes
+through the same 32 kHz mono vocals, so both runs feed ASR and diarization identical
+samples. Without `--normalize` (the default) the old gap was only a resampling difference.
+With `--normalize` it was larger: loudness normalization measured the two inputs about
+2.5 dB apart and moved 10-14% of diarization frames, so a re-run could change the speaker
+turns. Expect small differences against a 0.17.0 first run; re-runs from an existing cache
+are unchanged. One difference remains: a first run finds the speech timing reference (gap
+splitting, snapping words to speech) on the original mix, while a re-run from the cache
+uses the separated vocals, so cue timing can still differ slightly between the two.
 
 ### Opt-in voiceprint speaker clustering
 
@@ -33,10 +37,19 @@ so their words stay with the surrounding speaker. In our measurements it confuse
 four public test sets and got more short backchannels right in an online meeting, but it can
 report more speakers than there are, and a speaker who talks very little may be merged into
 others or dropped; that is why the default stays `pyannote`, whose output is unchanged.
-`--min-speakers`/`--max-speakers` bind the voiceprint stage too. If it fails (download, out of
-memory), cannot meet those bounds, or finds no turn long enough to anchor a voiceprint, the
-run warns and keeps pyannote's speakers. `--voiceprint-model pyannote` always keeps
-pyannote's clustering, because its voiceprints are keyed by pyannote's labels.
+`--min-speakers`/`--max-speakers` bind the voiceprint stage too; a `--min-speakers` above the
+number of voices it finds is met by dividing those voices, as pyannote does under that bound
+(it cost the stage less accuracy than pyannote in our measurements, but more than no bound).
+If it fails (download, out of memory), cannot meet those bounds, or finds no turn long enough
+to anchor a voiceprint, the run warns and keeps pyannote's speakers.
+`--voiceprint-model pyannote` always keeps pyannote's clustering, because its voiceprints are
+keyed by pyannote's labels.
+
+Saved speaker names are keyed by speaker id (`SPEAKER_00`, ...), and switching
+`--speaker-clustering` (like switching `--diarize-model`) renumbers the speakers of an episode
+you already named. `process` now warns when a named id's turns changed; review the names with
+`voxweave speakers <media>` before running `voxweave speakers enroll`, or a voice can be
+stored in the voice library under someone else's name.
 
 ### Voiceprints come from a dedicated embedder
 

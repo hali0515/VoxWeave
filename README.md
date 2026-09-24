@@ -204,8 +204,13 @@ sets (AliMeeting, VoxConverse and JVS-conv; slightly more on AMI) and attributed
 backchannels in an online meeting correctly more often (37 of 40 clips under 1 s, against 32),
 but it can split one person into more speakers than pyannote does, and a speaker who talks
 very little may be merged into others or dropped. `--min-speakers`/`--max-speakers` bind this
-stage too. If it fails (a download, out of memory), cannot meet those bounds, or finds no turn
-long enough to anchor a voiceprint, the run warns and keeps pyannote's speakers. With
+stage too. A `--min-speakers` above the number of voices it finds is met by dividing those
+voices, because someone with only a few seconds of speech cannot form a speaker of their own.
+pyannote does the same under that bound, and measured worse: given the true speaker count on
+the public recordings where the stage finds too few, the stage's DER rose from 19% to 23% and
+pyannote's from 19% to 30%. Set it only when a missing speaker matters more than a split one.
+If the stage fails (a download, out of memory), cannot meet the bounds, or finds no turn long
+enough to anchor a voiceprint, the run warns and keeps pyannote's speakers. With
 `--voiceprint-model pyannote` the run keeps pyannote's clustering, because those legacy
 voiceprints are keyed by pyannote's labels. The setting never changes which voice stores an
 episode's voiceprints match. Switching it (or `--diarize-model`) on an episode whose speakers
