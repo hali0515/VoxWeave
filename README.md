@@ -609,7 +609,7 @@ voxweave align episode.vtt
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
 | `--glossary`                   | Term/name glossary (`.json` → mapping; other → raw prompt). Strongly recommended for ambiguous proper nouns. |
 | `--apply`                      | Overwrite the original VTT (default: sidecar only, for review).                                              |
-| `--model`                      | Correction model (default `VOXWEAVE_FIX_MODEL` env, `[llm].model` in the config, or `gpt-5.6-luna`; `auto` = the endpoint's only served model). |
+| `--model`                      | Correction model (default `VOXWEAVE_FIX_MODEL` env, `[llm].model` in the config, or `gpt-6-luna`; `auto` = the endpoint's only served model). |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](#configuration)). |
 
 </details>
@@ -678,7 +678,7 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 | `-t, --target`                  | Target language code, written to `<stem>.<target>.<ext>` (default `zh`); use `export --format` to change file formats. |
 | `--context`                    | Show/tone context injected into the prompt.                                          |
 | `--glossary`                   | Term/name glossary (`.json` → mapping; other → raw prompt).                          |
-| `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env, `[llm].model` in the config, or `gpt-5.6-luna`; `auto` = the endpoint's only served model). |
+| `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env, `[llm].model` in the config, or `gpt-6-luna`; `auto` = the endpoint's only served model). |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](#configuration)). |
 | `--reasoning-effort`           | Model-specific effort. `VOXWEAVE_TRANSLATE_REASONING_EFFORT` > `[llm].reasoning_effort` > endpoint default; `default` explicitly omits the field. |
 | `--concurrency N`              | Windows in flight at once (`VOXWEAVE_TRANSLATE_CONCURRENCY` > `[llm].concurrency` > 8). `1` = one whole-episode request with translated-tail continuity. |
@@ -810,7 +810,7 @@ default config is written on first run (migrated automatically from a pre-rename
 - `VOXWEAVE_VOICEPRINT_MODEL` (default `[voiceprint].model` in the config, else `auto`; one of
   `auto`, `redimnet2`, `anime-va`, `pyannote`; same as `--voiceprint-model`)
 - `VOXWEAVE_TRANSLATE_MODEL` / `VOXWEAVE_FIX_MODEL` (default `[llm].model` in the config, else
-  `gpt-5.6-luna`; same as `--model` on `translate` / `correct`; `auto` = the endpoint's only served model)
+  `gpt-6-luna`; same as `--model` on `translate` / `correct`; `auto` = the endpoint's only served model)
 - `OPENAI_BASE_URL` (default `[llm].base_url` in the config, else api.openai.com; same as `--base-url`)
 - `VOXWEAVE_TRANSLATE_REASONING_EFFORT` (default `[llm].reasoning_effort`, else the endpoint default;
   same as `translate --reasoning-effort`; `default` leaves the request field unset)
@@ -983,7 +983,7 @@ vad_mask   = false                       # suppress CTC emissions outside speech
 
 # LLM for translate / correct: any OpenAI-compatible chat-completions endpoint.
 # Precedence per key: CLI option > env (VOXWEAVE_TRANSLATE_MODEL / VOXWEAVE_FIX_MODEL,
-# OPENAI_BASE_URL) > this section > built-in (gpt-5.6-luna on api.openai.com, key from OPENAI_API_KEY).
+# OPENAI_BASE_URL) > this section > built-in (gpt-6-luna on api.openai.com, key from OPENAI_API_KEY).
 [llm]
 model = "auto"                           # or a model name; "auto" = the endpoint's only served model
 base_url = "http://127.0.0.1:8000/v1"    # e.g. a local vLLM; remove for api.openai.com
