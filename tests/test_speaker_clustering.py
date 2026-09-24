@@ -1176,7 +1176,9 @@ def test_cli_flag_without_diarize_warns(cli_process, caplog):
 def test_cli_help_documents_the_flag(cli_process):
     result = _invoke(["transcribe", "--help"])
     assert result.exit_code == 0, result.output
-    text = re.sub(r"[\s│┃]+", " ", result.output)
+    # rich-click colours the help when GITHUB_ACTIONS is set, even in CliRunner.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    text = re.sub(r"[\s│┃]+", " ", plain)
     assert "--speaker-clustering" in text
     assert "[voiceprint|pyannote]" in text
     assert f"Default: {config.DEFAULT_DIARIZE_CLUSTERING}." in text
