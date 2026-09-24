@@ -1,10 +1,13 @@
 """Vocals cache duration freshness: a replaced/trimmed source must invalidate the cache."""
 
 import os
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import pytest
+import soundfile as sf
 
 from voxweave import pipeline, vocalscache
 
@@ -105,6 +108,91 @@ def test_first_run_16k_decode_matches_a_cache_hit(tmp_path, normalize, monkeypat
     assert wav == tmp_path / f"d{len(decoded) - 1}.wav"
     assert first_source == voc32  # the file the cache stores
     assert first_kwargs == hit_kwargs
+
+
+class _StopAfterAudio(Exception):
+    """Raised by the first step after audio preparation, to end transcribe early."""
+
+
+@pytest.mark.parametrize("normalize", [True, False])
+def test_transcribe_rerun_decodes_the_cache_like_its_first_run(
+    tmp_path, monkeypatch, normalize
+):
+    # transcribe's own cache-hit decode (not only align's) must feed ASR and
+    # diarization what the first run fed them: the 16k decode of the very 32k
+    # vocals the first run stored, with the same options.
+    media, cache = _paths(tmp_path)
+    cache.unlink()
+    decoded: list[tuple[Path, dict]] = []
+    encoded: list[Path] = []
+
+    def fake_decode(source, **kwargs):
+        out = tmp_path / f"d{len(decoded)}.wav"
+        out.write_bytes(b"x")
+        decoded.append((Path(source), kwargs))
+        return out
+
+    def fake_encode(src_wav, dst_flac):
+        encoded.append(Path(src_wav))
+        Path(dst_flac).write_bytes(b"flac")
+
+    def stop(*_args, **_kwargs):
+        raise _StopAfterAudio
+
+    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(pipeline, "_encode_flac", fake_encode)
+    monkeypatch.setattr(pipeline, "vad_speech_segments", stop)
+    monkeypatch.setattr(
+        pipeline.backend, "separate_vocals", lambda *_a, **_k: tmp_path / "v.wav"
+    )
+
+    with pytest.raises(_StopAfterAudio):
+        pipeline.transcribe(media, normalize=normalize, cache_vocals=cache)
+    first_source, first_kwargs = decoded[-1]
+    assert encoded == [first_source]  # the cache stores what the 16k came from
+
+    decoded.clear()
+    monkeypatch.setattr(pipeline, "_vocals_cache_fresh", lambda *_a: True)
+    with pytest.raises(_StopAfterAudio):
+        pipeline.transcribe(media, normalize=normalize, cache_vocals=cache)
+    assert decoded == [(cache, first_kwargs)]
+
+
+_FFMPEG_TOOLS = shutil.which("ffmpeg") is not None and shutil.which("ffprobe")
+
+
+@pytest.mark.skipif(not _FFMPEG_TOOLS, reason="needs ffmpeg and ffprobe")
+@pytest.mark.parametrize("normalize", [True, False])
+def test_real_cache_round_trip_gives_the_first_run_samples(tmp_path, normalize):
+    # The parity above also rests on vocals.32k.flac being a lossless copy of
+    # the first run's 32k wav: with real ffmpeg, the 16k input decoded from the
+    # stored flac must equal the first run's sample for sample.
+    rng = np.random.default_rng(7)
+    seconds, rate = 6.0, 44100
+    t = np.arange(int(seconds * rate)) / rate
+    voice = 0.3 * np.sin(2 * np.pi * 220.0 * t) * (0.6 + 0.4 * np.sin(2 * np.pi * t))
+    stereo = np.stack([voice, 0.8 * voice], axis=1) + 0.01 * rng.normal(
+        size=(t.size, 2)
+    )
+    vocals = tmp_path / "vocals.flac"  # the separator writes 16-bit FLAC
+    sf.write(vocals, stereo.astype(np.float32), rate, subtype="PCM_16")
+
+    voc32 = pipeline.decode_to_wav(vocals, sample_rate=pipeline.SONGDET_SR)
+    stored = tmp_path / "cache" / "vocals.32k.flac"
+    first = hit = None
+    try:
+        pipeline._encode_flac(voc32, stored)
+        first = pipeline._vocals_to_16k(voc32, normalize=normalize)
+        hit = pipeline._vocals_to_16k(stored, normalize=normalize)
+        first_samples, first_rate = sf.read(first, dtype="int16")
+        hit_samples, hit_rate = sf.read(hit, dtype="int16")
+    finally:
+        for path in (voc32, first, hit):
+            if path is not None:
+                Path(path).unlink(missing_ok=True)
+    assert first_rate == hit_rate == 16000
+    assert first_samples.ndim == 1 and first_samples.size > 5 * 16000
+    assert np.array_equal(first_samples, hit_samples)
 
 
 def test_prepare_align_reseparates_and_overwrites_stale_cache(tmp_path):

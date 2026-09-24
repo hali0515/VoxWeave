@@ -728,6 +728,19 @@ def _artifact_owner(reference: Path) -> Path:
     return value
 
 
+def _vocals_to_16k(voc32: Path, *, normalize: bool) -> Path:
+    """Decode 32 kHz mono vocals to the 16 kHz ASR/diarization input (a temp wav).
+
+    ``voc32`` is either a first run's fresh 32k wav or the ``vocals.32k.flac``
+    the vocals cache stores (a lossless copy of it). Every such decode (a first
+    run, and a cache hit in ``transcribe`` or ``align``) goes through here, so a
+    re-run feeds ASR and diarization exactly the samples its first run did:
+    loudnorm measures its input, and a different source, rate or filter would
+    move the speaker turns between runs.
+    """
+    return decode_to_wav(voc32, audio_filter=ASR_LOUDNORM if normalize else None)
+
+
 @overload
 def _separate_to_16k_32k(
     media: Path,
@@ -774,7 +787,6 @@ def _separate_to_16k_32k(
     its partial outputs if a later step raises — otherwise an OOM/ffmpeg failure mid-separation
     would orphan the already-decoded temp files.
     """
-    af = ASR_LOUDNORM if normalize else None
     created: list[Path] = []
     try:
         reporter.stage("decode fullband 44.1k")
@@ -799,7 +811,7 @@ def _separate_to_16k_32k(
         )  # 32k mono: PANNs + cache source
         created.append(voc32)
         # Same source and filter as a vocals-cache hit (32k mono -> 16k mono).
-        wav = decode_to_wav(voc32, audio_filter=af)
+        wav = _vocals_to_16k(voc32, normalize=normalize)
         created.append(wav)
         if return_separator_identity:
             return fullband, vocals, wav, voc32, separator_identity
@@ -1106,9 +1118,7 @@ def transcribe(
                         log.info("reuse cached vocals %s", cache_path)
                         voc32 = cache_path
                         try:
-                            wav = decode_to_wav(
-                                voc32, audio_filter=af
-                            )  # 32k flac -> 16k mono
+                            wav = _vocals_to_16k(voc32, normalize=normalize)
                         except BaseException as exc:
                             classify_cache_decode_failure(exc)
                             raise
@@ -3180,10 +3190,7 @@ def _prepare_16k_for_align(
                 reporter.stage("vocals cache (32k)")
                 log.info("reuse cached vocals %s", cache_handle.cache_path)
                 try:
-                    wav = decode_to_wav(
-                        cache_handle.cache_path,
-                        audio_filter=af,
-                    )  # 32k flac -> 16k
+                    wav = _vocals_to_16k(cache_handle.cache_path, normalize=normalize)
                 except BaseException as exc:
                     classify_cache_decode_failure(exc)
                     raise
