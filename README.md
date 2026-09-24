@@ -208,7 +208,10 @@ stage too. If it fails (a download, out of memory), cannot meet those bounds, or
 long enough to anchor a voiceprint, the run warns and keeps pyannote's speakers. With
 `--voiceprint-model pyannote` the run keeps pyannote's clustering, because those legacy
 voiceprints are keyed by pyannote's labels. The setting never changes which voice stores an
-episode's voiceprints match.
+episode's voiceprints match. Switching it (or `--diarize-model`) on an episode whose speakers
+you already named renumbers the speakers, while the saved names stay keyed by speaker id:
+`process` warns when a named id's turns changed, and you should review the names with
+`voxweave speakers` before `voxweave speakers enroll` stores a voice under a wrong name.
 
 **From source** (for development or pulling new code):
 

@@ -2432,6 +2432,58 @@ def _voiceprint_capture_from_generation(
     return None
 
 
+def _warn_stale_speaker_names(
+    media_path: Path,
+    previous_json: episode_transaction.FileGeneration,
+    speaker_turns: Sequence[tuple[float, float, str]] | None,
+) -> None:
+    """Warn when saved speaker names were given to turns this run replaced.
+
+    The speaker mapping keys names by ``SPEAKER_NN`` id alone. A re-run whose
+    turns differ (another ``--speaker-clustering`` or ``--diarize-model``, a
+    voiceprint stage that fell back to pyannote, new audio) can hand an id to
+    another voice, and its saved name follows the id into rendered subtitles,
+    the speakers page and ``speakers enroll`` (which would store that voice
+    under the name in the voice library). Names whose id kept exactly the
+    same turns are not reported. Never raises: this is advice, not a gate.
+    """
+    if not speaker_turns or previous_json.bytes_value is None:
+        return
+    try:
+        previous = json.loads(previous_json.bytes_value.decode("utf-8"))
+        raw_old = previous.get("speaker_turns") if isinstance(previous, dict) else None
+        mapping = inspect_speakers_mapping_path(media_path)
+        if not raw_old or not artifacts.path_present(mapping):
+            return
+        from voxweave.speakers import named_speaker_ids
+
+        named = named_speaker_ids(mapping)
+        old = [(float(s), float(e), str(label)) for s, e, label in raw_old]
+    except (OSError, RuntimeError, UnicodeError, ValueError, TypeError):
+        return
+
+    def spans_by_id(turns: Sequence[tuple[float, float, str]]) -> dict[str, list]:
+        spans: dict[str, list] = {}
+        for start, end, label in turns:
+            spans.setdefault(label, []).append((float(start), float(end)))
+        return {label: sorted(values) for label, values in spans.items()}
+
+    before, after = spans_by_id(old), spans_by_id(speaker_turns)
+    stale = sorted(i for i in named if before.get(i) != after.get(i))
+    if stale:
+        log.warning(
+            "%s names %s, but this run's speaker turns for %s differ from those "
+            "the names were given to (changing --speaker-clustering or "
+            "--diarize-model renumbers speakers), so a name may now label another "
+            "voice; review the names with `voxweave speakers %s` before "
+            "`voxweave speakers enroll`",
+            mapping.name,
+            ", ".join(stale),
+            "that id" if len(stale) == 1 else "those ids",
+            media_path.name,
+        )
+
+
 def _voiceprints_document(
     media_path: Path,
     capture: VoiceprintCapture,
@@ -2906,6 +2958,7 @@ def _finish_process_from_units(
     if machine_artifact is not None:
         log.info("wrote voice-biometric sidecar %s", machine_artifact.path.name)
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
+    _warn_stale_speaker_names(media_path, expected_json, speaker_turns)
     auxiliary_landed: tuple[Path, ...] = ()
     if sdh_enabled and source_mode == "transcribed-media":
         rep.step("create SDH sidecar")

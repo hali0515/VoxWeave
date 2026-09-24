@@ -908,6 +908,65 @@ def test_transcribe_releases_a_kept_embedder_the_capture_never_reached(
     assert events == [("diarize", False), "pyannote released", "embedder released"]
 
 
+def test_process_warns_when_saved_names_belong_to_replaced_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    # Names are keyed by SPEAKER_NN alone. Switching the clustering renumbers
+    # speakers, so after a re-run a saved name can label another voice (and
+    # `speakers enroll` would store that voice under it): process says so.
+    _stub_transcribe(tmp_path, monkeypatch)  # new turns: [(0.0, 3.0, SPEAKER_00)]
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    (tmp_path / "episode.json").write_text(
+        json.dumps(
+            {
+                "speaker_turns": [
+                    [0.0, 1.5, "SPEAKER_00"],
+                    [1.5, 3.0, "SPEAKER_01"],
+                    [3.0, 4.0, "SPEAKER_02"],
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    pipeline.speakers_mapping_path(media).write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "speakers": {
+                    "SPEAKER_00": "Xavier",
+                    "SPEAKER_01": "Yuki",
+                    "SPEAKER_02": "",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def run() -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="voxweave"):
+            pipeline.process(
+                media,
+                separate=False,
+                diarize=True,
+                shot_snap=False,
+                speaker_clustering="voiceprint",
+            )
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if "before `voxweave" in r.getMessage()
+        ]
+
+    (message,) = run()
+    # Both named ids changed turns; the unnamed one is not worth a warning.
+    assert "names SPEAKER_00, SPEAKER_01, but this run" in message
+    assert "SPEAKER_02" not in message
+    # Same turns again (a plain re-run): the names still fit, nothing to say.
+    assert run() == []
+
+
 def test_transcribe_reads_the_configured_knob(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

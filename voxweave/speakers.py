@@ -627,6 +627,15 @@ def _mapping_entries(path: Path) -> dict[str, Any]:
     return _mapping_entries_bytes(path.read_bytes(), source=path.name)
 
 
+def named_speaker_ids(path: Path) -> set[str]:
+    """The speaker ids a version-1 mapping gives a non-empty name."""
+    return {
+        str(raw_id)
+        for raw_id, raw_name in _mapping_entries(path).items()
+        if isinstance(raw_name, str) and raw_name.strip()
+    }
+
+
 def load_speaker_display_names(path: Path) -> list[str]:
     """Return the non-empty names in a mapping, in stable mapping order."""
     names: list[str] = []
