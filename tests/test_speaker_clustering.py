@@ -860,6 +860,54 @@ def test_transcribe_threads_the_knob_and_the_embedder_handoff(
         assert events[-1] == "embedder released"
 
 
+@pytest.mark.parametrize("failure", ["diarize raises", "no turns"])
+def test_transcribe_releases_a_kept_embedder_the_capture_never_reached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+):
+    # Clustering kept ReDimNet2 resident for the capture (release_embedder
+    # False), but the capture's own release never runs: diarization fails
+    # after clustering, or it yields no turns and the capture returns before
+    # embedding. transcribe's outer finally must release it, or it stays on
+    # the GPU in a long-lived process.
+    _stub_asr(tmp_path, monkeypatch)
+    events: list[object] = []
+
+    def fake_diarize(_wav_path, **kwargs):
+        events.append(("diarize", kwargs["release_embedder"]))
+        if failure == "diarize raises":
+            raise RuntimeError("diarization failed after clustering")
+        return diarize.DiarizationResult(turns=[], centroids=None, provenance={})
+
+    monkeypatch.setattr(diarize, "diarize_turns", fake_diarize)
+    monkeypatch.setattr(diarize, "release", lambda: events.append("pyannote released"))
+    monkeypatch.setattr(
+        voiceembed, "release", lambda: events.append("embedder released")
+    )
+    monkeypatch.setattr(
+        voiceembed,
+        "capture_voiceprints",
+        lambda *_a, **_k: pytest.fail("no turns: nothing to capture"),
+    )
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+
+    def run() -> None:
+        pipeline.transcribe(
+            media,
+            separate=False,
+            diarize=True,
+            voiceprints=True,
+            speaker_clustering="voiceprint",
+        )
+
+    if failure == "diarize raises":
+        with pytest.raises(RuntimeError, match="failed after clustering"):
+            run()
+    else:
+        run()
+    assert events == [("diarize", False), "pyannote released", "embedder released"]
+
+
 def test_transcribe_reads_the_configured_knob(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
