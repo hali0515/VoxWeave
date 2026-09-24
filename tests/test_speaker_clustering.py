@@ -680,6 +680,70 @@ def test_legacy_voiceprint_lane_keeps_pyannote_clustering(
     assert sum("keep pyannote's clustering" in m for m in messages) == 1
 
 
+class _TF32GuardPipeline(_FakePipeline):
+    """Fake pyannote whose reproducibility guard switches TF32 off, as the real one does."""
+
+    def __call__(self, _audio, **kwargs):
+        import torch
+
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        return super().__call__(_audio, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("precision", "cudnn_tf32"),
+    [("high", False), ("high", True), ("highest", False), ("medium", True)],
+)
+def test_clustering_embeds_under_a_fixed_tf32_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    precision: str,
+    cudnn_tf32: bool,
+):
+    # Whatever the process holds when the stage runs (a first run's separator
+    # turns TF32 matmuls on; a cache hit does not; a call moved inside
+    # pyannote's TF32-off span would see cuDNN TF32 off, which multiplies the
+    # embedder's VRAM), the embeddings see cuDNN TF32 on and strict fp32
+    # matmuls, and the process policy is restored afterwards.
+    import torch
+
+    fake = _TF32GuardPipeline(LONG)
+    monkeypatch.setattr(diarize, "_get_pipeline", lambda _token, _model: fake)
+    monkeypatch.setattr(diarize, "_package_version", lambda _name: "4.0.7")
+    spy = _EmbedderSpy(monkeypatch)
+    seen: list[tuple[bool, str]] = []
+
+    def recording(waveform, spans, spec):
+        seen.append(
+            (
+                bool(torch.backends.cudnn.allow_tf32),
+                torch.get_float32_matmul_precision(),
+            )
+        )
+        return spy.embed_segments(waveform, spans, spec)
+
+    monkeypatch.setattr(voiceembed, "embed_segments", recording)
+    saved = (torch.get_float32_matmul_precision(), torch.backends.cudnn.allow_tf32)
+    torch.set_float32_matmul_precision(precision)
+    torch.backends.cudnn.allow_tf32 = cudnn_tf32
+    try:
+        result = diarize.diarize_turns(
+            _wav(tmp_path), token="hf_test", model=MODEL, clustering="voiceprint"
+        )
+        after = (
+            torch.get_float32_matmul_precision(),
+            bool(torch.backends.cudnn.allow_tf32),
+        )
+    finally:
+        torch.set_float32_matmul_precision(saved[0])
+        torch.backends.cudnn.allow_tf32 = saved[1]
+
+    assert result.provenance["clustering"]["method"] == "voiceprint"
+    assert seen == [(True, "highest")]
+    assert after == (precision, cudnn_tf32)
+
+
 def test_invalid_knob_fails_before_pyannote_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

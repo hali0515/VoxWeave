@@ -982,6 +982,37 @@ def _audit_counts(audit: Mapping[str, object]) -> dict[str, object]:
     return counts
 
 
+@contextmanager
+def _clustering_embedding_numerics() -> Iterator[None]:
+    """A fixed TF32 policy for the clustering embeddings, restored afterwards.
+
+    The process policy at this point depends on the call site and the run:
+    pyannote's span above switches TF32 off, and the separator switches TF32
+    matmuls on only when this run separated vocals (not on a vocals-cache hit,
+    with ``--no-separate`` or with ``VOXWEAVE_TF32=0``). So pin it here:
+
+    * cuDNN TF32 on: with it off, cuDNN picks convolution algorithms with
+      much larger workspaces for ReDimNet2. Measured on a 2 h 13 min meeting
+      (2,710 spans): 6.6 GiB reserved with both TF32 flags off, 127 workspace
+      OOM fallbacks under a 5.5 GiB cap with only cuDNN TF32 off, against
+      2.3 GiB and no OOM with it on;
+    * strict fp32 matmuls (``"highest"``), the precision the recipe's
+      parameters were tuned with, so a first run and a re-run of the same
+      audio embed identically.
+    """
+    import torch
+
+    matmul_precision = torch.get_float32_matmul_precision()
+    cudnn_tf32 = bool(torch.backends.cudnn.allow_tf32)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(matmul_precision)
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+
 def _clustering_samples(waveform: Any, sample_rate: int) -> Any:
     """The 1-D float32 16 kHz samples of the ``(1, T)`` waveform pyannote saw."""
     import numpy as np
@@ -1068,7 +1099,7 @@ def _voiceprint_clustering(
         def embed(spans: Sequence[tuple[float, float]]) -> Any:
             # Hold the embedder lock across inference and attestation so the
             # recorded checkpoint is the one that produced these rows.
-            with voiceembed.embedder_lock():
+            with voiceembed.embedder_lock(), _clustering_embedding_numerics():
                 rows = voiceembed.embed_segments(samples, spans, spec)
                 if not attested:
                     attested.append(voiceembed.get_embedder(spec).checkpoint_sha256)
