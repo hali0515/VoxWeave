@@ -368,6 +368,24 @@ def test_bad_inputs_raise():
         vp.cluster_turns([(0.0, math.inf, "a")], FakeEmbed([]))
 
 
+def test_zero_embedding_rows_raise_instead_of_dropping_turns():
+    # A zero row has no direction: accepting it would silently abstain the
+    # turn (and drop it from the output) however long it is.
+    truth = _alternating(["alice", "bob"], 12)
+    turns = [(s, e, who) for s, e, who in truth]
+    fake = FakeEmbed(truth)
+
+    def some_zero(spans):
+        rows = fake(spans)
+        rows[[i for i, (s, _e) in enumerate(spans) if s >= 20.0]] = 0.0
+        return rows
+
+    with pytest.raises(vp.ClusteringError, match="all-zero row"):
+        vp.cluster_turns(turns, some_zero)
+    with pytest.raises(vp.ClusteringError, match="all-zero row"):
+        vp.cluster_turns(turns, lambda spans: np.zeros((len(spans), 4)))
+
+
 def test_local_assignment_prefers_nearby_clusters():
     # carol appears only early; a late short turn that sounds halfway between
     # alice and carol goes to alice, the only cluster active nearby.

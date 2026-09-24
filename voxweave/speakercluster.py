@@ -546,6 +546,9 @@ def _turn_vectors(
             )
         if not np.isfinite(rows).all():
             raise ClusteringError("embed returned non-finite values")
+        if not (np.linalg.norm(rows, axis=1) > 0.0).all():
+            # A zero row has no direction: its turn could only be abstained.
+            raise ClusteringError("embed returned an all-zero row")
         rows = _unit_rows(rows)
         dim = rows.shape[1]
     else:
