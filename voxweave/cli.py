@@ -217,6 +217,7 @@ def _resolve_llm(
                     "options": [
                         "--diarize",
                         "--diarize-model",
+                        "--speaker-clustering",
                         "--voiceprints",
                         "--voiceprint-model",
                         "--min-speakers",
@@ -332,6 +333,20 @@ def cli(ctx, verbose: bool) -> None:
     ),
 )
 @click.option(
+    "--speaker-clustering",
+    type=click.Choice(config.DIARIZE_CLUSTERING_CHOICES, case_sensitive=False),
+    default=None,
+    help=(
+        "How diarization groups its turns into speakers: pyannote (the pipeline's "
+        "own clustering) or voiceprint (regroup with ReDimNet2 voiceprints, weights "
+        "CC BY-NC-SA 4.0; turns nobody can be attributed to are dropped and their "
+        "words stay with the surrounding speaker). Default: "
+        f"{config.DEFAULT_DIARIZE_CLUSTERING}. Precedence: CLI, "
+        f"{config.DIARIZE_CLUSTERING_ENV}, conf [diarize].clustering. Only used with "
+        "--diarize."
+    ),
+)
+@click.option(
     "--voiceprints/--no-voiceprints",
     default=None,
     help=(
@@ -420,6 +435,7 @@ def cmd_transcribe(
     sdh: bool,
     diarize: bool | None,
     diarize_model: str | None,
+    speaker_clustering: str | None,
     voiceprints: bool | None,
     voiceprint_model: str | None,
     min_speakers: int | None,
@@ -450,6 +466,17 @@ def cmd_transcribe(
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
     diarize_model = config.resolve_diarize_model(diarize_model)
+    if diarize:
+        try:
+            speaker_clustering = config.resolve_diarize_clustering(speaker_clustering)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+    elif speaker_clustering is not None:
+        logging.getLogger("voxweave").warning(
+            "--speaker-clustering has no effect: diarization is off (from %s); "
+            "add --diarize to identify speakers",
+            diarize_source,
+        )
     if voiceprints and not diarize:
         raise click.UsageError(
             "voiceprint capture is on from "
@@ -490,6 +517,7 @@ def cmd_transcribe(
             sdh=sdh,
             diarize=diarize,
             diarize_model=diarize_model,
+            speaker_clustering=speaker_clustering,
             voiceprints=voiceprints,
             voiceprint_model=voiceprint_model,
             min_speakers=min_speakers,

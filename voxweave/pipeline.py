@@ -728,6 +728,19 @@ def _artifact_owner(reference: Path) -> Path:
     return value
 
 
+def _vocals_to_16k(voc32: Path, *, normalize: bool) -> Path:
+    """Decode 32 kHz mono vocals to the 16 kHz ASR/diarization input (a temp wav).
+
+    ``voc32`` is either a first run's fresh 32k wav or the ``vocals.32k.flac``
+    the vocals cache stores (a lossless copy of it). Every such decode (a first
+    run, and a cache hit in ``transcribe`` or ``align``) goes through here, so a
+    re-run feeds ASR and diarization exactly the samples its first run did:
+    loudnorm measures its input, and a different source, rate or filter would
+    move the speaker turns between runs.
+    """
+    return decode_to_wav(voc32, audio_filter=ASR_LOUDNORM if normalize else None)
+
+
 @overload
 def _separate_to_16k_32k(
     media: Path,
@@ -763,12 +776,17 @@ def _separate_to_16k_32k(
     downsampling to 16k/32k happens only after separation. Callers own temp bookkeeping,
     debug dumps, and caching of the returned paths.
 
+    The 16k ASR/diarization input is derived from the 32k mono vocals, never from the
+    44.1k stereo stem: ``voc32`` is exactly what the vocals cache stores, so a first run
+    and a later cache hit (which decodes ``vocals.32k.flac`` with the same filter) feed
+    loudnorm the same samples. Normalizing the stereo stem instead measured 2.5-2.6 dB
+    louder and moved ~10-14% of diarization frames between the two runs.
+
     On a clean return the caller registers the paths in its own ``tmp`` list (cleaned in its
     ``finally``). Since that registration only runs after this returns, the helper self-cleans
     its partial outputs if a later step raises — otherwise an OOM/ffmpeg failure mid-separation
     would orphan the already-decoded temp files.
     """
-    af = ASR_LOUDNORM if normalize else None
     created: list[Path] = []
     try:
         reporter.stage("decode fullband 44.1k")
@@ -788,11 +806,13 @@ def _separate_to_16k_32k(
             )
         created.append(vocals)
         reporter.stage("resample 16k")
-        wav = decode_to_wav(vocals, audio_filter=af)
-        created.append(wav)
         voc32 = decode_to_wav(
             vocals, sample_rate=SONGDET_SR
         )  # 32k mono: PANNs + cache source
+        created.append(voc32)
+        # Same source and filter as a vocals-cache hit (32k mono -> 16k mono).
+        wav = _vocals_to_16k(voc32, normalize=normalize)
+        created.append(wav)
         if return_separator_identity:
             return fullband, vocals, wav, voc32, separator_identity
         return fullband, vocals, wav, voc32
@@ -992,6 +1012,7 @@ def transcribe(
     min_speakers: int | None = None,
     max_speakers: int | None = None,
     release_panns: bool = True,
+    speaker_clustering: str | None = None,
 ) -> tuple[
     str,
     list[dict],
@@ -1014,7 +1035,10 @@ def transcribe(
     :func:`voxweave.voiceembed.resolve_voiceprint_model`); only its ``pyannote``
     legacy lane reads the diarization pipeline's own embeddings; its checkpoint(s)
     are fetched and verified before any audio work, and if that fails voiceprints
-    are off for the run (warning) while everything else proceeds. All models run
+    are off for the run (warning) while everything else proceeds.
+    ``speaker_clustering`` picks how diarization groups its turns into speakers
+    (:func:`voxweave.config.resolve_diarize_clustering`; resolved and validated
+    before any audio work). All models run
     in-process (weights are fetched once into the voxweave cache). smart_split and
     file writing are handled by :func:`process`.
 
@@ -1025,6 +1049,9 @@ def transcribe(
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
+    if diarize:
+        # Fail on a bad env/conf value now, not after separation and ASR.
+        speaker_clustering = config.resolve_diarize_clustering(speaker_clustering)
     if debug and debug_root is None:
         debug_root = artifacts.claim_paths(media_path).debug
     dbg: DebugSink = (
@@ -1091,12 +1118,11 @@ def transcribe(
                         log.info("reuse cached vocals %s", cache_path)
                         voc32 = cache_path
                         try:
-                            wav = decode_to_wav(
-                                voc32, audio_filter=af
-                            )  # 32k flac -> 16k mono
+                            wav = _vocals_to_16k(voc32, normalize=normalize)
                         except BaseException as exc:
                             classify_cache_decode_failure(exc)
                             raise
+                        tmp.append(wav)
             if cache_hit:
                 # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
                 pass
@@ -1118,11 +1144,11 @@ def transcribe(
                     fullband, vocals, wav, voc32 = _separate_to_16k_32k(
                         media_path, reporter=rep, normalize=normalize
                     )
-                tmp.append(fullband)
+                # Own every temp before anything else can raise (a debug dump
+                # onto a full disk would otherwise leave them in /tmp).
+                tmp.extend((fullband, vocals, voc32, wav))
                 dbg.audio("00_fullband_44k.wav", fullband)
-                tmp.append(vocals)
                 dbg.audio("01_vocals.flac", vocals)
-                tmp.append(voc32)
                 log.info("separated vocals (local Roformer)")
                 if cache_vocals is not None:
                     try:
@@ -1145,7 +1171,7 @@ def transcribe(
         else:
             rep.stage("decode 16k")
             wav = decode_to_wav(media_path, audio_filter=af)
-        tmp.append(wav)
+            tmp.append(wav)
         dbg.audio("02_speech_16k.wav", wav)
 
         # Song detection must run on clean separated vocals; BGM causes speech/music confusion.
@@ -1424,55 +1450,70 @@ def transcribe(
                 if voiceprints
                 else None
             )
+            # Voiceprint clustering embeds with ReDimNet2; when the capture below
+            # uses the same model, keep it resident across the two stages. The
+            # capture releases it, and so does the finally below on any path
+            # that never reaches the capture.
+            reuse_clustering_embedder = (
+                speaker_clustering == config.DIARIZE_CLUSTERING_VOICEPRINT
+                and isinstance(voiceprint_target, voiceembed.EmbedderSpec)
+                and voiceprint_target.name == voiceembed.REDIMNET2_B6.name
+            )
             rep.stage("speaker diarization (pyannote)")
             try:
-                diarization = diarize_mod.diarize_turns(
-                    wav,
-                    model=diarize_model,
-                    min_speakers=min_speakers,
-                    max_speakers=max_speakers,
-                    # Only the legacy lane reads the pipeline's own embeddings;
-                    # a dedicated embedder computes its voiceprints below.
-                    want_embeddings=voiceprint_target is voiceembed.LEGACY,
-                    audio_profile={
-                        "separated": separate,
-                        "normalized": normalize,
-                        "sample_rate": 16000,
-                        **(
-                            {
-                                "separator": {
-                                    **(
-                                        separator_identity
-                                        or {
-                                            "repo": backend.SEPARATOR_REPO,
-                                            "file": backend.SEPARATOR_REPO_FILE,
-                                            "checkpoint": "unresolved",
-                                            "config_sha256": "unresolved",
-                                        }
-                                    ),
+                try:
+                    diarization = diarize_mod.diarize_turns(
+                        wav,
+                        model=diarize_model,
+                        min_speakers=min_speakers,
+                        max_speakers=max_speakers,
+                        clustering=speaker_clustering,
+                        release_embedder=not reuse_clustering_embedder,
+                        # Only the legacy lane reads the pipeline's own embeddings;
+                        # a dedicated embedder computes its voiceprints below.
+                        want_embeddings=voiceprint_target is voiceembed.LEGACY,
+                        audio_profile={
+                            "separated": separate,
+                            "normalized": normalize,
+                            "sample_rate": 16000,
+                            **(
+                                {
+                                    "separator": {
+                                        **(
+                                            separator_identity
+                                            or {
+                                                "repo": backend.SEPARATOR_REPO,
+                                                "file": backend.SEPARATOR_REPO_FILE,
+                                                "checkpoint": "unresolved",
+                                                "config_sha256": "unresolved",
+                                            }
+                                        ),
+                                    }
                                 }
-                            }
-                            if separate
-                            else {}
-                        ),
-                    },
-                )
+                                if separate
+                                else {}
+                            ),
+                        },
+                    )
+                finally:
+                    diarize_mod.release()
+                speaker_turns = diarization.turns
+                if isinstance(voiceprint_target, voiceembed.EmbedderSpec):
+                    voiceprint_capture = _decoupled_voiceprint_capture(
+                        wav,
+                        diarization,
+                        voiceprint_target,
+                        reporter=rep,
+                    )
+                elif voiceprint_target is voiceembed.LEGACY and diarization.centroids:
+                    voiceprint_capture = VoiceprintCapture(
+                        centroids=diarization.centroids,
+                        provenance=diarization.provenance,
+                        turns=diarization.turns,
+                    )
             finally:
-                diarize_mod.release()
-            speaker_turns = diarization.turns
-            if isinstance(voiceprint_target, voiceembed.EmbedderSpec):
-                voiceprint_capture = _decoupled_voiceprint_capture(
-                    wav,
-                    diarization,
-                    voiceprint_target,
-                    reporter=rep,
-                )
-            elif voiceprint_target is voiceembed.LEGACY and diarization.centroids:
-                voiceprint_capture = VoiceprintCapture(
-                    centroids=diarization.centroids,
-                    provenance=diarization.provenance,
-                    turns=diarization.turns,
-                )
+                if reuse_clustering_embedder:
+                    voiceembed.release()  # idempotent after the capture's own
         panns_handoff = not release_panns
         return (
             iso,
@@ -2391,6 +2432,58 @@ def _voiceprint_capture_from_generation(
     return None
 
 
+def _warn_stale_speaker_names(
+    media_path: Path,
+    previous_json: episode_transaction.FileGeneration,
+    speaker_turns: Sequence[tuple[float, float, str]] | None,
+) -> None:
+    """Warn when saved speaker names were given to turns this run replaced.
+
+    The speaker mapping keys names by ``SPEAKER_NN`` id alone. A re-run whose
+    turns differ (another ``--speaker-clustering`` or ``--diarize-model``, a
+    voiceprint stage that fell back to pyannote, new audio) can hand an id to
+    another voice, and its saved name follows the id into rendered subtitles,
+    the speakers page and ``speakers enroll`` (which would store that voice
+    under the name in the voice library). Names whose id kept exactly the
+    same turns are not reported. Never raises: this is advice, not a gate.
+    """
+    if not speaker_turns or previous_json.bytes_value is None:
+        return
+    try:
+        previous = json.loads(previous_json.bytes_value.decode("utf-8"))
+        raw_old = previous.get("speaker_turns") if isinstance(previous, dict) else None
+        mapping = inspect_speakers_mapping_path(media_path)
+        if not raw_old or not artifacts.path_present(mapping):
+            return
+        from voxweave.speakers import named_speaker_ids
+
+        named = named_speaker_ids(mapping)
+        old = [(float(s), float(e), str(label)) for s, e, label in raw_old]
+    except (OSError, RuntimeError, UnicodeError, ValueError, TypeError):
+        return
+
+    def spans_by_id(turns: Sequence[tuple[float, float, str]]) -> dict[str, list]:
+        spans: dict[str, list] = {}
+        for start, end, label in turns:
+            spans.setdefault(label, []).append((float(start), float(end)))
+        return {label: sorted(values) for label, values in spans.items()}
+
+    before, after = spans_by_id(old), spans_by_id(speaker_turns)
+    stale = sorted(i for i in named if before.get(i) != after.get(i))
+    if stale:
+        log.warning(
+            "%s names %s, but this run's speaker turns for %s differ from those "
+            "the names were given to (changing --speaker-clustering or "
+            "--diarize-model renumbers speakers), so a name may now label another "
+            "voice; review the names with `voxweave speakers %s` before "
+            "`voxweave speakers enroll`",
+            mapping.name,
+            ", ".join(stale),
+            "that id" if len(stale) == 1 else "those ids",
+            media_path.name,
+        )
+
+
 def _voiceprints_document(
     media_path: Path,
     capture: VoiceprintCapture,
@@ -2435,6 +2528,7 @@ def process(
     max_speakers: int | None = None,
     diarize_model: str | None = None,
     voiceprint_model: str | None = None,
+    speaker_clustering: str | None = None,
 ) -> Path:
     """Full pipeline: transcribe -> smart_split -> write siblings. Return the .vtt path.
 
@@ -2445,7 +2539,9 @@ def process(
     ``sdh`` additionally writes a ``<stem>.sdh.vtt`` sidecar with PANNs-detected
     non-speech event tags merged into the dialogue (main VTT/JSON untouched).
     ``diarize`` runs pyannote speaker diarization and formats multi-speaker cues
-    (dual-speaker hyphens / speaker-boundary splits; turns persist to JSON).
+    (dual-speaker hyphens / speaker-boundary splits; turns persist to JSON);
+    ``speaker_clustering`` (``"pyannote"``/``"voiceprint"``, ``None`` = configured)
+    picks how its turns are grouped into speakers.
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
@@ -2499,6 +2595,7 @@ def process(
             diarize_model=diarize_model,
             voiceprints=capture_enabled,
             voiceprint_model=voiceprint_model,
+            speaker_clustering=speaker_clustering,
             word_segments=word_segments,
             asr_model=asr_model,
             context=context,
@@ -2605,6 +2702,7 @@ def _process_from_source(
     diarize_model: str | None = None,
     voiceprints: bool = False,
     voiceprint_model: str | None = None,
+    speaker_clustering: str | None = None,
     word_segments: tuple[str, list[dict]] | None = None,
     asr_model: str | None = None,
     context: str | None = None,
@@ -2653,6 +2751,7 @@ def _process_from_source(
                 diarize_model=diarize_model,
                 voiceprints=voiceprints,
                 voiceprint_model=voiceprint_model,
+                speaker_clustering=speaker_clustering,
                 normalize=normalize,
                 reporter=reporter,
                 debug=debug,
@@ -2859,6 +2958,7 @@ def _finish_process_from_units(
     if machine_artifact is not None:
         log.info("wrote voice-biometric sidecar %s", machine_artifact.path.name)
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
+    _warn_stale_speaker_names(media_path, expected_json, speaker_turns)
     auxiliary_landed: tuple[Path, ...] = ()
     if sdh_enabled and source_mode == "transcribed-media":
         rep.step("create SDH sidecar")
@@ -3144,10 +3244,7 @@ def _prepare_16k_for_align(
                 reporter.stage("vocals cache (32k)")
                 log.info("reuse cached vocals %s", cache_handle.cache_path)
                 try:
-                    wav = decode_to_wav(
-                        cache_handle.cache_path,
-                        audio_filter=af,
-                    )  # 32k flac -> 16k
+                    wav = _vocals_to_16k(cache_handle.cache_path, normalize=normalize)
                 except BaseException as exc:
                     classify_cache_decode_failure(exc)
                     raise

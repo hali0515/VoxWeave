@@ -45,6 +45,30 @@ def _isolate_voiceprint_model_env() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def _pin_pyannote_speaker_clustering() -> Iterator[None]:
+    """Run diarization tests on pyannote's own clustering unless they opt out.
+
+    Diarization tests drive fake pyannote pipelines over synthetic audio; the
+    voiceprint clustering stage would load (or download) the real ReDimNet2
+    checkpoint. Pinning the env layer keeps the suite independent of the
+    built-in default and of a developer's environment; tests of the voiceprint
+    stage or of knob precedence set or delete ``VOXWEAVE_DIARIZE_CLUSTERING``
+    themselves. Plain os.environ bookkeeping for the fixture-ordering reason
+    above.
+    """
+    name = "VOXWEAVE_DIARIZE_CLUSTERING"
+    previous = os.environ.get(name)
+    os.environ[name] = "pyannote"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
+@pytest.fixture(autouse=True)
 def _offline_voiceprint_prefetch(request: pytest.FixtureRequest) -> Iterator[None]:
     """Keep process()/transcribe() from fetching or hashing real checkpoints.
 
