@@ -480,6 +480,15 @@ def separate_vocals(
         raise _require(e.name or "torch") from e
 
     data, sr = sf.read(str(audio_path), dtype="float32", always_2d=True)  # [t, ch]
+    if data.shape[1] > 2:
+        # The Roformer is a stereo model and has no downmix of its own; refuse
+        # before loading it. decode_to_wav(mono=False) already caps at stereo, so
+        # this only trips on a caller that bypassed it.
+        raise ValueError(
+            f"vocal separation needs mono or stereo audio, but {Path(audio_path).name} "
+            f"has {data.shape[1]} channels; decode it with "
+            "chunking.decode_to_wav(mono=False), which downmixes to stereo"
+        )
     mix = torch.from_numpy(data.T.copy())  # [ch, t]
     if mix.shape[0] == 1:  # mono -> duplicate to stereo for the stereo model
         mix = mix.repeat(2, 1)

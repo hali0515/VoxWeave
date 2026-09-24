@@ -578,3 +578,53 @@ def test_log_is_drop_oldest_bounded_during_real_mutation():
     assert len(result.store["log"]) == 1024
     assert result.store["log"][0]["episode"] == "history-1"
     assert result.store["log"][-1]["action"] == "enroll"
+
+
+def _key(number, *, episode="ep01", added=NOW):
+    return voicestore.ExemplarKey(
+        id=f"x{number:08x}",
+        capture_id=f"c{number:032x}",
+        media_fingerprint=f"{number:064x}",
+        episode=episode,
+        vector=_unit(number % 16),
+        added=added,
+    )
+
+
+def _plan(existing, number, *, episode="ep09", replace=False):
+    return voicestore.plan_indexed_enrollment(
+        existing,
+        capture_id=f"c{number:032x}",
+        media_fingerprint=f"{number:064x}",
+        episode=episode,
+        vector=_unit(number % 16),
+        replace_episode=replace,
+    )
+
+
+def test_shared_indexed_plan_is_layout_independent():
+    existing = [
+        _key(1, episode="ep01", added="2026-08-27T05:00:03Z"),
+        _key(2, episode="ep02", added="2026-08-27T05:00:01Z"),
+    ]
+
+    assert _plan(existing, 1, episode="ep01") == voicestore.IndexedPlan(
+        "noop", target=0
+    )
+    assert _plan(existing, 9, episode="ep02", replace=True) == (
+        voicestore.IndexedPlan("replace", target=1)
+    )
+    with pytest.raises(voicestore.EnrollmentRefusal, match="replace-episode"):
+        _plan(existing, 9, episode="ep02")
+    assert _plan(existing, 9) == voicestore.IndexedPlan("enroll")
+
+    full = [
+        _key(
+            number, episode=f"ep{number:02d}", added=f"2026-08-27T05:00:0{9 - number}Z"
+        )
+        for number in range(1, voicestore.MAX_EXEMPLARS + 1)
+    ]
+    # The oldest ``added`` is displaced, independent of list position.
+    assert _plan(full, 9) == voicestore.IndexedPlan(
+        "enroll", evict=voicestore.MAX_EXEMPLARS - 1
+    )

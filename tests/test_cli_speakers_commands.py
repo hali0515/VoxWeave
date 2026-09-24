@@ -82,8 +82,35 @@ def test_serve_canonical_and_bare_forms(speaker_group, audition, args):
     assert result.exit_code == 0, result.output
     assert seen["create"] == [(media, {})]
     assert seen["serve"][0]["open_browser"] is False
+    assert seen["serve"][0]["host"] == "127.0.0.1"
+    assert seen["serve"][0]["ngrok"] is False
     assert result.stdout == "http://127.0.0.1:41533/\n"
     assert result.stderr == "Saved speaker names\n"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["serve", "EPISODE", "--host", "0.0.0.0"],
+        ["EPISODE", "--host", "0.0.0.0"],
+        ["--host", "0.0.0.0", "EPISODE"],
+    ],
+)
+def test_serve_accepts_all_interfaces(speaker_group, audition, args):
+    media, seen = audition
+    result = CliRunner().invoke(
+        speaker_group, [str(media) if arg == "EPISODE" else arg for arg in args]
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["serve"][0]["host"] == "0.0.0.0"
+
+
+@pytest.mark.parametrize("prefix", [["serve"], []])
+def test_serve_discovers_ngrok_without_a_domain(speaker_group, audition, prefix):
+    media, seen = audition
+    result = CliRunner().invoke(speaker_group, [*prefix, str(media), "--ngrok"])
+    assert result.exit_code == 0, result.output
+    assert seen["serve"][0]["ngrok"] is True
 
 
 @pytest.mark.parametrize("suffix", [".vtt", ".json"])
@@ -147,6 +174,39 @@ def test_enroll_preserves_options(
     assert ("deprecated" in result.stderr) is legacy
 
 
+def test_voices_dir_reaches_serve_and_enroll(
+    speaker_group, audition, monkeypatch, tmp_path
+):
+    media, seen = audition
+    library = tmp_path / "nas" / "voices"
+    served = CliRunner().invoke(
+        speaker_group, ["serve", str(media), "--voices-dir", str(library), "--no-open"]
+    )
+    assert served.exit_code == 0, served.output
+    assert seen["create"] == [
+        (
+            media,
+            {"voices": None, "show": None, "no_match": False, "voices_dir": library},
+        )
+    ]
+
+    enrolled = {}
+    monkeypatch.setattr(
+        speakers,
+        "enroll_speaker_voices",
+        lambda path, **kwargs: enrolled.update(path=path, **kwargs) or library,
+    )
+    result = CliRunner().invoke(
+        speaker_group,
+        ["enroll", str(media), "--voices-dir", str(library), "--show", "KonoSuba"],
+    )
+    assert result.exit_code == 0, result.output
+    assert enrolled["voices_dir"] == library
+    assert enrolled["voices"] is None
+    assert enrolled["show"] == "KonoSuba"
+    assert result.stdout == f"{library}\n"
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -180,7 +240,11 @@ def test_purge_allows_missing_media_and_preserves_names(speaker_group, tmp_path,
         ["--enroll", "--manual"],
         ["--enroll", "--no-open"],
         ["--enroll", "--port", "1234"],
+        ["--enroll", "--host", "0.0.0.0"],
+        ["--enroll", "--ngrok"],
         ["--purge-voiceprints", "--enroll"],
+        ["--purge-voiceprints", "--host", "0.0.0.0"],
+        ["--purge-voiceprints", "--ngrok"],
         ["--purge-voiceprints", "--show", "Show"],
         ["--episode", "S01E01"],
         ["--replace-episode"],
@@ -212,6 +276,8 @@ def test_help_lists_commands_and_hides_legacy_options(speaker_group):
         assert name in group_help.output
     assert "--manual" in serve_help.output
     assert "--open" in serve_help.output
+    assert "--host" in serve_help.output
+    assert "--ngrok" in serve_help.output
     for flag in ("--no-match", "--enroll", "--purge-voiceprints", "--replace-episode"):
         assert flag not in serve_help.output
     assert "--replace" in enroll_help.output

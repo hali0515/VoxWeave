@@ -1,4 +1,10 @@
-"""Turn-level speaker embeddings and deterministic two-way clustering."""
+"""Turn-level speaker embeddings and deterministic two-way clustering.
+
+Turns are embedded with the same embedder the bound voiceprints were captured
+with: the legacy lane loads the pyannote embedding checkpoint recorded in the
+provenance, the decoupled lane runs the registered :mod:`voxweave.voiceembed`
+model whose name and checkpoint SHA-256 the provenance records.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +22,7 @@ from typing import Any, overload
 
 import numpy as np
 
-from voxweave import config, runtime
+from voxweave import config, runtime, voiceembed
 from voxweave.diarize import _snapshot_commit
 from voxweave.diarize import _canonical_embedding_source as _canonical_source
 from voxweave.voicebase import MAX_EMBEDDING_DIM, MIN_EMBEDDING_DIM
@@ -24,7 +30,10 @@ from voxweave.voicebase import MAX_EMBEDDING_DIM, MIN_EMBEDDING_DIM
 EMBEDDING_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
 EMBEDDING_CHECKPOINT_FILE = "pytorch_model.bin"
 SAMPLE_RATE = 16_000
-MIN_TURN_SECONDS = 2.0
+# Shared with the centroid-v1 voiceprint recipe (one source of truth).
+MIN_TURN_SECONDS = voiceembed.MIN_TURN_SECONDS
+LANE_LEGACY = "legacy"
+LANE_DECOUPLED = voiceembed.LANE_DECOUPLED
 MAX_LLOYD_ITERATIONS = 32
 EIGENGAP_ABSOLUTE_TOLERANCE = 1e-12
 # Keep a healthy margin above float64/BLAS round-off: below this relative gap,
@@ -40,13 +49,38 @@ class UnsplittableSpeakerError(TurnEmbeddingError):
     """The supplied turns do not contain evidence for two distinct clusters."""
 
 
+class EmbeddingIdentityMismatch(TurnEmbeddingError):
+    """This installation cannot reproduce the embedder a capture recorded.
+
+    The capture is intact; the local embedder differs (a model this version
+    does not register, another pinned checkpoint, another pyannote.audio
+    version). A conflict with the capture, not a server fault.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class EmbeddingIdentity:
-    """Exact embedding model and checkpoint bytes bound during construction."""
+    """Exact embedding model and checkpoint bytes bound during construction.
+
+    ``lane`` is ``"legacy"`` (pyannote's embedding checkpoint, where the
+    installed pyannote.audio version is part of the identity) or
+    ``"decoupled"`` (a registered voiceembed model; ``model`` is its registry
+    name and ``pyannote_version`` is ``None`` because pyannote never runs it).
+    """
 
     model: str
     checkpoint_sha256: str
-    pyannote_version: str
+    pyannote_version: str | None
+    lane: str = LANE_LEGACY
+
+    @classmethod
+    def decoupled(cls, model: str, checkpoint_sha256: str) -> EmbeddingIdentity:
+        return cls(
+            model=model,
+            checkpoint_sha256=checkpoint_sha256,
+            pyannote_version=None,
+            lane=LANE_DECOUPLED,
+        )
 
 
 class AttestedTurnEmbeddings(dict[int, list[float]]):
@@ -250,7 +284,7 @@ def _construct_bound_checkpoint(
         ) from exc
     before = hashlib.sha256(payload).hexdigest()
     if expected_sha256 is not None and before != expected_sha256:
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             "speaker embedding checkpoint does not match requested identity"
         )
     checkpoint_buffer = io.BytesIO(payload)
@@ -265,13 +299,28 @@ def _construct_bound_checkpoint(
 
 def _load_inference(
     expected_identity: EmbeddingIdentity | None = None,
+    *,
+    source: str | None = None,
 ) -> tuple[Any, EmbeddingIdentity]:
-    """Load the production embedding family lazily on the best torch device."""
+    """Load the production embedding family lazily on the best torch device.
+
+    ``source`` (only without ``expected_identity``) names another pyannote
+    embedding checkpoint in the canonical ``checkpoint[@rev][#subfolder=]``
+    grammar, e.g. the community-1 pipeline's ``#subfolder=embedding`` model;
+    the default is the standalone WeSpeaker ResNet34 checkpoint.
+    """
+    if expected_identity is not None and source is not None:
+        raise TurnEmbeddingError("pass either an expected identity or a source")
     if expected_identity is None:
-        authority = _EmbeddingAuthority(EMBEDDING_MODEL, None, None)
+        authority = (
+            _EmbeddingAuthority(EMBEDDING_MODEL, None, None)
+            if source is None
+            else _parse_embedding_source(source)
+        )
     else:
         if (
-            len(expected_identity.checkpoint_sha256) != 64
+            expected_identity.lane != LANE_LEGACY
+            or len(expected_identity.checkpoint_sha256) != 64
             or any(
                 character not in "0123456789abcdef"
                 for character in expected_identity.checkpoint_sha256
@@ -287,7 +336,7 @@ def _load_inference(
         expected_identity is not None
         and pyannote_version != expected_identity.pyannote_version
     ):
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             "installed pyannote.audio version does not match requested identity"
         )
     token = config.conf_hf_token()
@@ -303,7 +352,7 @@ def _load_inference(
     checkpoint = _download_checkpoint(authority, token)
     embedding_source = _embedding_source(authority, checkpoint)
     if expected_identity is not None and embedding_source != expected_identity.model:
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             "resolved speaker embedding model does not match requested identity"
         )
     try:
@@ -375,7 +424,7 @@ def _load_inference(
         pyannote_version=pyannote_version,
     )
     if expected_identity is not None and identity != expected_identity:
-        raise TurnEmbeddingError(
+        raise EmbeddingIdentityMismatch(
             "loaded speaker embedding does not match requested identity"
         )
     return inference, identity
@@ -425,35 +474,10 @@ def _turn_bounds(turn: object, index: int) -> tuple[float, float]:
 
 
 def _read_mono_16k(wav_path: Path) -> np.ndarray:
-    import soundfile as sf
-
     try:
-        samples, sample_rate = sf.read(
-            str(wav_path),
-            dtype="float32",
-            always_2d=True,
-        )
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise TurnEmbeddingError(
-            f"could not read turn audio {wav_path}: {exc}"
-        ) from exc
-    if samples.ndim != 2 or samples.shape[0] == 0 or samples.shape[1] == 0:
-        raise TurnEmbeddingError(f"turn audio is empty: {wav_path}")
-    mono = np.asarray(samples, dtype=np.float32).mean(axis=1)
-    if int(sample_rate) != SAMPLE_RATE:
-        import torch
-        import torchaudio.functional as audio_functional
-
-        mono = (
-            audio_functional.resample(
-                torch.from_numpy(np.ascontiguousarray(mono)),
-                int(sample_rate),
-                SAMPLE_RATE,
-            )
-            .cpu()
-            .numpy()
-        )
-    return np.ascontiguousarray(mono, dtype=np.float32)
+        return voiceembed.read_mono_16k(Path(wav_path))
+    except voiceembed.VoiceEmbeddingError as exc:
+        raise TurnEmbeddingError(f"could not read turn audio: {exc}") from exc
 
 
 def _normalized_vector(value: object, *, field: str) -> list[float]:
@@ -521,6 +545,8 @@ def turn_embeddings(
     expected_identity = (
         turns.identity if isinstance(turns, AttestedTurnRequest) else None
     )
+    if expected_identity is not None and expected_identity.lane != LANE_LEGACY:
+        return _decoupled_turn_embeddings(Path(wav_path), turns, expected_identity)
     if not turns:
         with _inference_lock:
             _get_inference(expected_identity)
@@ -572,6 +598,86 @@ def turn_embeddings(
                 raise TurnEmbeddingError("turn embedding model returned ragged vectors")
             result[index] = vector
         return AttestedTurnEmbeddings(result, identity=identity)
+
+
+def _decoupled_spec(identity: EmbeddingIdentity) -> voiceembed.EmbedderSpec:
+    """The registered embedder a decoupled identity names, or refuse."""
+    if identity.lane != LANE_DECOUPLED:
+        raise TurnEmbeddingError("speaker embedding identity is invalid")
+    spec = voiceembed.spec_by_name(identity.model)
+    if spec is None:
+        raise EmbeddingIdentityMismatch(
+            f"speaker embedding model {identity.model} is not available in this "
+            "voxweave version"
+        )
+    if identity.checkpoint_sha256 != spec.sha256:
+        raise EmbeddingIdentityMismatch(
+            "speaker embedding checkpoint does not match requested identity"
+        )
+    return spec
+
+
+def _decoupled_turn_embeddings(
+    wav_path: Path,
+    turns: Sequence[object],
+    identity: EmbeddingIdentity,
+) -> AttestedTurnEmbeddings:
+    """Whole-turn vectors from the voiceprint embedder the identity names.
+
+    Each turn is embedded exactly like a voiceprint segment (one forward per
+    turn, long turns windowed, short ones repeated up to the model minimum).
+    """
+    spec = _decoupled_spec(identity)
+    spans = [_turn_bounds(turn, index) for index, turn in enumerate(turns)]
+    waveform = _read_mono_16k(wav_path) if spans else None
+    try:
+        with voiceembed.embedder_lock():
+            checkpoint_sha256 = voiceembed.get_embedder(spec).checkpoint_sha256
+            rows = (
+                voiceembed.embed_segments(waveform, spans, spec)
+                if waveform is not None
+                else []
+            )
+    except voiceembed.VoiceEmbeddingError as exc:
+        raise TurnEmbeddingError(str(exc)) from exc
+    return AttestedTurnEmbeddings(
+        {
+            index: _normalized_vector(row, field=f"turn embedding {index}")
+            for index, row in enumerate(rows)
+        },
+        identity=EmbeddingIdentity.decoupled(spec.name, checkpoint_sha256),
+    )
+
+
+def recipe_centroids(
+    wav_path: Path,
+    turns: Sequence[tuple[float, float, str]],
+    labels: Sequence[str],
+    identity: EmbeddingIdentity,
+) -> dict[str, list[float]]:
+    """centroid-v1 voiceprints of ``labels`` with the embedder ``identity`` names.
+
+    Only the decoupled lane has a recipe to reproduce; a label with no usable
+    segment is absent from the result, exactly as at capture time.
+    """
+    spec = _decoupled_spec(identity)
+    waveform = _read_mono_16k(Path(wav_path))
+    try:
+        with voiceembed.embedder_lock():
+            if voiceembed.get_embedder(spec).checkpoint_sha256 != (
+                identity.checkpoint_sha256
+            ):
+                raise EmbeddingIdentityMismatch(
+                    "loaded speaker embedding does not match requested identity"
+                )
+            return voiceembed.speaker_centroids(
+                waveform,
+                turns,
+                spec,
+                labels=labels,
+            )
+    except voiceembed.VoiceEmbeddingError as exc:
+        raise TurnEmbeddingError(str(exc)) from exc
 
 
 def normalized_centroid(vectors: Sequence[Sequence[float]]) -> list[float]:
@@ -670,9 +776,13 @@ __all__ = [
     "AttestedTurnEmbeddings",
     "AttestedTurnRequest",
     "EmbeddingIdentity",
+    "EmbeddingIdentityMismatch",
     "TurnEmbeddingError",
+    "LANE_DECOUPLED",
+    "LANE_LEGACY",
     "UnsplittableSpeakerError",
     "bisect_embeddings",
     "normalized_centroid",
+    "recipe_centroids",
     "turn_embeddings",
 ]

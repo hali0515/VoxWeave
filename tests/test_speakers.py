@@ -972,3 +972,99 @@ def test_enrollment_refusal_names_both_models_and_the_way_back(tmp_path, monkeyp
     assert config.DEFAULT_DIARIZE_MODEL in message
     assert "--diarize-model 3.1" in message
     assert '[diarize].model = "3.1"' in message
+
+
+def _decoupled_provenance(diarization_model, *, embedding_model="anime-va-ecapa-gn"):
+    return {
+        **_diarize_provenance(diarization_model),
+        "embedding_lane": "decoupled",
+        "embedding_model": embedding_model,
+        "embedding_checkpoint": "e" * 64,
+        "embedding_dim": 16,
+        "embedding_recipe": "centroid-v1",
+    }
+
+
+def test_decoupled_store_survives_a_diarizer_switch_and_uses_embedder_defaults(
+    tmp_path, monkeypatch
+):
+    from voxweave import voiceembed
+
+    for name in (
+        "VOXWEAVE_VOICES_ACCEPT",
+        "VOXWEAVE_VOICES_SUGGEST",
+        "VOXWEAVE_VOICES_MARGIN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    store = new_voice_store(
+        "Example Show", _decoupled_provenance(config.LEGACY_DIARIZE_MODEL)
+    )
+    store = enroll_exemplar(
+        store,
+        raw_name="Aqua",
+        capture_id="c" + "2" * 32,
+        media_fingerprint="f" * 64,
+        episode="prior",
+        vector=list(VOICE_VECTOR),
+    ).store
+    sidecar = {
+        "version": 1,
+        "capture_id": VOICE_CAPTURE,
+        "provenance": _decoupled_provenance(config.DEFAULT_DIARIZE_MODEL),
+        "binding": {
+            "turns_digest": canonical_turns_digest([[0.0, 4.0, "SPEAKER_00"]]),
+            "media_fingerprint": "f" * 64,
+            "media_stem": "episode",
+            "created": "2026-08-28T00:00:00Z",
+        },
+        "speakers": {"SPEAKER_00": list(VOICE_VECTOR)},
+    }
+
+    matching = speakers._matching_record(sidecar, tmp_path / "voices.json", store)
+
+    assert matching is not None
+    matches, record, thresholds = matching
+    assert matches["SPEAKER_00"].decision == "suggest"
+    assert (thresholds.suggest, thresholds.margin) == (
+        voiceembed.ANIME_VA.suggest,
+        voiceembed.ANIME_VA.margin,
+    )
+    assert record["thresholds"]["suggest"] == voiceembed.ANIME_VA.suggest
+
+
+def test_legacy_store_against_decoupled_capture_points_at_the_legacy_lane(
+    tmp_path, caplog
+):
+    sidecar = {"provenance": _decoupled_provenance(config.DEFAULT_DIARIZE_MODEL)}
+    store = new_voice_store(
+        "Example Show", _diarize_provenance(config.DEFAULT_DIARIZE_MODEL)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert (
+            speakers._matching_record(sidecar, tmp_path / "voices.json", store) is None
+        )
+
+    message = caplog.records[-1].getMessage()
+    assert "store was built with pyannote embeddings (example/embedder)" in message
+    assert "this run uses anime-va-ecapa-gn embeddings" in message
+    assert "--voiceprint-model pyannote" in message
+
+
+def test_enrollment_refuses_a_decoupled_capture_into_a_legacy_store(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("VOXWEAVE_CONFIG", str(tmp_path / "voxweave.conf"))
+    media = _write_voice_episode(
+        tmp_path, _decoupled_provenance(config.DEFAULT_DIARIZE_MODEL)
+    )
+    store_path = tmp_path / "voices.json"
+    _write_legacy_store(store_path, _diarize_provenance(config.DEFAULT_DIARIZE_MODEL))
+
+    with pytest.raises(EnrollmentRefusal) as excinfo:
+        speakers.enroll_speaker_voices(media, voices=store_path, show="Example Show")
+
+    message = str(excinfo.value)
+    assert "enrollment refused" in message
+    assert "store was built with pyannote embeddings" in message
+    assert "--voiceprint-model pyannote" in message

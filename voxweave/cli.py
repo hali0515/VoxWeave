@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ from voxweave.cli_compat import (
     require_media,
 )
 from voxweave.cli_speakers import build_speakers_group
+from voxweave.cli_voices import build_voices_group
 from voxweave.progress import Reporter
 from voxweave.ui import (
     RichReporter,
@@ -44,7 +46,7 @@ def _run(fn, *, reporter: bool = True):
 
 def _report_speaker_service(message: str) -> None:
     """Keep the service URL on stdout and session updates on stderr."""
-    click.echo(message, err=not message.startswith("http://127.0.0.1:"))
+    click.echo(message, err=not message.startswith("http://"))
 
 
 def _flag(value: bool | None, key: str, builtin: bool) -> bool:
@@ -185,7 +187,7 @@ def _resolve_llm(
                 {"name": "Capture", "commands": ["transcribe"]},
                 {
                     "name": "Revise",
-                    "commands": ["correct", "align", "render", "speakers"],
+                    "commands": ["correct", "align", "render", "speakers", "voices"],
                 },
                 {
                     "name": "Deliver",
@@ -215,7 +217,9 @@ def _resolve_llm(
                     "options": [
                         "--diarize",
                         "--diarize-model",
+                        "--speaker-clustering",
                         "--voiceprints",
+                        "--voiceprint-model",
                         "--min-speakers",
                         "--max-speakers",
                     ],
@@ -238,7 +242,7 @@ def cli(ctx, verbose: bool) -> None:
     Shortcut: voxweave MEDIA runs transcribe. Use COMMAND --help for options.
     """
     install_logging(verbose=verbose)
-    if ctx.invoked_subcommand not in {"speakers", "help"}:
+    if ctx.invoked_subcommand not in {"speakers", "voices", "help"}:
         config.ensure_default_config()  # write default config template on first run
 
 
@@ -329,6 +333,20 @@ def cli(ctx, verbose: bool) -> None:
     ),
 )
 @click.option(
+    "--speaker-clustering",
+    type=click.Choice(config.DIARIZE_CLUSTERING_CHOICES, case_sensitive=False),
+    default=None,
+    help=(
+        "How diarization groups its turns into speakers: pyannote (the pipeline's "
+        "own clustering) or voiceprint (regroup with ReDimNet2 voiceprints, weights "
+        "CC BY-NC-SA 4.0; turns nobody can be attributed to are dropped and their "
+        "words stay with the surrounding speaker). Default: "
+        f"{config.DEFAULT_DIARIZE_CLUSTERING}. Precedence: CLI, "
+        f"{config.DIARIZE_CLUSTERING_ENV}, conf [diarize].clustering. Only used with "
+        "--diarize."
+    ),
+)
+@click.option(
     "--voiceprints/--no-voiceprints",
     default=None,
     help=(
@@ -336,6 +354,19 @@ def cli(ctx, verbose: bool) -> None:
         "legacy sidecar is updated). Requires diarization; "
         "precedence is CLI, VOXWEAVE_VOICEPRINTS, conf [defaults].voiceprints, "
         "then off."
+    ),
+)
+@click.option(
+    "--voiceprint-model",
+    default=None,
+    metavar="MODEL",
+    help=(
+        "Speaker-embedding model for --voiceprints: auto (default: anime-va for "
+        "Japanese, redimnet2 otherwise), redimnet2, anime-va, or pyannote (legacy: "
+        "the diarization pipeline's own embeddings, matches pre-existing voice "
+        "stores). Precedence: CLI, VOXWEAVE_VOICEPRINT_MODEL, conf "
+        "[voiceprint].model. Always validated; without --voiceprints it has no "
+        "effect (warning)."
     ),
 )
 @click.option(
@@ -404,7 +435,9 @@ def cmd_transcribe(
     sdh: bool,
     diarize: bool | None,
     diarize_model: str | None,
+    speaker_clustering: str | None,
     voiceprints: bool | None,
+    voiceprint_model: str | None,
     min_speakers: int | None,
     max_speakers: int | None,
     context: str | None,
@@ -433,11 +466,41 @@ def cmd_transcribe(
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
     diarize_model = config.resolve_diarize_model(diarize_model)
+    if diarize:
+        try:
+            speaker_clustering = config.resolve_diarize_clustering(speaker_clustering)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+    elif speaker_clustering is not None:
+        logging.getLogger("voxweave").warning(
+            "--speaker-clustering has no effect: diarization is off (from %s); "
+            "add --diarize to identify speakers",
+            diarize_source,
+        )
     if voiceprints and not diarize:
         raise click.UsageError(
             "voiceprint capture is on from "
             f"{voiceprints_source}, but diarization is off from {diarize_source}; "
             "enable --diarize or disable voiceprints"
+        )
+    from voxweave import voiceembed
+
+    try:
+        if voiceprint_model is not None:
+            # An explicit --voiceprint-model is validated even when it cannot
+            # take effect, so a typo never goes unnoticed.
+            voiceprint_model = voiceembed.normalize_voiceprint_choice(voiceprint_model)
+        if voiceprints:
+            # Validate now; the per-language routing of "auto" happens once the
+            # language is detected.
+            voiceprint_model = voiceembed.resolve_voiceprint_choice(voiceprint_model)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if voiceprint_model is not None and not voiceprints:
+        logging.getLogger("voxweave").warning(
+            "--voiceprint-model has no effect: voiceprint capture is off (from %s); "
+            "add --voiceprints to capture voiceprints",
+            voiceprints_source,
         )
     timestamps = _flag(timestamps, "timestamps", True)
     shot_snap = _flag(shot_snap, "shot_snap", True)
@@ -454,7 +517,9 @@ def cmd_transcribe(
             sdh=sdh,
             diarize=diarize,
             diarize_model=diarize_model,
+            speaker_clustering=speaker_clustering,
             voiceprints=voiceprints,
+            voiceprint_model=voiceprint_model,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
             asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
@@ -480,6 +545,7 @@ cli.add_command(cmd_transcribe)
 
 cmd_speakers = build_speakers_group(_run, _report_speaker_service)
 cli.add_command(cmd_speakers)
+cli.add_command(build_voices_group(_run))
 
 
 @cli.command(

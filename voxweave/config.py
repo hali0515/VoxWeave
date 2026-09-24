@@ -50,6 +50,18 @@ DIARIZE_MODEL_ALIASES = {
     "3.1": LEGACY_DIARIZE_MODEL,
     "community-1": COMMUNITY_DIARIZE_MODEL,
 }
+# Who-is-who grouping of the diarizer's turns: "pyannote" keeps the pipeline's own
+# clustering; "voiceprint" regroups the raw turns with ReDimNet2 voiceprints and drops
+# turns nobody can be attributed to (voxweave.speakercluster). The built-in default is
+# this one constant: flipping it is a one-line change once the evaluation gates pass.
+DIARIZE_CLUSTERING_VOICEPRINT = "voiceprint"
+DIARIZE_CLUSTERING_PYANNOTE = "pyannote"
+DIARIZE_CLUSTERING_CHOICES = (
+    DIARIZE_CLUSTERING_VOICEPRINT,
+    DIARIZE_CLUSTERING_PYANNOTE,
+)
+DEFAULT_DIARIZE_CLUSTERING = DIARIZE_CLUSTERING_PYANNOTE
+DIARIZE_CLUSTERING_ENV = "VOXWEAVE_DIARIZE_CLUSTERING"
 # Per-language aligner defaults. Unlisted languages fall back to Qwen3-ForcedAligner.
 #
 # en: facebook/wav2vec2-large-960h-lv60-self loaded via HF (same LV60K-self weights as
@@ -169,8 +181,40 @@ _TEMPLATE = """\
 # separation); accept its model-card conditions on Hugging Face first. Use "3.1" to
 # stay on the older pipeline your existing gated access already covers, or provide
 # any full Hugging Face pipeline ID. (= --diarize-model / VOXWEAVE_DIARIZE_MODEL)
+#
+# clustering decides who is who once the pipeline has found the speaker turns
+# (= --speaker-clustering / VOXWEAVE_DIARIZE_CLUSTERING; default "@DIARIZE_CLUSTERING@"):
+#   pyannote   = the pipeline's own clustering
+#   voiceprint = regroup the turns with ReDimNet2 voiceprints (weights non-commercial,
+#                CC BY-NC-SA 4.0; 51 MB download on first use); turns nobody can be
+#                attributed to are dropped and their words stay with the speaker around them
 [diarize]
 # model = "community-1"
+# clustering = "@DIARIZE_CLUSTERING@"
+
+# Voiceprint embedder (= --voiceprint-model / VOXWEAVE_VOICEPRINT_MODEL); only used with
+# --voiceprints. pyannote still finds the speaker turns; the per-speaker voiceprints come
+# from a separate speaker-embedding model:
+#   auto (default) = anime-va for Japanese, redimnet2 for every other language
+#   redimnet2      = ReDimNet2-B6 (vb2+vox2+cnc2, large-margin); weights are
+#                    non-commercial (CC BY-NC-SA 4.0, VoxBlink2 training data)
+#   anime-va       = anime voice-actor ECAPA-TDNN (Japanese only)
+#   pyannote       = legacy: the diarization pipeline's own embeddings; keeps matching
+#                    voice stores built before the dedicated embedders
+# Voice stores are per embedding space: a store built by one embedder never matches
+# another. Changing [diarize].model no longer orphans a store built by redimnet2/anime-va.
+[voiceprint]
+# model = "auto"
+
+# Voice library (= --voices-dir / VOXWEAVE_VOICES_DIR): where `speakers enroll` stores the
+# named voices and `speakers serve` looks them up, across every media folder. Default:
+# $XDG_DATA_HOME/voxweave/voices, else ~/.local/share/voxweave/voices. It holds voice
+# biometrics of the people you name; `voxweave voices forget ID` removes one person.
+# It may point at a NAS path shared by several machines (plain JSON files plus one flock;
+# needs an NFSv4 or lock-enabled mount, not `nolock`). A relative path is relative to
+# this file's directory.
+[voices]
+# dir = "/mnt/nas/voxweave/voices"
 
 # Default on/off for the boolean pipeline flags. Explicit CLI flags always win
 # (e.g. separate = false here, --separate on the command line for one run).
@@ -194,7 +238,7 @@ en = "facebook/wav2vec2-large-960h-lv60-self"   # English: large wav2vec2 CTC pe
 ja = "mms"                             # Japanese: MMS-300m + uroman full-file single pass (= whisperx fork align_ctc; gold standard); requires onnxruntime-gpu for CUDA (bundled in core)
 # ja = "jonatasgrosman/wav2vec2-large-xlsr-53-japanese"   # Alternative: xlsr character-level CTC per-cue (full-file single pass is O(T^2) -> OOM)
 # zh = "mms"   # Chinese can also use MMS full-file pass; default is Qwen (native CJK character-level)
-"""
+""".replace("@DIARIZE_CLUSTERING@", DEFAULT_DIARIZE_CLUSTERING)
 
 
 def config_path() -> Path:
@@ -214,6 +258,8 @@ _KNOWN_KEYS = frozenset(
         "batch",
         "separate",
         "diarize",
+        "voiceprint",
+        "voices",
         "align",
         "defaults",
         "llm",
@@ -511,6 +557,115 @@ def resolve_diarize_model(cli_value: str | None = None) -> str:
         selected = DEFAULT_DIARIZE_MODEL
     selected = selected.strip()
     return DIARIZE_MODEL_ALIASES.get(selected.lower(), selected)
+
+
+def _conf_diarize_clustering() -> str | None:
+    """Return ``[diarize].clustering`` when it is a non-blank string."""
+    section = _load().get("diarize")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        log.warning(
+            "config key %r has wrong type (expected table), ignoring", "diarize"
+        )
+        return None
+    raw = section.get("clustering")
+    if raw is not None and not isinstance(raw, str):
+        log.warning(
+            "config [diarize].clustering has wrong type (expected string), ignoring"
+        )
+        return None
+    return _nonempty_str(raw)
+
+
+def normalize_diarize_clustering(
+    value: str, *, source: str = "--speaker-clustering"
+) -> str:
+    """Map a user value to ``"voiceprint"`` or ``"pyannote"`` (case-insensitive).
+
+    An unknown value raises ``ValueError`` naming its source instead of silently
+    running the other clustering.
+    """
+    key = value.strip().casefold()
+    if key in DIARIZE_CLUSTERING_CHOICES:
+        return key
+    raise ValueError(
+        f"{source} has unknown speaker clustering {value!r}; "
+        f"choose one of {', '.join(DIARIZE_CLUSTERING_CHOICES)}"
+    )
+
+
+def resolve_diarize_clustering(cli_value: str | None = None) -> str:
+    """Resolve how diarization groups its turns into speakers.
+
+    Precedence is explicit CLI value, ``VOXWEAVE_DIARIZE_CLUSTERING``,
+    ``[diarize].clustering``, then :data:`DEFAULT_DIARIZE_CLUSTERING`. Blank
+    values fall through to the next source; an unknown value raises
+    ``ValueError`` naming its source (a config value of the wrong type is warned
+    about and ignored, like ``[diarize].model``).
+    """
+    selected = _nonempty_str(cli_value)
+    if selected is not None:
+        return normalize_diarize_clustering(selected)
+    env = _nonempty_str(os.environ.get(DIARIZE_CLUSTERING_ENV))
+    if env is not None:
+        return normalize_diarize_clustering(
+            env, source=f"environment {DIARIZE_CLUSTERING_ENV}"
+        )
+    conf = _conf_diarize_clustering()
+    if conf is not None:
+        return normalize_diarize_clustering(conf, source="config [diarize].clustering")
+    return DEFAULT_DIARIZE_CLUSTERING
+
+
+def conf_voiceprint_model() -> str | None:
+    """Return ``[voiceprint].model`` when it is a non-blank string.
+
+    The value is resolved (aliases, per-language ``auto`` routing, validation) by
+    :func:`voxweave.voiceembed.resolve_voiceprint_choice`; this only reads it.
+    """
+    section = _load().get("voiceprint")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        log.warning(
+            "config key %r has wrong type (expected table), ignoring", "voiceprint"
+        )
+        return None
+    raw = section.get("model")
+    if raw is not None and not isinstance(raw, str):
+        log.warning(
+            "config [voiceprint].model has wrong type (expected string), ignoring"
+        )
+        return None
+    return _nonempty_str(raw)
+
+
+def conf_voices_dir() -> Path | None:
+    """Return ``[voices].dir`` as an absolute path, or None when unset.
+
+    ``~`` is expanded, and a relative value is taken relative to the config
+    file's directory (not the working directory, which changes per command).
+    Precedence against ``--voices-dir`` / ``VOXWEAVE_VOICES_DIR`` is resolved
+    by :func:`voxweave.voicelibrary.resolve_voices_dir`.
+    """
+    section = _load().get("voices")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        log.warning("config key %r has wrong type (expected table), ignoring", "voices")
+        return None
+    raw = section.get("dir")
+    if raw is not None and not isinstance(raw, str):
+        log.warning("config [voices].dir has wrong type (expected string), ignoring")
+        return None
+    value = _nonempty_str(raw)
+    if value is None:
+        return None
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        path = config_path().expanduser().absolute().parent / path
+    return path
 
 
 _LOAD_STRATEGIES = ("peak", "sum")

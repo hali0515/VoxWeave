@@ -901,6 +901,29 @@ def test_separate_vocals_resolves_autocast_once_for_forward_and_identity(
         out.unlink(missing_ok=True)
 
 
+def test_separate_vocals_refuses_multichannel_audio_before_loading(
+    monkeypatch, tmp_path
+):
+    # The Roformer is a stereo model. A 5.1 wav that bypassed decode_to_wav's
+    # stereo cap used to die deep inside it with "stereo needs to be set to True";
+    # it must be refused up front, naming the channel count, without a model load.
+    pytest.importorskip("torch")
+    sf = pytest.importorskip("soundfile")
+    numpy = pytest.importorskip("numpy")
+    monkeypatch.setattr(
+        backend,
+        "_load_separator",
+        lambda **_kwargs: pytest.fail("a 6-channel input must not load the model"),
+    )
+    source = tmp_path / "surround.wav"
+    sf.write(str(source), numpy.zeros((256, 6), dtype="float32"), 44100)
+
+    with pytest.raises(ValueError, match="has 6 channels") as caught:
+        backend.separate_vocals(source)
+    assert "surround.wav" in str(caught.value)
+    assert "mono or stereo" in str(caught.value)
+
+
 def _tiny_roformer(torch):
     """The vendored MelBandRoformer at toy size: CPU-only, deterministic, sub-second."""
     from voxweave.vendor.mel_band_roformer import MelBandRoformer

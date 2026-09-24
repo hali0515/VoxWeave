@@ -3,6 +3,151 @@
 What changed per release, newest first. Only releases that need an action or a
 heads-up appear here.
 
+## 0.18.0 (unreleased)
+
+Most of this release concerns `--voiceprints` (cross-episode voice matching and **Split
+this speaker**). One fix changes the audio a first run transcribes and diarizes, so a
+first run's subtitles can differ slightly from 0.17.0.
+
+### First runs transcribe and diarize the same audio as re-runs
+
+With vocal separation on (the default), a first run used to derive its 16 kHz ASR and
+diarization input straight from the 44.1 kHz stereo vocals, while every later run of the
+same media decodes the cached 32 kHz mono copy (`vocals.32k.flac`). A first run now goes
+through the same 32 kHz mono vocals, so both runs feed ASR and diarization identical
+samples. Without `--normalize` (the default) the old gap was only a resampling difference.
+With `--normalize` it was larger: loudness normalization measured the two inputs about
+2.5 dB apart and moved 10-14% of diarization frames, so a re-run could change the speaker
+turns. Expect small differences against a 0.17.0 first run; re-runs from an existing cache
+are unchanged. One difference remains: a first run finds the speech timing reference (gap
+splitting, snapping words to speech) on the original mix, while a re-run from the cache
+uses the separated vocals, so cue timing can still differ slightly between the two.
+
+### Opt-in voiceprint speaker clustering
+
+`--diarize` can group the speaker turns by voiceprint instead of by pyannote's own
+clustering. It is opt-in: `--speaker-clustering voiceprint`,
+`VOXWEAVE_DIARIZE_CLUSTERING=voiceprint` or `[diarize].clustering = "voiceprint"`. pyannote
+still finds who speaks when; the `voiceprint-v1` recipe decides who is who with ReDimNet2-B6
+(the `redimnet2` voiceprint model: weights CC BY-NC-SA 4.0, a 51 MB download on first use).
+It clusters the turns that hold at least 1 s of speech nobody talks over (turns overlapping
+in time for most of their length never share a speaker), gives the other turns to the
+closest voice nearby, and drops from `speaker_turns` the turns no voice is close enough to,
+so their words stay with the surrounding speaker. In our measurements it confused speakers less than pyannote on three of
+four public test sets and got more short backchannels right in an online meeting, but it can
+report more speakers than there are, and a speaker who talks very little may be merged into
+others or dropped; that is why the default stays `pyannote`, whose output is unchanged.
+`--min-speakers`/`--max-speakers` bind the voiceprint stage too; a `--min-speakers` above the
+number of voices it finds is met by dividing those voices, as pyannote does under that bound
+(it cost the stage less accuracy than pyannote in our measurements, but more than no bound).
+If it fails (download, out of memory), cannot meet those bounds, or finds no turn long enough
+to anchor a voiceprint, the run warns and keeps pyannote's speakers.
+`--voiceprint-model pyannote` always keeps pyannote's clustering, because its voiceprints are
+keyed by pyannote's labels.
+
+Saved speaker names are keyed by speaker id (`SPEAKER_00`, ...), and switching
+`--speaker-clustering` (like switching `--diarize-model`) renumbers the speakers of an episode
+you already named. `process` now warns when a named id's turns changed; review the names with
+`voxweave speakers <media>` before running `voxweave speakers enroll`, or a voice can be
+stored in the voice library under someone else's name.
+
+### Voiceprints come from a dedicated embedder
+
+`--voiceprints` used to store the diarization pipeline's own speaker embeddings. It now
+keeps pyannote for the speaker turns but computes the voiceprints with a separate
+speaker-embedding model chosen per language (`--voiceprint-model` /
+`VOXWEAVE_VOICEPRINT_MODEL` / `[voiceprint].model`, default `auto`):
+
+- `auto`: `anime-va` for Japanese, `redimnet2` for every other language;
+- `redimnet2`: ReDimNet2-B6 (weights non-commercial, CC BY-NC-SA 4.0);
+- `anime-va`: anime voice-actor ECAPA-TDNN (Japanese only);
+- `pyannote`: the previous behavior.
+
+A `--voiceprints` run fetches the checkpoint it may need (51 MB for `redimnet2`, 83 MB
+for `anime-va`; with `auto` and no `--lang`, both) into `~/.cache/voxweave/audio/` and
+verifies its SHA-256 before any audio work. If that fails (no network, a stalled
+download), the run warns and continues without voiceprints; the subtitles are written as
+usual. For an offline host:
+
+- `redimnet2`: copy `b6-vb2+vox2+cnc2_v0-lm.pt` into `~/.cache/voxweave/audio/redimnet2/`,
+  or point `VOXWEAVE_REDIMNET2_CKPT` at the file;
+- `anime-va`: point `VOXWEAVE_ANIME_VA_CKPT` at `embedding_model.pth`. Its cache entry
+  uses the Hugging Face hub layout (`models--litagin--.../snapshots/<revision>/`), so a
+  file copied into `~/.cache/voxweave/audio/` is not found.
+
+Either way the file must be the pinned checkpoint; its size and SHA-256 are verified.
+
+**Existing voiceprints and voice stores do not match new captures.** A voice store is
+tied to one embedding space, and the new embedders define new ones. Nothing is rewritten
+or deleted, but with the new default:
+
+- `speakers serve` skips an existing store with a warning that names both spaces
+  (`store was built with pyannote embeddings (...); this run uses redimnet2-... embeddings`);
+- `speakers enroll` refuses to add a new episode to it.
+
+To keep using an existing store, capture new episodes on the legacy lane:
+
+```bash
+voxweave episode.mkv --diarize --voiceprints --voiceprint-model pyannote
+```
+
+or set it once in `~/.config/voxweave.conf`:
+
+```toml
+[voiceprint]
+model = "pyannote"
+```
+
+Alternatively start a new store with the new embedder: re-run the reviewed episodes with
+`--diarize --voiceprints` and `speakers enroll` them into a new `--voices` file.
+
+In exchange, a store built by `redimnet2` or `anime-va` no longer depends on the
+diarization pipeline: switching `--diarize-model` keeps it matching. The default
+matching thresholds now follow the embedding space (`anime-va` uses a lower suggest
+threshold, 0.35); `VOXWEAVE_VOICES_SUGGEST` / `VOXWEAVE_VOICES_MARGIN` still override
+them. Those defaults are provisional; `scripts/calibrate_voiceprints.py` measures them on
+your own diarized episodes.
+
+**Split this speaker** embeds turns with whichever embedder the episode's voiceprints
+were captured with, so legacy episodes keep splitting as before.
+
+### Enrolled voices go to a global voice library
+
+`speakers enroll` without `--voices` used to need a per-folder `voxweave.voices.json`
+(created with `--voices PATH --show NAME`). It now saves into one voice library shared by
+every media folder, by default `~/.local/share/voxweave/voices` (or
+`$XDG_DATA_HOME/voxweave/voices`); `--voices-dir`, `VOXWEAVE_VOICES_DIR` or `[voices].dir`
+move it, for example onto a NAS shared by several machines. `voxweave voices where` shows
+which directory is in use. The first enrollment prints a notice that the library holds
+voice biometrics; `voxweave voices forget ID` removes one person.
+
+`speakers serve` suggests names from the library in two tiers: voices enrolled under the
+episode's scope (`--show`, else the media folder's name) as before, and voices of every
+other scope only above a stricter threshold (`VOXWEAVE_VOICES_GLOBAL_SUGGEST`), labelled
+with where they were heard and never prefilled.
+
+What stays the same, and what to do:
+
+- `--voices FILE` still selects a per-show store explicitly and behaves exactly as before;
+  it cannot be combined with `--voices-dir`.
+- An existing `voxweave.voices.json` beside the media is still used for suggestions, now
+  without `--show`, but is never written again. Merge it once with
+  `voxweave voices import path/to/voxweave.voices.json`. Its voices keep both scopes the
+  file served before, its folder's and its show's, so the same suggestions stay in the
+  first tier (`--scope NAME` picks one scope instead; importing again with another
+  `--scope` adds it). Importing keeps its ids, so running it again adds nothing,
+  and the file is left untouched; delete it yourself once you no longer need it. Such a
+  file keeps the vectors of everyone in it: `voxweave voices forget ID` stops VoxWeave
+  from reading them for that person and lists the files that still hold them, but only
+  deleting those files removes the vectors from disk.
+- `--show` now also names the scope of an enrollment. Without it, the scope is the media
+  folder's name, qualified with its parent for generic names such as `Season 1`, `S02`,
+  `Disc 1` or `Specials` (`Frieren / Season 1`); pass `--show` where two unrelated folders
+  share a distinctive name.
+- Enrolling a name does not merge it with a same-named person of another scope unless you
+  used that person's suggestion on the review page; use `voxweave voices list`,
+  `show`, `rename` and `forget` to curate the result.
+
 ## 0.17.0
 
 Two performance settings were added, both off by default, and successful runs gained

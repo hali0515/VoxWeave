@@ -1,4 +1,4 @@
-"""Local-only HTTP serving for the speaker audition page."""
+"""HTTP serving for the speaker audition page, with loopback binding by default."""
 
 from __future__ import annotations
 
@@ -19,8 +19,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from voxweave import artifacts, fsio, turnembed
+from voxweave import artifacts, fsio, turnembed, voiceembed
+from voxweave.ngrok import NgrokOrigins
 from voxweave.voicebase import (
     MAX_PROVENANCE_STRING_BYTES,
     VOICEPRINTS_MAX_BYTES,
@@ -63,6 +65,10 @@ class _SplitProposal:
     media_fingerprint: str
     assignment: tuple[tuple[int, str], ...]
     embeddings: tuple[tuple[int, tuple[float, ...]], ...]
+    # Decoupled lane only: the centroid-v1 voiceprints of groups "A" / "B"
+    # (a group without a usable segment is absent). None = legacy lane, whose
+    # confirm averages the per-turn embeddings above.
+    recipe_centroids: tuple[tuple[str, tuple[float, ...]], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,10 +86,23 @@ class _StagedSplit:
     audio_separated: bool
     audio_normalized: bool
     audio_separator: SeparatorIdentity | None
+    embedding_lane: str = turnembed.LANE_LEGACY
+
+    def embedding_identity(self) -> turnembed.EmbeddingIdentity:
+        """The provider identity the bound voiceprints were captured with."""
+        if self.embedding_lane == turnembed.LANE_DECOUPLED:
+            return turnembed.EmbeddingIdentity.decoupled(
+                self.embedding_model, self.embedding_checkpoint
+            )
+        return turnembed.EmbeddingIdentity(
+            model=self.embedding_model,
+            checkpoint_sha256=self.embedding_checkpoint,
+            pyannote_version=self.pyannote_version,
+        )
 
 
 class SpeakerHTTPServer(ThreadingHTTPServer):
-    """A loopback server carrying one in-memory audition session."""
+    """An HTTP server carrying one in-memory audition session."""
 
     daemon_threads = True
 
@@ -98,7 +117,11 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         pristine_mapping_generation: fsio.FileGeneration | None,
         port: int,
         report: Callable[[str], None],
+        host: str = HOST,
+        ngrok: bool = False,
     ) -> None:
+        if host not in (HOST, "0.0.0.0"):
+            raise ValueError("host must be 127.0.0.1 or 0.0.0.0")
         self.page_bytes = page.encode("utf-8")
         self.media_path = Path(media_path)
         self.mapping_path = Path(mapping_path)
@@ -113,11 +136,12 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         self.action_lock = threading.Lock()
         self.split_proposal: _SplitProposal | None = None
         self.session_terminal = False
-        super().__init__((HOST, port), _SpeakerRequestHandler)
+        super().__init__((host, port), _SpeakerRequestHandler)
+        self.ngrok_origins = NgrokOrigins(self.server_port) if ngrok else None
 
     @property
     def authority(self) -> str:
-        return f"{HOST}:{self.server_port}"
+        return f"{self.server_address[0]}:{self.server_port}"
 
     @property
     def origin(self) -> str:
@@ -163,16 +187,45 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
             no_store=no_store,
         )
 
-    def _host_allowed(self) -> bool:
-        # A DNS-rebinding page resolves its own hostname to 127.0.0.1 and can
-        # then read same-origin responses, so every route — not just the write
-        # path — must refuse a Host other than the bound authority (the page
-        # embeds private audio and serve-info discloses the save token).
-        return self.headers.get_all("Host", []) == [self.server.authority]
+    def _allowed_origins(self) -> set[str]:
+        # Every route checks Host because the page embeds audio and serve-info
+        # discloses the save token. Wildcard binding also accepts the connection's
+        # local IP, never arbitrary hostnames that could enable DNS rebinding.
+        authorities = {self.server.authority}
+        if self.server.server_address[0] == "0.0.0.0":
+            local_host = self.connection.getsockname()[0]
+            authorities.add(f"{local_host}:{self.server.server_port}")
+        if self.server.ngrok_origins is not None:
+            authorities.add(f"localhost:{self.server.server_port}")
+        hosts = self.headers.get_all("Host", [])
+        if len(hosts) != 1:
+            return set()
+        host = hosts[0]
+        local = host in authorities
+        origins = {f"http://{host}"} if local else set()
+        if self.server.ngrok_origins is not None and (
+            not local
+            or any(o not in origins for o in self.headers.get_all("Origin", []))
+        ):
+            origins.update(
+                origin
+                for origin in self.server.ngrok_origins.get()
+                if local or urlsplit(origin).netloc == host
+            )
+        return origins
 
     def do_GET(self) -> None:
-        if not self._host_allowed():
-            self._reply(HTTPStatus.FORBIDDEN)
+        if not self._allowed_origins():
+            message = (
+                b"No matching ngrok endpoint. Check the local agent at 127.0.0.1:4040 "
+                b"and forward it to this server's port.\n"
+                if self.server.ngrok_origins is not None
+                else b"Host is not allowed. For a local ngrok tunnel, start speakers with --ngrok.\n"
+            )
+            self._reply(
+                HTTPStatus.FORBIDDEN,
+                message,
+            )
             return
         if self.path == "/":
             self._reply(
@@ -236,11 +289,12 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
                 self._handle_split_undo(payload)
 
     def _guarded_json_body(self) -> object:
-        if not self._host_allowed():
+        allowed_origins = self._allowed_origins()
+        if not allowed_origins:
             self._reply(HTTPStatus.FORBIDDEN)
             return _INVALID_BODY
         origins = self.headers.get_all("Origin", [])
-        if len(origins) > 1 or (origins and origins[0] != self.server.origin):
+        if len(origins) > 1 or (origins and origins[0] not in allowed_origins):
             self._reply(HTTPStatus.FORBIDDEN)
             return _INVALID_BODY
         tokens = self.headers.get_all("X-VoxWeave-Token", [])
@@ -477,11 +531,21 @@ def _prepare_split_wav(media_path: Path, staged: _StagedSplit) -> Path:
         )
 
 
-def _staged_provenance(
-    sidecar: Mapping[str, object],
-) -> tuple[str, str, str, bool, bool, SeparatorIdentity | None]:
+@dataclass(frozen=True, slots=True)
+class _StagedProvenance:
+    embedding_lane: str
+    embedding_model: str
+    embedding_checkpoint: str
+    pyannote_version: str
+    audio_separated: bool
+    audio_normalized: bool
+    audio_separator: SeparatorIdentity | None
+
+
+def _staged_provenance(sidecar: Mapping[str, object]) -> _StagedProvenance:
     provenance = require_mapping(sidecar.get("provenance"), "provenance")
     require_known_compatibility(build_compatibility_fingerprint(provenance))
+    decoupled = provenance.get("embedding_lane") == turnembed.LANE_DECOUPLED
     embedding_model = require_string(
         provenance.get("embedding_model"),
         "provenance.embedding_model",
@@ -492,11 +556,25 @@ def _staged_provenance(
         "provenance.embedding_checkpoint",
         max_bytes=MAX_PROVENANCE_STRING_BYTES,
     )
-    pyannote_version = require_string(
-        provenance.get("pyannote_version"),
-        "provenance.pyannote_version",
-        max_bytes=MAX_PROVENANCE_STRING_BYTES,
-    )
+    if decoupled:
+        # The recipe is what split-confirm must reproduce; one this version
+        # does not implement cannot be recomputed faithfully.
+        recipe = provenance.get("embedding_recipe")
+        if recipe != voiceembed.CENTROID_RECIPE:
+            raise SplitConflict(
+                f"voiceprints use centroid recipe {recipe!r}, which this voxweave "
+                f"version cannot reproduce (it implements "
+                f"{voiceembed.CENTROID_RECIPE!r})"
+            )
+        # Informational only on this lane: pyannote never runs the embedder.
+        raw_version = provenance.get("pyannote_version")
+        pyannote_version = raw_version if isinstance(raw_version, str) else ""
+    else:
+        pyannote_version = require_string(
+            provenance.get("pyannote_version"),
+            "provenance.pyannote_version",
+            max_bytes=MAX_PROVENANCE_STRING_BYTES,
+        )
     audio = require_mapping(provenance.get("audio"), "provenance.audio")
     separated = audio.get("separated")
     normalized = audio.get("normalized")
@@ -510,13 +588,16 @@ def _staged_provenance(
     separator = (
         validate_separator_identity(audio.get("separator")) if separated else None
     )
-    return (
-        embedding_model,
-        embedding_checkpoint,
-        pyannote_version,
-        separated,
-        normalized,
-        separator,
+    return _StagedProvenance(
+        embedding_lane=(
+            turnembed.LANE_DECOUPLED if decoupled else turnembed.LANE_LEGACY
+        ),
+        embedding_model=embedding_model,
+        embedding_checkpoint=embedding_checkpoint,
+        pyannote_version=pyannote_version,
+        audio_separated=separated,
+        audio_normalized=normalized,
+        audio_separator=separator,
     )
 
 
@@ -562,14 +643,7 @@ def _stage_split_inputs(
             sibling,
             fingerprint,
         )
-        (
-            embedding_model,
-            embedding_checkpoint,
-            pyannote_version,
-            audio_separated,
-            audio_normalized,
-            audio_separator,
-        ) = _staged_provenance(sidecar)
+        staged = _staged_provenance(sidecar)
         return _StagedSplit(
             sibling_bytes=sibling_bytes,
             voiceprints_path=sidecar_path,
@@ -578,12 +652,13 @@ def _stage_split_inputs(
             turns=turns,
             selected_indices=selected,
             embedding_dim=validated.embedding_dim,
-            embedding_model=embedding_model,
-            embedding_checkpoint=embedding_checkpoint,
-            pyannote_version=pyannote_version,
-            audio_separated=audio_separated,
-            audio_normalized=audio_normalized,
-            audio_separator=audio_separator,
+            embedding_model=staged.embedding_model,
+            embedding_checkpoint=staged.embedding_checkpoint,
+            pyannote_version=staged.pyannote_version,
+            audio_separated=staged.audio_separated,
+            audio_normalized=staged.audio_normalized,
+            audio_separator=staged.audio_separator,
+            embedding_lane=staged.embedding_lane,
         )
 
 
@@ -657,13 +732,70 @@ def _require_embedding_identity(
         )
     identity = embeddings.identity
     if (
-        identity.model != staged.embedding_model
+        identity.lane != staged.embedding_lane
+        or identity.model != staged.embedding_model
         or identity.checkpoint_sha256 != staged.embedding_checkpoint
-        or identity.pyannote_version != staged.pyannote_version
+        # pyannote's version is part of the identity only on the legacy lane,
+        # where pyannote itself runs the embedding checkpoint.
+        or (
+            staged.embedding_lane == turnembed.LANE_LEGACY
+            and identity.pyannote_version != staged.pyannote_version
+        )
     ):
         raise SplitConflict(
             "the turn embedding provider does not match the voiceprint capture"
         )
+
+
+# Stand-in label for group B while its centroid-v1 segments are computed: the
+# real SPEAKER_NN id is only minted at confirm time, and the recipe needs no
+# more than "a speaker other than A and everyone else".
+_SPLIT_B_PLACEHOLDER = "\x00split-group-b"
+
+
+def _split_recipe_centroids(
+    wav_path: Path,
+    staged: _StagedSplit,
+    speaker_id: str,
+    assignment: Mapping[int, str],
+    identity: turnembed.EmbeddingIdentity,
+) -> tuple[tuple[str, tuple[float, ...]], ...]:
+    """centroid-v1 voiceprints of both split groups, as capture would compute them."""
+    relabeled = [
+        (start, end, _SPLIT_B_PLACEHOLDER if assignment.get(index) == "B" else label)
+        for index, (start, end, label) in enumerate(staged.turns)
+    ]
+    try:
+        centroids = turnembed.recipe_centroids(
+            wav_path,
+            relabeled,
+            (speaker_id, _SPLIT_B_PLACEHOLDER),
+            identity,
+        )
+    except turnembed.EmbeddingIdentityMismatch as exc:
+        raise _capture_mismatch(exc) from exc
+    groups: list[tuple[str, tuple[float, ...]]] = []
+    for group, label in (("A", speaker_id), ("B", _SPLIT_B_PLACEHOLDER)):
+        vector = centroids.get(label)
+        if vector is None:
+            continue
+        if len(vector) != staged.embedding_dim:
+            raise turnembed.TurnEmbeddingError(
+                "recomputed voiceprints do not match the bound voiceprint dimension"
+            )
+        groups.append((group, tuple(float(value) for value in vector)))
+    return tuple(groups)
+
+
+def _capture_mismatch(exc: turnembed.EmbeddingIdentityMismatch) -> SplitConflict:
+    """The 409 for an embedder this installation cannot reproduce.
+
+    Same answer as :func:`_require_embedding_identity`: the capture is intact,
+    the local embedder differs from the one it recorded.
+    """
+    return SplitConflict(
+        f"the turn embedding provider does not match the voiceprint capture: {exc}"
+    )
 
 
 def _build_split_proposal(
@@ -672,17 +804,17 @@ def _build_split_proposal(
 ) -> tuple[_SplitProposal, dict[str, object]]:
     staged = _stage_split_inputs(server, speaker_id)
     selected_turns = [staged.turns[index] for index in staged.selected_indices]
+    identity = staged.embedding_identity()
     embedding_request = turnembed.AttestedTurnRequest(
         selected_turns,
-        identity=turnembed.EmbeddingIdentity(
-            model=staged.embedding_model,
-            checkpoint_sha256=staged.embedding_checkpoint,
-            pyannote_version=staged.pyannote_version,
-        ),
+        identity=identity,
     )
     wav_path = _prepare_split_wav(server.media_path, staged)
     try:
-        provider_embeddings = turnembed.turn_embeddings(wav_path, embedding_request)
+        try:
+            provider_embeddings = turnembed.turn_embeddings(wav_path, embedding_request)
+        except turnembed.EmbeddingIdentityMismatch as exc:
+            raise _capture_mismatch(exc) from exc
         _require_embedding_identity(staged, provider_embeddings)
         expected = set(range(len(selected_turns)))
         if set(provider_embeddings) != expected:
@@ -710,6 +842,11 @@ def _build_split_proposal(
             )
             for local_index in sorted(local_embeddings)
         }
+        recipe = (
+            _split_recipe_centroids(wav_path, staged, speaker_id, assignment, identity)
+            if staged.embedding_lane == turnembed.LANE_DECOUPLED
+            else None
+        )
         groups = _proposal_groups(wav_path, staged.turns, assignment)
     finally:
         wav_path.unlink(missing_ok=True)
@@ -723,6 +860,7 @@ def _build_split_proposal(
         media_fingerprint=staged.media_fingerprint,
         assignment=ordered_assignment,
         embeddings=tuple(sorted(embeddings.items())),
+        recipe_centroids=recipe,
     )
     response: dict[str, object] = {
         "speaker_id": speaker_id,
@@ -901,8 +1039,26 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
             len(vector) != validated.embedding_dim for vector in (*group_a, *group_b)
         ):
             raise SplitConflict("split proposal embedding dimension changed")
-        centroid_a = turnembed.normalized_centroid(group_a)
-        centroid_b = turnembed.normalized_centroid(group_b)
+        if proposal.recipe_centroids is None:
+            # Legacy lane: the mean of the whole-turn pyannote embeddings.
+            group_centroids: dict[str, list[float] | None] = {
+                "A": turnembed.normalized_centroid(group_a),
+                "B": turnembed.normalized_centroid(group_b),
+            }
+        else:
+            # Decoupled lane: the centroid-v1 voiceprints the proposal computed
+            # with the capture's embedder, so the split sidecar matches what a
+            # fresh capture of the relabelled turns would write.
+            recipe = dict(proposal.recipe_centroids)
+            group_centroids = {
+                group: (list(recipe[group]) if group in recipe else None)
+                for group in ("A", "B")
+            }
+            if any(
+                vector is not None and len(vector) != validated.embedding_dim
+                for vector in group_centroids.values()
+            ):
+                raise SplitConflict("split proposal embedding dimension changed")
 
         updated_sibling = copy.deepcopy(sibling)
         raw_turns = updated_sibling.get("speaker_turns")
@@ -923,8 +1079,13 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
             updated_binding, dict
         ):
             raise Phase2DataError("voiceprints speakers and binding must be objects")
-        updated_speakers[proposal.speaker_id] = centroid_a
-        updated_speakers[new_id] = centroid_b
+        for group, label in (("A", proposal.speaker_id), ("B", new_id)):
+            centroid = group_centroids[group]
+            if centroid is None:
+                # Same rule as capture: no usable segment, no voiceprint.
+                updated_speakers.pop(label, None)
+            else:
+                updated_speakers[label] = centroid
         updated_binding["turns_digest"] = canonical_turns_digest(updated_turns)
         validate_voiceprint_conjunction(
             updated_sidecar,
@@ -1231,10 +1392,12 @@ def make_server(
     sibling_path: Path,
     speaker_ids: Sequence[str],
     pristine_mapping_generation: fsio.FileGeneration | None = None,
+    host: str = HOST,
+    ngrok: bool = False,
     port: int = 0,
     report: Callable[[str], None] = print,
 ) -> SpeakerHTTPServer:
-    """Bind and return one loopback-only audition server."""
+    """Bind and return one audition server."""
     return SpeakerHTTPServer(
         page=page,
         media_path=media_path,
@@ -1242,6 +1405,8 @@ def make_server(
         sibling_path=sibling_path,
         speaker_ids=speaker_ids,
         pristine_mapping_generation=pristine_mapping_generation,
+        host=host,
+        ngrok=ngrok,
         port=port,
         report=report,
     )
@@ -1255,11 +1420,13 @@ def serve(
     sibling_path: Path,
     speaker_ids: Sequence[str],
     pristine_mapping_generation: fsio.FileGeneration | None = None,
+    host: str = HOST,
+    ngrok: bool = False,
     port: int = 0,
     open_browser: bool = True,
     report: Callable[[str], None] = print,
 ) -> str:
-    """Serve an audition until interrupted and return its loopback URL."""
+    """Serve an audition until interrupted and return its listening URL."""
     server = make_server(
         page=page,
         media_path=media_path,
@@ -1267,14 +1434,22 @@ def serve(
         sibling_path=sibling_path,
         speaker_ids=speaker_ids,
         pristine_mapping_generation=pristine_mapping_generation,
+        host=host,
+        ngrok=ngrok,
         port=port,
         report=report,
     )
     url = f"{server.origin}/"
     report(url)
+    if ngrok:
+        report("ngrok discovery enabled via the local agent on 127.0.0.1:4040.")
+    if host == "0.0.0.0":
+        report(
+            "For access from another device, replace 0.0.0.0 with this machine's IP address."
+        )
     if open_browser:
         try:
-            webbrowser.open(url)
+            webbrowser.open(url.replace("//0.0.0.0:", f"//{HOST}:"))
         except Exception:
             pass
     try:

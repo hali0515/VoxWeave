@@ -218,6 +218,8 @@ def test_transcribe_releases_panns_and_silero(tmp_path, monkeypatch):
 
 def test_transcribe_returns_sixth_voiceprint_carrier(tmp_path, monkeypatch):
     _stub_transcribe_models(monkeypatch, tmp_path)
+    # Legacy lane: the centroids are the diarization pipeline's own embeddings.
+    monkeypatch.setenv("VOXWEAVE_VOICEPRINT_MODEL", "pyannote")
     turns = list(TURNS)
     provenance = {"embedding_dim": 16}
     seen: dict[str, object] = {}

@@ -1259,3 +1259,295 @@ def test_undo_treats_a_deleted_rewritten_input_as_changed(
         assert paths["sidecar"].read_bytes() == sidecar_after
         assert not paths["mapping"].exists()
         assert paths["undo"].is_file()
+
+
+# --------------------------------------------------------------------------
+# Decoupled lane: dedicated embedder identity + centroid-v1 recomputation
+# --------------------------------------------------------------------------
+
+DECOUPLED_MODEL = "redimnet2-b6-vb2-vox2-cnc2-lm"
+DECOUPLED_CHECKPOINT = (
+    "287365f6f485b19e65e5176554f8f7123bfa8d85185f3d2c040eab51acec9868"
+)
+DECOUPLED_PROVENANCE = {
+    **PROVENANCE,
+    "embedding_lane": "decoupled",
+    "embedding_model": DECOUPLED_MODEL,
+    "embedding_checkpoint": DECOUPLED_CHECKPOINT,
+    "embedding_recipe": "centroid-v1",
+}
+DECOUPLED_IDENTITY = turnembed.EmbeddingIdentity.decoupled(
+    DECOUPLED_MODEL, DECOUPLED_CHECKPOINT
+)
+RECIPE_A = [0.6, 0.8, *([0.0] * 14)]
+RECIPE_B = [0.0, 0.0, 1.0, *([0.0] * 13)]
+
+
+def _install_recipe(monkeypatch, observations, result=None):
+    def fake_recipe(wav_path, turns, labels, identity):
+        observations["recipe_wav"] = Path(wav_path)
+        observations["recipe_turns"] = list(turns)
+        observations["recipe_labels"] = tuple(labels)
+        observations["recipe_identity"] = identity
+        if result is not None:
+            return result(labels)
+        return {labels[0]: list(RECIPE_A), labels[1]: list(RECIPE_B)}
+
+    monkeypatch.setattr(speakerserve.turnembed, "recipe_centroids", fake_recipe)
+
+
+def test_decoupled_split_uses_the_capture_embedder_and_recomputes_recipe_centroids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=DECOUPLED_PROVENANCE,
+        provider_identity=DECOUPLED_IDENTITY,
+    ) as (server, paths, _originals, _logs, observations):
+        _install_recipe(monkeypatch, observations)
+
+        proposal = _preview_split(server)
+
+        assert observations["embedding_request_identity"] == DECOUPLED_IDENTITY
+        assert observations["recipe_identity"] == DECOUPLED_IDENTITY
+        assert observations["recipe_wav"] == tmp_path / "prepared.wav"
+        speaker, placeholder = observations["recipe_labels"]
+        assert speaker == "SPEAKER_00"
+        # Group B is relabelled before the recipe runs; every other turn keeps
+        # its speaker so overlap trimming sees the post-split episode.
+        assert observations["recipe_turns"] == [
+            (0.0, 3.0, "SPEAKER_00"),
+            (3.0, 6.0, "SPEAKER_01"),
+            (6.0, 9.0, placeholder),
+        ]
+        assert placeholder not in {"SPEAKER_00", "SPEAKER_01"}
+
+        assert _confirm_split(server, proposal) == (200, {"new_id": "SPEAKER_02"})
+        sibling = json.loads(paths["sibling"].read_bytes())
+        sidecar = json.loads(paths["sidecar"].read_bytes())
+        assert sidecar["speakers"]["SPEAKER_00"] == RECIPE_A
+        assert sidecar["speakers"]["SPEAKER_02"] == RECIPE_B
+        assert sidecar["provenance"] == DECOUPLED_PROVENANCE
+        validate_voiceprint_conjunction(
+            sidecar,
+            sibling,
+            media_fingerprint(paths["media"]),
+        )
+
+
+def test_decoupled_split_group_without_segments_gets_no_voiceprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=DECOUPLED_PROVENANCE,
+        provider_identity=DECOUPLED_IDENTITY,
+    ) as (server, paths, _originals, _logs, observations):
+        _install_recipe(
+            monkeypatch,
+            observations,
+            result=lambda labels: {labels[0]: list(RECIPE_A)},
+        )
+
+        proposal = _preview_split(server)
+        assert _confirm_split(server, proposal) == (200, {"new_id": "SPEAKER_02"})
+
+        sibling = json.loads(paths["sibling"].read_bytes())
+        sidecar = json.loads(paths["sidecar"].read_bytes())
+        assert sidecar["speakers"]["SPEAKER_00"] == RECIPE_A
+        assert "SPEAKER_02" not in sidecar["speakers"]
+        assert sibling["speaker_turns"][2][2] == "SPEAKER_02"
+        validate_voiceprint_conjunction(
+            sidecar,
+            sibling,
+            media_fingerprint(paths["media"]),
+        )
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        # A legacy provider for a decoupled capture, even with the same name.
+        turnembed.EmbeddingIdentity(
+            model=DECOUPLED_MODEL,
+            checkpoint_sha256=DECOUPLED_CHECKPOINT,
+            pyannote_version="3.4.0",
+        ),
+        turnembed.EmbeddingIdentity.decoupled("anime-va-ecapa-gn", "1" * 64),
+        turnembed.EmbeddingIdentity.decoupled(DECOUPLED_MODEL, "1" * 64),
+    ],
+)
+def test_decoupled_split_fails_closed_on_a_different_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    identity: turnembed.EmbeddingIdentity,
+) -> None:
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=DECOUPLED_PROVENANCE,
+        provider_identity=identity,
+    ) as (server, paths, originals, _logs, observations):
+        _install_recipe(monkeypatch, observations)
+        status, _headers, body = _post(
+            server,
+            "/split",
+            {"speaker_id": "SPEAKER_00"},
+            token=server.token,
+        )
+
+        assert status == 409
+        assert "does not match the voiceprint capture" in json.loads(body)["error"]
+        assert "bisect_embeddings" not in observations
+        assert "recipe_turns" not in observations
+        assert paths["sidecar"].read_bytes() == originals["sidecar"]
+
+
+def test_decoupled_split_refuses_a_recipe_it_cannot_reproduce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provenance = {**DECOUPLED_PROVENANCE, "embedding_recipe": "centroid-v9"}
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=provenance,
+        provider_identity=DECOUPLED_IDENTITY,
+    ) as (server, paths, originals, _logs, observations):
+        status, _headers, body = _post(
+            server,
+            "/split",
+            {"speaker_id": "SPEAKER_00"},
+            token=server.token,
+        )
+
+        assert status == 409
+        assert "cannot reproduce" in json.loads(body)["error"]
+        assert "embedding_turns" not in observations
+        assert paths["sidecar"].read_bytes() == originals["sidecar"]
+
+
+def test_legacy_split_does_not_run_the_recipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _running_split_server(tmp_path, monkeypatch) as (
+        server,
+        _paths,
+        _originals,
+        _logs,
+        observations,
+    ):
+        monkeypatch.setattr(
+            speakerserve.turnembed,
+            "recipe_centroids",
+            lambda *_a, **_k: pytest.fail("legacy splits average turn vectors"),
+        )
+
+        proposal = _preview_split(server)
+        assert _confirm_split(server, proposal) == (200, {"new_id": "SPEAKER_02"})
+        assert observations["embedding_request_identity"].lane == "legacy"
+
+
+# The real provider, captured before any fixture replaces it.
+_REAL_TURN_EMBEDDINGS = turnembed.turn_embeddings
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        # A model a newer voxweave registered, unknown to this one.
+        ({"embedding_model": "future-embedder-v9"}, "not available in this"),
+        # A registered model whose pinned checkpoint moved since the capture.
+        ({"embedding_checkpoint": "1" * 64}, "checkpoint does not match"),
+    ],
+)
+def test_decoupled_split_answers_an_unreproducible_embedder_with_409(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changes: dict[str, str],
+    reason: str,
+) -> None:
+    provenance = {**DECOUPLED_PROVENANCE, **changes}
+    identity = turnembed.EmbeddingIdentity.decoupled(
+        provenance["embedding_model"], provenance["embedding_checkpoint"]
+    )
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=provenance,
+        provider_identity=identity,
+    ) as (server, paths, originals, _logs, observations):
+        monkeypatch.setattr(
+            speakerserve.turnembed, "turn_embeddings", _REAL_TURN_EMBEDDINGS
+        )
+        monkeypatch.setattr(
+            "voxweave.voiceembed.get_embedder",
+            lambda _spec: pytest.fail("an unreproducible embedder is never loaded"),
+        )
+
+        status, headers, body = _post(
+            server,
+            "/split",
+            {"speaker_id": "SPEAKER_00"},
+            token=server.token,
+        )
+
+        error = json.loads(body)["error"]
+        assert status == 409
+        assert headers["Cache-Control"] == "no-store"
+        assert "does not match the voiceprint capture" in error
+        assert reason in error
+        assert "bisect_embeddings" not in observations
+        assert paths["sidecar"].read_bytes() == originals["sidecar"]
+        assert server.split_proposal is None
+
+
+def test_decoupled_split_answers_a_recipe_checkpoint_mismatch_with_409(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    from voxweave import voiceembed
+
+    with _running_split_server(
+        tmp_path,
+        monkeypatch,
+        provenance=DECOUPLED_PROVENANCE,
+        provider_identity=DECOUPLED_IDENTITY,
+    ) as (server, paths, originals, _logs, observations):
+        # The resident embedder turns out to be another checkpoint by the time
+        # the recipe runs: turnembed refuses it as an identity mismatch.
+        monkeypatch.setattr(
+            turnembed,
+            "_read_mono_16k",
+            lambda _path: np.zeros(16_000 * 10, dtype=np.float32),
+        )
+        monkeypatch.setattr(
+            voiceembed,
+            "get_embedder",
+            lambda spec: voiceembed.LoadedEmbedder(
+                spec=spec,
+                checkpoint_sha256="2" * 64,
+                network=None,
+                device="cpu",
+            ),
+        )
+
+        status, _headers, body = _post(
+            server,
+            "/split",
+            {"speaker_id": "SPEAKER_00"},
+            token=server.token,
+        )
+
+        assert status == 409
+        assert "does not match the voiceprint capture" in json.loads(body)["error"]
+        assert "bisect_embeddings" in observations  # the mismatch came late
+        assert paths["sidecar"].read_bytes() == originals["sidecar"]
+        assert server.split_proposal is None

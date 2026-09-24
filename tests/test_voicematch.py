@@ -466,3 +466,509 @@ def test_unknown_compatibility_cannot_build_suggest_record():
             store=_store(),
             generated=NOW,
         )
+
+
+# --------------------------------------------------------------------------
+# Embedding lanes: legacy digest pin, decoupled fingerprint, reporting
+# --------------------------------------------------------------------------
+
+# Digests of legacy (pyannote-lane) provenance computed before the decoupled
+# lane existed. Every sidecar and voice store in the wild fingerprints like
+# this; a change here orphans all of them.
+LEGACY_PLAIN = {
+    "diarization_model": "pyannote/speaker-diarization-community-1",
+    "outer_config_sha256": "a" * 64,
+    "embedding_model": (
+        "pyannote/speaker-diarization-community-1@"
+        "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee#subfolder=embedding"
+    ),
+    "embedding_checkpoint": (
+        "6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929"
+    ),
+    "embedding_dim": 256,
+    "audio": {"separated": False, "normalized": False, "sample_rate": 16000},
+    "pyannote_version": "4.0.7",
+    "torch_version": "2.11.0",
+}
+LEGACY_SEPARATED = {
+    **LEGACY_PLAIN,
+    "audio": {
+        "separated": True,
+        "normalized": True,
+        "sample_rate": 16000,
+        "separator": {
+            "repo": "KimberleyJSN/melbandroformer",
+            "file": "MelBandRoformer.ckpt",
+            "checkpoint": "b" * 64,
+            "config_sha256": "c" * 64,
+        },
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("provenance", "digest"),
+    [
+        (
+            LEGACY_PLAIN,
+            "bdfcde76bf029e051a7e453b8355fcce0233c5774c15b84b4e08cf2c748a7302",
+        ),
+        (
+            LEGACY_SEPARATED,
+            "0376adb94f19be9eb102af5538c32b0e089c80f5b7972374f1092ef482b9ff2e",
+        ),
+    ],
+)
+def test_legacy_fingerprint_is_byte_identical_to_the_pre_decoupling_digest(
+    provenance, digest
+):
+    assert voicematch.build_compatibility_fingerprint(provenance) == (
+        voicematch.CompatibilityFingerprint(digest)
+    )
+
+
+def _decoupled(**changes):
+    provenance = {
+        **LEGACY_SEPARATED,
+        "embedding_lane": "decoupled",
+        "embedding_model": "redimnet2-b6-vb2-vox2-cnc2-lm",
+        "embedding_checkpoint": "e" * 64,
+        "embedding_dim": 192,
+        "embedding_recipe": "centroid-v1",
+    }
+    provenance.update(changes)
+    return provenance
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"diarization_model": config.LEGACY_DIARIZE_MODEL},
+        {"outer_config_sha256": "unresolved"},
+        {"pyannote_version": "5.0.0"},
+        {"torch_version": "3.0.0"},
+    ],
+)
+def test_decoupled_fingerprint_ignores_the_diarization_pipeline(changes):
+    base = voicematch.build_compatibility_fingerprint(_decoupled())
+    other = voicematch.build_compatibility_fingerprint(_decoupled(**changes))
+
+    assert isinstance(base, voicematch.CompatibilityFingerprint)
+    assert voicematch.compatibility_equal(base, other)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"embedding_model": "anime-va-ecapa-gn"},
+        {"embedding_checkpoint": "f" * 64},
+        {"embedding_dim": 256},
+        {"embedding_recipe": "centroid-v2"},
+        {"audio": LEGACY_PLAIN["audio"]},
+    ],
+)
+def test_decoupled_fingerprint_tracks_the_embedding_space(changes):
+    base = voicematch.build_compatibility_fingerprint(_decoupled())
+    other = voicematch.build_compatibility_fingerprint(_decoupled(**changes))
+
+    assert isinstance(other, voicematch.CompatibilityFingerprint)
+    assert not voicematch.compatibility_equal(base, other)
+
+
+def test_lanes_never_share_a_fingerprint():
+    legacy = voicematch.build_compatibility_fingerprint(LEGACY_SEPARATED)
+    decoupled = voicematch.build_compatibility_fingerprint(_decoupled())
+
+    assert not voicematch.compatibility_equal(legacy, decoupled)
+
+
+_CLUSTERING_BLOCKS = [
+    {
+        "method": "voiceprint",
+        "recipe": "voiceprint-v1",
+        "embedder": "redimnet2-b6-vb2-vox2-cnc2-lm",
+        "embedder_checkpoint": "9" * 64,
+        "params": {"anchor_seconds": 1.5, "tau": 0.5},
+        "audit": {"anchors": 12, "abstained_turns": 3, "abstained_seconds": 2.4},
+    },
+    {
+        "method": "pyannote",
+        "requested": "voiceprint",
+        "reason": "VoiceEmbeddingError: could not download voiceprint model",
+    },
+]
+
+
+@pytest.mark.parametrize("block", _CLUSTERING_BLOCKS)
+def test_fingerprints_ignore_the_speaker_clustering_block(block):
+    # Clustering regroups the turns; it never changes an embedding space, so
+    # neither lane's fingerprint may read the diarization "clustering" block.
+    assert voicematch.build_compatibility_fingerprint(
+        {**LEGACY_SEPARATED, "clustering": block}
+    ) == voicematch.CompatibilityFingerprint(
+        "0376adb94f19be9eb102af5538c32b0e089c80f5b7972374f1092ef482b9ff2e"
+    )
+    assert voicematch.compatibility_equal(
+        voicematch.build_compatibility_fingerprint(_decoupled(clustering=block)),
+        voicematch.build_compatibility_fingerprint(_decoupled()),
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "embedding_model",
+        "embedding_checkpoint",
+        "embedding_dim",
+        "embedding_recipe",
+        "audio",
+    ],
+)
+def test_missing_decoupled_field_is_unknown(field):
+    provenance = _decoupled()
+    del provenance[field]
+
+    result = voicematch.build_compatibility_fingerprint(provenance)
+
+    assert isinstance(result, voicematch.CompatibilityUnknown)
+    assert field in result.unresolved_fields
+
+
+def test_unresolved_decoupled_values_are_unknown_and_malformed_ones_refused():
+    unresolved = voicematch.build_compatibility_fingerprint(
+        _decoupled(embedding_checkpoint="unresolved", embedding_dim="unresolved")
+    )
+    assert isinstance(unresolved, voicematch.CompatibilityUnknown)
+    assert unresolved.unresolved_fields == (
+        "embedding_checkpoint",
+        "embedding_dim",
+    )
+    with pytest.raises(voicematch.CompatibilityError):
+        voicematch.build_compatibility_fingerprint(
+            _decoupled(embedding_checkpoint="not-a-sha")
+        )
+    with pytest.raises(voicematch.CompatibilityError):
+        voicematch.build_compatibility_fingerprint(_decoupled(embedding_dim=4))
+
+
+def test_unknown_embedding_lane_is_never_compatible():
+    result = voicematch.build_compatibility_fingerprint(
+        _decoupled(embedding_lane="future")
+    )
+
+    assert isinstance(result, voicematch.CompatibilityUnknown)
+    assert result.unresolved_fields == ("embedding_lane",)
+
+
+def test_legacy_store_against_decoupled_run_names_both_spaces_and_the_way_back():
+    store_provenance = copy.deepcopy(LEGACY_SEPARATED)
+    episode_provenance = _decoupled()
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "store was built with pyannote embeddings (" in detail
+    assert "this run uses redimnet2-b6-vb2-vox2-cnc2-lm embeddings" in detail
+    assert "--voiceprint-model pyannote" in detail
+    assert '[voiceprint].model = "pyannote"' in detail
+    assert "--diarize-model" not in detail
+
+
+def test_legacy_31_store_against_decoupled_run_also_names_the_diarizer_way_back():
+    store_provenance = {
+        **copy.deepcopy(LEGACY_SEPARATED),
+        "diarization_model": config.LEGACY_DIARIZE_MODEL,
+    }
+    episode_provenance = _decoupled(diarization_model=config.DEFAULT_DIARIZE_MODEL)
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "--voiceprint-model pyannote" in detail
+    assert "--diarize-model 3.1" in detail
+
+
+def test_decoupled_store_from_another_embedder_names_its_alias():
+    store_provenance = _decoupled(
+        embedding_model="anime-va-ecapa-gn", embedding_checkpoint="f" * 64
+    )
+    episode_provenance = _decoupled()
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "store was built with anime-va-ecapa-gn embeddings" in detail
+    assert "this run uses redimnet2-b6-vb2-vox2-cnc2-lm embeddings" in detail
+    assert "--voiceprint-model anime-va" in detail
+    assert "pyannote version" not in detail
+    assert "diarization model" not in detail
+
+
+def test_decoupled_audio_difference_is_reported_without_a_model_hint():
+    store_provenance = _decoupled(audio=LEGACY_PLAIN["audio"])
+    episode_provenance = _decoupled()
+
+    detail = _mismatch(episode_provenance, store_provenance)
+
+    assert "audio profile" in detail
+    assert "store was built with" not in detail
+    assert "--voiceprint-model" not in detail
+
+
+def test_threshold_defaults_follow_the_embedding_space():
+    from voxweave import voiceembed
+
+    assert voicematch.threshold_defaults(None) == (0.45, 0.05)
+    assert voicematch.threshold_defaults(LEGACY_SEPARATED) == (0.45, 0.05)
+    assert voicematch.threshold_defaults(_decoupled()) == (
+        voiceembed.REDIMNET2_B6.suggest,
+        voiceembed.REDIMNET2_B6.margin,
+    )
+    assert voicematch.threshold_defaults(
+        _decoupled(embedding_model="anime-va-ecapa-gn")
+    ) == (voiceembed.ANIME_VA.suggest, voiceembed.ANIME_VA.margin)
+    assert voicematch.threshold_defaults(
+        _decoupled(embedding_model="future-embedder")
+    ) == (0.45, 0.05)
+
+
+def test_environment_thresholds_still_win_over_embedder_defaults():
+    anime = _decoupled(embedding_model="anime-va-ecapa-gn")
+
+    defaults = voicematch.parse_thresholds({}, provenance=anime)
+    overridden = voicematch.parse_thresholds(
+        {"VOXWEAVE_VOICES_SUGGEST": "0.6", "VOXWEAVE_VOICES_MARGIN": "0.1"},
+        provenance=anime,
+    )
+
+    assert (defaults.suggest, defaults.margin) == voicematch.threshold_defaults(anime)
+    assert (overridden.suggest, overridden.margin) == (0.6, 0.1)
+
+
+# --------------------------------------------------------------------------
+# Two-tier library matching
+# --------------------------------------------------------------------------
+
+
+def test_global_suggest_follows_the_space_and_is_never_looser_than_tier_one():
+    from voxweave import voiceembed
+
+    anime = _decoupled(embedding_model="anime-va-ecapa-gn")
+    assert voicematch.global_suggest_default(None) == voicematch.DEFAULT_GLOBAL_SUGGEST
+    assert voicematch.global_suggest_default(LEGACY_SEPARATED) == (
+        voicematch.DEFAULT_GLOBAL_SUGGEST
+    )
+    assert voicematch.global_suggest_default(_decoupled()) == (
+        voiceembed.REDIMNET2_B6.global_suggest
+    )
+    assert (
+        voicematch.global_suggest_default(anime) == voiceembed.ANIME_VA.global_suggest
+    )
+    assert voicematch.parse_global_suggest({}, provenance=anime, suggest=0.35) == (
+        voiceembed.ANIME_VA.global_suggest
+    )
+    env = {voicematch.ENV_GLOBAL_SUGGEST: "0.8"}
+    assert voicematch.parse_global_suggest(env, provenance=anime, suggest=0.35) == 0.8
+    # A global bar below tier 1 is raised to it rather than widening tier 2.
+    low = {voicematch.ENV_GLOBAL_SUGGEST: "0.1"}
+    assert voicematch.parse_global_suggest(low, suggest=0.45) == 0.45
+    for raw in ("nan", "1.5", "loose"):
+        with pytest.raises(voicematch.ThresholdError):
+            voicematch.parse_global_suggest(
+                {voicematch.ENV_GLOBAL_SUGGEST: raw}, suggest=0.45
+            )
+
+
+def _pool(entries):
+    """``{identity: (name, vector)}`` -> library-tier identities."""
+    return {
+        identity_id: {
+            "display_name": name,
+            "exemplars": [{"id": f"x{index:08x}", "vector": vector}],
+        }
+        for index, (identity_id, (name, vector)) in enumerate(
+            sorted(entries.items()), start=1
+        )
+    }
+
+
+def _tiers(centroids, in_scope, other, scopes, *, accept=None, global_suggest=0.6):
+    return voicematch.match_tiers(
+        centroids,
+        in_scope=_pool(in_scope),
+        other_scopes=_pool(other),
+        scopes=scopes,
+        embedding_dim=16,
+        thresholds=_thresholds(accept=accept),
+        global_suggest=global_suggest,
+    )
+
+
+def test_tier_two_is_stricter_never_prefilled_and_carries_scopes():
+    near = [0.7, (1 - 0.7**2) ** 0.5, *([0.0] * 14)]
+    matches = _tiers(
+        {"SPEAKER_00": _unit(), "SPEAKER_01": _unit(2)},
+        {"v000000000001": ("Aqua", _unit())},
+        {
+            "v000000000002": ("Kazuma", _unit(2)),
+            # 0.70 >= 0.6: suggested, but only as a secondary candidate.
+            "v000000000003": ("Aqua VA", near),
+        },
+        {
+            "v000000000001": ("Show A",),
+            "v000000000002": ("Show B", "Show C"),
+            "v000000000003": ("Show B",),
+        },
+        accept=0.9,
+    )
+
+    first = matches["SPEAKER_00"]
+    assert first.decision == "prefill"
+    assert [c.identity_id for c in first.candidates] == ["v000000000001"]
+    assert first.candidates[0].scopes == ("Show A",)
+    assert first.secondary is not None
+    assert first.secondary.decision == "suggest"
+    assert [c.display_name for c in first.secondary.candidates] == ["Aqua VA"]
+    assert first.secondary.candidates[0].scopes == ("Show B",)
+
+    second = matches["SPEAKER_01"]
+    assert second.decision == "none"
+    assert second.secondary is not None
+    # A perfect cross-scope hit still only suggests: prefill is tier 1 only.
+    assert second.secondary.decision == "suggest"
+    assert second.secondary.candidates[0].scopes == ("Show B", "Show C")
+
+
+def test_collision_is_decided_within_each_tier():
+    # Equidistant from both speakers: cosine 0.707 with each.
+    shared = [0.5**0.5, 0.5**0.5, *([0.0] * 14)]
+    matches = _tiers(
+        {"SPEAKER_A": _unit(), "SPEAKER_B": _unit(1)},
+        {"v000000000001": ("A", _unit()), "v000000000002": ("B", _unit(1))},
+        {"v000000000009": ("Everyone", shared)},
+        {},
+    )
+    for local_id in ("SPEAKER_A", "SPEAKER_B"):
+        match = matches[local_id]
+        # Tier 1 tops differ, so tier 1 never collides...
+        assert match.decision == "suggest"
+        # ...while both speakers share the same tier-2 top identity.
+        assert match.secondary is not None
+        assert match.secondary.decision == "collision"
+
+
+def _at_similarity(similarity, rng):
+    """A 16-d unit vector whose dot with e0 is exactly ``similarity``."""
+    tail = [rng.gauss(0.0, 1.0) for _ in range(15)]
+    norm = sum(value * value for value in tail) ** 0.5
+    scale = (1.0 - similarity * similarity) ** 0.5 / norm
+    return [similarity, *(value * scale for value in tail)]
+
+
+def test_large_library_impostors_do_not_reach_the_secondary_suggestions():
+    import random
+
+    rng = random.Random(20260923)
+    impostors = {
+        f"v{index:012x}": (f"Impostor {index}", _at_similarity(sim, rng))
+        for index, sim in enumerate(
+            (0.30 + 0.29 * rng.random() for _ in range(2000)), start=1
+        )
+    }
+    true_id = "v0000000fffff"
+    other = {**impostors, true_id: ("Same VA", _at_similarity(0.9, rng))}
+    tier_one_bar = _thresholds().suggest
+    passing_tier_one_bar = sum(
+        1 for _name, vector in impostors.values() if vector[0] >= tier_one_bar
+    )
+    # Hundreds of impostors would be suggested at the same-scope bar ...
+    assert passing_tier_one_bar > 100
+
+    matches = _tiers({"SPEAKER_00": _unit()}, {}, other, {}, global_suggest=0.6)
+
+    secondary = matches["SPEAKER_00"].secondary
+    assert secondary is not None
+    # ... while the stricter cross-scope bar keeps only the real voice.
+    assert [c.identity_id for c in secondary.candidates] == [true_id]
+    assert secondary.truncated == 0
+    assert matches["SPEAKER_00"].decision == "none"
+
+
+def test_tier_thresholds_must_be_ordered():
+    with pytest.raises(voicematch.ThresholdError):
+        _tiers({"S": _unit()}, {}, {}, {}, global_suggest=0.2)
+
+
+def _library_record(matches, *, global_suggest=0.6):
+    return voicematch.build_library_suggest_record(
+        matches,
+        capture_id="c" + "f" * 32,
+        voiceprints_content_digest="d" * 64,
+        compatibility="e" * 64,
+        thresholds=_thresholds(),
+        global_suggest=global_suggest,
+        library_path=voicestore.canonical_store_path("voices"),
+        scope="Show A",
+        revision=4,
+        content_digest="a" * 64,
+        generated=NOW,
+    )
+
+
+def test_library_record_round_trips_tiers_and_rejects_a_prefilled_tier_two():
+    matches = _tiers(
+        {"SPEAKER_00": _unit()},
+        {"v000000000001": ("Aqua", _unit())},
+        {"v000000000002": ("Aqua VA", _unit())},
+        {"v000000000001": ("Show A",), "v000000000002": ("Show B",)},
+    )
+    record = _library_record(matches)
+
+    speaker = record["speakers"]["SPEAKER_00"]
+    assert speaker["candidates"][0]["scopes"] == ["Show A"]
+    assert speaker["secondary"]["candidates"][0]["scopes"] == ["Show B"]
+    assert record["thresholds"]["global_suggest"] == 0.6
+    assert record["voices"]["show"] == "Show A"
+    voicematch.validate_suggest_record(record)
+
+    tampered = copy.deepcopy(record)
+    tampered["speakers"]["SPEAKER_00"]["secondary"]["decision"] = "prefill"
+    with pytest.raises(voicebase.Phase2DataError, match="secondary.decision"):
+        voicematch.validate_suggest_record(tampered)
+    tampered = copy.deepcopy(record)
+    tampered["thresholds"]["global_suggest"] = 0.1
+    with pytest.raises(voicebase.Phase2DataError, match="global_suggest"):
+        voicematch.validate_suggest_record(tampered)
+
+
+def test_library_candidates_record_where_their_identity_came_from():
+    library = {"display_name": "Aqua", "origin": "library", "exemplars": []}
+    legacy = {"display_name": "Kazuma", "origin": "legacy", "exemplars": []}
+    library["exemplars"] = [{"id": "x00000001", "vector": _unit()}]
+    legacy["exemplars"] = [{"id": "x00000002", "vector": _unit()}]
+    matches = voicematch.match_tiers(
+        {"SPEAKER_00": _unit()},
+        in_scope={"v000000000001": library, "v000000000002": legacy},
+        other_scopes={},
+        scopes={"v000000000001": ("Show A",), "v000000000002": ("Show A",)},
+        embedding_dim=16,
+        thresholds=_thresholds(),
+        global_suggest=0.6,
+    )
+    record = _library_record(matches)
+    candidates = record["speakers"]["SPEAKER_00"]["candidates"]
+    assert {c["identity"]: c["origin"] for c in candidates} == {
+        "v000000000001": "library",
+        "v000000000002": "legacy",
+    }
+    tampered = copy.deepcopy(record)
+    tampered["speakers"]["SPEAKER_00"]["candidates"][0]["origin"] = "elsewhere"
+    with pytest.raises(voicebase.Phase2DataError, match="origin"):
+        voicematch.validate_suggest_record(tampered)
+
+
+def test_per_show_records_keep_their_single_tier_shape():
+    record = _record()
+    assert "secondary" not in record["speakers"]["SPEAKER_00"]
+    assert "global_suggest" not in record["thresholds"]
+    assert all(
+        "scopes" not in candidate
+        for candidate in record["speakers"]["SPEAKER_00"]["candidates"]
+    )

@@ -200,6 +200,8 @@ def test_capture_raw_decoder_reads_stable_snapshot_through_truncate_aba(
         ),
     )
     monkeypatch.setattr(diarize, "release", lambda: None)
+    # Legacy lane: the faked diarizer supplies the centroids itself.
+    monkeypatch.setenv("VOXWEAVE_VOICEPRINT_MODEL", "pyannote")
 
     pipeline.process(
         media,
@@ -537,6 +539,7 @@ def test_smoothing_active_capture_publishes_valid_four_part_conjunction(
         lambda *_args, **_kwargs: dict(PROVENANCE),
     )
     monkeypatch.setattr(diarize, "release", lambda: None)
+    monkeypatch.setenv("VOXWEAVE_VOICEPRINT_MODEL", "pyannote")
 
     pipeline.process(
         media,
@@ -730,3 +733,410 @@ def test_episode_lock_canonicalizes_parent_symlink(tmp_path):
     assert lock == artifacts.claim_paths(real / "episode.mkv").episode_lock
     assert lock.parent != real
     assert not (real / "episode.episode.lock").exists()
+
+
+# --------------------------------------------------------------------------
+# Decoupled voiceprint lane (dedicated embedder after diarization)
+# --------------------------------------------------------------------------
+
+
+class _FakeEmbeddingNetwork:
+    def __init__(self):
+        self.inputs = []
+
+    def __call__(self, wave):
+        import torch
+
+        samples = wave.detach().cpu().numpy()
+        self.inputs.append(samples.copy())
+        row = torch.zeros((samples.shape[0], 192), dtype=torch.float32)
+        row[:, 0] = 1.0
+        return row
+
+
+def _install_fake_voiceprint_embedder(monkeypatch):
+    from voxweave import voiceembed
+
+    requested = []
+    network = _FakeEmbeddingNetwork()
+
+    def fake_get_embedder(spec):
+        requested.append(spec)
+        return voiceembed.LoadedEmbedder(
+            spec=spec,
+            checkpoint_sha256=spec.sha256,
+            network=network,
+            device="cpu",
+        )
+
+    monkeypatch.setattr(voiceembed, "get_embedder", fake_get_embedder)
+    return requested, network
+
+
+def _run_smoothing_capture(tmp_path, monkeypatch, *, lane):
+    media = tmp_path / lane / "episode.mkv"
+    media.parent.mkdir()
+    media.write_bytes(b"stable media bytes")
+    wav = _stub_transcribe_tail(tmp_path / lane, monkeypatch)
+    sf.write(wav, np.zeros(3 * 16000, dtype=np.float32), 16000)
+    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
+    monkeypatch.setattr(
+        diarize, "_get_pipeline", lambda _token, _model: _SmoothingPipeline()
+    )
+    monkeypatch.setattr(
+        diarize,
+        "_build_provenance",
+        lambda *_args, **_kwargs: dict(PROVENANCE),
+    )
+    monkeypatch.setattr(diarize, "release", lambda: None)
+    monkeypatch.setenv("VOXWEAVE_VOICEPRINT_MODEL", lane)
+
+    pipeline.process(
+        media,
+        separate=False,
+        diarize=True,
+        voiceprints=True,
+        shot_snap=False,
+    )
+
+    sibling = json.loads((media.parent / "episode.json").read_text(encoding="utf-8"))
+    sidecar, validated = load_voiceprints(artifacts.claim_paths(media).voiceprints)
+    validate_voiceprint_conjunction(sidecar, sibling, media_fingerprint(media))
+    return sibling, sidecar, validated
+
+
+def test_decoupled_capture_publishes_embedder_voiceprints_with_identical_turns(
+    tmp_path, monkeypatch
+):
+    from voxweave import voiceembed
+
+    requested, network = _install_fake_voiceprint_embedder(monkeypatch)
+    wanted: list[bool] = []
+    real_diarize = diarize.diarize_turns
+
+    def spy_diarize(*args, **kwargs):
+        wanted.append(kwargs["want_embeddings"])
+        return real_diarize(*args, **kwargs)
+
+    monkeypatch.setattr(diarize, "diarize_turns", spy_diarize)
+
+    legacy_sibling, legacy_sidecar, _ = _run_smoothing_capture(
+        tmp_path, monkeypatch, lane="pyannote"
+    )
+    sibling, sidecar, validated = _run_smoothing_capture(
+        tmp_path, monkeypatch, lane="auto"
+    )
+
+    # The embedder lane never changes what pyannote persisted.
+    assert sibling["speaker_turns"] == legacy_sibling["speaker_turns"]
+    assert wanted == [True, False]
+    assert requested and all(spec is voiceembed.REDIMNET2_B6 for spec in requested)
+    assert len(network.inputs) == 1  # one 2 s turn -> one forward
+    assert set(validated.speakers) == {"SPEAKER_A"}
+    assert validated.embedding_dim == 192
+    provenance = sidecar["provenance"]
+    assert provenance["embedding_lane"] == "decoupled"
+    assert provenance["embedding_model"] == voiceembed.REDIMNET2_B6.name
+    assert provenance["embedding_checkpoint"] == voiceembed.REDIMNET2_B6.sha256
+    assert provenance["embedding_recipe"] == "centroid-v1"
+    assert provenance["diarization_model"] == PROVENANCE["diarization_model"]
+    assert provenance["audio"] == PROVENANCE["audio"]
+    assert "embedding_lane" not in legacy_sidecar["provenance"]
+
+
+def _stub_decoupled_transcribe(tmp_path, monkeypatch, *, language="English"):
+    wav = _stub_transcribe_tail(tmp_path, monkeypatch)
+    sf.write(wav, np.zeros(5 * 16000, dtype=np.float32), 16000)
+    monkeypatch.setattr(
+        backend,
+        "transcribe_chunks",
+        lambda *_args, **_kwargs: [(language, "hello", [dict(UNIT)])],
+    )
+    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    seen: dict[str, object] = {}
+
+    def fake_diarize(wav_path, **kwargs):
+        seen["wav"] = Path(wav_path)
+        seen.update(kwargs)
+        return diarize.DiarizationResult(
+            turns=[(0.0, 3.0, "SPEAKER_00")],
+            centroids=None,
+            provenance=dict(PROVENANCE),
+        )
+
+    monkeypatch.setattr(diarize, "diarize_turns", fake_diarize)
+    monkeypatch.setattr(diarize, "release", lambda: None)
+    return wav, seen
+
+
+def test_japanese_episode_routes_to_the_anime_voice_actor_embedder(
+    tmp_path, monkeypatch
+):
+    from voxweave import voiceembed
+
+    wav, seen = _stub_decoupled_transcribe(tmp_path, monkeypatch, language="Japanese")
+    requested, _network = _install_fake_voiceprint_embedder(monkeypatch)
+    read_from: list[Path] = []
+    real_read = voiceembed.read_mono_16k
+
+    def spy_read(path):
+        read_from.append(Path(path))
+        return real_read(path)
+
+    released: list[str] = []
+    monkeypatch.setattr(voiceembed, "read_mono_16k", spy_read)
+    monkeypatch.setattr(voiceembed, "release", lambda: released.append("released"))
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"source")
+
+    result = pipeline.transcribe(
+        media,
+        separate=False,
+        diarize=True,
+        voiceprints=True,
+    )
+
+    capture = result[5]
+    assert capture is not None
+    assert capture.turns is result[4]
+    assert seen["want_embeddings"] is False
+    assert read_from == [seen["wav"]] == [wav]
+    assert requested and all(spec is voiceembed.ANIME_VA for spec in requested)
+    assert capture.provenance["embedding_model"] == voiceembed.ANIME_VA.name
+    assert released == ["released"]
+
+
+def test_embedder_failure_drops_the_capture_but_keeps_the_subtitles(
+    tmp_path, monkeypatch, caplog
+):
+    from voxweave import voiceembed
+
+    _stub_decoupled_transcribe(tmp_path, monkeypatch)
+
+    def unavailable(_spec):
+        raise voiceembed.VoiceEmbeddingError("could not download voiceprint model")
+
+    monkeypatch.setattr(voiceembed, "get_embedder", unavailable)
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = pipeline.process(
+            media,
+            separate=False,
+            diarize=True,
+            voiceprints=True,
+            shot_snap=False,
+        )
+
+    sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
+    assert out.exists()
+    assert sibling["speaker_turns"] == [[0.0, 3.0, "SPEAKER_00"]]
+    assert "voiceprint_capture" not in sibling
+    assert not artifacts.claim_paths(media).voiceprints.exists()
+    assert "voiceprint capture unavailable" in caplog.text
+
+
+def test_unknown_voiceprint_model_fails_before_any_audio_work(tmp_path, monkeypatch):
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    monkeypatch.setenv("VOXWEAVE_VOICEPRINT_MODEL", "wespeaker")
+    monkeypatch.setattr(
+        pipeline,
+        "transcribe",
+        lambda *_a, **_k: pytest.fail("must fail before transcription"),
+    )
+
+    with pytest.raises(ValueError, match="unknown voiceprint model"):
+        pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+
+
+def test_cli_voiceprint_model_is_validated_and_reaches_process(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from voxweave.cli import cli
+
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    seen: dict[str, object] = {}
+
+    def fake_process(_media, **kwargs):
+        seen.update(kwargs)
+        return tmp_path / "episode.vtt"
+
+    monkeypatch.setattr(pipeline, "process", fake_process)
+    ok = CliRunner().invoke(
+        cli,
+        ["--diarize", "--voiceprints", "--voiceprint-model", "Anime-VA", str(media)],
+    )
+    bad = CliRunner().invoke(
+        cli,
+        ["--diarize", "--voiceprints", "--voiceprint-model", "ecapa", str(media)],
+    )
+
+    assert ok.exit_code == 0, ok.output
+    assert seen["voiceprint_model"] == "anime-va-ecapa-gn"
+    assert bad.exit_code != 0
+    assert "unknown voiceprint model" in bad.output
+
+
+def test_cli_voiceprint_model_is_validated_even_without_voiceprints(
+    tmp_path, monkeypatch, caplog
+):
+    from click.testing import CliRunner
+
+    from voxweave.cli import cli
+
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+    calls: list[dict[str, object]] = []
+
+    def fake_process(_media, **kwargs):
+        calls.append(kwargs)
+        return tmp_path / "episode.vtt"
+
+    monkeypatch.setattr(pipeline, "process", fake_process)
+    # install_logging(force=True) would detach caplog's root handler.
+    monkeypatch.setattr("voxweave.cli.install_logging", lambda **_kwargs: None)
+    bad = CliRunner().invoke(cli, ["--voiceprint-model", "ecapa", str(media)])
+    assert bad.exit_code != 0
+    assert "unknown voiceprint model" in bad.output
+    assert calls == []
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        ok = CliRunner().invoke(cli, ["--voiceprint-model", "anime-va", str(media)])
+    assert ok.exit_code == 0, ok.output
+    assert calls[0]["voiceprints"] is False
+    assert "--voiceprint-model has no effect" in caplog.text
+    assert "add --voiceprints" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="voxweave"):
+        quiet = CliRunner().invoke(cli, [str(media)])
+    assert quiet.exit_code == 0, quiet.output
+    assert "--voiceprint-model" not in caplog.text
+
+
+# --------------------------------------------------------------------------
+# Checkpoint prefetch at the start of the run
+# --------------------------------------------------------------------------
+
+
+def test_prefetch_failure_turns_capture_off_but_keeps_the_subtitles(
+    tmp_path, monkeypatch, caplog
+):
+    from voxweave import voiceembed
+
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    seen: dict[str, object] = {}
+
+    def unavailable(cli_value, language_iso):
+        seen["prefetch"] = (cli_value, language_iso)
+        raise voiceembed.VoiceEmbeddingError(
+            "could not download voiceprint model redimnet2: timed out"
+        )
+
+    def fake_transcribe(source, **kwargs):
+        assert "prefetch" in seen, "the prefetch must run before any audio work"
+        seen["source"] = Path(source)
+        seen["voiceprints"] = kwargs["voiceprints"]
+        return "en", [dict(UNIT)], [(0.0, 1.0)], [], [TURN], None
+
+    monkeypatch.setattr(voiceembed, "prefetch_checkpoints", unavailable)
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    monkeypatch.setattr(
+        pipeline,
+        "MediaSnapshot",
+        lambda *_a, **_k: pytest.fail("no private snapshot without a capture"),
+    )
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        out = pipeline.process(media, diarize=True, voiceprints=True, shot_snap=False)
+
+    sibling = json.loads((tmp_path / "episode.json").read_text(encoding="utf-8"))
+    assert out.exists()
+    assert seen["prefetch"] == (None, None)
+    assert seen["source"] == media
+    assert seen["voiceprints"] is False
+    assert sibling["speaker_turns"] == [list(TURN)]
+    assert "voiceprint_capture" not in sibling
+    assert not artifacts.claim_paths(media).voiceprints.exists()
+    assert "voiceprint models unavailable" in caplog.text
+    assert "timed out" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("lang_override", "expected"),
+    [
+        (None, None),
+        ("  ", None),
+        ("ja", "ja"),
+        ("Japanese", "ja"),
+        ("xx-unknown", "en"),
+    ],
+)
+def test_prefetch_follows_a_forced_language(
+    tmp_path, monkeypatch, lang_override, expected
+):
+    from voxweave import voiceembed
+
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"stable media bytes")
+    calls: list[tuple[object, object]] = []
+
+    def fake_prefetch(cli_value, language_iso):
+        calls.append((cli_value, language_iso))
+        return ()
+
+    def fake_transcribe(_source, **kwargs):
+        assert kwargs["voiceprints"] is True
+        turns = [TURN]
+        return "en", [dict(UNIT)], [], [], turns, _capture(turns)
+
+    monkeypatch.setattr(voiceembed, "prefetch_checkpoints", fake_prefetch)
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+
+    pipeline.process(
+        media,
+        lang_override=lang_override,
+        diarize=True,
+        voiceprints=True,
+        voiceprint_model="auto",
+        shot_snap=False,
+    )
+
+    assert calls == [("auto", expected)]
+
+
+def test_transcribe_prefetch_failure_skips_the_capture(tmp_path, monkeypatch, caplog):
+    from voxweave import voiceembed
+
+    _wav, seen = _stub_decoupled_transcribe(tmp_path, monkeypatch, language="Japanese")
+    requested, _network = _install_fake_voiceprint_embedder(monkeypatch)
+    prefetched: list[tuple[object, object]] = []
+
+    def unavailable(cli_value, language_iso):
+        prefetched.append((cli_value, language_iso))
+        raise voiceembed.VoiceEmbeddingError("anime-va checkpoint is not reachable")
+
+    monkeypatch.setattr(voiceembed, "prefetch_checkpoints", unavailable)
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"source")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        result = pipeline.transcribe(
+            media,
+            lang_override="ja",
+            separate=False,
+            diarize=True,
+            voiceprints=True,
+        )
+
+    assert prefetched == [(None, "ja")]
+    assert result[4] == [(0.0, 3.0, "SPEAKER_00")]
+    assert result[5] is None
+    assert seen["want_embeddings"] is False
+    assert requested == []
+    assert "voiceprint models unavailable" in caplog.text

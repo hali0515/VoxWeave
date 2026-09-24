@@ -241,8 +241,9 @@ def test_ffmpeg_progress_interrupt_stops_encoder(monkeypatch):
     assert process.stdout.closed
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"])
 def test_speaker_service_url_and_session_updates_use_separate_streams(
-    delivery_inputs, monkeypatch
+    delivery_inputs, monkeypatch, host
 ):
     media, subtitle = delivery_inputs
     audition = SimpleNamespace(
@@ -256,16 +257,17 @@ def test_speaker_service_url_and_session_updates_use_separate_streams(
     monkeypatch.setattr(speakers, "create_speaker_audition", lambda path: audition)
 
     def fake_serve(**kwargs):
+        assert kwargs["host"] == host
         report = kwargs["report"]
-        report("http://127.0.0.1:41533/")
+        report(f"http://{host}:41533/")
         report("Saved speakers.json")
         report("Next: voxweave render episode.json")
-        return "http://127.0.0.1:41533/"
+        return f"http://{host}:41533/"
 
     monkeypatch.setattr(speakerserve, "serve", fake_serve)
-    result = CliRunner().invoke(cli_mod.cli, ["speakers", str(media)])
+    result = CliRunner().invoke(cli_mod.cli, ["speakers", str(media), "--host", host])
     assert result.exit_code == 0, result.output
-    assert result.stdout == "http://127.0.0.1:41533/\n"
+    assert result.stdout == f"http://{host}:41533/\n"
     assert "Saved speakers.json" in result.stderr
     assert "Next: voxweave render episode.json" in result.stderr
     assert "[1/" not in result.stderr

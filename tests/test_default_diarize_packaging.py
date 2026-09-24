@@ -184,6 +184,28 @@ def test_readme_diarize_docs_name_community1_as_default_everywhere() -> None:
     assert '"community-1" (built-in default)' in readme
 
 
+def test_readme_speaker_clustering_default_matches_the_constant() -> None:
+    from voxweave import config
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    default = config.DEFAULT_DIARIZE_CLUSTERING
+    other = next(
+        choice for choice in config.DIARIZE_CLUSTERING_CHOICES if choice != default
+    )
+
+    # Options table, env-var reference and sample conf each name the default,
+    # so flipping DEFAULT_DIARIZE_CLUSTERING fails here until the docs follow.
+    assert f"`{default}` (the default" in readme
+    assert f"`[diarize].clustering` in the config, else `{default}`" in readme
+    assert f'"{default}" (built-in default)' in readme
+    assert f'clustering = "{default}"' in readme
+    assert f"`{other}` (the default" not in readme
+    assert f'"{other}" (built-in default)' not in readme
+    assert "--speaker-clustering" in readme
+    assert "VOXWEAVE_DIARIZE_CLUSTERING" in readme
+    assert "CC BY-NC-SA 4.0" in readme
+
+
 def test_tracked_documentation_has_no_removed_semantic_split_language() -> None:
     result = subprocess.run(
         ["git", "ls-files", "-z", "--", "*.md", "*.rst", "*.txt"],
