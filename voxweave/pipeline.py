@@ -1122,6 +1122,7 @@ def transcribe(
                         except BaseException as exc:
                             classify_cache_decode_failure(exc)
                             raise
+                        tmp.append(wav)
             if cache_hit:
                 # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
                 pass
@@ -1143,11 +1144,11 @@ def transcribe(
                     fullband, vocals, wav, voc32 = _separate_to_16k_32k(
                         media_path, reporter=rep, normalize=normalize
                     )
-                tmp.append(fullband)
+                # Own every temp before anything else can raise (a debug dump
+                # onto a full disk would otherwise leave them in /tmp).
+                tmp.extend((fullband, vocals, voc32, wav))
                 dbg.audio("00_fullband_44k.wav", fullband)
-                tmp.append(vocals)
                 dbg.audio("01_vocals.flac", vocals)
-                tmp.append(voc32)
                 log.info("separated vocals (local Roformer)")
                 if cache_vocals is not None:
                     try:
@@ -1170,7 +1171,7 @@ def transcribe(
         else:
             rep.stage("decode 16k")
             wav = decode_to_wav(media_path, audio_filter=af)
-        tmp.append(wav)
+            tmp.append(wav)
         dbg.audio("02_speech_16k.wav", wav)
 
         # Song detection must run on clean separated vocals; BGM causes speech/music confusion.

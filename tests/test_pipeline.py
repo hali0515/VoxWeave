@@ -402,6 +402,33 @@ def test_separate_cleans_32k_vocals_when_16k_decode_fails(tmp_path, monkeypatch)
     assert len(created) == 3 and not any(p.exists() for p in created)
 
 
+def test_transcribe_cleans_separation_temps_when_a_debug_dump_fails(
+    tmp_path, monkeypatch
+):
+    # transcribe owns the helper's temps as soon as it returns: a debug dump
+    # that fails (a full disk under --debug) must not leave them in /tmp.
+    from voxweave import debug
+
+    made = [tmp_path / n for n in ("full.wav", "vocals.flac", "16k.wav", "32k.wav")]
+    for path in made:
+        path.write_bytes(b"x")
+    full, vocals, wav, voc32 = made
+    monkeypatch.setattr(
+        pipeline, "_separate_to_16k_32k", lambda *_a, **_k: (full, vocals, wav, voc32)
+    )
+
+    def full_disk(self, name, path):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(debug.FileDebugSink, "audio", full_disk)
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"m")
+
+    with pytest.raises(OSError, match="No space left"):
+        pipeline.transcribe(media, debug=True, debug_root=tmp_path / "dbg")
+    assert not any(path.exists() for path in made)
+
+
 # --- #18: _spans_in / _turns_in must skip malformed persisted entries instead of crashing ---
 
 
