@@ -3,9 +3,10 @@
 ``pack`` remuxes the source media with the subtitles added as a proper subtitle track
 (stream copy, instant, reversible). ``burn`` renders the subtitles into the
 pixels via a styled ASS + libass filter and re-encodes the video (constant
-quality, hardware encoder when available: NVENC on NVIDIA, VideoToolbox on
-macOS, libx264/libx265/libsvt-av1 software fallback). Both drop nothing from
-the source except, for burn, the now-redundant subtitle tracks.
+quality capped at the source bitrate, hardware encoder when available: NVENC on
+NVIDIA, VideoToolbox on macOS, libx264/libx265/libsvt-av1 software fallback).
+Both drop nothing from the source except, for burn, the now-redundant subtitle
+tracks.
 
 Command construction is kept separate from probing/execution so the ffmpeg
 argv builders stay unit-testable without media files or a GPU.
@@ -498,11 +499,19 @@ def pick_encoder(codec: str, *, force: str | None = None) -> str:
     return sw
 
 
-def _encoder_args(encoder: str, quality: int) -> list[str]:
+def _encoder_args(encoder: str, quality: int, max_rate: int | None = None) -> list[str]:
     """Constant-quality rate-control argv for the encoder (never a bitrate target:
-    -b:v 0 pure CQ avoids overshoot; the encoder spends bits where the content
-    needs them instead of chasing the source's rate)."""
+    -b:v 0 pure CQ; the encoder spends bits where the content needs them).
+
+    ``max_rate`` (bit/s) adds a ceiling on top of constant quality, so a
+    low-bitrate source is not re-encoded into a larger file than it came in as:
+    below the ceiling the quality value still decides the rate."""
+    cap = ["-maxrate", str(max_rate)] if max_rate else []
+    # the VBV buffer turns the ceiling into a running average rather than a
+    # per-frame limit; two seconds is the usual size
+    vbv = ["-bufsize", str(2 * max_rate)] if max_rate else []
     if encoder.endswith("_nvenc"):
+        # NVENC's CQ mode honours only the max bitrate and discards -bufsize
         return [
             "-preset",
             "p6",
@@ -522,12 +531,15 @@ def _encoder_args(encoder: str, quality: int) -> list[str]:
             "1",
             "-rc-lookahead",
             "32",
+            *cap,
         ]
     if encoder.endswith("_videotoolbox"):
-        return ["-q:v", str(quality)]
+        # VideoToolbox turns -maxrate into a one-second data rate limit
+        return ["-q:v", str(quality), *cap]
     if encoder == "libsvtav1":
-        return ["-preset", "6", "-crf", str(quality)]
-    return ["-preset", "slow", "-crf", str(quality)]  # libx264 / libx265
+        return ["-preset", "6", "-crf", str(quality), *cap, *vbv]  # capped CRF
+    # libx264 / libx265
+    return ["-preset", "slow", "-crf", str(quality), *cap, *vbv]
 
 
 # Ordered pix_fmt depth probes: endianness-suffixed digits, planar/semi-planar
@@ -558,6 +570,65 @@ def src_bit_depth(video_stream: dict) -> int:
         if m:
             return int(m.group(1))
     return 8
+
+
+def _stream_bitrate(stream: dict) -> int | None:
+    """A stream's bitrate in bit/s: ``bit_rate`` (mp4/mov) or the ``BPS`` tag
+    mkvmerge writes (matroska); None when neither is there."""
+    tags = stream.get("tags") or {}
+    for raw in (stream.get("bit_rate"), tags.get("BPS"), tags.get("BPS-eng")):
+        text = str(raw or "")
+        if text.isdecimal() and int(text) > 0:
+            return int(text)
+    return None
+
+
+def _stream_duration(stream: dict) -> float | None:
+    """A stream's duration in seconds: ``duration`` (mp4/mov) or the matroska
+    ``DURATION`` tag ("00:47:35.178000000"); None when neither parses."""
+    try:
+        seconds = float(stream.get("duration") or "")
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds > 0:
+        return seconds
+    tags = stream.get("tags") or {}
+    clock = str(tags.get("DURATION") or tags.get("DURATION-eng") or "")
+    parts = clock.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
+
+
+def src_video_bitrate(
+    video_stream: dict, streams: list[dict], media: Path
+) -> int | None:
+    """Bitrate of the source's video stream in bit/s (None when it cannot be told).
+
+    Uses the stream's own rate when the container reports one. Otherwise (webm
+    and most matroska remuxes) it is the file size over the video duration minus
+    the audio streams whose rate is known, which overestimates the video share
+    by the rate of any audio stream that reports none.
+    """
+    rate = _stream_bitrate(video_stream)
+    if rate:
+        return rate
+    duration = _stream_duration(video_stream)
+    try:
+        size = media.stat().st_size
+    except OSError:
+        return None
+    if not duration or size <= 0:
+        return None
+    audio = sum(
+        _stream_bitrate(s) or 0 for s in streams if s.get("codec_type") == "audio"
+    )
+    rate = int(size * 8 / duration) - audio
+    return rate if rate > 0 else None
 
 
 def _burn_pix_fmt(encoder: str, src_depth: int) -> str:
@@ -601,12 +672,14 @@ def build_burn_cmd(
     container: str,
     src_depth: int,
     audio_codecs: list[str],
+    max_rate: int | None = None,
 ) -> list[str]:
     """Build the ffmpeg argv that burns the styled ASS into the video.
 
-    Video is re-encoded at constant quality; audio is stream-copied (re-encoded
-    to AAC only when the target is mp4 and a source codec cannot live there);
-    every source subtitle track is dropped (they are burnt in now).
+    Video is re-encoded at constant quality, capped at ``max_rate`` bit/s when
+    given; audio is stream-copied (re-encoded to AAC only when the target is mp4
+    and a source codec cannot live there); every source subtitle track is
+    dropped (they are burnt in now).
     """
     pix = _burn_pix_fmt(encoder, src_depth)
     cmd: list[str] = [
@@ -625,7 +698,7 @@ def build_burn_cmd(
     cmd += ["-i", str(media)]
     cmd += ["-vf", f"ass={_filter_escape(str(ass_path))},format={pix}"]
     cmd += ["-map", "0:v:0", "-map", "0:a?"]
-    cmd += ["-c:v", encoder, *_encoder_args(encoder, quality)]
+    cmd += ["-c:v", encoder, *_encoder_args(encoder, quality, max_rate)]
     if container == "mp4" and encoder.split("_")[0] in ("hevc", "libx265"):
         cmd += ["-tag:v", "hvc1"]
     if container == "mp4" and any(c not in _MP4_SAFE_AUDIO for c in audio_codecs):
@@ -649,12 +722,15 @@ def burn(
     font_size: int | None = None,
     output: Path | None = None,
     reporter: Reporter | None = None,
+    bitrate_cap: bool = True,
 ) -> Path:
     """Burn the subtitles into the video pixels and write a clean
     (subtitle-track-free) output; return its path. VTT/SRT inputs are rendered
     to a styled ASS at the actual frame size so proportions match the export
     defaults at any resolution; ASS/SSA inputs go to libass as-is, keeping
-    their own styling (--font/--font-size are ignored)."""
+    their own styling (--font/--font-size are ignored). With ``bitrate_cap``
+    the video bitrate is capped at the source's, so the output is no larger
+    than the source."""
     from voxweave.export import _timed_rows, ass_header, render_ass
     from voxweave.subformats import load_subtitle_blocks, require_subtitle
 
@@ -706,6 +782,13 @@ def burn(
         if s.get("codec_type") == "audio"
     ]
 
+    max_rate = src_video_bitrate(video, streams, src) if bitrate_cap else None
+    if bitrate_cap and max_rate is None:
+        logger.warning(
+            "could not read the video bitrate of %s; encoding without a bitrate cap",
+            src.name,
+        )
+
     rep.step("select encoder")
     enc = pick_encoder(codec, force=encoder)
     q = quality if quality is not None else _DEFAULT_QUALITY.get(enc, 23)
@@ -744,8 +827,12 @@ def burn(
                 container=container,
                 src_depth=depth,
                 audio_codecs=audio_codecs,
+                max_rate=max_rate,
             )
-            logger.info("burning with %s (quality %s, %s)", enc, q, container)
+            cap_note = f", capped at {max_rate // 1000} kb/s" if max_rate else ""
+            logger.info(
+                "burning with %s (quality %s%s, %s)", enc, q, cap_note, container
+            )
             if reporter is None:
                 _run_ffmpeg(cmd, capture=False)
             else:

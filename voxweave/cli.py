@@ -900,7 +900,16 @@ def cmd_pack(
     default=None,
     help="Constant-quality value (NVENC -cq / x264-x265-svtav1 -crf, lower = better;"
     " VideoToolbox -q:v 1-100, higher = better). Default per encoder: h264 19 /"
-    " hevc 23 / av1 30 / VideoToolbox 65. Bitrate is never targeted.",
+    " hevc 23 / av1 30 / VideoToolbox 65. Bitrate is never targeted, only capped"
+    " (see --bitrate-cap).",
+)
+@click.option(
+    "--bitrate-cap/--no-bitrate-cap",
+    default=True,
+    help="Cap the video bitrate at the source's, so the output is no larger than the"
+    " source (default: on). Below the cap --quality still decides the bitrate; turn"
+    " it off to let constant quality alone decide, e.g. when re-encoding an AV1/VP9"
+    " source to h264.",
 )
 @renamed_option(
     "--container",
@@ -940,14 +949,15 @@ def cmd_burn(
     font: str,
     font_size: int | None,
     output: Path | None,
+    bitrate_cap: bool,
 ) -> None:
     """Burn subtitles (VTT/SRT/ASS) into the video pixels and drop all subtitle tracks.
 
     VTT/SRT inputs render to a styled ASS sized to the actual frame; ASS inputs
     keep their own styling. Video re-encodes at constant quality with hardware
-    acceleration when available (NVENC / VideoToolbox), preserves the source
-    bit depth (10-bit stays 10-bit on hevc/av1), and audio is stream-copied
-    (mp4 targets re-encode incompatible codecs to AAC).
+    acceleration when available (NVENC / VideoToolbox), capped at the source
+    bitrate, preserves the source bit depth (10-bit stays 10-bit on hevc/av1),
+    and audio is stream-copied (mp4 targets re-encode incompatible codecs to AAC).
     """
     from voxweave import mux
 
@@ -963,6 +973,7 @@ def cmd_burn(
             font_size=font_size,
             output=output,
             reporter=rep,
+            bitrate_cap=bitrate_cap,
         ),
     )
     success_panel("Burn done", [str(out)])

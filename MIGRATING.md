@@ -148,6 +148,17 @@ What stays the same, and what to do:
   used that person's suggestion on the review page; use `voxweave voices list`,
   `show`, `rename` and `forget` to curate the result.
 
+### `burn` output is no larger than the source
+
+`burn` still encodes at constant quality, but now caps the video bitrate at the source's.
+Constant quality alone could inflate a low-bitrate source: a 49-minute 3440x1440 screen
+recording at 374 kb/s H.264 (170 MB) came out of the default NVENC `-cq 23` at 873 kb/s HEVC
+(340 MB). Sources that need fewer bits than the cap still get fewer, so the output only
+changes where it used to exceed the source rate. Pass `--no-bitrate-cap` for the old
+behaviour, for example when burning an AV1 or VP9 source to h264, which needs more bits than
+the source for the same picture. When the source rate cannot be read, `burn` warns and
+encodes without a cap.
+
 ## 0.17.0
 
 Two performance settings were added, both off by default, and successful runs gained

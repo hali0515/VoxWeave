@@ -743,17 +743,26 @@ voxweave burn episode.zh.vtt --quality 20 --font "Noto Sans CJK SC"
 <details>
 <summary>Burn options & encoding policy</summary>
 
-| Option        | Meaning                                                                                                    |
-| ------------- | ---------------------------------------------------------------------------------------------------------- |
-| `--codec`     | `hevc` (default: 10-bit capable, ~40% smaller than h264, plays everywhere as `hvc1` mp4) / `h264` / `av1`. |
-| `--encoder`   | Force a specific ffmpeg encoder (default: auto-probe with a test encode).                                  |
-| `--quality`   | Constant quality: NVENC `-cq` / software `-crf` (lower = better); VideoToolbox `-q:v` (higher = better).   |
-| `--container` | `mp4` (default, maximum compatibility) or `mkv`.                                                           |
-| `--font`      | Subtitle font family (fontconfig resolves fallbacks; e.g. `Noto Sans CJK SC`).                             |
-| `--font-size` | Override the default 72-at-1080p scaled size.                                                              |
+| Option             | Meaning                                                                                                    |
+| ------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `--codec`          | `hevc` (default: 10-bit capable, ~40% smaller than h264, plays everywhere as `hvc1` mp4) / `h264` / `av1`. |
+| `--encoder`        | Force a specific ffmpeg encoder (default: auto-probe with a test encode).                                  |
+| `--quality`        | Constant quality: NVENC `-cq` / software `-crf` (lower = better); VideoToolbox `-q:v` (higher = better).   |
+| `--no-bitrate-cap` | Drop the default cap at the source's video bitrate, so constant quality alone decides the size.            |
+| `--container`      | `mp4` (default, maximum compatibility) or `mkv`.                                                           |
+| `--font`           | Subtitle font family (fontconfig resolves fallbacks; e.g. `Noto Sans CJK SC`).                             |
+| `--font-size`      | Override the default 72-at-1080p scaled size.                                                              |
 
-Bitrate is never targeted: pure constant-quality (`-b:v 0` on NVENC) lets the encoder spend
-bits where the content needs them, with no overshoot against the source rate. Output bit
+Bitrate is never targeted: constant quality (`-b:v 0` on NVENC) lets the encoder spend bits
+where the content needs them. It is capped, though, at the source's video bitrate (`-maxrate`;
+capped CRF on x264/x265/SVT-AV1, a one-second data rate limit on VideoToolbox), because
+constant quality alone can inflate a low-bitrate source: a 3440x1440 screen recording at
+374 kb/s H.264 came out of NVENC `-cq 23` at 873 kb/s HEVC. Under the cap the output is no
+larger than the source; content that needs fewer bits still gets fewer. The rate comes from
+the stream (`bit_rate`, or matroska's `BPS` tag), else from the file size over the duration
+minus the known audio rates; when neither can be read the cap is skipped with a warning.
+Turn it off with `--no-bitrate-cap` when the target codec is less efficient than the
+source's (an AV1 or VP9 source burnt to h264 needs more bits for the same picture). Output bit
 depth follows the source dynamically (8-bit stays 8-bit, 10-bit stays 10-bit; 12-bit is kept
 on libx265 and clamped to 10 on NVENC/VideoToolbox/SVT-AV1, which top out there) — except on
 h264 paths, which are always 8-bit for player compatibility (NVENC h264 cannot encode 10-bit

@@ -347,6 +347,60 @@ def test_encoder_args_constant_quality_only():
     assert mux._encoder_args("hevc_videotoolbox", 65) == ["-q:v", "65"]
     assert has_seq(mux._encoder_args("libx265", 23), "-crf", "23")
     assert has_seq(mux._encoder_args("libsvtav1", 30), "-preset", "6")
+    for enc in ("hevc_nvenc", "hevc_videotoolbox", "libx265", "libsvtav1"):
+        assert "-maxrate" not in mux._encoder_args(enc, 23)  # no cap unless asked
+
+
+def test_encoder_args_cap_keeps_constant_quality():
+    nv = mux._encoder_args("hevc_nvenc", 23, 374_000)
+    assert has_seq(nv, "-cq", "23") and has_seq(nv, "-b:v", "0")
+    assert has_seq(nv, "-maxrate", "374000")
+    assert "-bufsize" not in nv  # NVENC CQ mode discards it
+    assert mux._encoder_args("hevc_videotoolbox", 65, 374_000) == [
+        "-q:v",
+        "65",
+        "-maxrate",
+        "374000",
+    ]
+    for enc in ("libx264", "libx265", "libsvtav1"):
+        sw = mux._encoder_args(enc, 23, 374_000)
+        assert has_seq(sw, "-crf", "23")  # capped CRF, not a bitrate target
+        assert has_seq(sw, "-maxrate", "374000") and has_seq(sw, "-bufsize", "748000")
+        assert "-b:v" not in sw
+
+
+def test_src_video_bitrate_prefers_the_stream_rate(tmp_path):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"x" * 1000)
+    assert mux.src_video_bitrate({"bit_rate": "374150"}, [], media) == 374150
+    # mkvmerge writes the rate as a BPS tag
+    assert mux.src_video_bitrate({"tags": {"BPS": "2000000"}}, [], media) == 2_000_000
+    assert mux.src_video_bitrate({"tags": {"BPS-eng": "900"}}, [], media) == 900
+
+
+def test_src_video_bitrate_falls_back_to_size_over_duration(tmp_path):
+    media = tmp_path / "ep.webm"
+    media.write_bytes(b"x" * 125_000)  # 1 Mbit
+    audio = {"codec_type": "audio", "bit_rate": "100000"}
+    unknown_audio = {"codec_type": "audio"}
+    video = {"codec_type": "video", "duration": "2.0"}
+    # 500 kb/s over the file minus the audio whose rate is known
+    assert mux.src_video_bitrate(video, [video, audio], media) == 400_000
+    assert mux.src_video_bitrate(video, [video, unknown_audio], media) == 500_000
+    # matroska carries the duration as a clock tag
+    tagged = {"codec_type": "video", "tags": {"DURATION": "00:00:02.000000000"}}
+    assert mux.src_video_bitrate(tagged, [tagged], media) == 500_000
+
+
+def test_src_video_bitrate_unknown(tmp_path):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"x" * 1000)
+    assert mux.src_video_bitrate({}, [], media) is None  # no rate, no duration
+    assert mux.src_video_bitrate({"tags": {"DURATION": "bogus"}}, [], media) is None
+    assert mux.src_video_bitrate({"duration": "1"}, [], tmp_path / "gone.mkv") is None
+    # audio of known rate above the file's own rate leaves nothing for video
+    loud = {"codec_type": "audio", "bit_rate": "999999"}
+    assert mux.src_video_bitrate({"duration": "1"}, [loud], media) is None
 
 
 def test_filter_escape():
@@ -409,6 +463,21 @@ def test_build_burn_cmd_copies_flac_opus_dts_into_mp4():
             audio_codecs=[codec],
         )
         assert has_seq(cmd, "-c:a", "copy"), f"{codec} should stream-copy into mp4"
+
+
+def test_build_burn_cmd_passes_the_cap_to_the_encoder():
+    kwargs = dict(
+        encoder="hevc_nvenc",
+        quality=23,
+        container="mp4",
+        src_depth=8,
+        audio_codecs=["aac"],
+    )
+    paths = (Path("ep.mp4"), Path("/tmp/s.ass"), Path("ep.burn.mp4"))
+    capped = mux.build_burn_cmd(*paths, **kwargs, max_rate=374_000)
+    assert has_seq(capped, "-maxrate", "374000")
+    assert capped.index("-maxrate") < capped.index("-c:a")  # a video option
+    assert "-maxrate" not in mux.build_burn_cmd(*paths, **kwargs)
 
 
 # --- encoder-probe caching ----------------------------------------------------
@@ -582,6 +651,46 @@ def test_burn_failure_leaves_no_output(tmp_path, monkeypatch):
         mux.burn(vtt, output=out)
     assert not out.exists()
     assert not list(tmp_path.glob("*.part*"))
+
+
+def _burn_capturing_cmd(tmp_path, monkeypatch, video, **kwargs):
+    """Run burn() on a stub source with ``video`` as its probed video stream and
+    return the ffmpeg argv it built."""
+    (tmp_path / "ep.mp4").write_bytes(b"src")
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    stream = {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720}
+    monkeypatch.setattr(mux, "probe_streams", lambda _m: [{**stream, **video}])
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "hevc_nvenc")
+    captured = {}
+
+    def fake_ok(cmd, *, capture):
+        captured["cmd"] = cmd
+        Path(cmd[-1]).write_bytes(b"burned")
+
+    monkeypatch.setattr(mux, "_run_ffmpeg", fake_ok)
+    mux.burn(vtt, output=tmp_path / "ep.burn.mp4", **kwargs)
+    return captured["cmd"]
+
+
+def test_burn_caps_video_bitrate_at_the_source(tmp_path, monkeypatch):
+    cmd = _burn_capturing_cmd(tmp_path, monkeypatch, {"bit_rate": "374150"})
+    assert has_seq(cmd, "-maxrate", "374150")
+    assert has_seq(cmd, "-cq", "23")  # still constant quality under the cap
+
+
+def test_burn_without_bitrate_cap(tmp_path, monkeypatch):
+    cmd = _burn_capturing_cmd(
+        tmp_path, monkeypatch, {"bit_rate": "374150"}, bitrate_cap=False
+    )
+    assert "-maxrate" not in cmd
+
+
+def test_burn_warns_when_the_source_rate_is_unknown(tmp_path, monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        cmd = _burn_capturing_cmd(tmp_path, monkeypatch, {})
+    assert "-maxrate" not in cmd
+    assert any("without a bitrate cap" in r.message for r in caplog.records)
 
 
 def test_burn_ignores_corrupt_sidecar_and_keeps_sdh_prefix(
