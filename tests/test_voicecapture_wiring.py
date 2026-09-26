@@ -569,13 +569,19 @@ def test_capture_cache_hit_validates_pair_before_decode(tmp_path, monkeypatch):
         separator=SEPARATOR,
     )
     wav = _stub_transcribe_tail(tmp_path, monkeypatch)
-    decoded: list[Path] = []
+    decoded: list[Path | str] = []
+    real_validate = pipeline.validate_cache_pair
+
+    def recording_validate(*args, **kwargs):
+        decoded.append("validated")
+        return real_validate(*args, **kwargs)
 
     def fake_decode(source, **_kwargs):
         decoded.append(Path(source))
         return wav
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
+    monkeypatch.setattr(pipeline, "validate_cache_pair", recording_validate)
     monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
         pipeline,
@@ -592,7 +598,10 @@ def test_capture_cache_hit_validates_pair_before_decode(tmp_path, monkeypatch):
     )
 
     assert result[0] == "en"
-    assert decoded == [cache.resolve()]
+    # The pair is validated before any decode; the only decodes are the cached
+    # vocals (ASR input) and, after ASR, the source media itself for the
+    # original-audio VAD timing reference (no full-band stem on a cache hit).
+    assert decoded == ["validated", cache.resolve(), media]
     assert Path(f"{cache.resolve()}.lock").exists()
 
 

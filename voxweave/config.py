@@ -227,7 +227,7 @@ _TEMPLATE = """\
 # normalize = false    # loudnorm on the 16k input (--normalize/--no-normalize)
 # diarize = false      # pyannote speaker diarization; gated-model HF token required (--diarize/--no-diarize)
 # voiceprints = false   # opt-in biometric sidecar capture; requires diarize (--voiceprints/--no-voiceprints)
-# timestamps = true    # word-level timestamps in the VTT (--timestamps/--no-timestamps)
+# timestamps = true    # cue timing lines in the VTT (--timestamps/--no-timestamps)
 # shot_snap = true     # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
 # vad_mask = false     # suppress CTC emissions outside speech spans (--vad-mask/--no-vad-mask)
 
@@ -920,18 +920,24 @@ _SHOT_SNAP_DEFAULT_MS = (
 
 
 def _env_int(name: str, default: int) -> int:
+    """Integer env knob; unset/blank -> ``default``. A malformed value also falls back
+    to ``default`` (never raises: import-time knobs would break every command, even
+    ``--help``), with a warning naming the variable."""
     v = os.environ.get(name)
     try:
         return int(v) if v is not None and v.strip() else default
     except ValueError:
+        log.warning("ignoring %s=%r (not an integer); using %s", name, v, default)
         return default
 
 
 def _env_float(name: str, default: float) -> float:
+    """Float env knob; same fallback-with-warning contract as :func:`_env_int`."""
     v = os.environ.get(name)
     try:
         return float(v) if v is not None and v.strip() else default
     except ValueError:
+        log.warning("ignoring %s=%r (not a number); using %s", name, v, default)
         return default
 
 

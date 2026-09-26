@@ -129,11 +129,11 @@ def _log_voiceprint_notice_once() -> None:
 
 # ≤120s: long chunks occasionally trigger ASR repetition loops (stuck token ->
 # zero-duration wall). Do NOT raise this to pack more; the risk and blast radius grow.
-MAX_CHUNK_SEC = float(os.environ.get("VOXWEAVE_MAX_CHUNK_SEC", "120"))
+MAX_CHUNK_SEC = config._env_float("VOXWEAVE_MAX_CHUNK_SEC", 120.0)
 # Spans shorter than this after expansion are kept as dialogue, not skipped.
 # Real OP/ED runs 30-90s; short instrumental BGM scattered through speech would hurt ASR
 # if dropped (env VOXWEAVE_MIN_SONG_SKIP_SEC).
-MIN_SONG_SKIP_SEC = float(os.environ.get("VOXWEAVE_MIN_SONG_SKIP_SEC", "8"))
+MIN_SONG_SKIP_SEC = config._env_float("VOXWEAVE_MIN_SONG_SKIP_SEC", 8.0)
 # Loudness normalization applied only to the 16k VAD/ASR path; 44.1k separation path is untouched.
 ASR_LOUDNORM = os.environ.get("VOXWEAVE_LOUDNORM", "loudnorm=I=-16:TP=-1.5:LRA=11")
 # PANNs Cnn14 is trained at 32k.
@@ -141,20 +141,20 @@ SONGDET_SR = 32000
 # Sensitive VAD threshold for snapping zero-duration units to original (pre-separation)
 # audio. Silero default 0.5 misses back-channels (はい/ええ) attenuated by vocal separation;
 # 0.25 catches them. Used only for snap positioning, not for chunk boundary decisions.
-SNAP_VAD_THRESHOLD = float(os.environ.get("VOXWEAVE_SNAP_VAD_THRESHOLD", "0.25"))
+SNAP_VAD_THRESHOLD = config._env_float("VOXWEAVE_SNAP_VAD_THRESHOLD", 0.25)
 # Fine VAD pass for song excision: a small min-silence (vs the 300ms chunking default)
 # surfaces brief intra-segment pauses, so excision cut points land in real silence and
 # never bisect a dialogue word. Only runs when song spans were detected.
-SONG_FINE_SILENCE_MS = int(os.environ.get("VOXWEAVE_SONG_FINE_SILENCE_MS", "100"))
+SONG_FINE_SILENCE_MS = config._env_int("VOXWEAVE_SONG_FINE_SILENCE_MS", 100)
 # Align-stage cue duration floor. Default 0 (disabled): enforce_min_duration only
 # resolves overlaps without padding, so short back-channels keep their real ~0.6s.
 # Set VOXWEAVE_MIN_CUE_SEC=0.8 to re-enable padding. Distinct from VOXWEAVE_SEG_MIN_CUE_SEC.
-MIN_CUE_SEC = float(os.environ.get("VOXWEAVE_MIN_CUE_SEC", "0"))
+MIN_CUE_SEC = config._env_float("VOXWEAVE_MIN_CUE_SEC", 0.0)
 # Flash-cue rescue (orthogonal to MIN_CUE_SEC): genuine flash cues (so/あ at 0.1-0.2s)
 # are extended to TINY_CUE_TARGET, allowed to overlap only the immediately following cue.
 # VOXWEAVE_TINY_CUE_SEC=0 disables.
-TINY_CUE_SEC = float(os.environ.get("VOXWEAVE_TINY_CUE_SEC", "0.2"))
-TINY_CUE_TARGET = float(os.environ.get("VOXWEAVE_TINY_CUE_TARGET", "0.5"))
+TINY_CUE_SEC = config._env_float("VOXWEAVE_TINY_CUE_SEC", 0.2)
+TINY_CUE_TARGET = config._env_float("VOXWEAVE_TINY_CUE_TARGET", 0.5)
 
 
 # Vocals cache: per-media artifact claim ``vocals.32k.flac`` (32k mono, no BGM).
@@ -165,7 +165,7 @@ TINY_CUE_TARGET = float(os.environ.get("VOXWEAVE_TINY_CUE_TARGET", "0.5"))
 CACHE_DIRNAME = "cache"
 # Max |cache - media| duration drift still treated as the same source. Covers
 # container-vs-stream duration jitter; real source edits move duration by seconds.
-CACHE_DUR_TOL_SEC = float(os.environ.get("VOXWEAVE_CACHE_DUR_TOL_SEC", "0.5"))
+CACHE_DUR_TOL_SEC = config._env_float("VOXWEAVE_CACHE_DUR_TOL_SEC", 0.5)
 # Extensions tried when locating the source media by stem (align only receives the VTT).
 MEDIA_EXTS = (
     ".mkv",
@@ -547,8 +547,17 @@ def cache_16k_path(media_path: Path) -> Path:
     return media_path.parent / CACHE_DIRNAME / f"{media_path.stem}.16k.flac"
 
 
+class _ProbeUnavailable(RuntimeError):
+    """ffprobe itself could not answer (not installed, or timed out): says nothing
+    about whether the probed file is readable."""
+
+
 def _probe_duration(path: Path) -> float | None:
-    """Media duration in seconds via ffprobe, or None if unreadable."""
+    """Media duration in seconds via ffprobe, or None if unreadable.
+
+    Raises :class:`_ProbeUnavailable` when ffprobe is missing from PATH or times
+    out, so callers do not mistake a tool problem for an unreadable file.
+    """
     try:
         proc = subprocess.run(
             [
@@ -566,6 +575,10 @@ def _probe_duration(path: Path) -> float | None:
             text=True,
             timeout=60,
         )
+    except FileNotFoundError as e:
+        raise _ProbeUnavailable("ffprobe not found on PATH") from e
+    except subprocess.TimeoutExpired as e:
+        raise _ProbeUnavailable(f"ffprobe timed out on {path.name}") from e
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
@@ -582,12 +595,22 @@ def _vocals_cache_fresh(cache: Path, media: Path) -> bool:
     An unreadable cache is stale (truncated/corrupt flac must not be trusted);
     an unprobeable media keeps the cache hit — decoding will surface the real
     error later, and burning a separation pass on a maybe-valid cache helps nobody.
+    When ffprobe itself is unavailable (missing or timed out) the cache cannot be
+    validated, so it is re-separated too, but the warning names the real cause.
     """
-    cache_dur = _probe_duration(cache)
+    try:
+        cache_dur = _probe_duration(cache)
+    except _ProbeUnavailable as e:
+        log.warning("%s; cannot validate the vocals cache, re-separating: %s", e, cache)
+        return False
     if cache_dur is None:
         log.warning("vocals cache unreadable, re-separating: %s", cache)
         return False
-    media_dur = _probe_duration(media)
+    try:
+        media_dur = _probe_duration(media)
+    except _ProbeUnavailable as e:
+        log.warning("%s; keeping the vocals cache unvalidated: %s", e, cache)
+        return True
     if media_dur is None:
         return True
     if abs(cache_dur - media_dur) <= CACHE_DUR_TOL_SEC:
@@ -784,8 +807,8 @@ def _separate_to_16k_32k(
 
     On a clean return the caller registers the paths in its own ``tmp`` list (cleaned in its
     ``finally``). Since that registration only runs after this returns, the helper self-cleans
-    its partial outputs if a later step raises — otherwise an OOM/ffmpeg failure mid-separation
-    would orphan the already-decoded temp files.
+    its partial outputs if a later step raises (or is interrupted) — otherwise an OOM/ffmpeg
+    failure or a Ctrl-C mid-separation would orphan the already-decoded temp files.
     """
     created: list[Path] = []
     try:
@@ -816,7 +839,9 @@ def _separate_to_16k_32k(
         if return_separator_identity:
             return fullband, vocals, wav, voc32, separator_identity
         return fullband, vocals, wav, voc32
-    except Exception:
+    except BaseException:
+        # BaseException: a Ctrl-C mid-separation must not orphan the multi-hundred-MB
+        # full-band WAV either.
         for p in created:
             p.unlink(missing_ok=True)
         raise
@@ -839,17 +864,17 @@ def _load_sibling_json_bytes(
         )
         raise RuntimeError(
             f"{json_path.name} is corrupt JSON ({detail});"
-            " re-run transcribe/process to regenerate it"
+            " re-run `voxweave transcribe <media>` to regenerate it"
         ) from e
     if not isinstance(data, dict):
         raise RuntimeError(
             f"{json_path.name}: expected a JSON object, got {type(data).__name__};"
-            " re-run transcribe/process to regenerate it"
+            " re-run `voxweave transcribe <media>` to regenerate it"
         )
     if require is not None and require not in data:
         raise RuntimeError(
             f"{json_path.name} has no {require!r} key;"
-            " re-run transcribe/process to regenerate it"
+            " re-run `voxweave transcribe <media>` to regenerate it"
         )
     return data
 
@@ -903,7 +928,8 @@ def resolve_segmentation_manifest(data: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _load_cues(vtt_path: Path) -> list[dict]:
     """Parse subtitle cue blocks by extension (VTT/SRT/ASS/SSA); raise if the
-    file has no cues. Shared guard for align/translate/correct."""
+    file has no cues. Used by translate (align and correct decode the exact bytes
+    they snapshot instead)."""
     from voxweave.subformats import load_subtitle_blocks
 
     return load_subtitle_blocks(Path(vtt_path))
@@ -1363,7 +1389,9 @@ def transcribe(
         lang_name = _select_transcript_language(results, lang_override)
         if not is_supported(lang_name):
             log.warning(
-                "language %r not in aligner set; smart_split may misbehave", lang_name
+                "language %r is not officially supported; subtitle line breaking may"
+                " be poor — pass --language to override detection",
+                lang_name,
             )
         iso = to_iso_or(lang_name, "en")
 
@@ -1380,10 +1408,13 @@ def transcribe(
         # VAD misses them. We run VAD on the ORIGINAL audio (retains attenuated speech) as
         # the timing reference, excluding song spans to avoid snapping onto singing.
         # vad_spans are persisted to .json (vad_speech) for reuse by split.
-        # SNAP_VAD_THRESHOLD (0.25) catches attenuated back-channels; --no-separate uses
-        # silero default (0.5) since the original audio is not available separately.
-        if separate and fullband is not None:
-            orig16k = decode_to_wav(fullband)
+        # SNAP_VAD_THRESHOLD (0.25) catches attenuated back-channels. The original is the
+        # full-band stem on a fresh separation, or the source media itself on a vocals-cache
+        # hit (no stem exists then) -- both decoded to the same 16k mono, so a re-run gets
+        # the same reference as the first run. --no-separate reuses the chunking VAD
+        # (silero default 0.5): the decoded 16k input already IS the original audio.
+        if separate:
+            orig16k = decode_to_wav(fullband if fullband is not None else media_path)
             tmp.append(orig16k)
             orig_segs = vad_speech_segments(orig16k, threshold=SNAP_VAD_THRESHOLD)
             if song_spans:
@@ -1526,15 +1557,27 @@ def transcribe(
             voiceprint_capture,
         )
     finally:
+        # Each release is guarded on its own: a release that raises (e.g.
+        # torch.cuda.empty_cache after a CUDA fault) must neither mask the original
+        # error nor skip the remaining releases and the temp-file cleanup below.
         # Release ASR/alignment singleton VRAM (separation self-releases earlier).
-        backend.release()
+        try:
+            backend.release()
+        except Exception as e:
+            log.warning("releasing the ASR/alignment models failed: %r", e)
         # No VAD pass can follow: every vad_speech_segments call lives above.
-        chunking.release_silero_vad()
+        try:
+            chunking.release_silero_vad()
+        except Exception as e:
+            log.warning("releasing the VAD model failed: %r", e)
         if not panns_handoff:
             # Safety net: an exception before the post-detection release (or before
             # the sdh caller can take over) would otherwise strand PANNs on the card.
             # Idempotent when the release above already ran.
-            songdet.release_model()
+            try:
+                songdet.release_model()
+            except Exception as e:
+                log.warning("releasing the song-detection model failed: %r", e)
         for p in tmp:
             p.unlink(missing_ok=True)
         for c in tmp_chunks:
@@ -1654,9 +1697,10 @@ def mark_lyric_cues(
 ) -> None:
     """Flag cues whose span mostly overlaps detected singing (``lyric=True``).
 
-    The stored cue text stays clean; display layers (`_write_siblings` VTT rows,
-    SRT/ASS export) wrap flagged cues with music notes per the Netflix lyric
-    convention. Runs in place after smart_split so flags ride the final cues.
+    The stored cue text stays clean; display layers (the VTT rows rendered by
+    ``segmentation_projector`` / ``align_projector``, SRT/ASS export) wrap flagged
+    cues with music notes per the Netflix lyric convention. Runs in place after
+    smart_split so flags ride the final cues.
     """
     if not sing_spans:
         return
@@ -1998,15 +2042,17 @@ def segment_document(
     The pass order is exactly what production runs:
 
     1. snap sentence-break punctuation onto word boundaries (zh only),
-    2. flatten the units into one segment,
-    3. resolve the effective thresholds (optional adaptive gap scaling),
-    4. record the manifest and mint the :class:`SegDocument` (see below),
-    5. ``smart_split_segments`` (content breaks + timing cleanup + shot snap),
-    6. lyric marking from ``sing_spans``,
-    7. speaker formatting from ``speaker_turns`` (which re-runs timing cleanup),
-    8. re-snap to ``shot_changes`` because step 7 moved boundaries again.
+    2. repair stranded word tails (``repair_stranded_tails``) on the stream cue
+       formation sees; ``result.units`` keeps the raw aligner timings,
+    3. flatten the units into one segment,
+    4. resolve the effective thresholds (optional adaptive gap scaling),
+    5. record the manifest and mint the :class:`SegDocument` (see below),
+    6. ``smart_split_segments`` (content breaks + timing cleanup + shot snap),
+    7. lyric marking from ``sing_spans``,
+    8. speaker formatting from ``speaker_turns`` (which re-runs timing cleanup),
+    9. re-snap to ``shot_changes`` because step 8 moved boundaries again.
 
-    Step 4 sits *before* the engine on purpose: the document is the single
+    Step 5 sits *before* the engine on purpose: the document is the single
     authority describing what this segmentation runs on, so a later engine takes
     it as input instead of being reverse-engineered from its own output. Only
     ``degraded`` cannot be known that early; the manifest reserves the key at
@@ -2014,7 +2060,7 @@ def segment_document(
     persisted block is byte-identical either way.
 
     With :data:`SEG_V2_SHADOW_ENV` on, the v2 optimizer is measured between steps
-    5 and 6 and its artifact is returned on ``result.shadow``. It ships nothing:
+    6 and 7 and its artifact is returned on ``result.shadow``. It ships nothing:
     the cue stream, the units and the persisted manifest are byte-identical to a
     run with the flag off.
 
@@ -2225,10 +2271,12 @@ def _reconcile_word_segment_language(
     """
     if not units:
         raise RuntimeError("no word segments to split")
+    # schema.Unit carries the surface under ``text`` OR ``word``; read both.
+    from voxweave.core.smart_split import _unit_text
 
     original_units = units
     stored_iso = to_iso_or(language, "en")
-    pieces = [str(unit.get("text") or "") for unit in units]
+    pieces = [_unit_text(unit) for unit in units]
     meaningful = [piece for piece in pieces if piece.strip()]
     if not meaningful:
         return stored_iso, units
@@ -2296,8 +2344,15 @@ def _reconcile_word_segment_language(
         )
         return stored_iso, original_units
 
+    # reinject_punct reads ``text`` only: hand it ``word``-keyed units under that key.
+    text_units = [
+        unit
+        if unit.get("text") == _unit_text(unit)
+        else {**unit, "text": _unit_text(unit)}
+        for unit in units
+    ]
     try:
-        rebuilt = realign.reinject_punct(text, units, effective_iso)
+        rebuilt = realign.reinject_punct(text, text_units, effective_iso)
     except Exception as exc:  # noqa: BLE001 -- persisted input may be arbitrarily malformed
         log.warning(
             "cannot repair word-segment language %s -> %s: %s",
@@ -2315,9 +2370,9 @@ def _reconcile_word_segment_language(
         a[0] <= b[0] and a[1] <= b[1] for a, b in zip(rebuilt_times, rebuilt_times[1:])
     )
     if effective_no_space:
-        round_trip_ok = "".join(str(u.get("text") or "") for u in rebuilt) == text
+        round_trip_ok = "".join(_unit_text(u) for u in rebuilt) == text
     else:
-        rebuilt_text = " ".join(str(u.get("text") or "") for u in rebuilt)
+        rebuilt_text = " ".join(_unit_text(u) for u in rebuilt)
         round_trip_ok = " ".join(rebuilt_text.split()) == " ".join(text.split())
     envelope_ok = rebuilt_times is not None and all(
         math.isclose(a, b, abs_tol=1e-6)
@@ -3077,6 +3132,14 @@ def split(
             input_bytes,
             require="word_segments",
         )
+        word_segments = data["word_segments"]
+        if not isinstance(word_segments, list) or not all(
+            isinstance(unit, Mapping) for unit in word_segments
+        ):
+            raise RuntimeError(
+                f"{json_path.name}: 'word_segments' must be a list of objects;"
+                " re-run `voxweave transcribe <media>` to regenerate it"
+            )
     except RuntimeError as exc:
         _attach_json_decode_failure(exc)
         raise
@@ -3371,11 +3434,12 @@ def _align_blocks(
     if (legacy_distribution_invoker is None) != (legacy_shift_invoker is None):
         raise ValueError("legacy projection phase invokers must be supplied together")
 
-    # cue (start,end) bounds are used ONLY as silence anchors to split movie-length audio
-    # into memory-sized chunks when it overflows the single-pass DP budget — NOT to crop/route
-    # per cue. align is routing-free because the input VTT timestamps are exactly what may be
-    # wrong (the reason to re-align); the global DP self-locates every word. None for cues
-    # without timestamps. See memory voxweave-alignment-timing.
+    # MMS/CTC full passes: cue (start,end) bounds are used ONLY as silence anchors to split
+    # movie-length audio into memory-sized chunks when it overflows the single-pass DP
+    # budget — NOT to crop/route per cue. These routes are routing-free because the input
+    # VTT timestamps are exactly what may be wrong (the reason to re-align); the global DP
+    # self-locates every word. None for cues without timestamps. (The Qwen per-cue route
+    # below crops each cue from ``crops`` instead.)
     bounds = [
         (b["start"], b["end"])
         if b["start"] is not None and b["end"] is not None
@@ -3498,6 +3562,9 @@ def _align_blocks(
             )
 
         pending_qwen.append((prepared.source_index, raw_units, prepared.nominal_start))
+        # One tick per aligned cue as it lands (skipped cues ticked at preparation),
+        # so the bar moves with the work instead of jumping from 0/N at the end.
+        reporter.advance(1)
 
     if not pending_qwen:
         with align_runtime_activity("AO-07", "no-physical-calls"):
@@ -3528,8 +3595,6 @@ def _align_blocks(
         if legacy_shift_invoker is None
         else cast(list[list[dict]], legacy_shift_invoker(shift_owners))
     )
-    for _pending in pending_qwen:
-        reporter.advance(1)
     return block_units
 
 
@@ -3597,6 +3662,21 @@ def _notify_align_shadow_observer(
         )
 
 
+def _media_not_found_error(vtt_path: Path) -> FileNotFoundError:
+    """The classified error :func:`align` raises when the source media is missing."""
+    exc = FileNotFoundError(
+        f"source media for {vtt_path.name} not found (expected sibling with same stem); "
+        f"align needs the original file to re-align, or specify --media"
+    )
+    _attach_canonical_failure(
+        exc,
+        kind="media-identity-invalid",
+        phase="media",
+        detail_code="media-not-found",
+    )
+    return exc
+
+
 def align(
     vtt_path: Path,
     *,
@@ -3610,9 +3690,21 @@ def align(
 ) -> Path:
     """Re-align edited VTT text against original audio; overwrite VTT and update JSON.
 
-    Routes each block to its audio window (via word_segments or VTT timestamps), slices
-    and aligns locally, interpolates insertion blocks, then writes timing. ASR is not
-    re-run; smart_split is not touched. All models run in-process (no network calls).
+    The language's configured aligner (:func:`voxweave.config.align_model_for`)
+    picks one of three routes:
+
+    - MMS full pass (default for ja): one global forced alignment of all cue text
+      over the whole audio; cue timestamps serve only as silence anchors when the
+      audio overflows the single-pass budget.
+    - CTC full pass (wav2vec2, default for en): the same routing-free global
+      alignment over windowed emissions (optionally soft-masked by the persisted
+      ``vad_speech`` under ``--vad-mask``).
+    - Qwen per-cue crop (every language without an MMS/CTC aligner, e.g. zh/yue):
+      each block is routed to its audio window (via word_segments or VTT
+      timestamps), tightly cropped and aligned on its own.
+
+    Insertion blocks are then interpolated and timing is written. ASR is not re-run;
+    smart_split is not touched. All models run in-process (no network calls).
     """
     vtt_path = require_vtt(Path(vtt_path))  # align overwrites the input as VTT
     explicit_media_requested = media_path is not None
@@ -3698,17 +3790,7 @@ def align(
     with align_runtime_activity("AO-03", "selected-media-identity"):
         media = Path(media_path) if media_path else _find_subtitle_media(vtt_path)
         if media is None or not media.exists():
-            exc = FileNotFoundError(
-                f"source media for {vtt_path.name} not found (expected sibling with same stem); "
-                f"align needs the original file to re-align, or specify --media"
-            )
-            _attach_canonical_failure(
-                exc,
-                kind="media-identity-invalid",
-                phase="media",
-                detail_code="media-not-found",
-            )
-            raise exc
+            raise _media_not_found_error(vtt_path)
         try:
             media_input_fingerprint = media_fingerprint(media)
         except OSError as exc:
@@ -4034,8 +4116,10 @@ def align(
             legacy_shift_invoker=invoke_legacy_shift,
         )
 
-        # Tight cropping eliminates "last word drifts into inter-sentence silence", so
-        # position_units_with_vad is not needed here (unlike the transcribe path).
+        # position_units_with_vad is not needed here (unlike the transcribe path): on
+        # the Qwen per-cue route the tight crop already stops a cue's last word from
+        # drifting into inter-sentence silence, and the MMS/CTC full passes absorb
+        # silence in their blank tokens.
         with align_runtime_activity("AO-10", "group-block-spans"):
             final, all_units = realign.group_block_spans(block_units)
         with align_runtime_activity("AO-10", "common-all-empty-decision"):
@@ -4212,7 +4296,12 @@ def align(
                     detail_code="media-snapshot-residue",
                 )
         with align_runtime_activity("AO-24", "backend-and-audio-temp-disposal"):
-            backend.release()
+            # Guarded: a release that raises (e.g. torch.cuda.empty_cache after a CUDA
+            # fault) must neither mask the original error nor skip the temp cleanup.
+            try:
+                backend.release()
+            except Exception as exc:
+                log.warning("releasing the alignment models failed: %r", exc)
             for p in tmp:
                 try:
                     p.unlink(missing_ok=True)
@@ -4466,6 +4555,25 @@ def translate(
     return out_path
 
 
+def _warn_correction_not_realigned(vtt_path: Path, applied: Sequence[Mapping]) -> None:
+    """Warn that ``vtt_path`` was corrected but not re-aligned, listing the diff."""
+    shown = [
+        f"  #{fix.get('i')}: {fix.get('orig')!r} -> {fix.get('fixed')!r}"
+        for fix in applied[:20]
+    ]
+    if len(applied) > len(shown):
+        shown.append(f"  ... and {len(applied) - len(shown)} more")
+    log.warning(
+        "%s was corrected in place (%d change(s)) but re-alignment failed, so its"
+        " timing is stale; run `voxweave align %s` (add --media if the source is not"
+        " beside it) to refresh it. Applied changes:\n%s",
+        vtt_path.name,
+        len(applied),
+        vtt_path,
+        "\n".join(shown),
+    )
+
+
 def correct(
     vtt_path: Path,
     *,
@@ -4488,13 +4596,20 @@ def correct(
     ``apply``: overwrites the original VTT in place and writes **no audit json** (the diff is
     shown in the summary). When ``align_after`` and a real change was applied, immediately
     re-runs :func:`align` to refresh timestamps (text edits change word counts) and update the
-    sibling ``<stem>.json``.
+    sibling ``<stem>.json``. An explicit ``media_path`` that does not exist is rejected before
+    the LLM call; if the re-alignment fails after the in-place write, the applied diff is
+    logged (re-running correct would find nothing left to change) before the error propagates.
 
     Returns ``{out, audit, applied, rejected, n_cues, applied_in_place, aligned}``.
     """
     vtt_path = require_vtt(Path(vtt_path))  # --apply overwrites the input as VTT
     # None = env VOXWEAVE_FIX_MODEL > conf [llm].model > built-in (see translate()).
     model = model or config.resolve_llm_model(None, task_envvar="VOXWEAVE_FIX_MODEL")
+    if apply and align_after and media_path is not None:
+        # --apply commits before the re-alignment, so a --media that align would
+        # reject must fail here, before the LLM call and the in-place overwrite.
+        if not Path(media_path).exists():
+            raise _media_not_found_error(vtt_path)
     artifact_owner = (
         Path(media_path) if media_path is not None else _artifact_owner(vtt_path)
     )
@@ -4579,15 +4694,24 @@ def correct(
         if not applied:
             rep.stage("no text changes; alignment not needed")
     if apply and align_after and applied:
-        align(
-            out_path,
-            media_path=media_path,
-            separate=separate,
-            normalize=normalize,
-            lang_override=lang_override,
-            reporter=_NestedReporter(rep),
-            _expected_vtt_sha256=hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
-        )
+        try:
+            align(
+                out_path,
+                media_path=media_path,
+                separate=separate,
+                normalize=normalize,
+                lang_override=lang_override,
+                reporter=_NestedReporter(rep),
+                _expected_vtt_sha256=hashlib.sha256(
+                    rendered.encode("utf-8")
+                ).hexdigest(),
+            )
+        except BaseException:
+            # The text is already committed: re-running correct finds nothing left to
+            # change, so keep the diff the summary would have shown and say how to
+            # finish the job.
+            _warn_correction_not_realigned(out_path, applied)
+            raise
         aligned = True
 
     return {
