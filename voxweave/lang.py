@@ -23,8 +23,38 @@ _ISO_TO_NAME = {
 }
 _NAME_TO_ISO = {name: iso for iso, name in _ISO_TO_NAME.items()}
 
+# The 30 languages Qwen3-ASR recognizes (qwen_asr.inference.utils.SUPPORTED_LANGUAGES as
+# of qwen-asr 0.0.6), a superset of the aligner's 11 above, keyed by the code whisper
+# takes (Filipino -> "tl", whisper's Tagalog). Only --language validation for the ASR
+# engines reads this; alignment and splitting still fall back to English outside the 11.
+_ASR_ISO_TO_NAME = {
+    **_ISO_TO_NAME,
+    "ar": "arabic",
+    "cs": "czech",
+    "da": "danish",
+    "el": "greek",
+    "fa": "persian",
+    "fi": "finnish",
+    "hi": "hindi",
+    "hu": "hungarian",
+    "id": "indonesian",
+    "mk": "macedonian",
+    "ms": "malay",
+    "nl": "dutch",
+    "pl": "polish",
+    "ro": "romanian",
+    "sv": "swedish",
+    "th": "thai",
+    "tl": "filipino",
+    "tr": "turkish",
+    "vi": "vietnamese",
+}
+_ASR_NAME_TO_ISO = {name: iso for iso, name in _ASR_ISO_TO_NAME.items()}
+
 # ISO-639-1 -> ISO-639-3 for uroman/ctc-forced-aligner.
 # zh maps to "chi" not "zho": preprocess_text checks for "chi" to enable per-character mode.
+# Only the 11 aligner languages above reach this today (to_iso rejects the rest); the
+# ar..pl entries are reserved for a future [align] language expansion.
 _ISO1_TO_ISO3 = {
     "en": "eng",
     "zh": "chi",
@@ -103,6 +133,30 @@ def to_iso_or(raw: str | None, default: str | None) -> str | None:
     if key in _NAME_TO_ISO:
         return _NAME_TO_ISO[key]
     return default
+
+
+def to_asr_iso(raw: str) -> str:
+    """ISO code or English name of a Qwen3-ASR language -> its ISO code ("Japanese" -> "ja").
+
+    Wider than :func:`to_iso` (the 30 ASR languages, not the aligner's 11). Raises
+    ValueError naming the value and every accepted code/name when it is not one of them.
+    """
+    key = _canon(raw)
+    if key in _ASR_ISO_TO_NAME:
+        return key
+    if key in _ASR_NAME_TO_ISO:
+        return _ASR_NAME_TO_ISO[key]
+    supported = ", ".join(
+        f"{iso} ({name.capitalize()})" for iso, name in sorted(_ASR_ISO_TO_NAME.items())
+    )
+    raise ValueError(
+        f"unsupported language {raw!r}: use an ISO code or English name from {supported}"
+    )
+
+
+def to_asr_name(raw: str) -> str:
+    """ISO code or English name -> the capitalized name Qwen3-ASR validates ("ja" -> "Japanese")."""
+    return _ASR_ISO_TO_NAME[to_asr_iso(raw)].capitalize()
 
 
 _LANGUAGE_LABEL_SEP_RE = re.compile(r"[,，;；|/]+")

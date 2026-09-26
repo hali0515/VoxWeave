@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -8,13 +9,43 @@ from pathlib import Path
 
 import soundfile as sf
 
+from voxweave import config
 from voxweave.align_failures import CanonicalFailure
+
+log = logging.getLogger("voxweave")
+
+
+def _env_int(name: str, default: int) -> int:
+    """Import-time int knob via the tolerant ``config._env_int``: a malformed value falls
+    back to ``default`` instead of raising (which would break every CLI command, even
+    ``--help``), with a warning naming the variable."""
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            int(raw)
+        except ValueError:
+            log.warning("ignoring %s=%r (not an integer); using %s", name, raw, default)
+    return config._env_int(name, default)
+
+
+def _env_float(name: str, default: float) -> float:
+    """Float counterpart of :func:`_env_int` (``config._env_float``, warning on a typo)."""
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            float(raw)
+        except ValueError:
+            log.warning("ignoring %s=%r (not a number); using %s", name, raw, default)
+    return config._env_float(name, default)
+
 
 SAMPLE_RATE = 16000
 # Raised from silero default 100ms to 300ms: 200ms chops natural mid-sentence pauses.
-VAD_MIN_SILENCE_MS = int(os.environ.get("VOXWEAVE_VAD_MIN_SILENCE_MS", "300"))
+VAD_MIN_SILENCE_MS = _env_int("VOXWEAVE_VAD_MIN_SILENCE_MS", 300)
 # Wall-clock cap for a single ffmpeg decode; overridable via VOXWEAVE_FFMPEG_TIMEOUT.
-FFMPEG_TIMEOUT = float(os.environ.get("VOXWEAVE_FFMPEG_TIMEOUT", "3600"))
+FFMPEG_TIMEOUT = _env_float("VOXWEAVE_FFMPEG_TIMEOUT", 3600.0)
+# Lines of ffmpeg stderr kept in a decode error (the tail holds the actual failure).
+_FFMPEG_STDERR_LINES = 8
 # Non-mono decodes (the separator's full-band input) are capped at stereo. For
 # 3+ channels the negotiated conversion is ffmpeg's standard downmix, sample for
 # sample what `-ac 2` produces (centre and surrounds folded into left/right).
@@ -28,7 +59,9 @@ def pack_speech_segments(segments: list[dict], max_sec: float) -> list[dict]:
     """Bin-pack silero speech segments [{start,end}] into chunks of <= max_sec, cut at silence boundaries.
 
     Returns [{start, end, offset}] (offset == start, for timestamp shifting).
-    Single segments longer than max_sec are hard-cut (no silence to snap to; word cuts tolerated).
+    Single segments longer than max_sec are hard-cut into max_sec slices (no silence to snap
+    to; word cuts tolerated); the remainder stays the open block, so following segments can
+    still merge into it instead of it becoming a sliver chunk of its own.
     """
     if not segments:
         return []
@@ -37,30 +70,24 @@ def pack_speech_segments(segments: list[dict], max_sec: float) -> list[dict]:
     def emit(start: float, end: float) -> None:
         chunks.append({"start": start, "end": end, "offset": start})
 
-    def open_block(start, end):
-        # Returns (None, None) after hard-cutting an overlong segment into slices.
-        if end - start > max_sec:
-            t = start
-            while end - t > max_sec:
-                emit(t, t + max_sec)
-                t += max_sec
-            emit(t, end)
-            return None, None
-        return start, end
+    def open_block(start: float, end: float) -> tuple[float, float]:
+        # Emits the full max_sec slices of an overlong segment; returns the open remainder.
+        t = start
+        while end - t > max_sec:
+            emit(t, t + max_sec)
+            t += max_sec
+        return t, end
 
     cur_start, cur_end = open_block(segments[0]["start"], segments[0]["end"])
     for seg in segments[1:]:
-        if cur_start is None:
-            cur_start, cur_end = open_block(seg["start"], seg["end"])
-        elif seg["end"] - cur_start <= max_sec:
+        if seg["end"] - cur_start <= max_sec:
             cur_end = seg[
                 "end"
             ]  # still within budget; merge into current chunk (including intervening silence)
         else:
-            emit(cur_start, cur_end)  # type: ignore[arg-type]  # close at silence boundary
+            emit(cur_start, cur_end)  # close at silence boundary
             cur_start, cur_end = open_block(seg["start"], seg["end"])
-    if cur_start is not None:
-        emit(cur_start, cur_end)  # type: ignore[arg-type]  # cur_end is always assigned together with cur_start
+    emit(cur_start, cur_end)
     return chunks
 
 
@@ -87,6 +114,12 @@ def plan_dp_chunks(
     ``[{lo, hi, start, end}]`` where ``lo:hi`` is the cue index slice (``hi`` exclusive) and
     ``start``/``end`` is the audio crop window: adjacent chunks meet at the gap midpoint, file
     edges are padded by ``pad_sec`` (left clamped to 0, right capped at ``audio_end`` if given).
+
+    The budget applies to that crop window, not just the cue span, since the crop is what the
+    DP runs over (align_dp_safety.validate_over_budget_plans refuses a crop over ``max_sec``).
+    The final chunk extends to ``audio_end`` when that still fits, else stops ``pad_sec`` past
+    its last cue. A single cue (plus its crop edges) longer than ``max_sec`` cannot fit
+    whatever the split, and is still emitted as its own over-budget chunk.
     """
     n = len(bounds)
     if n == 0:
@@ -125,12 +158,25 @@ def plan_dp_chunks(
             return _last_end(0) or 0.0
         return e + pad_sec if s is None else (e + s) / 2.0
 
+    def _crop_start(lo: int) -> float:
+        # left edge of the crop of the chunk starting at cue lo (what the budget measures from)
+        if lo > 0:
+            return _split_time(lo - 1)
+        return max(0.0, (_first_start(lo) or 0.0) - pad_sec)
+
+    def _tail_end(last: float) -> float:
+        # tightest right edge of a final chunk: pad_sec past its last cue, capped at audio_end
+        return last + pad_sec if audio_end is None else min(audio_end, last + pad_sec)
+
     cuts: list[int] = []  # split AFTER cue index c
     i = 0
     while True:
         cstart = _first_start(i)
         rem_end = _last_end(i)
-        if cstart is None or rem_end is None or rem_end - cstart <= max_sec:
+        if cstart is None or rem_end is None:
+            break
+        crop_start = _crop_start(i)
+        if _tail_end(rem_end) - crop_start <= max_sec:
             break  # remaining cues fit in one final chunk
         last_any: int | None = None
         last_gap: int | None = None
@@ -138,8 +184,10 @@ def plan_dp_chunks(
             ek = _end(k)
             if ek is None:
                 continue
-            if ek - cstart > max_sec:
+            if ek - crop_start > max_sec:
                 break
+            if _split_time(k) - crop_start > max_sec:
+                continue  # the crop would run to the gap midpoint after cue k
             last_any = k
             g = _gap(k)
             if g is not None and g >= min_gap_sec:
@@ -155,17 +203,17 @@ def plan_dp_chunks(
     edges = [0, *[c + 1 for c in cuts], n]
     chunks: list[dict] = []
     for lo, hi in zip(edges, edges[1:]):
-        start = (
-            _split_time(lo - 1)
-            if lo > 0
-            else max(0.0, (_first_start(lo) or 0.0) - pad_sec)
-        )
+        start = _crop_start(lo)
         if hi < n:
             end = _split_time(hi - 1)
         else:
             end = (
                 audio_end if audio_end is not None else (_last_end(lo) or 0.0) + pad_sec
             )
+            last = _last_end(lo)
+            if last is not None and end - start > max_sec:
+                # trailing audio past the last cue would blow the budget: stop pad_sec after it
+                end = _tail_end(last)
         chunks.append({"lo": lo, "hi": hi, "start": start, "end": end})
     return chunks
 
@@ -193,6 +241,7 @@ def decode_command(
     return [
         "ffmpeg",
         "-nostdin",
+        "-hide_banner",
         "-y",
         "-i",
         str(media_path),
@@ -237,14 +286,31 @@ def decode_to_wav(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        out.unlink(missing_ok=True)
-        err = e.stderr
-        if isinstance(err, bytes):
-            err = err.decode("utf-8", "replace")
-        tail = (err or "").strip() or "(no stderr)"
-        raise RuntimeError(f"ffmpeg failed to decode {media_path.name}: {tail}") from e
+    except BaseException as e:
+        out.unlink(missing_ok=True)  # never leak the mkstemp wav, whatever went wrong
+        if isinstance(e, subprocess.TimeoutExpired):
+            raise RuntimeError(
+                f"ffmpeg timed out after {FFMPEG_TIMEOUT:g}s decoding {media_path.name}; "
+                f"raise VOXWEAVE_FFMPEG_TIMEOUT for very long media: {_stderr_tail(e.stderr)}"
+            ) from e
+        if isinstance(e, subprocess.CalledProcessError):
+            raise RuntimeError(
+                f"ffmpeg failed to decode {media_path.name}: {_stderr_tail(e.stderr)}"
+            ) from e
+        if isinstance(e, OSError):  # FileNotFoundError: no ffmpeg executable on PATH
+            raise RuntimeError(
+                "ffmpeg not found; install ffmpeg and make sure it is on your PATH"
+            ) from e
+        raise
     return out
+
+
+def _stderr_tail(err: bytes | str | None) -> str:
+    """Last few lines of captured ffmpeg stderr (where the actual error is), for messages."""
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    lines = (err or "").strip().splitlines()[-_FFMPEG_STDERR_LINES:]
+    return "\n".join(lines) or "(no stderr)"
 
 
 _silero_model = (
@@ -292,9 +358,10 @@ def vad_speech_segments(
     model = _get_silero_vad()
     # soundfile bypasses torchaudio>=2.9's torchcodec requirement
     data, sr = sf.read(str(wav_path), dtype="float32")
-    assert sr == SAMPLE_RATE, (
-        f"expected {SAMPLE_RATE} Hz wav, got {sr!r} Hz — run decode_to_wav first"
-    )
+    if sr != SAMPLE_RATE:
+        raise ValueError(
+            f"expected {SAMPLE_RATE} Hz wav, got {sr!r} Hz — run decode_to_wav first"
+        )
     wav = torch.from_numpy(data)
     return get_speech_timestamps(
         wav,

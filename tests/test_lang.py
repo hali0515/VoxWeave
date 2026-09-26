@@ -133,3 +133,24 @@ def test_reconcile_han_only_preserves_cantonese_candidate():
 
 def test_transcript_content_weight_ignores_alignment_and_punctuation():
     assert transcript_content_weight("你好，AI!") == 4
+
+
+def test_asr_language_helpers_accept_iso_and_names_of_the_wider_asr_set():
+    from voxweave.lang import to_asr_iso, to_asr_name
+
+    assert to_asr_name("ja") == "Japanese"
+    assert to_asr_name("JAPANESE") == "Japanese"
+    assert to_asr_name("pt-BR") == "Portuguese"
+    assert to_asr_iso("Vietnamese") == "vi"
+    assert to_asr_iso("vi") == "vi"
+    # the ASR set is wider, but the aligner set is unchanged
+    assert not is_supported("vi")
+
+
+def test_asr_language_helpers_reject_unknown_with_the_supported_set():
+    from voxweave.lang import to_asr_iso
+
+    with pytest.raises(ValueError, match=r"unsupported language 'xx'.*ja \(Japanese\)"):
+        to_asr_iso("xx")
+    with pytest.raises(ValueError, match="language is required"):
+        to_asr_iso("  ")

@@ -3,10 +3,10 @@
 On macOS / MPS the PyTorch Qwen3-ASR + Qwen3-ForcedAligner are served instead by their native
 MLX ports from `mlx-audio` (https://github.com/Blaizzy/mlx-audio): purpose-built Metal kernels +
 4/8-bit quantization, faster and lower-memory than running the torch models through the MPS
-backend. The two models cover the same 11 languages as the torch aligner, so on this backend ALL
-alignment (incl. ja/CJK and en, which the torch path routes to MMS/wav2vec2 CTC) goes through the
-MLX Qwen3-ForcedAligner — onnxruntime has no Metal provider, so the ONNX MMS aligner could never
-run on the GPU here anyway.
+backend. Alignment routing is unchanged on this backend: backend.align_text still tries the
+language's configured CTC aligner first (by default wav2vec2 on torch-MPS for en, the ONNX MMS
+aligner on CPU for ja -- onnxruntime has no Metal provider), and only the Qwen3-ForcedAligner
+fallback (languages without a CTC aligner, or a CTC failure) is served by the MLX port here.
 
 Vocal separation (MelBandRoformer) and PANNs song-skip have no MLX port and stay on torch-MPS;
 this module only owns ASR + forced alignment. Selection lives in voxweave.backend._use_mlx().
@@ -42,7 +42,7 @@ _MISSING_MLX = (
     "Force the torch backend instead with VOXWEAVE_BACKEND=torch. Missing: {mod}"
 )
 
-# whisper size string -> mlx-community converted repo. The hybrid/fusion engines (--model large-v3,
+# whisper size string -> mlx-community converted repo. The hybrid/fusion engines (--asr-model large-v3,
 # --hybrid) need whisper text, but faster-whisper's ctranslate2 has no Metal backend; mlx-whisper is
 # the native Metal port. Sizes outside this table fall back to the generic mlx-community naming
 # `whisper-<size>-mlx` (covers tiny/base/small/medium/large-v3); turbo/distil deviate, so list them.
@@ -56,10 +56,12 @@ _MLX_WHISPER_REPOS = {
 # Process-level singletons; released by release()/release_asr()/release_whisper() at end of episode
 # (mirrors backend.py).
 _asr = None  # _MlxAsr adapter
-_asr_repo = None  # currently loaded MLX ASR repo id (reloaded on --model change)
+_asr_repo = None  # currently loaded MLX ASR repo id (reloaded on --asr-model change)
 _aligner = None  # mlx_audio forced-aligner model
 _whisper = None  # _MlxWhisper adapter
-_whisper_id = None  # currently loaded whisper size string (reloaded on --model change)
+_whisper_id = None  # loaded whisper size string (reloaded on --asr-model change)
+# custom --asr-model ids already warned about in _mlx_asr_repo (it runs once per chunk)
+_warned_asr_ids: set[str] = set()
 
 
 def _require(mod: str) -> RuntimeError:
@@ -88,20 +90,35 @@ def _clear_cache() -> None:
 
 
 def _mlx_asr_repo(model_id: str | None) -> str:
-    """Map a torch ASR repo id (or --model value) to the mlx-community quantized repo.
+    """Map a torch ASR repo id (or --asr-model value) to the mlx-community quantized repo.
 
-    Size follows --model / VOXWEAVE_ASR_MODEL: 'Qwen/Qwen3-ASR-1.7B' (or any id containing '1.7')
-    -> the 1.7B quant, else the 0.6B quant. VOXWEAVE_MLX_ASR_REPO hard-overrides everything (e.g.
-    to pin a 4-bit quant or a non-standard repo), regardless of --model.
+    Size follows --asr-model / VOXWEAVE_ASR_MODEL: 'Qwen/Qwen3-ASR-1.7B' (or any id containing '1.7')
+    -> the 1.7B quant, else the 0.6B quant. An id already naming an mlx-community repo is used
+    as-is; any other custom id is substituted by a stock quant with a warning (once per id).
+    VOXWEAVE_MLX_ASR_REPO hard-overrides everything (e.g. to pin a 4-bit quant or a non-standard
+    repo), regardless of --asr-model.
     """
     override = os.environ.get("VOXWEAVE_MLX_ASR_REPO", "").strip()
     if override:
         return override
-    if model_id and model_id in _MLX_ASR_REPOS:
+    if not model_id:
+        return _DEFAULT_MLX_ASR
+    if model_id in _MLX_ASR_REPOS:
         return _MLX_ASR_REPOS[model_id]
-    if model_id and "1.7" in model_id:
-        return "mlx-community/Qwen3-ASR-1.7B-8bit"
-    return _DEFAULT_MLX_ASR
+    if model_id.lower().startswith("mlx-community/"):
+        return model_id
+    repo = (
+        "mlx-community/Qwen3-ASR-1.7B-8bit" if "1.7" in model_id else _DEFAULT_MLX_ASR
+    )
+    if model_id not in _warned_asr_ids:
+        _warned_asr_ids.add(model_id)
+        log.warning(
+            "MLX backend: no MLX port known for ASR model %r, using %s instead; "
+            "set VOXWEAVE_MLX_ASR_REPO to choose the MLX repo",
+            model_id,
+            repo,
+        )
+    return repo
 
 
 class _AsrResult:
@@ -131,9 +148,11 @@ class _MlxAsr:
         context: str | None = None,
     ) -> list[_AsrResult]:
         from voxweave.backend import format_qwen_context
-        from voxweave.lang import to_aligner_name
+        from voxweave.lang import to_asr_name
 
-        lang = to_aligner_name(language) if language and language.strip() else None
+        # mlx-audio matches the model config's capitalized names ("Japanese")
+        # case-insensitively and falls back to the raw value, so hand it that form
+        lang = to_asr_name(language) if language and language.strip() else None
         out = self._m.generate(
             str(wav_path), language=lang, system_prompt=format_qwen_context(context)
         )
@@ -269,8 +288,9 @@ def _get_aligner():
 def align(wav_path: Path, text: str, language: str) -> list[dict]:
     """Forced alignment via MLX Qwen3-ForcedAligner -> units [{text,start,end}].
 
-    Covers all 11 languages (incl. ja/CJK/en), so this fully replaces the torch MMS/wav2vec2 CTC
-    path on the MLX backend. language accepts ISO or full name.
+    The MLX backend's stand-in for the torch Qwen3-ForcedAligner: backend.align_text reaches it
+    only for languages without a configured CTC/MMS aligner, or when that aligner fails. It covers
+    all 11 aligner languages. language accepts ISO or full name.
     """
     from voxweave.lang import to_aligner_name
 

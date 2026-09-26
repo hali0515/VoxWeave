@@ -49,6 +49,35 @@ def test_mlx_asr_repo_mapping(monkeypatch):
     assert backend_mlx._mlx_asr_repo(None) == backend_mlx._DEFAULT_MLX_ASR
 
 
+def test_mlx_asr_repo_passes_mlx_community_ids_through(monkeypatch, caplog):
+    monkeypatch.delenv("VOXWEAVE_MLX_ASR_REPO", raising=False)
+    with caplog.at_level("WARNING", logger="voxweave"):
+        assert (
+            backend_mlx._mlx_asr_repo("mlx-community/Qwen3-ASR-1.7B-4bit")
+            == "mlx-community/Qwen3-ASR-1.7B-4bit"
+        )
+        assert (
+            backend_mlx._mlx_asr_repo("Qwen/Qwen3-ASR-0.6B")
+            == "mlx-community/Qwen3-ASR-0.6B-8bit"
+        )
+    assert not caplog.records  # stock and already-MLX ids map silently
+
+
+def test_mlx_asr_repo_warns_once_when_substituting_a_custom_id(monkeypatch, caplog):
+    monkeypatch.delenv("VOXWEAVE_MLX_ASR_REPO", raising=False)
+    monkeypatch.setattr(backend_mlx, "_warned_asr_ids", set())
+    with caplog.at_level("WARNING", logger="voxweave"):
+        for _ in range(3):  # get_asr resolves the repo once per chunk
+            assert (
+                backend_mlx._mlx_asr_repo("acme/qwen3-asr-finetune")
+                == backend_mlx._DEFAULT_MLX_ASR
+            )
+    warnings = [r.getMessage() for r in caplog.records]
+    assert len(warnings) == 1
+    assert "acme/qwen3-asr-finetune" in warnings[0]
+    assert "VOXWEAVE_MLX_ASR_REPO" in warnings[0]
+
+
 def test_mlx_asr_repo_env_override_wins(monkeypatch):
     # VOXWEAVE_MLX_ASR_REPO hard-overrides the size mapping (e.g. to pin a 4-bit quant)
     monkeypatch.setenv("VOXWEAVE_MLX_ASR_REPO", "mlx-community/Qwen3-ASR-1.7B-4bit")
@@ -88,11 +117,22 @@ def test_mlx_asr_maps_language_and_context():
     out = asr.transcribe(
         "/tmp/a.wav", language="ja", return_time_stamps=False, context="固有名詞"
     )
-    assert fake.calls[0]["language"] == "japanese"  # ISO -> Qwen full name
+    # ISO -> the capitalized Qwen name mlx-audio matches against its config
+    assert fake.calls[0]["language"] == "Japanese"
     # context -> system_prompt, bare term auto-framed (see backend.format_qwen_context)
     assert fake.calls[0]["system_prompt"] == "Proper nouns: 固有名詞."
     assert out[0].text == "こんにちは"
     assert out[0].language == "japanese"  # first non-empty of the per-segment list
+
+
+@pytest.mark.parametrize(
+    ("given", "sent"),
+    [("Japanese", "Japanese"), ("japanese", "Japanese"), ("ar", "Arabic")],
+)
+def test_mlx_asr_language_accepts_names_and_wider_asr_set(given, sent):
+    fake = _FakeAsrModel()
+    backend_mlx._MlxAsr(fake).transcribe("/tmp/a.wav", language=given)
+    assert fake.calls[0]["language"] == sent
 
 
 def test_mlx_asr_none_language_autodetect():

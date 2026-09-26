@@ -200,9 +200,15 @@ def apply_fixes(
     else is rejected with a ``_why`` reason — this blocks cross-cue word splits,
     hallucinated quotes, no-ops, cue erasure, and sentence "completion". Enforced in
     code, never trusted to the model.
+
+    Several fixes for one cue compose: a later fix must quote the cue as the earlier
+    ones left it (it then applies on top, still gated against the original cue), else
+    it is rejected as a ``"duplicate index"`` -- never silently overwriting an earlier
+    fix while the audit reports both as applied.
     """
     n = len(blocks)
     new_texts = [b["text"] for b in blocks]
+    changed: set[int] = set()
     applied: list[dict] = []
     rejected: list[dict] = []
     for f in fixes:
@@ -210,16 +216,23 @@ def apply_fixes(
         if not (0 <= i < n):
             rejected.append({**f, "_why": "index out of range"})
             continue
-        actual = blocks[i]["text"]
+        actual = new_texts[i]  # the cue as earlier fixes left it
         actual_n = _norm(actual)
         fixed_n = _norm(f["fixed"])
         if _norm(f["orig"]) != actual_n:
-            rejected.append({**f, "_why": "orig != cue (cross-cue split / misquote)"})
+            why = (
+                "duplicate index"
+                if i in changed
+                else "orig != cue (cross-cue split / misquote)"
+            )
+            rejected.append({**f, "_why": why})
             continue
         if fixed_n == actual_n:
             rejected.append({**f, "_why": "no-op"})
             continue
-        why = _semantic_reject(actual_n, fixed_n)
+        # the minimal-edit promise holds against the transcribed cue, so composed
+        # fixes cannot creep past the budgets one step at a time
+        why = _semantic_reject(_norm(blocks[i]["text"]), fixed_n)
         if why is not None:
             rejected.append({**f, "_why": why})
             continue
@@ -227,6 +240,7 @@ def apply_fixes(
         if isinstance(blocks[i].get("speakers"), list):
             fixed = restore_dash_layout(actual, fixed)
         new_texts[i] = fixed
+        changed.add(i)
         applied.append({**f, "orig": actual, "fixed": fixed})
     return new_texts, applied, rejected
 
@@ -263,6 +277,21 @@ class _UnparseableFixes(IncompleteResponse):
             raw if isinstance(raw, str) else "",
             detail="no parseable fix list in the response",
         )
+
+
+class _OutputCapped(RuntimeError):
+    """Carries a ``finish_reason == "length"`` :class:`IncompleteResponse` past the
+    request ladder.
+
+    Deliberately NOT an IncompleteResponse: translate._retryable retries every one of
+    those and request_with_json_fallback then re-sends it as plain chat, yet the same
+    cue set hits the same output cap every time. :func:`_request_fixes` unwraps it so
+    :func:`_correct_window` splits the cue set straight away.
+    """
+
+    def __init__(self, response: IncompleteResponse) -> None:
+        super().__init__(str(response))
+        self.response = response
 
 
 def _payload_indices(payload: list[dict]) -> set[int]:
@@ -316,17 +345,29 @@ def _request_fixes(
     label: str,
 ) -> list[dict]:
     """One cue set → its fix list, using translate's request ladder (json_object
-    with retries, then a single plain-chat attempt). Still-incomplete propagates."""
+    with retries, then a single plain-chat attempt). Still-incomplete propagates.
+
+    A response cut off by the output cap (``finish_reason == "length"``) skips the
+    ladder and propagates at once: re-requesting the same cue set cannot fit it.
+    """
     messages = build_messages(payload, glossary=glossary, source_tail=source_tail)
     wanted = _payload_indices(payload)
 
     def attempt(json_mode: bool) -> list[dict]:
-        raw = _call(client, model, messages, **_call_options(None, json_mode))
+        try:
+            raw = _call(client, model, messages, **_call_options(None, json_mode))
+        except IncompleteResponse as exc:
+            if exc.finish_reason == "length":
+                raise _OutputCapped(exc) from exc
+            raise
         return _parse_fix_window(raw, wanted, label=label)
 
-    return request_with_json_fallback(
-        attempt, label=label, call_label=f"{label} correct call"
-    )
+    try:
+        return request_with_json_fallback(
+            attempt, label=label, call_label=f"{label} correct call"
+        )
+    except _OutputCapped as capped:
+        raise capped.response from None
 
 
 def _splittable(exc: IncompleteResponse) -> bool:
@@ -368,9 +409,12 @@ def _correct_window(
         if len(payload) < 2 or not _splittable(exc):
             raise
         log.warning(
-            "%s: still incomplete after the plain-chat fallback (%s); splitting the "
-            "cue set in half and correcting each half separately",
+            "%s: %s (%s); splitting the cue set in half and correcting each half "
+            "separately",
             label,
+            "response hit the output length cap"
+            if exc.finish_reason == "length"
+            else "still incomplete after the plain-chat fallback",
             exc,
         )
     mid = len(payload) // 2
@@ -407,9 +451,10 @@ def correct_cues(
     A response that does not finish with ``"stop"`` is never read as the model's
     full review. It goes through translate's request ladder instead — retries in
     ``json_object`` mode, then one plain-chat attempt for servers whose
-    structured-output path aborts (vLLM's grammar FSM). Only when that ladder ends
-    in a size failure (``finish_reason == "length"``, or still nothing parseable) is
-    the cue set halved and each half requested separately, carrying the preceding
+    structured-output path aborts (vLLM's grammar FSM). A size failure halves the
+    cue set -- immediately for ``finish_reason == "length"`` (the same request would
+    hit the same output cap, so the ladder is skipped), after the ladder for an answer
+    that stays unparseable -- and each half is requested separately, carrying the preceding
     cues as context; the halves keep their original cue indices and their fixes are
     merged. A single cue that still fails raises
     :class:`voxweave.translate.IncompleteResponse`.

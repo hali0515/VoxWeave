@@ -182,6 +182,67 @@ def test_apply_fixes_allows_artifact_deletion_and_word_rejoin():
     assert len(applied) == 2 and not rejected
 
 
+def test_apply_fixes_second_fix_quoting_the_original_is_a_duplicate():
+    # two fixes for one cue, each quoting the ORIGINAL text: the second used to
+    # overwrite the first while the audit listed both as applied
+    blocks = _blocks(["the quick brwn fox jumpd", "next"])
+    first = {
+        "i": 0,
+        "orig": "the quick brwn fox jumpd",
+        "fixed": "the quick brown fox jumpd",
+        "reason": "a",
+    }
+    second = {
+        "i": 0,
+        "orig": "the quick brwn fox jumpd",
+        "fixed": "the quick brwn fox jumped",
+        "reason": "b",
+    }
+    new, applied, rejected = asrfix.apply_fixes(blocks, [first, second])
+    assert new[0] == "the quick brown fox jumpd"
+    assert applied == [first]
+    assert rejected == [{**second, "_why": "duplicate index"}]
+
+
+def test_apply_fixes_second_fix_composes_on_the_current_text():
+    blocks = _blocks(["the quick brwn fox jumpd", "next"])
+    fixes = [
+        {
+            "i": 0,
+            "orig": "the quick brwn fox jumpd",
+            "fixed": "the quick brown fox jumpd",
+            "reason": "a",
+        },
+        {
+            "i": 0,
+            "orig": "the quick brown fox jumpd",
+            "fixed": "the quick brown fox jumped",
+            "reason": "b",
+        },
+    ]
+    new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new[0] == "the quick brown fox jumped"
+    assert not rejected
+    # the audit chains: each step records the text it actually changed
+    assert [(a["orig"], a["fixed"]) for a in applied] == [
+        ("the quick brwn fox jumpd", "the quick brown fox jumpd"),
+        ("the quick brown fox jumpd", "the quick brown fox jumped"),
+    ]
+
+
+def test_apply_fixes_composed_fixes_stay_gated_against_the_original_cue():
+    # each step grows the cue within budget, but together they exceed it
+    blocks = _blocks(["ab"])
+    fixes = [
+        {"i": 0, "orig": "ab", "fixed": "ab cdefgh", "reason": "a"},
+        {"i": 0, "orig": "ab cdefgh", "fixed": "ab cdefgh ijklmn", "reason": "b"},
+    ]
+    new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == ["ab cdefgh"]
+    assert len(applied) == 1
+    assert rejected[0]["_why"] == "expansion (added content)"
+
+
 def test_pipeline_correct_sidecar_pair_cleaned_on_audit_failure(tmp_path, monkeypatch):
     # sidecar VTT + audit JSON are a pair: if the audit write fails after the
     # VTT landed, the half-pair must not be left behind
@@ -336,11 +397,10 @@ def test_correct_cues_empty_fix_list_is_a_valid_answer(single_attempt):
 
 
 def test_correct_cues_splits_on_length_and_merges_halves(single_attempt, caplog):
-    # whole set caps out (json attempt + plain-chat fallback), then each half
-    # succeeds on its first attempt: 2 + 1 + 1 requests.
+    # whole set caps out on its first attempt -> split at once (the same request would
+    # hit the same output cap), then each half succeeds: 1 + 1 + 1 requests.
     client = FinishClient(
         [
-            ('{"fixes":[{"i":0,"orig"', "length"),
             ('{"fixes":[{"i":0,"orig"', "length"),
             ('{"fixes":[{"i":1,"orig":"cue 1","fixed":"CUE 1","reason":"a"}]}', "stop"),
             ('{"fixes":[{"i":3,"orig":"cue 3","fixed":"CUE 3","reason":"b"}]}', "stop"),
@@ -350,15 +410,17 @@ def test_correct_cues_splits_on_length_and_merges_halves(single_attempt, caplog)
     with caplog.at_level("WARNING", logger="voxweave"):
         fixes = asrfix.correct_cues(payload, model="m", client=client)
 
-    assert len(client.calls) == 4
+    assert len(client.calls) == 3
     assert FinishClient.sent_ids(client.calls[0]) == [0, 1, 2, 3]
-    assert FinishClient.sent_ids(client.calls[1]) == [0, 1, 2, 3]
-    assert FinishClient.sent_ids(client.calls[2]) == [0, 1]  # first half
-    assert FinishClient.sent_ids(client.calls[3]) == [2, 3]  # second half
+    assert FinishClient.sent_ids(client.calls[1]) == [0, 1]  # first half
+    assert FinishClient.sent_ids(client.calls[2]) == [2, 3]  # second half
     # the second half carries the first half's cues as read-only context
-    assert "PRECEDING CUES" not in FinishClient.system_of(client.calls[2])
-    assert "cue 0\ncue 1" in FinishClient.system_of(client.calls[3])
+    assert "PRECEDING CUES" not in FinishClient.system_of(client.calls[1])
+    assert "cue 0\ncue 1" in FinishClient.system_of(client.calls[2])
     assert any("splitting the cue set in half" in r.message for r in caplog.records)
+    assert any("output length cap" in r.message for r in caplog.records)
+    # a length cut-off is not a structured-output failure: no json_object blame
+    assert not any("json_object mode dropped" in r.message for r in caplog.records)
 
     # merged, with absolute cue indices preserved -> lands on the right cues
     assert fixes == [
@@ -379,7 +441,6 @@ def test_correct_cues_split_drops_fixes_for_cues_outside_the_half(
     client = FinishClient(
         [
             ("", "length"),
-            ("", "length"),
             ('{"fixes":[{"i":3,"orig":"cue 3","fixed":"CUE 3","reason":"a"}]}', "stop"),
             ('{"fixes":[{"i":3,"orig":"cue 3","fixed":"CUE 3","reason":"a"}]}', "stop"),
         ]
@@ -393,10 +454,8 @@ def test_correct_cues_split_drops_fixes_for_cues_outside_the_half(
 def test_correct_cues_splits_recursively_until_a_half_fits(single_attempt):
     client = FinishClient(
         [
-            ("", "length"),  # 0-3 json
-            ("", "length"),  # 0-3 plain
-            ("", "length"),  # 0-1 json
-            ("", "length"),  # 0-1 plain
+            ("", "length"),  # 0-3
+            ("", "length"),  # 0-1
             ('{"fixes":[]}', "stop"),  # cue 0
             ('{"fixes":[]}', "stop"),  # cue 1
             ('{"fixes":[]}', "stop"),  # cues 2-3
@@ -405,8 +464,6 @@ def test_correct_cues_splits_recursively_until_a_half_fits(single_attempt):
     assert asrfix.correct_cues(_fix_payload(4), model="m", client=client) == []
     assert [FinishClient.sent_ids(c) for c in client.calls] == [
         [0, 1, 2, 3],
-        [0, 1, 2, 3],
-        [0, 1],
         [0, 1],
         [0],
         [1],
@@ -419,13 +476,11 @@ def test_correct_cues_single_cue_length_still_raises(single_attempt):
     # review, and a one-cue request has nothing left to split.
     from voxweave.translate import IncompleteResponse
 
-    client = FinishClient(
-        [('{"fixes":[{"i":0,"orig"', "length"), ('{"fixes":[{"i":0,"orig"', "length")]
-    )
+    client = FinishClient([('{"fixes":[{"i":0,"orig"', "length")])
     with pytest.raises(IncompleteResponse) as failure:
         asrfix.correct_cues([{"i": 0, "t": "hi"}], model="m", client=client)
     assert failure.value.finish_reason == "length"
-    assert len(client.calls) == 2  # json attempt + plain-chat fallback, then raise
+    assert len(client.calls) == 1  # the same request would cap out again: raise at once
 
 
 def test_correct_cues_non_size_failure_raises_without_splitting(single_attempt):
@@ -437,6 +492,33 @@ def test_correct_cues_non_size_failure_raises_without_splitting(single_attempt):
     with pytest.raises(IncompleteResponse):
         asrfix.correct_cues(_fix_payload(4), model="m", client=client)
     assert len(client.calls) == 2
+
+
+def test_correct_cues_length_skips_the_retry_ladder(monkeypatch, caplog):
+    # with the real retry schedule, a length cut-off is still not re-requested (json
+    # retries + plain chat would all hit the same output cap): it splits at once
+    from voxweave import translate
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(translate, "_sleep", sleeps.append)
+    assert translate._RETRY_DELAYS  # the default schedule does retry other failures
+    client = FinishClient(
+        [
+            ("", "length"),
+            ('{"fixes":[]}', "stop"),
+            ('{"fixes":[]}', "stop"),
+        ]
+    )
+    with caplog.at_level("WARNING", logger="voxweave"):
+        assert asrfix.correct_cues(_fix_payload(4), model="m", client=client) == []
+    assert [FinishClient.sent_ids(c) for c in client.calls] == [
+        [0, 1, 2, 3],
+        [0, 1],
+        [2, 3],
+    ]
+    assert sleeps == []
+    assert all("response_format" in c for c in client.calls)
+    assert not any("vLLM" in r.message for r in caplog.records)
 
 
 # --------------------------- pipeline.correct (E2E with mock) --------------------------- #
