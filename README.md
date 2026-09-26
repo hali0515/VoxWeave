@@ -350,8 +350,8 @@ routed to an in-place editing command. See the [migration notes](https://github.
 | `--context`                    | ASR bias prompt: names/terms likely to appear (comma or newline separated). Bare term lists are auto-framed as `Proper nouns: ...` for Qwen — a bare list actually _regresses_ accuracy ([details](https://github.com/TypeWhisper/typewhisper-mac/issues/321)); prose or pre-framed text passes through. |
 | `--hybrid`                     | Dual-ASR fusion: Whisper text + Qwen punctuation. Whisper's error bias is the opposite of Qwen's (it hallucinates rather than omits), so use this when Qwen drops uncertain words.                                                                                                                       |
 | `--normalize/--no-normalize`   | Apply loudness normalization (`loudnorm`) to the 16k ASR input — helps when quiet words get dropped; off by default since it also amplifies noise.                                                                                                                                                       |
-| `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.                                                                                                                                                                                                     |
-| `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export).                                                                                                                                                                                              |
+| `--timestamps/--no-timestamps` | VTT carries cue timing lines (word-level precision from alignment; default on); `--no-timestamps` writes a plain-text editing draft.                                                                                                                                                                                                     |
+| `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export). Requires vocal separation (warns and has no effect with `--no-separate`).                                                                                                                                                                                              |
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
 | `--diarize`                    | Opt in to the default-installed pyannote speaker diarizer: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). The gated checkpoint requires `VOXWEAVE_HF_TOKEN`, `HF_TOKEN`, config `hf_token`, or a prior `hf auth login`. Speaker turns persist to the sibling JSON, so `voxweave render` replays the formatting without re-running the model. |
 | `--diarize-model`              | Select `community-1` (the default), `3.1`, or any full Hugging Face pipeline id. The same setting is available as `VOXWEAVE_DIARIZE_MODEL` or `[diarize].model`; precedence is CLI > env > config > default. |
@@ -621,7 +621,7 @@ voxweave correct episode.vtt --glossary names.json --apply   # rewrite in place 
 | Option                         | Description                                                                                                  |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
 | `--glossary`                   | Term/name glossary (`.json` → mapping; other → raw prompt). Strongly recommended for ambiguous proper nouns. |
-| `--apply`                      | Overwrite the original VTT (default: sidecar only, for review).                                              |
+| `--apply`                      | Let the LLM rewrite the original VTT in place, then re-align it (default: sidecar only, for review).        |
 | `--align/--no-align`           | With `--apply`, re-run alignment afterwards to refresh timestamps (default: on).                             |
 | `--media`                      | Media for that re-alignment when it is not a same-stem sibling of the VTT.                                   |
 | `--model`                      | Correction model (default `VOXWEAVE_FIX_MODEL` env, `[llm].model` in the config, or `gpt-6-luna`; `auto` = the endpoint's only served model). |
@@ -794,7 +794,7 @@ enables DEBUG logging.
 
 ```
 voxweave episode.mkv          # 1. transcribe  -> episode.vtt + episode.json
-  └─ (optional) correct       # 2. LLM ASR fix -> episode.asrfix.vtt (--apply to commit)
+  └─ (optional) correct       # 2. LLM ASR fix -> episode.asrfix.vtt (review it; or --apply to rewrite + re-align)
 edit episode.vtt by hand      # 3. fix wording / line breaks
 voxweave align episode.vtt    # 4. re-derive timestamps from audio (overwrites VTT + JSON)
 voxweave translate episode.vtt --target zh   # 5. context-aware translation
@@ -1019,7 +1019,7 @@ skip_songs = true                        # PANNs music detection + skip before A
 normalize  = false                       # loudnorm on the 16k input (--normalize/--no-normalize)
 diarize    = false                       # pyannote speaker diarization (--diarize/--no-diarize; gated-model token required)
 voiceprints = false                      # opt-in biometric centroid capture; requires diarize
-timestamps = true                        # word-level timestamps in the VTT (--timestamps/--no-timestamps)
+timestamps = true                        # cue timing lines in the VTT (--timestamps/--no-timestamps)
 shot_snap  = true                        # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
 vad_mask   = false                       # suppress CTC emissions outside speech (--vad-mask/--no-vad-mask)
 

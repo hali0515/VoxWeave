@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import logging
 import re
 from pathlib import Path
@@ -183,6 +184,10 @@ def test_an_empty_voices_dir_is_refused_not_read_as_the_cwd(tmp_path, invoke):
         assert "must not be empty" in result.output
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores the read-only directory mode this test relies on",
+)
 def test_import_reads_a_store_it_cannot_write_beside(tmp_path, invoke):
     store = voicestore.new_voice_store("Example Show", LEGACY)
     store = voicestore.enroll_exemplar(
