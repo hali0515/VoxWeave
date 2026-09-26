@@ -1,6 +1,8 @@
 """Voice-store schema, normalized namespace, locking, and transition law."""
 
+import errno
 import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
@@ -309,6 +311,36 @@ def test_shared_store_locks_do_not_block_each_other(tmp_path):
             process.join()
 
 
+def test_a_shared_store_lock_needs_no_write_access(tmp_path, monkeypatch):
+    # A read-only mount, or a lock file another user owns: the lock file
+    # cannot be opened for writing and its mode cannot be changed.
+    locked = tmp_path / "locked.json"
+    lock = voicestore.store_lock_path(locked)
+    lock.touch()
+    unlocked = tmp_path / "unlocked.json"
+    real_open = os.open
+
+    def read_only_open(path, flags, *args):
+        if str(path).endswith(".lock") and flags & (os.O_RDWR | os.O_CREAT):
+            raise OSError(errno.EROFS, "Read-only file system", str(path))
+        return real_open(path, flags, *args)
+
+    def refuse_fchmod(_descriptor, _mode):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(voicestore.os, "open", read_only_open)
+    monkeypatch.setattr(voicestore.os, "fchmod", refuse_fchmod)
+    with voicestore.shared_store_lock(locked) as handle:
+        assert handle.lock_path == lock
+    # Without a lock file the store is read unlocked, and none is created.
+    with voicestore.shared_store_lock(unlocked) as handle:
+        assert handle.store_path == voicestore.canonical_store_path(unlocked)
+    assert not voicestore.store_lock_path(unlocked).exists()
+    with pytest.raises(OSError):
+        with voicestore.exclusive_store_lock(locked):
+            pass
+
+
 def test_symlink_writer_replaces_real_target_without_destroying_alias(tmp_path):
     real = tmp_path / "voices.json"
     real.write_text("old", encoding="utf-8")
@@ -408,7 +440,9 @@ def test_capture_hit_enforces_all_four_evidence_fields(media, episode, vector, m
 
 
 def test_fresh_capture_on_same_source_refuses_without_replace():
-    with pytest.raises(voicestore.EnrollmentRefusal, match="use --replace-episode"):
+    with pytest.raises(
+        voicestore.EnrollmentRefusal, match="use `speakers enroll --replace`"
+    ):
         voicestore.enroll_exemplar(
             _store(),
             raw_name="Aqua",
@@ -614,7 +648,7 @@ def test_shared_indexed_plan_is_layout_independent():
     assert _plan(existing, 9, episode="ep02", replace=True) == (
         voicestore.IndexedPlan("replace", target=1)
     )
-    with pytest.raises(voicestore.EnrollmentRefusal, match="replace-episode"):
+    with pytest.raises(voicestore.EnrollmentRefusal, match="speakers enroll --replace"):
         _plan(existing, 9, episode="ep02")
     assert _plan(existing, 9) == voicestore.IndexedPlan("enroll")
 

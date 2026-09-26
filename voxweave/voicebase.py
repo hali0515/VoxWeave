@@ -253,14 +253,9 @@ def load_json_object(
 ) -> dict[str, object]:
     """Read a phase-2 object, checking its cap both before and after reading."""
     source = Path(path)
-    try:
-        if source.stat().st_size > max_bytes:
-            _invalid(f"{source.name} exceeds the {max_bytes}-byte limit")
-        payload = source.read_bytes()
-    except Phase2DataError:
-        raise
-    except OSError:
-        raise
+    if source.stat().st_size > max_bytes:
+        _invalid(f"{source.name} exceeds the {max_bytes}-byte limit")
+    payload = source.read_bytes()
     return strict_json_object_loads(
         payload,
         max_bytes=max_bytes,

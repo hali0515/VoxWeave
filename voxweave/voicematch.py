@@ -137,8 +137,6 @@ class SpeakerMatch:
     candidates: tuple[MatchCandidate, ...]
     truncated: int
     decision: Decision
-    top_identity_id: str | None
-    top_similarity: float | None
     # Tier 2 of a library match (other scopes, stricter bar, never prefilled);
     # None for a per-show store, which has a single tier.
     secondary: SpeakerMatch | None = None
@@ -175,11 +173,16 @@ def validate_thresholds(thresholds: MatchThresholds) -> MatchThresholds:
         else _finite_float(thresholds.accept, ENV_ACCEPT)
     )
     if not -1.0 <= suggest <= 1.0:
-        raise ThresholdError(f"{ENV_SUGGEST} must be between -1 and 1")
-    if accept is not None and not suggest <= accept <= 1.0:
-        raise ThresholdError("thresholds must satisfy -1 <= suggest <= accept <= 1")
+        raise ThresholdError(f"{ENV_SUGGEST}={suggest} must be between -1 and 1")
+    if accept is not None and accept > 1.0:
+        raise ThresholdError(f"{ENV_ACCEPT}={accept} must be at most 1")
+    if accept is not None and accept < suggest:
+        raise ThresholdError(
+            f"{ENV_ACCEPT}={accept} is below the suggest threshold {suggest} for "
+            f"this embedding space ({ENV_SUGGEST} or the embedder's default)"
+        )
     if margin < 0.0:
-        raise ThresholdError(f"{ENV_MARGIN} must be nonnegative")
+        raise ThresholdError(f"{ENV_MARGIN}={margin} must be nonnegative")
     return MatchThresholds(accept=accept, suggest=suggest, margin=margin)
 
 
@@ -232,6 +235,12 @@ def parse_global_suggest(
     return max(value, _finite_float(suggest, ENV_SUGGEST))
 
 
+def _env_value(values: Mapping[str, str], name: str, default: str) -> str:
+    """``values[name]``, or ``default`` when it is unset or blank."""
+    raw = values.get(name)
+    return default if raw is None or not raw.strip() else raw
+
+
 def parse_thresholds(
     env: Mapping[str, str] | None = None,
     *,
@@ -239,18 +248,23 @@ def parse_thresholds(
 ) -> MatchThresholds:
     """Resolve the frozen environment policy without invalid-value defaults.
 
-    ``VOXWEAVE_VOICES_*`` always win; unset ones fall back to the defaults of the
-    embedding space ``provenance`` describes (see :func:`threshold_defaults`).
+    ``VOXWEAVE_VOICES_*`` always win; unset (or blank) ones fall back to the
+    defaults of the embedding space ``provenance`` describes (see
+    :func:`threshold_defaults`).
     """
     values = os.environ if env is None else env
     default_suggest, default_margin = threshold_defaults(provenance)
-    raw_accept = values.get(ENV_ACCEPT, DEFAULT_ACCEPT)
+    raw_accept = _env_value(values, ENV_ACCEPT, DEFAULT_ACCEPT)
     if raw_accept.strip().lower() == "off":
         accept: float | None = None
     else:
         accept = _finite_float(raw_accept, ENV_ACCEPT)
-    suggest = _finite_float(values.get(ENV_SUGGEST, str(default_suggest)), ENV_SUGGEST)
-    margin = _finite_float(values.get(ENV_MARGIN, str(default_margin)), ENV_MARGIN)
+    suggest = _finite_float(
+        _env_value(values, ENV_SUGGEST, str(default_suggest)), ENV_SUGGEST
+    )
+    margin = _finite_float(
+        _env_value(values, ENV_MARGIN, str(default_margin)), ENV_MARGIN
+    )
     return validate_thresholds(
         MatchThresholds(accept=accept, suggest=suggest, margin=margin)
     )
@@ -508,7 +522,7 @@ _REPORTED_PROVENANCE_FIELDS: tuple[tuple[str, str], ...] = (
 )
 
 LEGACY_DIARIZE_HINT = (
-    "run transcription and speakers with --diarize-model 3.1 "
+    "re-run transcription with --diarize --voiceprints --diarize-model 3.1 "
     '(or [diarize].model = "3.1") to keep matching against this store, '
     "or re-enroll it under the new model"
 )
@@ -820,12 +834,9 @@ def _match_pool(
         truncated = max(0, len(qualifying) - len(kept))
         if not all_scores or all_scores[0].similarity < suggest:
             decision: Decision = "none"
-            top_id: str | None = None
-            top_similarity: float | None = None
         else:
             top = all_scores[0]
             top_id = top.identity_id
-            top_similarity = top.similarity
             eligible_top_owners.setdefault(top_id, []).append(local_id)
             margin_ok = len(all_scores) == 1 or (
                 top.similarity - all_scores[1].similarity >= margin
@@ -838,8 +849,6 @@ def _match_pool(
             candidates=kept,
             truncated=truncated,
             decision=decision,
-            top_identity_id=top_id,
-            top_similarity=top_similarity,
         )
 
     collisions = {

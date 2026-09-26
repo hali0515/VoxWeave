@@ -130,7 +130,6 @@ HISTORY_ACTIONS = frozenset(
         "rename",
         "forget",
         "import",
-        "split",
         "orphan",
         "rescope",
     }
@@ -711,9 +710,13 @@ def _drop_orphans(
 ) -> dict[str, dict[str, int]]:
     """Remove, in place, the exemplars of identities that do not exist.
 
-    They can only be left by an interrupted or unlocked writer (or a manual
-    edit); refusing to read the library over them would also block the
-    ``forget`` that removes them, so readers skip them and writers delete them.
+    Every crash point of a locked writer leaves a valid library (see
+    :class:`LibraryChange`), so they can only be left by a writer on a mount
+    without working locks or by a manual edit. Refusing to read the library
+    over them would also block the ``forget`` that removes them, so readers
+    skip them and writers delete them. A missing ``identities.json`` is not
+    healed this way: :func:`read_state` refuses it (see
+    :func:`_refuse_missing_identities`).
     """
     known = cast(Mapping[str, object], identities["identities"])
     dropped: dict[str, dict[str, int]] = {}
@@ -723,13 +726,49 @@ def _drop_orphans(
             dropped.setdefault(name, {})[identity_id] = len(exemplars.pop(identity_id))
         if name in dropped:
             log.warning(
-                "voice library space %s holds voice samples of %d unknown "
-                "identities (left by an interrupted or unlocked writer); they are "
-                "ignored, and the next change to the library deletes them",
+                "voice library space %s holds %d voice sample(s) of %d unknown "
+                "identities (left by a writer on a mount without working locks, "
+                "or by a manual edit); they are ignored, and the next command "
+                "that changes the library deletes them",
                 name,
+                sum(dropped[name].values()),
                 len(dropped[name]),
             )
     return dropped
+
+
+def _refuse_missing_identities(
+    paths: LibraryPaths,
+    loaded: Mapping[str, dict[str, object]],
+    unread: Iterable[str],
+) -> None:
+    """Refuse a library whose ``identities.json`` is gone but whose samples are not.
+
+    Read as an empty library, every voice sample would be an orphan, and the
+    next enrollment or import would delete them all. ``loaded`` holds the
+    spaces already read; the space files named in ``unread`` are read here.
+    """
+    samples = 0
+    for name in sorted({*loaded, *unread}):
+        document = loaded.get(name)
+        if document is None:
+            raw = _read_bounded(paths.space(name), SPACE_MAX_BYTES)
+            if raw is None:
+                continue
+            document = _decode(
+                raw, source=f"{SPACES_DIRNAME}/{name}.json", max_bytes=SPACE_MAX_BYTES
+            )
+            validate_space(document, name=name)
+        exemplars = cast(Mapping[str, Sequence[object]], document["exemplars"])
+        samples += sum(len(items) for items in exemplars.values())
+    if samples:
+        raise VoiceLibraryError(
+            f"voice library {paths.root}: {IDENTITIES_NAME} is missing, but "
+            f"{SPACES_DIRNAME}/ holds {samples} voice sample(s); without it they "
+            f"belong to no one and the next change would delete them. Restore "
+            f"{IDENTITIES_NAME} (from a backup, or wherever it was moved) to use "
+            "the library; nothing was deleted"
+        )
 
 
 def read_state(
@@ -743,7 +782,8 @@ def read_state(
     Every space means every space ``identities.json`` lists, every space file
     found in the directory, and ``include`` (spaces a writer may create).
     Call it while holding :func:`library_lock`. A missing library reads as an
-    empty one.
+    empty one; a missing ``identities.json`` beside space files that still
+    hold voice samples is refused.
     """
     paths = LibraryPaths(Path(root))
     observed: dict[Path, bytes | None] = {}
@@ -775,6 +815,10 @@ def read_state(
         )
         validate_space(document, name=name)
         loaded[name] = document
+    if raw is None:
+        _refuse_missing_identities(
+            paths, loaded, () if spaces is None else list_space_names(paths)
+        )
     if missing:
         log.warning(
             "voice library %s lists space file(s) that cannot be found: %s",
@@ -1905,19 +1949,28 @@ def import_store(
                 superseded_count += 1
                 continue
             try:
+                # replace_episode only tells a replacement apart: an import
+                # never replaces a library sample, it reports the conflict.
                 plan = plan_indexed_enrollment(
                     keys,
                     capture_id=cast(str, legacy_exemplar["capture_id"]),
                     media_fingerprint=cast(str, legacy_exemplar["media_fingerprint"]),
                     episode=scoped_episode(scope, episode),
                     vector=vector,
-                    replace_episode=False,
+                    replace_episode=True,
                 )
             except EnrollmentRefusal as exc:
                 refused.append(f"{identity_id}/{legacy_exemplar['id']}: {exc}")
                 continue
             if plan.outcome == "noop":
                 present_count += 1
+                continue
+            if plan.outcome == "replace":
+                refused.append(
+                    f"{identity_id}/{legacy_exemplar['id']}: conflicts with a voice "
+                    f"sample already in the library (episode {episode!r}, scope "
+                    f"{scope!r}); not imported"
+                )
                 continue
             legacy_id = cast(str, legacy_exemplar["id"])
             exemplar_id = (

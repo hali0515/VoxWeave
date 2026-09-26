@@ -180,7 +180,7 @@ for users who have accepted only the existing 3.1 gate.
 per-speaker voiceprints (cross-episode matching and **Split this speaker**) come from a
 dedicated speaker-embedding model chosen per language. Each checkpoint is downloaded once into
 `~/.cache/voxweave/audio/`, pinned by size and SHA-256, and verified at the start of a
-`--voiceprints` run, before any audio work (with `auto` and no `--lang`, both checkpoints). If
+`--voiceprints` run, before any audio work (with `auto` and no `--language`, both checkpoints). If
 that fails, the run warns and continues without voiceprints:
 
 | `--voiceprint-model` | Checkpoint | Languages | Dim | Weights licence / caveats |

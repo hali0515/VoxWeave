@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import fcntl
 import os
 import secrets
@@ -316,12 +317,34 @@ def store_lock_path(path: Path) -> Path:
 
 @contextmanager
 def store_lock(path: Path, *, exclusive: bool) -> Iterator[StoreLockHandle]:
-    """Take the canonical persistent flock and yield the one resolved target."""
+    """Take the canonical persistent flock and yield the one resolved target.
+
+    A shared lock does not need write access: where the lock file cannot be
+    opened for writing (a read-only mount, a lock file another user owns) it
+    is opened read-only, and when that fails too the store is read unlocked
+    (writers replace it atomically), as ``voicelibrary.read_legacy_store``
+    does.
+    """
     resolved = canonical_store_path(path)
     lock = Path(f"{resolved}.lock")
-    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor: int | None
     try:
-        os.fchmod(descriptor, 0o600)
+        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        if exclusive or exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise
+        try:
+            descriptor = os.open(lock, os.O_RDONLY)
+        except OSError:
+            descriptor = None
+    if descriptor is None:
+        yield StoreLockHandle(store_path=resolved, lock_path=lock)
+        return
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+        except OSError:
+            pass
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         fcntl.flock(descriptor, mode)
         yield StoreLockHandle(store_path=resolved, lock_path=lock)
@@ -479,7 +502,7 @@ def plan_indexed_enrollment(
         if not replace_episode:
             raise EnrollmentRefusal(
                 f"source media for {episode!r} is already enrolled; "
-                "use --replace-episode"
+                "use `speakers enroll --replace`"
             )
         return IndexedPlan("replace", target=media_hit)
     if episode_hit is not None:
@@ -487,7 +510,7 @@ def plan_indexed_enrollment(
             old_capture = existing[episode_hit].capture_id
             raise EnrollmentRefusal(
                 f"episode {episode!r} already has capture {old_capture}; "
-                "use --replace-episode"
+                "use `speakers enroll --replace`"
             )
         return IndexedPlan("replace", target=episode_hit)
 

@@ -133,6 +133,26 @@ def test_threshold_preflight_matrix_refuses_without_defaulting(env):
         voicematch.parse_thresholds(env)
 
 
+def test_blank_threshold_variables_are_unset():
+    blank = {
+        voicematch.ENV_ACCEPT: "",
+        voicematch.ENV_SUGGEST: " ",
+        voicematch.ENV_MARGIN: "\t",
+    }
+    assert voicematch.parse_thresholds(blank) == voicematch.parse_thresholds({})
+
+
+def test_threshold_refusal_names_the_variable_and_the_effective_values():
+    anime = _decoupled(embedding_model="anime-va-ecapa-gn")
+    suggest, _margin = voicematch.threshold_defaults(anime)
+    with pytest.raises(voicematch.ThresholdError) as excinfo:
+        voicematch.parse_thresholds({voicematch.ENV_ACCEPT: "0.1"}, provenance=anime)
+    assert str(excinfo.value).startswith(
+        f"VOXWEAVE_VOICES_ACCEPT=0.1 is below the suggest threshold {suggest} "
+        "for this embedding space"
+    )
+
+
 def test_compatibility_fingerprint_is_canonical_and_torch_is_descriptive():
     provenance = _provenance()
     first = voicematch.build_compatibility_fingerprint(provenance)
@@ -683,7 +703,9 @@ def test_legacy_31_store_against_decoupled_run_also_names_the_diarizer_way_back(
     detail = _mismatch(episode_provenance, store_provenance)
 
     assert "--voiceprint-model pyannote" in detail
-    assert "--diarize-model 3.1" in detail
+    assert "re-run transcription with --diarize --voiceprints --diarize-model 3.1" in (
+        detail
+    )
 
 
 def test_decoupled_store_from_another_embedder_names_its_alias():

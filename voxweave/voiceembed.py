@@ -1,10 +1,10 @@
 """Decoupled speaker-embedding models for voiceprints.
 
-pyannote finds the speaker turns. The per-speaker centroids persisted in
-``<stem>.voiceprints.json``, matched against ``voxweave.voices.json`` and
-recomputed by the speakers page's "Split this speaker" come from a dedicated
-speaker-embedding model chosen per language instead of the diarization
-pipeline's own embedding head:
+pyannote finds the speaker turns. The per-speaker centroids persisted in an
+episode's voiceprints sidecar (``voiceprints.json`` in its artifact cache
+directory), matched against the voice library and recomputed by the speakers
+page's "Split this speaker" come from a dedicated speaker-embedding model
+chosen per language instead of the diarization pipeline's own embedding head:
 
 - ``redimnet2`` (default for every language but Japanese): ReDimNet2-B6 trained
   on VoxBlink2 + VoxCeleb2 + CN-Celeb2 with large-margin fine-tuning.
@@ -445,8 +445,9 @@ def prefetch_specs(
 ) -> tuple[EmbedderSpec, ...]:
     """The embedders a voiceprint run may need, before its language is detected.
 
-    ``auto`` needs both routes unless the language is already fixed (``--lang``);
-    an explicit embedder needs only itself; the legacy lane needs none.
+    ``auto`` needs both routes unless the language is already fixed
+    (``--language``); an explicit embedder needs only itself; the legacy lane
+    needs none.
     """
     choice = resolve_voiceprint_choice(cli_value)
     if choice == LEGACY.name:

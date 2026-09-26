@@ -300,7 +300,7 @@ def test_same_episode_needs_replace_within_its_scope(tmp_path):
         turns_digest=None,
         episode="ep01",
     )
-    with pytest.raises(voicestore.EnrollmentRefusal, match="replace-episode"):
+    with pytest.raises(voicestore.EnrollmentRefusal, match="speakers enroll --replace"):
         _enroll(root, [_entry(identity_id="v000000000001")], source=later)
     ids = _Ids()
     ids.exemplar = 10
@@ -913,6 +913,36 @@ def test_orphan_exemplars_are_skipped_on_read_and_deleted_by_a_writer(tmp_path, 
     assert orphan_row["exemplars"] == 1
 
 
+def test_a_missing_identities_json_is_refused_not_read_as_empty(tmp_path, caplog):
+    # Read as an empty library, every stored sample would be an orphan that
+    # the next enrollment deletes.
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry(), _entry("Kazuma", _unit(1), label="SPEAKER_01")], ids=ids)
+    [name] = _read(root).spaces
+    (root / "identities.json").unlink()
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    refusal = r"identities\.json is missing, but spaces/ holds 2 voice sample"
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        with pytest.raises(voicelibrary.VoiceLibraryError, match=refusal) as excinfo:
+            _enroll(
+                root,
+                [_entry("Megumin", _unit(2), label="SPEAKER_02")],
+                source=_source(2, episode="ep02"),
+                ids=ids,
+            )
+        assert "nothing was deleted" in str(excinfo.value)
+        # Also when the change targets another space, and for every reader.
+        with pytest.raises(voicelibrary.VoiceLibraryError, match=refusal):
+            _enroll(root, [_entry()], provenance=_decoupled("anime-va-ecapa-gn"))
+        for spaces in (None, [name], []):
+            with pytest.raises(voicelibrary.VoiceLibraryError, match=refusal):
+                _read(root, spaces=spaces)
+    assert "unknown identities" not in caplog.text
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+
+
 def test_identities_json_lists_every_space_file(tmp_path):
     root = tmp_path / "voices"
     ids = _Ids()
@@ -1033,6 +1063,31 @@ def test_import_is_idempotent_and_keeps_ids(tmp_path):
     assert second.exemplars_present == 2
     assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
     assert [row["action"] for row in _history(root)].count("import") == 1
+
+
+def test_an_import_that_conflicts_with_the_library_is_reported_not_replaced(tmp_path):
+    root = tmp_path / "voices"
+    store, identity_id = _dated_legacy_store(["2025-01-01T00:00:00Z"])
+    [legacy] = store["identities"][identity_id]["exemplars"]
+    # The library already holds another capture of that episode in that scope.
+    ids = _Ids()
+    ids.exemplar = 200
+    _enroll(
+        root,
+        [_entry(identity_id=identity_id)],
+        scope="Legacy",
+        source=_source(7, episode="legacy0"),
+        ids=ids,
+    )
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    change, summary = _import(root, store, scope="Legacy")
+    assert change.empty
+    assert summary.refused == (
+        f"{identity_id}/{legacy['id']}: conflicts with a voice sample already in "
+        "the library (episode 'legacy0', scope 'Legacy'); not imported",
+    )
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
 
 
 def _dated_legacy_store(identity_count_dates, *, first_number=100):
