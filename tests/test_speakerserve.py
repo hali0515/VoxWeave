@@ -430,6 +430,7 @@ def test_serve_closes_cleanly_after_keyboard_interrupt(
 ):
     class InterruptingServer:
         origin = f"http://{host}:3210"
+        server_port = 3210
         closed = False
 
         def serve_forever(self):
@@ -463,7 +464,9 @@ def test_serve_closes_cleanly_after_keyboard_interrupt(
     assert seen["host"] == host
     assert seen["ngrok"] is ngrok
     assert reports[0] == result
-    assert len(reports) == 1 + (host == "0.0.0.0") + ngrok
+    exposed = host == "0.0.0.0" or ngrok
+    assert len(reports) == 1 + (host == "0.0.0.0") + ngrok + exposed
+    assert any("there is no password" in line for line in reports) is exposed
     assert opened == (["http://127.0.0.1:3210/"] if open_browser else [])
     assert server.closed is True
 

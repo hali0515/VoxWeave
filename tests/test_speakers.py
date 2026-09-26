@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import shlex
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -767,7 +769,8 @@ def test_create_audition_missing_turns_has_actionable_hint(tmp_path):
     media.write_bytes(b"media")
     (tmp_path / "episode.json").write_text("{}", encoding="utf-8")
     with pytest.raises(
-        RuntimeError, match=r"run voxweave episode\.mkv --diarize first"
+        RuntimeError,
+        match=re.escape(f"run voxweave {shlex.quote(str(media))} --diarize first"),
     ):
         speakers.create_speaker_audition(media)
 

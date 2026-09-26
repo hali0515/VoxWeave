@@ -10,6 +10,7 @@ import json
 import math
 import os
 import secrets
+import shlex
 import tempfile
 import threading
 import webbrowser
@@ -50,6 +51,18 @@ MAX_NAME_CHARS = 500
 MAX_UNDO_BYTES = 64 * 1024 * 1024
 _POST_ROUTES = frozenset({"/save", "/split", "/split-confirm", "/split-undo"})
 _INVALID_BODY = object()
+# Per socket operation. sendall() treats its timeout as a total deadline, so
+# replies are written in chunks: a slow but progressing client is not cut off.
+_SOCKET_TIMEOUT_S = 30
+_WRITE_CHUNK_BYTES = 64 * 1024
+# Hosts that can only be reached through an ngrok tunnel.
+_NGROK_HOST_SUFFIXES = (
+    ".ngrok-free.app",
+    ".ngrok-free.dev",
+    ".ngrok.app",
+    ".ngrok.dev",
+    ".ngrok.io",
+)
 
 
 class SplitConflict(RuntimeError):
@@ -136,6 +149,7 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         self.action_lock = threading.Lock()
         self.split_proposal: _SplitProposal | None = None
         self.session_terminal = False
+        self.reported_stale_ids: set[str] = set()
         super().__init__((host, port), _SpeakerRequestHandler)
         self.ngrok_origins = NgrokOrigins(self.server_port) if ngrok else None
 
@@ -150,6 +164,10 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
 
 class _SpeakerRequestHandler(BaseHTTPRequestHandler):
     server: SpeakerHTTPServer
+    # StreamRequestHandler applies this to the socket, so idle or trickling
+    # connections cannot pin handler threads when the server is reachable
+    # from the network (--host 0.0.0.0 / --ngrok).
+    timeout = _SOCKET_TIMEOUT_S
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
@@ -168,7 +186,9 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         if no_store:
             self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        view = memoryview(body)
+        for offset in range(0, len(view), _WRITE_CHUNK_BYTES):
+            self.wfile.write(view[offset : offset + _WRITE_CHUNK_BYTES])
 
     def _json_reply(
         self,
@@ -214,17 +234,30 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
             )
         return origins
 
-    def do_GET(self) -> None:
-        if not self._allowed_origins():
-            message = (
+    def _forbidden_host_message(self) -> bytes:
+        if self.server.ngrok_origins is not None:
+            return (
                 b"No matching ngrok endpoint. Check the local agent at 127.0.0.1:4040 "
                 b"and forward it to this server's port.\n"
-                if self.server.ngrok_origins is not None
-                else b"Host is not allowed. For a local ngrok tunnel, start speakers with --ngrok.\n"
             )
+        hosts = self.headers.get_all("Host", [])
+        host = hosts[0] if len(hosts) == 1 else ""
+        message = (
+            f"Host '{host[:200]}' is not allowed (hostnames are refused to prevent "
+            f"DNS rebinding); open http://{HOST}:{self.server.server_port}/, "
+            "or with --host 0.0.0.0 use this machine's IP address."
+        )
+        if host.split(":", 1)[0].lower().endswith(_NGROK_HOST_SUFFIXES):
+            message += (
+                " For an ngrok tunnel, start voxweave speakers serve with --ngrok."
+            )
+        return f"{message}\n".encode()
+
+    def do_GET(self) -> None:
+        if not self._allowed_origins():
             self._reply(
                 HTTPStatus.FORBIDDEN,
-                message,
+                self._forbidden_host_message(),
             )
             return
         if self.path == "/":
@@ -243,7 +276,7 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
                     mapping_path = pipeline.speakers_mapping_path(
                         self.server.media_path
                     )
-                    speakers, generation = _mapping_entries(
+                    speakers, stale, generation = _mapping_entries(
                         mapping_path,
                         self.server.speaker_ids,
                     )
@@ -252,7 +285,16 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
                         and generation == self.server.pristine_mapping_generation
                     ):
                         speakers = {}
-            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                    unreported = sorted(set(stale) - self.server.reported_stale_ids)
+                    if unreported:
+                        self.server.reported_stale_ids.update(unreported)
+                        self.server.report(
+                            f"{mapping_path.name}: ignoring speaker id(s) no longer "
+                            f"in this episode: {', '.join(unreported)}; the next "
+                            "Save drops them"
+                        )
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                self.server.report(f"Could not read the speaker mapping: {exc}")
                 self._json_reply(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {"error": "mapping could not be read"},
@@ -339,19 +381,30 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
             if speaker_id in mapping
         }
         document = {"version": 1, "speakers": ordered}
-        with episode_lock(self.server.media_path):
-            from voxweave import pipeline
+        try:
+            with episode_lock(self.server.media_path):
+                from voxweave import pipeline
 
-            mapping_path = pipeline.speakers_mapping_path(self.server.media_path)
-            fsio.atomic_write_text(
-                mapping_path,
-                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                mapping_path = pipeline.speakers_mapping_path(self.server.media_path)
+                fsio.atomic_write_text(
+                    mapping_path,
+                    json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                )
+        except OSError as exc:
+            message = f"could not save the speaker mapping: {exc.strerror or exc}"
+            self.server.report(f"Save failed: {message}")
+            self._json_reply(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"error": message},
+                no_store=True,
             )
-        self.server.mapping_path = mapping_path
+            return
         self.server.pristine_mapping_generation = None
         self.server.pristine_mapping_path = None
         self.server.report(f"Saved {mapping_path}")
-        self.server.report(f"Next: voxweave render {self.server.sibling_path}")
+        self.server.report(
+            f"Next: voxweave render {shlex.quote(str(self.server.sibling_path))}"
+        )
         self._json_reply(HTTPStatus.OK, {"saved": True})
 
     def _handle_split(self, payload: object) -> None:
@@ -1138,7 +1191,6 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
             raise
 
     server.speaker_ids = (*server.speaker_ids, new_id)
-    server.mapping_path = mapping_path
     server.pristine_mapping_path = None
     server.pristine_mapping_generation = None
     server.split_proposal = None
@@ -1297,7 +1349,6 @@ def _undo_split(server: SpeakerHTTPServer) -> None:
     server.speaker_ids = tuple(
         dict.fromkeys(label for _start, _end, label in restored_turns)
     )
-    server.mapping_path = current_paths["mapping"]
     server.pristine_mapping_path = None
     server.pristine_mapping_generation = None
     server.split_proposal = None
@@ -1328,12 +1379,17 @@ def _strict_json_loads(raw: bytes) -> Any:
 def _validated_speakers(
     value: object,
     speaker_ids: Sequence[str],
+    *,
+    stale: list[str] | None = None,
 ) -> dict[str, str]:
     """Shared version/speakers schema core for both mapping readers.
 
     Only the surrounding envelope differs between them: the POST payload must be
     exactly ``{version, speakers}`` (see :func:`_validated_mapping`), while an
-    on-disk mapping is read tolerantly and may carry extra top-level keys.
+    on-disk mapping is read tolerantly and may carry extra top-level keys. When
+    ``stale`` is given, entries for ids outside ``speaker_ids`` (left behind by
+    a re-diarization) are dropped and collected there instead of rejected, as
+    :func:`voxweave.speakers.load_speaker_mapping_bytes` does.
     """
     if not isinstance(value, dict):
         raise ValueError("mapping must be an object")
@@ -1343,6 +1399,9 @@ def _validated_speakers(
     if not isinstance(speakers, dict):
         raise ValueError("speakers must be an object")
     known = set(speaker_ids)
+    if stale is not None:
+        stale.extend(key for key in speakers if key not in known)
+        speakers = {key: name for key, name in speakers.items() if key in known}
     if any(
         not isinstance(key, str)
         or key not in known
@@ -1375,13 +1434,16 @@ def _file_generation(path: Path) -> tuple[int, int, int, int]:
 
 def _mapping_entries(
     path: Path, speaker_ids: Sequence[str]
-) -> tuple[dict[str, str], tuple[int, int, int, int]]:
+) -> tuple[dict[str, str], list[str], tuple[int, int, int, int]]:
+    """Read the on-disk mapping, dropping (and returning) ids no longer known."""
     before = _file_generation(path)
     value = _strict_json_loads(Path(path).read_bytes())
     after = _file_generation(path)
     if before != after:
         raise ValueError("mapping changed while reading")
-    return _validated_speakers(value, speaker_ids), after
+    stale: list[str] = []
+    speakers = _validated_speakers(value, speaker_ids, stale=stale)
+    return speakers, stale, after
 
 
 def make_server(
@@ -1409,6 +1471,20 @@ def make_server(
         ngrok=ngrok,
         port=port,
         report=report,
+    )
+
+
+def _exposure_warning(port: int, *, host: str, ngrok: bool) -> str:
+    """Warn that a network-reachable audition has no authentication."""
+    reachable = []
+    if host != HOST:
+        reachable.append(f"this machine on port {port}")
+    if ngrok:
+        reachable.append("the ngrok URL")
+    return (
+        f"Warning: anyone who can reach {' or '.join(reachable)} can play the "
+        "episode audio, read and change speaker names and run splits — there is "
+        "no password; stop the server when you are done."
     )
 
 
@@ -1447,6 +1523,8 @@ def serve(
         report(
             "For access from another device, replace 0.0.0.0 with this machine's IP address."
         )
+    if host != HOST or ngrok:
+        report(_exposure_warning(server.server_port, host=host, ngrok=ngrok))
     if open_browser:
         try:
             webbrowser.open(url.replace("//0.0.0.0:", f"//{HOST}:"))

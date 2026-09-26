@@ -263,12 +263,19 @@ def build_speakers_group(
         type=click.Choice(["127.0.0.1", "0.0.0.0"]),
         default="127.0.0.1",
         show_default=True,
-        help="HTTP bind address; 0.0.0.0 allows access from other devices.",
+        help=(
+            "HTTP bind address; 0.0.0.0 allows access from other devices. There is no"
+            " password: anyone who can reach the port can play the audio and edit names."
+        ),
     )
     @click.option(
         "--ngrok",
         is_flag=True,
-        help="Discover this port's public URLs from the local ngrok agent automatically.",
+        help=(
+            "Discover this port's public URLs from the local ngrok agent automatically."
+            " There is no password: anyone with the tunnel URL can play the audio and"
+            " edit names."
+        ),
     )
     @click.option(
         "--port",

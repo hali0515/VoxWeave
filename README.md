@@ -389,6 +389,11 @@ For an ngrok tunnel on the same machine, run
 the local agent API at `127.0.0.1:4040` and refreshes the accepted URLs as tunnels change.
 Only tunnels forwarding to this local port are accepted, including HTTPS access and saves.
 
+> [!WARNING]
+> The audition server has no password. With `--host 0.0.0.0` anyone on your network, and with
+> `--ngrok` anyone who has the tunnel URL, can play the episode audio, read and change speaker
+> names and run splits. Stop the server when you are done.
+
 ```bash
 voxweave episode.mkv --diarize
 voxweave speakers serve episode.mkv

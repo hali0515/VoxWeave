@@ -1325,7 +1325,11 @@ for (const field of fields) field.addEventListener('input', update);
 }});
 update();
 fetch('serve-info', {{cache: 'no-store'}}).then(async (response) => {{
-  if (!response.ok) throw new Error(`serve-info ${{response.status}}`);
+  if (!response.ok) {{
+    let payload = {{}};
+    try {{ payload = await response.json(); }} catch (_) {{}}
+    throw new Error(splitErrorMessage(payload, `serve-info ${{response.status}}`));
+  }}
   const info = await response.json();
   sessionToken = info.token;
   for (const field of fields) {{
@@ -1338,7 +1342,12 @@ fetch('serve-info', {{cache: 'no-store'}}).then(async (response) => {{
   save.hidden = false;
   splitReady = true;
   for (const button of splitButtons) button.hidden = false;
-}}).catch(() => {{ save.textContent = 'Save failed'; save.hidden = false; }});
+}}).catch((error) => {{
+  const reason = error instanceof Error && error.message ? `: ${{error.message}}` : '';
+  save.textContent = `Could not load the saved names${{reason}} (see the terminal); use Copy JSON`;
+  save.disabled = true;
+  save.hidden = false;
+}});
 save.addEventListener('click', async () => {{
   save.disabled = true;
   try {{
@@ -1347,9 +1356,15 @@ save.addEventListener('click', async () => {{
       headers: {{'Content-Type': 'application/json', 'X-VoxWeave-Token': sessionToken}},
       body: output.textContent,
     }});
-    if (!response.ok) throw new Error(`save ${{response.status}}`);
+    if (!response.ok) {{
+      let payload = {{}};
+      try {{ payload = await response.json(); }} catch (_) {{}}
+      throw new Error(splitErrorMessage(payload, ''));
+    }}
     save.textContent = 'Saved';
-  }} catch (_) {{ save.textContent = 'Save failed'; }}
+  }} catch (error) {{
+    save.textContent = error instanceof Error && error.message ? `Save failed: ${{error.message}}` : 'Save failed';
+  }}
   finally {{ save.disabled = splitApplied; }}
 }});
 </script>
@@ -1486,12 +1501,14 @@ def create_speaker_audition(
     media = Path(media)
     if not media.is_file():
         raise FileNotFoundError(f"media file not found: {media}")
+    quoted_media = shlex.quote(str(media))
+    manual_hint = f"use `voxweave speakers serve {quoted_media} --manual`"
     json_path = pipeline.swap_ext(media, ".json")
     sibling_bytes: bytes | None = None
     try:
         if not json_path.exists():
             raise FileNotFoundError(
-                f"sibling transcript {json_path.name} not found; run voxweave {media.name} --diarize first"
+                f"sibling transcript {json_path.name} not found; run voxweave {quoted_media} --diarize first"
             )
         try:
             sibling_bytes = json_path.read_bytes()
@@ -1533,9 +1550,15 @@ def create_speaker_audition(
                 sibling_path=json_path,
                 sibling_bytes=sibling_bytes,
             )
+            if isinstance(exc, FileNotFoundError) and pair is not None:
+                raise RuntimeError(
+                    "voiceprint evidence is declared but not usable: this "
+                    "episode's voiceprints were removed (voxweave speakers purge); "
+                    f"{manual_hint} to review names without suggestions"
+                ) from exc
             raise RuntimeError(
                 "voiceprint evidence is declared but not usable; rerun "
-                f"--diarize --voiceprints or use --no-match: {exc}"
+                f"--diarize --voiceprints or {manual_hint}: {exc}"
             ) from exc
 
     library_location: voicelibrary.LibraryLocation | None = None
@@ -1564,7 +1587,7 @@ def create_speaker_audition(
             sibling_bytes=sibling_bytes,
         )
         raise RuntimeError(
-            f"{json_path.name} has no speaker_turns; run voxweave {media.name} --diarize first"
+            f"{json_path.name} has no speaker_turns; run voxweave {quoted_media} --diarize first"
         )
     vad_speech = pipeline._spans_in(data.get("vad_speech"))
     sing_spans = pipeline._spans_in(data.get("sing_spans"))
@@ -1586,7 +1609,7 @@ def create_speaker_audition(
                 )
                 raise RuntimeError(
                     "voiceprint evidence does not bind this episode; rerun "
-                    f"--diarize --voiceprints or use --no-match: {exc}"
+                    f"--diarize --voiceprints or {manual_hint}: {exc}"
                 ) from exc
 
         embedded: dict[str, list[tuple[Span, str]]] = {label: [] for label in picks}
