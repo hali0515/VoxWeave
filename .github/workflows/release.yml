@@ -4,9 +4,14 @@ on:
   push:
     tags: ["v*"]
 
+# Jobs that need more (OIDC publishing, the GitHub release) declare it themselves.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 

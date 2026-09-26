@@ -1,6 +1,9 @@
-"""Vendored Mel-Band Roformer (frozen third-party model code).
+"""Frozen third-party model code: the Mel-Band Roformer separator (this module),
+ReDimNet2 (``redimnet2/``) and SpeechBrain ECAPA-TDNN (``speechbrain_ecapa/``), each
+under its upstream license (see THIRD_PARTY_NOTICES.md and the subpackage LICENSE files).
 
-Source: lucidrains/BS-RoFormer (MIT), taken from the audio-separator (uvr_lib_v5) copy.
+Mel-Band Roformer source: lucidrains/BS-RoFormer (MIT), taken from the audio-separator
+(uvr_lib_v5) copy.
 
 Why it is frozen in-tree: the latest PyPI bs-roformer (1.1.0) has drifted in
 architecture (hyper-connections / pope were added), so the community Mel-Band Roformer

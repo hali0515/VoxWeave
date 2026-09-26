@@ -1,1 +1,4 @@
 include MIGRATING.md
+include THIRD_PARTY_NOTICES.md
+# The tests need conftest.py, scripts/ and calibration/, none of which ship in the sdist.
+prune tests

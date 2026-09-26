@@ -7,10 +7,12 @@
 # Install as a global uv tool (end-user mode): puts the voxweave command on PATH.
 # Separation / layout / song-skip / diarization / CJK-break / translation support is baked into
 # the core deps; the install variant selects the compute platform AND the ASR/alignment backend:
-#   VARIANT=cuda (default) -> NVIDIA/Linux: torch Qwen3-ASR+aligner (qwen-asr) + onnxruntime-gpu +
-#                             faster-whisper, on the cu128 torch wheel (Blackwell sm_120, no auto-detect)
-#   VARIANT=mps            -> Apple Silicon/macOS: native MLX Qwen3-ASR+aligner (mlx-audio) on the
-#                             default torch wheel (MPS built in for the separator; no whisper engine)
+#   VARIANT=cuda (default except on Apple Silicon) -> NVIDIA/Linux: torch Qwen3-ASR+aligner
+#                             (qwen-asr) + onnxruntime-gpu + faster-whisper, on the cu128 torch wheel
+#                             when nvidia-smi is present (Blackwell sm_120), else the CPU wheel
+#   VARIANT=mps            -> Apple Silicon/macOS: native MLX Qwen3-ASR+aligner (mlx-audio) +
+#                             mlx-whisper for the hybrid engines, on the default torch wheel
+#                             (MPS built in for the separator)
 # Everything lands in an isolated uv tool venv (a bare `uv pip` cannot reach that venv).
 # Override the torch index per-invocation if needed, e.g. CPU-only: make install TORCH_BACKEND=cpu
 
@@ -78,7 +80,7 @@ dev:
 test:
 	uv run --extra $(VARIANT) pytest tests/ -v
 
-# Lint / format (project-wide; repo has no ruff config but this is the canonical invocation).
+# Lint / format (project-wide; rules and the vendor exclusion come from [tool.ruff] in pyproject.toml).
 lint:
 	uv run --no-project --with ruff ruff check --fix .
 	uv run --no-project --with ruff ruff format .

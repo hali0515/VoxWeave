@@ -5,6 +5,8 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 *.lock
+# ...but the project lockfile is tracked (and digest-pinned by the P6 oracle)
+!uv.lock
 build/
 dist/
 debug/

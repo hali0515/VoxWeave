@@ -10,9 +10,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Build and test code needs only to read the repository.
+permissions:
+  contents: read
+
 jobs:
   checks:
     runs-on: ubuntu-latest
+    # The suite takes minutes; a hung test should not burn the 6 h default.
+    timeout-minutes: 45
     steps:
       # The P6 oracle validates its governing reference commits with
       # `git cat-file -e`; a shallow clone lacks them, so fetch full history.
@@ -59,14 +65,16 @@ jobs:
 
   # The segmentation ruler measures output *quality* against the recorded
   # baseline (calibration/segmentation/baseline.json). Three gates are
-  # `blocking` (mid-phrase, over-7s, cps_p90); forbidden_end stays `warning`
-  # until the en group reaches min_samples (48/100 as of 2026-08). Flipping a
-  # gate mode is a reviewed edit of the tracked baseline, not a code change.
+  # `blocking` (mid-phrase, over-7s, cps_p90); forbidden_end is configured
+  # `warning` but promotes to blocking per language once the baseline and the
+  # current run both reach min_samples (ja and zh do; en does not yet). Flipping
+  # a gate mode is a reviewed edit of the tracked baseline, not a code change.
   #
   # Zero GPU, zero network, no media: the corpus is tracked JSON replayed through
-  # the production entry point. It skips cleanly until the corpus is captured.
+  # the production entry point; a missing or invalid corpus fails the gate (exit 2).
   segmentation-quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -80,22 +88,11 @@ jobs:
       - name: Sync environment
         run: uv sync --extra cuda --dev --python 3.13
 
-      - name: Check for a captured corpus
-        id: corpus
-        run: |
-          if [ -f calibration/segmentation/corpus.json ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "No calibration/segmentation/corpus.json yet - skipping the gate."
-          fi
-
       - name: Segmentation quality gate
-        if: steps.corpus.outputs.present == 'true'
         run: make quality-segmentation
 
       - name: Upload quality report
-        if: always() && steps.corpus.outputs.present == 'true'
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: segmentation-quality

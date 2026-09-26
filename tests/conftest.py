@@ -7,7 +7,10 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _isolate_voxweave_cache(tmp_path: Path) -> Iterator[None]:
-    """Keep cache-owned episode artifacts inside each test's temporary root."""
+    """Point VOXWEAVE_CACHE_ROOT (media snapshots) into each test's temporary root.
+
+    config.CACHE_ROOT / ASR_CACHE / ALIGN_CACHE / AUDIO_CACHE are import-time
+    constants and are not affected; episode artifacts live beside the media."""
     name = "VOXWEAVE_CACHE_ROOT"
     previous = os.environ.get(name)
     os.environ[name] = str(tmp_path / ".voxweave-cache")

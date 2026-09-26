@@ -4,7 +4,7 @@ version = "0.17.0"
 description = "BGM-robust subtitles for anime / film / clips: vocal separation + song-skip so ASR doesn't hallucinate on background music, OP/ED, or insert songs. Local-first Qwen3 ASR + forced alignment + edit-and-resync, CJK-aware."
 requires-python = ">=3.11"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 readme = "README.md"
 authors = [{ name = "Hao Li" }]
 keywords = ["subtitles", "asr", "forced-alignment", "whisper", "qwen", "vtt"]
@@ -73,7 +73,7 @@ dependencies = [
   # falls back to the kana char table when absent. unidic-lite ships the dictionary.
   "fugashi>=1.3",
   "unidic-lite>=1.0.8",
-  # OpenAI subtitle translation (translate sub-command; lazy import).
+  # OpenAI-compatible LLM client for `translate` and `correct` (lazy import).
   "openai>=1.40",
 ]
 
@@ -85,7 +85,7 @@ voxweave = "voxweave.__main__:cli"
 # pipeline lives in the core deps above; each variant adds its platform's ASR + alignment stack.
 [project.optional-dependencies]
 # NVIDIA CUDA build (Linux): in-process PyTorch Qwen3-ASR + aligner (qwen-asr), GPU onnxruntime
-# (CUDAExecutionProvider for MMS alignment) + the faster-whisper hybrid engine (--model large-v3 /
+# (CUDAExecutionProvider for MMS alignment) + the faster-whisper hybrid engine (--asr-model large-v3 /
 # large-v3-turbo; pulls ctranslate2 + PyAV). onnxruntime-gpu/faster-whisper carry a non-darwin
 # marker (no such wheels on macOS), so resolving [cuda] in its fork degrades cleanly there.
 cuda = [
@@ -171,7 +171,8 @@ venvPath = "."
 venv = ".venv"
 
 [tool.ruff]
-# voxweave/vendor contains frozen third-party model code (lucidrains/audio-separator) -- skip lint/format
+# voxweave/vendor contains frozen third-party model code (Mel-Band Roformer, ReDimNet2,
+# SpeechBrain ECAPA-TDNN) -- skip lint/format
 extend-exclude = ["voxweave/vendor"]
 
 [tool.ruff.lint]
