@@ -9,7 +9,8 @@ Two independent artifacts, selected by flags:
    pure functions (songdet + ``pipeline.plan_song_skip``) -- zero GPU required.
    The fixture is pre-populated with the current (correct) behavior as a golden
    snapshot; fill in ``assert.speech_present_at`` manually with timestamps where
-   speech must be present (regression anchors).
+   speech must be present (regression anchors). An existing fixture is never
+   overwritten without ``--force``.
 
 2. **Segmentation case** (``--with-units``): writes an additional
    ``calibration/segmentation/cases/<name>.json`` validated against
@@ -85,6 +86,8 @@ cc = _load_calib_common()
 
 #: Where a segmentation case lands unless ``--case-out`` says otherwise.
 DEFAULT_CASE_DIR = REPO_ROOT / "calibration" / "segmentation" / "cases"
+#: Where a song-skip scenario lands; ``tests/test_scenarios.py`` replays every file.
+SCENARIO_DIR = REPO_ROOT / "tests" / "scenarios"
 
 CASE_SCHEMA = "segmentation-case"
 CASE_SCHEMA_VERSION = 1
@@ -116,6 +119,10 @@ TIME_DECIMALS = 6
 SHOT_SNAP_FPS = 24.0
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+#: A scenario name is a file stem under SCENARIO_DIR and a pytest id: the corpus
+#: id grammar of the calibration manifests (``meido-head-rescue``), which also
+#: admits every segmentation case id (``zh-03``) and no path separator.
+_SCENARIO_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 # --------------------------------------------------------------------------- #
@@ -604,16 +611,60 @@ def capture_units(args: argparse.Namespace) -> Path:
     return out
 
 
+def scenario_out(args: argparse.Namespace) -> Path:
+    """Validate the scenario name and refuse to clobber a fixture unless ``--force``.
+
+    Cheap and model-free, so it runs before any GPU stage (and, from ``main``,
+    before the segmentation case is written): a captured scenario carries
+    hand-filled ``speech_present_at`` anchors that a silent rewrite would lose.
+    """
+    name = str(args.name)
+    if not _SCENARIO_NAME_RE.match(name):
+        raise cc.CalibrationError(
+            f"scenario name {name!r} must match {_SCENARIO_NAME_RE.pattern}",
+            ["it becomes tests/scenarios/<name>.json and the replay test id"],
+        )
+    out = SCENARIO_DIR / f"{name}.json"
+    if out.exists() and not args.force:
+        raise cc.CalibrationError(
+            f"{out} already exists; pass --force to overwrite it",
+            [
+                "a captured scenario is a baseline with hand-filled"
+                " speech_present_at anchors -- silent replacement loses them"
+            ],
+        )
+    return out
+
+
+def _fresh_vocals_cache(media: Path) -> Path | None:
+    """A fresh separated-vocals cache for ``media``, looked up without side effects.
+
+    ``pipeline.cache_vocals_path`` claims (creates) the artifact directory; a
+    capture only reads, so it inspects the legacy and the managed location and
+    applies the pipeline's duration check before trusting either.
+    """
+    from voxweave import artifacts
+    from voxweave.pipeline import CACHE_DIRNAME, _vocals_cache_fresh
+
+    legacy = media.parent / CACHE_DIRNAME / f"{media.stem}.vocals.32k.flac"
+    managed = artifacts.inspect_paths(media)
+    for candidate in (legacy, managed.vocals_cache if managed else None):
+        if (
+            candidate is not None
+            and candidate.is_file()
+            and _vocals_cache_fresh(candidate, media)
+        ):
+            return candidate
+    return None
+
+
 def capture_songdet(args: argparse.Namespace) -> Path:
     """Run the GPU stages once and write the song-skip scenario fixture.
 
     Every model-bearing import lives in here so that ``--units-only`` can stay a
     genuinely zero-GPU path (no torch in ``sys.modules``).
     """
-    import json
-
-    import numpy as np
-    import soundfile as sf
+    out = scenario_out(args)
 
     from voxweave import backend, songdet
     from voxweave.chunking import decode_to_wav, silence_gaps, vad_speech_segments
@@ -622,47 +673,58 @@ def capture_songdet(args: argparse.Namespace) -> Path:
         MAX_CHUNK_SEC,
         MIN_SONG_SKIP_SEC,
         SONG_FINE_SILENCE_MS,
-        cache_vocals_path,
         plan_song_skip,
     )
 
     media = Path(args.media)
     af = ASR_LOUDNORM if args.normalize else None
-    if args.no_separate:
-        print(f"[capture] decode (no separation): {media.name}")
-        voc16 = decode_to_wav(media, audio_filter=af)
-        voc32 = decode_to_wav(media, sample_rate=songdet.SR)
-    else:
-        cache = cache_vocals_path(media)
-        if cache.exists():
-            print(f"[capture] reuse cached vocals: {cache}")
-            voc16 = decode_to_wav(cache, audio_filter=af)
-            voc32 = cache
+    # Temp WAV/FLAC files the decoder and separator hand over ("caller deletes").
+    # The reused vocals cache is never in here.
+    tmp: list[Path] = []
+    try:
+        if args.no_separate:
+            print(f"[capture] decode (no separation): {media.name}")
+            voc16 = decode_to_wav(media, audio_filter=af)
+            tmp.append(voc16)
+            voc32 = decode_to_wav(media, sample_rate=songdet.SR)
+            tmp.append(voc32)
         else:
-            print(f"[capture] decode + separate: {media.name}")
-            fb = decode_to_wav(media, sample_rate=44100, mono=False)
-            voc = backend.separate_vocals(fb)
-            voc16 = decode_to_wav(voc, audio_filter=af)
-            voc32 = decode_to_wav(voc, sample_rate=songdet.SR)
+            cache = _fresh_vocals_cache(media)
+            if cache is not None:
+                print(f"[capture] reuse cached vocals: {cache}")
+                voc16 = decode_to_wav(cache, audio_filter=af)
+                tmp.append(voc16)
+                voc32 = cache
+            else:
+                print(f"[capture] decode + separate: {media.name}")
+                fb = decode_to_wav(media, sample_rate=44100, mono=False)
+                tmp.append(fb)
+                voc = backend.separate_vocals(fb)
+                tmp.append(voc)
+                voc16 = decode_to_wav(voc, audio_filter=af)
+                tmp.append(voc16)
+                voc32 = decode_to_wav(voc, sample_rate=songdet.SR)
+                tmp.append(voc32)
 
-    # PANNs per-window scoring (mirrors the internals of detect_song_spans)
-    data, sr = sf.read(str(voc32), dtype="float32")
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    win, hop = int(songdet.WIN_SEC * sr), int(songdet.HOP_SEC * sr)
-    starts_idx = list(range(0, len(data) - win + 1, hop))
-    wins = np.stack([data[s : s + win] for s in starts_idx])
-    model = songdet._get_model()
-    probs = np.concatenate(
-        [model.inference(wins[i : i + 32])[0] for i in range(0, len(wins), 32)]
-    )
+        # PANNs per-window scoring: the same helper detect_song_spans runs.
+        scored = songdet.window_probs(voc32)
+        if scored is None:
+            raise cc.CalibrationError(
+                f"{media.name} is shorter than one {songdet.WIN_SEC:g}s PANNs"
+                " window; there is nothing to score"
+            )
+        probs, starts_sec = scored
+
+        segs = vad_speech_segments(voc16)
+        # Fine VAD silences: excision snaps its cut points into these (mirrors pipeline)
+        fine = vad_speech_segments(voc16, min_silence_ms=SONG_FINE_SILENCE_MS)
+    finally:
+        for path in tmp:
+            path.unlink(missing_ok=True)
+
     speech, sing, music = songdet.reduce_scores(probs)
-    t = [round(s / sr, 2) for s in starts_idx]
-
-    segs = vad_speech_segments(voc16)
+    t = [round(s, 2) for s in starts_sec]
     vad_segs = [[round(s["start"], 3), round(s["end"], 3)] for s in segs]
-    # Fine VAD silences: excision snaps its cut points into these (mirrors pipeline)
-    fine = vad_speech_segments(voc16, min_silence_ms=SONG_FINE_SILENCE_MS)
     silences = [[round(a, 3), round(b, 3)] for a, b in silence_gaps(fine)]
 
     # Current (correct) behavior -> golden snapshot
@@ -701,9 +763,7 @@ def capture_songdet(args: argparse.Namespace) -> Path:
             "max_chunk_sec": MAX_CHUNK_SEC,
         },
     }
-    out = REPO_ROOT / "tests" / "scenarios" / f"{args.name}.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(fixture, ensure_ascii=False, indent=2), encoding="utf-8")
+    cc.write_json(out, fixture)
     print(f"[capture] wrote {out}")
     print(
         f"  raw song={[(round(a, 1), round(b, 1)) for a, b in song]}  final={fixture['assert']['expected_song_spans']}"
@@ -773,7 +833,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"case destination (default: {DEFAULT_CASE_DIR}/<name>.json)",
     )
     seg.add_argument(
-        "--force", action="store_true", help="overwrite an existing case file"
+        "--force",
+        action="store_true",
+        help="overwrite an existing case file and/or song-skip scenario",
     )
     seg.add_argument(
         "--tags",
@@ -808,6 +870,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         ap.error("--units-only requires --with-units")
     # The case is cheap and fails fast: a bad window or an undeclared license must
     # not be discovered after a separation pass has already burned GPU minutes.
+    # Likewise a bad scenario name or an existing fixture refuses before the case
+    # is written, so a refused run leaves nothing half-captured behind.
+    if not args.units_only:
+        scenario_out(args)
     if args.with_units:
         capture_units(args)
     if not args.units_only:

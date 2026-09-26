@@ -651,3 +651,217 @@ def test_units_only_run_is_torch_free_in_a_fresh_interpreter(
     )
     assert proc.returncode == 0, proc.stderr
     assert out.is_file()
+
+
+# --------------------------------------------------------------------------- #
+# Song-skip scenario capture (GPU stages faked)
+# --------------------------------------------------------------------------- #
+
+
+def _scenario_args(tmp_path: Path, **overrides: Any) -> Any:
+    base: dict[str, Any] = {
+        "media": str(tmp_path / "ep.mkv"),
+        "name": "meido-e12",
+        "with_units": None,
+        "units_only": False,
+    }
+    base.update(overrides)
+    return _args(**base)
+
+
+@pytest.fixture()
+def fake_stages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
+    """Replace decode / separation / PANNs / VAD with instant fakes that make temp files."""
+    import numpy as np
+
+    from voxweave import backend, chunking, songdet
+
+    monkeypatch.setattr(capture, "SCENARIO_DIR", tmp_path / "scenarios")
+    monkeypatch.setattr(capture, "_fresh_vocals_cache", lambda _media: None)
+    state: dict[str, Any] = {
+        "made": [],
+        "separated": 0,
+        "starts": [s / songdet.SR for s in (0, 32000, 64000)],
+    }
+
+    def temp(suffix: str) -> Path:
+        path = tmp_path / f"voxweave_tmp{len(state['made'])}{suffix}"
+        path.write_bytes(b"")
+        state["made"].append(path)
+        return path
+
+    def fake_separate(_src: Path, **_kw: Any) -> Path:
+        state["separated"] += 1
+        return temp(".flac")
+
+    monkeypatch.setattr(chunking, "decode_to_wav", lambda _src, **_kw: temp(".wav"))
+    monkeypatch.setattr(backend, "separate_vocals", fake_separate)
+    monkeypatch.setattr(
+        chunking,
+        "vad_speech_segments",
+        lambda _path, **_kw: [{"start": 0.25, "end": 3.5}],
+    )
+    probs = np.zeros((len(state["starts"]), 527), dtype=np.float32)
+    monkeypatch.setattr(songdet, "window_probs", lambda _p: (probs, state["starts"]))
+    return state
+
+
+def test_scenario_capture_deletes_every_temp_file(
+    fake_stages: dict[str, Any], tmp_path: Path
+) -> None:
+    out = capture.capture_songdet(_scenario_args(tmp_path))
+
+    assert out == tmp_path / "scenarios" / "meido-e12.json"
+    assert fake_stages["separated"] == 1
+    # full-band decode + separated FLAC + 16k VAD input + 32k PANNs input
+    assert len(fake_stages["made"]) == 4
+    assert not any(path.exists() for path in fake_stages["made"])
+    fixture = json.loads(out.read_text(encoding="utf-8"))
+    assert fixture["scores"]["t"] == [0.0, 1.0, 2.0]
+    assert fixture["vad_segs"] == [[0.25, 3.5]]
+    assert fixture["assert"]["speech_present_at"] == []
+
+
+def test_scenario_capture_without_separation_deletes_its_decodes(
+    fake_stages: dict[str, Any], tmp_path: Path
+) -> None:
+    capture.capture_songdet(_scenario_args(tmp_path, no_separate=True))
+
+    assert fake_stages["separated"] == 0
+    assert len(fake_stages["made"]) == 2
+    assert not any(path.exists() for path in fake_stages["made"])
+
+
+def test_scenario_capture_never_deletes_a_reused_vocals_cache(
+    fake_stages: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache" / "ep.vocals.32k.flac"
+    cache.parent.mkdir()
+    cache.write_bytes(b"flac")
+    monkeypatch.setattr(capture, "_fresh_vocals_cache", lambda _media: cache)
+
+    capture.capture_songdet(_scenario_args(tmp_path))
+
+    assert cache.read_bytes() == b"flac"
+    assert fake_stages["separated"] == 0
+    assert len(fake_stages["made"]) == 1  # the 16k VAD decode only
+    assert not fake_stages["made"][0].exists()
+
+
+def test_audio_shorter_than_one_window_is_invalid_and_cleans_up(
+    fake_stages: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from voxweave import songdet
+
+    monkeypatch.setattr(songdet, "window_probs", lambda _p: None)
+
+    with pytest.raises(cc.CalibrationError, match="shorter than one"):
+        capture.capture_songdet(_scenario_args(tmp_path))
+
+    assert fake_stages["made"]
+    assert not any(path.exists() for path in fake_stages["made"])
+    assert not (tmp_path / "scenarios" / "meido-e12.json").exists()
+
+
+def test_existing_scenario_is_refused_before_any_gpu_stage(
+    fake_stages: dict[str, Any], tmp_path: Path
+) -> None:
+    out = tmp_path / "scenarios" / "meido-e12.json"
+    out.parent.mkdir()
+    out.write_text('{"assert": {"speech_present_at": [12.5]}}', encoding="utf-8")
+
+    with pytest.raises(cc.CalibrationError) as excinfo:
+        capture.capture_songdet(_scenario_args(tmp_path))
+
+    assert "--force" in str(excinfo.value)
+    assert fake_stages["made"] == []
+    assert json.loads(out.read_text(encoding="utf-8")) == {
+        "assert": {"speech_present_at": [12.5]}
+    }
+
+
+def test_force_overwrites_an_existing_scenario(
+    fake_stages: dict[str, Any], tmp_path: Path
+) -> None:
+    out = tmp_path / "scenarios" / "meido-e12.json"
+    out.parent.mkdir()
+    out.write_text("{}", encoding="utf-8")
+
+    capture.capture_songdet(_scenario_args(tmp_path, force=True))
+
+    assert json.loads(out.read_text(encoding="utf-8"))["name"] == "meido-e12"
+    assert [p.name for p in out.parent.iterdir()] == ["meido-e12.json"]
+
+
+def test_existing_scenario_is_refused_before_the_case_is_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ran = _record_flows(monkeypatch)
+    monkeypatch.setattr(capture, "SCENARIO_DIR", tmp_path)
+    (tmp_path / "zh-03.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(cc.CalibrationError, match="--force"):
+        capture.main(["ep.mkv", "zh-03", "--with-units"])
+
+    assert ran == []
+
+
+@pytest.mark.parametrize("name", ["../escape", "sub/dir", "Meido", "a b", ".x", ""])
+def test_scenario_name_must_be_a_corpus_id(
+    name: str, fake_stages: dict[str, Any], tmp_path: Path
+) -> None:
+    with pytest.raises(cc.CalibrationError, match="scenario name"):
+        capture.capture_songdet(_scenario_args(tmp_path, name=name))
+
+    assert fake_stages["made"] == []
+
+
+def test_vocals_cache_lookup_claims_nothing(tmp_path: Path) -> None:
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"")
+
+    assert capture._fresh_vocals_cache(media) is None
+    assert not (tmp_path / "cache").exists()
+
+
+def test_stale_vocals_cache_is_not_reused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from voxweave import pipeline
+
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"")
+    legacy = tmp_path / "cache" / "ep.vocals.32k.flac"
+    legacy.parent.mkdir()
+    legacy.write_bytes(b"flac")
+    checked: list[tuple[Path, Path]] = []
+
+    def fresh(cache: Path, source: Path) -> bool:
+        checked.append((cache, source))
+        return verdict
+
+    monkeypatch.setattr(pipeline, "_vocals_cache_fresh", fresh)
+
+    verdict = False
+    assert capture._fresh_vocals_cache(media) is None
+    verdict = True
+    assert capture._fresh_vocals_cache(media) == legacy
+    assert checked == [(legacy, media), (legacy, media)]
+
+
+def test_managed_vocals_cache_is_found_by_inspection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from voxweave import artifacts, pipeline
+
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"")
+    managed = artifacts.claim_paths(media).vocals_cache
+    managed.write_bytes(b"flac")
+    monkeypatch.setattr(pipeline, "_vocals_cache_fresh", lambda _c, _m: True)
+
+    assert capture._fresh_vocals_cache(media) == managed

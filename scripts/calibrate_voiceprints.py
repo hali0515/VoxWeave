@@ -51,7 +51,8 @@ Usage::
     python scripts/calibrate_voiceprints.py ep01.mkv ep02.mkv \\
         --models redimnet2,anime-va,pyannote-community-1 --out voiceprints-calib.json
 
-Exit codes: 0 = report written, 2 = invalid input.
+Exit codes: 0 = report written, 2 = invalid input or a decode / model /
+report-write failure (reported on stderr, no traceback).
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -78,6 +80,10 @@ from voxweave import voiceembed  # noqa: E402
 PYANNOTE_COMMUNITY_1 = "pyannote-community-1"
 PYANNOTE_EMBEDDING = "pyannote-embedding"
 PYANNOTE_BASELINES = (PYANNOTE_COMMUNITY_1, PYANNOTE_EMBEDDING)
+# The dedicated voiceembed checkpoints, by the short names the report uses.
+DEDICATED_MODELS = ("redimnet2", "anime-va")
+# Every --models entry this script accepts (and the only ones it lists).
+MODEL_CHOICES = (*DEDICATED_MODELS, *PYANNOTE_BASELINES)
 DEFAULT_MODELS = ("redimnet2", "anime-va", PYANNOTE_COMMUNITY_1)
 # Segments per speaker fed to the target split (longest first, then back to
 # time order); more than the capture cap so odd/even halves stay meaningful.
@@ -284,15 +290,15 @@ def _pyannote_embedder(name: str) -> Embedder:
 
         inference, minimum = load()
         rows = []
-        for start, end in spans:
-            first = max(0, math.floor(start * voiceembed.SAMPLE_RATE))
-            last = min(len(waveform), math.ceil(end * voiceembed.SAMPLE_RATE))
+        for index, (start, end) in enumerate(spans):
+            # Same span -> samples rule (and out-of-audio refusal) as voiceembed.
+            first, last = voiceembed._span_samples(
+                waveform, float(start), float(end), index=index
+            )
             windows = voiceembed.window_bounds(first, last)
             vectors = []
             for low, high in windows:
-                segment = waveform[low:high]
-                if len(segment) < minimum:
-                    segment = np.resize(segment, minimum)
+                segment = voiceembed._padded(waveform[low:high], minimum)
                 tensor = torch.from_numpy(np.ascontiguousarray(segment)).reshape(
                     1, 1, -1
                 )
@@ -319,6 +325,11 @@ def _pyannote_embedder(name: str) -> Embedder:
 
 
 def build_embedder(name: str) -> Embedder:
+    if name not in MODEL_CHOICES:
+        raise ValueError(
+            f"--models has unknown voiceprint model {name!r}; "
+            f"choose from {', '.join(MODEL_CHOICES)}"
+        )
     if name in PYANNOTE_BASELINES:
         return _pyannote_embedder(name)
     return _voiceembed_embedder(name)
@@ -354,7 +365,13 @@ def load_episode(media: Path, *, use_vocals_cache: bool) -> Episode:
         legacy = media.parent / pipeline.CACHE_DIRNAME / f"{media.stem}.vocals.32k.flac"
         managed = artifacts.inspect_paths(media)
         for candidate in (legacy, managed.vocals_cache if managed else None):
-            if candidate is not None and candidate.is_file():
+            # A cache that no longer matches the media duration (replaced
+            # source, truncated FLAC) is skipped; the mix is scored instead.
+            if (
+                candidate is not None
+                and candidate.is_file()
+                and pipeline._vocals_cache_fresh(candidate, media)
+            ):
                 source, separated = candidate, True
                 break
     return Episode(media=media, turns=turns, audio_source=source, separated=separated)
@@ -396,7 +413,14 @@ def calibrate(
                         episode.turns, label, max_segments=max_segments
                     )
                     if spans:
-                        embedded[label] = (spans, embedder.embed(waveform, spans))
+                        try:
+                            vectors = embedder.embed(waveform, spans)
+                        except RuntimeError as exc:
+                            raise RuntimeError(
+                                f"{embedder.name} on {episode.media.name}, "
+                                f"speaker {label}: {exc}"
+                            ) from exc
+                        embedded[label] = (spans, vectors)
                 episode_targets, episode_non_targets = episode_scores(embedded)
                 targets.extend(float(row["score"]) for row in episode_targets)
                 non_targets.extend(float(row["score"]) for row in episode_non_targets)
@@ -434,14 +458,38 @@ def _format_row(name: str, result: Mapping[str, Any]) -> str:
     )
 
 
+def _out_problem(out: Path) -> str | None:
+    """Why ``--out`` cannot be written, checked before any model runs; else None."""
+    parent = out.parent
+    if out.is_dir():
+        return "is a directory"
+    if not parent.is_dir():
+        return f"directory {parent} does not exist"
+    if not os.access(parent, os.W_OK | os.X_OK):
+        return f"directory {parent} is not writable"
+    if out.exists() and not os.access(out, os.W_OK):
+        return "is not writable"
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n", 1)[0] if __doc__ else None
     )
     parser.add_argument("media", nargs="+", type=Path)
-    parser.add_argument("--models", default=",".join(DEFAULT_MODELS))
     parser.add_argument(
-        "--out", type=Path, default=Path("voiceprints-calibration.json")
+        "--models",
+        default=",".join(DEFAULT_MODELS),
+        help=(
+            f"comma-separated models to calibrate, from {', '.join(MODEL_CHOICES)} "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("voiceprints-calibration.json"),
+        help="JSON report path; its directory must exist (default: %(default)s)",
     )
     parser.add_argument(
         "--normalize",
@@ -453,9 +501,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="always decode the original mix instead of the separated vocals",
     )
-    parser.add_argument("--max-segments", type=int, default=DEFAULT_MAX_SEGMENTS)
+    parser.add_argument(
+        "--max-segments",
+        type=int,
+        default=DEFAULT_MAX_SEGMENTS,
+        help=(
+            "longest segments per speaker fed to the odd/even target split; "
+            "at least 2 (default: %(default)s)"
+        ),
+    )
     args = parser.parse_args(argv)
 
+    if args.max_segments < 2:
+        print(
+            f"error: --max-segments must be at least 2 (got {args.max_segments}): "
+            "a speaker needs two segments for a target score",
+            file=sys.stderr,
+        )
+        return 2
+    out_problem = _out_problem(args.out)
+    if out_problem is not None:
+        print(f"error: --out {args.out}: {out_problem}", file=sys.stderr)
+        return 2
     names = [name.strip() for name in args.models.split(",") if name.strip()]
     try:
         embedders = [build_embedder(name) for name in names]
@@ -463,7 +530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             load_episode(Path(media), use_vocals_cache=not args.no_vocals_cache)
             for media in args.media
         ]
-    except ValueError as exc:
+    except (ValueError, RuntimeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if not embedders:
@@ -476,10 +543,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "scoring the original mix",
                 file=sys.stderr,
             )
-    waveforms = [
-        decode_episode(episode, normalize=args.normalize) for episode in episodes
-    ]
-    models = calibrate(episodes, waveforms, embedders, max_segments=args.max_segments)
+    try:
+        waveforms = [
+            decode_episode(episode, normalize=args.normalize) for episode in episodes
+        ]
+        models = calibrate(
+            episodes, waveforms, embedders, max_segments=args.max_segments
+        )
+    except (RuntimeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     report = {
         "version": 1,
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -497,7 +570,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ],
         "models": models,
     }
-    args.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    try:
+        args.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"error: cannot write {args.out}: {exc}", file=sys.stderr)
+        return 2
     for name, result in models.items():
         print(_format_row(name, result))
     print(f"report: {args.out}")
