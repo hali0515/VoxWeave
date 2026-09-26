@@ -34,18 +34,22 @@ TRANSLATE_MODEL = config.DEFAULT_LLM_MODEL
 # long compilations (>800 cues) fall back to sequential windows. Concurrency > 1 gives
 # that up on purpose -- it caps windows at WINDOW_CUES instead and relies on ``glossary``
 # and ``context`` for consistency (see :func:`translate_cues`).
-BATCH_THRESHOLD = int(os.environ.get("VOXWEAVE_TRANSLATE_BATCH", "800"))
+BATCH_THRESHOLD = config._env_int("VOXWEAVE_TRANSLATE_BATCH", 800)
 # Tail cues from the previous window carried into the next for stylistic continuity.
-CONTEXT_TAIL = int(os.environ.get("VOXWEAVE_TRANSLATE_CONTEXT_TAIL", "3"))
+CONTEXT_TAIL = config._env_int("VOXWEAVE_TRANSLATE_CONTEXT_TAIL", 3)
 # Second windowing gate: total cue characters per window. The cue-count cap alone
 # lets a dense compilation (800 long cues) build a prompt past the model's context
 # window; CJK text runs ~1 token/char and the response echoes the input size, so
 # 60k chars keeps request+response comfortably inside current context limits.
-WINDOW_CHARS = int(os.environ.get("VOXWEAVE_TRANSLATE_WINDOW_CHARS", "60000"))
+WINDOW_CHARS = config._env_int("VOXWEAVE_TRANSLATE_WINDOW_CHARS", 60000)
 # Concurrent-mode window size (cues per request when translate_cues runs with
 # concurrency > 1). Built-in only: env / conf [llm].window_cues resolve at call time
 # in the pipeline (config.resolve_llm_window_cues), never at import.
 WINDOW_CUES = config.DEFAULT_TRANSLATE_WINDOW_CUES
+# Per-request timeout (seconds) for the OpenAI client. The SDK's own retries are
+# disabled (our _RETRY_DELAYS loop already retries), so a hung endpoint fails after
+# at most three timeouts instead of the SDK's 600 s x 3 under each of ours.
+LLM_TIMEOUT_S = config._env_float("VOXWEAVE_LLM_TIMEOUT_S", 300.0)
 # Characters of the response kept in an IncompleteResponse message for diagnosis.
 _INCOMPLETE_TAIL_CHARS = 120
 # Cue indices listed in a "missing cues" log line before eliding.
@@ -86,12 +90,12 @@ class PartialTranslationError(RuntimeError):
     def __init__(self, missing: list[int], total: int) -> None:
         self.missing = list(missing)
         self.total = total
-        shown = ", ".join(str(i) for i in self.missing[:8])
+        shown = ", ".join(str(i + 1) for i in self.missing[:8])
         if len(self.missing) > 8:
             shown += ", ..."
         super().__init__(
             f"{len(self.missing)} of {total} cues untranslated after retry (cue "
-            f"indices {shown}); translation progress is kept -- rerun the same "
+            f"numbers {shown}); translation progress is kept -- rerun the same "
             "command to resume, or allow partial output (--allow-partial) to fill "
             "them with source text"
         )
@@ -458,7 +462,8 @@ def _make_client(base_url: str | None, api_key: str | None):
         from openai import OpenAI
     except ModuleNotFoundError as e:
         raise RuntimeError(
-            "translate requires openai (not installed); install with: pip install 'voxweave[translate]' or make install"
+            "translate requires openai (not installed); reinstall voxweave "
+            "(openai is a core dependency)"
         ) from e
     base_url = config.resolve_llm_base_url(base_url)
     key_env = config.resolve_llm_api_key_env(None)
@@ -469,8 +474,10 @@ def _make_client(base_url: str | None, api_key: str | None):
             'variable ([llm].api_key_env = "" declares a keyless endpoint)'
         )
     if base_url:
-        return OpenAI(api_key=key, base_url=base_url)
-    return OpenAI(api_key=key)
+        return OpenAI(
+            api_key=key, base_url=base_url, max_retries=0, timeout=LLM_TIMEOUT_S
+        )
+    return OpenAI(api_key=key, max_retries=0, timeout=LLM_TIMEOUT_S)
 
 
 def resolve_model(client, model: str) -> str:
@@ -876,10 +883,12 @@ def _expand_to_units(payload: list[dict]) -> list[dict]:
 
 
 def _collapse_units(payload: list[dict], unit_trans: dict[int, str]) -> dict[int, str]:
-    """Per-unit translations -> per-block translations (external cue count). A dash
-    cue recombines its two halves as ``X\\n-less`` joined by ``\\n`` only when BOTH
-    are present -- a partial cue is left absent so the pipeline retries the whole
-    cue instead of emitting a blank speaker line. Ordinary cues pass through."""
+    """Per-unit translations -> per-block translations (external cue count).
+
+    A dash cue's two halves are each cleaned (leading dash stripped, flattened to
+    one line) and rejoined as ``first\\nsecond`` only when BOTH are present -- a
+    partial cue is left absent so the pipeline retries the whole cue instead of
+    emitting a blank speaker line. Ordinary cues pass through."""
     out: dict[int, str] = {}
     for c in payload:
         k = c["i"]
@@ -1008,7 +1017,8 @@ def translate_cues(
                 result.update(request(position, win, msgs, on_entry))
                 if progress_path is not None:
                     save_progress(progress_path, progress_sig, result)
-            tail = [(c["t"], result.get(c["i"], "")) for c in win[-context_tail:]]
+            recent = win[-context_tail:] if context_tail > 0 else []  # win[-0:] is all
+            tail = [(c["t"], result.get(c["i"], "")) for c in recent]
         return _collapse_units(payload, result)
 
     # Concurrent lane: one lock serialises result merging, progress saves and

@@ -403,10 +403,14 @@ def test_src_video_bitrate_unknown(tmp_path):
     assert mux.src_video_bitrate({"duration": "1"}, [loud], media) is None
 
 
-def test_filter_escape():
+def test_filter_escape(monkeypatch):
+    # two levels: option value (\ ' : =), then filtergraph (\ ' [ ] , ;)
     assert mux._filter_escape("/tmp/a.ass") == "/tmp/a.ass"
-    assert mux._filter_escape("/tmp/a:b,c.ass") == "/tmp/a\\:b\\,c.ass"
-    assert mux._filter_escape("C:\\tmp\\a.ass") == "C\\:/tmp/a.ass"
+    assert mux._filter_escape("/tmp/a:b,c.ass") == "/tmp/a\\\\:b\\,c.ass"
+    assert mux._filter_escape("/tmp/Ocean's.ass") == "/tmp/Ocean\\\\\\'s.ass"
+    assert mux._filter_escape("/tmp/[x];y.ass") == "/tmp/\\[x\\]\\;y.ass"
+    monkeypatch.setattr(mux.sys, "platform", "win32")
+    assert mux._filter_escape("C:\\tmp\\a.ass") == "C\\\\:/tmp/a.ass"
 
 
 def test_build_burn_cmd_hevc_mp4():

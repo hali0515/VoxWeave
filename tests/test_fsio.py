@@ -119,7 +119,10 @@ def test_atomic_write_text_new_prefers_content_atomic_hard_link(tmp_path, monkey
     assert list(tmp_path.iterdir()) == [dst]
 
 
-@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV])
+@pytest.mark.parametrize(
+    "link_errno",
+    [errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EXDEV],
+)
 def test_atomic_write_text_new_claims_then_replaces_when_links_unavailable(
     tmp_path, monkeypatch, link_errno
 ):

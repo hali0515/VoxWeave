@@ -58,7 +58,7 @@ TAG_BY_NAME: dict[str, str] = {
 
 # A window must score at least this on a mapped class to register an event.
 EVENT_MIN_PROB = 0.5
-# Netflix duration bounds: events shorter than the 5/6s floor are padded, and
+# Netflix duration bounds: events shorter than the 5/6s floor are dropped, and
 # nothing runs past 7s (long ambience reads fine from one tag).
 MIN_EVENT_SEC = 5.0 / 6.0
 MAX_EVENT_SEC = 7.0
@@ -106,10 +106,9 @@ def fit_events_to_gaps(
     """Trim events to the speech-free gaps between dialogue cues.
 
     Dialogue always wins the screen: each event span has every cue interval
-    subtracted; the longest remaining piece survives if it still clears
-    ``min_sec`` (then padded to it when the gap allows nothing longer is
-    needed -- pieces are real time, never padded into a cue), capped at
-    ``max_sec``.
+    subtracted, and only the longest remaining piece is kept. A piece shorter
+    than ``min_sec`` drops the event (pieces are real speech-free time, never
+    padded into a cue); a longer one is capped at ``max_sec``.
     """
     spans = sorted(
         (float(c["start"]), float(c["end"]))

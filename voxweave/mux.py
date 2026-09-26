@@ -5,8 +5,10 @@
 pixels via a styled ASS + libass filter and re-encodes the video (constant
 quality capped at the source bitrate, hardware encoder when available: NVENC on
 NVIDIA, VideoToolbox on macOS, libx264/libx265/libsvt-av1 software fallback).
-Both drop nothing from the source except, for burn, the now-redundant subtitle
-tracks.
+pack into mkv keeps every source stream; pack into mp4/webm keeps video, audio
+and text subtitle tracks (image subtitles cannot be stored there and are
+dropped). burn keeps the one real video stream and the audio, dropping every
+subtitle track (now burnt in), data/attachment streams and cover art.
 
 Command construction is kept separate from probing/execution so the ffmpeg
 argv builders stay unit-testable without media files or a GPU.
@@ -14,10 +16,12 @@ argv builders stay unit-testable without media files or a GPU.
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -204,18 +208,16 @@ def track_title(iso: str | None) -> str:
 def resolve_media(vtt: Path, media: Path | None) -> Path:
     """Return the explicit media path, or find the sibling media next to the VTT.
 
-    Translated VTTs carry a language tag ("X.zh.vtt") while the media is named
-    "X.<ext>", so the lookup also retries with the language token stripped.
-    Sibling lookup itself is pipeline's, the one shared implementation.
+    Translated/derived subtitles carry suffix tags ("X.zh.vtt", "X.sdh.vtt",
+    "X.asrfix.vtt") while the media is named "X.<ext>", so the lookup peels
+    those tags. The lookup itself is pipeline's, the one shared implementation.
     """
-    from voxweave.pipeline import _find_sibling_media, swap_ext
+    from voxweave.pipeline import _find_subtitle_media
 
     if media is not None:
         return Path(media)
     vtt = Path(vtt)
-    found = _find_sibling_media(vtt)
-    if found is None and detect_subtitle_language(vtt) is not None:
-        found = _find_sibling_media(swap_ext(vtt, ""))  # drop ".zh" tag and retry
+    found = _find_subtitle_media(vtt)
     if found is None:
         raise FileNotFoundError(
             f"no sibling media found for {vtt.name}; pass --media explicitly"
@@ -230,6 +232,31 @@ def _timed_subtitle_check(sub: Path) -> None:
     from voxweave.subformats import load_subtitle_blocks
 
     _timed_rows(load_subtitle_blocks(Path(sub)))
+
+
+def _utf8_subtitle(sub: Path, temp_dirs: list[Path]) -> Path:
+    """Return ``sub`` when its bytes are UTF-8 (BOM or not), else a UTF-8 copy.
+
+    The loader accepts GBK/Big5/cp1252/UTF-16 subtitles, but ffmpeg's subtitle
+    demuxers and libass read them as UTF-8 and drop or mangle the cues. The
+    copy keeps the file name (extension and language tag) inside a fresh temp
+    directory, which is appended to ``temp_dirs`` for the caller to remove.
+    """
+    from voxweave.subformats import decode_subtitle_bytes
+
+    sub = Path(sub)
+    data = sub.read_bytes()
+    try:
+        data.removeprefix(codecs.BOM_UTF8).decode("utf-8")
+        return sub
+    except UnicodeDecodeError:
+        pass
+    text = decode_subtitle_bytes(data, sub.name)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="voxweave-sub-"))
+    temp_dirs.append(tmp_dir)
+    copy = tmp_dir / sub.name
+    copy.write_text(text, encoding="utf-8")
+    return copy
 
 
 def default_output(media: Path, container: str, tag: str) -> Path:
@@ -404,9 +431,17 @@ def pack(
     streams = probe_streams(src)
     _check_pack_compat(cont, streams)  # raise before any ffmpeg run
     rep.step("pack subtitles")
-    with fsio.atomic_path(out) as tmp_out:
-        cmd = build_pack_cmd(src, vtts, tmp_out, container=cont, source_streams=streams)
-        _run_ffmpeg(cmd, capture=True)
+    temp_dirs: list[Path] = []
+    try:
+        inputs = [_utf8_subtitle(v, temp_dirs) for v in vtts]
+        with fsio.atomic_path(out) as tmp_out:
+            cmd = build_pack_cmd(
+                src, inputs, tmp_out, container=cont, source_streams=streams
+            )
+            _run_ffmpeg(cmd, capture=True)
+    finally:
+        for d in temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
     return out
 
 
@@ -631,6 +666,12 @@ def src_video_bitrate(
     return rate if rate > 0 else None
 
 
+def _stream_index(stream: dict) -> int | None:
+    """ffprobe's absolute stream index, or None when missing/malformed."""
+    index = stream.get("index")
+    return index if isinstance(index, int) and not isinstance(index, bool) else None
+
+
 def _burn_pix_fmt(encoder: str, src_depth: int) -> str:
     """Output pixel format: match the source bit depth, clamped to what the
     encoder can produce.
@@ -655,9 +696,18 @@ def _burn_pix_fmt(encoder: str, src_depth: int) -> str:
 
 
 def _filter_escape(path: str) -> str:
-    """Escape a filename for use inside an ffmpeg filtergraph option value."""
-    out = path.replace("\\", "/")
-    for ch in ("\\", "'", ":", ",", ";", "[", "]"):
+    """Escape a filename for use as a filter option value inside ``-vf``.
+
+    ffmpeg unescapes ``-vf`` twice: the filtergraph parser first (special
+    ``\\ ' [ ] , ;``), then the filter's option parser (special ``\\ ' :``,
+    plus ``=`` so a path is never read as ``key=value``). Escape the inner
+    level first, then the outer one. Windows separators become ``/``
+    (backslash is a legal filename character everywhere else).
+    """
+    out = path.replace("\\", "/") if sys.platform == "win32" else path
+    for ch in ("\\", "'", ":", "="):  # option-value level
+        out = out.replace(ch, "\\" + ch)
+    for ch in ("\\", "'", "[", "]", ",", ";"):  # filtergraph level
         out = out.replace(ch, "\\" + ch)
     return out
 
@@ -673,6 +723,7 @@ def build_burn_cmd(
     src_depth: int,
     audio_codecs: list[str],
     max_rate: int | None = None,
+    video_index: int | None = None,
 ) -> list[str]:
     """Build the ffmpeg argv that burns the styled ASS into the video.
 
@@ -697,7 +748,9 @@ def build_burn_cmd(
         cmd += ["-hwaccel", "videotoolbox"]
     cmd += ["-i", str(media)]
     cmd += ["-vf", f"ass={_filter_escape(str(ass_path))},format={pix}"]
-    cmd += ["-map", "0:v:0", "-map", "0:a?"]
+    # map the exact stream that was sized/measured (skips leading cover art)
+    video_map = f"0:{video_index}" if video_index is not None else "0:v:0"
+    cmd += ["-map", video_map, "-map", "0:a?"]
     cmd += ["-c:v", encoder, *_encoder_args(encoder, quality, max_rate)]
     if container == "mp4" and encoder.split("_")[0] in ("hevc", "libx265"):
         cmd += ["-tag:v", "hvc1"]
@@ -797,12 +850,13 @@ def burn(
     )
 
     tmp_ass: Path | None = None
+    temp_dirs: list[Path] = []
     if native_ass:
         if font != "Arial" or font_size is not None:
             logger.warning(
                 "ASS input keeps its own styling; --font/--font-size ignored"
             )
-        ass_path = Path(vtt)
+        ass_path = _utf8_subtitle(Path(vtt), temp_dirs)
     else:
         rep.step("prepare subtitles")
         header = ass_header(width=width, height=height, font=font, font_size=font_size)
@@ -828,6 +882,7 @@ def burn(
                 src_depth=depth,
                 audio_codecs=audio_codecs,
                 max_rate=max_rate,
+                video_index=_stream_index(video),
             )
             cap_note = f", capped at {max_rate // 1000} kb/s" if max_rate else ""
             logger.info(
@@ -846,4 +901,6 @@ def burn(
     finally:
         if tmp_ass is not None:
             tmp_ass.unlink(missing_ok=True)
+        for d in temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
     return out

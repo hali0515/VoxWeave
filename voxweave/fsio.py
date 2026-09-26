@@ -116,6 +116,8 @@ def atomic_write_text_new(
             if isinstance(exc, FileExistsError) or exc.errno not in {
                 errno.EPERM,
                 errno.EOPNOTSUPP,
+                errno.ENOTSUP,  # macOS: distinct from EOPNOTSUPP
+                errno.ENOSYS,  # FUSE filesystems without link()
                 errno.EXDEV,
             }:
                 raise

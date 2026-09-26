@@ -1486,7 +1486,7 @@ def test_incomplete_and_partial_errors_are_runtime_errors():
     assert isinstance(err, RuntimeError)
     assert err.missing == list(range(12)) and err.total == 40
     assert "12 of 40 cues untranslated" in str(err)
-    assert "0, 1, 2, 3, 4, 5, 6, 7, ..." in str(err)
+    assert "cue numbers 1, 2, 3, 4, 5, 6, 7, 8, ..." in str(err)
 
 
 # --------------------------------------------------------------------------- #
