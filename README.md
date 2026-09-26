@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="resources/VoxWeave_icon.png" alt="VoxWeave" width="200"/>
+<img src="https://raw.githubusercontent.com/hali0515/VoxWeave/main/resources/VoxWeave_icon.png" alt="VoxWeave" width="200"/>
 
 # VoxWeave
 
@@ -62,7 +62,7 @@ breaks) handles Chinese/Japanese/English as first-class.
   - [Pack soft subtitles (`pack`)](#pack-soft-subtitles)
   - [Burn hard subtitles (`burn`)](#burn-hard-subtitles)
 - [The edit-and-resync workflow](#the-edit-and-resync-workflow)
-- [Migration notes](MIGRATING.md)
+- [Migration notes](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
   - [Performance knobs](#performance-knobs)
@@ -127,10 +127,17 @@ Override the torch index per-invocation: `make install TORCH_BACKEND=cpu`.
 
 ```bash
 # NVIDIA / Linux:
-uv tool install --torch-backend=cu128 "voxweave[cuda]"   # full pipeline + faster-whisper hybrid
+uv tool install --torch-backend=cu128 \
+  --overrides <(printf "onnxruntime; sys_platform == 'darwin'\n") \
+  "voxweave[cuda]"                                       # full pipeline + faster-whisper hybrid
 # Apple Silicon / macOS:
 uv tool install "voxweave[mps]"                          # full pipeline + MLX Whisper hybrid
 ```
+
+`--torch-backend` in `uv tool install` needs uv 0.9.19 or newer (`uv self update`). On Linux the
+`--overrides` line keeps the CPU `onnxruntime` wheel (pulled in by ctc-forced-aligner) from
+shadowing `onnxruntime-gpu`, which would silently move Japanese MMS alignment onto the CPU; the
+Makefile passes the same rule from `overrides.txt`.
 
 The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
 Japanese/CJK), layout, song-skip, and speaker-diarization support — plus CJK line-break and
@@ -328,7 +335,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 Unknown command words produce a command error. Bare subtitle or JSON paths are not
 transcribed: use `align` for edited VTT, `export` for subtitle format conversion,
 or `render` for layout from the sibling JSON. These inputs are never automatically
-routed to an in-place editing command. See the [migration notes](MIGRATING.md) for old names.
+routed to an in-place editing command. See the [migration notes](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md) for old names.
 
 <details>
 <summary><b>Options</b></summary>
@@ -505,7 +512,7 @@ only with both `--voices` and `--show`); it cannot be combined with `--voices-di
 A space belongs to one embedding model (see the voiceprint embedders under [Setup](#setup));
 a per-show store captured with another embedder is skipped with a warning that names both
 spaces, and enrollment into such a store is refused. A store built before the dedicated
-embedders keeps working with `--voiceprint-model pyannote` (see [MIGRATING.md](MIGRATING.md)).
+embedders keeps working with `--voiceprint-model pyannote` (see [MIGRATING.md](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md)).
 
 Use `speakers enroll --replace` to replace this episode's prior contribution (the same episode
 label within the same scope, or the same media). Enrolling an already enrolled capture again
@@ -1140,7 +1147,7 @@ If VoxWeave saves you time, you can support development here:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/hali0515/VoxWeave/blob/main/LICENSE).
 
 ## Acknowledgments
 
