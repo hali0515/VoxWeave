@@ -2,15 +2,22 @@
 
 Two stages:
 1. ``split_at_sentence_end`` — PySBD (or regex fallback) sentence boundaries,
-   then ``split_sentence_heuristically`` for comma/conjunction splits.
+   then clause splitting. With ``thresholds`` and word timings -- every
+   production call, since the pipeline always passes thresholds -- length
+   splitting is deferred (``defer_length_split``): each sentence is only grouped
+   into comma clauses by ``_comma_clauses`` and stage 2 does all length
+   breaking. Only the legacy length-break-only mode (``thresholds=None``) runs
+   ``split_sentence_heuristically`` (comma clauses, then terminal/conjunction
+   and even splits until each clause fits the budget).
 2. ``split_long_cues_with_word_timings`` — word-level greedy packing into
    cues fitting ``max_lines × max_line_length``, with gap/duration breaks.
 
-Each sentence/comma clause is its own cue so timings track real speech
-boundaries; the one exception is ``_glue_short_cues`` (see ``timing``), which
-folds a lone-word flicker cue onto whichever neighbor abuts it within a
-sub-0.3s gap (no real pause crossed) — forward for leading interjections,
-backward for tail fragments.
+A stage-1 clause boundary is a cue boundary going into stage 2 but not
+necessarily in the output: in gap-aware mode ``_repair_bound_particle_cues``
+(zh/yue/ja: merges or repartitions a connected edge that strands a particle),
+``_merge_micro_cues`` and ``_glue_short_cues`` (see ``timing``) can fold
+adjacent cues across it. Each of those folds gates on a sub-pause gap, so none
+crosses a real pause.
 
 This module owns the segmentation *engine*: clause/sentence splitting and the
 atom packing loop. Pure text helpers and display wrapping live in ``layout``;
@@ -654,7 +661,9 @@ def _segment_sentences(text: str, lang: str) -> list[str]:
     Two distinct failures land on the same fallback -- pysbd absent, and pysbd
     having no model for this language (``Segmenter(language="yue")`` raises,
     which also hits ``pt``/``ko``). Both are recorded through
-    :func:`providers.note_degraded`; the returned sentences are unchanged.
+    :func:`providers.note_degraded`; the returned sentences are unchanged. A
+    language pysbd has no model for is a designed fallback and is logged at
+    DEBUG; pysbd failing on a language it does support keeps its warning.
     """
     try:
         import pysbd  # type: ignore
@@ -663,7 +672,12 @@ def _segment_sentences(text: str, lang: str) -> list[str]:
             seg = pysbd.Segmenter(language=lang, clean=False)
             return [s for s in seg.segment(text) if s and s.strip()]
         except Exception:
-            note_degraded("sentences", "pysbd-language-unsupported:regex")
+            codes = getattr(getattr(pysbd, "languages", None), "LANGUAGE_CODES", None)
+            note_degraded(
+                "sentences",
+                "pysbd-language-unsupported:regex",
+                expected=codes is not None and lang not in codes,
+            )
     except ImportError:
         note_degraded("sentences", "pysbd-missing:regex")
     return [s for s in re.split(r"(?<=[.!?。！？])\s*", text) if s and s.strip()]
@@ -1102,7 +1116,11 @@ def _attach_end_penalties(
     的) and the ja kana check still reads the word's last char. For ja, UniDic POS
     (ja_pos_end_penalties) overrides the char table where it scores a token end,
     disambiguating 準体の from 格助詞の. Atoms a break cannot legally follow (next
-    atom mid-phrase) score 0; they are never candidates.
+    atom mid-phrase) score 0. They are normally never candidates, but
+    ``_best_len_break_pos``'s emergency path (one phrase over the safety or
+    duration cap with no internal boundary) makes every atom edge a candidate;
+    there such an edge is priced as undamaged, so pause, fragment size and
+    balance pick the cut.
     """
     n = len(atoms)
     for atom in atoms:
@@ -1886,9 +1904,12 @@ def smart_split_segments(
     Returns a flat list of cues with ``text``, ``start``, ``end``, ``word_data``.
 
     ``split_at_comma`` (default on) breaks at commas unless either side is
-    shorter than ``comma_split_min_len`` visual chars. Each sentence/comma clause
-    is its own cue, except a lone-word flicker cue with a sub-0.3s gap, which
-    ``_glue_short_cues`` folds onto its nearer neighbor (forward or backward).
+    shorter than ``comma_split_min_len`` visual chars. With ``thresholds`` set
+    (as every production call does), the sentence/comma clauses are packed by
+    the timed atom stage and then the cue-stream folds run:
+    ``_repair_bound_particle_cues``, ``_merge_micro_cues`` and
+    ``_glue_short_cues`` can each merge adjacent cues across a clause boundary
+    when the gap between them is below a real pause.
     """
     if max_line_length is None:
         max_line_length = default_max_line_length(lang)

@@ -142,3 +142,29 @@ def test_two_line_break_widths_match_the_joined_slices(text, lang, budget):
     index, top, bottom = chosen
     assert top == _vis_width(_join_line(units[:index]))
     assert bottom == _vis_width(_join_line(units[index:]))
+
+
+# ----------------------------------------------- narrow alphabetic scripts
+
+
+@pytest.mark.parametrize(
+    "text,lang",
+    [
+        ("Привет, как у тебя дела сегодня", "ru"),
+        ("Ça coûte très cher à la fête de l'été", "fr"),
+    ],
+)
+def test_narrow_alphabetic_letters_count_one_cell(text, lang):
+    # Cyrillic and accented Latin letters render at Latin width. Charging them
+    # two cells each halved a ru/fr line's budget and wrapped text that fits.
+    assert _vis_width(text) == len(text)
+    assert _vis_width(text) <= DEFAULT_MAX_LINE_LENGTH
+    assert wrap_cue_text(text, lang, 2) == text
+
+
+def test_combining_marks_are_zero_width_and_wide_glyphs_stay_wide():
+    # A decomposed accent adds no cell; fullwidth Latin and CJK keep two cells.
+    assert _vis_width("été") == _vis_width("été") == 3
+    assert _vis_width("αβγ") == 3
+    assert _vis_width("ＡＢ") == 4
+    assert _vis_width("中文") == 4

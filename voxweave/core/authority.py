@@ -32,7 +32,7 @@ import itertools
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 __all__ = [
     "AUTHORITY_KINDS",
@@ -61,8 +61,10 @@ AUTHORITY_KINDS: tuple[AuthorityKind, ...] = (
     "v1-capture",
 )
 
-#: The N8b probe record, in the spec's own field order. Stated once so the probe
-#: and its tests cannot drift apart about which fields a lineage tuple carries.
+#: The N8b probe record, in the spec's own field order. Stated once:
+#: :func:`lineage_tuples` reads exactly these ``FactoryEvent`` fields in this
+#: order, so the probe and its tests cannot drift apart about which fields a
+#: lineage tuple carries.
 LINEAGE_FIELDS: tuple[str, ...] = (
     "evaluation_id",
     "row_id",
@@ -124,14 +126,6 @@ class Seal:
     authority_id: str
     kind: AuthorityKind
     digest: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "authority_id": self.authority_id,
-            "digest": self.digest,
-            "issuer": self.issuer,
-            "kind": self.kind,
-        }
 
 
 @dataclass
@@ -269,14 +263,7 @@ def lineage_tuples(ledger: AuthorityLedger) -> tuple[LineageRecord, ...]:
     producer can say which it handed over, and this is where it says so.
     """
     records: list[LineageRecord] = [
-        (
-            event.evaluation_id,
-            event.row_id,
-            event.call_id,
-            event.input_seed_id,
-            event.input_kind,
-            event.parent_finalize_call_id,
-        )
+        cast(LineageRecord, tuple(getattr(event, name) for name in LINEAGE_FIELDS))
         for event in ledger.events
     ]
     # ``None`` is a legal value in the last field, so the sort key substitutes a

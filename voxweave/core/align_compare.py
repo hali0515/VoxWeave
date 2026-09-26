@@ -782,6 +782,10 @@ def _expected_lyrics(
     sing_spans = getattr(evidence, "sing_spans", None)
     if not isinstance(sing_spans, tuple):
         return None
+    # A block/phase-1 count mismatch leaves no seeds; that is the shape
+    # violation ALD-5 reports, not a reason for the comparison to raise.
+    if len(authority_blocks) != len(seeds):
+        return None
     expected: list[bool] = []
     for block, seed in zip(authority_blocks, seeds, strict=True):
         words = tuple(getattr(block, "word_data", None) or ())

@@ -1264,11 +1264,15 @@ def finalize(
 ) -> FinalizeResult:
     """Consume the seed's capability, solve, and deliver cues + report + trace.
 
-    Raises :class:`~voxweave.core.authority.UnissuedAuthority` when the stream's
+    Raises :class:`ValueError` when ``profile`` is not the profile the stream
+    was sealed with (checked first, so the capability is not spent),
+    :class:`~voxweave.core.authority.UnissuedAuthority` when the stream's
     seal is not one its ledger issued, :class:`SealBroken` when the sealed
     payload was mutated after issuance, :class:`CapabilityConsumed` on a second
     use, and :class:`NonFiniteTime` from the preflight.
     """
+    if profile != stream.profile:
+        raise ValueError("finalize profile differs from the sealed stream's profile")
     stream.capability.consume(
         _stream_payload(
             stream.cues, stream.profile, stream.row_id, stream.evaluation_id

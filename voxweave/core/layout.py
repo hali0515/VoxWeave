@@ -10,6 +10,8 @@ cue dicts — those live in ``timing`` (cue-stream polish) and ``smart_split``
 from __future__ import annotations
 
 import re
+import unicodedata
+from functools import lru_cache
 
 from .kinsoku import line_end_penalty
 from .langsets import LANGUAGES_WITHOUT_SPACES
@@ -243,9 +245,31 @@ def strip_punct_for_subtitles(text: str) -> str:
     return cleaned
 
 
+# Alphabetic scripts whose letters render at Latin (half-width) width. Matched on
+# the Unicode character name, so fullwidth forms ("FULLWIDTH LATIN ...") stay wide.
+_NARROW_SCRIPT_PREFIXES = ("LATIN", "CYRILLIC", "GREEK")
+
+
+@lru_cache(maxsize=4096)
+def _non_ascii_width(c: str) -> int:
+    """Half-width cells for one non-ASCII, non-space character."""
+    if unicodedata.combining(c):
+        return 0
+    if unicodedata.name(c, "").startswith(_NARROW_SCRIPT_PREFIXES):
+        return 1
+    return 2
+
+
 def _vis_width(s: str) -> int:
-    """Visual width: CJK/full-width glyphs count 2; ASCII/space counts 1."""
-    return sum(1 if (c.isascii() or c.isspace()) else 2 for c in s)
+    """Visual width in half-width cells, summed per character.
+
+    ASCII and whitespace count 1. Letters of the narrow alphabetic scripts
+    (Unicode name starting with LATIN, CYRILLIC or GREEK, e.g. ``é``, ``ж``,
+    ``λ``) count 1 and combining marks count 0, so a Russian or accented-French
+    line gets the same budget as English. Every other non-ASCII character --
+    CJK/full-width glyphs, fullwidth Latin, symbols, other scripts -- counts 2.
+    """
+    return sum(1 if (c.isascii() or c.isspace()) else _non_ascii_width(c) for c in s)
 
 
 def _wrap_units(text: str, lang: str) -> list[tuple[str, str]]:

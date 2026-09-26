@@ -47,13 +47,6 @@ from voxweave.segmentation_adapter import (
 SegmentationCommand = Literal["process", "split"]
 
 
-def _swap_ext(path: Path, new_ext: str) -> Path:
-    target = Path(path)
-    if target.suffix:
-        return target.with_name(target.name[: -len(target.suffix)] + new_ext)
-    return target.with_name(target.name + new_ext)
-
-
 @dataclass(frozen=True)
 class SegmentationSelection:
     context: IssuedSegmentationContext

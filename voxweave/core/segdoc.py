@@ -64,11 +64,18 @@ class SourceUnit:
     (``text`` wins, ``word`` is the ASR-side fallback, absent is ``""``); spans
     are whatever the aligner recorded, including ``None`` for ghost units.
 
-    ``provenance`` and ``confidence`` are RESERVED for P5: they are minted with
-    their defaults today and nothing reads them, so the field set is already the
-    one a later per-unit evidence pass needs and that pass does not have to
-    migrate the IR a second time. Additive with defaults, so every existing
-    positional construction and equality comparison is unchanged.
+    ``provenance`` says where a unit's times came from. Ingest
+    (:func:`build_seg_document`) always mints the default ``"aligner"``; the
+    shadow sub-unit refiner mints ``"subunit-<evidence>"`` and the P6 align seed
+    carries ``"align-interpolated"`` through. It is read: only an
+    ``"aligner"`` endpoint unit may supply a speech anchor
+    (``subunit.speech_span_units``, ``speaker_evidence``), ``boundary_v2``
+    switches to its provenance-aware span fold for a mixed stream and refuses a
+    ``subunit-`` stream without its audited split, and the finalizer seals it
+    into the phase-1 capability digest. ``confidence`` is still unused: it is
+    ``None`` at ingest and is only copied, serialized and sealed, never
+    consulted. Both are additive with defaults, so every existing positional
+    construction and equality comparison is unchanged.
     """
 
     id: str

@@ -30,7 +30,13 @@ cut-local feature.
 
 :class:`DisplayTimingPreview` is the swap seam. P4 ships
 :class:`LegacyCleanupPreview`, a faithful mirror of today's pass; P5 hands in
-the finalizer's own preview and the cost model does not change a line.
+the finalizer's own preview. The seam is not transparent to the cost model:
+``boundary_cost`` branches on ``isinstance(preview, LegacyCleanupPreview)``.
+Under the legacy preview it prices layout (lines, balance, width) from the
+packed edge and ``rendered_layout`` and reading load from the edge's
+punctuation-stripped display text, which keeps experimental_policy_1 frozen;
+under any other preview it prices both from the preview's own ``final_text``
+and ``reading_chars``. Only the duration terms read the preview uniformly.
 """
 
 from __future__ import annotations

@@ -70,10 +70,13 @@ __all__ = [
 #: forgotten: exhausting them without observing a no-op is a reported fact.
 STUTTER_MAX_SCANS: int = 4
 
-#: The exact worst-case number of character passes one projection makes:
-#: 1 strip + at most STUTTER_MAX_SCANS stutter scans + 1 wrap. The N14 work
-#: bound is stated in terms of this factor, so it may not be rounded up for
-#: comfort.
+#: Character passes of the projection proper: 1 strip + at most
+#: STUTTER_MAX_SCANS stutter scans + 1 wrap. This is NOT the worst case
+#: :class:`CanonicalWork` records: ``canonical_text`` also charges its
+#: ``reconstruct_surface`` pass, so one projection can charge 7 passes. The
+#: value stays 6 because the calibration ruler's N14 work bound
+#: (``scripts/calib_segmentation.py``) is computed from it; changing it
+#: re-baselines that bound.
 CANONICAL_PASS_FACTOR: int = 6
 
 #: Closed vocabulary of the reasons a projection falls back to the cue's own

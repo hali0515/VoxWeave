@@ -25,7 +25,6 @@ from .schema import Cue
 
 TWO_FRAME_S = 2.0 / 24.0  # ~0.083s Netflix min inter-cue gap
 CHAIN_MAX_GAP_S = 0.5  # gaps below this are "dead zone" -> chain to 2 frames
-VISIBLE_GAP_MIN_S = 1.0  # gaps >= this stay a visible pause (BBC); not enforced in code (CHAIN_MAX_GAP_S=0.5 never reaches them)
 GLUE_MAX_GAP_S = 0.3  # lone-word flicker cue glues onto its nearer neighbor when that gap is below this
 LINGER_CAP_S = 1.0  # CPS-driven extension never lingers more than this past speech end
 DEGENERATE_CUE_S = (
@@ -318,7 +317,8 @@ def _cleanup_cues(
     - Tail pad (lag_out_s>0): every cue end gets a flat pad so text does not vanish
       the instant speech stops; absorbed by chaining in dense dialogue.
     - Chains sub-0.5s inter-cue gaps down to 2 frames.
-    - Visible gaps (>=1s) are left untouched.
+    - Gaps of CHAIN_MAX_GAP_S or more are never chained, but they are not left
+      untouched: the extensions above grow into them, capped by the next start.
     - max_cue_s prevents any extension from re-inflating past the segmentation cap.
 
     Idempotent for cues carrying timed ``word_data``: every extension target is an
