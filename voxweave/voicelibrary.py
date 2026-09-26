@@ -624,9 +624,12 @@ class LibraryState:
     compare-and-swap baseline of a later :func:`commit`.
 
     ``orphans`` counts, per space, the exemplars of identities that do not
-    exist, which were dropped from ``spaces`` on read (the next commit
-    deletes them from disk); ``missing_spaces`` names spaces that
-    ``identities.json`` lists but that could not be found.
+    exist, which were dropped from ``spaces`` on read; ``orphan_exemplars``
+    holds them. The next commit deletes only those of forgotten (tombstoned)
+    ids and carries the rest through unchanged: an ``identities.json``
+    rolled back to an older copy must not cost the newer voices their
+    samples. ``missing_spaces`` names spaces that ``identities.json`` lists
+    but that could not be found.
     """
 
     paths: LibraryPaths
@@ -636,6 +639,7 @@ class LibraryState:
     all_spaces: bool = False
     orphans: dict[str, dict[str, int]] = field(default_factory=dict)
     missing_spaces: tuple[str, ...] = ()
+    orphan_exemplars: dict[str, dict[str, list[object]]] = field(default_factory=dict)
 
     @property
     def identity_map(self) -> dict[str, dict[str, object]]:
@@ -644,6 +648,24 @@ class LibraryState:
     @property
     def forgotten(self) -> frozenset[str]:
         return frozenset(forgotten_ids(self.identities))
+
+    def kept_orphans(self, name: str) -> dict[str, list[object]]:
+        """Orphan exemplars of ``name`` a writer keeps: ids not forgotten."""
+        tombstones = self.forgotten
+        return {
+            identity_id: items
+            for identity_id, items in self.orphan_exemplars.get(name, {}).items()
+            if identity_id not in tombstones
+        }
+
+    def orphan_ids(self, name: str) -> tuple[set[str], set[str]]:
+        """Identity and exemplar ids held by the orphans of space ``name``."""
+        held = self.orphan_exemplars.get(name, {})
+        return set(held), {
+            cast(str, cast(Mapping[str, object], item)["id"])
+            for items in held.values()
+            for item in items
+        }
 
     def space_exemplars(self, name: str) -> dict[str, list[dict[str, object]]]:
         space = self.spaces.get(name)
@@ -707,34 +729,56 @@ def validate_relations(state: LibraryState) -> None:
 
 def _drop_orphans(
     identities: Mapping[str, object], spaces: Mapping[str, dict[str, object]]
-) -> dict[str, dict[str, int]]:
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, list[object]]]]:
     """Remove, in place, the exemplars of identities that do not exist.
 
-    Every crash point of a locked writer leaves a valid library (see
-    :class:`LibraryChange`), so they can only be left by a writer on a mount
-    without working locks or by a manual edit. Refusing to read the library
-    over them would also block the ``forget`` that removes them, so readers
-    skip them and writers delete them. A missing ``identities.json`` is not
-    healed this way: :func:`read_state` refuses it (see
-    :func:`_refuse_missing_identities`).
+    Returns their per-space counts and the removed exemplars. They are left
+    by a forget racing a writer on a mount without working locks, by a
+    manual edit, or by an ``identities.json`` rolled back to an older copy
+    (a partial backup restore, a sync conflict). Refusing to read the
+    library over them would also block the ``forget`` that removes them, so
+    readers skip them. Writers delete only those of forgotten (tombstoned)
+    ids; the others are kept until ``identities.json`` is restored (see
+    :func:`commit`). A missing ``identities.json`` is refused by
+    :func:`read_state` instead (see :func:`_refuse_missing_identities`).
     """
     known = cast(Mapping[str, object], identities["identities"])
+    tombstones = set(forgotten_ids(identities))
     dropped: dict[str, dict[str, int]] = {}
+    removed: dict[str, dict[str, list[object]]] = {}
     for name, document in spaces.items():
         exemplars = cast(dict[str, list[object]], document["exemplars"])
         for identity_id in sorted(set(exemplars) - set(known)):
-            dropped.setdefault(name, {})[identity_id] = len(exemplars.pop(identity_id))
+            items = exemplars.pop(identity_id)
+            dropped.setdefault(name, {})[identity_id] = len(items)
+            removed.setdefault(name, {})[identity_id] = items
         if name in dropped:
-            log.warning(
-                "voice library space %s holds %d voice sample(s) of %d unknown "
-                "identities (left by a writer on a mount without working locks, "
-                "or by a manual edit); they are ignored, and the next command "
-                "that changes the library deletes them",
-                name,
-                sum(dropped[name].values()),
-                len(dropped[name]),
-            )
-    return dropped
+            kept = {i: n for i, n in dropped[name].items() if i not in tombstones}
+            if kept:
+                log.warning(
+                    "voice library space %s holds %d voice sample(s) of %d "
+                    "identities that %s does not list (it may have been "
+                    "restored from an older copy, or edited by hand); they are "
+                    "ignored but kept. Restore %s to use them again; to delete "
+                    "them, restore it and run `voxweave voices forget` on those "
+                    "ids, or remove them from %s/%s.json by hand",
+                    name,
+                    sum(kept.values()),
+                    len(kept),
+                    IDENTITIES_NAME,
+                    IDENTITIES_NAME,
+                    SPACES_DIRNAME,
+                    name,
+                )
+            if len(kept) < len(dropped[name]):
+                log.warning(
+                    "voice library space %s holds %d voice sample(s) of "
+                    "forgotten identities; they are ignored, and the next "
+                    "command that changes the library deletes them",
+                    name,
+                    sum(n for i, n in dropped[name].items() if i in tombstones),
+                )
+    return dropped, removed
 
 
 def _refuse_missing_identities(
@@ -825,7 +869,7 @@ def read_state(
             paths.root,
             ", ".join(missing),
         )
-    orphans = _drop_orphans(identities, loaded)
+    orphans, orphan_exemplars = _drop_orphans(identities, loaded)
     state = LibraryState(
         paths,
         identities,
@@ -834,6 +878,7 @@ def read_state(
         spaces is None,
         orphans=orphans,
         missing_spaces=tuple(missing),
+        orphan_exemplars=orphan_exemplars,
     )
     validate_relations(state)
     return state
@@ -1092,9 +1137,14 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
     paths = state.paths
     healed_spaces: dict[str, dict[str, object]] = {}
     healed_history: list[dict[str, object]] = []
-    for name, dropped in sorted(state.orphans.items()):
-        # Delete what read_state skipped: vectors of identities that do not
-        # exist (a space the change rewrites anyway was read without them).
+    tombstones = state.forgotten
+    for name, all_dropped in sorted(state.orphans.items()):
+        # Delete the orphans of forgotten ids (a space the change rewrites
+        # anyway was read without them). Those of other ids are carried
+        # through below: identities.json may be an older copy.
+        dropped = {i: n for i, n in all_dropped.items() if i in tombstones}
+        if not dropped:
+            continue
         healed_history.append(
             history_row(
                 "orphan",
@@ -1123,6 +1173,28 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
         validate_space(document, name=name)
         merged_spaces[name] = document
     validate_relations(LibraryState(paths, identities, merged_spaces, state.observed))
+    carried: dict[str, dict[str, object]] = {}
+    for name, document in change.spaces.items():
+        kept = state.kept_orphans(name)
+        if not kept:
+            continue
+        written = copy.deepcopy(document)
+        exemplars = cast(dict[str, list[object]], written["exemplars"])
+        clash = sorted(set(kept) & set(exemplars))
+        if clash:
+            raise VoiceLibraryError(
+                f"{SPACES_DIRNAME}/{name}.json holds "
+                f"{sum(len(items) for items in kept.values())} voice sample(s) "
+                f"of identities {IDENTITIES_NAME} does not list, and this "
+                f"change would add samples under the same id ({', '.join(clash)}). "
+                f"Restore {IDENTITIES_NAME} (it may be an older copy); nothing "
+                "was changed"
+            )
+        exemplars.update(copy.deepcopy(kept))
+        validate_space(written, name=name)
+        carried[name] = written
+    if carried:
+        change = dataclasses.replace(change, spaces={**change.spaces, **carried})
 
     writes: list[tuple[Path, str]] = []
     if change.identities is not None:
@@ -1513,7 +1585,8 @@ def enroll_entries(
     identities_document = copy.deepcopy(state.identities)
     identities = cast(dict[str, dict[str, object]], identities_document["identities"])
     exemplars_by_identity = cast(dict[str, list[dict[str, object]]], space["exemplars"])
-    used_exemplars = _used_exemplar_ids(space)
+    orphan_identities, orphan_exemplars = state.orphan_ids(space_name)
+    used_exemplars = _used_exemplar_ids(space) | orphan_exemplars
     history: list[dict[str, object]] = []
     outcomes: list[EnrollOutcome] = []
     targets: set[str] = set()
@@ -1526,7 +1599,10 @@ def enroll_entries(
         vector = list(validate_vector(entry.vector, dim=dim, field="incoming vector"))
         if entry.identity_id is None:
             identity_id = _mint(
-                identity_id_factory, set(identities), require_identity_id, "identity"
+                identity_id_factory,
+                set(identities) | orphan_identities,
+                require_identity_id,
+                "identity",
             )
         else:
             identity_id = require_identity_id(entry.identity_id)
@@ -1911,7 +1987,7 @@ def import_store(
     identities_document = copy.deepcopy(state.identities)
     identities = cast(dict[str, dict[str, object]], identities_document["identities"])
     exemplars_by_identity = cast(dict[str, list[dict[str, object]]], space["exemplars"])
-    used_exemplars = _used_exemplar_ids(space)
+    used_exemplars = _used_exemplar_ids(space) | state.orphan_ids(space_name)[1]
     history: list[dict[str, object]] = []
     refused: list[str] = []
     created_count = added_count = present_count = superseded_count = 0

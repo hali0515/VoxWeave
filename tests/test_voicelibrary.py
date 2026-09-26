@@ -880,12 +880,16 @@ def test_misfiled_spaces_are_rejected(tmp_path):
         _read(root, spaces=["pyannote-000000000000"])
 
 
-def test_orphan_exemplars_are_skipped_on_read_and_deleted_by_a_writer(tmp_path, caplog):
-    # What a forget racing an enrollment on a mount without working locks
-    # leaves behind: vectors of an identity identities.json no longer has.
+def test_orphan_exemplars_are_skipped_on_read_and_kept_unless_forgotten(
+    tmp_path, caplog
+):
+    # Vectors of an identity identities.json does not list: left by a forget
+    # racing an enrollment on a mount without working locks, a manual edit,
+    # or an identities.json rolled back to an older copy.
     root = tmp_path / "voices"
     _enroll(root, [_entry(), _entry("Kazuma", _unit(1), label="SPEAKER_01")])
     [name] = _read(root).spaces
+    space_file = root / "spaces" / f"{name}.json"
     identities = root / "identities.json"
     document = json.loads(identities.read_text())
     del document["identities"]["v000000000002"]
@@ -896,21 +900,85 @@ def test_orphan_exemplars_are_skipped_on_read_and_deleted_by_a_writer(tmp_path, 
             state = _read(root, spaces=spaces)
             assert list(state.space_exemplars(name)) == ["v000000000001"]
             assert state.orphans == {name: {"v000000000002": 1}}
-    assert "unknown identities" in caplog.text
-    assert b"v000000000002" in (root / "spaces" / f"{name}.json").read_bytes()
+    assert "ignored but kept" in caplog.text
+    assert b"v000000000002" in space_file.read_bytes()
 
-    # Any write deletes them: here, forgetting the only remaining person.
+    # A write keeps them: here, forgetting the only remaining person.
     with voicelibrary.library_lock(root, exclusive=True):
         state = voicelibrary.read_state(root)
         change, removed = voicelibrary.forget_identity(state, "v000000000001")
         voicelibrary.commit(state, change)
     assert removed == {name: 1}
-    assert b"vector" not in (root / "spaces" / f"{name}.json").read_bytes()
+    on_disk = json.loads(space_file.read_text())
+    assert list(on_disk["exemplars"]) == ["v000000000002"]
+    assert _read(root).orphans == {name: {"v000000000002": 1}}
+    assert not [r for r in _history(root) if r["action"] == "orphan"]
+
+    # Orphans of a forgotten (tombstoned) id are deleted by the next write
+    # that read their space, even one that changes another space.
+    document = json.loads(identities.read_text())
+    document["forgotten"] = [*document["forgotten"], "v000000000002"]
+    identities.write_text(json.dumps(document))
+    ids = _Ids()
+    ids.identity = ids.exemplar = 10
+    with voicelibrary.library_lock(root, exclusive=True):
+        other, _fingerprint = voicelibrary.space_identity(_decoupled("other-model"))
+        state = voicelibrary.read_state(root, include=[other])
+        change, _outcomes = voicelibrary.enroll_entries(
+            state,
+            provenance=_decoupled("other-model"),
+            scope="Show A",
+            source=_source(),
+            entries=[_entry("Megumin", _unit(2))],
+            replace_episode=False,
+            at=NOW,
+            identity_id_factory=ids.identity_id,
+            exemplar_id_factory=ids.exemplar_id,
+        )
+        voicelibrary.commit(state, change)
+    assert b"vector" not in space_file.read_bytes()
     assert _read(root).orphans == {}
     orphan_row = next(r for r in _history(root) if r["action"] == "orphan")
     assert orphan_row["space"] == name
     assert orphan_row["identities"] == ["v000000000002"]
     assert orphan_row["exemplars"] == 1
+
+
+def test_a_rolled_back_identities_json_does_not_delete_newer_voices(tmp_path):
+    # A partial backup restore or a sync conflict leaves an older
+    # identities.json: the voices enrolled since must survive every writer.
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry("Aqua", _unit(0))], ids=ids)
+    identities = root / "identities.json"
+    old_identities = identities.read_bytes()
+    _enroll(root, [_entry("Kazuma", _unit(1))], source=_source(2), ids=ids)
+    [name] = _read(root).spaces
+    space_file = root / "spaces" / f"{name}.json"
+    kazuma = json.loads(space_file.read_text())["exemplars"]["v000000000002"]
+
+    identities.write_bytes(old_identities)
+    assert _read(root).orphans == {name: {"v000000000002": 1}}
+    _enroll(root, [_entry("Megumin", _unit(2))], source=_source(3), ids=ids)
+    _enroll(
+        root,
+        [_entry("Darkness", _unit(3))],
+        provenance=_decoupled("other-model"),
+        source=_source(4),
+        ids=ids,
+    )
+    assert json.loads(space_file.read_text())["exemplars"]["v000000000002"] == kazuma
+    assert not [r for r in _history(root) if r["action"] == "orphan"]
+
+    # Restoring the current identities.json brings the voice back.
+    document = json.loads(identities.read_text())
+    document["identities"]["v000000000002"] = json.loads(old_identities)["identities"][
+        "v000000000001"
+    ] | {"display_name": "Kazuma"}
+    identities.write_text(json.dumps(document))
+    state = _read(root)
+    assert state.orphans == {}
+    assert state.space_exemplars(name)["v000000000002"] == kazuma
 
 
 def test_a_missing_identities_json_is_refused_not_read_as_empty(tmp_path, caplog):
