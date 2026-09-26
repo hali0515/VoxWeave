@@ -33,7 +33,6 @@ from voxweave.engine_registry import (
 RouteKind = Literal["ctc-full", "mms-full", "qwen-crop"]
 AlignRole = Literal["acquisition", "adapter", "encoder", "evidence-bind", "commit"]
 SegmentationRole = Literal["adapter", "encoder", "commit"]
-ContextRole = AlignRole | SegmentationRole
 RoleTerminal = Literal["consumed", "retired"]
 
 ALIGN_ROLE_ORDER: tuple[AlignRole, ...] = (
@@ -387,28 +386,6 @@ def consume_context_role(
         return event
 
 
-def retire_context_role(
-    context: IssuedContext, role: str, *, consumer: str = "outer-orchestration"
-) -> ContextRoleEvent:
-    """Retire one still-live role; a terminal role cannot be retired again."""
-    with _LOCK:
-        record = _record_for(context)
-        role_record = record.roles.get(role)
-        if role_record is None:
-            raise ContextAuthorityError(
-                "context-role", f"unknown context role {role!r}"
-            )
-        if role_record.terminal is not None:
-            raise ContextAuthorityError(
-                "context-consumed", f"context role {role!r} is already terminal"
-            )
-        role_record.terminal = "retired"
-        role_record.consumer = consumer
-        event = ContextRoleEvent(role, "retired", consumer, len(record.events))
-        record.events.append(event)
-        return event
-
-
 def retire_live_context_roles(
     context: IssuedContext, *, consumer: str = "outer-orchestration"
 ) -> tuple[ContextRoleEvent, ...]:
@@ -498,16 +475,6 @@ def verify_context_binding(
         if observed != record.paths:
             raise ContextAuthorityError(
                 "context-binding", "context paths do not match the issued invocation"
-            )
-
-
-def verify_context_content(context: IssuedContext, stable_fields: FrozenObject) -> None:
-    """Reject a stable-content splice even if public digests were copied."""
-    with _LOCK:
-        record = _record_for(context)
-        if stable_fields != record.stable_fields:
-            raise ContextAuthorityError(
-                "context-binding", "stable context fields changed after issuance"
             )
 
 

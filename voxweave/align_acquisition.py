@@ -243,7 +243,7 @@ def _optional_json_float(value: float | None) -> FrozenJSON:
 
 
 def _relative_unit_value(unit: StrictCapturedUnit) -> FrozenArray:
-    """The displayed §5.3 fields, in their displayed order."""
+    """Every relative-unit field, in the fixed order its digest encoding binds."""
     return FrozenArray(
         (
             freeze_json(unit.unit_id),
@@ -457,7 +457,7 @@ def qwen_sample_geometry(
     sample_rate: int,
     sample_count: int,
 ) -> QwenSampleGeometry:
-    """Reproduce HEAD's Qwen slice arithmetic and retain both time origins."""
+    """Mirror ``chunking.slice_wav``'s sample arithmetic; retain both time origins."""
     if type(nominal_start) is not float or type(nominal_end) is not float:
         raise SampleGeometryError(
             "sample-geometry", "Qwen nominal bounds must be exact floats"
@@ -796,10 +796,6 @@ def _is_sha256(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
-
-
-def _default_digest(label: str, value: str) -> str:
-    return hashlib.sha256(f"{label}\0{value}".encode()).hexdigest()
 
 
 def _stable_fact_digest(value: object) -> str:
@@ -2194,27 +2190,6 @@ def _fresh_reference_core_inputs(
         copy.deepcopy(payload.v2_policy_status),
         copy.deepcopy(profile_status),
         copy.deepcopy(evidence_status),
-    )
-
-
-def _fresh_evidence_inputs(
-    context: IssuedAlignContext,
-    acquisition: IssuedFreshAlignment,
-) -> tuple[
-    tuple[AuthorityBlock, ...],
-    tuple[StrictCaptureResult, ...],
-    tuple[AuthorityTransformResult, ...],
-    tuple[LegacyCallDistributionReceipt, ...],
-    tuple[tuple[Mapping[str, Any], ...], ...],
-]:
-    """Return a separate thaw of facts needed by the AO-21 evidence binder."""
-    record = _fresh_record(context, acquisition)
-    return (
-        copy.deepcopy(record.blocks),
-        copy.deepcopy(record.captures),
-        copy.deepcopy(record.transforms),
-        copy.deepcopy(record.legacy_receipts),
-        copy.deepcopy(record.legacy_block_units),
     )
 
 

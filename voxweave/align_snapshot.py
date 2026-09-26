@@ -124,8 +124,6 @@ def freeze_json(value: Any) -> FrozenJSON:
             ),
         ):
             return node
-        if node is FROZEN_ABSENT:
-            return FROZEN_ABSENT
         if node is None:
             return FROZEN_NULL
         if type(node) is bool:
@@ -472,6 +470,14 @@ def _sibling_digest(
     )
 
 
+# Align runs on a hand-edited VTT: the recovery hint must not steer the user
+# into regenerating (and so overwriting) those edits without warning.
+_SIBLING_JSON_RECOVERY_HINT = (
+    "; restore it from a backup, or re-run `voxweave transcribe MEDIA` to"
+    " regenerate it (this also rewrites the VTT, so keep a copy of your edits)"
+)
+
+
 def decode_sibling_json_snapshot(name: str, raw: bytes | None) -> SiblingJSONSnapshot:
     """Build tolerant semantic and strict lexical projections from exact J0."""
     if raw is None:
@@ -499,21 +505,20 @@ def decode_sibling_json_snapshot(name: str, raw: bytes | None) -> SiblingJSONSna
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RuntimeError(
-            f"{name} is corrupt JSON (invalid UTF-8);"
-            " re-run transcribe/process to regenerate it"
+            f"{name} is corrupt JSON (invalid UTF-8){_SIBLING_JSON_RECOVERY_HINT}"
         ) from exc
     try:
         semantic_value = json.loads(text)
         lexical = _lexical_json_loads(text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"{name} is corrupt JSON ({exc.msg} at line {exc.lineno});"
-            " re-run transcribe/process to regenerate it"
+            f"{name} is corrupt JSON ({exc.msg} at line {exc.lineno})"
+            f"{_SIBLING_JSON_RECOVERY_HINT}"
         ) from exc
     if not isinstance(semantic_value, dict) or not isinstance(lexical, FrozenObject):
         raise RuntimeError(
-            f"{name}: expected a JSON object, got {type(semantic_value).__name__};"
-            " re-run transcribe/process to regenerate it"
+            f"{name}: expected a JSON object, got {type(semantic_value).__name__}"
+            f"{_SIBLING_JSON_RECOVERY_HINT}"
         )
     semantic_frozen = freeze_json(semantic_value)
     assert isinstance(semantic_frozen, FrozenObject)
@@ -568,9 +573,11 @@ def decode_subtitle_snapshot(name: str, raw: bytes) -> SubtitleSnapshot:
     sniffed = sniff_format(text)
     if sniffed == "ass":
         suffix = Path(name).suffix.lower().lstrip(".") or "no extension"
+        ass_name = Path(name).with_suffix(".ass").name
         raise RuntimeError(
             f"{Path(name).name}: content is ASS/SSA but the extension says {suffix};"
-            " rename the file to its real format"
+            f" align needs WebVTT, so rename it to {ass_name} and convert it with"
+            f" `voxweave export {ass_name} -f vtt`"
         )
     raw_blocks = realign.parse_vtt_blocks(text)
     if not raw_blocks:

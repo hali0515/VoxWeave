@@ -48,7 +48,6 @@ _PRODUCTION_CALL_VALUES = (1_000_000, 4_000_000, 1_000_000, 64_000_000)
 _PRODUCTION_JOB_VALUES = (4_096, 4_000_000, 16_000_000, 4_000_000, 256_000_000)
 
 COUNTER_ORDER = ("calls", "states", "edges", "intervals", "normalize_chars")
-SCOPE_ORDER = ("job", "call")
 
 
 @dataclass(frozen=True)

@@ -1,8 +1,9 @@
 """Closed RAT-2 evidence binding and independent durable verification.
 
-The producer receives only already-issued context/acquisition values and the
-independently projected EvidenceCore. The path verifier deliberately does not
-consult any in-memory issuer registry.
+The binder receives only already-issued context/acquisition values and the
+producer EvidenceCore, which AO-16 has already checked against the independent
+reference projection. The path verifier deliberately does not consult any
+in-memory issuer registry.
 """
 
 from __future__ import annotations
@@ -330,10 +331,6 @@ class SelectedOutputs:
     vtt_sha256: str
     json_present: Literal[True]
     json_sha256: str
-
-    @property
-    def main_json_sha256(self) -> str:
-        return self.json_sha256
 
 
 @dataclass(frozen=True, init=False)
@@ -1308,6 +1305,7 @@ def _project_route_mismatch(
             "expected_delivery_index": position,
             "observed_delivery_index": observed[position],
         }
+    skip_ordinal = 0
     for position, claim in enumerate(claims):
         route = route_entries[position]
         owner_kind = claim["owner_kind"]
@@ -1316,9 +1314,12 @@ def _project_route_mismatch(
             owner_kind == "skip" and owner_index < len(skips)
         )
         expected_kind = "skip" if route["action"] == "qwen-skip" else "call"
-        expected_owner = (
-            route["delivery_index"] if expected_kind == "skip" else route["call_index"]
-        )
+        if expected_kind == "skip":
+            # A skip is owned by its ordinal among the plan's qwen-skip entries.
+            expected_owner = skip_ordinal
+            skip_ordinal += 1
+        else:
+            expected_owner = route["call_index"]
         if (
             not exists
             or claim["source_index"] != route["source_index"]
@@ -2087,7 +2088,9 @@ def _media_integrity(
 
 
 def _w1_usable_audit(root: Mapping[str, Any]) -> bool:
-    """Return the unsigned section 9.3 usability audit conjunction."""
+    """Return the unsigned W1 usability conjunction: production limit profile,
+    valid V2 admission, full (non-default) source facts, and owner ranges that
+    cover every raw unit exactly once."""
     try:
         history = root["input_history"]
         source_facts = root["source_facts"]
