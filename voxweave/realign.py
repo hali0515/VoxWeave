@@ -1,8 +1,15 @@
-"""Pure logic for re-running forced alignment on edited VTT text.
+"""Pure logic around forced alignment: VTT I/O, punctuation mapping, cue-span finalization.
 
-Parses VTT, routes edited blocks to audio windows via char-level difflib against
-old word_segments, back-fills aligner-returned units into each block, and formats
-timestamps. Model inference and audio preparation live in :mod:`voxweave.pipeline`.
+Parses and renders VTT; maps text char-by-char with difflib (punctuation re-injection and
+dual-ASR fusion); positions aligned units against the VAD speech map (transcribe path);
+turns per-block aligned units into final cue spans (insertion interpolation, duration
+floor, flash-cue rescue, clamping); formats timestamps.
+
+The route/crop helpers serve only the per-cue Qwen align path (languages without a CTC
+aligner configured, e.g. zh/yue). The default en (wav2vec2 CTC) and ja (MMS) align runs one
+full-file pass that slices units back per cue itself. Model inference lives in
+:mod:`voxweave.backend`, :mod:`voxweave.align_ctc` and :mod:`voxweave.align_mms`; audio
+preparation and orchestration in :mod:`voxweave.pipeline`.
 """
 
 from __future__ import annotations
@@ -31,7 +38,8 @@ GAP_SEC = 2.0
 # 0.1s is kept only so difflib rough spans on edited text don't clip real speech.
 PAD_SEC = 0.1
 # Forced alignment snaps to tight acoustic boundaries; short interjections (はい 50ms, クレイ 150ms)
-# flash by instantly without a floor. Unlike process/smart_split, align must enforce this itself.
+# can flash by. Optional display floor, used only as enforce_min_duration's default; production
+# passes pipeline.MIN_CUE_SEC (VOXWEAVE_MIN_CUE_SEC, default 0 = off).
 MIN_CUE_SEC = 0.8
 # Flash-display rescue for very short cues (so/あ/え). Orthogonal to MIN_CUE_SEC: that mechanism
 # never overlaps; this one allows side-by-side display with the next cue (at most 1 overlapping neighbor).
@@ -39,6 +47,10 @@ TINY_CUE_SEC = 0.2
 TINY_CUE_TARGET = 0.5
 
 _TS = re.compile(r"(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})")
+# WebVTT file header: only valid as the first block; case-insensitive for back-compat.
+_VTT_HEADER = re.compile(r"WEBVTT(?:[ \t].*)?", re.IGNORECASE)
+# NOTE/STYLE/REGION blocks: exact uppercase keyword, alone or followed by space/tab.
+_VTT_META = re.compile(r"(?:NOTE|STYLE|REGION)(?:[ \t].*)?")
 
 
 # --------------------------------------------------------------------------- #
@@ -59,10 +71,14 @@ def parse_vtt_blocks(text: str, *, srt_speaker_names: Sequence[str] = ()) -> lis
 
     Handles both formats: if a ``-->`` timing line is present, start/end are populated
     (re-run scenario); otherwise start/end are None (initial align from plain-text edit).
-    Cue id lines, WEBVTT headers, and NOTE/STYLE/REGION blocks are discarded.
+    Cue id lines, the WEBVTT header, and NOTE/STYLE/REGION blocks are discarded. Per the
+    WebVTT grammar the header is recognised only as the first block, and a NOTE/STYLE/REGION
+    block needs the exact uppercase keyword (alone or followed by space/tab) and no ``-->``
+    line — so dialogue such as ``Noted, sir.`` or ``Regional office.`` stays a cue.
     """
     blocks: list[dict] = []
     music_only = 0
+    first = True
     text = text.lstrip("\ufeff")  # a leading BOM must not defeat the header check
     for raw in re.split(r"\n[ \t]*\n", text.replace("\r\n", "\n").replace("\r", "\n")):
         lines = [ln for ln in raw.split("\n")]
@@ -74,7 +90,11 @@ def parse_vtt_blocks(text: str, *, srt_speaker_names: Sequence[str] = ()) -> lis
         if not lines:
             continue
         head = lines[0].strip()
-        if head.upper().startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
+        is_header = first and _VTT_HEADER.fullmatch(head) is not None
+        first = False
+        if is_header:
+            continue
+        if _VTT_META.fullmatch(head) and not any("-->" in ln for ln in lines):
             continue
         start = end = None
         body = lines
@@ -118,7 +138,7 @@ def parse_vtt_blocks(text: str, *, srt_speaker_names: Sequence[str] = ()) -> lis
 
 
 # --------------------------------------------------------------------------- #
-# Character-level alignment (shared by routing and back-fill)
+# Character-level alignment (Qwen-path routing and punctuation re-injection)
 # --------------------------------------------------------------------------- #
 def _flatten(texts: list[str]) -> tuple[str, list[int]]:
     """Flatten text segments → (lowercased alnum char stream, per-char owner index).
@@ -156,8 +176,8 @@ def _seq_map_proportional(a, b):
 def char_owner_map(item_texts: list[str], ref_texts: list[str]) -> list[set[int]]:
     """Character-level difflib alignment → set of ref indices covered by each item text.
 
-    Used for routing (item=edited blocks, ref=old word_segments) and back-fill
-    (item=window blocks, ref=aligner units). Replace blocks still anchor to the ref region.
+    Used by :func:`route_blocks` (item=edited blocks, ref=old word_segments) on the per-cue
+    Qwen align path. Replace blocks still anchor to the ref region.
     """
     ic, io = _flatten(item_texts)
     rc, ro = _flatten(ref_texts)
@@ -187,6 +207,11 @@ def spans_from_sets(
 _FUSE_PUNCT = set("。、！？，,.!?")
 
 
+def _in_number(text: str, i: int) -> bool:
+    """Whether ``text[i]`` sits between two digits (decimal point / thousands separator)."""
+    return 0 < i < len(text) - 1 and text[i - 1].isdigit() and text[i + 1].isdigit()
+
+
 def fuse_punct_into_text(
     text: str,
     punct_units: list[dict],
@@ -207,12 +232,19 @@ def fuse_punct_into_text(
     boundary (≈ sentence boundary) or is dropped.
 
     ``strip_existing`` (True for spaced languages): strips whisper's own sentence delimiters so
-    only Qwen punctuation remains. No-space languages retain whisper's own punctuation (whisper
-    large-v3 ja punctuation is reasonable; both coexist after content alignment).
+    only Qwen punctuation remains — except a ``.``/``,`` between two digits (``14.2``,
+    ``1,000``), which is part of the number. No-space languages retain whisper's own
+    punctuation (whisper large-v3 ja punctuation is reasonable; both coexist after content
+    alignment). A Qwen mark is not inserted next to a retained whisper delimiter, so the two
+    never double up (``。。``).
 
     ``punct_units`` must carry Qwen content chars + punctuation (output of
     :func:`reinject_punct`) so punctuation has content anchors. Pure function.
     """
+
+    def kept(i: int) -> bool:  # whisper char survives the rebuild
+        return not strip_existing or text[i] not in _FUSE_PUNCT or _in_number(text, i)
+
     # Extract Qwen content-char stream + punctuation events.
     # event (idx, char): insert after the idx-th content char; idx==0 = sentence-initial.
     q_chars: list[str] = []
@@ -225,7 +257,7 @@ def fuse_punct_into_text(
                 events.append((len(q_chars), c))
     if not events:  # no Qwen punctuation: optionally strip whisper's own delimiters
         if strip_existing:
-            return "".join(c for c in text if c not in _FUSE_PUNCT)
+            return "".join(c for i, c in enumerate(text) if kept(i))
         return text
     # Whisper content-char stream + each char's position in text.
     w_chars: list[str] = []
@@ -257,13 +289,18 @@ def fuse_punct_into_text(
             if wi is None:
                 continue  # no equal char before this punct (e.g. song lyrics) → drop
             at = w_pos[wi] + 1
+        if any(
+            0 <= k < len(text) and text[k] in _FUSE_PUNCT and kept(k)
+            for k in (at, at - 1)
+        ):
+            continue  # whisper already has a delimiter here → no double punctuation
         inserts.setdefault(at, []).append(punct)
     # Rebuild text, inserting Qwen punctuation at resolved positions.
     out: list[str] = []
     for i, c in enumerate(text):
         for p in inserts.get(i, ()):
             out.append(p)
-        if not strip_existing or c not in _FUSE_PUNCT:
+        if kept(i):
             out.append(c)
     for p in inserts.get(len(text), ()):  # trailing punct
         out.append(p)
@@ -472,8 +509,9 @@ def route_blocks(
 ) -> list[tuple[float, float] | None]:
     """Rough audio interval for each edited block (used only for window positioning, not in final output).
 
-    If blocks already carry timestamps (re-run scenario), those are used directly; otherwise
-    falls back to character-level matching against the old word_segments.
+    Per-cue Qwen align path only; the en/ja full-pass aligners need no routing. If blocks
+    already carry timestamps (re-run scenario), those are used directly; otherwise falls back
+    to character-level matching against the old word_segments.
     """
     if blocks and all(b["start"] is not None and b["end"] is not None for b in blocks):
         return [(b["start"], b["end"]) for b in blocks]
@@ -496,7 +534,8 @@ def crop_blocks(
     WhisperX confines each segment to its own acoustic range — this is isomorphic. The window is
     **not extended to the next sentence start**: with no extra room, the CTC path cannot drift
     the final word into inter-sentence silence. Window size is independent of neighbor distance,
-    so crossing song holes is impossible without needing gap_sec checks.
+    so crossing song holes is impossible without needing gap_sec checks. Per-cue Qwen align
+    path only; the en/ja full-pass aligners are not cropped.
 
     Returns the same length as ``spans``; None entries are insertion blocks handled by
     :func:`fill_insert_blocks`.
@@ -524,7 +563,7 @@ def join_block_texts(texts: list[str], iso: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Back-fill and finalization
+# Insertion-block interpolation (all align paths)
 # --------------------------------------------------------------------------- #
 def fill_insert_blocks(
     spans: list[tuple[float, float] | None],
@@ -637,10 +676,15 @@ class ZeroDurationDiagnostics:
         raw_exact_zero == repaired_exact_zero + residual_exact_zero
 
     Fate is decided per input index, so every raw zero-duration unit lands in exactly
-    one bucket. Repairs are attributed from the steps' own change records
-    (:meth:`record_change`), never guessed by diffing floats — a later carve can move
-    a unit the snap step never touched, and a relocated unit can land on a span that
-    happens to be as wide as it started.
+    one bucket. An exact-zero unit is judged from the output width alone: repaired when
+    its output span is wider than ``EXACT_ZERO_EPS``, residual otherwise (any width a
+    ``start == end`` input gains is a repair, whichever step supplied it). Collapse
+    candidates are instead attributed from the steps' own change records
+    (:meth:`record_change`), not by diffing floats — a later carve can move a unit the
+    snap step never touched, and a relocated unit can land on a span as narrow as it
+    started. ``repaired_collapse_candidates`` (changed) and
+    ``residual_collapse_candidates`` (still ``<= ZERO_DURATION_EPS`` wide) are therefore
+    independent counts and need not sum to ``raw_collapse_candidates``.
     """
 
     calls: int = 0
@@ -1050,17 +1094,20 @@ def position_units_with_vad(
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Cue span finalization (all align paths)
+# --------------------------------------------------------------------------- #
 def group_block_spans(
     block_units: list[list[dict]],
 ) -> tuple[list[tuple[float, float] | None], list[dict]]:
-    """Reconstruct per-block spans: ``(first word start, last word end)`` from the cropped window.
+    """Reconstruct per-block spans: ``(first word start, last word end)`` of each block's units.
 
     Empty blocks → None (interpolated by :func:`fill_insert_blocks`). Returns ``(spans, flat_units)``.
 
-    **No VAD snap/carve**: tight cropping gives the aligner no room to drift into inter-sentence
-    silence, making :func:`position_units_with_vad` unnecessary here (transcribe applies it on
-    full-chunk alignments). Zero-duration residues go directly to :func:`clamp_spans` —
-    isomorphic to WhisperX's "trust raw + interpolate_nans". Pure function.
+    **No VAD snap/carve**: per-cue Qwen crops are tight and the en/ja full-pass DP absorbs
+    silence in blank tokens, so :func:`position_units_with_vad` is not applied here (transcribe
+    applies it on full-chunk alignments). Zero-duration residues go directly to
+    :func:`clamp_spans` — isomorphic to WhisperX's "trust raw + interpolate_nans". Pure function.
     """
     flat = [u for bu in block_units for u in bu]
     spans: list[tuple[float, float] | None] = []
