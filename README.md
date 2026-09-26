@@ -890,6 +890,8 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
   display duration; distinct from the segmentation floor `VOXWEAVE_SEG_MIN_CUE_SEC`)
 - `VOXWEAVE_SNAP_VAD_THRESHOLD` (default 0.25; sensitive VAD used when repositioning
   zero-duration units against the original audio)
+- `VOXWEAVE_SHOT_SCENE` (default 0.3, range (0, 1]; ffmpeg scene-change score above which a
+  frame counts as a shot cut for `--shot-snap`; an invalid value warns and uses the default)
 - `VOXWEAVE_SONG_CORE_MERGE_SEC` (default 15; song spans within this gap of a long OP/ED
   cluster into one song "core" that stops the dialogue edge trim — an isolated brief sting
   farther away is trimmed through instead of anchoring dialogue into the excised song)
@@ -1056,9 +1058,9 @@ re-run alone through the per-chunk call (thresholds: `VOXWEAVE_ASR_BATCH_MIN_CPS
 `VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC`). A batch whose call raises is likewise redone chunk by
 chunk, so one poisoned chunk degrades alone.
 
-Shot-change detection needs no setting: it is a CPU-only ffmpeg pass that now starts before
-transcription and is joined at its workflow step, so it overlaps the GPU stages and the
-`detect shot changes` entry in the timing line is normally ~0s.
+Shot-change detection normally needs no setting (`VOXWEAVE_SHOT_SCENE` tunes its
+sensitivity): it is a CPU-only ffmpeg pass that now starts before transcription and is
+joined at its workflow step, so it overlaps the GPU stages and the `detect shot changes` entry in the timing line is normally ~0s.
 
 ## Data contract
 
