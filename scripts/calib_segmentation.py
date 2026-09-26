@@ -55,9 +55,11 @@ Subcommands::
     shadow            P5: measure the full finalizer lane/row matrix beside v1
     compare-video-dir legacy: run the same metrics over private media siblings
 
-The last stdout line is always a machine summary::
+A run that measures (exit 0 or 1) ends stdout with a machine summary::
 
     QUALITY segmentation status=pass cases=20 failures=0 warnings=0 report=...
+
+An invalid run (exit 2) reports on stderr and may print no summary line.
 """
 
 from __future__ import annotations
@@ -311,11 +313,6 @@ def metric_definition_block() -> dict[str, Any]:
             "ja_tail_lens": forbidden_end_ja_lens(),
         },
     }
-
-
-def metric_definition_digest() -> str:
-    """Digest of :func:`metric_definition_block` for baseline compatibility."""
-    return cc.canonical_digest(metric_definition_block())
 
 
 def repo_commit() -> str | None:
@@ -1875,8 +1872,9 @@ def gate_exit_code(results: Sequence[Mapping[str, Any]]) -> int:
 def load_baseline(path: str | Path, corpus: Corpus) -> dict[str, Any]:
     """Load a baseline and refuse to compare against one that does not fit.
 
-    A digest, metric-definition or segmenter-version mismatch is exit 2 and
-    demands a reviewed ``record-baseline``. Silently comparing today's corpus to
+    A corpus-digest or metric-definition mismatch is exit 2 and demands a
+    reviewed ``record-baseline``. Segmenter/python version drift is checked
+    separately by :func:`environment_drift` in ``evaluate``. Silently comparing today's corpus to
     yesterday's numbers is how a gate stops meaning anything.
     """
     baseline = cc.load_validated_json(path, BASELINE_SCHEMA, label=str(path))
@@ -1914,7 +1912,16 @@ def load_baseline(path: str | Path, corpus: Corpus) -> dict[str, Any]:
     if problems:
         raise cc.CalibrationError(
             f"{path} does not describe this corpus",
-            [*problems, "re-record deliberately: make quality-record-segmentation"],
+            [
+                *problems,
+                "re-record deliberately: `make quality-segmentation` refuses to run"
+                " against this baseline, so first write a fresh report without it:"
+                " `uv run --extra <cuda|mps> python scripts/calib_segmentation.py"
+                f" evaluate --corpus {corpus.path}"
+                " --json-out build/calibration/segmentation-report.json`"
+                " (no --baseline, no --check), review it, then run"
+                " `make quality-record-segmentation`",
+            ],
         )
     return baseline
 
@@ -2101,9 +2108,20 @@ def private_corpus_path() -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _warn_private_missing() -> None:
+    """Say why ``--private`` produced no private block (stderr only)."""
+    root = os.environ.get("VOXWEAVE_CALIB_ROOT", "").strip()
+    if not root:
+        reason = "VOXWEAVE_CALIB_ROOT is not set"
+    else:
+        reason = f"{Path(root) / 'segmentation' / 'corpus.json'} does not exist"
+    print(f"warning: --private ignored: {reason}", file=sys.stderr)
+
+
 def evaluate_private() -> dict[str, Any] | None:
     path = private_corpus_path()
     if path is None:
+        _warn_private_missing()
         return None
     corpus = load_corpus(path, strict_size=False)
     measurements = run_cases(corpus.cases)
@@ -2318,7 +2336,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     warned = sum(
         1 for r in gate_results if r["mode"] == "warning" and r["status"] != "pass"
     )
-    code = gate_exit_code(gate_results) if args.check else cc.EXIT_OK
+    verdict = gate_exit_code(gate_results)
+    code = verdict if args.check else cc.EXIT_OK
     if code == cc.EXIT_INVALID:
         print(
             machine_summary("invalid", len(measurements), failures, warned, destination)
@@ -2331,7 +2350,18 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 if r["mode"] == "blocking" and r["status"] == "insufficient_samples"
             ],
         )
-    status = "fail" if code == cc.EXIT_GATE_FAILED else "pass"
+    # The status reflects the gates even without --check (as ``shadow`` does);
+    # only the exit code is left unenforced.
+    status = {
+        cc.EXIT_OK: "pass",
+        cc.EXIT_GATE_FAILED: "fail",
+        cc.EXIT_INVALID: "invalid",
+    }[verdict]
+    if not args.check and verdict != cc.EXIT_OK:
+        print(
+            f"note: status={status} not enforced (--check not given); exiting 0",
+            file=sys.stderr,
+        )
     print(machine_summary(status, len(measurements), failures, warned, destination))
     return code
 
@@ -3857,10 +3887,11 @@ _COARSE_BREAKERS = frozenset("。！？、，,.!?；;：:")
 def load_coarse_manifest(path: str | Path = DEFAULT_COARSE_CORPUS) -> dict[str, Any]:
     """Load W2's shadow-only derivation registry under a closed local schema."""
     source = Path(path)
-    try:
-        payload = cc.read_json(source)
-    except OSError as exc:
-        raise cc.CalibrationError(f"coarse corpus not found: {source}") from exc
+    # cc.read_json already turns OSError into CalibrationError, so check
+    # existence first to keep the specific message reachable.
+    if not source.is_file():
+        raise cc.CalibrationError(f"coarse corpus not found: {source}")
+    payload = cc.read_json(source)
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",
         "description",
@@ -6487,7 +6518,10 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--baseline",
         default=None,
-        help="tracked baseline to compare against; omitted = absolute gates only",
+        help=(
+            "tracked baseline to compare against; omitted = the default gates are"
+            " reported in warning mode only, so no gate is enforced"
+        ),
     )
     evaluate.add_argument("--json-out", default=None, help="where to write the report")
     evaluate.add_argument(

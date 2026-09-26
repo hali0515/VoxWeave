@@ -175,6 +175,8 @@ def read_json(path: str | Path) -> Any:
         text = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise CalibrationError(f"cannot read {p}: {exc}") from None
+    except UnicodeDecodeError as exc:
+        raise CalibrationError(f"{p} is not valid UTF-8: {exc}") from None
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
@@ -219,7 +221,8 @@ def _jsonschema_module() -> Any:
     except ImportError as exc:  # pragma: no cover - environment problem, not logic
         raise CalibrationError(
             "jsonschema is required for calibration validation "
-            "(dev group: `uv sync --extra cuda --dev`)",
+            "(dev group: `make dev`, i.e. `uv sync --extra <cuda|mps> --dev`; "
+            "or `pip install 'jsonschema>=4,<5'`)",
             [str(exc)],
         ) from None
     return jsonschema
@@ -257,15 +260,20 @@ def schema_errors(
     """
     jsonschema = _jsonschema_module()
     validator = jsonschema.Draft202012Validator(_resolve_schema(schema))
+    # ``relevance`` ranks higher-is-better (``best_match`` takes its max), so
+    # sort descending to keep the most relevant errors when truncating.
+    errors = sorted(
+        validator.iter_errors(instance),
+        key=jsonschema.exceptions.relevance,
+        reverse=True,
+    )
     out: list[str] = []
-    for err in sorted(
-        validator.iter_errors(instance), key=jsonschema.exceptions.relevance
-    ):
+    for err in errors[:limit]:
         where = "/".join(str(part) for part in err.absolute_path) or "<root>"
         out.append(f"{where}: {err.message}")
-        if len(out) >= limit:
-            out.append("... (further errors suppressed)")
-            break
+    dropped = len(errors) - len(out)
+    if dropped > 0:
+        out.append(f"... ({dropped} further errors suppressed)")
     return out
 
 

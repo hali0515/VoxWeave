@@ -185,6 +185,25 @@ def test_unparsable_json_is_calibration_error(tmp_path: Path) -> None:
         cc.read_json(path)
 
 
+def test_non_utf8_json_is_calibration_error_naming_the_file(tmp_path: Path) -> None:
+    path = tmp_path / "latin1.json"
+    path.write_bytes(b'{"k": "\xff"}')
+    with pytest.raises(cc.CalibrationError) as excinfo:
+        cc.read_json(path)
+    assert str(path) in excinfo.value.message
+
+
+def test_schema_errors_notice_only_when_errors_dropped() -> None:
+    schema = {"type": "object", "properties": {k: {"type": "string"} for k in "abc"}}
+    doc = {"a": 1, "b": 2, "c": 3}
+    exact = cc.schema_errors(doc, schema, limit=3)
+    assert len(exact) == 3
+    assert not any("suppressed" in e for e in exact)
+    capped = cc.schema_errors(doc, schema, limit=2)
+    assert len(capped) == 3
+    assert capped[-1] == "... (1 further errors suppressed)"
+
+
 def test_read_json_or_exit2_uses_exit_code_2(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as excinfo:
         cc.read_json_or_exit2(tmp_path / "missing.json")
