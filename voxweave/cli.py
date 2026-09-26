@@ -9,6 +9,7 @@ import rich_click as click
 
 from voxweave import artifacts, config, pipeline
 from voxweave.cli_compat import (
+    HELP_REQUESTED,
     DefaultGroup,
     DeprecatedAlias,
     renamed_option,
@@ -66,9 +67,10 @@ def _flag_source(
     envvar: str | None = None,
 ) -> tuple[bool, str]:
     if value is not None:
-        return value, f"CLI --{key.replace('_', '-')}"
-    if envvar is not None and envvar in os.environ:
-        raw = os.environ[envvar].strip().lower()
+        return value, f"CLI --{'' if value else 'no-'}{key.replace('_', '-')}"
+    # A blank value (an exported but empty variable) counts as unset.
+    raw = os.environ.get(envvar, "").strip().lower() if envvar is not None else ""
+    if raw:
         if raw in _TRUE_FLAG_VALUES:
             return True, f"environment {envvar}"
         if raw in _FALSE_FLAG_VALUES:
@@ -236,13 +238,18 @@ def _resolve_llm(
 def cli(ctx, verbose: bool) -> None:
     """Turn media into editable subtitles and ready-to-share video.
 
-    Capture: transcribe. Revise: correct -> edit -> align -> render.
+    Capture: transcribe. Revise: correct -> edit the VTT by hand -> align;
+    render re-lays out cues from the JSON.
     Deliver: translate -> export -> pack or burn.
 
     Shortcut: voxweave MEDIA runs transcribe. Use COMMAND --help for options.
     """
     install_logging(verbose=verbose)
-    if ctx.invoked_subcommand not in {"speakers", "voices", "help"}:
+    if (
+        ctx.invoked_subcommand not in {"speakers", "voices", "help"}
+        and not ctx.resilient_parsing
+        and not ctx.meta.get(HELP_REQUESTED)
+    ):
         config.ensure_default_config()  # write default config template on first run
 
 
@@ -267,7 +274,8 @@ def cli(ctx, verbose: bool) -> None:
     default=None,
     envvar="VOXWEAVE_ASR_MODEL",
     help=(
-        "Local ASR model (default: Qwen3-ASR-0.6B; use qwen3-asr-1.7B or full HF id for higher accuracy; "
+        "Local ASR model (default: VOXWEAVE_ASR_MODEL env, conf asr_model, or "
+        "Qwen3-ASR-0.6B; use qwen3-asr-1.7B or full HF id for higher accuracy; "
         "or faster-whisper: large-v3 / large-v3-turbo / turbo)."
     ),
 )
@@ -303,7 +311,7 @@ def cli(ctx, verbose: bool) -> None:
     default=False,
     help="Transcribe detected songs instead of skipping them: sung cues are flagged and"
     " wrapped with music notes (overrides --skip-songs excision; detection still runs;"
-    " export to ASS renders them italic).",
+    " export to ASS renders them italic). Requires --separate.",
 )
 @click.option(
     "--sdh",
@@ -371,14 +379,14 @@ def cli(ctx, verbose: bool) -> None:
 )
 @click.option(
     "--min-speakers",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
     help="Lower bound on the number of speakers for diarization (only used with --diarize;"
     " pass both --min-speakers and --max-speakers when the count is known to steer pyannote).",
 )
 @click.option(
     "--max-speakers",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
     help="Upper bound on the number of speakers for diarization (only used with --diarize).",
 )
@@ -403,8 +411,8 @@ def cli(ctx, verbose: bool) -> None:
 @click.option(
     "--timestamps/--no-timestamps",
     default=None,
-    help="Include word-level timestamps in VTT (default: on, or conf [defaults].timestamps;"
-    " same precision as align output, ready to use)."
+    help="Write cue timing lines in the VTT (word-level precision from alignment;"
+    " default: on, or conf [defaults].timestamps)."
     " Use --no-timestamps for a plain-text editing draft; run align afterwards to re-assign timing.",
 )
 @click.option(
@@ -451,10 +459,24 @@ def cmd_transcribe(
     Runs ASR and alignment models locally. Also available as voxweave MEDIA.
     Existing sibling outputs are replaced; preserve reviewed edits before rerunning.
     """
+    log = logging.getLogger("voxweave")
     _apply_vad_mask(vad_mask)
     separate = _flag(separate, "separate", True)
     normalize = _flag(normalize, "normalize", False)
     skip_songs = _flag(skip_songs, "skip_songs", True)
+    if keep_lyrics and not separate:
+        log.warning(
+            "--keep-lyrics has no effect: song detection needs vocal separation"
+        )
+    if (
+        min_speakers is not None
+        and max_speakers is not None
+        and min_speakers > max_speakers
+    ):
+        raise click.UsageError(
+            f"--min-speakers ({min_speakers}) is greater than "
+            f"--max-speakers ({max_speakers})"
+        )
     try:
         diarize, diarize_source = _flag_source(diarize, "diarize", False)
         voiceprints, voiceprints_source = _flag_source(
@@ -465,18 +487,26 @@ def cmd_transcribe(
         )
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
+    if not diarize:
+        for flag, value in (
+            ("--diarize-model", diarize_model),
+            ("--speaker-clustering", speaker_clustering),
+            ("--min-speakers", min_speakers),
+            ("--max-speakers", max_speakers),
+        ):
+            if value is not None:
+                log.warning(
+                    "%s has no effect: diarization is off (from %s); "
+                    "add --diarize to identify speakers",
+                    flag,
+                    diarize_source,
+                )
     diarize_model = config.resolve_diarize_model(diarize_model)
     if diarize:
         try:
             speaker_clustering = config.resolve_diarize_clustering(speaker_clustering)
         except ValueError as exc:
             raise click.UsageError(str(exc)) from exc
-    elif speaker_clustering is not None:
-        logging.getLogger("voxweave").warning(
-            "--speaker-clustering has no effect: diarization is off (from %s); "
-            "add --diarize to identify speakers",
-            diarize_source,
-        )
     if voiceprints and not diarize:
         raise click.UsageError(
             "voiceprint capture is on from "
@@ -497,7 +527,7 @@ def cmd_transcribe(
     except ValueError as exc:
         raise click.UsageError(str(exc)) from exc
     if voiceprint_model is not None and not voiceprints:
-        logging.getLogger("voxweave").warning(
+        log.warning(
             "--voiceprint-model has no effect: voiceprint capture is off (from %s); "
             "add --voiceprints to capture voiceprints",
             voiceprints_source,
@@ -528,7 +558,14 @@ def cmd_transcribe(
             shot_snap=shot_snap,
         )
     )
-    dbg_dir = artifacts.claim_paths(media).debug if debug else None
+    dbg_dir = None
+    if debug:
+        # Display only: read the claim the run made, never create or fail on it.
+        try:
+            paths = artifacts.inspect_paths(media)
+        except artifacts.ArtifactMarkerError:
+            paths = None
+        dbg_dir = paths.debug if paths is not None else None
     summary_panel(
         out,
         separated=separate,
@@ -642,10 +679,10 @@ def cmd_align(
     normalize: bool | None,
     vad_mask: bool | None,
 ) -> None:
-    """Re-align after editing: run forced alignment on edited VTT text against the original audio,
-    overwrite VTT with timestamps, and update JSON.
+    """Re-align edited VTT text against the original audio.
 
-    **Loads alignment/separation models locally** (in-process PyTorch, see voxweave.backend); no endpoint calls.
+    Runs forced alignment with local models (no endpoint calls), then
+    overwrites the VTT with fresh timestamps and updates the sibling JSON.
     """
     _apply_vad_mask(vad_mask)
     separate = _flag(separate, "separate", True)
@@ -746,11 +783,13 @@ def cmd_translate(
     window_cues: int | None,
     allow_partial: bool,
 ) -> None:
-    """Translate after align: call an OpenAI-compatible endpoint for each subtitle cue
-    (VTT/SRT/ASS), write <stem>.<to>.<ext> mirroring the input format (original unchanged)."""
+    """Translate subtitles (VTT/SRT/ASS) with an OpenAI-compatible endpoint.
+
+    Sends the cues in windows (see --concurrency) and writes
+    <stem>.<target>.<ext> in the input's format; the original is unchanged.
+    """
     from voxweave.translate import load_glossary
 
-    gloss = load_glossary(glossary) if glossary else None
     api_key, kwargs = _resolve_llm(
         api_key_env, model, base_url, task_envvar="VOXWEAVE_TRANSLATE_MODEL"
     )
@@ -759,7 +798,7 @@ def cmd_translate(
             vtt,
             to=to,
             context=context,
-            glossary=gloss,
+            glossary=load_glossary(glossary) if glossary else None,
             api_key=api_key,
             reasoning_effort=reasoning_effort,
             concurrency=concurrency,
@@ -1023,28 +1062,30 @@ def cmd_correct(
     base_url: str | None,
     api_key_env: str,
 ) -> None:
-    """Pre-align LLM correction: fix obvious ASR errors, split words, and garbled proper nouns; produce a reviewable diff.
+    """Fix obvious ASR errors (split words, garbled proper nouns) with an LLM.
 
-    By default writes adjacent sidecar ``<stem>.asrfix.vtt`` plus an audit in the per-media
-    artifact cache (or an existing adjacent legacy audit lane); the original VTT is untouched.
-    ``--apply`` overwrites the original VTT in place (no audit json) and, since the text changed,
-    automatically re-runs alignment to refresh timestamps (use ``--no-align`` to skip).
-    Safety gate: only applies revisions where orig matches the original text line-for-line.
+    By default writes <stem>.asrfix.vtt next to the VTT for review, plus an
+    audit of every change in the artifact cache; the original VTT is untouched.
+    --apply rewrites the original VTT instead (no audit) and re-aligns it to
+    refresh timestamps (--no-align skips that). A safety gate rejects revisions
+    whose quoted text does not match the cue or that rewrite too much.
     """
     from voxweave.translate import load_glossary
 
-    gloss = load_glossary(glossary) if glossary else None
+    _apply_vad_mask(None)
     api_key, kwargs = _resolve_llm(
         api_key_env, model, base_url, task_envvar="VOXWEAVE_FIX_MODEL"
     )
     res = _run(
         lambda rep: pipeline.correct(
             vtt,
-            glossary=gloss,
+            glossary=load_glossary(glossary) if glossary else None,
             api_key=api_key,
             apply=apply,
             align_after=apply and do_align,
             media_path=media,
+            separate=_flag(None, "separate", True),
+            normalize=_flag(None, "normalize", False),
             reporter=rep,
             **kwargs,
         )

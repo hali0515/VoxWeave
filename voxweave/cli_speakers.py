@@ -13,7 +13,7 @@ from rich.table import Table
 
 from voxweave import artifacts, pipeline
 from voxweave.cli_compat import DefaultGroup, warn_deprecated
-from voxweave.cli_voices import VoicesDirPath
+from voxweave.cli_voices import VOICES_DIR_DEFAULT, VoicesDirPath
 
 
 class SpeakersGroup(DefaultGroup):
@@ -165,8 +165,7 @@ def build_speakers_group(
     @click.option(
         "--voices-dir",
         type=voices_dir_type,
-        help="Voice library directory (default: VOXWEAVE_VOICES_DIR, conf "
-        "[voices].dir, or ~/.local/share/voxweave/voices).",
+        help=f"Voice library directory ({VOICES_DIR_DEFAULT}).",
     )
     @click.option(
         "--voices",
@@ -242,8 +241,7 @@ def build_speakers_group(
     @click.option(
         "--voices-dir",
         type=voices_dir_type,
-        help="Voice library for name suggestions (default: VOXWEAVE_VOICES_DIR, "
-        "conf [voices].dir, or ~/.local/share/voxweave/voices).",
+        help=f"Voice library for name suggestions ({VOICES_DIR_DEFAULT}).",
     )
     @click.option(
         "--voices",

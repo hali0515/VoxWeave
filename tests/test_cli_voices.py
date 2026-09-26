@@ -346,3 +346,18 @@ def test_help_lists_voices_and_the_alias_matches(invoke):
 def test_voices_commands_do_not_write_a_config_template(tmp_path, invoke):
     invoke("voices", "where")
     assert not Path(tmp_path / "voxweave.conf").exists()
+
+
+def test_every_voices_dir_option_documents_the_same_default():
+    from voxweave.cli_voices import VOICES_DIR_DEFAULT
+
+    assert "$XDG_DATA_HOME/voxweave/voices" in VOICES_DIR_DEFAULT
+    helps = [
+        param.help or ""
+        for group in ("voices", "speakers")
+        for command in cli_module.cli.commands[group].commands.values()
+        for param in command.params
+        if param.name == "voices_dir"
+    ]
+    assert len(helps) >= 3
+    assert all(f"({VOICES_DIR_DEFAULT})" in text for text in helps)

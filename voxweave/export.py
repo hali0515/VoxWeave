@@ -230,7 +230,11 @@ def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
         raise ValueError(f"unknown export format(s): {', '.join(unknown)}")
     src_fmt = sub_path.suffix.lower().lstrip(".")
     if src_fmt in formats:
-        raise ValueError(f"{sub_path.name} is already .{src_fmt}; pick another --to")
+        example = "vtt" if src_fmt == "srt" else "srt"
+        raise ValueError(
+            f"{sub_path.name} is already .{src_fmt}; "
+            f"pick another --format (e.g. -f {example})"
+        )
     blocks = load_subtitle_blocks(sub_path)
     timed_blocks = [
         block

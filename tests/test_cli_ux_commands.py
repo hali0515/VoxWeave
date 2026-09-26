@@ -388,6 +388,24 @@ def test_native_click_suggestion_is_not_duplicated(monkeypatch):
     assert "pass a path" in result.output
 
 
+def test_unknown_verb_never_suggests_a_hidden_alias(cli_case):
+    hidden = _invoke(cli_case, ["spli"])
+    assert hidden.exit_code == 2
+    assert "'split'" not in hidden.output
+    visible = _invoke(cli_case, ["rendr"])
+    assert visible.exit_code == 2
+    flat = " ".join(visible.output.replace("│", " ").split())
+    assert flat.count("Did you mean 'render'?") == 1
+
+
+def test_overlong_token_is_an_unknown_command_not_a_crash(cli_case):
+    result = _invoke(cli_case, ["a" * 5000])
+    assert result.exit_code == 2
+    assert "No such command" in result.output
+    assert not isinstance(result.exception, OSError)
+    cli_case.calls["transcribe"].assert_not_called()
+
+
 def test_speakers_list_does_not_create_first_run_config(tmp_path, monkeypatch):
     from voxweave.cli_speakers import _list_episode
 

@@ -398,3 +398,149 @@ def test_process_diarize_default_off(tmp_path):
         r = CliRunner().invoke(cli, [str(media)])
     assert r.exit_code == 0, r.output
     assert m.call_args.kwargs["diarize"] is False
+
+
+def _flat(text: str) -> str:
+    """Collapse rich's wrapping so log lines can be matched as one sentence."""
+    return " ".join(text.split())
+
+
+def _correct_result(v):
+    return {
+        "out": v,
+        "audit": None,
+        "applied": [],
+        "rejected": [],
+        "n_cues": 1,
+        "applied_in_place": True,
+        "aligned": False,
+    }
+
+
+def test_correct_apply_realign_honours_conf_defaults(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("VOXWEAVE_VAD_EMISSION_MASK", "")  # restored after the test
+    _write_conf(
+        tmp_path, "[defaults]\nseparate = false\nnormalize = true\nvad_mask = true\n"
+    )
+    v = _vtt(tmp_path)
+    with patch("voxweave.pipeline.correct", return_value=_correct_result(v)) as m:
+        r = CliRunner().invoke(cli, ["correct", "--apply", str(v)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["separate"] is False
+    assert m.call_args.kwargs["normalize"] is True
+    assert os.environ["VOXWEAVE_VAD_EMISSION_MASK"] == "1"
+
+
+@pytest.mark.parametrize("command", ["translate", "correct"])
+def test_bad_glossary_renders_error_panel(tmp_path, monkeypatch, command):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    v = _vtt(tmp_path)
+    g = tmp_path / "g.json"
+    g.write_text("{not json", encoding="utf-8")
+    with patch(f"voxweave.pipeline.{command}") as m:
+        r = CliRunner().invoke(cli, [command, str(v), "--glossary", str(g)])
+    assert r.exit_code == 1
+    assert isinstance(r.exception, SystemExit)  # error panel, not a traceback
+    assert "invalid JSON in glossary g.json" in _flat(r.output)
+    assert not m.called
+
+
+@pytest.mark.parametrize("option", ["--min-speakers", "--max-speakers"])
+def test_speaker_bounds_must_be_positive(tmp_path, option):
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, ["--diarize", option, "0", str(media)])
+    assert r.exit_code == 2
+    assert not m.called
+
+
+def test_min_speakers_above_max_speakers_is_usage_error(tmp_path):
+    media, out = _media(tmp_path)
+    args = ["--diarize", "--min-speakers", "3", "--max-speakers", "2", str(media)]
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, args)
+    assert r.exit_code == 2
+    assert "is greater than" in _flat(r.output)
+    assert not m.called
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--min-speakers", "2"],
+        ["--max-speakers", "4"],
+        ["--diarize-model", "3.1"],
+        ["--speaker-clustering", "pyannote"],
+    ],
+)
+def test_speaker_options_warn_when_diarization_is_off(tmp_path, args):
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out):
+        r = CliRunner().invoke(cli, ["--no-diarize", *args, str(media)])
+    assert r.exit_code == 0, r.output
+    assert (
+        f"{args[0]} has no effect: diarization is off (from CLI --no-diarize)"
+        in _flat(r.output)
+    )
+
+
+def test_keep_lyrics_without_separation_warns(tmp_path):
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, ["--no-separate", "--keep-lyrics", str(media)])
+    assert r.exit_code == 0, r.output
+    assert "--keep-lyrics has no effect" in _flat(r.output)
+    assert m.call_args.kwargs["keep_lyrics"] is True
+
+
+def test_blank_voiceprints_env_counts_as_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOXWEAVE_VOICEPRINTS", "  ")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["voiceprints"] is False
+
+
+@pytest.mark.parametrize(
+    "args", [["transcribe", "--help"], ["render", "-h"], ["-v", "align", "--help"]]
+)
+def test_subcommand_help_does_not_write_default_config(tmp_path, args):
+    r = CliRunner().invoke(cli, args)
+    assert r.exit_code == 0, r.output
+    assert not (tmp_path / "voxweave.conf").exists()
+    assert "created default config" not in r.output
+
+
+def test_real_run_still_writes_default_config(tmp_path):
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out):
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert (tmp_path / "voxweave.conf").exists()
+
+
+def test_debug_summary_reads_the_claim_without_creating_one(tmp_path):
+    from voxweave import artifacts
+
+    media, out = _media(tmp_path)
+    with (
+        patch("voxweave.pipeline.process", return_value=out),
+        patch("voxweave.cli.summary_panel") as panel,
+    ):
+        r = CliRunner().invoke(cli, ["--debug", str(media)])
+    assert r.exit_code == 0, r.output
+    assert panel.call_args.kwargs["debug_dir"] is None
+    assert artifacts.inspect_paths(media) is None  # nothing claimed for display
+
+    debug_dir = artifacts.claim_paths(media).debug
+    with (
+        patch("voxweave.pipeline.process", return_value=out),
+        patch("voxweave.cli.summary_panel") as panel,
+    ):
+        r = CliRunner().invoke(cli, ["--debug", str(media)])
+    assert r.exit_code == 0, r.output
+    assert panel.call_args.kwargs["debug_dir"] == debug_dir

@@ -89,11 +89,13 @@ def _empty_cache() -> None:
         pass
 
 
+_INSTALL_CUDA = '`uv tool install --torch-backend=cu128 "voxweave[cuda]"`'
+
 _MISSING_HINT = (
     "Local model loading requires the voxweave[cuda] or voxweave[mps] install "
     "(qwen-asr + einops/rotary-embedding-torch/... + torch). "
-    "Install: `make install` (NVIDIA/Linux, cu128 wheel) or `make install VARIANT=mps` "
-    "(Apple Silicon/macOS). Missing: {mod}"
+    f'Install: {_INSTALL_CUDA} (NVIDIA) or `uv tool install "voxweave[mps]"` '
+    "(Apple Silicon); from a checkout: `make install`. Missing: {mod}"
 )
 
 
@@ -101,7 +103,8 @@ _MISSING_WHISPER = (
     "faster-whisper engine requires the voxweave[cuda] install (faster-whisper + qwen-asr aligner; "
     "CUDA/Linux only — ctranslate2 has no Metal/MPS backend). On Apple Silicon the whisper engine "
     "runs via mlx-whisper instead (voxweave[mps]); this torch path is only reached with "
-    "VOXWEAVE_BACKEND=torch. Install: `make install` or `uv pip install -e '.[cuda]'`. Missing: {mod}"
+    f"VOXWEAVE_BACKEND=torch. Install: {_INSTALL_CUDA}; from a checkout: `make install`. "
+    "Missing: {mod}"
 )
 
 
@@ -114,7 +117,8 @@ def _hf_error(repo: str, err: Exception) -> RuntimeError:
     """Wrap a raw huggingface_hub download failure with an actionable auth/network hint."""
     return RuntimeError(
         f"failed to download {repo!r} from Hugging Face: {err}. "
-        "Check network access; gated repos need HF_TOKEN (or VOXWEAVE_HF_TOKEN) set."
+        "Check network access; gated repos need a token (VOXWEAVE_HF_TOKEN, HF_TOKEN, "
+        "conf hf_token, or `hf auth login`)."
     )
 
 
@@ -227,8 +231,10 @@ def _hf_download(repo: str, filename: str, cache_dir: str | None = None) -> str:
         from huggingface_hub import hf_hub_download
     except ModuleNotFoundError as e:
         raise _require(e.name or "huggingface_hub") from e
+    from voxweave import config
+
     with _bridged_bars(filename) as bridge:
-        kwargs = {}
+        kwargs: dict[str, Any] = {"token": config.conf_hf_token()}
         if (
             bridge is not None
             and "tqdm_class" in inspect.signature(hf_hub_download).parameters
@@ -254,8 +260,12 @@ def _hf_snapshot(repo: str, cache_dir: str) -> str:
         from huggingface_hub import snapshot_download
     except ModuleNotFoundError as e:
         raise _require(e.name or "huggingface_hub") from e
+    from voxweave import config
+
     with _bridged_bars(repo) as bridge:
-        kwargs: dict[str, Any] = {} if bridge is None else {"tqdm_class": bridge}
+        kwargs: dict[str, Any] = {"token": config.conf_hf_token()}
+        if bridge is not None:
+            kwargs["tqdm_class"] = bridge
         try:
             return snapshot_download(repo, cache_dir=cache_dir, **kwargs)
         except RuntimeError:

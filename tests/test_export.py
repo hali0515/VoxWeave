@@ -79,8 +79,11 @@ def test_export_rejects_unknown_format(tmp_path):
 def test_export_rejects_same_format_as_source(tmp_path):
     srt = tmp_path / "x.srt"
     srt.write_text("1\n00:00:00,000 --> 00:00:01,000\nhi\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="already .srt"):
+    with pytest.raises(ValueError, match="already .srt") as info:
         export_subtitles(srt, ("srt",))
+    # Names the visible option with a format that differs from the source.
+    assert "pick another --format (e.g. -f vtt)" in str(info.value)
+    assert "--to" not in str(info.value)
 
 
 def test_export_srt_input_to_vtt_and_ass(tmp_path):
