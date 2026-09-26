@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from voxweave import backend, chunking, songdet
+from voxweave import backend, chunking, runtime, songdet
 
 SR = 16000
 
@@ -182,6 +182,11 @@ def _fake_panns(monkeypatch, *, cuda: bool):
     monkeypatch.setattr(songdet, "_ensure_panns_labels", lambda: None)
     monkeypatch.setattr(songdet, "_resolve_panns_ckpt", lambda: "/fake/Cnn14.pth")
     monkeypatch.setattr(songdet, "_model", None)
+    # songdet resolves the device through runtime.get_device(), which caches it
+    # process-wide; pin it here so the torch stub never leaks into that cache.
+    monkeypatch.setattr(
+        runtime, "get_device", lambda: "cuda:0" if cuda else "cpu", raising=True
+    )
     return instances, empties
 
 

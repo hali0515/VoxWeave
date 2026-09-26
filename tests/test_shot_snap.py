@@ -262,26 +262,49 @@ def _install_missing_ffmpeg(monkeypatch):
     monkeypatch.setattr(shotdet.subprocess, "Popen", popen)
 
 
+def _detect_shot_changes(media, threshold=None, timeout_s=3600):
+    """Blocking use of the job: start the pass and collect it at once."""
+    return shotdet.ShotDetectionJob().start(media, threshold, timeout_s).result()
+
+
 def test_detect_parses_showinfo(monkeypatch, tmp_path):
     _install_popen(monkeypatch, rc=0, stderr=SHOWINFO)
-    cuts = shotdet.detect_shot_changes(tmp_path / "v.mkv")
+    cuts = _detect_shot_changes(tmp_path / "v.mkv")
     assert cuts == [12.345, 23.4]
 
 
 def test_detect_none_on_no_video(monkeypatch, tmp_path):
     _install_popen(monkeypatch, rc=1)
-    assert shotdet.detect_shot_changes(tmp_path / "a.wav") is None
+    assert _detect_shot_changes(tmp_path / "a.wav") is None
 
 
 def test_detect_none_on_missing_ffmpeg(monkeypatch, tmp_path):
     _install_missing_ffmpeg(monkeypatch)
-    assert shotdet.detect_shot_changes(tmp_path / "v.mkv") is None
+    assert _detect_shot_changes(tmp_path / "v.mkv") is None
 
 
 def test_detect_none_on_timeout(monkeypatch, tmp_path):
     launches = _install_popen(monkeypatch, hang=True)
-    assert shotdet.detect_shot_changes(tmp_path / "v.mkv", timeout_s=1) is None
+    assert _detect_shot_changes(tmp_path / "v.mkv", timeout_s=1) is None
     assert launches[0][2].calls == ["kill"]
+
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-0.2", "1.5", "nan"])
+def test_scene_threshold_env_warns_and_falls_back(monkeypatch, caplog, raw):
+    # unparsable or outside (0, 1] (scene scores lie in [0, 1]) -> default, loudly
+    monkeypatch.setenv("VOXWEAVE_SHOT_SCENE", raw)
+    with caplog.at_level(logging.WARNING, logger="voxweave.shotdet"):
+        assert shotdet._scene_threshold() == shotdet.SCENE_THRESHOLD
+    assert "VOXWEAVE_SHOT_SCENE" in caplog.text
+
+
+def test_scene_threshold_env_in_range_is_used(monkeypatch):
+    monkeypatch.setenv("VOXWEAVE_SHOT_SCENE", " 0.45 ")
+    assert shotdet._scene_threshold() == 0.45
+    monkeypatch.setenv("VOXWEAVE_SHOT_SCENE", "1")
+    assert shotdet._scene_threshold() == 1.0
+    monkeypatch.setenv("VOXWEAVE_SHOT_SCENE", "")
+    assert shotdet._scene_threshold() == shotdet.SCENE_THRESHOLD
 
 
 def test_job_launch_follows_ffmpeg_contract(monkeypatch, tmp_path):
@@ -289,7 +312,7 @@ def test_job_launch_follows_ffmpeg_contract(monkeypatch, tmp_path):
     shotdet.ShotDetectionJob().start(tmp_path / "v.mkv", threshold=0.42)
     (cmd, kwargs, _proc), *rest = launches
     assert not rest
-    # Byte-identical to the argv the blocking detect_shot_changes built before
+    # Byte-identical to the argv the original blocking detector built before
     # the job existed; anything else changes what ffmpeg detects.
     assert cmd == [
         "ffmpeg",
@@ -320,7 +343,7 @@ def test_job_launch_follows_ffmpeg_contract(monkeypatch, tmp_path):
 
 def test_job_result_matches_detect_and_is_idempotent(monkeypatch, tmp_path):
     launches = _install_popen(monkeypatch, rc=0, stderr=SHOWINFO)
-    expected = shotdet.detect_shot_changes(tmp_path / "v.mkv")
+    expected = _detect_shot_changes(tmp_path / "v.mkv")
     job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
     first = job.result()
     assert first == expected == [12.345, 23.4]
@@ -363,7 +386,7 @@ def test_job_keeps_cuts_around_undecodable_stderr_bytes(monkeypatch, tmp_path):
     )
     job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
     assert job.result() == [1.5, 3.5]
-    assert shotdet.detect_shot_changes(tmp_path / "v.mkv") == [1.5, 3.5]
+    assert _detect_shot_changes(tmp_path / "v.mkv") == [1.5, 3.5]
 
 
 @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")

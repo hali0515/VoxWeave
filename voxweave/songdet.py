@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import contextlib
+import csv
+import io
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +14,20 @@ import soundfile as sf
 from voxweave import config
 
 log = logging.getLogger("voxweave")
+
+
+def _env_float(name: str, default: float) -> float:
+    """Import-time float knob via the tolerant ``config._env_float``: a malformed value falls
+    back to ``default`` instead of raising (which would break every CLI command, even
+    ``--help``), with a warning naming the variable."""
+    raw = os.environ.get(name, "").strip()
+    if raw:
+        try:
+            float(raw)
+        except ValueError:
+            log.warning("ignoring %s=%r (not a number); using %s", name, raw, default)
+    return config._env_float(name, default)
+
 
 # PANNs Cnn14 training SR — must feed 32k; 16k input causes a sample-rate mismatch.
 SR = 32000
@@ -25,6 +43,9 @@ PANNS_LABELS_URL = os.environ.get(
     "VOXWEAVE_PANNS_LABELS_URL",
     "https://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv",
 )
+# A complete labels csv: this header plus one row per Cnn14 output class.
+_PANNS_LABELS_HEADER = ["index", "mid", "display_name"]
+PANNS_CLASSES = 527
 
 # AudioSet class indices (class_labels_indices.csv)
 IDX_SPEECH = [0, 4, 6, 7]  # Speech, Conversation, Babbling, Speech synthesizer
@@ -39,7 +60,8 @@ SPEECH_MAX = 0.25
 # Clean-dialogue signature on separated vocals: speech dominant, almost no singing/instrumental
 # residue. Used during span expansion to trim dialogue flush against the song-core edge rather
 # than absorb it. Interior rap verses still carry rhythmic residue (sing >= SING_QUIET_MAX or
-# music >= MUSIC_QUIET_MAX), so they do NOT match and are still absorbed (preserves pit-2 protection).
+# music >= MUSIC_QUIET_MAX), so they do NOT match and are still absorbed: a rap verse between
+# sung windows stays inside the excised song.
 SPEECH_CLEAN_MIN = 0.5
 SING_QUIET_MAX = 0.10
 MUSIC_QUIET_MAX = 0.20
@@ -48,13 +70,15 @@ HOP_SEC = 1.0
 GAP_MERGE_SEC = 2.0
 MIN_SPAN_SEC = 3.0
 BLOCK_GAP_SEC = 3.0  # adjacent VAD segments within this gap are treated as one voiced block (for span expansion)
-# Song-core clustering: song spans within this gap of a long expandable span are the same song
-# (tolerates rap/instrumental interludes between sung windows — e.g. a 3s sung OP intro sitting
-# ~12s before the chorus). A short song span farther than this from any long core is an isolated
-# sting embedded in dialogue; it must NOT stop the edge trim (else it anchors the whole dialogue
-# tail into the song). Bounds the two known cases: yofukashi rap-OP intro (~12s) is protected,
-# an Isekai in-dialogue sting (~49s from the OP) is isolated.
-SONG_CORE_MERGE_SEC = float(os.environ.get("VOXWEAVE_SONG_CORE_MERGE_SEC", "15.0"))
+# Song-core clustering: song spans are chained single-linkage — each span (in start order) joins
+# the current cluster when it starts within this gap of the cluster's end so far — and a cluster
+# that overlaps an expandable span is one song (tolerates rap/instrumental interludes between
+# sung windows — e.g. a 3s sung OP intro sitting ~12s before the chorus). A short song span not
+# chained to any expandable span is an isolated sting embedded in dialogue; it must NOT stop the
+# edge trim (else it anchors the whole dialogue tail into the song). Bounds the two known cases:
+# yofukashi rap-OP intro (~12s) is protected, an Isekai in-dialogue sting (~49s from the OP) is
+# isolated.
+SONG_CORE_MERGE_SEC = _env_float("VOXWEAVE_SONG_CORE_MERGE_SEC", 15.0)
 # Intra-segment excision: PANNs span edges are coarse (2s windows), so cut points are
 # snapped into the nearest real silence within SNAP_SEC (fine-VAD gaps) — the song goes
 # out together with its flanking silence, and dialogue words are never bisected.
@@ -65,7 +89,7 @@ MIN_KEEP_SEC = 0.4  # excised remainders shorter than this are noise shards, dro
 # separated audio 0.66-0.83 Speech). A PANNs clean-dialogue stretch of at least this length
 # with NO waveform-VAD coverage is a genuine miss and is rescued into the chunk stream;
 # shorter remainders are inter-sentence pauses (PANNs 2s windows blur them) and stay out.
-SPEECH_RESCUE_MIN_SEC = float(os.environ.get("VOXWEAVE_SPEECH_RESCUE_MIN_S", "3.0"))
+SPEECH_RESCUE_MIN_SEC = _env_float("VOXWEAVE_SPEECH_RESCUE_MIN_S", 3.0)
 
 _model = None  # AudioTagging singleton — lazy-loaded, reused within the process
 
@@ -79,44 +103,123 @@ def _resolve_panns_ckpt() -> str:
     return _hf_download(PANNS_REPO, PANNS_REPO_FILE, cache_dir=config.AUDIO_CACHE)
 
 
+def _panns_labels_ok(data: bytes) -> bool:
+    """True when ``data`` is a complete AudioSet labels csv: the header plus one row per class.
+
+    An empty file, a truncated download or an HTML error page saved under the csv name would
+    otherwise reach panns_inference, which sizes Cnn14's output layer from the row count."""
+    try:
+        rows = [r for r in csv.reader(io.StringIO(data.decode("utf-8-sig"))) if r]
+    except (UnicodeDecodeError, csv.Error):
+        return False
+    return (
+        bool(rows)
+        and rows[0] == _PANNS_LABELS_HEADER
+        and len(rows) == PANNS_CLASSES + 1
+    )
+
+
 def _ensure_panns_labels() -> None:
     """Pre-place ~/panns_data/class_labels_indices.csv so importing panns_inference never shells out
     to `wget` (its config.py wgets this file at import time — wget is absent on macOS). Pulls from the
-    same HF repo as the checkpoint when available, else the canonical AudioSet URL via urllib."""
-    dst = Path.home() / "panns_data" / PANNS_LABELS_FILE
-    if dst.exists():
-        return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    try:  # prefer HF (cached under AUDIO_CACHE, same source as the checkpoint)
-        import shutil
+    same HF repo as the checkpoint when available, else the canonical AudioSet URL via urllib.
 
+    An existing file is kept only when it is a complete labels csv; anything else (empty,
+    truncated, an HTML error page) is re-fetched. The write is atomic (temp file + replace), so
+    an interrupted fetch never leaves a partial csv behind. Raises RuntimeError naming the path
+    and URL when no valid copy can be obtained."""
+    dst = Path.home() / "panns_data" / PANNS_LABELS_FILE
+    try:
+        if _panns_labels_ok(dst.read_bytes()):
+            return
+        log.warning("PANNs labels %s is incomplete or corrupt; re-fetching", dst)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning("cannot read PANNs labels %s (%r); re-fetching", dst, e)
+
+    def _fail(why: str) -> RuntimeError:
+        return RuntimeError(
+            f"cannot obtain the PANNs labels csv ({why}); download {PANNS_LABELS_URL} "
+            f"and place it manually at {dst}"
+        )
+
+    data = b""
+    try:  # prefer HF (cached under AUDIO_CACHE, same source as the checkpoint)
         from voxweave.runtime import _hf_download
 
         src = _hf_download(PANNS_REPO, PANNS_LABELS_FILE, cache_dir=config.AUDIO_CACHE)
-        shutil.copyfile(src, dst)
-        return
+        data = Path(src).read_bytes()
     except Exception:  # noqa: BLE001 -- repo may not host the csv; fall back to the canonical URL
         pass
-    import urllib.request
+    if not _panns_labels_ok(data):
+        import http.client
+        import urllib.request
 
-    with urllib.request.urlopen(PANNS_LABELS_URL) as r:  # noqa: S310 -- fixed trusted host
-        data = r.read()
-    dst.write_bytes(data)
-    log.info("downloaded PANNs labels -> %s", dst)
+        try:
+            # fixed trusted host; the timeout keeps a stalled connection from hanging the job
+            with urllib.request.urlopen(PANNS_LABELS_URL, timeout=30) as r:  # noqa: S310
+                data = r.read()
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            raise _fail(f"download failed: {e!r}") from e
+        if not _panns_labels_ok(data):
+            raise _fail(
+                f"{PANNS_LABELS_URL} did not return a {PANNS_CLASSES}-class csv"
+            )
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{PANNS_LABELS_FILE}.")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, dst)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+    except OSError as e:
+        raise _fail(f"write failed: {e!r}") from e
+    log.info("placed PANNs labels -> %s", dst)
+
+
+def panns_labels() -> list[str]:
+    """AudioSet display names in PANNs output order (column i of :func:`window_probs`).
+
+    Ensures the labels csv first: importing panns_inference without it runs the package's own
+    import-time ``wget`` bootstrap."""
+    _ensure_panns_labels()
+    from panns_inference import labels
+
+    return labels
 
 
 def _get_model():
     global _model
     if _model is None:
         _ensure_panns_labels()  # must precede the import: panns_inference.config reads the csv eagerly
-        import torch
         from panns_inference import AudioTagging
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        from voxweave.runtime import get_device
+
+        # Honour VOXWEAVE_DEVICE / cuda -> mps -> cpu like every other model. AudioTagging
+        # itself only knows the exact string "cuda", and then wraps the net in DataParallel
+        # over EVERY visible GPU; any other string makes it load on CPU. So pass the resolved
+        # device (bare "cuda" pinned to one card) and move the bare module there ourselves.
+        dev = get_device()
+        if dev == "cuda":
+            dev = "cuda:0"
         # Pass checkpoint explicitly so panns_inference never falls back to its ~/panns_data Zenodo download.
         ckpt = _resolve_panns_ckpt()
-        _model = AudioTagging(checkpoint_path=ckpt, device=device)
-        log.info("PANNs Cnn14 loaded on %s (%s)", device, ckpt)
+        # AudioTagging print()s its setup; stdout must carry only result paths (CLI contract).
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            m = AudioTagging(checkpoint_path=ckpt, device=dev)
+        for line in out.getvalue().splitlines():
+            log.debug("panns_inference: %s", line)
+        if m.device != dev:
+            m.model.to(dev)
+            m.device = dev  # inference() moves each input batch to self.device
+        _model = m
+        log.info("PANNs Cnn14 loaded on %s (%s)", dev, ckpt)
     return _model
 
 
@@ -217,7 +320,8 @@ def speech_flags_from_scores(
 
     Used during expansion edge-trimming: genuine dialogue (sing~0/music~0.03) at the song
     boundary is trimmed rather than absorbed. Interior rap verses carry residue and do NOT
-    match, so they are still absorbed (preserves pit-2 protection)."""
+    match, so they are still absorbed: a rap verse between sung windows stays inside the
+    excised song."""
     return (speech > speech_min) & (sing < sing_max) & (music < music_max)
 
 
@@ -383,15 +487,19 @@ def expand_spans_to_voiced_blocks(
 
     ``protect`` (default None = no trimming) lists clean-dialogue spans (see
     :func:`speech_flags`): before absorbing a block, dialogue segments at the leading/trailing
-    edges are trimmed inward until a non-dialogue segment is hit. Interior segments (rap verses
-    between song windows) are NOT trimmed and are still absorbed (preserves pit-2 protection).
-    The song **core** (an expandable OP/ED span plus any song span contiguous with it, gap
-    <= block_gap) is always preserved; trimming only affects what block expansion adds. The
-    trim stop keys on that core, NOT on every ``spans`` entry: a brief embedded sting (a short,
-    non-expandable song span sitting inside a dialogue block far from any core — e.g. a 3s
-    musical hit) must not anchor the whole dialogue tail into the song. Such stings are trimmed
-    through here and re-covered by the short-span excision path (``plan_song_skip`` short_sing).
-    A short sung intro flush against a long core stays part of the core and still stops the trim.
+    edges are trimmed inward until a non-dialogue segment is hit. Interior segments are NOT
+    trimmed and are still absorbed, so a rap verse between sung windows stays inside the
+    excised song even when it scores as clean dialogue.
+    The song **core** (the member spans of a cluster that overlaps an expandable OP/ED span;
+    ``spans`` are clustered single-linkage, each joining when it starts within
+    ``SONG_CORE_MERGE_SEC`` of the cluster's end so far — ``block_gap`` plays no part) is
+    always preserved; trimming only affects what block expansion adds. The trim stop keys on
+    that core, NOT on every ``spans`` entry: a brief embedded sting (a short, non-expandable
+    song span sitting inside a dialogue block far from any core — e.g. a 3s musical hit) must
+    not anchor the whole dialogue tail into the song. Such stings are trimmed through here and
+    re-covered by the short-span excision path (``plan_song_skip`` short_sing). A short sung
+    intro within ``SONG_CORE_MERGE_SEC`` of a long core stays part of the core and still stops
+    the trim.
     """
     if not spans or not segments:
         return spans
@@ -553,20 +661,25 @@ def window_probs(
     data, sr = sf.read(str(wav_path), dtype="float32")
     if data.ndim > 1:
         data = data.mean(axis=1)
-    assert sr == SR, f"expected {SR} Hz, got {sr!r} — decode_to_wav(sample_rate={SR})"
+    if sr != SR:
+        raise ValueError(
+            f"expected {SR} Hz, got {sr!r} — decode_to_wav(sample_rate={SR})"
+        )
 
     win, hop = int(WIN_SEC * SR), int(HOP_SEC * SR)
     if len(data) < win:
         return None
     starts_idx = list(range(0, len(data) - win + 1, hop))
-    wins = np.stack([data[s : s + win] for s in starts_idx])
 
     model = _get_model()
-    batch_starts = list(range(0, len(wins), batch))
+    batch_starts = list(range(0, len(starts_idx), batch))
     nb = len(batch_starts)
     probs = []
     for bi, i in enumerate(batch_starts):
-        out, _ = model.inference(wins[i : i + batch])
+        # Stack one batch at a time: materialising every overlapping window up front
+        # would hold ~WIN_SEC/HOP_SEC copies of the decoded audio.
+        wins = np.stack([data[s : s + win] for s in starts_idx[i : i + batch]])
+        out, _ = model.inference(wins)
         probs.append(out)
         if progress is not None:
             progress(bi + 1, nb)
@@ -581,7 +694,8 @@ def detect_song_spans(
     """Run PANNs on a 32 kHz mono separated-vocals WAV.
 
     Returns ``(song/music spans, singing spans, clean-dialogue spans)``:
-    - song/music spans: used to drop VAD segments.
+    - song/music spans: after voiced-block expansion, cut out of the VAD segments (see
+      :func:`excise_spans_from_segments`) so flanking dialogue keeps its own timestamps.
     - singing spans (subset): spans with human vocals; only these trigger voiced-block
       expansion. Pure-instrumental BGM is absent here, so it never swallows adjacent dialogue.
     - clean-dialogue spans: trimmed from voiced-block boundaries during expansion rather

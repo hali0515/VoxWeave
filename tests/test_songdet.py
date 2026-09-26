@@ -1,4 +1,10 @@
+import logging
+import sys
+import types
+
 import numpy as np
+import pytest
+import soundfile as sf
 
 from voxweave import songdet
 from voxweave.songdet import (
@@ -16,43 +22,207 @@ from voxweave.songdet import (
 )
 
 
-def test_ensure_panns_labels_noop_when_present(monkeypatch, tmp_path):
-    # CSV already at ~/panns_data -> no download attempted (urllib/hf would raise if called)
-    monkeypatch.setattr(songdet.Path, "home", staticmethod(lambda: tmp_path))
-    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
-    dst.parent.mkdir(parents=True)
-    dst.write_text("index,mid,display_name\n")
-
-    def _boom(*a, **k):
-        raise AssertionError("must not download when csv already present")
-
-    monkeypatch.setattr("urllib.request.urlopen", _boom)
-    songdet._ensure_panns_labels()  # should return immediately, no exception
+# A complete labels csv: header + one row per class (display names may hold quoted commas).
+LABELS_CSV = (
+    "index,mid,display_name\n"
+    + "".join(f'{i},/m/{i:05d},"Label {i}, x"\n' for i in range(songdet.PANNS_CLASSES))
+).encode()
 
 
-def test_ensure_panns_labels_falls_back_to_url(monkeypatch, tmp_path):
-    # HF download fails -> urllib fetches the canonical csv and writes it to ~/panns_data
+class _Resp:
+    def __init__(self, body: bytes):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self.body
+
+
+def _labels_env(monkeypatch, tmp_path, body=None):
+    """Home -> tmp_path, HF has no csv; urlopen serves ``body`` (None: must not be called).
+
+    Returns the list of urlopen calls (args, kwargs)."""
     monkeypatch.setattr(songdet.Path, "home", staticmethod(lambda: tmp_path))
 
     def _hf_fail(*a, **k):
         raise RuntimeError("repo has no csv")
 
     monkeypatch.setattr("huggingface_hub.hf_hub_download", _hf_fail)
+    calls = []
 
-    class _Resp:
-        def __enter__(self):
-            return self
+    def _urlopen(*a, **k):
+        if body is None:
+            raise AssertionError("must not download when csv already present")
+        calls.append((a, k))
+        return _Resp(body)
 
-        def __exit__(self, *a):
-            return False
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    return calls
 
-        def read(self):
-            return b"index,mid,display_name\n0,/m/x,Speech\n"
 
-    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Resp())
+def test_ensure_panns_labels_noop_when_present(monkeypatch, tmp_path):
+    # complete CSV already at ~/panns_data -> no download attempted
+    _labels_env(monkeypatch, tmp_path)
+    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
+    dst.parent.mkdir(parents=True)
+    dst.write_bytes(LABELS_CSV)
+    songdet._ensure_panns_labels()  # should return immediately, no exception
+    assert dst.read_bytes() == LABELS_CSV
+
+
+def test_ensure_panns_labels_falls_back_to_url(monkeypatch, tmp_path):
+    # HF download fails -> urllib fetches the canonical csv (with a timeout) into ~/panns_data
+    calls = _labels_env(monkeypatch, tmp_path, LABELS_CSV)
     songdet._ensure_panns_labels()
     dst = tmp_path / "panns_data" / "class_labels_indices.csv"
-    assert dst.read_bytes().startswith(b"index,mid,display_name")
+    assert dst.read_bytes() == LABELS_CSV
+    assert calls and calls[0][1].get("timeout") == 30
+    # atomic write: no temp file left beside the csv
+    assert sorted(p.name for p in dst.parent.iterdir()) == [dst.name]
+
+
+@pytest.mark.parametrize(
+    "stale",
+    [b"", b"index,mid,display_name\n", b"<html>503</html>", LABELS_CSV[:-200]],
+)
+def test_ensure_panns_labels_refetches_invalid_file(monkeypatch, tmp_path, stale):
+    # empty / header-only / HTML / truncated leftovers are not trusted
+    _labels_env(monkeypatch, tmp_path, LABELS_CSV)
+    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
+    dst.parent.mkdir(parents=True)
+    dst.write_bytes(stale)
+    songdet._ensure_panns_labels()
+    assert dst.read_bytes() == LABELS_CSV
+
+
+def test_ensure_panns_labels_invalid_download_raises_actionable(monkeypatch, tmp_path):
+    # the URL serves an error page -> nothing written, error names path + URL
+    _labels_env(monkeypatch, tmp_path, b"<html>blocked</html>")
+    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
+    with pytest.raises(RuntimeError, match="place it manually") as exc:
+        songdet._ensure_panns_labels()
+    assert str(dst) in str(exc.value) and songdet.PANNS_LABELS_URL in str(exc.value)
+    assert not dst.exists()
+
+
+def test_ensure_panns_labels_network_error_raises_actionable(monkeypatch, tmp_path):
+    _labels_env(monkeypatch, tmp_path, LABELS_CSV)
+
+    def _down(*a, **k):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("urllib.request.urlopen", _down)
+    with pytest.raises(RuntimeError, match="place it manually"):
+        songdet._ensure_panns_labels()
+
+
+def test_panns_labels_ensures_csv_before_import(monkeypatch):
+    # sdh reads the label names through this helper: csv first, then the import
+    order = []
+    monkeypatch.setattr(songdet, "_ensure_panns_labels", lambda: order.append("csv"))
+    panns = types.ModuleType("panns_inference")
+    panns.labels = ["Speech", "Explosion"]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "panns_inference", panns)
+    assert songdet.panns_labels() == ["Speech", "Explosion"]
+    assert order == ["csv"]
+
+
+def test_env_float_warns_and_falls_back(monkeypatch, caplog):
+    # a malformed knob must not crash import (every CLI command imports songdet)
+    monkeypatch.setenv("VOXWEAVE_SONG_CORE_MERGE_SEC", "fifteen")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert songdet._env_float("VOXWEAVE_SONG_CORE_MERGE_SEC", 15.0) == 15.0
+    assert "VOXWEAVE_SONG_CORE_MERGE_SEC" in caplog.text
+    monkeypatch.setenv("VOXWEAVE_SONG_CORE_MERGE_SEC", "20")
+    assert songdet._env_float("VOXWEAVE_SONG_CORE_MERGE_SEC", 15.0) == 20.0
+
+
+def _fake_audio_tagging(monkeypatch, device):
+    """Stand-in panns_inference.AudioTagging mimicking the real constructor: GPU only
+    for the exact string "cuda", setup print()ed to stdout. Returns the created models."""
+    made = []
+
+    class _Net:
+        def __init__(self):
+            self.moved_to = None
+
+        def to(self, dev):
+            self.moved_to = dev
+            return self
+
+    class _AudioTagging:
+        def __init__(self, checkpoint_path=None, device="cuda"):
+            print(f"Checkpoint path: {checkpoint_path}")
+            self.device = "cuda" if device == "cuda" else "cpu"
+            self.model = _Net()
+            print("GPU number: 8" if self.device == "cuda" else "Using CPU.")
+            made.append(self)
+
+    panns = types.ModuleType("panns_inference")
+    panns.AudioTagging = _AudioTagging  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "panns_inference", panns)
+    monkeypatch.setattr(songdet, "_ensure_panns_labels", lambda: None)
+    monkeypatch.setattr(songdet, "_resolve_panns_ckpt", lambda: "/fake/Cnn14.pth")
+    monkeypatch.setattr(songdet, "_model", None)
+    monkeypatch.setattr("voxweave.runtime.get_device", lambda: device)
+    return made
+
+
+@pytest.mark.parametrize(
+    ("resolved", "expected"),
+    [("mps", "mps"), ("cuda:1", "cuda:1"), ("cuda", "cuda:0"), ("cpu", "cpu")],
+)
+def test_get_model_uses_runtime_device_without_dataparallel(
+    monkeypatch, capsys, resolved, expected
+):
+    made = _fake_audio_tagging(monkeypatch, resolved)
+    m = songdet._get_model()
+    assert made == [m]
+    # never the bare "cuda" that makes AudioTagging wrap DataParallel over every GPU
+    assert m.device == expected
+    assert m.model.moved_to == (None if expected == "cpu" else expected)
+    # AudioTagging's setup prints never reach stdout (it carries only result paths)
+    assert capsys.readouterr().out == ""
+
+
+def test_window_probs_batches_lazily_with_identical_windows(monkeypatch, tmp_path):
+    # 7.5s -> 6 windows; batch=4 -> batches of 4 and 2 holding exactly the 2s/1s-hop windows
+    rng = np.random.default_rng(0)
+    data = rng.uniform(-0.5, 0.5, int(7.5 * songdet.SR)).astype("float32")
+    wav = tmp_path / "a.wav"
+    sf.write(wav, data, songdet.SR, subtype="FLOAT")
+    seen = []
+
+    class _Model:
+        def inference(self, x):
+            seen.append(x.copy())
+            return np.full((len(x), 527), len(seen), dtype="float32"), None
+
+    monkeypatch.setattr(songdet, "_get_model", lambda: _Model())
+    progress = []
+    wp = songdet.window_probs(
+        wav, batch=4, progress=lambda d, t: progress.append((d, t))
+    )
+    assert wp is not None
+    probs, starts = wp
+    win, hop = int(songdet.WIN_SEC * songdet.SR), int(songdet.HOP_SEC * songdet.SR)
+    expected = np.stack([data[s : s + win] for s in range(0, len(data) - win + 1, hop)])
+    assert [len(b) for b in seen] == [4, 2]
+    np.testing.assert_array_equal(np.concatenate(seen), expected)
+    assert probs.shape == (6, 527) and starts == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    assert progress == [(1, 2), (2, 2)]
+
+
+def test_window_probs_rejects_wrong_sample_rate(tmp_path):
+    wav = tmp_path / "a.wav"
+    sf.write(wav, np.zeros(16000 * 3, dtype="float32"), 16000)
+    with pytest.raises(ValueError, match="expected 32000 Hz"):
+        songdet.window_probs(wav)
 
 
 def _probs(rows: list[dict]) -> np.ndarray:
@@ -295,7 +465,7 @@ def test_speech_flags_song_false():
 
 def test_speech_flags_rap_with_residual_music_false():
     # carries rhythmic/instrumental residue (music>=0.2 or sing>=0.1) -> not clean dialogue
-    # -> rap verse is NOT trimmed as dialogue (preserves pit-2 protection)
+    # -> rap verse is NOT trimmed as dialogue (it stays inside the excised song)
     assert speech_flags(
         _probs([{"speech": 0.7, "sing": 0.0, "music": 0.25}])
     ).tolist() == [False]
@@ -339,7 +509,7 @@ def test_expand_trims_trailing_clean_speech_dialogue():
 
 
 def test_expand_keeps_interior_rap_between_choruses():
-    # Pit-2 no regression: rap verse between two choruses (interior to the block) -> NOT trimmed even if protect marks it; whole block absorbed
+    # Interior rap verse between two choruses -> NOT trimmed even if protect marks it; whole block absorbed
     segs = [
         {"start": 66.0, "end": 80.0},  # chorus1 (singing, detected)
         {"start": 82.0, "end": 96.0},  # rap verse (clean speech, interior)
