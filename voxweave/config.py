@@ -15,7 +15,7 @@ from pathlib import Path
 
 log = logging.getLogger("voxweave")
 
-# Built-in defaults (mirrors backend.ASR_MODEL / FUSION_*).
+# Built-in defaults (backend.ASR_MODEL falls back to DEFAULT_ASR_MODEL).
 DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 # Dual-ASR fusion (--hybrid): whisper supplies text, Qwen supplies punctuation.
 # 0.6B emits no punctuation, so fusion must use 1.7B.
@@ -64,15 +64,17 @@ DEFAULT_DIARIZE_CLUSTERING = DIARIZE_CLUSTERING_PYANNOTE
 DIARIZE_CLUSTERING_ENV = "VOXWEAVE_DIARIZE_CLUSTERING"
 # Per-language aligner defaults. Unlisted languages fall back to Qwen3-ForcedAligner.
 #
-# en: facebook/wav2vec2-large-960h-lv60-self loaded via HF (same LV60K-self weights as
-#     the torchaudio bundle), per-cue crop alignment (<=120s). Torchaudio bundle name
-#     also accepted for back-compat.
+# Every CTC aligner (en wav2vec2, ja "mms", any HF wav2vec2 id or torchaudio bundle)
+# runs one full-file pass: windowed emission, then a global DP that is split at silence
+# anchors once it exceeds ctc_max_dp_frames (backend._full_pass_units). Only languages
+# without an entry here (Qwen3-ForcedAligner) align per chunk.
 #
-# ja: "mms" = MMS-300m ONNX + uroman, full-file single pass (align_blocks_full_mms,
-#     equivalent to whisperx fork align_ctc). Full-file is required: per-cue cropping
-#     causes coarse routing errors that drift timestamps — empirically misplaced
-#     エルダドワーフ by 11s. xlsr full-file is O(T²) so 23 min → ~300 GB OOM; only
-#     MMS (ctc-forced-aligner internal windowing) can handle full-file safely.
+# en: facebook/wav2vec2-large-960h-lv60-self loaded via HF (same LV60K-self weights as
+#     the torchaudio bundle). Torchaudio bundle name also accepted for back-compat.
+#
+# ja: "mms" = MMS-300m ONNX + uroman (align_blocks_full_mms, equivalent to whisperx
+#     fork align_ctc). Full-file is required: per-cue cropping causes coarse routing
+#     errors that drift timestamps — empirically misplaced エルダドワーフ by 11s.
 #     Note: MMS needs onnxruntime-gpu; CPU ort has the same package name and silently
 #     drops CUDAExecutionProvider — see pyproject [tool.uv] override-dependencies.
 DEFAULT_ALIGN_MODELS = {"en": "facebook/wav2vec2-large-960h-lv60-self", "ja": "mms"}
@@ -95,7 +97,7 @@ _TEMPLATE = """\
 # Precedence: CLI options > environment variables > this file > built-in defaults.
 # Remove a line to revert to the built-in default.
 
-# Default ASR model (= --model / env VOXWEAVE_ASR_MODEL); short name qwen3-asr-1.7B or full HF id.
+# Default ASR model (= --asr-model / env VOXWEAVE_ASR_MODEL); short name qwen3-asr-1.7B or full HF id.
 # Special value "hybrid" (= CLI --hybrid) -> dual-ASR fusion (whisper text quality + Qwen punctuation).
 # asr_model = "Qwen/Qwen3-ASR-0.6B"
 
@@ -109,8 +111,9 @@ _TEMPLATE = """\
 # Model load strategy (= env VOXWEAVE_LOAD_STRATEGY):
 #   peak (default) = serial peak-shaving: all-chunk ASR -> release -> all-chunk align;
 #                    ASR and aligner never co-reside; peak VRAM = max(each model); works on 8 GB cards.
-#   sum            = concurrent co-residence: per-chunk ASR+align in one pass;
-#                    peak VRAM = sum(models); saves two swap round-trips on large-VRAM cards.
+#   sum            = same passes as peak, but the ASR model(s) stay resident while the
+#                    aligner loads; peak VRAM = sum(models); saves two swap round-trips on
+#                    large-VRAM cards.
 # load_strategy = "peak"
 
 # LLM used by `translate` and `correct`: any OpenAI-compatible chat-completions endpoint.
@@ -140,10 +143,10 @@ _TEMPLATE = """\
 
 # dual-ASR fusion sub-models (= CLI --hybrid; env VOXWEAVE_FUSION_WHISPER / VOXWEAVE_FUSION_QWEN).
 # whisper supplies accurate text, Qwen supplies punctuation positions (merged on a shared timeline).
-#   whisper = faster-whisper size: large-v3 (highest quality) | large-v3-turbo (~5x faster, default).
+#   whisper = faster-whisper size: large-v3 (highest quality, default) | large-v3-turbo (~5x faster).
 #   qwen    = punctuation model; must emit punctuation so 1.7B (not 0.6B).
 [fusion]
-# whisper = "large-v3-turbo"
+# whisper = "large-v3"
 # qwen = "Qwen/Qwen3-ASR-1.7B"
 
 # Inference batch sizes: windows per GPU forward pass (= env VOXWEAVE_SEP_BATCH /
@@ -231,20 +234,20 @@ _TEMPLATE = """\
 # Per-language forced-alignment models; unlisted languages use Qwen3-ForcedAligner (built-in default).
 # Values: "mms" (MMS-300m + uroman, full-file single pass; bundled in core) |
 #         HF wav2vec2 id (downloaded to the voxweave align cache ~/.cache/voxweave/align) | torchaudio bundle name (-> torch.hub cache).
-# Set to "" to explicitly fall back to Qwen.  "mms" uses the full-file pass (immune to per-cue drift);
-# all other values use per-cue crop alignment.
+# Set to "" to explicitly fall back to Qwen. Every CTC value runs one full-file pass (DP split
+# at silence anchors above ctc_max_dp_frames); only Qwen-aligned languages align per chunk.
 [align]
-en = "facebook/wav2vec2-large-960h-lv60-self"   # English: large wav2vec2 CTC per-cue, HF path -> ~/.cache/voxweave/align (same LV60K-self weights as torchaudio WAV2VEC2_ASR_LARGE_LV60K_960H bundle)
-ja = "mms"                             # Japanese: MMS-300m + uroman full-file single pass (= whisperx fork align_ctc; gold standard); requires onnxruntime-gpu for CUDA (bundled in core)
-# ja = "jonatasgrosman/wav2vec2-large-xlsr-53-japanese"   # Alternative: xlsr character-level CTC per-cue (full-file single pass is O(T^2) -> OOM)
+# en = "facebook/wav2vec2-large-960h-lv60-self"   # English (built-in default): large wav2vec2 CTC, HF path -> ~/.cache/voxweave/align (same LV60K-self weights as torchaudio WAV2VEC2_ASR_LARGE_LV60K_960H bundle)
+# ja = "mms"                             # Japanese (built-in default): MMS-300m + uroman (= whisperx fork align_ctc; gold standard); requires onnxruntime-gpu for CUDA (bundled in core)
+# ja = "jonatasgrosman/wav2vec2-large-xlsr-53-japanese"   # Alternative: xlsr character-level CTC
 # zh = "mms"   # Chinese can also use MMS full-file pass; default is Qwen (native CJK character-level)
 """.replace("@DIARIZE_CLUSTERING@", DEFAULT_DIARIZE_CLUSTERING)
 
 
 def config_path() -> Path:
     """Config file path: ``VOXWEAVE_CONFIG`` env if set, else ``~/.config/voxweave.conf``."""
-    env = os.environ.get("VOXWEAVE_CONFIG")
-    return Path(env) if env else Path.home() / ".config" / "voxweave.conf"
+    env = (os.environ.get("VOXWEAVE_CONFIG") or "").strip()
+    return Path(env).expanduser() if env else Path.home() / ".config" / "voxweave.conf"
 
 
 # Recognized top-level keys; anything else in the file is a typo/stale setting.
@@ -267,9 +270,45 @@ _KNOWN_KEYS = frozenset(
 )
 
 
+# Recognized keys inside each table; [align] is keyed by language code instead.
+# A typo here would otherwise silently revert the setting (e.g. ``[llm] base-url``
+# would send subtitles to api.openai.com instead of the local endpoint).
+_KNOWN_SECTION_KEYS = {
+    "llm": frozenset(
+        {
+            "model",
+            "base_url",
+            "api_key_env",
+            "reasoning_effort",
+            "concurrency",
+            "window_cues",
+        }
+    ),
+    "fusion": frozenset({"whisper", "qwen"}),
+    "batch": frozenset({"separate", "ctc", "mms", "asr"}),
+    "separate": frozenset({"autocast"}),
+    "diarize": frozenset({"model", "clustering"}),
+    "voiceprint": frozenset({"model"}),
+    "voices": frozenset({"dir"}),
+    "defaults": frozenset(
+        {
+            "separate",
+            "skip_songs",
+            "normalize",
+            "diarize",
+            "voiceprints",
+            "timestamps",
+            "shot_snap",
+            "vad_mask",
+        }
+    ),
+}
+
+
 def _load() -> dict:
     """Parse the config TOML. Missing or malformed file returns {} (no crash).
-    Unknown top-level keys are warned about but do not stop known keys loading."""
+    Unknown top-level keys, and unknown keys inside a known table, are warned
+    about but do not stop known keys loading."""
     p = config_path()
     if not p.exists():
         return {}
@@ -282,6 +321,15 @@ def _load() -> dict:
     for key in data:
         if key not in _KNOWN_KEYS:
             log.warning("unknown config key %r in %s (ignored)", key, p)
+            continue
+        known = _KNOWN_SECTION_KEYS.get(key)
+        section = data[key]
+        if known is not None and isinstance(section, dict):
+            for inner in section:
+                if inner not in known:
+                    log.warning(
+                        "unknown config key %r in [%s] of %s (ignored)", inner, key, p
+                    )
     return data
 
 
@@ -320,12 +368,13 @@ def ensure_default_config() -> None:
 
 
 def _nonempty_str(v: object) -> str | None:
-    """Return v if it is a non-blank string, else None (config values may be missing/blank/non-str)."""
-    return v if isinstance(v, str) and v.strip() else None
+    """Return v stripped if it is a non-blank string, else None (config values may be missing/blank/non-str)."""
+    return v.strip() if isinstance(v, str) and v.strip() else None
 
 
 def conf_asr_model() -> str | None:
-    """ASR model from config; None if unset (caller falls back to env/built-in)."""
+    """ASR model from config; None if unset. The CLI consults it after --asr-model /
+    VOXWEAVE_ASR_MODEL and before the built-in default."""
     v = _load().get("asr_model")
     if v is not None and not isinstance(v, str):
         log.warning(
@@ -676,14 +725,20 @@ def conf_load_strategy() -> str:
 
     - ``"peak"`` (default): serial peak-shaving — ASR and aligner never co-reside;
       peak VRAM = max(each model). Works on 8 GB cards.
-    - ``"sum"``: concurrent co-residence — per-chunk ASR+align; peak VRAM = sum(models).
-      Saves swap overhead on large-VRAM cards.
+    - ``"sum"``: same passes as peak, but the ASR model(s) stay resident while the
+      aligner loads; peak VRAM = sum(models). Saves swap overhead on large-VRAM cards.
 
     Precedence: env VOXWEAVE_LOAD_STRATEGY > conf load_strategy > "peak". Invalid
-    values fall back to "peak".
+    values are warned about and fall back to "peak".
     """
-    v = os.environ.get("VOXWEAVE_LOAD_STRATEGY") or _load().get("load_strategy")
-    v = v.strip().lower() if isinstance(v, str) else ""
+    raw = os.environ.get("VOXWEAVE_LOAD_STRATEGY") or _load().get("load_strategy")
+    v = raw.strip().lower() if isinstance(raw, str) else ""
+    if (raw is not None and raw != "") and v not in _LOAD_STRATEGIES:
+        log.warning(
+            "load_strategy must be one of %s (got %r); using 'peak'",
+            ", ".join(sorted(_LOAD_STRATEGIES)),
+            raw,
+        )
     return v if v in _LOAD_STRATEGIES else "peak"
 
 
@@ -698,21 +753,22 @@ def conf_ctc_max_dp_frames() -> int:
     """Max emission frames for one CTC forced-align DP before silence-anchored chunking kicks in.
 
     Precedence: env VOXWEAVE_CTC_MAX_DP_FRAMES > conf ``ctc_max_dp_frames`` > 90000 (~30min).
-    Non-integer values (env or file) are ignored and fall through to the next source.
+    Values that are not integers >= 1 (env or file) are warned about and fall through
+    to the next source.
     """
     env = os.environ.get("VOXWEAVE_CTC_MAX_DP_FRAMES")
     if env is not None and env.strip():
-        try:
-            return int(env)
-        except ValueError:
-            pass
+        parsed = _positive_int(env, "environment VOXWEAVE_CTC_MAX_DP_FRAMES")
+        if parsed is not None:
+            return parsed
     v = _load().get("ctc_max_dp_frames")
-    if isinstance(v, int) and not isinstance(v, bool):
+    if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
         return v
     if v is not None:
         log.warning(
-            "config key %r has wrong type (expected integer), using default",
+            "config key %r must be an integer >= 1 (got %r), using default",
             "ctc_max_dp_frames",
+            v,
         )
     return _CTC_MAX_DP_FRAMES_DEFAULT
 

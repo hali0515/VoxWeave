@@ -502,3 +502,48 @@ def test_default_template_documents_defaults_section(conf_at):
     config.ensure_default_config()
     txt = conf_at.read_text(encoding="utf-8")
     assert "[defaults]" in txt and "# separate = true" in txt
+
+
+def test_config_path_expands_tilde(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("VOXWEAVE_CONFIG", "~/vw.conf")
+    assert config.config_path() == tmp_path / "vw.conf"
+
+
+def test_unknown_section_key_warns(conf_at, caplog):
+    conf_at.write_text(
+        '[llm]\nbase-url = "http://127.0.0.1:8000/v1"\n'
+        "[defaults]\nskip_song = false\n"
+        '[align]\nzh = "mms"\n',
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        config.resolve_llm_base_url(None)
+    assert "'base-url' in [llm]" in caplog.text
+    assert "'skip_song' in [defaults]" in caplog.text
+    assert "[align]" not in caplog.text  # language-keyed table is not schema-checked
+
+
+def test_ctc_max_dp_frames_rejects_non_positive(conf_at, monkeypatch, caplog):
+    monkeypatch.setenv("VOXWEAVE_CTC_MAX_DP_FRAMES", "0")
+    conf_at.write_text("ctc_max_dp_frames = -5\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_ctc_max_dp_frames() == 90000
+    assert "VOXWEAVE_CTC_MAX_DP_FRAMES" in caplog.text
+    assert "ctc_max_dp_frames" in caplog.text
+
+
+def test_load_strategy_invalid_warns(conf_at, monkeypatch, caplog):
+    monkeypatch.delenv("VOXWEAVE_LOAD_STRATEGY", raising=False)
+    conf_at.write_text('load_strategy = "summ"\n', encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        assert config.conf_load_strategy() == "peak"
+    assert "summ" in caplog.text
+
+
+def test_default_template_leaves_align_defaults_commented(conf_at):
+    config.ensure_default_config()
+    import tomllib
+
+    data = tomllib.loads(conf_at.read_text(encoding="utf-8"))
+    assert data.get("align", {}) == {}  # built-in DEFAULT_ALIGN_MODELS stay in force

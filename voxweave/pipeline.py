@@ -203,7 +203,7 @@ def _prefetch_voiceprint_models(
 
     The capture itself only runs after separation, ASR and diarization; a
     missing or stalled download discovered there would waste the whole run.
-    ``auto`` needs both embedders unless ``--lang`` already fixes the language
+    ``auto`` needs both embedders unless ``--language`` already fixes the language
     (resolved to ISO exactly as :func:`transcribe` resolves it). ``False``
     (after a warning) means voiceprints are off for this run; the subtitles are
     still produced. An invalid model choice raises ``ValueError``.
@@ -1197,11 +1197,13 @@ def transcribe(
                             [(round(a, 1), round(b, 1)) for a, b in song_spans],
                         )
                 except ModuleNotFoundError as e:
-                    # panns-inference not installed; continue without song skip.
-                    # Install voxweave[songdet] or pass --no-skip-songs to suppress.
+                    # panns-inference (or one of its deps) is missing from a broken
+                    # environment: it is a core dependency, so reinstalling fixes it.
                     log.warning(
-                        "song detection requires panns-inference (not installed: %s) -- "
-                        "continuing without song skip; install voxweave[songdet] or pass --no-skip-songs",
+                        "song detection unavailable (missing module: %s) -- continuing "
+                        "without song skip; panns-inference is a core dependency, so "
+                        "reinstall voxweave, or pass --no-skip-songs (and drop "
+                        "--keep-lyrics) to silence this",
                         e,
                     )
         if release_panns:

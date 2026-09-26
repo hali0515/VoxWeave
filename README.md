@@ -804,6 +804,7 @@ them. Edit the text freely; `align` puts the timing back.
 
 Precedence: **CLI flag > env var > `~/.config/voxweave.conf` > built-in default.** A commented
 default config is written on first run (migrated automatically from a pre-rename `qsub.conf`).
+Set `VOXWEAVE_CONFIG` to read (and create) the config file somewhere else.
 
 <details>
 <summary><b>Environment variables</b></summary>
@@ -878,7 +879,8 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
 
 - `VOXWEAVE_MAX_CHUNK_SEC` (default 120; shorter chunks reduce ASR repetition loops on long segments)
 - `VOXWEAVE_LOUDNORM` (default `loudnorm=I=-16:TP=-1.5:LRA=11`; the `-af` filter for `--normalize`)
-- `VOXWEAVE_MIN_CUE_SEC` (default 0.8; minimum cue display duration in `align`)
+- `VOXWEAVE_MIN_CUE_SEC` (default 0 = off; set e.g. 0.8 to pad `align`-stage cues to a minimum
+  display duration; distinct from the segmentation floor `VOXWEAVE_SEG_MIN_CUE_SEC`)
 - `VOXWEAVE_SNAP_VAD_THRESHOLD` (default 0.25; sensitive VAD used when repositioning
   zero-duration units against the original audio)
 - `VOXWEAVE_SONG_CORE_MERGE_SEC` (default 15; song spans within this gap of a long OP/ED
@@ -926,8 +928,9 @@ asr_model = "Qwen/Qwen3-ASR-1.7B"        # built-in default: Qwen/Qwen3-ASR-0.6B
 # Model load strategy:
 #   "peak" (default) — serial peak-shaving: all-chunk ASR -> release -> all-chunk align;
 #                      ASR and aligner never co-reside, peak VRAM = max(models). Works on 8 GB.
-#   "sum"            — concurrent per-chunk ASR+align; peak VRAM = sum(models), but skips two
-#                      model swap round-trips (faster on large-VRAM cards).
+#   "sum"            — same passes as "peak", but the ASR model(s) stay resident while the aligner
+#                      loads; peak VRAM = sum(models), but skips two model swap round-trips
+#                      (faster on large-VRAM cards).
 load_strategy = "sum"
 
 # Inference batch sizes: windows per GPU forward (env: VOXWEAVE_SEP_BATCH / VOXWEAVE_CTC_BATCH /
@@ -1009,11 +1012,11 @@ qwen    = "Qwen/Qwen3-ASR-1.7B"          # punctuation model; must emit punctuat
 # Per-language forced-alignment model. Key = ISO-639-1 code; unlisted languages use Qwen3-ForcedAligner.
 # Values:
 #   "mms"   — MMS-300m + uroman, full-file single pass (immune to per-cue drift; the gold standard).
-#   HF id   — wav2vec2 CTC via HF transformers; weights land in ~/.cache/voxweave/align (per-cue crop).
+#   HF id   — wav2vec2 CTC via HF transformers, also full-file; weights land in ~/.cache/voxweave/align.
 #   bundle  — torchaudio bundle name, e.g. "WAV2VEC2_ASR_LARGE_LV60K_960H" (same model, cached in ~/.cache/torch).
 #   ""      — explicitly fall back to Qwen for that language.
 [align]
-en = "facebook/wav2vec2-large-960h-lv60-self"  # English: LV60K-self CTC, per-cue crop (HF hub)
+en = "facebook/wav2vec2-large-960h-lv60-self"  # English: LV60K-self CTC, full-file (HF hub)
 ja = "mms"                                      # Japanese: MMS-300m + uroman full-file (= whisperx fork align_ctc)
 # zh  = "mms"                                   # Chinese can also use MMS; default is Qwen (native CJK char-level)
 # yue = ""                                      # force Qwen for Cantonese
