@@ -215,29 +215,14 @@ def test_pyannote4_embeddings_are_not_exposed_without_voiceprint_opt_in(
     assert "return_embeddings" not in pipeline.calls[0][1]
 
 
-def test_legacy_annotation_output_is_still_adapted(
+def test_bare_annotation_output_is_still_adapted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A custom pipeline may return a plain Annotation instead of pyannote 4's
+    # output object; its turns are kept, and it has no embeddings to offer.
     annotation = _Annotation([(_Segment(0.0, 1.0), "track", "SPEAKER_00")])
     pipeline = _CapturePipeline(annotation)
     _patch_pipeline(monkeypatch, pipeline)
-    monkeypatch.setattr(diarize, "_package_version", lambda _name: "3.4.0")
-
-    result = diarize.diarize_turns(_wav(tmp_path), token="hf_test", model=LEGACY_MODEL)
-
-    assert result.turns == [(0.0, 1.0, "SPEAKER_00")]
-    assert result.centroids is None
-
-
-def test_legacy_annotation_embedding_tuple_is_still_adapted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    annotation = _Annotation([(_Segment(0.0, 1.0), "track", "SPEAKER_00")])
-    pipeline = _CapturePipeline(
-        (annotation, np.array([[1.0, *([0.0] * 15)]], dtype=np.float32))
-    )
-    _patch_pipeline(monkeypatch, pipeline)
-    monkeypatch.setattr(diarize, "_package_version", lambda _name: "3.4.0")
 
     result = diarize.diarize_turns(
         _wav(tmp_path),
@@ -246,8 +231,9 @@ def test_legacy_annotation_embedding_tuple_is_still_adapted(
         want_embeddings=True,
     )
 
-    assert pipeline.calls[0][1]["return_embeddings"] is True
-    assert set(result.centroids or {}) == {"SPEAKER_00"}
+    assert result.turns == [(0.0, 1.0, "SPEAKER_00")]
+    assert result.centroids is None
+    assert "return_embeddings" not in pipeline.calls[0][1]
 
 
 class _LoadedPipeline:
@@ -281,7 +267,7 @@ def test_pipeline_cache_is_keyed_by_model_and_pyannote4_uses_token_and_cache_dir
     _PipelineLoader.calls = []
     _install_pyannote_module(monkeypatch, _PipelineLoader)
     monkeypatch.setattr(diarize, "_package_version", lambda _name: "4.0.7")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(diarize.runtime, "get_device", lambda: "cpu")
 
     second_model = "example/second-diarizer"
 
@@ -312,6 +298,48 @@ def test_pipeline_cache_is_keyed_by_model_and_pyannote4_uses_token_and_cache_dir
         assert "use_auth_token" not in kwargs
 
 
+@pytest.mark.parametrize(
+    ("device", "expected"),
+    [
+        ("cpu", []),
+        ("cuda:1", [torch.device("cuda:1")]),
+        # Apple Silicon keeps pyannote on the CPU, as before VOXWEAVE_DEVICE
+        # was honoured here.
+        ("mps", []),
+    ],
+)
+def test_pipeline_follows_the_runtime_device_except_mps(
+    monkeypatch: pytest.MonkeyPatch, device: str, expected: list[object]
+) -> None:
+    moved: list[object] = []
+
+    class _Movable:
+        def to(self, target: object) -> None:
+            moved.append(target)
+
+    class _Loader:
+        @classmethod
+        def from_pretrained(cls, _checkpoint: object, **_kwargs: object) -> object:
+            return _Movable()
+
+    _install_pyannote_module(monkeypatch, _Loader)
+    monkeypatch.setattr(
+        diarize,
+        "_prepare_pipeline_load",
+        lambda model, _token: diarize._PipelineLoadPlan(
+            checkpoint=model,
+            revision=None,
+            authority=None,
+            outer_config_sha256="unresolved",
+        ),
+    )
+    monkeypatch.setattr(diarize.runtime, "get_device", lambda: device)
+
+    diarize._get_pipeline("hf_secret", COMMUNITY_MODEL)
+
+    assert moved == expected
+
+
 class _ForbiddenPipeline:
     @classmethod
     def from_pretrained(cls, _checkpoint: object, **_kwargs: object) -> object:
@@ -326,7 +354,7 @@ def test_community1_403_names_the_exact_model_card(
 ) -> None:
     _install_pyannote_module(monkeypatch, _ForbiddenPipeline)
     monkeypatch.setattr(diarize, "_package_version", lambda _name: "4.0.7")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(diarize.runtime, "get_device", lambda: "cpu")
 
     with pytest.raises(RuntimeError) as caught:
         diarize._get_pipeline("hf_secret", COMMUNITY_MODEL)

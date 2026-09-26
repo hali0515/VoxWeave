@@ -537,10 +537,14 @@ def turn_embeddings(
 ) -> AttestedTurnEmbeddings:
     """Return one normalized embedding for each turn index.
 
-    Audio is decoded to 16 kHz mono in memory. Turns shorter than two seconds
-    or the model's safe lower bound are right-padded with silence. Imports and
-    model construction stay lazy so CPU-only tests can replace the inference
-    boundary without importing pyannote.
+    Audio is decoded to 16 kHz mono in memory. A request whose identity names
+    the decoupled lane is embedded through :mod:`voxweave.voiceembed` exactly
+    like a voiceprint segment: short turns are repeated cyclically up to the
+    embedder's ``min_seconds`` and long turns are embedded window by window.
+    Otherwise (the legacy pyannote lane, or a plain turn list) turns shorter
+    than two seconds or the model's safe lower bound are right-padded with
+    silence. Imports and model construction stay lazy so CPU-only tests can
+    replace the inference boundary without importing pyannote.
     """
     expected_identity = (
         turns.identity if isinstance(turns, AttestedTurnRequest) else None

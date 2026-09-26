@@ -6,7 +6,7 @@ sibling JSON. Formatting is a pure post-pass over smart_split's cues: each
 cue's atoms get a speaker by time overlap with the turns; a cue containing two
 speakers becomes a Netflix dual-speaker event (one line per speaker, leading
 hyphen, no space) when the language allows two lines and both halves fit one
-line, otherwise the cue splits at the speaker boundaries. ``split`` replays
+line, otherwise the cue splits at the speaker boundaries. ``render`` replays
 formatting from the persisted turns without re-running pyannote.
 
 With ``[diarize].clustering = "voiceprint"`` the raw pyannote turns are regrouped
@@ -28,6 +28,7 @@ import importlib.metadata
 import logging
 import math
 import os
+import re
 import threading
 import warnings
 from collections.abc import Mapping, Sequence
@@ -38,7 +39,7 @@ from typing import TYPE_CHECKING, Any, Iterator, cast
 
 import yaml
 
-from voxweave import config
+from voxweave import config, runtime
 from voxweave.backend import _sha256_file
 from voxweave.core.schema import Cue
 from voxweave.voicebase import (
@@ -55,8 +56,9 @@ log = logging.getLogger("voxweave")
 DIARIZE_MODEL = config.DEFAULT_DIARIZE_MODEL
 COMMUNITY_DIARIZE_MODEL = config.COMMUNITY_DIARIZE_MODEL
 # The bundled pipeline ids, both gated on Hugging Face: without a token they
-# cannot load at all, so the run is refused up front with an actionable message.
-# Derived from the alias table so a new bundled alias joins the gate set with it.
+# cannot load at all, so :func:`preflight` (and the run itself, before loading
+# the pipeline) refuses them with an actionable message. Derived from the alias
+# table so a new bundled alias joins the gate set with it.
 GATED_DIARIZE_MODELS = frozenset(config.DIARIZE_MODEL_ALIASES.values())
 EMBEDDING_CHECKPOINT_FILE = "pytorch_model.bin"
 
@@ -135,12 +137,17 @@ class _EmbeddingLoadAuthority:
 
 @dataclass(frozen=True)
 class _PipelineLoadPlan:
-    """Immutable pipeline config plus the embedding authority it carries."""
+    """Immutable pipeline config plus the embedding authority it carries.
+
+    ``config_error`` keeps the download error when no config could be fetched,
+    so a loader that needs the config can say why it is missing.
+    """
 
     checkpoint: str | Path | dict[str, Any]
     revision: str | None
     authority: _EmbeddingLoadAuthority | None
     outer_config_sha256: str
+    config_error: Exception | None = None
 
 
 class EmbeddingCheckpointChangedError(RuntimeError):
@@ -223,11 +230,19 @@ def _is_gated_hub_error(exc: BaseException) -> bool:
 
 def _pipeline_config_path(model: str, token: str | None = None) -> Path | None:
     """Download or resolve the exact pipeline config inside VoxWeave's cache."""
+    return _fetch_pipeline_config(model, token)[0]
+
+
+def _fetch_pipeline_config(
+    model: str,
+    token: str | None = None,
+) -> tuple[Path | None, Exception | None]:
+    """Like :func:`_pipeline_config_path`, plus the download error it swallowed."""
     configured = Path(model)
     if configured.is_dir():
         configured = configured / "config.yaml"
     try:
-        return configured.resolve(strict=True)
+        return configured.resolve(strict=True), None
     except OSError:
         pass
     model_id, revision = _split_model_revision(model)
@@ -247,8 +262,8 @@ def _pipeline_config_path(model: str, token: str | None = None) -> Path | None:
         # or unreachable config counts as "no config".
         if _is_gated_hub_error(exc):
             raise
-        return None
-    return Path(cached).absolute()
+        return None, exc
+    return Path(cached).absolute(), None
 
 
 def _outer_config_identity(
@@ -402,7 +417,6 @@ def _expand_model_references(
     model_id: str,
     revision: str | None,
     token: str | None,
-    parent_subfolder: str | None = None,
 ) -> None:
     """Expand pyannote 4.x ``$model/subfolder`` references with stable coordinates."""
 
@@ -412,8 +426,6 @@ def _expand_model_references(
             subfolder, child_revision = subfolder.rsplit("@", 1)
         else:
             child_revision = revision
-        if parent_subfolder:
-            subfolder = f"{parent_subfolder.rstrip('/')}/{subfolder.lstrip('/')}"
         return {
             "checkpoint": model_id,
             **({"revision": child_revision} if child_revision is not None else {}),
@@ -432,7 +444,6 @@ def _expand_model_references(
                     model_id=model_id,
                     revision=revision,
                     token=token,
-                    parent_subfolder=parent_subfolder,
                 )
     elif isinstance(value, list):
         for index, child in enumerate(value):
@@ -444,7 +455,6 @@ def _expand_model_references(
                     model_id=model_id,
                     revision=revision,
                     token=token,
-                    parent_subfolder=parent_subfolder,
                 )
 
 
@@ -454,13 +464,14 @@ def _prepare_pipeline_load(
 ) -> _PipelineLoadPlan:
     """Pin outer config and embedding coordinates before pipeline construction."""
     model_id, requested_revision = _split_model_revision(model)
-    config_path = _pipeline_config_path(model, token)
+    config_path, config_error = _fetch_pipeline_config(model, token)
     if config_path is None:
         return _PipelineLoadPlan(
             checkpoint=model_id,
             revision=requested_revision,
             authority=None,
             outer_config_sha256="unresolved",
+            config_error=config_error,
         )
     try:
         config_bytes = config_path.read_bytes()
@@ -743,11 +754,18 @@ def _without_unused_legacy_plda(
     with a class default pointing at community-1's ``plda`` subfolder, which an
     AgglomerativeClustering plan never reads. Any such plan is suppressed, however
     it is named. The 3.1 id itself stays fail-closed: an unrecognized shape under
-    that id means the verified plan is not the one about to be built.
+    that id means the verified plan is not the one about to be built, and a
+    config that could not be fetched at all is reported as such.
     """
     model_id, _revision = _split_model_revision(model)
     if not _is_agglomerative_plda_free_plan(plan.checkpoint):
         if model_id == config.LEGACY_DIARIZE_MODEL:
+            exc = plan.config_error
+            if exc is not None:
+                raise RuntimeError(
+                    f"could not fetch config.yaml for {model}: {exc}; check the "
+                    "network / revision, or run once online to cache it"
+                ) from exc
             raise RuntimeError(
                 "speaker-diarization-3.1 under pyannote.audio 4 requires a verified "
                 "AgglomerativeClustering pipeline config"
@@ -819,21 +837,71 @@ def _model_card_url(model: str) -> str:
     return f"https://hf.co/{model_id}"
 
 
-def _gated_model_error(model: str) -> RuntimeError:
+# A Hub model URL (``huggingface.co/<repo>/resolve/...``, ``hf.co/<repo>``, or the
+# ``/api/models/<repo>/...`` form) as it appears in a hub error's response URL or
+# message; group 1 is the ``<namespace>/<name>`` repo id.
+_HUB_MODEL_URL = re.compile(
+    r"(?<![\w.-])(?:www\.)?(?:huggingface\.co|hf\.co)/(?:api/models/)?"
+    r"(?!(?:api|datasets|spaces|docs|settings)/)"
+    r"([A-Za-z0-9][\w.-]*/[\w.-]+)"
+)
+
+
+def _refused_hub_repo(exc: BaseException) -> str | None:
+    """The Hub repo a gate refusal names, when the error carries one.
+
+    A pipeline loads sub-models from other repos (3.1 loads
+    ``pyannote/segmentation-3.0``), so the repo that refused is not always the
+    configured pipeline. The response URL is authoritative; the message is the
+    fallback for errors raised without a response.
+    """
+    url = getattr(getattr(exc, "response", None), "url", None)
+    for text in (str(url) if url is not None else "", str(exc)):
+        match = _HUB_MODEL_URL.search(text)
+        if match:
+            return match.group(1).rstrip(".-")
+    return None
+
+
+def _gated_model_error(model: str, refused_repo: str | None = None) -> RuntimeError:
+    """The actionable gate error for ``model``.
+
+    ``refused_repo`` is the Hub repo that actually refused, when known
+    (:func:`_refused_hub_repo`); a sub-model's refusal names that repo's card,
+    with the configured pipeline kept as context. No card URL is ever built
+    from a local pipeline path.
+    """
     model_id, _revision = _split_model_revision(model)
-    message = (
-        f"could not load {model}: accept the model-card conditions at "
-        f"{_model_card_url(model)}, then use `hf auth login` or set "
-        "VOXWEAVE_HF_TOKEN / HF_TOKEN (or hf_token in "
-        "~/.config/voxweave.conf)"
+    if refused_repo is not None and refused_repo.casefold() == model_id.casefold():
+        refused_repo = None
+    auth = (
+        "then use `hf auth login` or set VOXWEAVE_HF_TOKEN / HF_TOKEN (or "
+        "hf_token in ~/.config/voxweave.conf)"
     )
-    if model_id == COMMUNITY_DIARIZE_MODEL:
+    if refused_repo is not None:
+        message = (
+            f"could not load {model}: Hugging Face refused access to "
+            f"{refused_repo}, which this pipeline loads; accept the model-card "
+            f"conditions at {_model_card_url(refused_repo)}, {auth}"
+        )
+    elif Path(model).exists():
+        message = (
+            f"could not load {model}: accept the model-card conditions of the "
+            f"gated Hugging Face model this pipeline loads, {auth}"
+        )
+    else:
+        message = (
+            f"could not load {model}: accept the model-card conditions at "
+            f"{_model_card_url(model)}, {auth}"
+        )
+    if model_id == COMMUNITY_DIARIZE_MODEL and refused_repo is None:
         # community-1 and 3.1 are gated separately, so the default can fail for a
         # user who already accepted the other one -- name that way out.
         message += (
             ". If you only accepted the speaker-diarization-3.1 gate, pass "
             '--diarize-model 3.1 (or set [diarize].model = "3.1" in '
-            "~/.config/voxweave.conf); voiceprint stores are per-model"
+            "~/.config/voxweave.conf); voice stores built with "
+            "--voiceprint-model pyannote are tied to the diarization model"
         )
     return RuntimeError(message)
 
@@ -863,12 +931,18 @@ def _get_pipeline_locked(token: str | None, model: str):
             pl = _load_pipeline(Pipeline, token, model)
         except Exception as exc:
             if _is_gated_hub_error(exc):
-                raise _gated_model_error(model) from exc
+                raise _gated_model_error(model, _refused_hub_repo(exc)) from exc
             raise
         if pl is None:
             raise _gated_model_error(model)
-        if torch.cuda.is_available():
-            pl.to(torch.device("cuda"))
+        # Same device as the other models (VOXWEAVE_DEVICE, else autodetect),
+        # except MPS: pyannote has only ever run on the CPU on Apple Silicon, so
+        # keep it there rather than move it to an untested backend.
+        device = torch.device(runtime.get_device())
+        if device.type == "mps":
+            device = torch.device("cpu")
+        if device.type != "cpu":
+            pl.to(device)
         _pipeline = pl
         _pipeline_model = model
         log.info("loaded diarization pipeline %s", model)
@@ -895,6 +969,57 @@ def _release_locked() -> None:
             torch.cuda.empty_cache()
     except ModuleNotFoundError:
         pass
+
+
+def _validate_speaker_bounds(
+    min_speakers: int | None, max_speakers: int | None
+) -> None:
+    """Refuse speaker bounds no diarization can honour, in pyannote's words.
+
+    pyannote reads a bound of 0 as "no bound", and only rejects ``min > max``
+    once inference has already run.
+    """
+    for name, value in (("min_speakers", min_speakers), ("max_speakers", max_speakers)):
+        if value is not None and value < 1:
+            raise ValueError(f"{name} must be at least 1 (here: {name}={value}).")
+    if (
+        min_speakers is not None
+        and max_speakers is not None
+        and min_speakers > max_speakers
+    ):
+        raise ValueError(
+            "min_speakers must be smaller than (or equal to) max_speakers "
+            f"(here: min_speakers={min_speakers} and max_speakers={max_speakers})."
+        )
+
+
+def _diarize_token(resolved_model: str, token: str | None) -> str | None:
+    """The token a run of ``resolved_model`` uses; a gated one needs one."""
+    token = token or config.conf_hf_token()
+    # Compare the bare id: a pinned "<id>@<revision>" is the same gated repo.
+    if not token and _split_model_revision(resolved_model)[0] in GATED_DIARIZE_MODELS:
+        raise _gated_model_error(resolved_model)
+    return token
+
+
+def preflight(
+    model: str | None,
+    *,
+    token: str | None = None,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> None:
+    """Refuse a diarization run that cannot succeed, before any audio work.
+
+    Makes the checks :func:`diarize_turns` makes before loading pyannote --
+    the speaker bounds (``ValueError``), then the no-token refusal of a bundled
+    gated pipeline (the :func:`_gated_model_error` ``RuntimeError``), with
+    ``model`` resolved exactly as the run resolves it -- so a caller can fail
+    in seconds instead of after separation, ASR and alignment. Never imports
+    torch or pyannote and never touches the network.
+    """
+    _validate_speaker_bounds(min_speakers, max_speakers)
+    _diarize_token(config.resolve_diarize_model(model), token)
 
 
 def diarize_turns(
@@ -986,10 +1111,11 @@ def _audit_counts(audit: Mapping[str, object]) -> dict[str, object]:
 def _clustering_embedding_numerics() -> Iterator[None]:
     """A fixed TF32 policy for the clustering embeddings, restored afterwards.
 
-    The process policy at this point depends on the call site and the run:
-    pyannote's span above switches TF32 off, and the separator switches TF32
-    matmuls on only when this run separated vocals (not on a vocals-cache hit,
-    with ``--no-separate`` or with ``VOXWEAVE_TF32=0``). So pin it here:
+    The process policy at this point depends on the run: the diarization span
+    above switches TF32 off only while pyannote runs and restores the policy it
+    found before clustering starts, and that policy has TF32 matmuls on only
+    when this run separated vocals (not on a vocals-cache hit, with
+    ``--no-separate`` or with ``VOXWEAVE_TF32=0``). So pin it here:
 
     * cuDNN TF32 on: with it off, cuDNN picks convolution algorithms with
       much larger workspaces for ReDimNet2. Measured on a 2 h 13 min meeting
@@ -1166,10 +1292,9 @@ def _diarize_turns_locked(
 ) -> DiarizationResult:
     resolved_model = config.resolve_diarize_model(model)
     resolved_clustering = config.resolve_diarize_clustering(clustering)
-    token = token or config.conf_hf_token()
-    # Compare the bare id: a pinned "<id>@<revision>" is the same gated repo.
-    if not token and _split_model_revision(resolved_model)[0] in GATED_DIARIZE_MODELS:
-        raise _gated_model_error(resolved_model)
+    # The same checks as preflight(), for callers that skipped it.
+    _validate_speaker_bounds(min_speakers, max_speakers)
+    token = _diarize_token(resolved_model, token)
     import soundfile as sf
     import torch
 
@@ -1208,20 +1333,9 @@ def _diarize_turns_locked(
             warnings.filterwarnings(
                 "ignore", message=r"TensorFloat-32 \(TF32\) has been disabled"
             )
-            audio_input = {"waveform": wav, "sample_rate": int(sr)}
-            version = _package_version("pyannote.audio")
-            try:
-                pyannote_major = int(version.split(".", 1)[0])
-            except ValueError:
-                pyannote_major = 4
-            if pyannote_major >= 4:
-                raw_result = pl(audio_input, **kwargs)
-            else:
-                raw_result = pl(
-                    audio_input,
-                    return_embeddings=want_embeddings,
-                    **kwargs,
-                )
+            # pyannote.audio 4.x (pinned) returns the embeddings on the output
+            # object; there is no return_embeddings keyword.
+            raw_result = pl({"waveform": wav, "sample_rate": int(sr)}, **kwargs)
     finally:
         torch.set_float32_matmul_precision(matmul_precision)
         torch.backends.cudnn.allow_tf32 = cudnn_tf32
@@ -1236,9 +1350,6 @@ def _diarize_turns_locked(
         else:
             centroids = None
             embedding_dim = "unresolved"
-    elif want_embeddings and isinstance(raw_result, tuple) and len(raw_result) == 2:
-        annotation, embeddings = raw_result
-        centroids, embedding_dim = _normalized_centroids(annotation, embeddings)
     else:
         annotation = raw_result
         centroids = None
@@ -1347,7 +1458,10 @@ def _smooth_turns(turns: Sequence[Turn]) -> list[Turn]:
 def _span_speaker(
     start: float | None, end: float | None, turns: Sequence[Turn]
 ) -> str | None:
-    """Dominant speaker for a time span by accumulated overlap (whisperX pattern)."""
+    """Dominant speaker for a time span by accumulated overlap (whisperX pattern).
+
+    ``turns`` must be sorted by start (:func:`format_speaker_cues` sorts them).
+    """
     if start is None or end is None or end <= start:
         return None
     overlap: dict[str, float] = {}
@@ -1423,10 +1537,9 @@ def _absorb_tiny_runs(
         if not tiny:
             break
         _, i = min(tiny)  # shortest absorbable run first
+        # len(runs) > 1, so at least one neighbour exists (durations are >= 0).
         left = durs[i - 1] if i > 0 else -1.0
         right = durs[i + 1] if i + 1 < len(runs) else -1.0
-        if left < 0 and right < 0:
-            break
         if right > left:  # merge into the following (longer) run: prepend atoms
             runs[i + 1] = (runs[i + 1][0], runs[i][1] + runs[i + 1][1])
         else:  # merge into the preceding run: append atoms
@@ -1461,10 +1574,8 @@ def _snap_runs_to_phrases(
     new_labels = list(labels)
     for s, e in zip(edges, edges[1:]):
         weight: dict[str, float] = {}
-        for k in range(s, e):
+        for k in range(s, e):  # edges strictly increase: never empty
             weight[labels[k]] = weight.get(labels[k], 0.0) + _run_dur([flat[k]])
-        if not weight:
-            continue
         first = labels[s]
         best = max(weight, key=lambda lb: (weight[lb], lb == first))
         for k in range(s, e):
@@ -1697,6 +1808,9 @@ def format_speaker_cues(
     """
     if not turns:
         return cues
+    # Persisted turns may arrive in any order; _span_speaker relies on start
+    # order. Pipeline-produced turns are already in this order (a no-op).
+    turns = sorted(turns, key=lambda t: (t[0], t[1], t[2]))
     from voxweave.core.layout import (
         _line_budget_width,
         _vis_width,

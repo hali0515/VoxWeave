@@ -89,7 +89,6 @@ Turn = tuple[float, float, str]
 Span = tuple[float, float]
 # spans in seconds -> [N, D] L2-normalised rows, one per span, in span order.
 EmbedFn = Callable[[Sequence[Span]], np.ndarray]
-Embed = EmbedFn
 
 RECIPE = "voiceprint-v1"
 METHODS = ("ahc", "spectral", "refine")
@@ -1125,7 +1124,6 @@ __all__ = [
     "ClusteringError",
     "ClusteringParams",
     "ClusteringResult",
-    "Embed",
     "EmbedFn",
     "LABEL_FORMAT",
     "METHODS",
