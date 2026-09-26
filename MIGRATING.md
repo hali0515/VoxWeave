@@ -47,7 +47,7 @@ keyed by pyannote's labels.
 
 Saved speaker names are keyed by speaker id (`SPEAKER_00`, ...), and switching
 `--speaker-clustering` (like switching `--diarize-model`) renumbers the speakers of an episode
-you already named. `process` now warns when a named id's turns changed; review the names with
+you already named. A transcription run now warns when a named id's turns changed; review the names with
 `voxweave speakers <media>` before running `voxweave speakers enroll`, or a voice can be
 stored in the voice library under someone else's name.
 
@@ -64,7 +64,7 @@ speaker-embedding model chosen per language (`--voiceprint-model` /
 - `pyannote`: the previous behavior.
 
 A `--voiceprints` run fetches the checkpoint it may need (51 MB for `redimnet2`, 83 MB
-for `anime-va`; with `auto` and no `--lang`, both) into `~/.cache/voxweave/audio/` and
+for `anime-va`; with `auto` and no `--language`, both) into `~/.cache/voxweave/audio/` and
 verifies its SHA-256 before any audio work. If that fails (no network, a stalled
 download), the run warns and continues without voiceprints; the subtitles are written as
 usual. For an offline host:
@@ -98,8 +98,9 @@ or set it once in `~/.config/voxweave.conf`:
 model = "pyannote"
 ```
 
-Alternatively start a new store with the new embedder: re-run the reviewed episodes with
-`--diarize --voiceprints` and `speakers enroll` them into a new `--voices` file.
+Alternatively re-run the reviewed episodes with `--diarize --voiceprints` and
+`voxweave speakers enroll EPISODE`; the voice library keeps the new embedder's voices in their
+own embedding space.
 
 In exchange, a store built by `redimnet2` or `anime-va` no longer depends on the
 diarization pipeline: switching `--diarize-model` keeps it matching. The default
