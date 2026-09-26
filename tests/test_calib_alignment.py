@@ -1104,3 +1104,85 @@ def test_source_and_item_filters_narrow_the_run(gated_corpus: Path) -> None:
     empty = ca.evaluate(ca.load_manifest(gated_corpus), item_filter=("nothing",))
     assert empty["status"] == "invalid"
     assert empty["failures"][0]["code"] == "no_references_selected"
+
+
+def test_filtered_report_cannot_become_a_baseline(
+    gated_corpus: Path, tmp_path: Path
+) -> None:
+    """A --source/--item run keeps the whole manifest's digest; it must say so."""
+    report_path = tmp_path / "report.json"
+    assert (
+        ca.main(
+            [
+                "report",
+                "--manifest",
+                str(gated_corpus),
+                "--source",
+                "mfa_words",
+                "--json-out",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert ca.report_filters(report) == {"source": ["mfa_words"]}
+    with pytest.raises(SystemExit) as exc:
+        ca.main(
+            [
+                "record-baseline",
+                "--manifest",
+                str(gated_corpus),
+                "--report",
+                str(report_path),
+                "--output",
+                str(tmp_path / "baseline.json"),
+            ]
+        )
+    assert exc.value.code == cc.EXIT_INVALID
+    assert not (tmp_path / "baseline.json").exists()
+
+    full = ca.evaluate(ca.load_manifest(gated_corpus))
+    assert ca.report_filters(full) == {}
+    baseline_path = tmp_path / "full-baseline.json"
+    baseline_path.write_text(json.dumps(ca.baseline_document(full)), encoding="utf-8")
+    for extra in (["--report", str(report_path)], ["--item", "en-split"]):
+        with pytest.raises(SystemExit) as exc:
+            ca.main(
+                [
+                    "check",
+                    "--manifest",
+                    str(gated_corpus),
+                    "--baseline",
+                    str(baseline_path),
+                    *extra,
+                ]
+            )
+        assert exc.value.code == cc.EXIT_INVALID
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda b: b.pop("lanes"),
+        lambda b: b["lanes"][0].pop("metrics"),
+        lambda b: b["lanes"][0].pop("source_kind"),
+        lambda b: b.update(schema_version="one"),
+        lambda b: b.update(tolerances={"relative": "loose"}),
+        lambda b: next(iter(b["lanes"][0]["metrics"].values())).update(mae="x"),
+    ],
+    ids=["no-lanes", "no-metrics", "no-source-kind", "version", "tolerance", "mae"],
+)
+def test_malformed_baseline_is_invalid_not_a_regression(
+    gated_corpus: Path, tmp_path: Path, capsys: Any, mutate: Any
+) -> None:
+    baseline = ca.baseline_document(ca.evaluate(ca.load_manifest(gated_corpus)))
+    mutate(baseline)
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        ca.main(
+            ["check", "--manifest", str(gated_corpus), "--baseline", str(baseline_path)]
+        )
+    assert exc.value.code == cc.EXIT_INVALID
+    assert str(baseline_path) in capsys.readouterr().err

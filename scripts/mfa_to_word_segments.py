@@ -66,7 +66,6 @@ import importlib.util
 import itertools
 import math
 import re
-import shlex
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -144,6 +143,15 @@ PROVENANCE_FIELDS = (
     "annotators",
 )
 REQUIRED_PROVENANCE = ("created_by", "tool_version", "acoustic_model", "dictionary")
+
+#: The flag that supplies each required provenance field (``tool_version`` is
+#: ``--mfa-version``, so the flag name cannot be derived from the key).
+PROVENANCE_FLAGS = {
+    "created_by": "--created-by",
+    "tool_version": "--mfa-version",
+    "acoustic_model": "--acoustic-model",
+    "dictionary": "--dictionary",
+}
 
 _REFERENCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]+$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -333,6 +341,8 @@ class _Values:
             raise cc.CalibrationError(
                 f"{self.path}: expected an integer for {what}, got {raw!r}"
             ) from None
+        if not math.isfinite(number):
+            raise cc.CalibrationError(f"{self.path}: {what} is not finite ({raw!r})")
         value = int(number)
         if value != number:
             raise cc.CalibrationError(
@@ -649,6 +659,36 @@ def _lexical_phones(tiers: Sequence[Tier], start: float, end: float) -> list[str
     return out
 
 
+def _tier_speaker(name: str, target: str) -> str:
+    """Speaker of an MFA tier name: ``<speaker> - <target>`` -> speaker, bare -> ``""``.
+
+    ``target`` may itself be fully qualified (``--tier "spk1 - words"``), so an
+    exact match still splits on MFA's `` - `` separator.
+    """
+    folded = name.strip().casefold()
+    target = target.strip().casefold()
+    if folded != target and folded.endswith(target):
+        return folded[: -len(target)].rstrip(" -")
+    head, sep, _ = folded.rpartition(" - ")
+    return head.strip() if sep else ""
+
+
+def speaker_phone_tiers(
+    word_tier: Tier,
+    phone_tiers: Sequence[Tier],
+    *,
+    tier_name: str,
+    phone_tier_name: str,
+) -> list[Tier]:
+    """The phone tiers of ``word_tier``'s own speaker.
+
+    Pooling every speaker's phones would let another speaker's real phones,
+    talking over an ``spn``-realized word, turn that OOV word into a truth sample.
+    """
+    speaker = _tier_speaker(word_tier.name, tier_name)
+    return [t for t in phone_tiers if _tier_speaker(t.name, phone_tier_name) == speaker]
+
+
 def classify_interval(
     interval: Interval,
     *,
@@ -736,9 +776,7 @@ def load_provenance_file(path: str | Path) -> dict[str, Any]:
     return dict(document)
 
 
-def build_provenance(
-    args: argparse.Namespace, *, source_digest: str, argv: Sequence[str]
-) -> dict[str, Any]:
+def build_provenance(args: argparse.Namespace, *, source_digest: str) -> dict[str, Any]:
     """Merge ``--provenance`` with the flags (flags win) and enforce what MFA cannot embed."""
     merged: dict[str, Any] = {}
     if args.provenance:
@@ -774,7 +812,7 @@ def build_provenance(
         raise cc.CalibrationError(
             "MFA provenance is incomplete -- a TextGrid embeds none of it",
             [
-                f"missing {key} (pass --{key.replace('_', '-')} or --provenance)"
+                f"missing {key} (pass {PROVENANCE_FLAGS[key]} or --provenance)"
                 for key in missing
             ],
         )
@@ -787,20 +825,38 @@ def build_provenance(
             merged.get(key), merged.get(f"{key}_sha256"), key.replace("_", "-")
         )
 
-    uncertainty = float(merged.get("reference_uncertainty_s", NOMINAL_UNCERTAINTY_S))
-    if not math.isfinite(uncertainty) or uncertainty < 0:
+    # A null uncertainty (schema-valid) means "not stated": record the nominal one.
+    uncertainty = merged.get("reference_uncertainty_s")
+    if uncertainty is None:
+        uncertainty = NOMINAL_UNCERTAINTY_S
+    if (
+        isinstance(uncertainty, bool)
+        or not isinstance(uncertainty, (int, float))
+        or not math.isfinite(uncertainty)
+        or uncertainty < 0
+    ):
         raise cc.CalibrationError(
-            f"reference_uncertainty_s must be finite and >= 0, got {uncertainty!r}"
+            f"reference_uncertainty_s must be a finite number >= 0, got {uncertainty!r}"
         )
-    merged["reference_uncertainty_s"] = uncertainty
+    merged["reference_uncertainty_s"] = float(uncertainty)
 
-    annotators = int(merged.get("annotators", 0))
-    if annotators < 0:
-        raise cc.CalibrationError(f"annotators must be >= 0, got {annotators}")
+    annotators = merged.get("annotators", 0)
+    if isinstance(annotators, float) and annotators.is_integer():
+        annotators = int(annotators)
+    if (
+        isinstance(annotators, bool)
+        or not isinstance(annotators, int)
+        or annotators < 0
+    ):
+        raise cc.CalibrationError(
+            f"annotators must be an integer >= 0, got {annotators!r}"
+        )
     merged["annotators"] = annotators
 
     merged.setdefault("created_at", _now_iso())
-    merged.setdefault("command", shlex.join(list(argv)))
+    # `command` is the `mfa align` invocation; this converter's own argv is not
+    # it, so an unstated command stays null rather than being mislabelled.
+    merged.setdefault("command", None)
     merged["source_digest"] = source_digest
     return merged
 
@@ -851,9 +907,12 @@ def _read_shard(
 
     out: list[_Candidate] = []
     for tier in word_tiers:
+        own_phones = speaker_phone_tiers(
+            tier, phone_tiers, tier_name=tier_name, phone_tier_name=phone_tier_name
+        )
         for index, interval in enumerate(tier.intervals, start=1):
             truth, reason = classify_interval(
-                interval, phone_tiers=phone_tiers, oov_words=oov_words
+                interval, phone_tiers=own_phones, oov_words=oov_words
             )
             out.append(
                 _Candidate(
@@ -940,9 +999,14 @@ def _validate_segments(
                     f"segments overlap inside utterance {utterance!r} at {seg_id}"
                 )
             last_end[utterance] = max(last_end.get(utterance, -math.inf), end)
-        if media_duration_s is not None and (
-            start + offset_s < -_EPS or end + offset_s > media_duration_s + _EPS
-        ):
+        # The loader rejects any start pushed below 0 by offset_s, whether or not
+        # a media duration is known -- so must the file's producer.
+        if start + offset_s < 0:
+            raise cc.CalibrationError(
+                f"segment {seg_id} falls outside the media after offset_s={offset_s}",
+                [f"segment start {start} + {offset_s} is before 0"],
+            )
+        if media_duration_s is not None and end + offset_s > media_duration_s + _EPS:
             raise cc.CalibrationError(
                 f"segment {seg_id} falls outside the media after offset_s={offset_s}",
                 [
@@ -1108,7 +1172,8 @@ def convert(
         raise cc.CalibrationError(
             f"--media-duration must be finite and >= 0, got {duration!r}"
         )
-    _validate_segments(segments, offset_s=offset_s, media_duration_s=duration)
+    # Validate against the offset as written, which is what the loader will read.
+    _validate_segments(segments, offset_s=_round(offset_s), media_duration_s=duration)
 
     reference: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -1246,8 +1311,9 @@ def build_parser() -> argparse.ArgumentParser:
     shape.add_argument(
         "--phone-tier",
         default="phones",
-        help="phone tier used to spot OOV words realized as spn (default: phones;"
-        " empty string disables the check)",
+        help="phone tier used to spot OOV words realized as spn; each word tier is"
+        " checked against its own speaker's phone tier (default: phones; empty"
+        " string disables the check)",
     )
     shape.add_argument(
         "--oov-list",
@@ -1374,9 +1440,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     window = parse_range(args.range) if args.range else Window()
     oov_words = load_oov_words(args.oov_list) if args.oov_list else frozenset()
     provenance = build_provenance(
-        args,
-        source_digest=source_digest(shards, search_root),
-        argv=[Path(sys.argv[0]).name, *(argv if argv is not None else sys.argv[1:])],
+        args, source_digest=source_digest(shards, search_root)
     )
 
     reference, report = convert(

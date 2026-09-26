@@ -7,8 +7,10 @@ acoustic boundaries get more accurate" and "did subtitle segmentation get better
 ```text
 calibration/
   schemas/       JSON Schema (draft 2020-12) contracts, tracked and stable
-  alignment/     manifest example, reference fixtures, recorded baseline
+  alignment/     manifest example and synthetic reference fixtures (no tracked baseline)
   segmentation/  corpus registry, golden cases, recorded baseline
+  align-shadow/  align-shadow corpus, manifest and baseline for scripts/calib_align_shadow.py
+  p6-oracle/     detached oracle corpus for scripts/p6_oracle.py (see its README)
 ```
 
 Shared helpers live in `scripts/calib_common.py`: schema validation, the single type-7
@@ -31,8 +33,9 @@ to exit 1.
 
 ## The two truth lanes
 
-The alignment ruler never pools its ground-truth sources. Each lane is kept separate by
-`(source_kind, language, reference_id)` and answers a different question.
+The alignment ruler never pools its ground-truth sources. Each lane is keyed by
+`(source_kind, language)` and answers a different question; inside a lane every item keeps
+its `reference_id` and its own metrics, so the pooled lane numbers stay traceable.
 
 | lane | ground truth | answers | primary metrics |
 |---|---|---|---|
@@ -49,6 +52,21 @@ Rules that are not negotiable:
   same-language commercial track often does not exist.
 - Matching hypothesis to reference is text-driven. Timestamps are what is under test and
   must never be used to pair units.
+
+`scripts/calib_alignment.py` has four subcommands (`--help` lists their flags):
+
+```bash
+uv run python scripts/calib_alignment.py inspect-tracks MEDIA --lang ja [--json]
+uv run python scripts/calib_alignment.py report --manifest M [--json-out P]
+uv run python scripts/calib_alignment.py check --manifest M --baseline B
+uv run python scripts/calib_alignment.py record-baseline --manifest M --report R --output O
+```
+
+`report` writes `build/calibration/alignment-report.json` unless `--json-out` says
+otherwise. `--source` / `--item` narrow a `report` for exploration; such a report records
+its filters, and `check` and `record-baseline` refuse it, because a baseline gates the
+whole manifest. `calibration/alignment/manifest.example.json` is the manifest shape to
+copy; no alignment baseline is tracked yet, so `--output` names wherever you record one.
 
 The segmentation ruler is a separate, zero-GPU lane. It stores no expected subtitle text:
 each case in `segmentation/cases/` is a real captured `word_segments` stream plus the
@@ -71,9 +89,10 @@ never change the denominator of the public PR gate.
 
 ## Baselines
 
-`alignment/baseline.json` and `segmentation/baseline.json` are recorded reference points,
-not targets invented by hand. Gates are one-sided (lower is better), so an improvement can
-never fail:
+`segmentation/baseline.json` (and any alignment baseline recorded with
+`calib_alignment.py record-baseline`) is a recorded reference point, not a target invented
+by hand. Gates are one-sided in the direction that means "worse" (errors may not rise, hit
+rates and coverage may not fall), so an improvement can never fail. For an error metric:
 
 ```python
 allowed = baseline_value + max(absolute_tolerance, baseline_value * relative_tolerance)

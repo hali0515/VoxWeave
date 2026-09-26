@@ -1364,3 +1364,127 @@ def test_exit_driving_stage_set_is_partition_checks_not_a_restated_literal() -> 
         )
         counts = calib.shadow_violation_counts(artifact)
         assert counts["exit_driving"], f"stage {stage!r} must drive the exit"
+
+
+# --------------------------------------------------------------------------- #
+# scripts/calib_align_shadow.py CLI contract (the P6 align-shadow runner; its
+# corpus-level tests live in test_p6_align_shadow_corpus.py)
+# --------------------------------------------------------------------------- #
+
+align_shadow = _load_script("calib_align_shadow")
+ALIGN_SHADOW_MANIFEST = REPO_ROOT / "calibration" / "align-shadow" / "manifest.json"
+
+
+def test_align_shadow_help_hides_the_worker_and_describes_each_command() -> None:
+    text = align_shadow._parser().format_help()
+    assert "_worker" not in text and "SUPPRESS" not in text
+    for command, description in align_shadow._COMMAND_HELP.items():
+        assert command in text
+        assert description.split()[0] in text
+
+
+def test_align_shadow_environment_drift_names_the_field(tmp_path: Path) -> None:
+    pytest.importorskip("voxweave.engine_registry")
+    manifest = json.loads(ALIGN_SHADOW_MANIFEST.read_text(encoding="utf-8"))
+    manifest["environment"]["timezone"] = "Mars/Olympus_Mons"
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(align_shadow.HarnessInvalid) as excinfo:
+        align_shadow._validate_manifest(path)
+    message = str(excinfo.value)
+    assert "timezone" in message and "Mars/Olympus_Mons" in message
+
+
+def _align_shadow_baseline_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    manifest = {"registry_sha256": "a" * 64}
+    report = {
+        "cases": [
+            {
+                "id": "case-a",
+                "expected_failure": None,
+                "expected_detail_code": None,
+                "runs": [
+                    {
+                        "shadow_enabled": True,
+                        "observer": "collector",
+                        "selected": {"engine_family": "legacy-v1"},
+                        "artifact_kind": "rich",
+                        "alds": ["ALD-6"],
+                        "artifact_sha256": "b" * 64,
+                    }
+                ],
+            }
+        ]
+    }
+    baseline = {
+        "schema_version": 1,
+        "manifest_sha256": align_shadow._sha256_path(manifest_path),
+        "manifest_schema_sha256": align_shadow._sha256_path(
+            align_shadow.MANIFEST_SCHEMA_PATH
+        ),
+        "artifact_schema_sha256": align_shadow._sha256_path(
+            align_shadow.ARTIFACT_SCHEMA_PATH
+        ),
+        "report_schema_sha256": align_shadow._sha256_path(
+            align_shadow.REPORT_SCHEMA_PATH
+        ),
+        "registry_sha256": manifest["registry_sha256"],
+        "cases": align_shadow._baseline_cases(report),
+    }
+    return tmp_path / "baseline.json", manifest_path, manifest, report, baseline
+
+
+def test_align_shadow_baseline_differences_are_named(tmp_path: Path) -> None:
+    baseline_path, manifest_path, manifest, report, baseline = (
+        _align_shadow_baseline_fixture(tmp_path)
+    )
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+    assert (
+        align_shadow._check_baseline(baseline_path, manifest_path, manifest, report)
+        == []
+    )
+    baseline["cases"]["case-a"]["artifact_sha256"] = "0" * 64
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+    assert align_shadow._check_baseline(
+        baseline_path, manifest_path, manifest, report
+    ) == ["case-a: artifact_sha256 differ from the baseline"]
+
+
+def test_align_shadow_baseline_header_mismatch_is_invalid(tmp_path: Path) -> None:
+    """A changed manifest or schema is exit 2 (no standing), not a regression."""
+    baseline_path, manifest_path, manifest, report, baseline = (
+        _align_shadow_baseline_fixture(tmp_path)
+    )
+    baseline["manifest_schema_sha256"] = "0" * 64
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+    with pytest.raises(align_shadow.HarnessInvalid) as excinfo:
+        align_shadow._check_baseline(baseline_path, manifest_path, manifest, report)
+    assert "manifest_schema_sha256" in str(excinfo.value)
+    assert str(baseline_path) in str(excinfo.value)
+
+
+def test_align_shadow_json_errors_name_the_path(tmp_path: Path) -> None:
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    with pytest.raises(align_shadow.HarnessInvalid) as excinfo:
+        align_shadow._load_json(broken)
+    assert str(broken) in str(excinfo.value)
+    duplicated = tmp_path / "dup.json"
+    duplicated.write_text('{"a": 1, "a": 2}', encoding="utf-8")
+    with pytest.raises(align_shadow.HarnessInvalid) as excinfo:
+        align_shadow._load_json(duplicated)
+    assert str(duplicated) in str(excinfo.value) and "duplicate" in str(excinfo.value)
+
+
+def test_align_shadow_report_write_is_atomic(tmp_path: Path) -> None:
+    target = tmp_path / "out" / "report.json"
+    align_shadow._write_json(target, {"ok": True})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
+    with pytest.raises(ValueError):
+        align_shadow._write_json(target, {"bad": float("nan")})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
+    assert sorted(p.name for p in target.parent.iterdir()) == ["report.json"]

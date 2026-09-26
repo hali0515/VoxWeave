@@ -47,7 +47,8 @@ passed, ``1`` valid but a gate failed, ``2`` manifest / schema / reference /
 coverage / tooling invalid.
 
 ``record-baseline`` is a deliberate human action: it refuses a report whose
-manifest digest differs and it is never wired into CI or a default make target.
+manifest digest differs or that was narrowed with ``--source`` / ``--item``, and
+it is never wired into CI or a default make target.
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = _SCRIPTS_DIR.parent
@@ -112,7 +113,7 @@ TEXT_NORM_VERSION = 1
 WORD_KINDS = ("mfa_words", "manual_words")
 CUE_KINDS = ("commercial_cues", "manual_cues")
 
-#: Thresholds each lane reports (design 3.7). Cue lanes are a display ruler, so
+#: Hit-rate thresholds each lane kind reports. Cue lanes are a display ruler, so
 #: 25 ms buckets would be noise; word lanes are an acoustic ruler, so a 1 s
 #: bucket would be uninformative.
 CUE_THRESHOLDS = (0.25, 1.0)
@@ -172,7 +173,8 @@ LEVENSHTEIN_CELL_LIMIT = 250_000
 
 #: Language detection needs enough lexical characters to mean anything.
 MIN_DETECT_CHARS = 16
-#: Japanese script-ratio floor from design 3.4 rule 6.
+#: A Japanese-lane reference track must be at least this share kana/Han, so a
+#: mistagged English translation track is refused rather than paired.
 JA_SCRIPT_RATIO_MIN = 0.5
 #: Two candidate tracks this close in text coverage are not distinguishable.
 TRACK_COVERAGE_AMBIGUITY = 0.02
@@ -392,7 +394,7 @@ def detect_text_language(text: str) -> str | None:
 
 
 def japanese_script_ratio(text: str) -> float:
-    """Fraction of lexical codepoints that are kana or Han (design 3.4 rule 6)."""
+    """Fraction of lexical codepoints that are kana or Han."""
     counts = script_counts(text)
     total = sum(counts.values())
     if not total:
@@ -928,7 +930,7 @@ class BoundaryError:
     shape: str = "1:1"
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize one pair for manual spot-checking (design 3.6)."""
+        """Serialize one pair so a human can spot-check it against the media."""
         return {
             "hyp_ids": list(self.hyp_ids),
             "ref_ids": list(self.ref_ids),
@@ -1605,7 +1607,7 @@ def select_subtitle_track(
 ) -> TrackSelection:
     """Pick the same-language dialogue track, by tags first and text second.
 
-    Order of business (design 3.4): an explicit manifest index wins but is still
+    Order of business: an explicit manifest index wins but is still
     validated; language tags are canonicalized and never guessed; bitmap, forced
     and signs/songs tracks are dropped; the survivors are parsed and ranked by
     text coverage against the hypothesis; two candidates within 2 points of each
@@ -2155,7 +2157,7 @@ def build_lanes(
 def _pair_details(
     errors: Sequence[BoundaryError], *, pairs: str, limit: int
 ) -> dict[str, Any]:
-    """Per-group detail for manual spot-checking (design 3.6).
+    """Per-group detail a human can spot-check against the media.
 
     ``worst`` (the default) keeps the largest boundary errors, which is what a
     human actually opens the report for; the selection is named, and
@@ -2184,7 +2186,11 @@ def _pair_details(
 def _item_detail(
     outcome: ItemOutcome, level: str, *, pairs: str, pairs_limit: int
 ) -> dict[str, Any]:
-    """Per-item stratification kept inside the lane (design 3.1)."""
+    """Per-item stratification inside the lane.
+
+    Each item keeps its ``reference_id`` and its own metrics, so the pooled lane
+    numbers stay traceable to the item that moved them.
+    """
     metrics: dict[str, Any] = {}
     if outcome.status != "invalid":
         metrics, _ = lane_metrics(
@@ -2227,6 +2233,8 @@ def build_report(
     failures: Sequence[Mapping[str, Any]] = (),
     pairs: str = "worst",
     pairs_limit: int = 25,
+    source_filter: Sequence[str] = (),
+    item_filter: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Assemble the report document and validate it against its tracked schema."""
     bootstrap = int(manifest.defaults["bootstrap_samples"])
@@ -2258,6 +2266,12 @@ def build_report(
                 "skip_cost": SKIP_COST,
                 "merge_similarity_step": MERGE_SIMILARITY_STEP,
                 "max_group": {k: list(v) for k, v in MAX_GROUP.items()},
+                # The digest names the whole manifest, so a --source / --item run
+                # must say it covered less: see report_filters().
+                "filters": {
+                    "source": sorted(source_filter),
+                    "item": sorted(item_filter),
+                },
             }
         },
         "failures": all_failures,
@@ -2314,12 +2328,32 @@ def evaluate(
         failures=failures,
         pairs=pairs,
         pairs_limit=pairs_limit,
+        source_filter=source_filter,
+        item_filter=item_filter,
     )
 
 
 # --------------------------------------------------------------------------- #
 # Baseline and one-way gates
 # --------------------------------------------------------------------------- #
+
+
+def report_filters(report: Mapping[str, Any]) -> dict[str, Any]:
+    """The non-empty ``--source`` / ``--item`` filters a report was computed with.
+
+    A filtered report still carries the whole manifest's digest, so without this
+    it could be recorded as a baseline that silently leaves every other lane (or
+    item) ungated. Anything unreadable counts as a filter: refusing is safe,
+    guessing "unfiltered" is not.
+    """
+    health = report.get("health")
+    config = health.get("config") if isinstance(health, Mapping) else None
+    filters = config.get("filters") if isinstance(config, Mapping) else None
+    if filters is None:
+        return {}
+    if not isinstance(filters, Mapping):
+        return {"filters": filters}
+    return {str(key): value for key, value in filters.items() if value}
 
 
 def baseline_document(
@@ -2366,6 +2400,83 @@ def baseline_document(
     }
 
 
+def _got(value: Any) -> str:
+    return "missing" if value is None else repr(value)[:60]
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def baseline_shape_errors(baseline: Any) -> list[str]:
+    """Where ``baseline`` departs from the shape :func:`baseline_document` writes.
+
+    A hand-edited or truncated baseline is invalid input (exit 2); letting it
+    surface as a bare ``KeyError`` would exit 1 and read as a quality regression.
+    """
+    if not isinstance(baseline, Mapping):
+        return [f"<root>: expected an object, got {type(baseline).__name__}"]
+    errors: list[str] = []
+    for key in ("schema_version", "text_norm_version"):
+        value = baseline.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            errors.append(f"{key}: expected an integer, got {_got(value)}")
+    tolerances = baseline.get("tolerances")
+    if tolerances is not None and not isinstance(tolerances, Mapping):
+        errors.append(f"tolerances: expected an object, got {_got(tolerances)}")
+    elif tolerances:
+        errors.extend(
+            f"tolerances/{key}: expected a finite number, got {_got(value)}"
+            for key, value in tolerances.items()
+            if not _is_finite_number(value)
+        )
+    lanes = baseline.get("lanes")
+    if not isinstance(lanes, list):
+        return [*errors, f"lanes: expected an array, got {_got(lanes)}"]
+    for index, lane in enumerate(lanes):
+        where = f"lanes/{index}"
+        if not isinstance(lane, Mapping):
+            errors.append(f"{where}: expected an object, got {_got(lane)}")
+            continue
+        for key in ("source_kind", "language"):
+            if not isinstance(lane.get(key), str):
+                errors.append(
+                    f"{where}/{key}: expected a string, got {_got(lane.get(key))}"
+                )
+        coverage = lane.get("coverage")
+        if coverage is not None and not isinstance(coverage, Mapping):
+            errors.append(f"{where}/coverage: expected an object, got {_got(coverage)}")
+        elif coverage:
+            for side in ("hyp_chars", "ref_chars"):
+                value = coverage.get(side)
+                if value is not None and not _is_finite_number(value):
+                    errors.append(
+                        f"{where}/coverage/{side}: expected a number, got {_got(value)}"
+                    )
+        metrics = lane.get("metrics")
+        if not isinstance(metrics, Mapping):
+            errors.append(f"{where}/metrics: expected an object, got {_got(metrics)}")
+            continue
+        for name, block in metrics.items():
+            if not isinstance(block, Mapping):
+                errors.append(
+                    f"{where}/metrics/{name}: expected an object, got {_got(block)}"
+                )
+                continue
+            for metric_field in (*GATED_ERROR_FIELDS, *GATED_RATE_FIELDS):
+                value = block.get(metric_field)
+                if value is not None and not _is_finite_number(value):
+                    errors.append(
+                        f"{where}/metrics/{name}/{metric_field}: expected a number,"
+                        f" got {_got(value)}"
+                    )
+    return errors
+
+
 def _allowed_ceiling(base: float, tol: Mapping[str, float]) -> float:
     return base + max(float(tol["absolute_s"]), abs(base) * float(tol["relative"]))
 
@@ -2385,6 +2496,9 @@ def apply_gates(
     disappeared, a metric whose samples vanished) is *invalid*, not a
     regression -- a run with different inputs has no standing to judge quality.
     """
+    shape_errors = baseline_shape_errors(baseline)
+    if shape_errors:
+        raise cc.CalibrationError("baseline is malformed", shape_errors)
     if int(baseline.get("schema_version", 0)) != BASELINE_SCHEMA_VERSION:
         raise cc.CalibrationError(
             f"baseline schema_version {baseline.get('schema_version')!r} != "
@@ -2669,14 +2783,31 @@ def cmd_report(args: argparse.Namespace) -> int:
     return cc.EXIT_OK
 
 
+def _die_filtered(filters: Mapping[str, Any], what: str) -> NoReturn:
+    cc.die_invalid(
+        f"refusing to {what} a report filtered with --source/--item",
+        [
+            *(f"{key}: {value}" for key, value in sorted(filters.items())),
+            "a baseline gates the whole manifest; a filtered run would leave the "
+            "other lanes and items ungated -- re-run without --source/--item",
+        ],
+    )
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Compare a report against a recorded baseline with one-way gates."""
     manifest = _load_manifest_or_die(args.manifest)
+    requested = {"source": args.source, "item": args.item}
+    if any(requested.values()):
+        _die_filtered({k: v for k, v in requested.items() if v}, "gate")
     if args.report:
         report = cc.read_json_or_exit2(args.report)
         errors = cc.schema_errors(report, "alignment-report")
         if errors:
             cc.die_invalid(f"{args.report} failed schema validation", errors)
+        filters = report_filters(report)
+        if filters:
+            _die_filtered(filters, "gate")
     else:
         report = evaluate(
             manifest,
@@ -2692,7 +2823,10 @@ def cmd_check(args: argparse.Namespace) -> int:
         cc.die_invalid("the run is invalid; it cannot judge quality")
 
     baseline = cc.read_json_or_exit2(args.baseline)
-    failures = apply_gates(report, baseline)
+    try:
+        failures = apply_gates(report, baseline)
+    except cc.CalibrationError as exc:
+        cc.die_invalid(f"{args.baseline}: {exc.message}", exc.details)
     if args.json_out:
         cc.write_json(args.json_out, report)
     print_report(report)
@@ -2713,6 +2847,9 @@ def cmd_record_baseline(args: argparse.Namespace) -> int:
         cc.die_invalid(f"{args.report} failed schema validation", errors)
     if report["status"] == "invalid":
         cc.die_invalid("refusing to record a baseline from an invalid report")
+    filters = report_filters(report)
+    if filters:
+        _die_filtered(filters, "record a baseline from")
     if report["manifest_digest"] != manifest.digest:
         cc.die_invalid(
             "report manifest_digest does not match the manifest; re-run the report "
