@@ -1462,11 +1462,16 @@ def _resolve_selected_path(
         replacements.get((edge.start_node, edge.end_node), edge)
         for edge in lattice.edges
     )
-    edges_from: dict[int, tuple[Edge, ...]] = {}
-    for node in lattice.nodes:
-        outgoing = tuple(edge for edge in edges if edge.start_node == node)
-        if outgoing:
-            edges_from[node] = outgoing
+    # One pass over the edges (not one per node): same keys in lattice.nodes
+    # order, same per-node edge order as the edge tuple.
+    nodes = set(lattice.nodes)
+    grouped: dict[int, list[Edge]] = {}
+    for edge in edges:
+        if edge.start_node in nodes:
+            grouped.setdefault(edge.start_node, []).append(edge)
+    edges_from: dict[int, tuple[Edge, ...]] = {
+        node: tuple(grouped[node]) for node in lattice.nodes if node in grouped
+    }
     sealed_lattice = replace(lattice, edges=edges, edges_from=edges_from)
     return sealed_lattice, tuple(resolved)
 
@@ -1954,7 +1959,7 @@ def _artifact(
         "v1": None if v1_reference is None else v1_reference.to_dict(),
         "validator": {
             "core": None,
-            # The two counters the module docstring says are cross-checked, and
+            # The two counters are cross-checked here, and
             # the answer stated rather than left for a reader to recompute: the
             # document pass sees cross-interval predicates the per-interval
             # passes cannot, so it may report MORE, but a document pass reporting
@@ -2134,7 +2139,10 @@ def shadow_artifact(
     speakers: UnitSpeakers | None = None,
     speaker_weight: float | None = None,
 ) -> dict[str, Any]:
-    """The one call the Wave B hook makes."""
+    """Artifact of :func:`optimize_document` — a test/calibration convenience.
+
+    The shadow hook (``shadow_v2``) calls :func:`optimize_document` directly.
+    """
     return optimize_document(
         document,
         v1=v1,

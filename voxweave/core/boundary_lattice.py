@@ -125,8 +125,6 @@ SPAN_VIOLATION_REASONS: tuple[str, ...] = (
     "starts-non-monotone",
 )
 
-PROFILE_VIOLATION_REASONS: tuple[str, ...] = ("not-positive", "negative", "too-small")
-
 
 # --------------------------------------------------------------------- spans
 

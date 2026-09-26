@@ -510,6 +510,7 @@ LAYOUT_SOURCES: tuple[str, ...] = (
     "greedy-packer",
     "renderer-single-line",
     "renderer-two-line",
+    "preview-final-text",
 )
 
 
