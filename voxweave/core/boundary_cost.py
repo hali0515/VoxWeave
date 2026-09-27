@@ -241,6 +241,13 @@ def pause_evidence(
     would otherwise have their shared time counted twice and could push the
     fraction past 1.0, under-reporting the effective silence and making the cut
     look more expensive than the evidence says.
+
+    A gap with no length still gets its state from VAD rather than defaulting to
+    ``silence``. Where the units overlap, the fraction is taken over the shared
+    stretch; where they touch, it is 1.0 when a span covers that instant (a span
+    covers its start but not its end, the ``[low, high)`` rule above) and 0.0
+    otherwise. The effective silence is zero either way, so only the label and
+    the fraction move, never the price.
     """
     if (
         prev_end is None
@@ -269,8 +276,16 @@ def pause_evidence(
             effective_ms=gap_ms,
             ramp_ms=offline_ramp_ms(profile),
         )
-    overlapped = _covered_length(low, high, speech_spans) if gap_seconds > 0 else 0.0
-    fraction = 0.0 if gap_seconds <= 0 else min(1.0, overlapped / gap_seconds)
+    if gap_seconds > 0:
+        fraction = min(1.0, _covered_length(low, high, speech_spans) / gap_seconds)
+    elif gap_seconds < 0:
+        # The units overlap: the fraction is taken over the shared stretch.
+        fraction = min(1.0, _covered_length(high, low, speech_spans) / -gap_seconds)
+    else:
+        # The units touch: classify the instant, on the ``[start, end)`` rule.
+        fraction = (
+            1.0 if any(start <= low < end for start, end in speech_spans) else 0.0
+        )
     return PauseEvidence(
         gap_ms_raw=gap_ms,
         vad_state="speech-overlap" if fraction > 0 else "silence",
@@ -371,18 +386,23 @@ def sum_breakdowns(parts: Iterable[CostBreakdown]) -> CostBreakdown:
     (``vad_state``) has no sum and is dropped rather than being turned into a
     misleading aggregate. It survives on the per-cut breakdowns, which is where
     a reader should look for it anyway.
+
+    A feature sums over the parts that carry it. Edge and cut breakdowns record
+    disjoint feature sets, so a key missing from a part is simply not in that
+    part's schema; requiring it in every part would empty every aggregate of a
+    path. A carried ``None`` is different -- an unknown value -- and drops the
+    key, since a sum that skipped it would not be the total it claims to be.
     """
-    items = list(parts)
     feature_values: dict[str, list[Any]] = {}
     term_totals: dict[str, float] = {}
-    for part in items:
+    for part in parts:
         for key, value in part.features.items():
             feature_values.setdefault(key, []).append(value)
         for key, value in part.weighted_terms.items():
             term_totals[key] = term_totals.get(key, 0.0) + value
     features: dict[str, bool | float | str | None] = {}
     for key, values in feature_values.items():
-        if len(values) == len(items) and all(_numeric(value) for value in values):
+        if all(_numeric(value) for value in values):
             features[key] = float(sum(values))
     return make_breakdown(features, term_totals)
 

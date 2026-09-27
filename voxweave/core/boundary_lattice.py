@@ -1488,8 +1488,16 @@ def granularity_check(
     That is a structural fact about the input, not a search that failed, and it
     is worth its own answer: the required cut count comes from a greedy chunking
     at the loosest capacity a cue could ever have (``max_lines`` whole lines,
-    every atom at least one half-width cell), so it is a strict lower bound and
-    a ``collapsed`` verdict cannot be wrong about there being no legal path.
+    and the separator a line break replaces never charged: the first
+    ``max_lines - 1`` joins of a chunk are free), with every atom at the fewest
+    cells any cue can show of it -- an atom that shows nothing takes neither
+    width nor a join. That width is the atom's text normalized on its own, not
+    ``LatticeAtom.display``: the display comes from the stream joined without
+    spaces, where the ``.`` of ``de.`` before ``5`` survives ``[.,](?!\\d)``,
+    while a cue joins a space there (or ends) and strips it. Every other strip
+    rule is context-free, so the text alone strips at least what any cue does.
+    The count is therefore a strict lower bound, and a ``collapsed`` verdict
+    cannot be wrong about there being no legal path.
 
     Being a lower bound, it is deliberately one-sided. A coarse stream that has
     *enough* candidate boundaries but none of them in a usable place still fails,
@@ -1510,14 +1518,19 @@ def granularity_check(
     separator = 0 if _no_spaces(profile.language) else 1
     chunks = 1
     width = 0
+    pieces = 0
     for atom in atoms:
-        piece = _vis_width(atom.display)
-        extra = separator if width else 0
-        if width and width + extra + piece > capacity:
+        piece = _vis_width(_display_chars([atom.text])[0])
+        if not piece:
+            continue
+        extra = separator if pieces >= profile.max_lines else 0
+        if pieces and width + extra + piece > capacity:
             chunks += 1
             width = piece
+            pieces = 1
         else:
             width += extra + piece
+            pieces += 1
     return GranularityCheck(required_cuts=chunks - 1, available_cuts=available)
 
 
@@ -1838,7 +1851,11 @@ def _build_mixed_edges(
                     )
                 )
                 emitted = True
-            if over:
+            if over and emitted:
+                # Every longer edge from here is over the cap as well. Before the
+                # first edge, an over-cap span at a node that is not a candidate
+                # must keep scanning: the duration ladder runs only at the next
+                # candidate node, and a held unit can hide the node in between.
                 break
         if infeasible is not None:
             break
@@ -1850,6 +1867,52 @@ def _build_mixed_edges(
         packer_steps=0 if packer is None else packer.steps,
         cap_nodes=tuple(sorted(cap_nodes)),
     )
+
+
+def _scan_with_cap_nodes(
+    atoms: Sequence[LatticeAtom],
+    nodes: Sequence[int],
+    profile: DisplayProfile,
+    units: Sequence[SourceUnit],
+    *,
+    work: CanonicalWork,
+    canonical_spaced: bool,
+) -> tuple[MixedEdges, tuple[int, ...], int, int]:
+    """Scan, inject every cap cut the duration ladder exposed, and re-scan.
+
+    Returns the final scan, the node set with those cuts added, the packer steps
+    spent across every scan, and how many nodes the ladder exposed.
+    """
+    current = tuple(nodes)
+    scan = _build_mixed_edges(
+        atoms,
+        current,
+        profile,
+        units,
+        work=work,
+        canonical_spaced=canonical_spaced,
+    )
+    steps = scan.packer_steps
+    exposed = 0
+    guard = len(atoms) + 2
+    while scan.cap_nodes and guard > 0:
+        guard -= 1
+        known = set(current)
+        fresh = tuple(node for node in scan.cap_nodes if node not in known)
+        if not fresh:
+            break
+        current = tuple(sorted(known | set(fresh)))
+        exposed += len(fresh)
+        scan = _build_mixed_edges(
+            atoms,
+            current,
+            profile,
+            units,
+            work=work,
+            canonical_spaced=canonical_spaced,
+        )
+        steps += scan.packer_steps
+    return scan, current, steps, exposed
 
 
 def _forced_chain(
@@ -2001,6 +2064,10 @@ def build_interval_lattice(
                     )
                 )
             )
+        # ``widened`` is only the gate. The scan below starts from the
+        # linguistic nodes; where they leave no path, the relief branch injects
+        # these same relief nodes and re-scans with the cap cuts they expose, so
+        # the set is re-derived there and counted as relief rather than carried.
         if granularity_check(atoms, widened, profile).collapsed:
             return IntervalLattice(
                 interval=interval,
@@ -2028,7 +2095,7 @@ def build_interval_lattice(
             )
 
     canonical_work = CanonicalWork()
-    scan = _build_mixed_edges(
+    scan, nodes, steps, cap_relief_nodes = _scan_with_cap_nodes(
         atoms,
         nodes,
         profile,
@@ -2036,25 +2103,6 @@ def build_interval_lattice(
         work=canonical_work,
         canonical_spaced=canonical_spaced,
     )
-    steps = scan.packer_steps
-    cap_relief_nodes = 0
-    guard = len(atoms) + 2
-    while scan.cap_nodes and guard > 0:
-        guard -= 1
-        fresh = tuple(node for node in scan.cap_nodes if node not in set(nodes))
-        if not fresh:
-            break
-        nodes = tuple(sorted(set(nodes) | set(fresh)))
-        cap_relief_nodes += len(fresh)
-        scan = _build_mixed_edges(
-            atoms,
-            nodes,
-            profile,
-            units,
-            work=canonical_work,
-            canonical_spaced=canonical_spaced,
-        )
-        steps += scan.packer_steps
     edges, waivers, infeasible = scan.edges, scan.waivers, scan.infeasible
     edges_from = _edges_from(edges)
 
@@ -2070,7 +2118,11 @@ def build_interval_lattice(
                 max_lines=profile.max_lines,
             )
             nodes = tuple(sorted(set(nodes) | set(injected)))
-            scan = _build_mixed_edges(
+            # Relief can put a candidate node inside the duration band for the
+            # first time, so the rescan may expose cap cuts the first scan never
+            # met. They are injected exactly as before relief; dropping them
+            # would type a splittable run ``relief-insufficient``.
+            scan, nodes, relief_steps, relief_cap_nodes = _scan_with_cap_nodes(
                 atoms,
                 nodes,
                 profile,
@@ -2079,7 +2131,8 @@ def build_interval_lattice(
                 canonical_spaced=canonical_spaced,
             )
             edges, waivers, infeasible = scan.edges, scan.waivers, scan.infeasible
-            steps += scan.packer_steps
+            steps += relief_steps
+            cap_relief_nodes += relief_cap_nodes
             edges_from = _edges_from(edges)
             relief_injections += len(injected)
             if infeasible is None and not _reachable(edges_from, len(atoms)):

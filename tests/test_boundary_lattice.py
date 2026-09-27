@@ -997,6 +997,53 @@ def test_a_cap_splittable_run_exposes_its_cut_instead_of_claiming_unwaivable():
         assert low is None or high is None or high - low <= prof.max_cue_s + CAP_EPS_S
 
 
+def test_cap_cuts_exposed_by_the_relief_rescan_are_injected_not_dropped():
+    """Bug pin: the duration ladder's cuts were honoured on the first scan only.
+
+    Twelve boundaryless one-glyph ja units: no phrase start, so the first scan
+    reaches no candidate node and runs no duration ladder at all. Relief then
+    injects node 6, and only the rescan meets the cap (six glyphs span 2.9 s
+    against 2 s) and exposes the unit edges that split it. Those cuts used to be
+    dropped, which left no legal path and typed a splittable run as
+    ``relief-insufficient``.
+    """
+    spec = [("あ", i * 0.5, i * 0.5 + 0.4) for i in range(12)]
+    prof = profile("ja", max_line_length=6, max_lines=1, max_cue_s=2.0)
+    lattice = build_document_lattice(document(spec, prof=prof)).lattices[0]
+
+    assert candidate_nodes(lattice.atoms, "ja") == (0, 12)
+    # the granularity gate collapses and passes only on the widened node set
+    assert granularity_check(lattice.atoms, (0, 12), prof).collapsed
+    assert not granularity_check(lattice.atoms, (0, 6, 12), prof).collapsed
+    assert lattice.relief_injections >= 1
+    assert lattice.cap_relief_nodes >= 1
+    assert lattice.infeasible is None
+    assert reachable(lattice)
+    for edge in lattice.edges:
+        assert edge.span_end - edge.span_start <= prof.max_cue_s + CAP_EPS_S
+
+
+def test_packer_scan_runs_the_duration_ladder_past_a_hidden_node():
+    """Bug pin: packer admission gave up before the held-chain test could run.
+
+    One coarse en unit carries two words, so the atom edge between them is not
+    a candidate. The first atom already inherits the unit's whole 8 s span, and
+    the packer scan used to stop there, before reaching the candidate node where
+    the duration ladder waives a single held unit. Canonical admission always
+    skipped the hidden node, so the two lanes now agree.
+    """
+    prof = profile(max_cue_s=7.0)
+    doc = document([("hello world", 0.0, 8.0)], prof=prof)
+    for canonical_spaced in (False, True):
+        lattice = build_document_lattice(
+            doc, canonical_spaced=canonical_spaced
+        ).lattices[0]
+        assert candidate_nodes(lattice.atoms, "en") == (0, 2)
+        assert lattice.infeasible is None, canonical_spaced
+        assert [(e.start_node, e.end_node) for e in lattice.edges] == [(0, 2)]
+        assert [w.kind for w in lattice.waivers] == ["held-chain-duration"]
+
+
 def test_relief_never_reintroduces_a_zero_display_atom_into_a_mixed_interval():
     """AD3-1 after relief: no invisible atom, and no empty-display edge.
 
@@ -1100,3 +1147,100 @@ def test_granularity_check_is_a_lower_bound_never_a_false_collapse():
         check = granularity_check(lattice.atoms, lattice.nodes, doc.profile)
         assert check.required_cuts >= 1
         assert check.collapsed is False
+
+
+def test_a_line_break_is_not_charged_a_separator():
+    """Bug pin: a legal two-line cue was typed ``coarse-granularity``.
+
+    One coarse unit renders as ``aaaaa bbbb`` / ``ccccc dddd``, two full lines
+    of a 10-cell budget. The check used to charge the space the line break
+    replaces, counted 21 cells against a capacity of 20, and demanded a cut the
+    single legal cue does not need.
+    """
+    prof = profile(max_line_length=10, max_lines=2)
+    doc = document([("aaaaa bbbb ccccc dddd", 0.0, 2.0)], prof=prof)
+    lattice = build_document_lattice(doc).lattices[0]
+    assert granularity_check(lattice.atoms, (0, 4), prof).required_cuts == 0
+    assert lattice.infeasible is None
+    assert [(e.start_node, e.end_node, e.lines) for e in lattice.edges] == [(0, 4, 2)]
+    # one line has no break to absorb a separator: the cut is still required
+    single = profile(max_line_length=20, max_lines=1)
+    assert granularity_check(lattice.atoms, (0, 4), single).required_cuts == 1
+
+
+@pytest.mark.parametrize("canonical_spaced", [False, True])
+def test_punctuation_a_digit_keeps_in_the_stream_is_not_charged(canonical_spaced):
+    """Bug pin: a cue that strips a trailing ``.`` was charged for it.
+
+    Atom displays come from the stream joined without spaces, where ``de.`` is
+    followed by ``5`` and the dot survives ``[.,](?!\\d)``. Inside a cue the join
+    puts a space there and the dot is stripped, so ``abc de`` fits a 6-cell line.
+    Charging the dot demanded a second cut the single offered node cannot give,
+    and typed a legal partition ``coarse-granularity``.
+    """
+    prof = profile(max_line_length=6, max_lines=1, max_cue_s=0.0)
+    doc = document([("abc de.", 0.0, 1.0), ("5 xyz", 1.0, 2.0)], prof=prof)
+    lattice = build_document_lattice(doc, canonical_spaced=canonical_spaced).lattices[0]
+    assert [atom.display for atom in lattice.atoms] == ["abc", "de.", "5", "xyz"]
+    assert lattice.nodes == (0, 2, 4)
+    check = granularity_check(lattice.atoms, lattice.nodes, prof)
+    assert (check.required_cuts, check.available_cuts) == (1, 1)
+    assert lattice.infeasible is None
+    assert [(e.start_node, e.end_node, e.display_text) for e in lattice.edges] == [
+        (0, 2, "abc de"),
+        (2, 4, "5 xyz"),
+    ]
+
+
+def _fewest_cuts(lattice):
+    """Breadth-first fewest interior cuts over the lattice's legal edges."""
+    target = len(lattice.atoms)
+    depth = {0: 0}
+    frontier = [0]
+    while frontier and target not in depth:
+        ahead = []
+        for node in frontier:
+            for edge in lattice.edges_from.get(node, ()):
+                if edge.end_node not in depth:
+                    depth[edge.end_node] = depth[node] + 1
+                    ahead.append(edge.end_node)
+        frontier = ahead
+    return depth[target] - 1
+
+
+# Tokens whose trailing ``.``/``,`` survives or not depending on the next glyph,
+# digit-internal separators, and other punctuation the strip pass removes.
+_PUNCT_WORDS = ("abc", "de.", "5", "3.5", "no,", "ok!", "yes?", "x", "100%", "Mr.", "a")
+
+
+@pytest.mark.parametrize("canonical_spaced", [False, True])
+@pytest.mark.parametrize("vocabulary", ["plain", "punctuation"])
+@pytest.mark.parametrize("max_lines", [1, 2, 3])
+def test_granularity_required_cuts_never_exceed_the_lattices_fewest_cuts(
+    max_lines, vocabulary, canonical_spaced
+):
+    """The lower bound, checked against exhaustive search on word-level text.
+
+    With one word per unit every word edge is a candidate, so the lattice holds
+    every layout-legal cue and a breadth-first search over it finds the fewest
+    cuts any legal partition uses. A strict lower bound may never exceed that.
+    The punctuation vocabulary puts a ``.`` or ``,`` before a digit, where the
+    joined stream and the rendered cue disagree about whether it shows.
+    """
+    rng = random.Random(20260927 + max_lines + (100 if vocabulary == "plain" else 0))
+    prof = profile(max_line_length=8, max_lines=max_lines, max_cue_s=0.0)
+    for _ in range(300):
+        if vocabulary == "plain":
+            words = [
+                "".join(rng.choice("abcdefgh") for _ in range(rng.randint(1, 4)))
+                for _ in range(rng.randint(1, 12))
+            ]
+        else:
+            words = [rng.choice(_PUNCT_WORDS) for _ in range(rng.randint(1, 12))]
+        lattice = build_document_lattice(
+            document(timed(words), prof=prof), canonical_spaced=canonical_spaced
+        ).lattices[0]
+        assert lattice.infeasible is None, words
+        fewest = _fewest_cuts(lattice)
+        check = granularity_check(lattice.atoms, lattice.nodes, prof)
+        assert check.required_cuts <= fewest, (words, check, fewest)
