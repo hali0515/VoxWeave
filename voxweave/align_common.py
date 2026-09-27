@@ -17,8 +17,10 @@ from typing import Any
 
 from voxweave import config
 from voxweave.align_dp_safety import (
+    route_hint_envelope,
     validate_over_budget_hints,
     validate_over_budget_plans,
+    validate_widened_plans,
 )
 
 log = logging.getLogger("voxweave")
@@ -313,6 +315,11 @@ def _prepare_dp_calls(
         chunk_fraction=CTC_DP_CHUNK_FRAC,
     )
     assert bounds is not None  # narrowed by the fail-closed validator above
+    # Plan on the monotone envelope so a nested or overlapping cue (e.g. a rescued flash
+    # cue stretched across its successor) is not cut by a chunk boundary; a plan that
+    # still has to split inside such a cue is refused below.
+    hints = bounds
+    bounds = route_hint_envelope(hints)
     plans = plan_dp_chunks(bounds, max_sec=budget_sec, audio_end=total_sec)
     validate_over_budget_plans(
         plans,
@@ -324,6 +331,7 @@ def _prepare_dp_calls(
         frame_stride=_CTC_STRIDE,
         chunk_fraction=CTC_DP_CHUNK_FRAC,
     )
+    validate_widened_plans(plans, hints=hints, envelope=bounds)
     log.info(
         "%s DP-chunking %.0fmin audio into %d silence-anchored chunks (budget ~%.0fmin)",
         label,

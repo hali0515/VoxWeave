@@ -370,9 +370,14 @@ def _attach_json_decode_failure(exc: BaseException) -> None:
     )
 
 
-def _attach_vtt_decode_failure(exc: BaseException) -> None:
-    cause = exc.__cause__
-    if isinstance(cause, UnicodeDecodeError):
+def _attach_vtt_decode_failure(exc: BaseException, vtt_name: str) -> None:
+    # Encoding failures reach here raw (a BOM-declared encoding that does not
+    # decode) or as the subtitle decoder's "cannot determine text encoding" refusal.
+    if (
+        isinstance(exc, UnicodeDecodeError)
+        or isinstance(exc.__cause__, UnicodeDecodeError)
+        or str(exc).startswith(f"{vtt_name}: cannot determine text encoding")
+    ):
         detail = "vtt-encoding"
     elif str(exc).startswith("no cues in "):
         detail = "vtt-no-cues"
@@ -3783,8 +3788,8 @@ def align(
                 effective_iso=iso,
                 sibling_snapshot=sibling_snapshot,
             )
-        except RuntimeError as exc:
-            _attach_vtt_decode_failure(exc)
+        except (RuntimeError, UnicodeDecodeError) as exc:
+            _attach_vtt_decode_failure(exc, vtt_path.name)
             raise
 
     with align_runtime_activity("AO-03", "selected-media-identity"):

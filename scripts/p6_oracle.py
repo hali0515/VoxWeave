@@ -2883,16 +2883,42 @@ def _check_literal_source_terminals() -> list[str]:
 
 
 def _imports(path: Path) -> set[str]:
+    """Every module ``path`` may import, as absolute dotted names.
+
+    ``from P import X`` reports ``P`` and ``P.X`` (``X`` may be a submodule, as in
+    ``from voxweave import pipeline``); relative imports resolve against the
+    package the file lives in under ``REPO_ROOT``.
+    """
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, SyntaxError) as exc:
         _invalid(f"cannot parse dependency-gate source {path}: {exc}")
+    try:
+        package = path.relative_to(REPO_ROOT).with_suffix("").parts[:-1]
+    except ValueError:
+        _invalid(f"dependency-gate source is outside the repository: {path}")
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                if node.level - 1 >= len(package):
+                    _invalid(
+                        f"relative import beyond the top package in {path}"
+                        f" at line {node.lineno}"
+                    )
+                base = package[: len(package) - (node.level - 1)]
+                tail = node.module.split(".") if node.module else []
+                module = ".".join((*base, *tail))
+            elif node.module:
+                module = node.module
+            else:
+                continue
+            imported.add(module)
+            imported.update(
+                f"{module}.{alias.name}" for alias in node.names if alias.name != "*"
+            )
     return imported
 
 

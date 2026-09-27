@@ -110,7 +110,11 @@ def plan_dp_chunks(
     silence, so no word crosses them.
 
     ``bounds[i]`` = ``(start, end)`` of cue i, or ``None`` for a timestamp-less cue (insertion /
-    empty) — it carries no anchor and just rides along in its chunk. Returns
+    empty) — it carries no anchor and just rides along in its chunk. Overlapping or nested
+    cues are expected to arrive as their monotone envelope
+    (align_dp_safety.route_hint_envelope), so a positive gap after cue i is silence for every
+    earlier and later cue, not just for its neighbours (a fallback cut at a non-positive gap
+    can still split an overlap; align_dp_safety.validate_widened_plans refuses that). Returns
     ``[{lo, hi, start, end}]`` where ``lo:hi`` is the cue index slice (``hi`` exclusive) and
     ``start``/``end`` is the audio crop window: adjacent chunks meet at the gap midpoint, file
     edges are padded by ``pad_sec`` (left clamped to 0, right capped at ``audio_end`` if given).
