@@ -862,9 +862,13 @@ class UnitLocator:
     (this was the silent-exclusion mechanism behind up to 10% unmapped
     boundaries on len-break-heavy zh cases). Lookup prefers the first candidate
     at or after a monotonic cursor, which disambiguates the repeated keys that
-    zero-duration units produce. An entry the splitter fabricated (the logged
-    proportional-timing desync path) still resolves to nothing, and its boundary
-    is excluded and counted -- never guessed at.
+    zero-duration units produce. A cue's *last* entry needs one more step: a
+    zero-duration word and the punctuation ``reinject_punct`` hangs on it share
+    one key, so the cue's n-th entry with that key is the n-th candidate from
+    the cue's first unit, not the first one (taking the first hid the
+    punctuation and misclassified the boundary). An entry the splitter
+    fabricated (the logged proportional-timing desync path) still resolves to
+    nothing, and its boundary is excluded and counted -- never guessed at.
     """
 
     def __init__(self, units: Sequence[Mapping[str, Any]]) -> None:
@@ -886,12 +890,15 @@ class UnitLocator:
         )
 
     @staticmethod
-    def _pick(candidates: list[int] | None, cursor: int) -> int | None:
+    def _pick(
+        candidates: list[int] | None, cursor: int, occurrence: int = 1
+    ) -> int | None:
+        """The ``occurrence``-th candidate at or after ``cursor`` (clamped)."""
         if not candidates:
             return None
-        for i in candidates:
+        for pos, i in enumerate(candidates):
             if i >= cursor:
-                return i
+                return candidates[min(pos + occurrence - 1, len(candidates) - 1)]
         return candidates[-1]
 
     def locate_first(self, entry: Mapping[str, Any], cursor: int) -> int | None:
@@ -902,13 +909,25 @@ class UnitLocator:
             return found
         return self._pick(self._by_start.get(key[0]), cursor)
 
-    def locate_last(self, entry: Mapping[str, Any], cursor: int) -> int | None:
-        """Index of the unit this entry *ends* on (edge fallback for atoms)."""
+    def locate_last(
+        self, entry: Mapping[str, Any], cursor: int, occurrence: int = 1
+    ) -> int | None:
+        """Index of the unit this entry *ends* on (edge fallback for atoms).
+
+        ``occurrence`` is how many entries of the cue, this one included, carry
+        this entry's exact key; with ``cursor`` at the cue's first unit it picks
+        the matching repeat of a same-timestamp run instead of its first unit.
+        """
         key = self._key(entry)
-        found = self._pick(self._index.get(key), cursor)
+        found = self._pick(self._index.get(key), cursor, occurrence)
         if found is not None:
             return found
         return self._pick(self._by_end.get(key[1]), cursor)
+
+    def occurrence(self, entries: Sequence[Mapping[str, Any]]) -> int:
+        """How many of ``entries`` share the last entry's exact key."""
+        key = self._key(entries[-1])
+        return sum(1 for entry in entries if self._key(entry) == key)
 
 
 @dataclass(frozen=True)
@@ -946,7 +965,9 @@ def map_boundaries(
             continue
         first = locator.locate_first(word_data[0], cursor)
         last = locator.locate_last(
-            word_data[-1], first if first is not None else cursor
+            word_data[-1],
+            first if first is not None else cursor,
+            locator.occurrence(word_data),
         )
         firsts.append(first)
         lasts.append(last)
@@ -1920,7 +1941,8 @@ def load_baseline(path: str | Path, corpus: Corpus) -> dict[str, Any]:
                 f" evaluate --corpus {corpus.path}"
                 " --json-out build/calibration/segmentation-report.json`"
                 " (no --baseline, no --check), review it, then run"
-                " `make quality-record-segmentation`",
+                " `make quality-record-segmentation` (it keeps the gate levels of"
+                " the baseline it replaces)",
             ],
         )
     return baseline
@@ -1944,8 +1966,15 @@ def environment_drift(baseline: Mapping[str, Any]) -> list[str]:
     return drift
 
 
-def baseline_from_report(report: Mapping[str, Any]) -> dict[str, Any]:
-    """Project a report onto the tracked baseline shape (groups + gate rules)."""
+def baseline_from_report(
+    report: Mapping[str, Any],
+    gates: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Project a report onto the tracked baseline shape (groups + gate rules).
+
+    ``gates`` replaces the report's own gate table; ``record-baseline`` passes
+    the table :func:`carry_gate_levels` built.
+    """
     return {
         "schema_version": SCHEMA_VERSION,
         "metric_definition_version": METRIC_DEFINITION_VERSION,
@@ -1955,8 +1984,64 @@ def baseline_from_report(report: Mapping[str, Any]) -> dict[str, Any]:
         "generated_from_commit": report["generated_from_commit"],
         "environment": report["environment"],
         "groups": report["groups"],
-        "gates": report["gates"],
+        "gates": report["gates"] if gates is None else gates,
     }
+
+
+def carry_gate_levels(
+    report_gates: Mapping[str, Mapping[str, Any]],
+    levels: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """The report's gate rules, each at the ``mode`` the ``levels`` table set.
+
+    A gate's level is tracked policy, raised to ``blocking`` by a reviewed edit
+    of the baseline (design 4.6), while its thresholds belong to the metric
+    definition in this code. A report's table is DEFAULT_GATES -- every gate at
+    the ``warning`` landing level -- whenever it was evaluated without a
+    baseline, which after a corpus or metric-definition change is the only way
+    to get one; so re-recording keeps each level and takes only the thresholds
+    from the report. Returns the table and one note per field that differs
+    from ``levels``, for the reviewer.
+    """
+    gates: dict[str, dict[str, Any]] = {}
+    notes: list[str] = []
+    for metric in METRICS:
+        rule = dict(report_gates[metric])
+        kept = levels[metric]
+        if rule.get("mode") != kept["mode"]:
+            notes.append(
+                f"{metric}: mode {kept['mode']} kept (the report has {rule.get('mode')})"
+            )
+        rule["mode"] = kept["mode"]
+        for key in sorted(set(rule) | set(kept)):
+            if key != "mode" and rule.get(key) != kept.get(key):
+                notes.append(
+                    f"{metric}: {key} {kept.get(key)!r} -> {rule.get(key)!r}"
+                    " (from the report)"
+                )
+        gates[metric] = rule
+    return gates, notes
+
+
+def load_gate_levels(path: str | Path) -> dict[str, Any]:
+    """The gate table of an existing baseline, validated on its own.
+
+    Only the table is read: the baseline being replaced is expected to be stale
+    in every other respect (digests, groups, even an older schema).
+    """
+    doc = cc.read_json(path)
+    gates: Any = doc.get("gates") if isinstance(doc, dict) else None
+    errors = cc.schema_errors(gates, gates_schema())
+    if errors:
+        raise cc.CalibrationError(
+            f"cannot read the gate levels of {path}",
+            [
+                *(f"gates/{e}" for e in errors),
+                "fix its gate table, name another baseline with --gates-from, or"
+                " pass --gates-from-report to take the report's levels",
+            ],
+        )
+    return gates
 
 
 # --------------------------------------------------------------------------- #
@@ -2372,6 +2457,11 @@ def cmd_record_baseline(args: argparse.Namespace) -> int:
     Refuses a partial report, a stale digest or a metric-definition mismatch, so
     a regression cannot be laundered into a new baseline by rerunning the
     harness until the numbers look acceptable.
+
+    Gate levels are kept from the baseline being replaced (``--output``, or
+    ``--gates-from``), never copied from the report: see
+    :func:`carry_gate_levels`. With no such baseline the run refuses unless
+    ``--gates-from-report`` says the report's levels are the intended ones.
     """
     corpus = load_corpus(args.corpus)
     report = cc.read_json(args.report)
@@ -2404,15 +2494,45 @@ def cmd_record_baseline(args: argparse.Namespace) -> int:
         problems.append(
             "report has no generated_from_commit (run inside a git checkout)"
         )
+    problems.extend(
+        f"report gates/{e}"
+        for e in cc.schema_errors(report.get("gates"), gates_schema())
+    )
     if problems:
         raise cc.CalibrationError(f"refusing to record {args.output}", problems)
 
-    baseline = baseline_from_report(report)
+    notes: list[str] = []
+    if args.gates_from_report:
+        gates = {metric: dict(report["gates"][metric]) for metric in METRICS}
+        levels_from = f"{args.report} (--gates-from-report)"
+    else:
+        source = Path(args.gates_from or args.output)
+        if not source.is_file():
+            raise cc.CalibrationError(
+                f"refusing to record {args.output}: no baseline at {source} to keep"
+                " the gate levels of",
+                [
+                    "a report evaluated without a baseline carries the all-warning"
+                    " DEFAULT_GATES, so copying its table would silently demote"
+                    " every blocking gate",
+                    "name the tracked baseline with --gates-from (e.g. when --output"
+                    " is a new path)",
+                    "or pass --gates-from-report for a first recording, or to reset"
+                    " the levels to the report's on purpose",
+                ],
+            )
+        gates, notes = carry_gate_levels(report["gates"], load_gate_levels(source))
+        levels_from = str(source)
+
+    baseline = baseline_from_report(report, gates)
     cc.validate_or_exit2(baseline, BASELINE_SCHEMA, label=str(args.output))
     path = cc.write_json(args.output, baseline)
     print(f"recorded {path}")
     print(f"  corpus_digest : {baseline['corpus_digest']}")
     print(f"  commit        : {baseline['generated_from_commit']}")
+    print(f"  gate levels   : {levels_from}")
+    for note in notes:
+        print(f"  note: {note}")
     for metric in METRICS:
         gate = baseline["gates"][metric]
         print(f"  gate {metric:<26} mode={gate['mode']}")
@@ -6553,6 +6673,25 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--corpus", default=str(DEFAULT_CORPUS))
     record.add_argument("--report", required=True)
     record.add_argument("--output", default=str(DEFAULT_BASELINE))
+    levels = record.add_mutually_exclusive_group()
+    levels.add_argument(
+        "--gates-from",
+        default=None,
+        help=(
+            "baseline whose gate levels (mode per metric) the new baseline keeps;"
+            " default: the existing --output baseline. Thresholds always come"
+            " from the report"
+        ),
+    )
+    levels.add_argument(
+        "--gates-from-report",
+        action="store_true",
+        help=(
+            "take the gate levels from the report instead (all warning unless it"
+            " was evaluated against a baseline): a first recording, or a"
+            " deliberate reset"
+        ),
+    )
     record.set_defaults(func=cmd_record_baseline)
 
     shadow = sub.add_parser(

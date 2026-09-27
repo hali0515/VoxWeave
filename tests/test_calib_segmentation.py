@@ -942,6 +942,95 @@ def test_atom_level_word_data_maps_by_span_edges() -> None:
     assert measurement.diagnostics["unmapped_boundaries"] == 0
 
 
+def _unit(text: str, start: float, end: float) -> dict[str, Any]:
+    return {"text": text, "start": start, "end": end}
+
+
+def _cue_over(units: list[dict[str, Any]]) -> dict[str, Any]:
+    return cue(
+        "".join(u["text"] for u in units), units[0]["start"], units[-1]["end"], units
+    )
+
+
+def test_cue_ending_on_same_time_punctuation_maps_to_the_punctuation() -> None:
+    """A zero-duration word and its reinjected comma share one ``(start, end)``.
+
+    The cue's word_data ends on the comma, so the boundary's left unit is the
+    comma -- resolving it to the word (the first unit with that key) hid the
+    punctuation from every rule that reads it.
+    """
+    units = [
+        _unit("你", 0.0, 0.3),
+        _unit("好", 0.3, 0.6),
+        _unit("啊", 0.6, 0.6),
+        _unit("，", 0.6, 0.6),
+        _unit("我", 0.9, 1.2),
+        _unit("们", 1.2, 1.5),
+    ]
+    boundaries, unmapped = calib.map_boundaries(
+        units, [_cue_over(units[0:4]), _cue_over(units[4:6])]
+    )
+    assert unmapped == 0
+    assert boundaries[0] is not None
+    assert (boundaries[0].left_unit, boundaries[0].right_unit) == (3, 4)
+
+
+def test_cue_splitting_a_same_time_run_maps_to_the_actual_split() -> None:
+    """A collapse wall split across two cues keeps each cue's own units."""
+    units = [
+        _unit("T", 0.0, 0.1),
+        _unit("哈", 0.5, 0.5),
+        _unit("哈", 0.5, 0.5),
+        _unit("哈", 0.5, 0.5),
+        _unit("好", 0.6, 0.7),
+    ]
+    boundaries, unmapped = calib.map_boundaries(
+        units, [_cue_over(units[0:3]), _cue_over(units[3:5])]
+    )
+    assert unmapped == 0
+    assert boundaries[0] is not None
+    assert (boundaries[0].left_unit, boundaries[0].right_unit) == (2, 3)
+
+
+def test_same_time_unit_that_opens_the_next_cue_stays_there() -> None:
+    """Only the cue's own repeats count: a shared key across the edge is not one."""
+    units = [
+        _unit("我", 0.0, 0.3),
+        _unit("说", 0.3, 0.64),
+        _unit("，", 0.64, 0.64),
+        _unit("你", 0.64, 0.64),
+        _unit("们", 0.64, 0.9),
+    ]
+    boundaries, unmapped = calib.map_boundaries(
+        units, [_cue_over(units[0:3]), _cue_over(units[3:5])]
+    )
+    assert unmapped == 0
+    assert boundaries[0] is not None
+    assert (boundaries[0].left_unit, boundaries[0].right_unit) == (2, 3)
+
+
+def test_same_time_punctuation_at_a_cue_end_is_a_punctuation_break(
+    one_phrase: None,
+) -> None:
+    """End to end: the comma behind a zero-duration word makes the break intended."""
+    units = [
+        _unit("一", 0.0, 0.5),
+        _unit("二", 0.5, 1.0),
+        _unit("三", 1.0, 1.5),
+        _unit("啊", 1.5, 1.5),
+        _unit("，", 1.5, 1.5),
+        _unit("五", 1.5, 2.0),
+        _unit("六", 2.0, 2.5),
+        _unit("七", 2.5, 3.0),
+    ]
+    doc = make_case("zh-01", "zh", units)
+    cues = [_cue_over(units[0:5]), _cue_over(units[5:8])]
+    measurement = calib.measure_case(as_case(doc), Replayed(cues))
+    ratio = measurement.ratios["len_break_mid_phrase_rate"]
+    assert (ratio.bad, ratio.eligible) == (0, 1)
+    assert measurement.diagnostics["punctuation_breaks"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # Aggregation
 # --------------------------------------------------------------------------- #
@@ -1361,6 +1450,23 @@ def test_report_groups_match_the_tracked_baseline_contract(
     assert cc.schema_errors(report["gates"], calib.gates_schema()) == []
 
 
+def _record_cli(
+    corpus_path: Path, report_path: Path, baseline_path: Path, *extra: str
+) -> int:
+    return run_cli(
+        [
+            "record-baseline",
+            "--corpus",
+            str(corpus_path),
+            "--report",
+            str(report_path),
+            "--output",
+            str(baseline_path),
+            *extra,
+        ]
+    )
+
+
 def test_record_baseline_round_trips_and_then_passes(
     corpus_path: Path, tmp_path: Path
 ) -> None:
@@ -1368,17 +1474,7 @@ def test_record_baseline_round_trips_and_then_passes(
     baseline_path = tmp_path / "baseline.json"
     assert _evaluate(corpus_path, report_path)[0] == cc.EXIT_OK
     assert (
-        run_cli(
-            [
-                "record-baseline",
-                "--corpus",
-                str(corpus_path),
-                "--report",
-                str(report_path),
-                "--output",
-                str(baseline_path),
-            ]
-        )
+        _record_cli(corpus_path, report_path, baseline_path, "--gates-from-report")
         == cc.EXIT_OK
     )
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
@@ -1401,18 +1497,93 @@ def _record(corpus_path: Path, tmp_path: Path) -> Path:
     report_path = tmp_path / "report.json"
     baseline_path = tmp_path / "baseline.json"
     _evaluate(corpus_path, report_path)
-    run_cli(
-        [
-            "record-baseline",
-            "--corpus",
-            str(corpus_path),
-            "--report",
-            str(report_path),
-            "--output",
-            str(baseline_path),
-        ]
-    )
+    _record_cli(corpus_path, report_path, baseline_path, "--gates-from-report")
     return baseline_path
+
+
+#: The level mix the tracked baseline carries: promoted by a reviewed edit, never
+#: by a report (a report evaluated without a baseline holds DEFAULT_GATES).
+_TRACKED_LEVELS = {
+    "len_break_mid_phrase_rate": "blocking",
+    "over_7s_rate": "blocking",
+    "cps_p90": "blocking",
+    "forbidden_end_rate": "warning",
+}
+
+
+def test_record_baseline_keeps_the_tracked_gate_levels(
+    corpus_path: Path, tmp_path: Path
+) -> None:
+    """Re-recording from a fresh report must not demote the tracked gates.
+
+    After a corpus or metric-definition change the old baseline cannot be
+    evaluated against, so the only recordable report carries the all-warning
+    DEFAULT_GATES; copying that table demoted every blocking gate silently.
+    """
+    baseline_path = _record(corpus_path, tmp_path)
+    tracked = json.loads(baseline_path.read_text(encoding="utf-8"))
+    for metric, mode in _TRACKED_LEVELS.items():
+        tracked["gates"][metric]["mode"] = mode
+    baseline_path.write_text(json.dumps(tracked), encoding="utf-8")
+
+    report_path = tmp_path / "fresh.json"
+    _, report = _evaluate(corpus_path, report_path)
+    assert {rule["mode"] for rule in report["gates"].values()} == {"warning"}
+    assert _record_cli(corpus_path, report_path, baseline_path) == cc.EXIT_OK
+
+    recorded = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert {m: r["mode"] for m, r in recorded["gates"].items()} == _TRACKED_LEVELS
+    # Only the level is carried; the rule parameters are the report's.
+    for metric, mode in _TRACKED_LEVELS.items():
+        assert recorded["gates"][metric] == {**report["gates"][metric], "mode": mode}
+
+
+def test_record_baseline_refuses_to_guess_gate_levels(
+    corpus_path: Path, tmp_path: Path
+) -> None:
+    """No baseline to keep levels from and no explicit choice is exit 2."""
+    report_path = tmp_path / "report.json"
+    _evaluate(corpus_path, report_path)
+    output = tmp_path / "new-baseline.json"
+    assert _record_cli(corpus_path, report_path, output) == cc.EXIT_INVALID
+    assert not output.exists()
+
+
+def test_record_baseline_takes_levels_from_an_explicit_baseline(
+    corpus_path: Path, tmp_path: Path
+) -> None:
+    """Recording to a new path keeps the levels of the named tracked baseline."""
+    tracked_path = _record(corpus_path, tmp_path)
+    tracked = json.loads(tracked_path.read_text(encoding="utf-8"))
+    for metric, mode in _TRACKED_LEVELS.items():
+        tracked["gates"][metric]["mode"] = mode
+    tracked_path.write_text(json.dumps(tracked), encoding="utf-8")
+
+    output = tmp_path / "candidate.json"
+    code = _record_cli(
+        corpus_path,
+        tmp_path / "report.json",
+        output,
+        "--gates-from",
+        str(tracked_path),
+    )
+    assert code == cc.EXIT_OK
+    recorded = json.loads(output.read_text(encoding="utf-8"))
+    assert {m: r["mode"] for m, r in recorded["gates"].items()} == _TRACKED_LEVELS
+
+
+def test_record_baseline_with_an_unreadable_gate_table_is_invalid(
+    corpus_path: Path, tmp_path: Path
+) -> None:
+    """A tracked table that cannot say its levels fails loudly and stays untouched."""
+    baseline_path = _record(corpus_path, tmp_path)
+    tracked = json.loads(baseline_path.read_text(encoding="utf-8"))
+    del tracked["gates"]["cps_p90"]
+    baseline_path.write_text(json.dumps(tracked), encoding="utf-8")
+    before = baseline_path.read_text(encoding="utf-8")
+    code = _record_cli(corpus_path, tmp_path / "report.json", baseline_path)
+    assert code == cc.EXIT_INVALID
+    assert baseline_path.read_text(encoding="utf-8") == before
 
 
 def _blocking(baseline_path: Path, metric: str, **mutate: Any) -> dict[str, Any]:
@@ -1585,16 +1756,8 @@ def test_record_baseline_refuses_a_partial_report(
     assert report["partial"] is True
     assert report["gate_results"] == []
     assert (
-        run_cli(
-            [
-                "record-baseline",
-                "--corpus",
-                str(corpus_path),
-                "--report",
-                str(report_path),
-                "--output",
-                str(tmp_path / "baseline.json"),
-            ]
+        _record_cli(
+            corpus_path, report_path, tmp_path / "baseline.json", "--gates-from-report"
         )
         == cc.EXIT_INVALID
     )
@@ -1609,16 +1772,8 @@ def test_record_baseline_refuses_a_stale_report(
     report["corpus_digest"] = "a" * 64
     report_path.write_text(json.dumps(report), encoding="utf-8")
     assert (
-        run_cli(
-            [
-                "record-baseline",
-                "--corpus",
-                str(corpus_path),
-                "--report",
-                str(report_path),
-                "--output",
-                str(tmp_path / "baseline.json"),
-            ]
+        _record_cli(
+            corpus_path, report_path, tmp_path / "baseline.json", "--gates-from-report"
         )
         == cc.EXIT_INVALID
     )
