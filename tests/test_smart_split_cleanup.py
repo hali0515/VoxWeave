@@ -249,6 +249,45 @@ def test_two_frame_gap_in_input_survives_cleanup():
     assert out[1]["start"] - out[0]["end"] == pytest.approx(TWO_FRAME_S)
 
 
+def test_extension_stops_two_frames_before_next_cue():
+    # A lag-out pad that reaches past the next cue's start must stop at the
+    # two-frame floor, not at next.start: chaining never reopens a zero gap, so
+    # clamping to next.start left the two cues back to back.
+    cues = [
+        {
+            "text": "a",
+            "start": 0.0,
+            "end": 2.0,
+            "word_data": [{"start": 0.0, "end": 2.0}],
+        },
+        {
+            "text": "b",
+            "start": 2.3,
+            "end": 3.0,
+            "word_data": [{"start": 2.3, "end": 3.0}],
+        },
+    ]
+    kw = dict(min_cue_s=0.0, max_cue_s=7.0, lag_out_s=0.5)
+    once = _cleanup_cues(cues, **kw)
+    assert once[0]["end"] == pytest.approx(2.3 - TWO_FRAME_S)
+    assert once[1]["start"] - once[0]["end"] >= TWO_FRAME_S - 1e-9
+    twice = _cleanup_cues(once, **kw)
+    assert [(c["start"], c["end"]) for c in twice] == [
+        (c["start"], c["end"]) for c in once
+    ]
+
+
+def test_extension_landing_inside_two_frame_band_keeps_the_floor():
+    # A desire that lands just short of next.start (inside the sub-two-frame
+    # band, where chaining does not act) must not leave a sub-two-frame gap.
+    cues = [
+        {"text": "a", "start": 0.0, "end": 0.2, "word_data": []},
+        {"text": "b", "start": 0.53, "end": 1.0, "word_data": []},
+    ]
+    out = _cleanup_cues(cues, min_cue_s=0.5, max_cue_s=7.0)
+    assert out[1]["start"] - out[0]["end"] == pytest.approx(TWO_FRAME_S)
+
+
 def test_gap_above_two_frames_still_lags_out():
     # (c) a gap wider than the 2-frame floor still gets the normal flat lag-out
     # pad (existing behavior must not regress).

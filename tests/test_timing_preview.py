@@ -6,6 +6,10 @@ compares the pass's resulting duration against the preview -- exactly, not to a
 tolerance, because the preview mirrors the pass statement by statement. A
 discrepancy is a mirror bug: fix ``timing_preview``, never this file and never
 ``timing``.
+
+The mirror under test is ``LegacyCleanupPreview(two_frame_extension_floor=True)``.
+The no-argument instance is experimental_policy_1's frozen preview and differs
+from today's pass only in where an extension stops (pinned at the end).
 """
 
 import random
@@ -27,7 +31,8 @@ from voxweave.core.timing_preview import (
     LegacyCleanupPreview,
 )
 
-PREVIEW = LegacyCleanupPreview()
+PREVIEW = LegacyCleanupPreview(two_frame_extension_floor=True)
+POLICY_ONE_PREVIEW = LegacyCleanupPreview()
 
 # The evidence-map probe profile used by cleanup-preview calibration.
 PROFILE = {"min_cue_s": 0.5, "max_cue_s": 7.0, "cps": 17.0, "lag_out_s": 0.25}
@@ -121,10 +126,11 @@ def test_chaining_band_wide_gap():
 
 
 def test_chaining_band_narrow_gap():
-    # evidence case C2: gap 0.30 -> the lag-out extension eats it down to 0.05,
-    # which is already under the 2-frame floor, so chaining does not fire
+    # evidence case C2: gap 0.30 -> the lag-out extension wants 2.45, which would
+    # leave 0.05 (under the 2-frame floor, where chaining never acts); it stops
+    # at next - 2 frames instead
     got = _check([_cue("a", 1.0, 2.2), _cue("b", 2.5, 3.0)], **PROFILE)
-    assert got[0] == pytest.approx(1.45)
+    assert got[0] == pytest.approx(2.5 - TWO_FRAME_S - 1.0)
 
 
 def test_gap_just_below_chain_max_still_chains():
@@ -138,11 +144,12 @@ def test_gap_at_chain_max_stays_visible():
     _check([_cue("a", 1.0, 2.2), _cue("b", 2.2 + CHAIN_MAX_GAP_S, 3.5)], **PROFILE)
 
 
-def test_extension_clamps_to_next_start():
-    # evidence case D: gap 0.10 -> the extension wants 2.45 and clamps to 2.30
-    # (cleanup's ``min(want, nxt_start)``, not next - 2 frames)
+def test_extension_clamps_two_frames_before_next_start():
+    # evidence case D: gap 0.10 -> the extension wants 2.45 and clamps to
+    # next - 2 frames (cleanup's ``min(want, nxt_start - TWO_FRAME_S)``), never
+    # to next.start itself, which would leave the cues back to back
     got = _check([_cue("a", 1.0, 2.2), _cue("b", 2.3, 3.0)], **PROFILE)
-    assert got[0] == pytest.approx(1.3)
+    assert got[0] == pytest.approx(2.3 - TWO_FRAME_S - 1.0)
 
 
 # --- two-frame band -----------------------------------------------------------
@@ -266,7 +273,8 @@ def test_min_cue_floor_clamped_by_next_start():
         cps=0.0,
         lag_out_s=0.0,
     )
-    assert got[0] == pytest.approx(1.0)  # min(want, nxt_start), not next - 2 frames
+    # min(want, nxt_start - TWO_FRAME_S): the floor never reaches next.start
+    assert got[0] == pytest.approx(2.0 - TWO_FRAME_S - 1.0)
 
 
 def test_min_cue_zero_keeps_short_cue():
@@ -436,7 +444,8 @@ def test_three_cue_stream_middle_cue_matches():
         _cue("last", 2.4, 3.9, _words((2.4, 3.9))),
     ]
     got = _check(cues, **PROFILE)
-    assert got[1] == pytest.approx(0.75)  # lag-out from speech_end 2.1, clamped
+    # lag-out from speech_end 2.1 wants 2.35, clamped to next (2.4) - 2 frames
+    assert got[1] == pytest.approx(2.4 - TWO_FRAME_S - 1.6)
 
 
 def test_dense_stream_every_cue_matches():
@@ -636,3 +645,48 @@ def test_cue_preview_available_s_is_zero_when_either_bound_is_absent():
             reading_chars=1,
         )
         assert preview.available_s == 0.0
+
+
+# --- experimental_policy_1's frozen clamp -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("next_start", "frozen"),
+    [
+        (2.5, 1.45),  # evidence case C2: the lag-out extension eats the gap to 0.05
+        (2.3, 1.3),  # evidence case D: the extension clamps to next.start
+    ],
+)
+def test_no_argument_instance_keeps_the_policy_one_extension_clamp(next_start, frozen):
+    """boundary_v2 builds experimental_policy_1 on ``LegacyCleanupPreview()``;
+    its extensions still run to ``next_start`` so the policy's partitions stay
+    put, while the mirror of today's pass stops two frames short."""
+    kwargs = dict(text="a", word_data=[], **PROFILE)
+    assert POLICY_ONE_PREVIEW.preview_display_span(
+        1.0, 2.2, next_start, **kwargs
+    ) == pytest.approx(frozen)
+    assert PREVIEW.preview_display_span(1.0, 2.2, next_start, **kwargs) == (
+        pytest.approx(next_start - TWO_FRAME_S - 1.0)
+    )
+
+
+@pytest.mark.parametrize("case", range(200))
+def test_policy_one_preview_differs_only_where_an_extension_nears_next_start(case):
+    rng = random.Random(f"timing-preview-policy-one:{case}")
+    thresholds = dict(
+        min_cue_s=rng.choice(_MIN_CUE),
+        max_cue_s=rng.choice(_MAX_CUE),
+        cps=rng.choice(_CPS),
+        lag_out_s=rng.choice(_LAG_OUT),
+    )
+    start = round(rng.uniform(0.0, 5.0), 3)
+    end = start + rng.choice((0.12, 0.3, 0.9, 3.4, 9.0))
+    next_start = None if rng.random() < 0.2 else end + rng.choice(_GAPS)
+    words = _random_words(rng, start, end)
+    kwargs = dict(text="x" * rng.randint(0, 40), word_data=words, **thresholds)
+    frozen = POLICY_ONE_PREVIEW.preview_display_span(start, end, next_start, **kwargs)
+    today = PREVIEW.preview_display_span(start, end, next_start, **kwargs)
+    if frozen != today:
+        assert next_start is not None
+        assert start + today == pytest.approx(next_start - TWO_FRAME_S)
+        assert next_start - TWO_FRAME_S < start + frozen <= next_start

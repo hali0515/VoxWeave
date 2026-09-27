@@ -40,9 +40,15 @@ LINE_END_PROHIBITED = frozenset(
 _BIND_END_HIGH = frozenset(
     "のをにへ"
 )  # case/adnominal particles, almost always binds forward
-_BIND_END_MED = frozenset(
-    "とまでより"
-)  # と parallel/quotative, まで/より range: usually binds
+# と parallel/quotative, まで/より range: usually binds. Whole particles, matched
+# as a suffix (``_ends_bind_med``): the single chars で/よ/り/ま are not entries.
+_BIND_END_MED = frozenset({"と", "まで", "より"})
+
+
+def _ends_bind_med(text: str) -> bool:
+    """True when ``text`` ends with one of the medium-binding particles."""
+    return any(text.endswith(particle) for particle in _BIND_END_MED)
+
 
 # zh equivalents, whole-word semantics (the caller passes the trailing *word*, so 目的/标的
 # never match — only the standalone particle/preposition does). Same high-precision policy
@@ -125,9 +131,10 @@ def line_end_penalty(text: str, lang: str = "") -> int:
     0 = fine, 1 = mild (likely binds forward), 2 = bad (function word/particle dangling).
 
     Signal source by language:
-    - ja (and default): last *char* against the kana particle tables — atoms are per-char,
-      and a particle is always the final char of its BudouX phrase. Always active: kana
-      can't false-positive in other scripts.
+    - ja (and default): the trailing particle against the kana tables — the last char
+      for the one-kana HIGH table, a whole-particle suffix for MED (まで/より), so the
+      caller should pass the BudouX phrase rather than its last atom. Always active:
+      kana can't false-positive in other scripts.
     - en: whole token against breakpoints._FORBIDDEN_LEFT (articles/preps/aux/conj).
     - zh/yue: whole word against the Chinese particle/preposition tables.
     """
@@ -137,7 +144,7 @@ def line_end_penalty(text: str, lang: str = "") -> int:
     last = s[-1]
     if last in _BIND_END_HIGH:
         return 2
-    if last in _BIND_END_MED:
+    if _ends_bind_med(s):
         return 1
     if lang == "en":
         from .breakpoints import _FORBIDDEN_LEFT
@@ -337,7 +344,7 @@ def _pos_penalty(
         if pos2 == "格助詞":
             if last in _BIND_END_HIGH:
                 return 2
-            return 1 if last in _BIND_END_MED else 0
+            return 1 if _ends_bind_med(surface) else 0
         if pos2 == "副助詞":
             return 1
         return 0  # 係助詞 / 接続助詞 / 終助詞 / 準体助詞

@@ -5,7 +5,7 @@ from voxweave.core.layout import (
     strip_punct_for_subtitles,
     wrap_cue_text,
 )
-from voxweave.core.smart_split import smart_split_segments
+from voxweave.core.smart_split import _rebalance_adjacent_parts, smart_split_segments
 
 
 def _seg_from_words(text, dt=0.5):
@@ -189,6 +189,48 @@ def test_wrap_never_breaks_mid_word():
     for line in out.split("\n"):
         # every line is composed of whole words; no long word is split mid-character
         assert all(w in text.split() for w in line.split())
+
+
+def test_wrap_zh_scores_the_trailing_word_not_its_last_character():
+    # 目的 ends in 的, but it is a noun, not the attributive particle: scoring
+    # single glyphs penalized "目的|" like "的|" and pushed the break inside the
+    # word ("目|的").
+    text = "这次旅行真正的目的就是去看看那片大海"
+    lines = wrap_cue_text(text, "zh", 2, max_line_length=20).split("\n")
+    assert len(lines) == 2
+    assert "".join(lines) == text
+    assert lines[0].endswith("目的")
+
+
+def test_wrap_cjk_breaks_on_a_segmented_word_boundary():
+    # A break inside a segmented word (電|車) is only a fallback for when no
+    # word boundary fits the budget.
+    text = "彼は駅まで歩いてから電車に乗って会社へ行った"
+    lines = wrap_cue_text(text, "ja", 2, max_line_length=24).split("\n")
+    assert len(lines) == 2
+    assert "".join(lines) == text
+    assert not (lines[0].endswith("電") and lines[1].startswith("車"))
+
+
+def test_rebalance_zh_scores_the_trailing_word_not_its_last_character():
+    # The untimed/legacy clause split rebalances two parts on jieba word starts;
+    # scoring the last glyph read 目的 as the particle 的 and left 的目的 split.
+    assert _rebalance_adjacent_parts(
+        "他说", "这件事情的目的其实很简单明了", 10, 1, "zh"
+    ) == (
+        "他说这件事情的目的",
+        "其实很简单明了",
+    )
+
+
+def test_rebalance_ja_sees_a_multi_kana_bound_ending():
+    # まで only matches as a whole particle, so the phrase ending in it has to be
+    # scored, not its last kana で (which is no longer an entry on its own).
+    new_left, new_right = _rebalance_adjacent_parts(
+        "僕は", "昨日から今日まで何も食べていない", 12, 1, "ja"
+    )
+    assert new_left + new_right == "僕は昨日から今日まで何も食べていない"
+    assert not new_left.endswith("まで")
 
 
 # --------------------------------------------------------------------------- #

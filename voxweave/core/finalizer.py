@@ -696,6 +696,16 @@ def _guarded_end(want: float, seed_end: float, next_start: float | None) -> floa
     The ``else`` arm of the inner test is the 87fde9d gap preservation: a gap
     already at or under the two-frame floor is never extended into, because the
     chaining branch could not restore it afterwards.
+
+    The grant is still clamped AT the neighbour's start, where ``_cleanup_cues``
+    now stops two frames short of it. The delivered end still matches v1
+    whenever the cue's speech ends at least two frames before the neighbour,
+    because slot 6's ladder (branch 1) trims the sub-two-frame gap back to
+    ``next_start - 2f``; only the trace differs (desire + ladder legs rather than
+    one desire leg). Moving the clamp here must move it in
+    ``trace_validator.guarded_end`` and in P6's independent comparator
+    ``align_compare._guarded_end`` in the same change, or the comparator's trace
+    equality fails every document whose extension reaches its neighbour.
     """
     if want > seed_end:
         if next_start is None:

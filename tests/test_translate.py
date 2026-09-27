@@ -698,9 +698,10 @@ def test_render_translated_wraps_long_zh_to_two_lines():
 
 def test_layout_translated_zh_uses_eighteen_native_cell_budget():
     # 19 Han glyphs occupy 38 half-width cells: over zh's 36, under the old 42.
+    # The break lands on the jieba word boundary after the numeral run.
     text = "一二三四五六七八九十甲乙丙丁戊己庚辛壬"
     assert translate._layout_translated(text, "zh") == (
-        "一二三四五六七八九\n十甲乙丙丁戊己庚辛壬"
+        "一二三四五六七八九十\n甲乙丙丁戊己庚辛壬"
     )
 
 
