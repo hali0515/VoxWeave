@@ -7,8 +7,9 @@ quality capped at the source bitrate, hardware encoder when available: NVENC on
 NVIDIA, VideoToolbox on macOS, libx264/libx265/libsvt-av1 software fallback).
 pack into mkv keeps every source stream; pack into mp4/webm keeps video, audio
 and text subtitle tracks (image subtitles cannot be stored there and are
-dropped). burn keeps the one real video stream and the audio, dropping every
-subtitle track (now burnt in), data/attachment streams and cover art.
+dropped, as is cover art in webm). burn keeps the one real video stream and the
+audio, dropping every subtitle track (now burnt in), data/attachment streams
+and cover art. The container follows the ``-o`` extension when it names one.
 
 Command construction is kept separate from probing/execution so the ffmpeg
 argv builders stay unit-testable without media files or a GPU.
@@ -25,7 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import Path
 
 from voxweave import fsio, lang
@@ -36,13 +37,41 @@ logger = logging.getLogger(__name__)
 # Containers pack/burn can write, mapped to the text subtitle codec each stores.
 SUB_CODEC = {"mkv": "srt", "mp4": "mov_text", "webm": "webvtt"}
 
+# ffmpeg muxer for each container, forced with -f when the output file name
+# does not already select it.
+_MUXER = {"mkv": "matroska", "mp4": "mp4", "webm": "webm"}
+
 # Video/audio codecs each non-mkv container can stream-copy (mkv holds anything).
-# pack stream-copies A/V, so an unlisted codec cannot be remuxed as-is.
+# pack stream-copies A/V, so an unlisted codec cannot be remuxed as-is. The mp4
+# audio set is every audio codec ffmpeg 9's mp4 muxer accepts without
+# `-strict experimental` (avformat_query_codec); truehd needs that flag, so it
+# is refused here and packs into mkv.
 _PACK_VIDEO_ALLOW = {
     "mp4": {"h264", "hevc", "av1", "vp9", "mpeg4"},
     "webm": {"vp8", "vp9", "av1"},
 }
 _PACK_AUDIO_ALLOW = {
+    "mp4": {
+        "aac",
+        "ac3",
+        "eac3",
+        "mp3",
+        "mp2",
+        "alac",
+        "flac",
+        "opus",
+        "dts",
+        "vorbis",
+        "mp4als",
+        "mpegh_3d_audio",
+        "qcelp",
+        "evrc",
+        *(
+            f"pcm_{kind}{order}"
+            for kind in ("s16", "s24", "s32", "f32", "f64")
+            for order in ("le", "be")
+        ),
+    },
     "webm": {"opus", "vorbis"},
 }
 
@@ -95,11 +124,37 @@ def _run_ffmpeg(cmd: list[str], *, capture: bool) -> None:
             stdin=subprocess.DEVNULL,
             capture_output=capture,
             text=capture,
+            # a non-UTF-8 file name in ffmpeg's output must not fail the run
+            errors="replace" if capture else None,
         )
     except FileNotFoundError as e:
         raise _missing_binary_error(cmd[0]) from e
     if proc.returncode != 0:
         raise _ffmpeg_failure(cmd[0], proc.returncode, proc.stderr if capture else "")
+    if capture:
+        _log_ffmpeg_warnings(cmd[0], proc.stderr)
+
+
+# Distinct stderr lines passed on after a successful run; libass repeats its
+# missing-glyph warning for every glyph.
+_FFMPEG_WARNING_LINES = 10
+
+# Lines ffmpeg prints for any ordinary source, not about this run: the mov
+# demuxer's note on an mp4 cover-art stream (plain decoding prints it too).
+_BENIGN_FFMPEG_LINE = re.compile(r"\bstream \d+, timescale not set$")
+
+
+def _log_ffmpeg_warnings(binary: str, stderr: str | None) -> None:
+    """Pass on what a successful run printed at -loglevel warning (ffmpeg's
+    own warnings and libass's, e.g. a font lacking the subtitle's glyphs)."""
+    lines = list(dict.fromkeys(line.strip() for line in (stderr or "").splitlines()))
+    lines = [line for line in lines if line and not _BENIGN_FFMPEG_LINE.search(line)]
+    if not lines:
+        return
+    shown = lines[:_FFMPEG_WARNING_LINES]
+    if len(lines) > len(shown):
+        shown.append(f"... and {len(lines) - len(shown)} more")
+    logger.warning("%s reported:\n%s", binary, "\n".join(shown))
 
 
 def _ffmpeg_failure(binary: str, returncode: int, stderr: str | None) -> RuntimeError:
@@ -125,7 +180,9 @@ def _run_ffmpeg_progress(
     frames = completed = 0
     out_time = "00:00:00"
     # A file drains diagnostics independently of stdout and avoids a full stderr pipe.
-    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errors:
+    with tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8", errors="replace"
+    ) as errors:
         try:
             proc = subprocess.Popen(
                 command,
@@ -163,9 +220,10 @@ def _run_ffmpeg_progress(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
+        errors.seek(0)
         if returncode != 0:
-            errors.seek(0)
             raise _ffmpeg_failure(command[0], returncode, errors.read())
+        _log_ffmpeg_warnings(command[0], errors.read())
 
 
 def probe_streams(media: Path) -> list[dict]:
@@ -307,6 +365,44 @@ def _default_container(media: Path) -> str:
     return ext if ext in SUB_CODEC else "mkv"
 
 
+def _output_container(
+    output: Path | None,
+    container: str | None,
+    fallback: str,
+    allowed: Collection[str],
+) -> str:
+    """The container to write.
+
+    An ``-o`` extension naming a container decides (ffmpeg would pick that
+    muxer from it anyway), overriding a different ``--container`` with a
+    warning. Otherwise ``--container``, else ``fallback``; for any other
+    extension the muxer is forced with ``-f`` (see ``_muxer_args``).
+    """
+    name = Path(output).name if output is not None else ""
+    named = Path(name).suffix.lower().lstrip(".")
+    if named in _MUXER:
+        if named not in allowed:
+            raise ValueError(
+                f"cannot write {named} ({name}); choose from {', '.join(allowed)}"
+            )
+        if container is not None and container != named:
+            logger.warning(
+                "writing %s as the output name %s says, not --container %s",
+                named,
+                name,
+                container,
+            )
+        return named
+    return container or fallback
+
+
+def _muxer_args(out: Path, container: str) -> list[str]:
+    """``-f <muxer>`` unless the output extension already selects it."""
+    if Path(out).suffix.lower().lstrip(".") == container:
+        return []
+    return ["-f", _MUXER[container]]
+
+
 # ---------------------------------------------------------------------------
 # pack — soft-mux subtitle tracks
 
@@ -319,13 +415,18 @@ def _packed_sub_codec(sub: Path, container: str) -> str:
     return SUB_CODEC[container]
 
 
-def _check_pack_compat(container: str, streams: list[dict]) -> None:
+def _check_pack_compat(
+    container: str, streams: list[dict], *, output_named: bool = False
+) -> None:
     """Reject stream-copying source codecs the target container cannot hold.
 
     Raised before any ffmpeg run so the caller gets a clear message (and the
     mkv escape hatch) instead of a cryptic muxer failure. mkv holds every
     video/audio codec (text subtitles it cannot hold are converted to srt).
+    ``output_named`` means the ``-o`` extension chose the container, so the
+    hint names that instead of ``--container`` (which it overrides).
     """
+    hint = "an -o name ending in .mkv" if output_named else "--container mkv"
     checks = (
         ("video", _PACK_VIDEO_ALLOW.get(container)),
         ("audio", _PACK_AUDIO_ALLOW.get(container)),
@@ -342,7 +443,7 @@ def _check_pack_compat(container: str, streams: list[dict]) -> None:
             if name and name not in allow:
                 raise ValueError(
                     f"{container} cannot store {name} {kind}; "
-                    f"pack into mkv instead (--container mkv)"
+                    f"pack into mkv instead ({hint})"
                 )
 
 
@@ -362,11 +463,14 @@ def build_pack_cmd(
     subtitles Matroska cannot store, like mov_text, are converted to srt); mp4
     and webm targets keep video+audio and only those existing subtitle tracks
     that are text-based (image subs cannot become mov_text/webvtt and are
-    dropped). Only the first packed track is left flagged default.
+    dropped; webm also drops cover art). Only the first packed track is left
+    flagged default. Every output stream gets exactly one codec option, so
+    ffmpeg's warnings (logged after a successful run) are real ones.
     """
     sub_codec = SUB_CODEC[container]
     subs = [s for s in source_streams if s.get("codec_type") == "subtitle"]
-    cmd: list[str] = ["ffmpeg", "-nostdin", "-hide_banner", "-y", "-i", str(media)]
+    cmd: list[str] = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning"]
+    cmd += ["-y", "-i", str(media)]
     for vtt in vtts:
         cmd += ["-i", str(vtt)]
 
@@ -377,6 +481,16 @@ def build_pack_cmd(
         kept = subs
     else:
         cmd += ["-map", "0:v", "-map", "0:a?"]
+        if container == "webm":
+            for s in source_streams:
+                index = _stream_index(s)
+                if (
+                    s.get("codec_type") == "video"
+                    and (s.get("disposition") or {}).get("attached_pic") == 1
+                    and index is not None
+                ):
+                    logger.warning("dropping cover art (webm cannot store it)")
+                    cmd += ["-map", f"-0:{index}"]
         for s in subs:
             if s.get("codec_name") in _TEXT_SUB_CODECS:
                 cmd += ["-map", f"0:{s['index']}"]
@@ -391,13 +505,15 @@ def build_pack_cmd(
     for i in range(len(vtts)):
         cmd += ["-map", f"{i + 1}:0"]
 
-    cmd += ["-c", "copy"]
+    cmd += ["-c:v", "copy", "-c:a", "copy"]
     if container == "mkv":
-        # existing subs stream-copy unless Matroska cannot store their codec;
-        # the appended files are transcoded
+        # data and attachment (font) streams ride along; existing subs
+        # stream-copy unless Matroska cannot store their codec; the appended
+        # files are transcoded
+        cmd += ["-c:d", "copy", "-c:t", "copy"]
         for i, s in enumerate(kept):
-            if s.get("codec_name") in _MKV_CONVERT_SUB_CODECS:
-                cmd += [f"-c:s:{i}", "srt"]
+            convert = s.get("codec_name") in _MKV_CONVERT_SUB_CODECS
+            cmd += [f"-c:s:{i}", "srt" if convert else "copy"]
         for i, vtt in enumerate(vtts):
             cmd += [f"-c:s:{kept_subs + i}", _packed_sub_codec(vtt, container)]
     else:
@@ -429,7 +545,7 @@ def build_pack_cmd(
         if (s.get("disposition") or {}).get("default") == 1:
             cmd += [f"-disposition:s:{i}", "-default"]
     cmd += [f"-disposition:s:{kept_subs}", "default"]
-    cmd += [str(out)]
+    cmd += [*_muxer_args(out, container), str(out)]
     return cmd
 
 
@@ -454,7 +570,7 @@ def pack(
         require_subtitle(v)
         _timed_subtitle_check(v)
     src = resolve_media(vtts[0], media)
-    cont = container or _default_container(src)
+    cont = _output_container(output, container, _default_container(src), SUB_CODEC)
     if cont not in SUB_CODEC:
         raise ValueError(
             f"unsupported container {cont!r} (choose from {', '.join(SUB_CODEC)})"
@@ -467,7 +583,11 @@ def pack(
         src,
     )
     streams = probe_streams(src)
-    _check_pack_compat(cont, streams)  # raise before any ffmpeg run
+    output_named = output is not None and Path(output).suffix.lower() in {
+        f".{name}" for name in _MUXER
+    }
+    # raise before any ffmpeg run
+    _check_pack_compat(cont, streams, output_named=output_named)
     rep.step("pack subtitles")
     temp_dirs: list[Path] = []
     try:
@@ -797,7 +917,7 @@ def build_burn_cmd(
         cmd += ["-c:a", "aac", "-b:a", "192k"]
     else:
         cmd += ["-c:a", "copy"]
-    cmd += [str(out)]
+    cmd += [*_muxer_args(out, container), str(out)]
     return cmd
 
 
@@ -808,7 +928,7 @@ def burn(
     codec: str = "hevc",
     encoder: str | None = None,
     quality: int | None = None,
-    container: str = "mp4",
+    container: str | None = None,
     font: str = "Arial",
     font_size: int | None = None,
     output: Path | None = None,
@@ -821,7 +941,8 @@ def burn(
     defaults at any resolution; ASS/SSA inputs go to libass as-is, keeping
     their own styling (--font/--font-size are ignored). With ``bitrate_cap``
     the video bitrate is capped at the source's, so the output is no larger
-    than the source."""
+    than the source. The container is mp4 unless ``container`` or an mkv
+    ``output`` name says otherwise."""
     from voxweave.export import _timed_rows, ass_header, render_ass
     from voxweave.subformats import require_subtitle
 
@@ -833,6 +954,7 @@ def burn(
     steps.append("encode video")
     rep.plan(steps)
     rep.step("check inputs")
+    container = _output_container(output, container, "mp4", ("mp4", "mkv"))
     if container not in ("mp4", "mkv"):
         raise ValueError(f"unsupported container {container!r} (choose mp4 or mkv)")
     require_subtitle(vtt)

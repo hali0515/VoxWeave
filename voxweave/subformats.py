@@ -269,20 +269,17 @@ def load_subtitle_blocks_bytes(path: Path, data: bytes) -> list[dict]:
         from voxweave.pipeline import inspect_speakers_mapping_path
         from voxweave.speakers import load_speaker_display_names
 
-        mapping_path = inspect_speakers_mapping_path(
-            p,
-            reference=p,
-        )
+        # The mapping only lets "Name: line" speaker labels be recognised; a
+        # broken lookup (an unreadable cache marker, say) must not fail the load.
         known_names: list[str] = []
-        if mapping_path.exists():
-            try:
+        label = p.name
+        try:
+            mapping_path = inspect_speakers_mapping_path(p, reference=p)
+            label = mapping_path.name
+            if mapping_path.exists():
                 known_names = load_speaker_display_names(mapping_path)
-            except (OSError, RuntimeError, UnicodeError) as exc:
-                log.warning(
-                    "%s: ignoring unreadable speaker mapping: %s",
-                    mapping_path.name,
-                    exc,
-                )
+        except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+            log.warning("%s: ignoring unreadable speaker mapping: %s", label, exc)
         if known_names:
             blocks = parse_vtt_blocks(text, srt_speaker_names=known_names)
         else:

@@ -1,9 +1,14 @@
 """Optimistic per-episode commits and private generation observations.
 
 This module owns filesystem generations, staging, publication order, and the
-post-primary SDH compare-and-swap. It deliberately has no model or renderer
-dependency: callers hand it final bytes produced and independently checked
-outside the episode lock.
+post-primary SDH compare-and-swap. It never runs a model, renders or encodes:
+callers hand it final bytes produced and independently checked outside the
+episode lock. The only content it parses is split's speaker mapping, for the
+tolerant mapping observation.
+
+Published VTT/JSON/SDH files are user deliverables and get ``fsio``'s
+deliverable permissions (umask for a new file, the existing mode on
+overwrite); the voiceprint sidecar and durable align evidence stay ``0o600``.
 """
 
 from __future__ import annotations
@@ -11,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
-import tempfile
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -19,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from voxweave import fsio
 from voxweave.align_context import (
     IssuedAlignContext,
     IssuedSegmentationContext,
@@ -27,7 +32,6 @@ from voxweave.align_context import (
 )
 from voxweave.align_failures import CanonicalFailure, SecondaryFailure
 from voxweave.align_runtime import align_runtime_activity
-from voxweave.speakers import load_speaker_mapping_bytes
 from voxweave.voicebase import media_fingerprint
 from voxweave.voiceepisode import episode_lock
 
@@ -134,6 +138,7 @@ class TransactionReceipt:
 class _OwnedStage:
     target: Path
     path: Path
+    private: bool = False
 
 
 @dataclass(frozen=True)
@@ -147,7 +152,33 @@ _SPEAKER_MAPPING_BINDINGS: dict[int, _SpeakerMappingBinding] = {}
 _SPEAKER_MAPPING_BINDINGS_LOCK = threading.RLock()
 
 
-class InputStaleError(RuntimeError):
+class _PublicationError(RuntimeError):
+    """A transaction error whose message also says what already landed.
+
+    ``landed``/``machine_landed``/``leftovers`` are filled in when the error
+    leaves a transaction, so a partial publication reaches the user's error
+    message, not just the exception attributes.
+    """
+
+    landed: tuple[Path, ...] = ()
+    machine_landed: tuple[Path, ...] = ()
+    leftovers: tuple[Path, ...] = ()
+
+    def __str__(self) -> str:
+        message = super().__str__()
+        written = (*self.landed, *self.machine_landed)
+        if written:
+            message += "; already written: " + ", ".join(
+                Path(path).name for path in written
+            )
+        if self.leftovers:
+            message += "; temp files left behind: " + ", ".join(
+                str(path) for path in self.leftovers
+            )
+        return message
+
+
+class InputStaleError(_PublicationError):
     """A declared optimistic generation changed before commit."""
 
     def __init__(self, detail_code: str, message: str):
@@ -157,7 +188,7 @@ class InputStaleError(RuntimeError):
         self.leftovers: tuple[Path, ...] = ()
 
 
-class MediaStaleError(RuntimeError):
+class MediaStaleError(_PublicationError):
     """Selected media changed between compute and commit."""
 
     def __init__(self, detail_code: str, message: str):
@@ -167,12 +198,18 @@ class MediaStaleError(RuntimeError):
         self.leftovers: tuple[Path, ...] = ()
 
 
-class ArtifactCleanupError(RuntimeError):
+class ArtifactCleanupError(_PublicationError):
     """A required post-primary unlink failed after ordered publication."""
 
-    def __init__(self, cleanup: ArtifactCleanup, cause: OSError):
+    def __init__(
+        self,
+        cleanup: ArtifactCleanup,
+        cause: OSError,
+        *,
+        outputs: str = "primary JSON/VTT outputs",
+    ):
         super().__init__(
-            "primary JSON/VTT outputs landed but required artifact cleanup failed: "
+            f"{outputs} landed but required artifact cleanup failed: "
             f"could not delete {cleanup.path}: {cause}"
         )
         self.failure = CanonicalFailure(
@@ -182,7 +219,7 @@ class ArtifactCleanupError(RuntimeError):
         self.leftovers: tuple[Path, ...] = ()
 
 
-class TransactionOperationError(RuntimeError):
+class TransactionOperationError(_PublicationError):
     """A staged transaction operation failed at one closed P6 terminal."""
 
     def __init__(
@@ -198,7 +235,7 @@ class TransactionOperationError(RuntimeError):
         self.leftovers: tuple[Path, ...] = ()
 
 
-class StageResidueError(RuntimeError):
+class StageResidueError(_PublicationError):
     """Owned transaction stages remained after best-effort disposal."""
 
     def __init__(self, leftovers: Sequence[Path]):
@@ -227,10 +264,17 @@ def capture_file_generation(path: Path) -> FileGeneration:
 
 
 def same_file_generation(path: Path, expected: FileGeneration) -> bool:
+    return _generation_problem(path, expected) is None
+
+
+def _generation_problem(path: Path, expected: FileGeneration) -> str | None:
+    """None when ``path`` still holds ``expected``; otherwise why not: the
+    literal "changed", or a message naming the error that stopped the re-read."""
     try:
-        return capture_file_generation(path) == expected
-    except OSError:
-        return False
+        observed = capture_file_generation(path)
+    except OSError as exc:
+        return f"could not re-read {Path(path).name} to check it is unchanged: {exc}"
+    return None if observed == expected else "changed"
 
 
 def _mapping_stat(
@@ -238,8 +282,8 @@ def _mapping_stat(
 ) -> tuple[MappingStat | None, type[BaseException] | None, int | None]:
     try:
         observed = path.lstat()
-    except BaseException as exc:
-        return None, type(exc), getattr(exc, "errno", None)
+    except OSError as exc:
+        return None, type(exc), exc.errno
     return (
         (
             observed.st_dev,
@@ -287,6 +331,10 @@ def capture_speaker_mapping(
             ),
             (),
         )
+    # Imported here: voxweave.speakers pulls in numpy and the voice stack,
+    # which nothing else in a transaction needs.
+    from voxweave.speakers import load_speaker_mapping_bytes
+
     try:
         names = load_speaker_mapping_bytes(raw, known_ids, source=target.name)
     except (RuntimeError, UnicodeError) as exc:
@@ -386,13 +434,10 @@ def same_speaker_mapping_generation(
 
 
 def _stage_bytes(target: Path, value: bytes) -> _OwnedStage:
+    """Write ``value`` to a fsynced ``0o600`` temp file next to ``target``
+    (named and swept by ``fsio``, so crash residue does not pile up)."""
     destination = Path(target)
-    descriptor, name = tempfile.mkstemp(
-        dir=destination.parent,
-        prefix=f".{destination.stem}.",
-        suffix=f".part{destination.suffix}",
-    )
-    stage = Path(name)
+    descriptor, stage = fsio.make_temp(destination)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(value)
@@ -406,16 +451,19 @@ def _stage_bytes(target: Path, value: bytes) -> _OwnedStage:
 
 def _replace_stage(stage: _OwnedStage) -> None:
     """Publication seam kept small for ordered failure injection."""
-    os.replace(stage.path, stage.target)
+    fsio.install_temp(stage.path, stage.target, private=stage.private)
 
 
-def _stage_primary(target: Path, value: bytes, detail_code: str) -> _OwnedStage:
+def _stage_primary(
+    target: Path, value: bytes, detail_code: str, *, private: bool = False
+) -> _OwnedStage:
     try:
-        return _stage_bytes(target, value)
+        stage = _stage_bytes(target, value)
     except Exception as exc:
         raise TransactionOperationError(
             "stage-failed", "stage", detail_code, exc
         ) from exc
+    return _OwnedStage(stage.target, stage.path, private=True) if private else stage
 
 
 def _replace_primary(stage: _OwnedStage, detail_code: str) -> None:
@@ -450,11 +498,39 @@ def _transaction_lock(path: Path) -> Iterator[None]:
         manager.__exit__(None, None, None)
 
 
-def _cleanup_after_primary(cleanup: ArtifactCleanup) -> None:
+def _cleanup_after_primary(
+    cleanup: ArtifactCleanup, *, outputs: str = "primary JSON/VTT outputs"
+) -> None:
     try:
         cleanup.path.unlink(missing_ok=True)
     except OSError as exc:
-        raise ArtifactCleanupError(cleanup, exc) from exc
+        raise ArtifactCleanupError(cleanup, exc, outputs=outputs) from exc
+
+
+def _defer_cleanup(
+    cleanup: ArtifactCleanup,
+    failures: list[ArtifactCleanupError],
+    *,
+    outputs: str = "primary JSON/VTT outputs",
+) -> None:
+    """Run one required cleanup, recording a failure instead of raising it.
+
+    The cleanups are independent of each other and of the machine artifact
+    that binds the already-landed primaries, so one undeletable file must not
+    stop them; the caller raises the first failure (later ones ride along as
+    secondaries) once they have all run.
+    """
+    try:
+        _cleanup_after_primary(cleanup, outputs=outputs)
+    except ArtifactCleanupError as exc:
+        if failures:
+            _append_secondary(
+                failures[0],
+                SecondaryFailure(
+                    exc.failure.kind, exc.failure.phase, exc.failure.detail_code
+                ),
+            )
+        failures.append(exc)
 
 
 def _discard_stages(stages: Iterable[_OwnedStage]) -> tuple[Path, ...]:
@@ -478,7 +554,12 @@ def _discard_stages(stages: Iterable[_OwnedStage]) -> tuple[Path, ...]:
 
 
 def _append_stage_residue_secondary(exc: BaseException) -> None:
-    secondary = SecondaryFailure("snapshot-dispose-failed", "dispose", "stage-residue")
+    _append_secondary(
+        exc, SecondaryFailure("snapshot-dispose-failed", "dispose", "stage-residue")
+    )
+
+
+def _append_secondary(exc: BaseException, secondary: SecondaryFailure) -> None:
     failure = getattr(exc, "failure", None)
     if isinstance(failure, CanonicalFailure):
         try:
@@ -519,13 +600,19 @@ def _annotate_failure(
             pass
 
 
-def _stale(command: TransactionCommand, detail: str) -> InputStaleError:
+def _stale(
+    command: TransactionCommand, detail: str, problem: str = "changed"
+) -> InputStaleError:
+    """``problem`` is a ``_generation_problem`` result: a read error is named
+    as such instead of being reported as a change."""
     messages = {
         "process": "output changed during processing; re-run",
         "split": "input changed during replay; re-run",
         "align": "input changed during replay; re-run",
     }
-    return InputStaleError(detail, messages[command])
+    return InputStaleError(
+        detail, messages[command] if problem == "changed" else problem
+    )
 
 
 def _check_primary_generations(
@@ -536,30 +623,41 @@ def _check_primary_generations(
     expected_json: FileGeneration,
     expected_vtt: FileGeneration | None,
 ) -> None:
-    if not same_file_generation(json_path, expected_json):
+    problem = _generation_problem(json_path, expected_json)
+    if problem is not None:
         detail = (
             "process-output-generation"
             if command == "process"
             else "sibling-generation"
         )
-        raise _stale(command, detail)
+        raise _stale(command, detail, problem)
     if command != "split":
-        if expected_vtt is None or not same_file_generation(vtt_path, expected_vtt):
+        problem = (
+            "changed"
+            if expected_vtt is None
+            else _generation_problem(vtt_path, expected_vtt)
+        )
+        if problem is not None:
             detail = (
                 "process-output-generation"
                 if command == "process"
                 else "vtt-generation"
             )
-            raise _stale(command, detail)
+            raise _stale(command, detail, problem)
+
+
+def _unreadable_media(path: Path, exc: OSError) -> str:
+    return (
+        f"could not re-read the selected media {Path(path).name} to check it is "
+        f"unchanged: {exc}"
+    )
 
 
 def require_media_generation(path: Path, expected_fingerprint: str) -> None:
     try:
         observed = media_fingerprint(Path(path))
     except OSError as exc:
-        raise MediaStaleError(
-            "media-generation", "selected media changed during processing; re-run"
-        ) from exc
+        raise MediaStaleError("media-generation", _unreadable_media(path, exc)) from exc
     if observed != expected_fingerprint:
         raise MediaStaleError(
             "media-generation", "selected media changed during processing; re-run"
@@ -576,10 +674,7 @@ def require_media_pair_decision(
     try:
         observed = media_fingerprint(Path(path))
     except OSError as exc:
-        raise MediaStaleError(
-            "pair-decision",
-            "selected media pair decision changed during processing; re-run",
-        ) from exc
+        raise MediaStaleError("pair-decision", _unreadable_media(path, exc)) from exc
     if (observed == voiceprint_media_fingerprint) is not expected_decision:
         raise MediaStaleError(
             "pair-decision",
@@ -675,6 +770,7 @@ def commit_primary_outputs(
                     machine_artifact.path,
                     machine_artifact.bytes_value,
                     "machine-artifact-stage",
+                    private=True,
                 )
                 stages.append(machine_stage)
             if evidence_artifact is not None:
@@ -682,6 +778,7 @@ def commit_primary_outputs(
                     evidence_artifact.path,
                     evidence_artifact.bytes_value,
                     "evidence-stage",
+                    private=True,
                 )
                 stages.append(evidence_stage)
         with _transaction_lock(Path(episode_path)):
@@ -739,22 +836,42 @@ def commit_primary_outputs(
                 ):
                     _replace_primary(stage, detail_code)
                     landed.append(stage.target)
+                # A failed cleanup is raised only after the remaining cleanups
+                # and the machine artifact (it binds the primaries that already
+                # landed) have run. Durable evidence attests a complete
+                # publication, so it is withheld once any cleanup failed.
+                cleanup_failures: list[ArtifactCleanupError] = []
                 for cleanup in (
                     item
                     for item in cleanup_paths
                     if item.detail_code != "evidence-unlink"
                 ):
-                    _cleanup_after_primary(cleanup)
+                    _defer_cleanup(cleanup, cleanup_failures)
                 if machine_artifact is not None:
                     assert machine_stage is not None
-                    _replace_primary(machine_stage, "machine-artifact-replace")
+                    try:
+                        _replace_primary(machine_stage, "machine-artifact-replace")
+                    except TransactionOperationError as exc:
+                        if not cleanup_failures:
+                            raise
+                        _append_secondary(
+                            cleanup_failures[0],
+                            SecondaryFailure(
+                                exc.failure.kind,
+                                exc.failure.phase,
+                                exc.failure.detail_code,
+                            ),
+                        )
+                        raise cleanup_failures[0]
                     machine_landed.append(machine_artifact.path)
                 for cleanup in (
                     item
                     for item in cleanup_paths
                     if item.detail_code == "evidence-unlink"
                 ):
-                    _cleanup_after_primary(cleanup)
+                    _defer_cleanup(cleanup, cleanup_failures)
+                if cleanup_failures:
+                    raise cleanup_failures[0]
                 if evidence_artifact is not None:
                     assert evidence_stage is not None
                     _replace_primary(evidence_stage, "evidence-replace")
@@ -797,19 +914,28 @@ def commit_correction(
     landed: list[Path] = []
     try:
         with _transaction_lock(Path(episode_path)):
-            if not same_file_generation(target, expected_vtt):
+            problem = _generation_problem(target, expected_vtt)
+            if problem is not None:
                 raise InputStaleError(
-                    "correct-generation", "input changed during correction; re-run"
+                    "correct-generation",
+                    "input changed during correction; re-run"
+                    if problem == "changed"
+                    else problem,
                 )
             _replace_primary(stage, "vtt-replace")
             landed.append(target)
             if rendered_vtt_bytes != expected_vtt.bytes_value:
+                cleanup_failures: list[ArtifactCleanupError] = []
                 for evidence_path in dict.fromkeys(
                     Path(path) for path in evidence_paths
                 ):
-                    _cleanup_after_primary(
-                        ArtifactCleanup(evidence_path, "evidence-unlink")
+                    _defer_cleanup(
+                        ArtifactCleanup(evidence_path, "evidence-unlink"),
+                        cleanup_failures,
+                        outputs="the corrected VTT",
                     )
+                if cleanup_failures:
+                    raise cleanup_failures[0]
     except BaseException as exc:
         leftovers = _discard_stages((stage,))
         if leftovers:

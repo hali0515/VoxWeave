@@ -242,6 +242,28 @@ def test_load_srt_ignores_unreadable_speaker_sidecar_once(
     assert len(warnings) == 1
 
 
+def test_load_srt_survives_an_unreadable_cache_marker(tmp_path, caplog):
+    # The mapping lookup walks the media directory's cache claims; a broken
+    # marker there must not stop an unrelated SRT from loading.
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n",
+        encoding="utf-8",
+    )
+    claim = tmp_path / "cache" / "ep"
+    claim.mkdir(parents=True)
+    (claim / "source.json").write_text("not json", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        blocks = load_subtitle_blocks(srt)
+
+    assert blocks[0]["text"] == "Aoi: Hello"
+    assert any(
+        "ignoring unreadable speaker mapping" in record.message
+        for record in caplog.records
+    )
+
+
 def test_load_ssa_uses_ass_parser(tmp_path):
     ssa = tmp_path / "ep.ssa"
     ssa.write_text(
