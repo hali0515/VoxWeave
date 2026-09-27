@@ -264,8 +264,10 @@ def build_speakers_group(
         default="127.0.0.1",
         show_default=True,
         help=(
-            "HTTP bind address; 0.0.0.0 allows access from other devices. There is no"
-            " password: anyone who can reach the port can play the audio and edit names."
+            "HTTP bind address; 0.0.0.0 allows access from other devices. The page opens"
+            " only through the printed access link (/?k=...); anyone who has that link can"
+            " play the audio and edit names, and on the network the connection is plain"
+            " HTTP."
         ),
     )
     @click.option(
@@ -273,8 +275,8 @@ def build_speakers_group(
         is_flag=True,
         help=(
             "Discover this port's public URLs from the local ngrok agent automatically."
-            " There is no password: anyone with the tunnel URL can play the audio and"
-            " edit names."
+            " Open the tunnel URL with the printed /?k=... appended; anyone who has that"
+            " link can play the audio and edit names."
         ),
     )
     @click.option(
@@ -373,8 +375,6 @@ def build_speakers_group(
 
         def prepare(_rep: object) -> Any:
             owner = _episode_owner(episode_path, require_media=True)
-            if voices is None and show is None and not manual and not library:
-                return create_speaker_audition(owner)
             return create_speaker_audition(
                 owner, voices=voices, show=show, no_match=manual, **library
             )

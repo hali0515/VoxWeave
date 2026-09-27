@@ -40,7 +40,6 @@ from typing import TYPE_CHECKING, Any, Iterator, cast
 import yaml
 
 from voxweave import config, runtime
-from voxweave.backend import _sha256_file
 from voxweave.core.schema import Cue
 from voxweave.voicebase import (
     MAX_EMBEDDING_DIM,
@@ -159,6 +158,14 @@ _EMBEDDING_MODEL_ATTR = "_voxweave_embedding_model"
 _OUTER_CONFIG_ATTR = "_voxweave_outer_config_sha256"
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _split_model_revision(model: str) -> tuple[str, str | None]:
     """Split Hugging Face ``repo@revision`` without rewriting local paths."""
     if Path(model).exists() or "@" not in model:
@@ -169,14 +176,18 @@ def _split_model_revision(model: str) -> tuple[str, str | None]:
     return model_id, revision
 
 
-def _snapshot_commit(
+def snapshot_commit(
     cached_path: Path,
     model_id: str,
     *,
     filename: str = EMBEDDING_CHECKPOINT_FILE,
     subfolder: str | None = None,
 ) -> str | None:
-    """Extract a commit from a validated HF snapshot path, including subfolders."""
+    """Extract a commit from a validated HF snapshot path, including subfolders.
+
+    Shared with :mod:`voxweave.turnembed`, which pins split embeddings to the
+    same checkpoint authority the voiceprint provenance records.
+    """
     absolute = cached_path.absolute()
     expected_relative = Path(subfolder) / filename if subfolder else Path(filename)
     for snapshot in absolute.parents:
@@ -199,12 +210,14 @@ def _snapshot_commit(
     return None
 
 
-def _canonical_embedding_source(
+def canonical_embedding_source(
     checkpoint: str,
     *,
     revision: str | None,
     subfolder: str | None,
 ) -> str:
+    """The ``checkpoint[@revision][#subfolder=...]`` grammar of embedding
+    provenance (shared with :mod:`voxweave.turnembed`, which parses it)."""
     source = checkpoint if revision is None else f"{checkpoint}@{revision}"
     if subfolder:
         source = f"{source}#subfolder={subfolder}"
@@ -376,7 +389,7 @@ def _embedding_load_authority(
                 raise
             return None
         cached_path = Path(cached).absolute()
-        commit = _snapshot_commit(
+        commit = snapshot_commit(
             cached_path,
             model_id,
             subfolder=cast(str | None, subfolder),
@@ -401,7 +414,7 @@ def _embedding_load_authority(
         return None
     return _EmbeddingLoadAuthority(
         loader_value=loader_value,
-        provenance_value=_canonical_embedding_source(
+        provenance_value=canonical_embedding_source(
             raw_checkpoint,
             revision=cast(str | None, revision),
             subfolder=cast(str | None, subfolder),
@@ -497,7 +510,7 @@ def _prepare_pipeline_load(
     except OSError:
         configured_model = None
     if configured_model is None:
-        snapshot_revision = _snapshot_commit(
+        snapshot_revision = snapshot_commit(
             config_path,
             model_id,
             filename="config.yaml",
@@ -589,7 +602,7 @@ def _build_provenance(
                 and (revision is None or isinstance(revision, str))
                 and (subfolder is None or isinstance(subfolder, str))
             ):
-                embedding_model = _canonical_embedding_source(
+                embedding_model = canonical_embedding_source(
                     checkpoint,
                     revision=cast(str | None, revision),
                     subfolder=cast(str | None, subfolder),
@@ -1111,11 +1124,10 @@ def _audit_counts(audit: Mapping[str, object]) -> dict[str, object]:
 def _clustering_embedding_numerics() -> Iterator[None]:
     """A fixed TF32 policy for the clustering embeddings, restored afterwards.
 
-    The process policy at this point depends on the run: the diarization span
-    above switches TF32 off only while pyannote runs and restores the policy it
-    found before clustering starts, and that policy has TF32 matmuls on only
-    when this run separated vocals (not on a vocals-cache hit, with
-    ``--no-separate`` or with ``VOXWEAVE_TF32=0``). So pin it here:
+    The diarization span above switches TF32 off only while pyannote runs and
+    restores the policy it found (vocal separation scopes its own TF32 matmuls
+    to the separation forward, so that is the process default), and this recipe
+    needs a fixed policy of its own whatever ran before. So pin it here:
 
     * cuDNN TF32 on: with it off, cuDNN picks convolution algorithms with
       much larger workspaces for ReDimNet2. Measured on a 2 h 13 min meeting

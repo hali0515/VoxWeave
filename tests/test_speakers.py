@@ -20,7 +20,7 @@ from voxweave.export import (
     render_srt,
     render_vtt_rows,
 )
-from voxweave.realign import parse_vtt_blocks, render_vtt
+from voxweave.realign import parse_vtt_blocks, render_cues, render_vtt
 from voxweave.subformats import load_subtitle_blocks, parse_ass_blocks
 from voxweave.voicebase import (
     canonical_turns_digest,
@@ -138,8 +138,10 @@ def test_mapping_reader_ignores_empty_and_unknown_ids_once(tmp_path, caplog):
     )
 
     with caplog.at_level(logging.WARNING, logger="voxweave"):
-        names = speakers.load_speaker_mapping(
-            mapping, {"SPEAKER_00", "SPEAKER_01", "SPEAKER_02"}
+        names = speakers.load_speaker_mapping_bytes(
+            mapping.read_bytes(),
+            {"SPEAKER_00", "SPEAKER_01", "SPEAKER_02"},
+            source=mapping.name,
         )
 
     assert names == {"SPEAKER_00": " Aoi "}
@@ -163,7 +165,9 @@ def test_mapping_reader_rejects_invalid_schema(tmp_path, document):
     mapping = tmp_path / "episode.speakers.json"
     mapping.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(RuntimeError):
-        speakers.load_speaker_mapping(mapping, set())
+        speakers.load_speaker_mapping_bytes(
+            mapping.read_bytes(), set(), source=mapping.name
+        )
 
 
 def test_vtt_voice_tags_strip_and_render_idempotently():
@@ -353,6 +357,11 @@ def test_named_srt_round_trip_recovers_clean_text_and_dash_metadata(tmp_path):
     assert vtt.read_text(encoding="utf-8") == source
 
 
+def _render_translated_vtt(blocks, trans, to_iso=None):
+    """Translated blocks -> VTT, the way the translate pipeline renders them."""
+    return render_cues(translate.translated_rows(blocks, trans, to_iso))
+
+
 def test_translate_keeps_names_out_of_payload_and_restores_vtt_tags():
     blocks = parse_vtt_blocks(
         "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<v Aoi>Hello</v>\n\n"
@@ -360,9 +369,7 @@ def test_translate_keeps_names_out_of_payload_and_restores_vtt_tags():
     )
 
     payload = translate.build_payload(blocks)
-    rendered = translate.render_translated_vtt(
-        blocks, {0: "你好", 1: "留下\n走吧"}, to_iso="zh"
-    )
+    rendered = _render_translated_vtt(blocks, {0: "你好", 1: "留下\n走吧"}, to_iso="zh")
 
     assert payload[0] == {"i": 0, "t": "Hello"}
     assert payload[1]["parts"] == ["Stay", "Go"]
@@ -463,7 +470,7 @@ def test_translate_rewrap_never_attributes_speakers_by_line_index():
     )
     translated = {0: "你到底整个下午跑到哪里去了我一直在找你 哪儿也没去"}
 
-    vtt = translate.render_translated_vtt(blocks, translated, to_iso="zh")
+    vtt = _render_translated_vtt(blocks, translated, to_iso="zh")
     rows = translate.translated_rows(blocks, translated, to_iso="zh", voice_tags=False)
     srt = render_srt(
         [(float(start), float(end), text) for start, end, text in rows],
@@ -481,9 +488,7 @@ def test_distinct_line_names_render_unnamed_after_unrecoverable_collapse():
         "<v Aoi>Hello there my friend</v>\n<v Ren>Hi</v>\n"
     )
 
-    rendered = translate.render_translated_vtt(
-        blocks, {0: "你好 我的朋友 嗨"}, to_iso="zh"
-    )
+    rendered = _render_translated_vtt(blocks, {0: "你好 我的朋友 嗨"}, to_iso="zh")
 
     assert "<v " not in rendered
     assert "\n你好 我的朋友 嗨\n" in rendered
@@ -787,7 +792,9 @@ def test_speakers_cli_routes_through_shared_error_wrapper(tmp_path, monkeypatch)
     )
     seen = {}
     monkeypatch.setenv("VOXWEAVE_CONFIG", str(tmp_path / "voxweave.conf"))
-    monkeypatch.setattr(speakers, "create_speaker_audition", lambda path: audition)
+    monkeypatch.setattr(
+        speakers, "create_speaker_audition", lambda path, **_kwargs: audition
+    )
     monkeypatch.setattr(
         speakerserve,
         "serve",

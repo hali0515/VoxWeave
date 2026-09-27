@@ -1,4 +1,12 @@
-"""HTTP serving for the speaker audition page, with loopback binding by default."""
+"""HTTP serving for the speaker audition page, with loopback binding by default.
+
+Access is by link: the URL the server prints and opens carries a random access
+key (``/?k=...``, new for every start). Opening it sets an HttpOnly,
+SameSite=Strict session cookie and moves the browser to the clean ``/``; every
+route (the page, ``/serve-info``, ``/save`` and the split routes) then requires
+that cookie, on 127.0.0.1 too. The Host/Origin checks against DNS rebinding and
+the per-session save token of the POST routes apply on top of it.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +28,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from voxweave import artifacts, fsio, turnembed, voiceembed
 from voxweave.ngrok import NgrokOrigins
@@ -55,6 +63,27 @@ _INVALID_BODY = object()
 # replies are written in chunks: a slow but progressing client is not cut off.
 _SOCKET_TIMEOUT_S = 30
 _WRITE_CHUNK_BYTES = 64 * 1024
+# The query parameter of the access link (``/?k=<access key>``).
+_ACCESS_KEY_PARAM = "k"
+_NO_SESSION_MESSAGE = (
+    b"This audition needs its access link: open the /?k=... link that "
+    b"voxweave speakers serve printed when it started.\n"
+)
+_BAD_KEY_MESSAGE = (
+    b"This access key is not valid for this server (a new one is made every "
+    b"time voxweave speakers serve starts); open the link it printed.\n"
+)
+# The answer to a valid access link. Not a 3xx: after a cross-site navigation
+# (a link tapped in a chat or mail app) browsers withhold SameSite=Strict
+# cookies from the redirected request too, so a 303 would land on a 403. A
+# navigation this same-origin page starts is same-site and carries the cookie;
+# location.replace also drops the key from the tab's history.
+_ENTER_PAGE = (
+    b'<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+    b'<meta name="referrer" content="no-referrer">\n<title>VoxWeave</title>\n'
+    b"</head>\n<body>\n<script>location.replace('/');</script>\n"
+    b'<noscript><a href="/">Open the audition</a></noscript>\n</body>\n</html>\n'
+)
 # Hosts that can only be reached through an ngrok tunnel.
 _NGROK_HOST_SUFFIXES = (
     ".ngrok-free.app",
@@ -100,6 +129,9 @@ class _StagedSplit:
     audio_normalized: bool
     audio_separator: SeparatorIdentity | None
     embedding_lane: str = turnembed.LANE_LEGACY
+    # The sibling's voiced and sung spans, for picking clean preview clips.
+    vad_speech: tuple[tuple[float, float], ...] = ()
+    sing_spans: tuple[tuple[float, float], ...] = ()
 
     def embedding_identity(self) -> turnembed.EmbeddingIdentity:
         """The provider identity the bound voiceprints were captured with."""
@@ -137,13 +169,18 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
             raise ValueError("host must be 127.0.0.1 or 0.0.0.0")
         self.page_bytes = page.encode("utf-8")
         self.media_path = Path(media_path)
-        self.mapping_path = Path(mapping_path)
         self.sibling_path = Path(sibling_path)
         self.speaker_ids = tuple(speaker_ids)
+        # Every read resolves the mapping path afresh; this one only identifies
+        # the untouched skeleton the audition was generated with.
         self.pristine_mapping_path = (
-            self.mapping_path if pristine_mapping_generation is not None else None
+            Path(mapping_path) if pristine_mapping_generation is not None else None
         )
         self.pristine_mapping_generation = pristine_mapping_generation
+        # Access link key -> session cookie (see the module docstring); the
+        # token guards the POST routes as before.
+        self.access_key = secrets.token_urlsafe(32)
+        self.session_cookie = secrets.token_urlsafe(32)
         self.token = secrets.token_urlsafe(32)
         self.report = report
         self.action_lock = threading.Lock()
@@ -160,6 +197,24 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
     @property
     def origin(self) -> str:
         return f"http://{self.authority}"
+
+    @property
+    def access_url(self) -> str:
+        """The link to open: the page's URL plus this session's access key."""
+        return f"{self.origin}/?{_ACCESS_KEY_PARAM}={self.access_key}"
+
+    @property
+    def cookie_name(self) -> str:
+        # Cookies are not scoped by port: a per-port name keeps two auditions
+        # served from one host from replacing each other's session cookie.
+        return f"voxweave_session_{self.server_port}"
+
+
+def _same_secret(candidate: str, expected: str) -> bool:
+    """Constant-time comparison that also accepts non-ASCII input."""
+    return secrets.compare_digest(
+        candidate.encode("utf-8", "surrogateescape"), expected.encode("utf-8")
+    )
 
 
 class _SpeakerRequestHandler(BaseHTTPRequestHandler):
@@ -179,12 +234,15 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         *,
         content_type: str = "text/plain; charset=utf-8",
         no_store: bool = False,
+        extra_headers: Sequence[tuple[str, str]] = (),
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         if no_store:
             self.send_header("Cache-Control", "no-store")
+        for name, value in extra_headers:
+            self.send_header(name, value)
         self.end_headers()
         view = memoryview(body)
         for offset in range(0, len(view), _WRITE_CHUNK_BYTES):
@@ -242,10 +300,12 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
             )
         hosts = self.headers.get_all("Host", [])
         host = hosts[0] if len(hosts) == 1 else ""
+        # Never the access key itself: whoever sent this request may not have it.
         message = (
             f"Host '{host[:200]}' is not allowed (hostnames are refused to prevent "
-            f"DNS rebinding); open http://{HOST}:{self.server.server_port}/, "
-            "or with --host 0.0.0.0 use this machine's IP address."
+            f"DNS rebinding); open the http://{HOST}:{self.server.server_port}/?"
+            f"{_ACCESS_KEY_PARAM}=... link that voxweave speakers serve printed, "
+            "or with --host 0.0.0.0 use this machine's IP address in it."
         )
         if host.split(":", 1)[0].lower().endswith(_NGROK_HOST_SUFFIXES):
             message += (
@@ -253,12 +313,71 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
             )
         return f"{message}\n".encode()
 
+    def _has_session(self) -> bool:
+        """Whether the request carries this server's session cookie."""
+        name = self.server.cookie_name
+        for header in self.headers.get_all("Cookie", []):
+            for pair in header.split(";"):
+                key, separator, value = pair.strip().partition("=")
+                if (
+                    separator
+                    and key == name
+                    and _same_secret(value, self.server.session_cookie)
+                ):
+                    return True
+        return False
+
+    def _enter_with_access_key(self) -> bool:
+        """Answer ``/?k=...``: trade a valid access key for the session cookie.
+
+        Returns False for any other path, which the caller routes as usual.
+        """
+        parts = urlsplit(self.path)
+        if parts.path != "/" or not parts.query:
+            return False
+        try:
+            query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError:
+            query = {}
+        keys = query.get(_ACCESS_KEY_PARAM, [])
+        if (
+            set(query) != {_ACCESS_KEY_PARAM}
+            or len(keys) != 1
+            or not _same_secret(keys[0], self.server.access_key)
+        ):
+            self._reply(HTTPStatus.FORBIDDEN, _BAD_KEY_MESSAGE)
+            return True
+        cookie = (
+            f"{self.server.cookie_name}={self.server.session_cookie}; "
+            "Path=/; HttpOnly; SameSite=Strict"
+        )
+        hosts = self.headers.get_all("Host", [])
+        if f"https://{hosts[0]}" in self._allowed_origins():
+            # Reached through an HTTPS tunnel: never send the cookie in clear.
+            cookie += "; Secure"
+        self._reply(
+            HTTPStatus.OK,
+            _ENTER_PAGE,
+            content_type="text/html; charset=utf-8",
+            no_store=True,
+            extra_headers=(
+                ("Set-Cookie", cookie),
+                ("Referrer-Policy", "no-referrer"),
+            ),
+        )
+        return True
+
     def do_GET(self) -> None:
         if not self._allowed_origins():
             self._reply(
                 HTTPStatus.FORBIDDEN,
                 self._forbidden_host_message(),
             )
+            return
+        if self._enter_with_access_key():
+            return
+        if not self._has_session():
+            self._reply(HTTPStatus.FORBIDDEN, _NO_SESSION_MESSAGE)
             return
         if self.path == "/":
             self._reply(
@@ -314,6 +433,9 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         self._reply(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        if not self._allowed_origins() or not self._has_session():
+            self._reply(HTTPStatus.FORBIDDEN)
+            return
         if self.path not in _POST_ROUTES:
             self._reply(HTTPStatus.NOT_FOUND)
             return
@@ -341,7 +463,7 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
             return _INVALID_BODY
         tokens = self.headers.get_all("X-VoxWeave-Token", [])
         token = tokens[0] if len(tokens) == 1 else ""
-        if not secrets.compare_digest(token, self.server.token):
+        if not _same_secret(token, self.server.token):
             self._reply(HTTPStatus.FORBIDDEN)
             return _INVALID_BODY
         length_values = self.headers.get_all("Content-Length", [])
@@ -389,6 +511,7 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
                 fsio.atomic_write_text(
                     mapping_path,
                     json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                    private=True,
                 )
         except OSError as exc:
             message = f"could not save the speaker mapping: {exc.strerror or exc}"
@@ -712,16 +835,40 @@ def _stage_split_inputs(
             audio_normalized=staged.audio_normalized,
             audio_separator=staged.audio_separator,
             embedding_lane=staged.embedding_lane,
+            vad_speech=tuple(pipeline._spans_in(sibling.get("vad_speech")) or ()),
+            sing_spans=tuple(pipeline._spans_in(sibling.get("sing_spans")) or ()),
         )
+
+
+# Stand-in speaker labels of the two proposed groups while preview clips are
+# picked (never a real diarizer id).
+_SPLIT_GROUP_LABEL = "\x00split-group-{}"
 
 
 def _proposal_groups(
     wav_path: Path,
-    turns: Sequence[tuple[float, float, str]],
+    staged: _StagedSplit,
     assignment: Mapping[int, str],
 ) -> list[dict[str, object]]:
     from voxweave import speakers
 
+    turns = staged.turns
+    # The page's clip rules: outside every other speaker's turn (the other
+    # group's included), inside VAD speech, outside singing.
+    clean = speakers.select_snippets(
+        [
+            (
+                start,
+                end,
+                _SPLIT_GROUP_LABEL.format(assignment[index])
+                if index in assignment
+                else label,
+            )
+            for index, (start, end, label) in enumerate(turns)
+        ],
+        staged.vad_speech,
+        staged.sing_spans,
+    )
     groups: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(prefix="voxweave_split_clips_") as temp_dir:
         root = Path(temp_dir)
@@ -730,10 +877,12 @@ def _proposal_groups(
                 index for index, group in assignment.items() if group == label
             )
             spans = [(turns[index][0], turns[index][1]) for index in indices]
+            # A group without a clean stretch still gets clips of its turns.
+            picks = clean.get(
+                _SPLIT_GROUP_LABEL.format(label)
+            ) or speakers._pick_spread(spans, speakers.MAX_SNIPPETS_PER_SPEAKER)
             samples: list[dict[str, object]] = []
-            for clip_index, (start, end) in enumerate(
-                speakers._pick_spread(spans, speakers.MAX_SNIPPETS_PER_SPEAKER)
-            ):
+            for clip_index, (start, end) in enumerate(picks):
                 clip_path = root / f"{label}-{clip_index}.mp3"
                 speakers.extract_clip(wav_path, start, end, clip_path)
                 encoded = base64.b64encode(clip_path.read_bytes()).decode("ascii")
@@ -900,9 +1049,11 @@ def _build_split_proposal(
             if staged.embedding_lane == turnembed.LANE_DECOUPLED
             else None
         )
-        groups = _proposal_groups(wav_path, staged.turns, assignment)
+        groups = _proposal_groups(wav_path, staged, assignment)
     finally:
         wav_path.unlink(missing_ok=True)
+        # Confirming needs no model; do not hold VRAM while the page is open.
+        turnembed.release()
     _recheck_split_inputs(server, staged)
     ordered_assignment = tuple(sorted(assignment.items()))
     proposal = _SplitProposal(
@@ -939,19 +1090,17 @@ def _validate_confirmation(value: object, proposal: _SplitProposal) -> None:
 def _mapping_document(
     raw: bytes, *, source: str
 ) -> tuple[dict[str, object], dict[str, str]]:
-    value = _strict_json_loads(raw)
-    if not isinstance(value, dict) or set(value) != {"version", "speakers"}:
-        raise SplitConflict(f"{source} has an invalid speaker mapping schema")
-    if type(value["version"]) is not int or value["version"] != 1:
-        raise SplitConflict(f"{source} has an unsupported speaker mapping version")
-    speakers = value["speakers"]
-    if not isinstance(speakers, dict) or any(
-        not isinstance(key, str)
-        or not isinstance(name, str)
-        or len(name) > MAX_NAME_CHARS
-        for key, name in speakers.items()
-    ):
-        raise SplitConflict(f"{source} contains invalid speaker mapping entries")
+    """Parse the on-disk mapping a split rewrites (or an undo restores).
+
+    The same rules as ``/serve-info`` (:func:`_mapping_speakers`), except that
+    every id is kept: a split adds an id and must not drop anyone's name.
+    """
+    try:
+        value = _strict_json_loads(raw)
+        speakers = _mapping_speakers(value)
+        _check_names(speakers)
+    except (UnicodeError, ValueError) as exc:
+        raise SplitConflict(f"{source} is not a valid speaker mapping: {exc}") from exc
     return value, speakers
 
 
@@ -1016,17 +1165,19 @@ def _undo_bytes(
     return encode_json_bytes(value, max_bytes=MAX_UNDO_BYTES)
 
 
-def _write_bytes(path: Path, raw: bytes) -> None:
+def _write_bytes(path: Path, raw: bytes, *, private: bool = True) -> None:
+    """Replace ``path``; ``private=False`` only for the sibling JSON, a user
+    deliverable (it keeps its mode), everything else here stays 0600."""
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise SplitConflict(f"{path.name} is not valid UTF-8") from exc
-    fsio.atomic_write_text(path, text)
+    fsio.atomic_write_text(path, text, private=private)
 
 
-def _restore_files(files: Iterable[tuple[Path, bytes]]) -> None:
-    for path, raw in files:
-        _write_bytes(path, raw)
+def _restore_files(files: Iterable[tuple[Path, bytes, bool]]) -> None:
+    for path, raw, private in files:
+        _write_bytes(path, raw, private=private)
 
 
 def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
@@ -1172,15 +1323,15 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
         )
         suggest_path = pipeline.speakers_suggest_path(server.media_path)
         _write_bytes(undo_path, snapshot)
-        written: list[tuple[Path, bytes]] = []
+        written: list[tuple[Path, bytes, bool]] = []
         try:
-            for path, before, after in (
-                (sidecar_path, sidecar_bytes, sidecar_after),
-                (server.sibling_path, sibling_bytes, sibling_after),
-                (mapping_path, mapping_bytes, mapping_after),
+            for path, before, after, private in (
+                (sidecar_path, sidecar_bytes, sidecar_after, True),
+                (server.sibling_path, sibling_bytes, sibling_after, False),
+                (mapping_path, mapping_bytes, mapping_after, True),
             ):
-                written.append((path, before))
-                _write_bytes(path, after)
+                written.append((path, before, private))
+                _write_bytes(path, after, private=private)
             delete_suggest(suggest_path)
         except BaseException:
             _restore_files(reversed(written))
@@ -1330,7 +1481,7 @@ def _undo_split(server: SpeakerHTTPServer) -> None:
         validate_voiceprint_conjunction(sidecar, sibling, fingerprint)
         _mapping_document(mapping_before, source=current_paths["mapping"].name)
 
-        restored: list[tuple[Path, bytes]] = []
+        restored: list[tuple[Path, bytes, bool]] = []
         try:
             for field, before in (
                 ("voiceprints", sidecar_before),
@@ -1338,8 +1489,9 @@ def _undo_split(server: SpeakerHTTPServer) -> None:
                 ("mapping", mapping_before),
             ):
                 path = current_paths[field]
-                restored.append((path, current[field]))
-                _write_bytes(path, before)
+                private = field != "sibling"
+                restored.append((path, current[field], private))
+                _write_bytes(path, before, private=private)
             undo_path.unlink()
         except BaseException:
             _restore_files(reversed(restored))
@@ -1376,20 +1528,12 @@ def _strict_json_loads(raw: bytes) -> Any:
     )
 
 
-def _validated_speakers(
-    value: object,
-    speaker_ids: Sequence[str],
-    *,
-    stale: list[str] | None = None,
-) -> dict[str, str]:
-    """Shared version/speakers schema core for both mapping readers.
+def _mapping_speakers(value: object) -> dict[str, Any]:
+    """The version-1 envelope every mapping reader of this server shares.
 
-    Only the surrounding envelope differs between them: the POST payload must be
-    exactly ``{version, speakers}`` (see :func:`_validated_mapping`), while an
-    on-disk mapping is read tolerantly and may carry extra top-level keys. When
-    ``stale`` is given, entries for ids outside ``speaker_ids`` (left behind by
-    a re-diarization) are dropped and collected there instead of rejected, as
-    :func:`voxweave.speakers.load_speaker_mapping_bytes` does.
+    Returns the ``speakers`` object unchecked; extra top-level keys are allowed
+    (only the POST payload is held to exactly ``{version, speakers}``, see
+    :func:`_validated_mapping`).
     """
     if not isinstance(value, dict):
         raise ValueError("mapping must be an object")
@@ -1398,18 +1542,38 @@ def _validated_speakers(
     speakers = value.get("speakers")
     if not isinstance(speakers, dict):
         raise ValueError("speakers must be an object")
+    return speakers
+
+
+def _check_names(speakers: Mapping[str, object]) -> None:
+    if any(
+        not isinstance(name, str) or len(name) > MAX_NAME_CHARS
+        for name in speakers.values()
+    ):
+        raise ValueError("mapping contains invalid speaker entries")
+
+
+def _validated_speakers(
+    value: object,
+    speaker_ids: Sequence[str],
+    *,
+    stale: list[str] | None = None,
+) -> dict[str, str]:
+    """The mapping's names, all of them for ids in ``speaker_ids``.
+
+    Used for the ``/save`` payload and the ``/serve-info`` read. When ``stale``
+    is given, entries for ids outside ``speaker_ids`` (left behind by a
+    re-diarization) are dropped and collected there instead of rejected, as
+    :func:`voxweave.speakers.load_speaker_mapping_bytes` does.
+    """
+    speakers = _mapping_speakers(value)
     known = set(speaker_ids)
     if stale is not None:
         stale.extend(key for key in speakers if key not in known)
         speakers = {key: name for key, name in speakers.items() if key in known}
-    if any(
-        not isinstance(key, str)
-        or key not in known
-        or not isinstance(name, str)
-        or len(name) > MAX_NAME_CHARS
-        for key, name in speakers.items()
-    ):
+    if any(key not in known for key in speakers):
         raise ValueError("mapping contains invalid speaker entries")
+    _check_names(speakers)
     return speakers
 
 
@@ -1474,18 +1638,19 @@ def make_server(
     )
 
 
-def _exposure_warning(port: int, *, host: str, ngrok: bool) -> str:
-    """Warn that a network-reachable audition has no authentication."""
-    reachable = []
-    if host != HOST:
-        reachable.append(f"this machine on port {port}")
-    if ngrok:
-        reachable.append("the ngrok URL")
-    return (
-        f"Warning: anyone who can reach {' or '.join(reachable)} can play the "
-        "episode audio, read and change speaker names and run splits — there is "
-        "no password; stop the server when you are done."
+def _exposure_warning(*, host: str) -> str:
+    """Warn that a network-reachable audition is only as private as its link."""
+    warning = (
+        "Warning: anyone who has the access link (the one with ?k=) can play the "
+        "episode audio, read and change speaker names and run splits; share it "
+        "only with people you trust and stop the server when you are done."
     )
+    if host != HOST:
+        warning += (
+            " On the local network the connection is plain HTTP, so the link and "
+            "the audio are not encrypted."
+        )
+    return warning
 
 
 def serve(
@@ -1502,7 +1667,11 @@ def serve(
     open_browser: bool = True,
     report: Callable[[str], None] = print,
 ) -> str:
-    """Serve an audition until interrupted and return its listening URL."""
+    """Serve an audition until interrupted and return its access link.
+
+    The link (the listening URL plus ``?k=`` and the access key) is the only
+    way in; it is printed first and is what the browser is opened with.
+    """
     server = make_server(
         page=page,
         media_path=media_path,
@@ -1515,16 +1684,20 @@ def serve(
         port=port,
         report=report,
     )
-    url = f"{server.origin}/"
+    url = server.access_url
     report(url)
     if ngrok:
-        report("ngrok discovery enabled via the local agent on 127.0.0.1:4040.")
+        report(
+            "ngrok discovery enabled via the local agent on 127.0.0.1:4040; open "
+            f"the tunnel's URL with /?{_ACCESS_KEY_PARAM}={server.access_key} "
+            "appended."
+        )
     if host == "0.0.0.0":
         report(
             "For access from another device, replace 0.0.0.0 with this machine's IP address."
         )
     if host != HOST or ngrok:
-        report(_exposure_warning(server.server_port, host=host, ngrok=ngrok))
+        report(_exposure_warning(host=host))
     if open_browser:
         try:
             webbrowser.open(url.replace("//0.0.0.0:", f"//{HOST}:"))

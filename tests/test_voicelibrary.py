@@ -862,12 +862,25 @@ def test_only_the_built_in_location_is_marked_default(tmp_path, monkeypatch):
     assert not voicelibrary.resolve_voices_dir().default
 
 
-def test_existing_shared_directory_keeps_its_mode(tmp_path):
-    root = tmp_path / "shared"
-    root.mkdir(mode=0o770)
-    os.chmod(root, 0o770)
+def test_existing_directory_keeps_its_mode_but_the_files_stay_private(tmp_path):
+    # One account per library: a pre-created directory is not narrowed, but
+    # nothing inside it is ever readable by another account.
+    root = tmp_path / "prepared"
+    root.mkdir(mode=0o755)
+    os.chmod(root, 0o755)
     _enroll(root, [_entry()])
-    assert stat.S_IMODE(root.stat().st_mode) == 0o770
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
+    (root / "identities.json").chmod(0o644)
+    _enroll(root, [_entry(name="Ren", vector=_unit(1))], source=_source(2))
+    files = [p for p in root.rglob("*") if p.is_file()]
+    assert {p.name for p in files} >= {
+        ".library.lock",
+        "identities.json",
+        "history.jsonl",
+    }
+    assert {p: stat.S_IMODE(p.stat().st_mode) for p in files} == {
+        p: 0o600 for p in files
+    }
 
 
 def test_misfiled_spaces_are_rejected(tmp_path):
@@ -1156,6 +1169,52 @@ def test_an_import_that_conflicts_with_the_library_is_reported_not_replaced(tmp_
         "the library (episode 'legacy0', scope 'Legacy'); not imported",
     )
     assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+
+
+def test_the_import_hint_skips_samples_the_import_would_refuse(tmp_path):
+    root = tmp_path / "voices"
+    store, identity_id = _dated_legacy_store(["2025-01-01T00:00:00Z"])
+    ids = _Ids()
+    ids.exemplar = 200
+    _enroll(
+        root,
+        [_entry(identity_id=identity_id)],
+        scope="Legacy",
+        source=_source(7, episode="legacy0"),
+        ids=ids,
+    )
+    name, _ = voicelibrary.space_identity(store["provenance"])
+    state = _read(root, spaces=[name])
+    pools = voicelibrary.matching_pools(state, name, "Legacy")
+    _pools, unimported = voicelibrary.add_legacy_store(
+        pools, store, state=state, space_name=name, in_scope=True
+    )
+    # `voices import` reports the conflict and adds nothing, so serve must not
+    # keep advising it.
+    assert not unimported
+    change, summary = _import(root, store, scope="Legacy")
+    assert change.empty and summary.refused
+
+
+def test_the_import_hint_uses_the_scopes_the_import_defaults_to(tmp_path):
+    root = tmp_path / "voices"
+    folder = tmp_path / "Show A"
+    folder.mkdir()
+    store_path = folder / "voxweave.voices.json"
+    store = _legacy_store(store_path)
+    name, _ = voicelibrary.space_identity(store["provenance"])
+    state = _read(root, spaces=[name])
+    pools = voicelibrary.matching_pools(state, name, "Show A")
+    _pools, unimported = voicelibrary.add_legacy_store(
+        pools, store, state=state, space_name=name, in_scope=True, store_path=store_path
+    )
+    assert unimported
+    _import(root, store, scope="Show A")
+    state = _read(root, spaces=[name])
+    _pools, unimported = voicelibrary.add_legacy_store(
+        pools, store, state=state, space_name=name, in_scope=True, store_path=store_path
+    )
+    assert not unimported
 
 
 def _dated_legacy_store(identity_count_dates, *, first_number=100):

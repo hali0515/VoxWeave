@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 
 from voxweave import artifacts
@@ -31,12 +31,6 @@ _MEDIA_SUFFIXES = (
 _DERIVED_SUBTITLE_TAGS = frozenset({"asrfix", "sdh"})
 
 
-@dataclass(frozen=True)
-class EpisodeLockHandle:
-    episode_path: Path
-    lock_path: Path
-
-
 def episode_base_path(path: Path) -> Path:
     value = Path(path)
     stem = value.name.rsplit(".", 1)[0] if "." in value.name else value.name
@@ -45,14 +39,10 @@ def episode_base_path(path: Path) -> Path:
 
 def episode_lock_path(path: Path) -> Path:
     """Return the cache-owned lock shared by a media episode and its siblings."""
-    return _lock_path_for_owner(_episode_owner(Path(path)))
+    return artifacts.claim_paths(_episode_owner(Path(path))).episode_lock
 
 
-def _lock_path_for_owner(owner: Path) -> Path:
-    return artifacts.claim_paths(owner).episode_lock
-
-
-def _artifact_lock_paths(owner: Path) -> tuple[Path, tuple[Path, ...]]:
+def _artifact_lock_paths(owner: Path) -> tuple[Path, ...]:
     """Return every same-directory/same-stem claim lock in stable order."""
     claimed = artifacts.claim_paths(owner)
     locks: list[Path] = []
@@ -61,7 +51,7 @@ def _artifact_lock_paths(owner: Path) -> tuple[Path, tuple[Path, ...]]:
         if paths is not None:
             locks.append(paths.episode_lock)
     locks.append(claimed.episode_lock)
-    return claimed.episode_lock, tuple(sorted(dict.fromkeys(locks), key=str))
+    return tuple(sorted(dict.fromkeys(locks), key=str))
 
 
 def _legacy_lock_path(owner: Path) -> Path:
@@ -94,7 +84,13 @@ def _open_lock(path: Path, *, create: bool) -> int:
 
 
 def _episode_owner(path: Path) -> Path:
-    """Resolve a subtitle/JSON reference to sibling media when one is present."""
+    """Resolve a subtitle/JSON reference to sibling media when one is present.
+
+    The same answer as ``pipeline._artifact_owner`` (so a subtitle and its
+    media lock the same episode): media present on disk under any peeled
+    stem (``ep.zh.vtt`` -> ``ep.zh.*``, then ``ep.*``) wins over media the
+    artifact cache only recorded, whatever the stem it was recorded under.
+    """
     value = Path(path)
     if value.suffix.lower() in _MEDIA_SUFFIXES:
         return value
@@ -106,9 +102,17 @@ def _episode_owner(path: Path) -> Path:
     order = {suffix: index for index, suffix in enumerate(_MEDIA_SUFFIXES)}
     from voxweave.mux import detect_subtitle_language
 
-    stem = episode_base_path(value).name
-    normalized_parent = Path(os.path.realpath(os.fspath(parent)))
-    while True:
+    stems = [episode_base_path(value).name]
+    while "." in stems[-1]:
+        stem = stems[-1]
+        tag = stem.rsplit(".", 1)[1].casefold()
+        if (
+            tag not in _DERIVED_SUBTITLE_TAGS
+            and detect_subtitle_language(parent / stem) is None
+        ):
+            break
+        stems.append(stem.rsplit(".", 1)[0])
+    for stem in stems:
         matches = sorted(
             (
                 order[candidate.suffix.lower()],
@@ -122,6 +126,8 @@ def _episode_owner(path: Path) -> Path:
         )
         if matches:
             return matches[0][2]
+    normalized_parent = Path(os.path.realpath(os.fspath(parent)))
+    for stem in stems:
         recorded = sorted(
             (
                 order[source.suffix.lower()],
@@ -133,40 +139,30 @@ def _episode_owner(path: Path) -> Path:
         )
         if recorded:
             return recorded[0][2]
-        if "." not in stem:
-            break
-        tag = stem.rsplit(".", 1)[1].casefold()
-        tagged = parent / stem
-        if (
-            tag not in _DERIVED_SUBTITLE_TAGS
-            and detect_subtitle_language(tagged) is None
-        ):
-            break
-        stem = stem.rsplit(".", 1)[0]
     return value
 
 
 @contextmanager
-def episode_lock(path: Path) -> Iterator[EpisodeLockHandle]:
+def episode_lock(path: Path) -> Iterator[None]:
     """Take the canonical persistent exclusive lock for one episode stem."""
     owner = _episode_owner(Path(path))
-    episode = episode_base_path(owner)
     domain_lock = artifacts.episode_domain_lock_path(owner)
-    lock = domain_lock
     descriptors: list[int] = []
     try:
         legacy = _legacy_lock_path(owner)
         try:
             legacy.lstat()
-        except FileNotFoundError:
-            pass
+        except OSError as exc:
+            # A legacy name too long to exist (long media stem) is absent too.
+            if exc.errno not in (errno.ENOENT, errno.ENAMETOOLONG):
+                raise
         else:
             descriptors.append(_open_lock(legacy, create=False))
         descriptors.append(_open_lock(domain_lock, create=True))
         for descriptor in descriptors:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
         try:
-            lock, artifact_locks = _artifact_lock_paths(owner)
+            artifact_locks = _artifact_lock_paths(owner)
         except artifacts.ArtifactMarkerError:
             # A selected adjacent legacy lane must not be blocked by unrelated
             # cache corruption. Any later cache access still validates and
@@ -176,7 +172,7 @@ def episode_lock(path: Path) -> Iterator[EpisodeLockHandle]:
             descriptor = _open_lock(lock_path, create=True)
             descriptors.append(descriptor)
             fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield EpisodeLockHandle(episode_path=episode, lock_path=lock)
+        yield
     finally:
         for descriptor in reversed(descriptors):
             try:
@@ -186,7 +182,6 @@ def episode_lock(path: Path) -> Iterator[EpisodeLockHandle]:
 
 
 __all__ = [
-    "EpisodeLockHandle",
     "episode_base_path",
     "episode_lock",
     "episode_lock_path",

@@ -363,7 +363,10 @@ def test_suggest_record_bytes_are_deterministic_across_input_order():
     }
     first = voicematch.build_suggest_record(forward, **kwargs)
     second = voicematch.build_suggest_record(reverse, **kwargs)
-    assert voicematch.suggest_bytes(first) == voicematch.suggest_bytes(second)
+    limit = voicebase.SUGGEST_MAX_BYTES
+    assert voicebase.encode_json_bytes(first, max_bytes=limit) == (
+        voicebase.encode_json_bytes(second, max_bytes=limit)
+    )
 
 
 def test_suggest_write_load_delete_helpers(tmp_path):

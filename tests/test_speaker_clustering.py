@@ -437,7 +437,8 @@ def test_real_recipe_is_wired_end_to_end(
     # pyannote said two speakers; the voiceprints say one.
     assert result.turns == [(start, end, "SPEAKER_00") for start, end, _ in LONG]
     ((_waveform, spans, _spec),) = embedder.calls
-    assert spans == speakercluster.embedding_spans(LONG)
+    # No turn overlaps another: each whole turn is one clean piece.
+    assert spans == [(start, end) for start, end, _ in LONG]
     block = result.provenance["clustering"]
     assert block["method"] == "voiceprint"
     assert block["recipe"] == "voiceprint-v1"
@@ -915,6 +916,8 @@ def test_process_warns_when_saved_names_belong_to_replaced_turns(
     # speakers, so after a re-run a saved name can label another voice (and
     # `speakers enroll` would store that voice under it): process says so.
     _stub_transcribe(tmp_path, monkeypatch)  # new turns: [(0.0, 3.0, SPEAKER_00)]
+    # process() preflights diarization; the gated default model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"media")
     (tmp_path / "episode.json").write_text(
@@ -1083,6 +1086,8 @@ def test_process_passes_the_knob_to_transcribe(
         raise _Stop
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    # process() preflights diarization; the gated default model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"media")
 

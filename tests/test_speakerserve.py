@@ -1,5 +1,6 @@
 import http.client
 import json
+import stat
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -53,13 +54,28 @@ def _running_server(tmp_path: Path, *, host: str = "127.0.0.1", ngrok: bool = Fa
         thread.join(timeout=5)
 
 
+def _session_cookie(server) -> str:
+    return f"{server.cookie_name}={server.session_cookie}"
+
+
 def _request(
-    server, method: str, path: str, body=None, headers=None, *, connect_host=None
+    server,
+    method: str,
+    path: str,
+    body=None,
+    headers=None,
+    *,
+    connect_host=None,
+    auth: bool = True,
 ):
+    """One request; ``auth`` sends the session cookie the access link sets."""
     host, port = server.server_address
     host = connect_host or ("127.0.0.1" if host == "0.0.0.0" else host)
+    headers = dict(headers or {})
+    if auth:
+        headers.setdefault("Cookie", _session_cookie(server))
     connection = http.client.HTTPConnection(host, port, timeout=5)
-    connection.request(method, path, body=body, headers=headers or {})
+    connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     payload = response.read()
     connection.close()
@@ -331,6 +347,186 @@ def test_save_accepts_its_exact_self_origin(tmp_path):
         assert json.loads(mapping.read_bytes())["speakers"] == {"SPEAKER_00": "Aoi"}
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"])
+def test_every_route_refuses_requests_without_the_session_cookie(tmp_path, host):
+    with _running_server(tmp_path, host=host) as (server, mapping, _logs):
+        before = mapping.read_bytes()
+        secrets_in_play = (
+            server.token.encode(),
+            server.access_key.encode(),
+            server.session_cookie.encode(),
+        )
+        cookies = (
+            None,
+            f"{server.cookie_name}=wrong",
+            # A session of another audition on this host (another port).
+            f"voxweave_session_1={server.session_cookie}",
+            f"{server.cookie_name}={server.access_key}",
+            f"{server.cookie_name}=café",
+        )
+        payload = b'{"version":1,"speakers":{"SPEAKER_00":"Ren"}}'
+        for cookie in cookies:
+            headers = {} if cookie is None else {"Cookie": cookie}
+            for path in ("/", "/serve-info", "/elsewhere"):
+                status, _headers, body = _request(
+                    server, "GET", path, headers=headers, auth=False
+                )
+                assert status == 403
+                assert not any(secret in body for secret in secrets_in_play)
+            for route in ("/save", "/split", "/split-confirm", "/split-undo", "/x"):
+                status, _headers, body = _request(
+                    server,
+                    "POST",
+                    route,
+                    payload,
+                    {**headers, "X-VoxWeave-Token": server.token},
+                    auth=False,
+                )
+                assert status == 403
+                assert not any(secret in body for secret in secrets_in_play)
+        assert mapping.read_bytes() == before
+
+
+def test_access_link_sets_a_strict_http_only_session_cookie(tmp_path):
+    with _running_server(tmp_path) as (server, mapping, _logs):
+        assert server.access_url == (
+            f"http://127.0.0.1:{server.server_port}/?k={server.access_key}"
+        )
+        status, headers, body = _request(
+            server, "GET", f"/?k={server.access_key}", auth=False
+        )
+        assert status == 200
+        assert headers.get_content_type() == "text/html"
+        assert headers["Cache-Control"] == "no-store"
+        assert headers["Referrer-Policy"] == "no-referrer"
+        assert b"location.replace('/')" in body
+        assert server.access_key.encode() not in body
+        (cookie,) = headers.get_all("Set-Cookie")
+        attributes = [part.strip() for part in cookie.split(";")]
+        assert attributes[0] == f"{server.cookie_name}={server.session_cookie}"
+        assert set(attributes[1:]) == {"Path=/", "HttpOnly", "SameSite=Strict"}
+
+        # The cookie the link set opens every route; Host/Origin/token stay.
+        session = {"Cookie": attributes[0]}
+        assert _request(server, "GET", "/", headers=session, auth=False)[0] == 200
+        status, _headers, body = _request(
+            server, "GET", "/serve-info", headers=session, auth=False
+        )
+        assert status == 200
+        token = json.loads(body)["token"]
+        save = b'{"version":1,"speakers":{"SPEAKER_00":"Ren"}}'
+        status, _headers, _body = _request(
+            server,
+            "POST",
+            "/save",
+            save,
+            {**session, "X-VoxWeave-Token": token},
+            auth=False,
+        )
+        assert status == 200
+        assert json.loads(mapping.read_bytes())["speakers"] == {"SPEAKER_00": "Ren"}
+        for extra in (
+            {"Host": "attacker.invalid"},
+            {"Origin": "https://attacker.invalid"},
+            {"X-VoxWeave-Token": "wrong-token"},
+            {"X-VoxWeave-Token": "café"},
+        ):
+            status, _headers, _body = _request(
+                server,
+                "POST",
+                "/save",
+                save,
+                {**session, "X-VoxWeave-Token": token, **extra},
+                auth=False,
+            )
+            assert status == 403
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "k=wrong",
+        "k=",
+        "k={key}&k={key}",
+        "k={key}&x=1",
+        "x={key}",
+        "k={key}%C3%A9",
+    ],
+)
+def test_invalid_access_links_set_no_cookie(tmp_path, query):
+    with _running_server(tmp_path) as (server, _mapping, _logs):
+        path = "/?" + query.format(key=server.access_key)
+        status, headers, body = _request(server, "GET", path, auth=False)
+        assert status == 403
+        assert headers.get_all("Set-Cookie") is None
+        assert b"not valid for this server" in body
+
+
+def test_access_link_is_refused_for_a_foreign_host(tmp_path):
+    with _running_server(tmp_path) as (server, _mapping, _logs):
+        status, headers, body = _request(
+            server,
+            "GET",
+            f"/?k={server.access_key}",
+            headers={"Host": "attacker.invalid"},
+            auth=False,
+        )
+        assert status == 403
+        assert headers.get_all("Set-Cookie") is None
+        assert server.access_key.encode() not in body
+
+
+def test_access_link_through_an_https_tunnel_sets_a_secure_cookie(
+    tmp_path, monkeypatch
+):
+    with _running_server(tmp_path, ngrok=True) as (server, _mapping, _logs):
+        monkeypatch.setattr(
+            ngrok,
+            "_agent_endpoints",
+            lambda: [("https://ours.ngrok.app", f"localhost:{server.server_port}")],
+        )
+        link = f"/?k={server.access_key}"
+        status, headers, _body = _request(
+            server, "GET", link, headers={"Host": "ours.ngrok.app"}, auth=False
+        )
+        assert status == 200
+        assert "Secure" in [part.strip() for part in headers["Set-Cookie"].split(";")]
+        # The loopback address itself is plain HTTP: no Secure there.
+        status, headers, _body = _request(server, "GET", link, auth=False)
+        assert status == 200
+        assert "Secure" not in headers["Set-Cookie"]
+
+
+def test_session_cookie_names_differ_per_port(tmp_path):
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    with (
+        _running_server(first_dir) as (first, _m1, _l1),
+        _running_server(second_dir) as (second, _m2, _l2),
+    ):
+        assert first.cookie_name != second.cookie_name
+        # Both cookies in one Cookie header, as a browser sends them.
+        both = f"{_session_cookie(first)}; {_session_cookie(second)}"
+        for server in (first, second):
+            status, _headers, _body = _request(
+                server, "GET", "/", headers={"Cookie": both}, auth=False
+            )
+            assert status == 200
+
+
+def test_saved_mapping_is_private(tmp_path):
+    with _running_server(tmp_path) as (server, mapping, _logs):
+        mapping.chmod(0o644)
+        token = _serve_info(server)["token"]
+        status, _headers, _body = _save(
+            server, token, {"version": 1, "speakers": {"SPEAKER_00": "Aoi"}}
+        )
+        assert status == 200
+    assert stat.S_IMODE(mapping.stat().st_mode) == 0o600
+
+
 def test_save_rejects_foreign_host_before_other_failures(tmp_path):
     with _running_server(tmp_path) as (server, mapping, _logs):
         before = mapping.read_bytes()
@@ -431,6 +627,8 @@ def test_serve_closes_cleanly_after_keyboard_interrupt(
     class InterruptingServer:
         origin = f"http://{host}:3210"
         server_port = 3210
+        access_key = "access-key"
+        access_url = f"http://{host}:3210/?k=access-key"
         closed = False
 
         def serve_forever(self):
@@ -460,14 +658,17 @@ def test_serve_closes_cleanly_after_keyboard_interrupt(
         report=reports.append,
     )
 
-    assert result == f"http://{host}:3210/"
+    assert result == f"http://{host}:3210/?k=access-key"
     assert seen["host"] == host
     assert seen["ngrok"] is ngrok
     assert reports[0] == result
     exposed = host == "0.0.0.0" or ngrok
     assert len(reports) == 1 + (host == "0.0.0.0") + ngrok + exposed
-    assert any("there is no password" in line for line in reports) is exposed
-    assert opened == (["http://127.0.0.1:3210/"] if open_browser else [])
+    assert any("anyone who has the access link" in line for line in reports) is (
+        exposed
+    )
+    assert any("/?k=access-key appended" in line for line in reports) is ngrok
+    assert opened == (["http://127.0.0.1:3210/?k=access-key"] if open_browser else [])
     assert server.closed is True
 
 

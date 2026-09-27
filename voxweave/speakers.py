@@ -38,6 +38,7 @@ from voxweave.voicebase import (
     media_fingerprint,
     require_capture_id,
     require_sha256,
+    sanitize_speaker_name,
     strict_turn_projection,
     strict_json_object_loads,
     validate_voiceprint_conjunction,
@@ -66,6 +67,7 @@ from voxweave.voicematch import (
     write_suggest,
 )
 from voxweave.voicestore import (
+    MAX_EXEMPLARS,
     EnrollmentRefusal,
     canonical_store_path,
     enroll_exemplar,
@@ -140,9 +142,9 @@ def _declared_voiceprint_pair(
     )
 
 
-def _resolved_voices_path(media: Path, voices: Path | None) -> tuple[Path, bool]:
-    explicit = voices is not None
-    raw = Path(voices) if voices is not None else media.parent / "voxweave.voices.json"
+def _resolved_voices_path(media: Path, voices: Path) -> Path:
+    """The canonical path of an explicit ``--voices`` per-show store."""
+    raw = Path(voices)
     if not raw.is_absolute():
         raw = Path.cwd() / raw
     path = canonical_store_path(raw)
@@ -151,53 +153,32 @@ def _resolved_voices_path(media: Path, voices: Path | None) -> tuple[Path, bool]
         raise RuntimeError(
             f"voices store {path.name} is inside the {media.stem}.* episode namespace"
         )
-    return path, explicit
+    return path
 
 
 def _load_generation_store(
     media: Path,
     *,
-    voices: Path | None,
+    voices: Path,
     show: str | None,
-) -> tuple[Path, bytes, dict[str, object]] | None:
-    path, explicit = _resolved_voices_path(media, voices)
+) -> tuple[Path, bytes, dict[str, object]]:
+    """Read an explicit ``--voices`` store for matching; refuse an unusable one.
+
+    (A per-folder ``voxweave.voices.json`` found beside the media is read by
+    the voice-library path instead, see :func:`_read_legacy_store`.)
+    """
+    path = _resolved_voices_path(media, voices)
     if not path.exists():
-        if explicit:
-            raise FileNotFoundError(f"explicit voices store not found: {path}")
-        if show is not None:
-            raise FileNotFoundError(
-                f"no discovered voices store for --show {show!r}: expected {path}"
-            )
-        return None
+        raise FileNotFoundError(f"explicit voices store not found: {path}")
     try:
         raw, store = _read_exact_object(path, VOICES_STORE_MAX_BYTES)
         validated = validate_voice_store(store)
     except (OSError, Phase2DataError) as exc:
-        if explicit:
-            raise RuntimeError(
-                f"explicit voices store {path} is unusable: {exc}"
-            ) from exc
-        log.warning(
-            "discovered voices store %s is unusable; matching skipped: %s", path, exc
-        )
-        return None
-    if show is None and not explicit:
-        log.info(
-            "found voices store %s; pass --show %r to activate matching",
-            path,
-            validated.show,
-        )
-        return None
+        raise RuntimeError(f"explicit voices store {path} is unusable: {exc}") from exc
     if show is not None and normalize_show(show) != normalize_show(validated.show):
-        if explicit:
-            raise RuntimeError(
-                f"--show {show!r} does not match voices store show {validated.show!r}"
-            )
-        log.info(
-            "discovered voices store %s belongs to a different show; matching skipped",
-            path,
+        raise RuntimeError(
+            f"--show {show!r} does not match voices store show {validated.show!r}"
         )
-        return None
     return path, raw, store
 
 
@@ -378,6 +359,7 @@ def _library_matching(
             state=state,
             space_name=space_name,
             in_scope=folder_scope or legacy_show == scope,
+            store_path=legacy_path,
         )
         if unimported:
             _warn_legacy_store_once(legacy_path)
@@ -645,27 +627,19 @@ def load_speaker_display_names(path: Path) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def load_speaker_mapping(
-    path: Path, known_ids: Sequence[str] | set[str]
-) -> dict[str, str]:
-    """Read a version-1 mapping, ignoring empty names and unknown speaker ids.
-
-    Unknown ids are reported in one logger call so a stale phase-1 mapping is
-    visible without flooding an episode replay.  Non-empty names are preserved
-    exactly as entered; surrounding whitespace only decides whether a value is
-    effectively empty.
-    """
-    path = Path(path)
-    return load_speaker_mapping_bytes(path.read_bytes(), known_ids, source=path.name)
-
-
 def load_speaker_mapping_bytes(
     raw_bytes: bytes,
     known_ids: Sequence[str] | set[str],
     *,
     source: str,
 ) -> dict[str, str]:
-    """Project names from one exact mapping-byte observation."""
+    """Project names from one exact mapping-byte observation.
+
+    Empty names and unknown speaker ids are ignored. Unknown ids are reported
+    in one logger call so a stale phase-1 mapping is visible without flooding
+    an episode replay. Non-empty names are preserved exactly as entered;
+    surrounding whitespace only decides whether a value is effectively empty.
+    """
     speakers = _mapping_entries_bytes(raw_bytes, source=source)
 
     known = set(known_ids)
@@ -686,22 +660,6 @@ def load_speaker_mapping_bytes(
             ", ".join(sorted(unknown)),
         )
     return names
-
-
-_NAME_RECORD_SEPARATORS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
-_NAME_TRANSLATION = str.maketrans({char: " " for char in _NAME_RECORD_SEPARATORS})
-_NAME_ASCII_WHITESPACE_RE = re.compile(r"[ \t]+")
-
-
-def sanitize_speaker_name(name: str) -> str:
-    """Normalize record separators without changing display punctuation.
-
-    Only ASCII layout runs are collapsed. Unicode whitespace is stripped at
-    name edges but remains meaningful inside a name. ASS applies its comma
-    escape separately.
-    """
-    normalized = name.translate(_NAME_TRANSLATION)
-    return _NAME_ASCII_WHITESPACE_RE.sub(" ", normalized).strip()
 
 
 def sanitize_ass_speaker_name(name: str) -> str:
@@ -969,7 +927,7 @@ def run_clip_command(cmd: list[str]) -> None:
 
 def extract_clip(media: Path, start: float, end: float, output: Path) -> None:
     """Extract one clip atomically; command construction remains separately testable."""
-    with fsio.atomic_path(output) as tmp:
+    with fsio.atomic_path(output, private=True) as tmp:
         run_clip_command(build_clip_command(media, start, end, tmp))
 
 
@@ -1464,6 +1422,7 @@ def _publish_audition(
                     if before_mapping_install is not None
                     else None
                 ),
+                private=True,
             )
         except FileExistsError:
             # A concurrent editor or generator won the protected install.
@@ -1968,15 +1927,11 @@ def _enroll_into_store(
 ) -> Path:
     """Enroll into one explicit per-show store (the pre-library behavior)."""
     paths = _enrollment_paths(media)
-    store_path, explicit = _resolved_voices_path(media, voices)
+    store_path = _resolved_voices_path(media, voices)
     create_store = not store_path.exists()
-    if create_store and (not explicit or show is None):
+    if create_store and show is None:
         raise RuntimeError(
             "creating a voices store requires explicit --voices PATH and --show NAME"
-        )
-    if not create_store and not explicit and show is None:
-        raise RuntimeError(
-            f"found voices store {store_path}; pass --show NAME to confirm enrollment"
         )
     if create_store:
         store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2059,6 +2014,7 @@ def _enroll_into_store(
                 base_revision = cast(int, store["revision"])
                 mutations = 0
                 noops = 0
+                evicted = 0
                 for _local_id, raw_name, vector in selected:
                     result = enroll_exemplar(
                         working,
@@ -2074,6 +2030,7 @@ def _enroll_into_store(
                         noops += 1
                     else:
                         mutations += 1
+                    evicted += result.evicted_exemplar_id is not None
                 if mutations:
                     working["revision"] = base_revision + 1
                     validate_voice_store(working)
@@ -2081,6 +2038,7 @@ def _enroll_into_store(
                     log.info(
                         "enrolled %d voice exemplar(s) into %s", mutations, store_path
                     )
+                    _log_evictions(evicted)
                 elif noops:
                     log.info("already enrolled; voices store unchanged")
                 else:  # defensive: selected is nonempty and every transition is total
@@ -2088,6 +2046,17 @@ def _enroll_into_store(
                 return lock_handle.store_path
     finally:
         snapshot_context.__exit__(None, None, None)
+
+
+def _log_evictions(count: int) -> None:
+    """Say when enrollment displaced stored samples (the per-voice cap)."""
+    if count:
+        log.info(
+            "%d voice(s) already had %d samples; the oldest sample of each was "
+            "replaced",
+            count,
+            MAX_EXEMPLARS,
+        )
 
 
 def _accepted_suggestions(
@@ -2295,6 +2264,9 @@ def _enroll_into_library(
                         root,
                         scope,
                     )
+                    _log_evictions(
+                        sum(o.evicted_exemplar_id is not None for o in outcomes)
+                    )
                 else:
                     log.info("already enrolled; voice library unchanged")
                 return root
@@ -2343,7 +2315,6 @@ __all__ = [
     "enroll_speaker_voices",
     "extract_clip",
     "load_speaker_display_names",
-    "load_speaker_mapping",
     "load_speaker_mapping_bytes",
     "purge_voiceprints",
     "run_clip_command",

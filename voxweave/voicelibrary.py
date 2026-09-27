@@ -48,7 +48,6 @@ import json
 import logging
 import os
 import re
-import secrets
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -93,7 +92,11 @@ from voxweave.voicestore import (
     EnrollmentRefusal,
     ExemplarKey,
     canonical_store_path,
+    event_time,
     load_voice_store,
+    mint_unique_id,
+    new_exemplar_id,
+    new_identity_id,
     normalize_episode,
     normalize_speaker_key,
     plan_indexed_enrollment,
@@ -900,11 +903,14 @@ def _chmod_best_effort(path: Path, mode: int) -> None:
 def _ensure_private_dir(path: Path, *, parents: bool = False) -> None:
     """Create ``path``; only a directory created here gets 0o700.
 
-    A pre-existing directory keeps its mode, so a NAS share prepared for
-    several users or machines is never narrowed behind the owner's back.
-    Missing parents are created only with ``parents`` (the built-in
-    location); otherwise they are refused, since a missing parent of a
-    configured library usually is a network share that is not mounted.
+    A library belongs to one account: every file in it (the lock included) is
+    created 0o600, and libraries shared between user accounts are not
+    supported (several machines can share one through the same account). A
+    pre-existing directory keeps the mode its owner gave it; the files inside
+    are private either way. Missing parents are created only with
+    ``parents`` (the built-in location); otherwise they are refused, since a
+    missing parent of a configured library usually is a network share that is
+    not mounted.
     """
     if path.is_dir():
         return
@@ -1019,7 +1025,7 @@ def _write_cas(path: Path, payload: str, *, expected: bytes | None) -> None:
                 "(is locking enabled on this mount?); re-run the command"
             )
 
-    fsio.atomic_write_text(path, payload, before_replace=still_expected)
+    fsio.atomic_write_text(path, payload, before_replace=still_expected, private=True)
 
 
 # fsio.atomic_path names its temp files ``.<stem>.<random>.part<suffix>``.
@@ -1116,7 +1122,7 @@ def _rewrite_history_redacted(
             kept.append(line)
     kept.extend(canonical_json_bytes(row) for row in rows)
     payload = b"".join(line + b"\n" for line in kept)
-    with fsio.atomic_path(paths.history) as temporary:
+    with fsio.atomic_path(paths.history, private=True) as temporary:
         with open(temporary, "wb") as handle:
             handle.write(payload)
             handle.flush()
@@ -1245,33 +1251,6 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
 # --------------------------------------------------------------------------
 # Transitions (pure: they never touch the filesystem)
 # --------------------------------------------------------------------------
-
-
-def _default_identity_id() -> str:
-    return f"v{secrets.token_hex(6)}"
-
-
-def _default_exemplar_id() -> str:
-    return f"x{secrets.token_hex(4)}"
-
-
-def _mint(
-    factory: Callable[[], str],
-    used: set[str],
-    validator: Callable[[object], str],
-    kind: str,
-) -> str:
-    for _attempt in range(1024):
-        candidate = validator(factory())
-        if candidate not in used:
-            return candidate
-    raise EnrollmentRefusal(f"could not mint a unique {kind} id")
-
-
-def _event_time(at: str | datetime | None) -> str:
-    if isinstance(at, str):
-        return require_utc_timestamp(at, "event timestamp")
-    return utc_timestamp(at)
 
 
 def scoped_episode(scope: str, episode: str) -> str:
@@ -1550,8 +1529,8 @@ def enroll_entries(
     entries: Sequence[EnrollEntry],
     replace_episode: bool = False,
     at: str | datetime | None = None,
-    identity_id_factory: Callable[[], str] = _default_identity_id,
-    exemplar_id_factory: Callable[[], str] = _default_exemplar_id,
+    identity_id_factory: Callable[[], str] = new_identity_id,
+    exemplar_id_factory: Callable[[], str] = new_exemplar_id,
 ) -> tuple[LibraryChange, tuple[EnrollOutcome, ...]]:
     """Enroll one episode's named speakers into the space of ``provenance``.
 
@@ -1563,7 +1542,7 @@ def enroll_entries(
     """
     if type(replace_episode) is not bool:
         raise EnrollmentRefusal("replace_episode must be a boolean")
-    event_at = _event_time(at)
+    event_at = event_time(at, "event timestamp")
     scope = normalize_scope(scope)
     episode = normalize_episode(source.episode)
     capture = require_capture_id(source.capture_id)
@@ -1598,7 +1577,7 @@ def enroll_entries(
         normalize_speaker_key(name)
         vector = list(validate_vector(entry.vector, dim=dim, field="incoming vector"))
         if entry.identity_id is None:
-            identity_id = _mint(
+            identity_id = mint_unique_id(
                 identity_id_factory,
                 set(identities) | orphan_identities,
                 require_identity_id,
@@ -1691,7 +1670,7 @@ def enroll_entries(
             )
             continue
 
-        exemplar_id = _mint(
+        exemplar_id = mint_unique_id(
             exemplar_id_factory, used_exemplars, require_exemplar_id, "exemplar"
         )
         used_exemplars.add(exemplar_id)
@@ -1796,7 +1775,7 @@ def rename_identity(
     identity = cast(dict[str, dict[str, object]], document["identities"])[identity_id]
     if identity["display_name"] == name:
         return LibraryChange()
-    event_at = _event_time(at)
+    event_at = event_time(at, "event timestamp")
     identity["display_name"] = name
     identity["updated"] = event_at
     document["revision"] = cast(int, document["revision"]) + 1
@@ -1834,7 +1813,7 @@ def forget_identity(
             'deleted on purpose, remove its name from the "spaces" list in '
             "identities.json"
         )
-    event_at = _event_time(at)
+    event_at = event_time(at, "event timestamp")
     identities = copy.deepcopy(state.identities)
     del cast(dict[str, object], identities["identities"])[identity_id]
     identities["forgotten"] = [*forgotten_ids(identities), identity_id][-MAX_FORGOTTEN:]
@@ -1959,7 +1938,7 @@ def import_store(
     source_label: str,
     also_scopes: Sequence[str] = (),
     at: str | datetime | None = None,
-    exemplar_id_factory: Callable[[], str] = _default_exemplar_id,
+    exemplar_id_factory: Callable[[], str] = new_exemplar_id,
 ) -> tuple[LibraryChange, ImportSummary]:
     """Merge a pre-library per-show store into the library, idempotently.
 
@@ -1981,7 +1960,7 @@ def import_store(
         dict.fromkeys([scope, *(normalize_scope(extra) for extra in also_scopes)])
     )
     scopes_added = 0
-    event_at = _event_time(at)
+    event_at = event_time(at, "event timestamp")
     provenance = cast(Mapping[str, object], store["provenance"])
     space_name, space = _space_for(state, provenance)
     identities_document = copy.deepcopy(state.identities)
@@ -2052,7 +2031,7 @@ def import_store(
             exemplar_id = (
                 legacy_id
                 if legacy_id not in used_exemplars
-                else _mint(
+                else mint_unique_id(
                     exemplar_id_factory, used_exemplars, require_exemplar_id, "exemplar"
                 )
             )
@@ -2293,43 +2272,31 @@ def add_legacy_store(
     state: LibraryState,
     space_name: str,
     in_scope: bool,
+    store_path: Path | None = None,
 ) -> tuple[MatchPools, bool]:
     """Add a read-only pre-library store's identities to ``pools``.
 
     Identities the library already holds are skipped (the library copy wins),
     and so are identities forgotten in this library. Returns the new pools
-    and whether the store holds anything the library lacks: an identity it
-    does not have, or a capture that is not in this space yet and that an
-    import would keep (the cue to suggest ``voxweave voices import``); a
-    capture older than every sample of an identity at the cap is
-    superseded, not missing.
+    and whether ``voxweave voices import`` of the store would add anything
+    (the cue to suggest it): an identity or a voice sample the library lacks
+    and the import keeps. That is a dry run of :func:`import_store` under the
+    scopes the import defaults to for ``store_path`` (the store's show without
+    it), so samples the import refuses (they conflict with the library) or
+    supersedes (older than every sample of an identity at the cap) do not
+    count, and the hint cannot outlive a successful import.
     """
     validated = validate_voice_store(store)
     show = normalize_scope(validated.show)
-    library_exemplars = state.space_exemplars(space_name)
     target = dict(pools.in_scope if in_scope else pools.other_scopes)
     scopes = dict(pools.scopes)
-    unimported = False
     tombstones = state.forgotten
     for identity_id, raw in validated.identities.items():
         if identity_id in tombstones:
             continue  # forgotten in this library: never offered again
         identity = cast(Mapping[str, object], raw)
         exemplars = cast(list[Mapping[str, object]], identity["exemplars"])
-        if identity_id in state.identity_map:
-            keys = _exemplar_keys(library_exemplars.get(identity_id, []))
-            present = {key.capture_id for key in keys}
-            if any(
-                item["capture_id"] not in present
-                and not _older_than_retained(
-                    keys, cast(str, item["added"]), cast(str, item["id"])
-                )
-                for item in exemplars
-            ):
-                unimported = True
-            continue
-        unimported = True
-        if not exemplars:
+        if identity_id in state.identity_map or not exemplars:
             continue
         target[identity_id] = {
             "display_name": identity["display_name"],
@@ -2339,6 +2306,24 @@ def add_legacy_store(
             ],
         }
         scopes[identity_id] = (show,)
+    import_scopes = (
+        (show,)
+        if store_path is None
+        else default_import_scopes(store_path, validated.show)
+    )
+    try:
+        _change, summary = import_store(
+            state,
+            store,
+            scope=import_scopes[0],
+            also_scopes=import_scopes[1:],
+            source_label="(dry run)",
+        )
+    except Phase2DataError:
+        # The import would stop on the same error: nothing to suggest.
+        unimported = False
+    else:
+        unimported = bool(summary.identities_created or summary.exemplars_added)
     if in_scope:
         return MatchPools(target, dict(pools.other_scopes), scopes), unimported
     return MatchPools(dict(pools.in_scope), target, scopes), unimported

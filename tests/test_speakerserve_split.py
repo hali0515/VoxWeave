@@ -4,6 +4,7 @@ import base64
 import copy
 import http.client
 import json
+import stat
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -86,8 +87,12 @@ def _request(
     headers: dict[str, str] | None = None,
 ):
     host = str(server.server_address[0])
+    # With the session cookie the server's access link sets.
+    headers = {"Cookie": f"{server.cookie_name}={server.session_cookie}"} | dict(
+        headers or {}
+    )
     connection = http.client.HTTPConnection(host, server.server_port, timeout=5)
-    connection.request(method, path, body=body, headers=headers or {})
+    connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     payload = response.read()
     connection.close()
@@ -126,6 +131,7 @@ def _running_split_server(
     *,
     provenance: Mapping[str, object] | None = None,
     provider_identity: turnembed.EmbeddingIdentity | None = None,
+    sibling_extra: Mapping[str, object] | None = None,
 ) -> Iterator[
     tuple[
         speakerserve.SpeakerHTTPServer,
@@ -164,6 +170,7 @@ def _running_split_server(
         "voiceprint_capture": CAPTURE_ID,
         "voiceprint_media": fingerprint,
         "fixture_marker": "preserve me",
+        **(sibling_extra or {}),
     }
     sibling_path = tmp_path / "episode.json"
     sibling_path.write_bytes(_json_bytes(sibling))
@@ -630,6 +637,37 @@ def test_split_returns_mocked_groups_and_does_not_mutate_episode(
         assert not paths["undo"].exists()
 
 
+@pytest.mark.parametrize(
+    ("vad_speech", "expected"),
+    [
+        # Clean clips: inside VAD speech, outside singing (like the main page).
+        ([[0.0, 2.5], [6.0, 9.0]], [(0.0, 2.5), (6.0, 8.5)]),
+        # A group with no clean stretch still gets clips of its turns.
+        ([[0.0, 2.5]], [(0.0, 2.5), (6.0, 9.0)]),
+    ],
+)
+def test_split_preview_clips_follow_the_page_clip_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    vad_speech: list[list[float]],
+    expected: list[tuple[float, float]],
+) -> None:
+    extra = {"vad_speech": vad_speech, "sing_spans": [[8.5, 9.0]]}
+    with _running_split_server(tmp_path, monkeypatch, sibling_extra=extra) as (
+        server,
+        _paths,
+        _originals,
+        _logs,
+        observations,
+    ):
+        proposal = _preview_split(server)
+
+    wav = tmp_path / "prepared.wav"
+    assert observations["clips"] == [(wav, start, end) for start, end in expected]
+    samples = [group["samples"] for group in proposal["groups"]]  # type: ignore[index]
+    assert [(s[0]["start"], s[0]["end"]) for s in samples] == expected
+
+
 def test_community1_split_confirms_with_exact_authority_and_matching_binding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -966,6 +1004,97 @@ def test_confirm_rewrites_bound_episode_deletes_suggest_and_terminalizes_save(
         assert paths["mapping"].read_bytes() == expected_mapping
 
 
+def test_confirm_keeps_the_sibling_mode_and_private_files_private(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _running_split_server(tmp_path, monkeypatch) as (
+        server,
+        paths,
+        _originals,
+        _logs,
+        _observations,
+    ):
+        for name in ("sibling", "sidecar", "mapping"):
+            paths[name].chmod(0o644)
+        status, response = _confirm_split(server, _preview_split(server))
+        assert status == 200, response
+        modes = {
+            name: stat.S_IMODE(paths[name].stat().st_mode)
+            for name in ("sibling", "sidecar", "mapping", "undo")
+        }
+    # The sibling JSON is a deliverable; voiceprints, names and undo are not.
+    assert modes == {
+        "sibling": 0o644,
+        "sidecar": 0o600,
+        "mapping": 0o600,
+        "undo": 0o600,
+    }
+
+
+def test_confirm_reads_the_mapping_by_the_serve_info_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _running_split_server(tmp_path, monkeypatch) as (
+        server,
+        paths,
+        _originals,
+        _logs,
+        _observations,
+    ):
+        # Extra top-level keys are allowed (and kept), as /serve-info allows them.
+        paths["mapping"].write_bytes(
+            _json_bytes(
+                {
+                    "version": 1,
+                    "speakers": {"SPEAKER_00": "Aoi", "SPEAKER_01": "Ren"},
+                    "note": "kept",
+                },
+                newline=True,
+            )
+        )
+        proposal = _preview_split(server)
+        status, response = _confirm_split(server, proposal)
+        assert status == 200, response
+        assert json.loads(paths["mapping"].read_bytes()) == {
+            "version": 1,
+            "speakers": {"SPEAKER_00": "Aoi", "SPEAKER_01": "Ren", "SPEAKER_02": ""},
+            "note": "kept",
+        }
+
+
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        b"{not json",
+        b'{"version": 2, "speakers": {}}',
+        b'{"version": 1, "speakers": {"SPEAKER_00": 7}}',
+    ],
+)
+def test_confirm_refuses_an_unreadable_mapping_with_a_conflict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mapping: bytes,
+) -> None:
+    with _running_split_server(tmp_path, monkeypatch) as (
+        server,
+        paths,
+        originals,
+        _logs,
+        _observations,
+    ):
+        proposal = _preview_split(server)
+        paths["mapping"].write_bytes(mapping)
+        status, response = _confirm_split(server, proposal)
+        assert status == 409
+        assert "is not a valid speaker mapping" in response["error"]  # type: ignore[index]
+        assert paths["sibling"].read_bytes() == originals["sibling"]
+        assert paths["sidecar"].read_bytes() == originals["sidecar"]
+        assert paths["mapping"].read_bytes() == mapping
+        assert not paths["undo"].exists()
+
+
 def test_confirm_rolls_back_a_write_that_interrupts_after_replace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -983,9 +1112,9 @@ def test_confirm_rolls_back_a_write_that_interrupts_after_replace(
         real_write = speakerserve._write_bytes
         interrupted = False
 
-        def write_then_interrupt(path: Path, raw: bytes) -> None:
+        def write_then_interrupt(path: Path, raw: bytes, **kwargs: bool) -> None:
             nonlocal interrupted
-            real_write(path, raw)
+            real_write(path, raw, **kwargs)
             if Path(path) == paths["sidecar"] and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt
@@ -1054,9 +1183,9 @@ def test_undo_rolls_back_a_write_that_interrupts_after_replace_and_can_retry(
         real_write = speakerserve._write_bytes
         interrupted = False
 
-        def write_then_interrupt(path: Path, raw: bytes) -> None:
+        def write_then_interrupt(path: Path, raw: bytes, **kwargs: bool) -> None:
             nonlocal interrupted
-            real_write(path, raw)
+            real_write(path, raw, **kwargs)
             if Path(path) == paths["sidecar"] and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt

@@ -13,10 +13,10 @@ from voxweave import config
 from voxweave.voicebase import (
     MAX_PROVENANCE_STRING_BYTES,
     MAX_SIDECAR_LABEL_BYTES,
+    MAX_SIDECAR_SPEAKERS,
     SUGGEST_MAX_BYTES,
     Phase2DataError,
     canonical_json_digest,
-    encode_json_bytes,
     load_json_object,
     require_capture_id,
     require_dimension,
@@ -794,8 +794,10 @@ def _best_identity_candidates(
 def _validated_centroids(
     centroids: Mapping[str, object], embedding_dim: int
 ) -> dict[str, tuple[int | float, ...]]:
-    if len(centroids) > 64:
-        raise Phase2DataError("centroids may contain at most 64 speakers")
+    if len(centroids) > MAX_SIDECAR_SPEAKERS:
+        raise Phase2DataError(
+            f"centroids may contain at most {MAX_SIDECAR_SPEAKERS} speakers"
+        )
     validated: dict[str, tuple[int | float, ...]] = {}
     for local_id in sorted(centroids):
         require_string(
@@ -1041,8 +1043,10 @@ def validate_suggest_record(value: object) -> None:
     _validate_record_thresholds(root.get("thresholds"))
 
     speakers = require_mapping(root.get("speakers"), "speakers")
-    if len(speakers) > 64:
-        raise Phase2DataError("suggest record may contain at most 64 speakers")
+    if len(speakers) > MAX_SIDECAR_SPEAKERS:
+        raise Phase2DataError(
+            f"suggest record may contain at most {MAX_SIDECAR_SPEAKERS} speakers"
+        )
     for local_id, raw_match in speakers.items():
         require_string(local_id, "local speaker id", max_bytes=MAX_SIDECAR_LABEL_BYTES)
         field = f"speakers.{local_id}"
@@ -1168,11 +1172,6 @@ def build_library_suggest_record(
     )
 
 
-def suggest_bytes(value: Mapping[str, object]) -> bytes:
-    validate_suggest_record(value)
-    return encode_json_bytes(value, max_bytes=SUGGEST_MAX_BYTES)
-
-
 def load_suggest(path: Path) -> dict[str, object]:
     raw = load_json_object(path, max_bytes=SUGGEST_MAX_BYTES)
     validate_suggest_record(raw)
@@ -1225,7 +1224,6 @@ __all__ = [
     "parse_global_suggest",
     "parse_thresholds",
     "require_known_compatibility",
-    "suggest_bytes",
     "threshold_defaults",
     "validate_suggest_record",
     "validate_thresholds",

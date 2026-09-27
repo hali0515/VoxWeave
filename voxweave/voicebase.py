@@ -306,9 +306,13 @@ def write_json_object(
     *,
     max_bytes: int,
 ) -> None:
-    """Atomically write preflighted strict JSON."""
+    """Atomically write preflighted strict JSON as a private (0600) file.
+
+    Every document written here is private data: voice stores, voiceprints,
+    suggestion records and cache companions.
+    """
     payload = encode_json_bytes(value, max_bytes=max_bytes)
-    fsio.atomic_write_text(Path(path), payload.decode("utf-8"))
+    fsio.atomic_write_text(Path(path), payload.decode("utf-8"), private=True)
 
 
 def canonical_json_digest(value: object) -> str:
@@ -560,16 +564,20 @@ def validate_voiceprint_conjunction(
     return validated
 
 
-def voiceprint_conjunction_valid(
-    sidecar: Mapping[str, object],
-    sibling: Mapping[str, object],
-    consumer_fingerprint: str,
-) -> bool:
-    try:
-        validate_voiceprint_conjunction(sidecar, sibling, consumer_fingerprint)
-    except Phase2DataError:
-        return False
-    return True
+_NAME_RECORD_SEPARATORS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+_NAME_TRANSLATION = str.maketrans({char: " " for char in _NAME_RECORD_SEPARATORS})
+_NAME_ASCII_WHITESPACE_RE = re.compile(r"[ \t]+")
+
+
+def sanitize_speaker_name(name: str) -> str:
+    """Normalize record separators without changing display punctuation.
+
+    Only ASCII layout runs are collapsed. Unicode whitespace is stripped at
+    name edges but remains meaningful inside a name. ASS applies its comma
+    escape separately.
+    """
+    normalized = name.translate(_NAME_TRANSLATION)
+    return _NAME_ASCII_WHITESPACE_RE.sub(" ", normalized).strip()
 
 
 def html_text(value: str) -> str:
@@ -580,21 +588,6 @@ def html_text(value: str) -> str:
 def html_attribute(value: str) -> str:
     """Escape an untrusted value for a quoted HTML attribute."""
     return html.escape(value, quote=True)
-
-
-def script_json(value: object) -> str:
-    """Encode a script value as JSON and neutralize every HTML close tag."""
-    try:
-        encoded = json.dumps(
-            value,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise Phase2DataError(f"script value cannot be encoded as JSON: {exc}") from exc
-    return encoded.replace("</", "<\\/")
 
 
 __all__ = [
@@ -634,7 +627,7 @@ __all__ = [
     "require_string",
     "require_utc_timestamp",
     "require_version_one",
-    "script_json",
+    "sanitize_speaker_name",
     "strict_json_loads",
     "strict_json_object_loads",
     "strict_turn_projection",
@@ -644,7 +637,6 @@ __all__ = [
     "validate_vector",
     "validate_voiceprint_conjunction",
     "validate_voiceprints_mapping",
-    "voiceprint_conjunction_valid",
     "voiceprints_digest",
     "write_json_object",
     "write_voiceprints",

@@ -51,8 +51,12 @@ def _running_server(tmp_path: Path, *, speakers_on_disk: dict[str, str], page=No
 
 
 def _request(server, method: str, path: str, body=None, headers=None):
+    # With the session cookie the server's access link sets.
+    headers = {"Cookie": f"{server.cookie_name}={server.session_cookie}"} | dict(
+        headers or {}
+    )
     connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
-    connection.request(method, path, body=body, headers=headers or {})
+    connection.request(method, path, body=body, headers=headers)
     response = connection.getresponse()
     payload = response.read()
     connection.close()
@@ -111,7 +115,7 @@ def test_save_disk_failure_replies_json_500_and_reports(tmp_path, monkeypatch):
         token = json.loads(_request(server, "GET", "/serve-info")[2])["token"]
         before = mapping.read_bytes()
 
-        def disk_full(_path, _text):
+        def disk_full(_path, _text, **_kwargs):
             raise OSError(28, "No space left on device")
 
         monkeypatch.setattr(speakerserve.fsio, "atomic_write_text", disk_full)
@@ -164,7 +168,8 @@ def test_forbidden_host_explains_what_is_accepted(tmp_path, host, mentions_ngrok
     text = body.decode("utf-8")
     assert f"Host '{host}:{port}' is not allowed" in text
     assert "DNS rebinding" in text
-    assert f"http://127.0.0.1:{port}/" in text
+    assert f"http://127.0.0.1:{port}/?k=... link" in text
+    assert server.access_key not in text
     assert "--host 0.0.0.0" in text
     assert ("--ngrok" in text) is mentions_ngrok
 
@@ -196,20 +201,22 @@ def test_large_pages_are_written_intact(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("host", "ngrok", "expected"),
+    ("host", "ngrok", "expected", "plain_http"),
     [
-        ("127.0.0.1", False, None),
-        ("0.0.0.0", False, "this machine on port 3210"),
-        ("127.0.0.1", True, "the ngrok URL"),
-        ("0.0.0.0", True, "this machine on port 3210 or the ngrok URL"),
+        ("127.0.0.1", False, False, False),
+        ("0.0.0.0", False, True, True),
+        ("127.0.0.1", True, True, False),
+        ("0.0.0.0", True, True, True),
     ],
 )
-def test_network_exposure_prints_a_no_password_warning(
-    tmp_path, monkeypatch, host, ngrok, expected
+def test_network_exposure_warns_that_the_link_grants_access(
+    tmp_path, monkeypatch, host, ngrok, expected, plain_http
 ):
     class InterruptingServer:
         origin = f"http://{host}:3210"
         server_port = 3210
+        access_key = "access-key"
+        access_url = f"http://{host}:3210/?k=access-key"
 
         def serve_forever(self):
             raise KeyboardInterrupt
@@ -233,13 +240,18 @@ def test_network_exposure_prints_a_no_password_warning(
         report=reports.append,
     )
     warnings = [line for line in reports if line.startswith("Warning:")]
-    if expected is None:
+    if not expected:
         assert warnings == []
         return
+    plain = (
+        " On the local network the connection is plain HTTP, so the link and the "
+        "audio are not encrypted."
+    )
     assert warnings == [
-        f"Warning: anyone who can reach {expected} can play the episode audio, "
-        "read and change speaker names and run splits — there is no password; "
-        "stop the server when you are done."
+        "Warning: anyone who has the access link (the one with ?k=) can play the "
+        "episode audio, read and change speaker names and run splits; share it "
+        "only with people you trust and stop the server when you are done."
+        + (plain if plain_http else "")
     ]
     assert not warnings[0].startswith("http://")
 

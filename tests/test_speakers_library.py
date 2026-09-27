@@ -293,6 +293,32 @@ def test_same_scope_name_resolves_and_repeat_is_a_noop(tmp_path):
     assert len(_library().space_exemplars(space)[identity_id]) == 2
 
 
+def test_enrollment_says_when_the_cap_displaces_the_oldest_sample(tmp_path, caplog):
+    for digit in "12345":
+        media = _episode(
+            tmp_path / "Show",
+            f"episode{digit}",
+            capture_digit=digit,
+            names={"SPEAKER_00": "Aqua"},
+        )
+        with caplog.at_level(logging.INFO, logger="voxweave"):
+            speakers.enroll_speaker_voices(media)
+    assert "oldest sample" not in caplog.text
+
+    sixth = _episode(
+        tmp_path / "Show", "episode6", capture_digit="6", names={"SPEAKER_00": "Aqua"}
+    )
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="voxweave"):
+        speakers.enroll_speaker_voices(sixth)
+    assert "1 voice(s) already had 5 samples; the oldest sample of each" in (
+        caplog.text
+    )
+    [identity_id] = _library().identity_map
+    [space] = _library().spaces
+    assert len(_library().space_exemplars(space)[identity_id]) == 5
+
+
 def test_re_enrolling_after_a_speaker_split_needs_replace(tmp_path):
     folder = tmp_path / "Show"
     media = _episode(folder, names={"SPEAKER_00": "Aqua"})

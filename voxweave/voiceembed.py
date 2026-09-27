@@ -291,7 +291,7 @@ def _download_url(spec: EmbedderSpec, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
     received = 0
-    with fsio.atomic_path(target) as partial:
+    with fsio.atomic_path(target, private=True) as partial:
         with (
             _open_url(spec.url, DOWNLOAD_TIMEOUT_SECONDS) as response,
             open(partial, "wb") as sink,
@@ -673,10 +673,11 @@ def window_bounds(first: int, last: int) -> list[tuple[int, int]]:
     return [(edges[k], edges[k + 1]) for k in range(count) if edges[k + 1] > edges[k]]
 
 
-def _padded(segment: np.ndarray, minimum: int) -> np.ndarray:
+def repeat_to_length(segment: np.ndarray, minimum: int) -> np.ndarray:
     """Repeat a short segment up to ``minimum`` samples.
 
-    Neither embedder masks its statistics pooling, so zero padding would pool
+    Neither voiceprint embedder (nor the legacy lane's pyannote model, see
+    turnembed) masks its statistics pooling, so zero padding would pool
     silence into the voice statistics; cyclic repetition only reuses speech.
     """
     if len(segment) >= minimum:
@@ -719,7 +720,9 @@ def _embed_span(
     weights = []
     for low, high in windows:
         try:
-            vectors.append(embedder.embed_samples(_padded(samples[low:high], minimum)))
+            vectors.append(
+                embedder.embed_samples(repeat_to_length(samples[low:high], minimum))
+            )
         except VoiceEmbeddingError:
             raise
         except Exception as exc:  # noqa: BLE001 -- inference errors (OOM, ...)
@@ -990,6 +993,7 @@ __all__ = [
     "read_mono_16k",
     "read_verified_checkpoint",
     "release",
+    "repeat_to_length",
     "resolve_voiceprint_choice",
     "resolve_voiceprint_model",
     "speaker_centroids",

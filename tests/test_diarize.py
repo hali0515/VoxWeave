@@ -142,8 +142,6 @@ def test_speaker_split_survives_embedded_latin_atom():
         [{"text": text, "start": 0.0, "end": 10.9, "word_data": word_data}],
         max_line_length=18,
         max_lines=1,
-        min_duration=0.0,
-        desired_wps=4.0,
         lang="zh",
     )
     assert len(packed) == 1  # the fixture must reach the formatter as one cue

@@ -37,7 +37,7 @@ def _install_fake_provider(
         pyannote_version="3.4.0",
     )
     monkeypatch.setattr(turnembed, "_read_mono_16k", lambda _path: waveform)
-    monkeypatch.setattr(turnembed, "_get_inference", lambda _identity=None: model)
+    monkeypatch.setattr(turnembed, "_get_inference", lambda _identity: model)
     monkeypatch.setattr(turnembed, "_inference_identity", identity)
     return identity
 
@@ -319,8 +319,9 @@ def test_inference_identity_is_published_with_singleton(monkeypatch) -> None:
     monkeypatch.setattr(turnembed, "_inference_identity", None)
     monkeypatch.setattr(turnembed, "_load_inference", load_inference)
 
-    assert turnembed._get_inference() is inference
+    assert turnembed._get_inference(identity) is inference
     assert turnembed._inference_identity == identity
+    assert turnembed._get_inference(identity) is inference
     assert calls == 1
 
 
@@ -368,7 +369,7 @@ def test_attested_turn_request_is_a_frozen_sequence() -> None:
         setattr(request, "identity", identity)
 
 
-def test_turn_embeddings_contract_and_model_driven_padding(monkeypatch) -> None:
+def test_turn_embeddings_contract_and_model_driven_repetition(monkeypatch) -> None:
     model = _FakeEmbeddingModel(
         [_vector(3.0, 4.0), _vector(3.0, 4.0)],
         min_num_samples=8,
@@ -397,19 +398,22 @@ def test_turn_embeddings_contract_and_model_driven_padding(monkeypatch) -> None:
         isinstance(item, float) for value in embeddings.values() for item in value
     )
     assert model.inputs[0].shape == (1, 1, 8)
-    assert model.inputs[0][0, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0]
+    # Repeated, not zero-padded: the model pools without a mask.
+    assert model.inputs[0][0, 0].tolist() == [0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0]
     assert model.inputs[1].shape == (1, 1, 10)
     assert model.inputs[1][0, 0].tolist() == list(map(float, range(4, 14)))
 
 
 def test_turn_embeddings_l2_normalizes_model_rows(monkeypatch) -> None:
     model = _FakeEmbeddingModel([_vector(3.0, 4.0)], min_num_samples=1)
-    _install_fake_provider(monkeypatch, model)
+    identity = _install_fake_provider(monkeypatch, model)
     monkeypatch.setattr(turnembed, "MIN_TURN_SECONDS", 0.0)
 
     vector = turnembed.turn_embeddings(
         Path("unused.wav"),
-        [(0.0, 1 / turnembed.SAMPLE_RATE, "SPEAKER_00")],
+        turnembed.AttestedTurnRequest(
+            [(0.0, 1 / turnembed.SAMPLE_RATE, "SPEAKER_00")], identity=identity
+        ),
     )[0]
 
     assert vector[:2] == pytest.approx([0.6, 0.8])
@@ -419,14 +423,77 @@ def test_turn_embeddings_l2_normalizes_model_rows(monkeypatch) -> None:
 
 def test_turn_embeddings_refuses_zero_model_row(monkeypatch) -> None:
     model = _FakeEmbeddingModel([_vector(0.0, 0.0)], min_num_samples=1)
-    _install_fake_provider(monkeypatch, model)
+    identity = _install_fake_provider(monkeypatch, model)
     monkeypatch.setattr(turnembed, "MIN_TURN_SECONDS", 0.0)
 
     with pytest.raises(turnembed.TurnEmbeddingError, match="zero or non-finite"):
         turnembed.turn_embeddings(
             Path("unused.wav"),
-            [(0.0, 1 / turnembed.SAMPLE_RATE, "SPEAKER_00")],
+            turnembed.AttestedTurnRequest(
+                [(0.0, 1 / turnembed.SAMPLE_RATE, "SPEAKER_00")], identity=identity
+            ),
         )
+
+
+def test_turn_embeddings_refuse_a_request_without_an_identity(monkeypatch) -> None:
+    monkeypatch.setattr(
+        turnembed,
+        "_load_inference",
+        lambda *_a, **_k: pytest.fail("no model may load for an unattested request"),
+    )
+    with pytest.raises(turnembed.TurnEmbeddingError, match="embedder identity"):
+        turnembed.turn_embeddings(
+            Path("unused.wav"),
+            [(0.0, 1.0, "SPEAKER_00")],  # type: ignore[arg-type]
+        )
+
+
+def test_legacy_turn_embeddings_are_windowed_and_length_weighted(monkeypatch) -> None:
+    from voxweave import voiceembed
+
+    model = _FakeEmbeddingModel(
+        [_vector(1.0, 0.0), _vector(0.0, 1.0), _vector(0.0, 1.0)],
+        min_num_samples=1,
+    )
+    identity = _install_fake_provider(monkeypatch, model)
+    monkeypatch.setattr(turnembed, "MIN_TURN_SECONDS", 0.0)
+    # Windows of at most 8 samples: the 20-sample turn becomes 6 + 7 + 7.
+    monkeypatch.setattr(voiceembed, "WINDOW_SECONDS", 8 / turnembed.SAMPLE_RATE)
+
+    vector = turnembed.turn_embeddings(
+        Path("unused.wav"),
+        turnembed.AttestedTurnRequest(
+            [(0.0, 20 / turnembed.SAMPLE_RATE, "SPEAKER_00")], identity=identity
+        ),
+    )[0]
+
+    assert [chunk[0, 0].tolist() for chunk in model.inputs] == [
+        list(map(float, range(0, 6))),
+        list(map(float, range(6, 13))),
+        list(map(float, range(13, 20))),
+    ]
+    expected = np.array(_vector(6.0, 14.0))
+    assert vector == pytest.approx((expected / np.linalg.norm(expected)).tolist())
+
+
+def test_release_drops_the_resident_models(monkeypatch) -> None:
+    from voxweave import voiceembed
+
+    identity = turnembed.EmbeddingIdentity(
+        model=turnembed.EMBEDDING_MODEL,
+        checkpoint_sha256="b" * 64,
+        pyannote_version="3.4.0",
+    )
+    monkeypatch.setattr(turnembed, "_inference", object())
+    monkeypatch.setattr(turnembed, "_inference_identity", identity)
+    released = []
+    monkeypatch.setattr(voiceembed, "release", lambda: released.append(True))
+
+    turnembed.release()
+
+    assert turnembed._inference is None
+    assert turnembed._inference_identity is None
+    assert released == [True]
 
 
 def test_bisect_embeddings_is_deterministic_for_two_blobs() -> None:
