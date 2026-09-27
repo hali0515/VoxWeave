@@ -193,7 +193,7 @@ def test_autocast_mode_keys_the_cache_pair(tmp_path, mode):
         separator=produced,
     )
     assert companion["separator"] == produced
-    assert vocalscache.cache_pair_valid(
+    vocalscache.validate_cache_pair(
         companion,
         cache,
         media_fingerprint="a" * 64,
@@ -230,7 +230,7 @@ def test_legacy_companion_without_autocast_is_an_fp32_claim(tmp_path):
     assert "autocast" not in raw["separator"]  # bytes on disk stay untouched
     assert validated.separator.autocast == "off"
     for separator in (_separator(), _canonical_separator("off")):
-        assert vocalscache.cache_pair_valid(
+        vocalscache.validate_cache_pair(
             raw,
             cache,
             media_fingerprint="a" * 64,
@@ -270,12 +270,6 @@ def test_same_size_torn_pair_is_detected_by_full_flac_hash(tmp_path):
         separator=_separator(),
     )
     cache.write_bytes(b"B" * 4096)
-    assert not vocalscache.cache_pair_valid(
-        companion,
-        cache,
-        media_fingerprint="a" * 64,
-        separator=_separator(),
-    )
     with pytest.raises(vocalscache.CacheCompanionMismatch, match="SHA-256"):
         vocalscache.validate_cache_pair(
             companion,
@@ -295,12 +289,13 @@ def test_full_hash_catches_middle_only_mutation(tmp_path):
     )
     payload[1024 * 1024 + 100] = ord("B")
     cache.write_bytes(payload)
-    assert not vocalscache.cache_pair_valid(
-        companion,
-        cache,
-        media_fingerprint="a" * 64,
-        separator=_separator(),
-    )
+    with pytest.raises(vocalscache.CacheCompanionError):
+        vocalscache.validate_cache_pair(
+            companion,
+            cache,
+            media_fingerprint="a" * 64,
+            separator=_separator(),
+        )
 
 
 def test_cache_size_media_and_separator_mismatches_each_refuse(tmp_path):
@@ -345,20 +340,22 @@ def test_missing_or_nonregular_cache_is_not_a_valid_pair(tmp_path):
         "cache_size": 0,
         "cache_sha256": hashlib.sha256(b"").hexdigest(),
     }
-    assert not vocalscache.cache_pair_valid(
-        companion,
-        missing,
-        media_fingerprint="a" * 64,
-        separator=_separator(),
-    )
+    with pytest.raises(vocalscache.CacheCompanionError):
+        vocalscache.validate_cache_pair(
+            companion,
+            missing,
+            media_fingerprint="a" * 64,
+            separator=_separator(),
+        )
     directory = tmp_path / "directory.flac"
     directory.mkdir()
-    assert not vocalscache.cache_pair_valid(
-        companion,
-        directory,
-        media_fingerprint="a" * 64,
-        separator=_separator(),
-    )
+    with pytest.raises(vocalscache.CacheCompanionError):
+        vocalscache.validate_cache_pair(
+            companion,
+            directory,
+            media_fingerprint="a" * 64,
+            separator=_separator(),
+        )
 
 
 def test_realpath_aliases_share_cache_companion_and_lock_paths(tmp_path):
@@ -437,7 +434,7 @@ def test_capture_writer_publishes_only_after_finished_cache(tmp_path):
             separator=_separator(),
         )
         assert handle.companion_path.exists()
-    assert vocalscache.cache_pair_valid(
+    vocalscache.validate_cache_pair(
         companion,
         cache,
         media_fingerprint=media,

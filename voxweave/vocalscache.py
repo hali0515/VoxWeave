@@ -28,6 +28,11 @@ from voxweave.voicebase import (
 )
 
 HASH_CHUNK_BYTES = 1024 * 1024
+# What a companion (or capture provenance) without an ``autocast`` field means:
+# those were written before the setting existed, when separation always ran the
+# fp32 path. Pinned here, not tied to config.SEP_AUTOCAST_DEFAULT: flipping the
+# configured default must not rewrite what old companions claim.
+PRE_AUTOCAST_MODE = "off"
 
 
 class CacheCompanionError(Phase2DataError):
@@ -87,7 +92,7 @@ class SeparatorIdentity:
     file: str
     checkpoint: str
     config_sha256: str
-    autocast: str = config.SEP_AUTOCAST_DEFAULT
+    autocast: str = PRE_AUTOCAST_MODE
 
     def as_mapping(self) -> dict[str, object]:
         return {
@@ -164,7 +169,7 @@ def validate_separator_identity(value: object) -> SeparatorIdentity:
         # Absent is not unknown: no writer omitted this field after the setting
         # existed, so a companion without it describes an "off" (fp32) run.
         autocast = require_string(
-            separator.get("autocast", config.SEP_AUTOCAST_DEFAULT),
+            separator.get("autocast", PRE_AUTOCAST_MODE),
             "separator.autocast",
             max_bytes=MAX_PROVENANCE_STRING_BYTES,
         )
@@ -362,25 +367,6 @@ def validate_cache_pair(
     return validated
 
 
-def cache_pair_valid(
-    companion: Mapping[str, object],
-    cache_path: Path,
-    *,
-    media_fingerprint: str,
-    separator: Mapping[str, object] | SeparatorIdentity,
-) -> bool:
-    try:
-        validate_cache_pair(
-            companion,
-            cache_path,
-            media_fingerprint=media_fingerprint,
-            separator=separator,
-        )
-    except (CacheCompanionError, OSError):
-        return False
-    return True
-
-
 def write_cache_companion(path: Path, value: Mapping[str, object]) -> None:
     validate_cache_companion(value)
     try:
@@ -505,7 +491,7 @@ def cache_publish_path(cache_path: Path) -> Iterator[Path]:
         # fsio owns the staging convention (same-directory ".<stem>.*.part<suffix>"
         # temp file, os.replace on clean exit, unlink on any failure); only the
         # cache-specific terminal classification stays here.
-        with fsio.atomic_path(destination) as temporary:
+        with fsio.atomic_path(destination, private=True) as temporary:
             staged = True
             try:
                 yield temporary
@@ -533,13 +519,13 @@ __all__ = [
     "CacheCompanionMismatch",
     "CacheLockHandle",
     "HASH_CHUNK_BYTES",
+    "PRE_AUTOCAST_MODE",
     "SeparatorIdentity",
     "ValidatedCacheCompanion",
     "build_cache_companion",
     "cache_companion_path",
     "cache_lock",
     "cache_lock_path",
-    "cache_pair_valid",
     "cache_publish_path",
     "cache_write_window",
     "canonical_cache_path",

@@ -73,6 +73,8 @@ def test_process_forwards_diarize_model_to_transcribe(
         return "en", units, [(0.0, 1.0)], [], [], None
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    # process() preflights diarization; the gated model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
 
     pipeline.process(
         media,

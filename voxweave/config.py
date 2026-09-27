@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
 log = logging.getLogger("voxweave")
@@ -79,9 +80,11 @@ DIARIZE_CLUSTERING_ENV = "VOXWEAVE_DIARIZE_CLUSTERING"
 #     drops CUDAExecutionProvider — see pyproject [tool.uv] override-dependencies.
 DEFAULT_ALIGN_MODELS = {"en": "facebook/wav2vec2-large-960h-lv60-self", "ja": "mms"}
 
-# Model cache layout: all weights go under VOXWEAVE_CACHE_ROOT (~/.cache/voxweave),
-# split by role (asr / align / audio). Each subdir is a self-contained HF hub tree
-# passed as cache_dir/download_root= to every model download.
+# Model cache layout: every downloaded weight goes under VOXWEAVE_CACHE_ROOT
+# (~/.cache/voxweave), split by role (asr / align / audio). Each subdir is a
+# self-contained HF hub tree passed as cache_dir/download_root= to every model download.
+# A hand-placed separator checkpoint/config is looked up in backend.MODEL_DIR
+# (VOXWEAVE_MODEL_DIR, else this root); a downloaded one lands in AUDIO_CACHE.
 # Weights do NOT share with ~/.cache/huggingface/hub — a model already pulled by
 # `hf download` will re-download here on first run. This isolation is intentional:
 # it keeps the voxweave weight set self-contained for packaging/migration/deletion.
@@ -213,9 +216,10 @@ _TEMPLATE = """\
 # named voices and `speakers serve` looks them up, across every media folder. Default:
 # $XDG_DATA_HOME/voxweave/voices, else ~/.local/share/voxweave/voices. It holds voice
 # biometrics of the people you name; `voxweave voices forget ID` removes one person.
-# It may point at a NAS path shared by several machines (plain JSON files plus one flock;
-# needs an NFSv4 or lock-enabled mount, not `nolock`). A relative path is relative to
-# this file's directory.
+# It may point at a NAS path shared by several machines of the same user account (plain
+# JSON files plus one flock; needs an NFSv4 or lock-enabled mount, not `nolock`); its files
+# are private to that account, so several accounts cannot share one library. A relative
+# path is relative to this file's directory.
 [voices]
 # dir = "/mnt/nas/voxweave/voices"
 
@@ -305,10 +309,25 @@ _KNOWN_SECTION_KEYS = {
 }
 
 
+# Config-file warnings already emitted, keyed by (config path, message). Every
+# accessor re-reads the file (so an edit is seen at once), and without this a
+# single typo would be reported again by every accessor call of a run.
+_WARNED: set[tuple[str, str]] = set()
+
+
+def _warn_config(message: str, *args: object) -> None:
+    """Warn about the config file's content, once per file and message."""
+    key = (str(config_path()), message % args if args else message)
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    log.warning(message, *args)
+
+
 def _load() -> dict:
     """Parse the config TOML. Missing or malformed file returns {} (no crash).
     Unknown top-level keys, and unknown keys inside a known table, are warned
-    about but do not stop known keys loading."""
+    about (once per process) but do not stop known keys loading."""
     p = config_path()
     if not p.exists():
         return {}
@@ -316,21 +335,32 @@ def _load() -> dict:
         with p.open("rb") as f:
             data = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError) as e:
-        log.warning("config %s read failed (%r), treating as empty", p, e)
+        _warn_config("config %s read failed (%r), treating as empty", p, e)
         return {}
     for key in data:
         if key not in _KNOWN_KEYS:
-            log.warning("unknown config key %r in %s (ignored)", key, p)
+            _warn_config("unknown config key %r in %s (ignored)", key, p)
             continue
         known = _KNOWN_SECTION_KEYS.get(key)
         section = data[key]
         if known is not None and isinstance(section, dict):
             for inner in section:
                 if inner not in known:
-                    log.warning(
+                    _warn_config(
                         "unknown config key %r in [%s] of %s (ignored)", inner, key, p
                     )
     return data
+
+
+def _section(name: str) -> dict | None:
+    """The ``[name]`` table, or None when absent or not a table (warned about)."""
+    section = _load().get(name)
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        _warn_config("config key %r has wrong type (expected table), ignoring", name)
+        return None
+    return section
 
 
 # Legacy config path from when the tool was named "qsub"; auto-migrated on first run.
@@ -377,7 +407,7 @@ def conf_asr_model() -> str | None:
     VOXWEAVE_ASR_MODEL and before the built-in default."""
     v = _load().get("asr_model")
     if v is not None and not isinstance(v, str):
-        log.warning(
+        _warn_config(
             "config key %r has wrong type (expected string), ignoring", "asr_model"
         )
         return None
@@ -386,10 +416,16 @@ def conf_asr_model() -> str | None:
 
 def _conf_fusion(key: str) -> str | None:
     """``[fusion].<key>`` from config, or None if absent/empty."""
-    fusion = _load().get("fusion")
-    if isinstance(fusion, dict):
-        return _nonempty_str(fusion.get(key))
-    return None
+    fusion = _section("fusion")
+    if fusion is None:
+        return None
+    v = fusion.get(key)
+    if v is not None and not isinstance(v, str):
+        _warn_config(
+            "config [fusion].%s has wrong type (expected string), ignoring", key
+        )
+        return None
+    return _nonempty_str(v)
 
 
 def conf_fusion_whisper() -> str:
@@ -408,12 +444,12 @@ def conf_fusion_qwen() -> str:
 
 def _conf_llm(key: str) -> str | None:
     """``[llm].<key>`` as written (may be ""), or None if absent / not a string."""
-    llm = _load().get("llm")
-    if not isinstance(llm, dict) or key not in llm:
+    llm = _section("llm")
+    if llm is None or key not in llm:
         return None
     v = llm[key]
     if not isinstance(v, str):
-        log.warning(
+        _warn_config(
             "config key %r has wrong type (expected string), ignoring", f"[llm].{key}"
         )
         return None
@@ -470,11 +506,14 @@ def resolve_llm_reasoning_effort(cli_value: str | None) -> str | None:
     return value.strip() if value is not None else None
 
 
-def _positive_int(value: object, source: str) -> int | None:
+def _positive_int(
+    value: object, source: str, *, warn: Callable[..., None] = log.warning
+) -> int | None:
     """``value`` as an int >= 1, or None (with a warning) when it is missing or invalid.
 
     Accepts ints and digit strings (env vars arrive as text); bools, floats,
     zero and negatives are rejected so a typo falls through to the next source.
+    Config-file sources pass ``warn=_warn_config`` so a run reports them once.
     """
     if value is None:
         return None
@@ -490,7 +529,7 @@ def _positive_int(value: object, source: str) -> int | None:
     else:
         parsed = None
     if parsed is None or parsed < 1:
-        log.warning("%s must be an integer >= 1 (got %r); ignoring it", source, value)
+        warn("%s must be an integer >= 1 (got %r); ignoring it", source, value)
         return None
     return parsed
 
@@ -511,9 +550,9 @@ def _resolve_llm_positive_int(
         resolved = _positive_int(env, f"environment {envvar}")
         if resolved is not None:
             return resolved
-    llm = _load().get("llm")
-    if isinstance(llm, dict) and key in llm:
-        resolved = _positive_int(llm[key], f"config [llm].{key}")
+    llm = _section("llm")
+    if llm is not None and key in llm:
+        resolved = _positive_int(llm[key], f"config [llm].{key}", warn=_warn_config)
         if resolved is not None:
             return resolved
     return default
@@ -561,7 +600,12 @@ def conf_hf_token() -> str | None:
         v = _nonempty_str(os.environ.get(key))
         if v:
             return v
-    v = _nonempty_str(_load().get("hf_token"))
+    raw = _load().get("hf_token")
+    if raw is not None and not isinstance(raw, str):
+        _warn_config(
+            "config key %r has wrong type (expected string), ignoring", "hf_token"
+        )
+    v = _nonempty_str(raw)
     if v:
         return v
     try:
@@ -574,17 +618,14 @@ def conf_hf_token() -> str | None:
 
 def _conf_diarize_model() -> str | None:
     """Return ``[diarize].model`` when it is a non-blank string."""
-    section = _load().get("diarize")
+    section = _section("diarize")
     if section is None:
-        return None
-    if not isinstance(section, dict):
-        log.warning(
-            "config key %r has wrong type (expected table), ignoring", "diarize"
-        )
         return None
     raw = section.get("model")
     if raw is not None and not isinstance(raw, str):
-        log.warning("config [diarize].model has wrong type (expected string), ignoring")
+        _warn_config(
+            "config [diarize].model has wrong type (expected string), ignoring"
+        )
         return None
     return _nonempty_str(raw)
 
@@ -610,17 +651,12 @@ def resolve_diarize_model(cli_value: str | None = None) -> str:
 
 def _conf_diarize_clustering() -> str | None:
     """Return ``[diarize].clustering`` when it is a non-blank string."""
-    section = _load().get("diarize")
+    section = _section("diarize")
     if section is None:
-        return None
-    if not isinstance(section, dict):
-        log.warning(
-            "config key %r has wrong type (expected table), ignoring", "diarize"
-        )
         return None
     raw = section.get("clustering")
     if raw is not None and not isinstance(raw, str):
-        log.warning(
+        _warn_config(
             "config [diarize].clustering has wrong type (expected string), ignoring"
         )
         return None
@@ -673,17 +709,12 @@ def conf_voiceprint_model() -> str | None:
     The value is resolved (aliases, per-language ``auto`` routing, validation) by
     :func:`voxweave.voiceembed.resolve_voiceprint_choice`; this only reads it.
     """
-    section = _load().get("voiceprint")
+    section = _section("voiceprint")
     if section is None:
-        return None
-    if not isinstance(section, dict):
-        log.warning(
-            "config key %r has wrong type (expected table), ignoring", "voiceprint"
-        )
         return None
     raw = section.get("model")
     if raw is not None and not isinstance(raw, str):
-        log.warning(
+        _warn_config(
             "config [voiceprint].model has wrong type (expected string), ignoring"
         )
         return None
@@ -698,15 +729,12 @@ def conf_voices_dir() -> Path | None:
     Precedence against ``--voices-dir`` / ``VOXWEAVE_VOICES_DIR`` is resolved
     by :func:`voxweave.voicelibrary.resolve_voices_dir`.
     """
-    section = _load().get("voices")
+    section = _section("voices")
     if section is None:
-        return None
-    if not isinstance(section, dict):
-        log.warning("config key %r has wrong type (expected table), ignoring", "voices")
         return None
     raw = section.get("dir")
     if raw is not None and not isinstance(raw, str):
-        log.warning("config [voices].dir has wrong type (expected string), ignoring")
+        _warn_config("config [voices].dir has wrong type (expected string), ignoring")
         return None
     value = _nonempty_str(raw)
     if value is None:
@@ -731,10 +759,12 @@ def conf_load_strategy() -> str:
     Precedence: env VOXWEAVE_LOAD_STRATEGY > conf load_strategy > "peak". Invalid
     values are warned about and fall back to "peak".
     """
-    raw = os.environ.get("VOXWEAVE_LOAD_STRATEGY") or _load().get("load_strategy")
+    env = os.environ.get("VOXWEAVE_LOAD_STRATEGY")
+    raw = env or _load().get("load_strategy")
     v = raw.strip().lower() if isinstance(raw, str) else ""
     if (raw is not None and raw != "") and v not in _LOAD_STRATEGIES:
-        log.warning(
+        warn = log.warning if env else _warn_config
+        warn(
             "load_strategy must be one of %s (got %r); using 'peak'",
             ", ".join(sorted(_LOAD_STRATEGIES)),
             raw,
@@ -765,7 +795,7 @@ def conf_ctc_max_dp_frames() -> int:
     if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
         return v
     if v is not None:
-        log.warning(
+        _warn_config(
             "config key %r must be an integer >= 1 (got %r), using default",
             "ctc_max_dp_frames",
             v,
@@ -795,24 +825,27 @@ def conf_batch(key: str) -> int:
     """Inference batch size for stage ``key`` ("separate" | "ctc" | "mms" | "asr"), min 1.
 
     Precedence: env _BATCH_ENV[key] > conf ``[batch].<key>`` > _BATCH_DEFAULTS.
-    Non-integer values (env or file) are ignored and fall through to the next source.
+    Non-integer values (env or file) are warned about and fall through to the next
+    source; integers below 1 are raised to 1.
     """
-    env = os.environ.get(_BATCH_ENV[key])
+    name = _BATCH_ENV[key]
+    env = os.environ.get(name)
     if env is not None and env.strip():
         try:
             return max(1, int(env))
         except ValueError:
-            pass
-    batch = _load().get("batch")
-    if isinstance(batch, dict):
-        v = batch.get(key)
+            log.warning("ignoring %s=%r (not an integer)", name, env)
+    batch = _section("batch")
+    if batch is not None and key in batch:
+        v = batch[key]
         if isinstance(v, int) and not isinstance(v, bool):
             return max(1, v)
+        _warn_config("config [batch].%s must be an integer (got %r), ignoring", key, v)
     return _BATCH_DEFAULTS[key]
 
 
 # Autocast for the MelBandRoformer separation forward. "off" is the byte-identical
-# reference path (fp32 with TF32 matmuls, see backend._load_separator); bf16/fp16 trade
+# reference path (fp32 with TF32 matmuls, see backend._separation_matmul_precision); bf16/fp16 trade
 # tiny stem differences for throughput. The default stays off until an A/B decides it.
 SEP_AUTOCAST_MODES = ("off", "bf16", "fp16")
 SEP_AUTOCAST_DEFAULT = "off"
@@ -824,31 +857,28 @@ def conf_separate_autocast() -> str:
 
     Precedence: env VOXWEAVE_SEP_AUTOCAST > conf ``[separate].autocast`` > "off".
     Values are case-insensitive. An invalid value (unknown mode or wrong type) from
-    the winning source is warned about once and falls back to "off" -- it does not
-    fall through to the next source, so a typo never silently enables autocast. A
+    the winning source is warned about and falls back to "off" -- it does not fall
+    through to the next source, so a typo never silently enables autocast. A
     non-table ``separate`` key (a scalar instead of a ``[separate]`` section) is
-    warned about the same way.
+    warned about the same way. Config-file problems are reported once per run.
     """
     env = os.environ.get(SEP_AUTOCAST_ENV)
+    warn: Callable[..., None] = log.warning
     if env is not None and env.strip():
         raw: object = env
         source = f"env {SEP_AUTOCAST_ENV}"
     else:
-        separate = _load().get("separate")
-        if separate is not None and not isinstance(separate, dict):
-            log.warning(
-                "config key %r has wrong type (expected table), ignoring", "separate"
-            )
-            return SEP_AUTOCAST_DEFAULT
-        raw = separate.get("autocast") if isinstance(separate, dict) else None
+        separate = _section("separate")
+        raw = separate.get("autocast") if separate is not None else None
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             return SEP_AUTOCAST_DEFAULT
         source = "config [separate].autocast"
+        warn = _warn_config
     if isinstance(raw, str):
         mode = raw.strip().casefold()
         if mode in SEP_AUTOCAST_MODES:
             return mode
-    log.warning(
+    warn(
         "%s has invalid value %r (expected one of %s), using %r",
         source,
         raw,
@@ -870,12 +900,12 @@ def conf_default_flag(key: str, builtin: bool) -> bool:
 
 def conf_default_flag_source(key: str, builtin: bool) -> tuple[bool, str]:
     """Resolve a config boolean and report its source for cross-flag errors."""
-    defaults = _load().get("defaults")
-    if isinstance(defaults, dict) and key in defaults:
+    defaults = _section("defaults")
+    if defaults is not None and key in defaults:
         v = defaults[key]
         if isinstance(v, bool):
             return v, f"config [defaults].{key}"
-        log.warning(
+        _warn_config(
             "config [defaults].%s has wrong type (expected boolean), using default",
             key,
         )
@@ -888,12 +918,12 @@ def align_model_for(iso: str) -> str | None:
     Config ``[align]`` takes precedence (set to "" to explicitly revert to Qwen);
     falls back to DEFAULT_ALIGN_MODELS, then None.
     """
-    align = _load().get("align")
-    if isinstance(align, dict) and iso in align:
+    align = _section("align")
+    if align is not None and iso in align:
         v = align[iso]
         if isinstance(v, str):
             return _nonempty_str(v)  # "" = explicit disable (fall back to Qwen)
-        log.warning(
+        _warn_config(
             "config [align].%s has wrong type (expected string), using default", iso
         )
     return DEFAULT_ALIGN_MODELS.get(iso)

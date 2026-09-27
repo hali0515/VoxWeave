@@ -262,21 +262,6 @@ def test_replay_repair_rejects_malformed_timing_without_relabeling(caplog):
     assert any("malformed source timings" in r.getMessage() for r in caplog.records)
 
 
-def test_write_siblings_drops_ts_line_when_cue_time_missing(tmp_path):
-    # defensive: cue missing start/end (rare) -> falls back to plain text, does not crash (fmt_ts rejects None)
-    cues = [
-        {"text": "a", "start": None, "end": None},
-        {"text": "b", "start": 0.0, "end": 1.0},
-    ]
-    out = pipeline._write_siblings(tmp_path / "x.mkv", cues, [], "en")
-    body = out.read_text(encoding="utf-8")
-    assert "00:00:00.000 --> 00:00:01.000" in body  # second cue has timing
-    # first cue (a) has no timing line: line before "a" must be blank, not "-->"
-    lines = body.splitlines()
-    assert "a" in lines
-    assert lines[lines.index("a") - 1] == ""
-
-
 def test_find_sibling_media_matches_dotted_name(tmp_path):
     media = tmp_path / f"{DOTTED}.webm"
     media.write_bytes(b"x")

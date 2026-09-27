@@ -58,12 +58,13 @@ def test_hint_for_unknown_is_empty():
     assert ui._hint_for(ValueError("x")) == ""
 
 
-def test_hint_for_partial_translation_points_at_resume_and_allow_partial():
+def test_hint_for_partial_translation_adds_only_the_server_log_advice():
     from voxweave.translate import PartialTranslationError
 
     hint = ui._hint_for(PartialTranslationError([3, 4], 10))
-    assert "Rerun the same command" in hint
-    assert "--allow-partial" in hint
+    # The message already names both ways out; the hint adds only what it does not say.
+    assert "--allow-partial" not in hint
+    assert "LLM server log" in hint
 
 
 def test_hint_for_incomplete_response_points_at_the_server():

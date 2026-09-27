@@ -118,6 +118,9 @@ def stub_transcription(tmp_path, monkeypatch):
         path.write_bytes(b"audio")
         return path
 
+    # process() preflights diarization before any audio work: the gated default
+    # model needs a token even though pyannote itself is faked below.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     monkeypatch.setattr(pipeline, "decode_to_wav", audio)
     monkeypatch.setattr(pipeline, "slice_wav", audio)
     monkeypatch.setattr(

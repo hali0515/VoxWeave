@@ -55,6 +55,9 @@ PROVENANCE = {
 @pytest.fixture(autouse=True)
 def _private_snapshot_root(tmp_path, monkeypatch):
     monkeypatch.setenv("VOXWEAVE_CACHE_ROOT", str(tmp_path / "cache-root"))
+    # process() preflights diarization before any audio work: the gated default
+    # model needs a token even though pyannote itself is faked here.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
 
 
 def _capture(turns):

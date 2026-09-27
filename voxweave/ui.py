@@ -317,11 +317,10 @@ class RichReporter(Reporter):
             self._progress.update(self._task_id, completed=done, total=total)
 
 
-# Pipeline aborts that leave nothing to write (pipeline.transcribe/split).
+# Pipeline aborts that leave nothing to write (pipeline.transcribe/split/align).
 _PIPELINE_ABORT_MARKERS = (
     "no speech",
     "no aligned",
-    "no alignment",
     "no word segments",
 )
 
@@ -356,12 +355,11 @@ def _hint_for(exc: Exception) -> str:
     if isinstance(exc, RuntimeError):
         message = str(exc).lower()
         if "cues untranslated" in message:
+            # The message itself already says how to resume or allow partial output.
             return (
-                "Rerun the same command to resume: the translation progress file is "
-                "kept and already-translated cues are not re-requested. Pass "
-                "--allow-partial to write the file with the remaining cues in source "
-                "text. If the same cues keep failing, check the LLM server log "
-                "(structured-output aborts, max_tokens)."
+                "Already-translated cues are not re-requested on a rerun. If the same "
+                "cues keep failing, check the LLM server log (structured-output "
+                "aborts, max_tokens)."
             )
         if "response incomplete" in message:
             return (

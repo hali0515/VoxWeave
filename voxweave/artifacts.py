@@ -10,6 +10,7 @@ name (never an absolute path) so a relocated media directory keeps its claims.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -286,16 +287,12 @@ def _paths(source: Path, directory: Path) -> ArtifactPaths:
 
 
 def _claim_directory(source: Path, directory: Path) -> bool:
+    # Raises ArtifactMarkerError for every OSError itself.
+    _ensure_private_directory(directory)
     try:
-        _ensure_private_directory(directory)
-    except ArtifactMarkerError:
-        raise
-    except OSError as exc:
-        raise ArtifactMarkerError(
-            f"cannot create artifact claim {directory}: {exc}"
-        ) from exc
-    try:
-        fsio.atomic_write_text_new(directory / "source.json", _marker_text(source.name))
+        fsio.atomic_write_text_new(
+            directory / "source.json", _marker_text(source.name), private=True
+        )
     except FileExistsError:
         return _read_marker(directory / "source.json") == source.name
     return True
@@ -384,8 +381,12 @@ def path_present(path: Path) -> bool:
     """Return false only when a filesystem node is truly absent."""
     try:
         Path(path).lstat()
-    except FileNotFoundError:
-        return False
+    except OSError as exc:
+        # A name too long to exist (ENAMETOOLONG) is absent too: a long media stem
+        # plus a legacy sidecar suffix can exceed NAME_MAX.
+        if exc.errno in (errno.ENOENT, errno.ENAMETOOLONG):
+            return False
+        raise
     return True
 
 

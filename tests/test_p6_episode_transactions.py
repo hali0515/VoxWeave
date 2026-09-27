@@ -781,6 +781,8 @@ def test_process_output_snapshot_precedes_voiceprint_media_snapshot(
             raise AssertionError("media snapshot ran before output snapshot")
 
     monkeypatch.setattr(pipeline, "MediaSnapshot", ForbiddenSnapshot)
+    # process() preflights diarization; the gated default model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
 
     with pytest.raises(IsADirectoryError) as caught:
         pipeline.process(media, diarize=True, voiceprints=True)
@@ -823,6 +825,8 @@ def test_process_voiceprint_candidate_uses_the_same_context_bound_transaction(
         "transcribe",
         lambda *_args, **_kwargs: ("en", _units(), None, [], turns, capture),
     )
+    # process() preflights diarization; the gated default model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     real_commit = episode_transaction.commit_primary_outputs
     seen: dict[str, object] = {}
 
@@ -863,6 +867,75 @@ def test_successful_segmentation_retires_stale_align_evidence(command, tmp_path)
         pipeline.split(json_path)
     assert not evidence.exists()
     assert not cached_evidence.exists()
+
+
+def test_split_reports_a_legacy_render_failure_with_its_cause(tmp_path, monkeypatch):
+    from voxweave import candidate_encoder, segmentation_candidates
+
+    json_path = tmp_path / "episode.json"
+    json_path.write_text(
+        json.dumps({"language": "en", "word_segments": _units()}), encoding="utf-8"
+    )
+
+    def fail_render(*_args, **_kwargs):
+        raise OSError("render target vanished")
+
+    monkeypatch.setattr(
+        segmentation_candidates, "project_segmentation_delivery", fail_render
+    )
+    with pytest.raises(
+        candidate_encoder.SelectedCandidateError, match="render target vanished"
+    ):
+        pipeline.split(json_path)
+    assert not (tmp_path / "episode.vtt").exists()
+
+
+@pytest.mark.parametrize("command", ["process", "split"])
+def test_segmentation_forgets_its_context_once_retired(command, tmp_path, monkeypatch):
+    from voxweave import (
+        align_context,
+        candidate_encoder,
+        segmentation_adapter,
+        segmentation_candidates,
+        segmentation_orchestration,
+    )
+    from voxweave.align_context import ContextAuthorityError, role_vector
+
+    registries = (
+        align_context._ISSUED,
+        candidate_encoder._SETS,
+        candidate_encoder._ENCODED,
+        candidate_encoder._VERIFIED,
+        segmentation_adapter._LEGACY,
+        segmentation_adapter._ADAPTER,
+        segmentation_candidates._ENCODED,
+        segmentation_candidates._VERIFIED,
+    )
+    issued = []
+    issue = segmentation_orchestration.issue_segmentation_context
+
+    def capture_issue(*args, **kwargs):
+        context = issue(*args, **kwargs)
+        issued.append(context)
+        return context
+
+    monkeypatch.setattr(
+        segmentation_orchestration, "issue_segmentation_context", capture_issue
+    )
+    json_path = tmp_path / "episode.json"
+    json_path.write_text(
+        json.dumps({"language": "en", "word_segments": _units()}), encoding="utf-8"
+    )
+    baseline = [len(registry) for registry in registries]
+    if command == "process":
+        pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
+    else:
+        pipeline.split(json_path)
+    (context,) = issued
+    assert [len(registry) for registry in registries] == baseline
+    with pytest.raises(ContextAuthorityError) as caught:
+        role_vector(context)
+    assert caught.value.detail_code == "context-unissued"
 
 
 def test_align_legacy_evidence_writeback_retires_cached_copy(tmp_path, monkeypatch):

@@ -289,8 +289,8 @@ def cli(ctx, verbose: bool) -> None:
     "--debug",
     is_flag=True,
     default=False,
-    help="Save intermediate artifacts (fullband/vocals/chunk wavs + ASR raw/alignment) under the"
-    " per-media artifact cache for inspection.",
+    help="Save intermediate artifacts (fullband/vocals/chunk wavs + ASR text/alignment) under the"
+    " per-media artifact cache for inspection; each run replaces the previous run's set.",
 )
 @click.option(
     "--normalize/--no-normalize",
@@ -381,14 +381,16 @@ def cli(ctx, verbose: bool) -> None:
     "--min-speakers",
     type=click.IntRange(min=1),
     default=None,
-    help="Lower bound on the number of speakers for diarization (only used with --diarize;"
-    " pass both --min-speakers and --max-speakers when the count is known to steer pyannote).",
+    help="Lower bound on the number of speakers for diarization (only used with --diarize)."
+    " A bound above the voices actually found splits voices to meet it, so set it only"
+    " when a missing speaker matters more than a split one.",
 )
 @click.option(
     "--max-speakers",
     type=click.IntRange(min=1),
     default=None,
-    help="Upper bound on the number of speakers for diarization (only used with --diarize).",
+    help="Upper bound on the number of speakers for diarization (only used with --diarize);"
+    " e.g. 2 for an interview, the best lever against over-splitting noisy material.",
 )
 @click.option(
     "--context",
@@ -426,10 +428,12 @@ def cli(ctx, verbose: bool) -> None:
 @click.option(
     "--vad-mask/--no-vad-mask",
     default=None,
-    help="Suppress CTC emissions outside speech spans during alignment so words cannot"
-    " park in music/silence (recommended for sparse-dialogue movies with songs; keep"
-    " off when VAD may misjudge sung/whispered speech). Default: off, or conf"
-    " [defaults].vad_mask; same as VOXWEAVE_VAD_EMISSION_MASK=1.",
+    help="Suppress wav2vec2 CTC emissions outside speech spans during alignment so"
+    " words cannot park in music/silence (recommended for sparse-dialogue movies with"
+    " songs; keep off when VAD may misjudge sung/whispered speech). Only languages"
+    " aligned with a wav2vec2 CTC model use it (en by default); ja (MMS) and zh/yue"
+    " (Qwen) alignment ignore it. Default: off, or conf [defaults].vad_mask; same as"
+    " VOXWEAVE_VAD_EMISSION_MASK=1.",
 )
 def cmd_transcribe(
     media: Path,
@@ -666,10 +670,12 @@ cli.add_command(DeprecatedAlias("split", cmd_split))
 @click.option(
     "--vad-mask/--no-vad-mask",
     default=None,
-    help="Suppress CTC emissions outside the JSON's vad_speech spans so words cannot"
-    " park in music/silence (recommended for sparse-dialogue movies with songs;"
-    " keep off when VAD may misjudge sung/whispered speech). Default: off, or conf"
-    " [defaults].vad_mask; same as VOXWEAVE_VAD_EMISSION_MASK=1.",
+    help="Suppress wav2vec2 CTC emissions outside the JSON's vad_speech spans so words"
+    " cannot park in music/silence (recommended for sparse-dialogue movies with songs;"
+    " keep off when VAD may misjudge sung/whispered speech). Only languages aligned"
+    " with a wav2vec2 CTC model use it (en by default); ja (MMS) and zh/yue (Qwen)"
+    " alignment ignore it. Default: off, or conf [defaults].vad_mask; same as"
+    " VOXWEAVE_VAD_EMISSION_MASK=1.",
 )
 def cmd_align(
     vtt: Path,
@@ -869,8 +875,8 @@ def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
     legacy="--to",
     type=click.Choice(["mkv", "mp4", "webm"]),
     default=None,
-    help="Output container (default: keep the source container when it can store"
-    " text subtitles, else mkv).",
+    help="Output container (default: the -o extension when it names one, else keep"
+    " the source container when it can store text subtitles, else mkv).",
 )
 @click.option(
     "-o",
@@ -895,7 +901,7 @@ def cmd_pack(
     packed track is flagged default and the source's own subtitle tracks lose
     their default flag. ASS keeps its styling in mkv targets.
     Existing streams are preserved (mp4/webm targets drop image-based subtitle
-    tracks they cannot store).
+    tracks they cannot store; webm also drops cover art).
     """
     from voxweave import mux
 
@@ -957,8 +963,9 @@ def cmd_pack(
     "container",
     legacy="--to",
     type=click.Choice(["mp4", "mkv"]),
-    default="mp4",
-    help="Output container (default: mp4 for maximum player compatibility).",
+    default=None,
+    help="Output container (default: mp4 for maximum player compatibility; an -o path"
+    " ending in .mkv or .mp4 picks it).",
 )
 @click.option(
     "--font",
@@ -987,7 +994,7 @@ def cmd_burn(
     codec: str,
     encoder: str | None,
     quality: int | None,
-    container: str,
+    container: str | None,
     font: str,
     font_size: int | None,
     output: Path | None,

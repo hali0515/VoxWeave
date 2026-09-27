@@ -1,6 +1,8 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 from voxweave import pipeline
 
 
@@ -148,3 +150,22 @@ def test_align_no_routing_anchor_raises(tmp_path):
     except RuntimeError:
         raised = True
     assert raised
+
+
+def test_align_partly_untimed_vtt_names_the_untimed_cues(tmp_path):
+    # no word_segments and only some cues timed → the error counts the untimed ones
+    media, vtt, json_path = _setup(
+        tmp_path, "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n你好\n\n世界\n"
+    )
+    json_path.write_text(
+        json.dumps({"language": "zh", "word_segments": []}), encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError) as caught:
+        pipeline.align(vtt)
+    assert str(caught.value) == (
+        "ep.json has no word_segments and 1 of 2 VTT cues have no timestamps; "
+        "cannot route audio windows (give every cue a timing line, or restore "
+        "the sibling JSON's word_segments)"
+    )
+    assert caught.value.failure.kind == "qwen-route-invalid"
+    assert caught.value.failure.detail_code == "no-route-source"

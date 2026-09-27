@@ -14,7 +14,6 @@ import logging
 import os
 import threading
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("voxweave")
@@ -89,7 +88,12 @@ def _empty_cache() -> None:
         pass
 
 
-_INSTALL_CUDA = '`uv tool install --torch-backend=cu128 "voxweave[cuda]"`'
+# The README's PyPI command: without the override, the CPU onnxruntime wheel pulled in
+# by ctc-forced-aligner shadows onnxruntime-gpu and MMS alignment silently runs on CPU.
+_INSTALL_CUDA = (
+    "`uv tool install --torch-backend=cu128 --overrides "
+    '<(printf "onnxruntime; sys_platform == \'darwin\'\\n") "voxweave[cuda]"`'
+)
 
 _MISSING_HINT = (
     "Local model loading requires the voxweave[cuda] or voxweave[mps] install "
@@ -134,11 +138,6 @@ def _parse_yaml(text: str) -> dict:
         lambda loader, node: tuple(loader.construct_sequence(node)),  # pyright: ignore[reportArgumentType]
     )
     return yaml.load(text, Loader=_Loader)
-
-
-def _load_yaml(path: Path) -> dict:
-    """SafeLoader + !!python/tuple support (used by window sizes in MSST-style configs)."""
-    return _parse_yaml(path.read_text())
 
 
 # Reporter receiving byte progress for HF downloads, installed by the CLI for the lifetime of its
