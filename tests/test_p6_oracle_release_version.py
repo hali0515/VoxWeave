@@ -68,6 +68,10 @@ def _run(
     environment: dict[str, str] | None = None,
     timeout: int = 120,
 ) -> subprocess.CompletedProcess[str]:
+    if environment is None:
+        # An inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE (set by git hooks or a
+        # caller) would point the scratch repository's init/add/commit at the real one.
+        environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     return subprocess.run(
         arguments,
         cwd=cwd,

@@ -394,7 +394,9 @@ def test_unknown_verb_never_suggests_a_hidden_alias(cli_case):
     assert "'split'" not in hidden.output
     visible = _invoke(cli_case, ["rendr"])
     assert visible.exit_code == 2
-    flat = " ".join(visible.output.replace("│", " ").split())
+    # rich-click colours the panel under GITHUB_ACTIONS; compare the plain text.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", visible.output)
+    flat = " ".join(plain.replace("│", " ").split())
     assert flat.count("Did you mean 'render'?") == 1
 
 
