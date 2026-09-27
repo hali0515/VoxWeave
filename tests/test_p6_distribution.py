@@ -490,3 +490,204 @@ def test_whole_file_identity_performs_no_addition_and_drops_extra_fields():
     assert result.block_units == (({"text": "kept", "start": -0.0, "end": 2.0},),)
     assert result.relative_block_units == result.block_units
     assert math.copysign(1.0, result.block_units[0][0]["start"]) == -1.0
+
+
+def _single_call_job(block_texts, surfaces, iso):
+    d = _module()
+    blocks = tuple(d.AuthorityBlock(i, text) for i, text in enumerate(block_texts))
+    call = d.AuthorityCallInput(
+        0,
+        tuple(range(len(blocks))),
+        (0, len(surfaces)),
+        tuple(f"r{i}" for i in range(len(surfaces))),
+        tuple(surfaces),
+        "valid",
+        None,
+    )
+    receipt = d.build_authority_distribution(
+        blocks=blocks,
+        delivery_route=tuple(
+            d.RouteExpectation(i, i, "call", 0) for i in range(len(blocks))
+        ),
+        calls=(call,),
+        skipped_blocks=(),
+        route_claims=tuple(d.RouteClaim("call", 0, i, i) for i in range(len(blocks))),
+        iso=iso,
+    )
+    return blocks, call, receipt
+
+
+@pytest.mark.parametrize("iso", ["en", "ja"])
+def test_full_pass_episode_allocation_is_linear_within_production_budget(iso):
+    from voxweave.align_distribution_reference import replay_authority_distribution
+
+    # One full-pass call over a long episode: 3000 cues, 12 units each.  An
+    # allocator that scans every interval end to the end of the call spends
+    # quadratic work here and exhausts the production budget within a few cues.
+    words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf"]
+    kana = "あいうえおかきくけこさしすせそ"
+    block_texts = []
+    surfaces = []
+    for cue in range(3000):
+        if iso == "ja":
+            tokens = [kana[(cue + k) % len(kana)] for k in range(12)]
+            block_texts.append("".join(tokens) + "。")
+        else:
+            tokens = [words[(cue + k) % len(words)] for k in range(12)]
+            block_texts.append(" ".join(tokens[:6]) + ", " + " ".join(tokens[6:]) + ".")
+        surfaces.extend(tokens)
+    blocks, call, receipt = _single_call_job(block_texts, surfaces, iso)
+
+    assert receipt.status == "valid"
+    assert receipt.work.status == "complete"
+    assert receipt.expected_counts == (12,) * 3000
+    row = receipt.work.calls[0]
+    for lane in (row.allocator, row.verifier):
+        assert lane is not None
+        # Each cue tests its own units plus the one that overruns it.
+        assert lane.counters.edges <= len(surfaces) + len(blocks)
+        assert lane.counters.intervals <= len(surfaces) + len(blocks)
+    replay_authority_distribution(
+        blocks=blocks, calls=(call,), skipped=(), receipt=receipt, iso=iso
+    )
+
+
+def _brute_force_tiling(block_texts, surfaces, iso):
+    """Every tiling by exhaustive interval search, no pruning and no budget."""
+    from voxweave.core.partition_check import normalize_text
+
+    separator = "" if iso == "ja" else " "
+    targets = [normalize_text(text) for text in block_texts]
+    for text, target in zip(block_texts, targets):
+        if not text.strip():
+            return "partial-empty-ownership", None, None
+        if not target:
+            return "punctuation-only-block", None, None
+    ways = [{0: 1}] + [{} for _ in block_texts]
+    parent = {}
+    full_scan_edges = 0
+    for index, target in enumerate(targets):
+        for lo in sorted(ways[index]):
+            for hi in range(lo + 1, len(surfaces) + 1):
+                full_scan_edges += 1
+                if normalize_text(separator.join(surfaces[lo:hi])) != target:
+                    continue
+                total = ways[index + 1].get(hi, 0) + ways[index][lo]
+                ways[index + 1][hi] = min(2, total)
+                parent[index + 1, hi] = lo
+    count = ways[-1].get(len(surfaces), 0)
+    if count == 0:
+        return "allocation-no-tiling", None, full_scan_edges
+    if count == 2:
+        return "allocation-ambiguous", None, full_scan_edges
+    cuts = [len(surfaces)]
+    for row in range(len(block_texts), 0, -1):
+        cuts.append(parent[row, cuts[-1]])
+    return None, tuple(reversed(cuts)), full_scan_edges
+
+
+def test_bounded_interval_scan_matches_exhaustive_search_on_random_calls():
+    import random
+
+    from voxweave.align_distribution_reference import replay_authority_distribution
+
+    tokens = ["a", "b", "ab", "3", "7", "３", ".", ",", "-", "!", "。", "、", "", " "]
+    tokens += ["a.", "3.", ".5", "x-y", "b,", "?", "\n"]
+    rng = random.Random(20260926)
+    outcomes = set()
+    for _ in range(1500):
+        iso = rng.choice(["en", "ja"])
+        separator = "" if iso == "ja" else " "
+        surfaces = [rng.choice(tokens) for _ in range(rng.randint(1, 10))]
+        cut_count = rng.randint(0, min(3, len(surfaces) - 1))
+        cuts = sorted(rng.sample(range(1, len(surfaces)), cut_count))
+        bounds = [0, *cuts, len(surfaces)]
+        block_texts = []
+        for lo, hi in zip(bounds, bounds[1:]):
+            text = separator.join(surfaces[lo:hi])
+            if rng.random() < 0.15:
+                text += rng.choice(tokens)
+            if not text.strip():
+                text = rng.choice(["a", "3.7", text])
+            block_texts.append(text)
+        blocks, call, receipt = _single_call_job(block_texts, surfaces, iso)
+        detail, cuts_expected, full_scan_edges = _brute_force_tiling(
+            block_texts, surfaces, iso
+        )
+        row = receipt.work.calls[0]
+        assert receipt.work.status in ("complete", "invalid")
+        assert row.allocator.terminal_detail_code == detail
+        if detail is None:
+            assert cuts_expected is not None
+            assert receipt.owners == tuple(
+                call.raw_unit_ids[lo:hi]
+                for lo, hi in zip(cuts_expected, cuts_expected[1:])
+            )
+        if full_scan_edges is not None:
+            assert row.allocator.counters.edges <= full_scan_edges
+        outcomes.add(detail)
+        replay_authority_distribution(
+            blocks=blocks, calls=(call,), skipped=(), receipt=receipt, iso=iso
+        )
+    assert {None, "allocation-no-tiling", "allocation-ambiguous"} <= outcomes
+
+
+def test_normalized_join_only_grows_when_a_unit_is_appended():
+    # The allocator stops scanning a lower bound once the normalized interval is
+    # longer than the block; that is sound only while appending a unit can never
+    # shorten or rewrite the normalized prefix.
+    import itertools
+
+    from voxweave.core.partition_check import normalize_text
+
+    pieces = ["", " ", "a", "3", "３", ".", ",", "-", "。", "!", "\n", "3.", ".5"]
+    for left, right in itertools.product(pieces, repeat=2):
+        for separator in ("", " "):
+            before = normalize_text(left)
+            after = normalize_text(left + separator + right)
+            assert after.startswith(before), (left, separator, right)
+
+
+def test_reference_replays_zero_call_receipt_under_declared_test_limits():
+    from voxweave.align_distribution_reference import (
+        DistributionReferenceError,
+        replay_authority_distribution,
+    )
+
+    d = _module()
+    call_limits = d.CallWorkLimits(10, 20, 10, 100)
+    token = d._issue_test_authority_limit_qualification(
+        "zero-call-reference", call_limits, d.JobWorkLimits(2, 20, 40, 20, 200)
+    )
+    blocks = (d.AuthorityBlock(0, "   "),)
+    skipped = (
+        d.AuthoritySkippedBlockInput(0, 0, "empty-alignment-text", "whitespace"),
+    )
+    with d._with_test_authority_limit_qualification(token):
+        receipt = d.build_authority_distribution(
+            blocks=blocks,
+            delivery_route=(d.RouteExpectation(0, 0, "skip", 0),),
+            calls=(),
+            skipped_blocks=skipped,
+            route_claims=(d.RouteClaim("skip", 0, 0, 0),),
+            iso="en",
+        )
+    assert receipt.work.limit_profile_kind == "test-only"
+    assert receipt.work.calls == ()
+    replay_authority_distribution(
+        blocks=blocks,
+        calls=(),
+        skipped=skipped,
+        receipt=receipt,
+        iso="en",
+        call_limits=call_limits,
+    )
+    with pytest.raises(DistributionReferenceError, match="profile digest"):
+        replay_authority_distribution(
+            blocks=blocks,
+            calls=(),
+            skipped=skipped,
+            receipt=receipt,
+            iso="en",
+            call_limits=d.CallWorkLimits(9, 20, 10, 100),
+        )

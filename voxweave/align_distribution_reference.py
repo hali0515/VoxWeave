@@ -188,10 +188,17 @@ def _profile_digest(
     )
 
 
-def _validate_profile(work: AuthorityJobWorkReceipt) -> CallWorkLimits:
+def _validate_profile(
+    work: AuthorityJobWorkReceipt, declared_call: CallWorkLimits | None
+) -> CallWorkLimits:
     if work.limit_profile_kind not in ("production", "test-only"):
         raise DistributionReferenceError("allocator profile kind is invalid")
-    call = work.calls[0].limits if work.calls else _PRODUCTION_CALL
+    # Only call rows record the per-call limits, so a zero-call receipt cannot
+    # restate a lowered test-only profile on its own: the caller declares it.
+    if declared_call is not None:
+        call = declared_call
+    else:
+        call = work.calls[0].limits if work.calls else _PRODUCTION_CALL
     if any(row.limits != call for row in work.calls):
         raise DistributionReferenceError("allocator call limits disagree")
     if work.limit_profile_digest != _profile_digest(
@@ -397,7 +404,13 @@ def _run_lane(
                     normalized_intervals[interval] = normalize_text(
                         _joined(surfaces, lower, upper, iso)
                     )
-                if normalized_blocks[block_index] != normalized_intervals[interval]:
+                candidate = normalized_intervals[interval]
+                target = normalized_blocks[block_index]
+                if target != candidate:
+                    # Appending a unit never shortens the normalized join, so the
+                    # first interval longer than the block closes this lower bound.
+                    if len(candidate) > len(target):
+                        break
                     continue
                 if upper not in paths[block_index + 1]:
                     denied = budget.charge(
@@ -602,10 +615,17 @@ def replay_authority_distribution(
     skipped: tuple[AuthoritySkippedBlockInput, ...],
     receipt: AuthorityDistributionReceipt,
     iso: str,
+    call_limits: CallWorkLimits | None = None,
 ) -> None:
-    """Recompute and require the complete producer receipt exactly."""
+    """Recompute and require the complete producer receipt exactly.
+
+    ``call_limits`` is the per-call half of the effective limit profile the
+    producer ran under.  When given, every call row must carry it and the
+    receipt's profile digest is recomputed from it, which is the only way to
+    check the digest of a zero-call receipt under a lowered test-only profile.
+    """
     work = receipt.work
-    call_limits = _validate_profile(work)
+    call_limits = _validate_profile(work, call_limits)
     if type(iso) is not str or not iso:
         raise DistributionReferenceError("allocator language is invalid")
     blocks_by_source = {block.source_index: block for block in blocks}

@@ -732,6 +732,12 @@ def _run_allocator_lane(
                         _join_surfaces(surfaces, lo, hi, iso)
                     )
                 if block_cache[index] != interval_cache[key]:
+                    # normalize_text only grows when a unit is appended: the one
+                    # context-sensitive rule (a "." or "," survives before a digit)
+                    # can only revive the old last character.  Once the interval is
+                    # longer than the block, no longer interval from lo can match.
+                    if len(interval_cache[key]) > len(block_cache[index]):
+                        break
                     continue
                 if hi not in ways[index + 1]:
                     denied = budget.reserve(
@@ -859,6 +865,12 @@ def _run_verifier_lane(
                         _join_surfaces(surfaces, lower, upper, iso)
                     )
                 if normalized_blocks[block_index] != normalized_intervals[interval]:
+                    # Same monotone stop as the allocator: a normalized interval
+                    # never shrinks as upper grows, so an overlong one ends the scan.
+                    if len(normalized_intervals[interval]) > len(
+                        normalized_blocks[block_index]
+                    ):
+                        break
                     continue
                 if upper not in reachable[block_index + 1]:
                     denied = budget.reserve(

@@ -1220,6 +1220,17 @@ def _r_transform(
     capture: StrictCaptureResult,
     retained_count: int,
 ) -> AuthorityTransformResult:
+    # Same precedence as the producer's transform: a capture failure outranks a
+    # geometry failure, so when both are present the locator is the capture's.
+    if capture.status != "valid":
+        return AuthorityTransformResult(
+            call.call_index,
+            "invalid",
+            capture,
+            None,
+            None,
+            capture.failure,
+        )
     if call.geometry_failure is not None:
         return AuthorityTransformResult(
             call.call_index,
@@ -1229,7 +1240,7 @@ def _r_transform(
             None,
             call.geometry_failure,
         )
-    if capture.status != "valid" or capture.units is None:
+    if capture.units is None:
         return AuthorityTransformResult(
             call.call_index,
             "invalid",
@@ -1596,6 +1607,7 @@ def _r_replay_distribution(
             skipped=tuple(skipped),
             receipt=facts.distribution,
             iso=facts.language,
+            call_limits=facts.authority_profile.call,
         )
     except DistributionReferenceError as exc:
         raise EvidenceCoreProjectionError(
