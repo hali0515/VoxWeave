@@ -19,7 +19,11 @@ class FakeClient:
         self.calls.append(messages)
         content = self._contents.pop(0)
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content), finish_reason="stop"
+                )
+            ]
         )
 
 

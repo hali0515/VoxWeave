@@ -74,6 +74,13 @@ def test_to_iso3_unknown_code_warns(caplog):
     assert any("unknown language" in rec.message.lower() for rec in caplog.records)
 
 
+def test_to_iso3_table_covers_exactly_the_aligner_languages():
+    # its callers (MMS alignment, pack's language tags) only ever pass one of the 11
+    from voxweave import lang
+
+    assert set(lang._ISO1_TO_ISO3) == set(lang._ISO_TO_NAME)
+
+
 # --- transcript-aware auto-detection -------------------------------------- #
 
 

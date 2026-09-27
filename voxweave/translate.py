@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import TypeVar
 
 from voxweave import config, fsio
-from voxweave.realign import render_cues
 from voxweave.speakers import voice_text_for_block
 
 log = logging.getLogger("voxweave")
@@ -25,9 +24,6 @@ _sleep = time.sleep
 # blips, short enough that a hard failure surfaces within seconds.
 _RETRY_DELAYS = (2.0, 8.0)
 
-# Built-in only: env / conf [llm] are resolved at call time (config.resolve_llm_model)
-# by the CLI and pipeline, never at import (a test or library import must not read the user conf).
-TRANSLATE_MODEL = config.DEFAULT_LLM_MODEL
 # Cue cap of the SEQUENTIAL planner (concurrency == 1). Set high (800) so a typical
 # episode (300-500 cues) fits in one call: with one window there are no seams, hence no
 # cross-window disambiguation errors or inconsistent proper-noun rendering, and only very
@@ -347,14 +343,6 @@ def translated_rows(
     return [(b.get("start"), b.get("end"), _text(i, b)) for i, b in enumerate(blocks)]
 
 
-def render_translated_vtt(
-    blocks: list[dict], trans: dict[int, str], to_iso: str | None = None
-) -> str:
-    """Translated blocks -> VTT (see :func:`translated_rows`); blocks without
-    timestamps produce plain-text cues."""
-    return render_cues(translated_rows(blocks, trans, to_iso))
-
-
 def format_glossary(glossary: dict[str, str] | str | None) -> str:
     """Glossary -> prompt fragment; dict is rendered as 'source -> translation' lines, str is returned as-is."""
     if not glossary:
@@ -502,21 +490,18 @@ def resolve_model(client, model: str) -> str:
     )
 
 
-# Marker for "this response object does not expose finish_reason at all" (fakes,
-# minimal shims). Only a response that exposes the field can be judged incomplete;
-# the real SDK always exposes it (``None`` until the finish chunk arrives).
-_NO_FINISH_FIELD = object()
-
-
 def _check_complete(finish_reason: object, text: str) -> None:
     """Raise :class:`IncompleteResponse` unless the response finished with ``"stop"``.
 
-    ``None`` means the stream ended without a finish chunk (the server dropped the
-    request mid-answer); ``"length"`` / ``"abort"`` / anything else means the text
-    is cut short -- a truncated JSON object never parses, so treating the window as
-    "no result" and retrying beats silently accepting a partial buffer.
+    ``None`` means no finish reason was reported: a stream that ended without its
+    finish chunk (the server dropped the request mid-answer), or a response that
+    left the field out (the SDK exposes a missing field as ``None``, and so does
+    :func:`_call` for a client object without the attribute). ``"length"`` /
+    ``"abort"`` / anything else means the text is cut short -- a truncated JSON
+    object never parses, so treating the window as "no result" and retrying beats
+    silently accepting a partial buffer.
     """
-    if finish_reason is _NO_FINISH_FIELD or finish_reason == "stop":
+    if finish_reason == "stop":
         return
     raise IncompleteResponse(
         finish_reason if isinstance(finish_reason, str) else None, text
@@ -544,7 +529,7 @@ def _call(
     prose) -- the fallback for servers whose structured-output path aborts requests.
 
     Both paths check the final ``finish_reason`` and raise :class:`IncompleteResponse`
-    unless it is ``"stop"``; a response that never exposes the field is trusted.
+    unless it is ``"stop"`` (see :func:`_check_complete`).
     """
     request_options: dict = (
         {"reasoning_effort": reasoning_effort}
@@ -561,12 +546,12 @@ def _call(
         )
         choice = resp.choices[0]
         text = choice.message.content or ""
-        _check_complete(getattr(choice, "finish_reason", _NO_FINISH_FIELD), text)
+        _check_complete(getattr(choice, "finish_reason", None), text)
         return text
 
     buf: list[str] = []
     seen = 0
-    finish_reason: object = _NO_FINISH_FIELD
+    finish_reason: object = None
     stream = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -578,13 +563,10 @@ def _call(
             if not getattr(chunk, "choices", None):
                 continue  # trailing usage-only chunks have no choices
             choice = chunk.choices[0]
-            reason = getattr(choice, "finish_reason", _NO_FINISH_FIELD)
-            if reason is not _NO_FINISH_FIELD and (
-                reason is not None or finish_reason is _NO_FINISH_FIELD
-            ):
-                # A non-None reason is final; None only records that the field exists
-                # so an early-terminated stream is caught, without erasing a "stop"
-                # already seen (servers may trail an empty-delta chunk).
+            reason = getattr(choice, "finish_reason", None)
+            if reason is not None:
+                # A reported reason is final: a later None (servers may trail an
+                # empty-delta chunk) must not erase a "stop" already seen.
                 finish_reason = reason
             piece = getattr(getattr(choice, "delta", None), "content", None)
             if not piece:
@@ -650,25 +632,15 @@ def _with_retry(fn: Callable[[], _T], *, label: str = "translate call") -> _T:
     raise AssertionError("unreachable")
 
 
-def _call_options(reasoning_effort: str | None, json_mode: bool) -> dict:
-    """Keyword arguments forwarded to :func:`_call`, omitting defaults so a
-    minimal ``_call`` replacement (tests) keeps working."""
-    options: dict = {}
-    if reasoning_effort is not None:
-        options["reasoning_effort"] = reasoning_effort
-    if not json_mode:
-        options["json_mode"] = False
-    return options
-
-
 def _block_index(unit_index: int) -> int:
     """Translation-unit index -> its cue (block) index; dash halves share one cue."""
     return unit_index % _DASH_UNIT_BASE
 
 
 def _window_label(position: int, win: list[dict]) -> str:
-    first = _block_index(win[0]["i"])
-    last = _block_index(win[-1]["i"])
+    """Log label naming the window's cues by 1-based cue number, as players show them."""
+    first = _block_index(win[0]["i"]) + 1
+    last = _block_index(win[-1]["i"]) + 1
     return f"window {position + 1} (cues {first}-{last})"
 
 
@@ -700,7 +672,7 @@ def _parse_window(raw: str, win_ids: list[int], *, label: str) -> dict[int, str]
             label,
             len(missing),
             len(win_ids),
-            _short_indices([_block_index(i) for i in missing]),
+            _short_indices([_block_index(i) + 1 for i in missing]),
         )
     return parsed
 
@@ -760,7 +732,8 @@ def _request_window(
             model,
             messages,
             on_entry=on_entry,
-            **_call_options(reasoning_effort, json_mode),
+            reasoning_effort=reasoning_effort,
+            json_mode=json_mode,
         )
         return _parse_window(raw, win_ids, label=label)
 
@@ -813,7 +786,9 @@ def save_progress(path: Path, sig: str | None, trans: dict[int, str]) -> None:
     """Persist completed translations (atomic) so an interrupted multi-window
     run can resume instead of re-translating from zero."""
     doc = {"sig": sig, "translations": {str(i): t for i, t in trans.items()}}
-    fsio.atomic_write_text(Path(path), json.dumps(doc, ensure_ascii=False))
+    fsio.atomic_write_text(
+        Path(path), json.dumps(doc, ensure_ascii=False), private=True
+    )
 
 
 def load_progress(path: Path, sig: str | None) -> dict[int, str]:

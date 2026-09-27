@@ -728,10 +728,7 @@ def capture_songdet(args: argparse.Namespace) -> Path:
     silences = [[round(a, 3), round(b, 3)] for a, b in silence_gaps(fine)]
 
     # Current (correct) behavior -> golden snapshot
-    song = songdet.merge_spans(songdet.song_flags(probs), t)
-    sing_starts = [tt for tt, f in zip(t, songdet.sing_flags(probs)) if f]
-    sing_spans = [(a, b) for (a, b) in song if any(a <= x < b for x in sing_starts)]
-    speech_spans = songdet.merge_spans(songdet.speech_flags(probs), t)
+    song, sing_spans, speech_spans = songdet.spans_from_scores(speech, sing, music, t)
     _, final, kept, chunks = plan_song_skip(
         song,
         sing_spans,

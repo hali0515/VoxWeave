@@ -16,17 +16,9 @@ from voxweave import config
 log = logging.getLogger("voxweave")
 
 
-def _env_float(name: str, default: float) -> float:
-    """Import-time float knob via the tolerant ``config._env_float``: a malformed value falls
-    back to ``default`` instead of raising (which would break every CLI command, even
-    ``--help``), with a warning naming the variable."""
-    raw = os.environ.get(name, "").strip()
-    if raw:
-        try:
-            float(raw)
-        except ValueError:
-            log.warning("ignoring %s=%r (not a number); using %s", name, raw, default)
-    return config._env_float(name, default)
+# Import-time float knobs: a malformed value warns (once, naming the variable) and falls back
+# to the default instead of raising, which would break every CLI command, even ``--help``.
+_env_float = config._env_float
 
 
 # PANNs Cnn14 training SR — must feed 32k; 16k input causes a sample-rate mismatch.
@@ -367,6 +359,20 @@ def merge_spans(
     return [(a, b) for a, b in spans if b - a >= min_span]
 
 
+def _union_spans(spans: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Sort ``spans`` and merge the overlapping or touching ones. Pure function."""
+    if not spans:
+        return []
+    ordered = sorted(spans)
+    merged: list[list[float]] = [list(ordered[0])]
+    for a, b in ordered[1:]:
+        if a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
 def _snap_cut(c: float, silences: list[tuple[float, float]], snap_sec: float) -> float:
     """Snap a cut point into the nearest real silence within ±snap_sec; return c unchanged if none.
 
@@ -421,14 +427,7 @@ def excise_spans_from_segments(
         if cb <= ca:  # snapping inverted a brief span — keep the raw edges
             ca, cb = a, b
         cuts.append((ca, cb))
-    cuts.sort()
-    merged: list[list[float]] = [list(cuts[0])]
-    for a, b in cuts[1:]:
-        if a <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], b)
-        else:
-            merged.append([a, b])
-    cut_spans = [(a, b) for a, b in merged]
+    cut_spans = _union_spans(cuts)
 
     kept: list[dict] = []
     for seg in segments:
@@ -560,14 +559,7 @@ def expand_spans_to_voiced_blocks(
             continue
         out.append((blk[lo]["start"], blk[hi]["end"]))
 
-    out.sort()
-    merged: list[list[float]] = [list(out[0])]
-    for a, b in out[1:]:
-        if a <= merged[-1][1]:
-            merged[-1][1] = max(merged[-1][1], b)
-        else:
-            merged.append([a, b])
-    return [(a, b) for a, b in merged]
+    return _union_spans(out)
 
 
 def group_segments_by_spans(
@@ -686,6 +678,31 @@ def window_probs(
     return np.concatenate(probs), [s / SR for s in starts_idx]
 
 
+def spans_from_scores(
+    speech: np.ndarray,
+    sing: np.ndarray,
+    music: np.ndarray,
+    starts_sec: list[float],
+) -> tuple[
+    list[tuple[float, float]], list[tuple[float, float]], list[tuple[float, float]]
+]:
+    """Per-window ``(speech, sing, music)`` scores -> the three span lists of
+    :func:`detect_song_spans`: ``(song/music spans, singing spans, clean-dialogue spans)``.
+
+    A song span counts as singing when any window flagged by :func:`sing_flags_from_scores`
+    starts inside it. Pure function: scenario replays and the capture script feed it the
+    stored score arrays, so they derive spans exactly as detection does.
+    """
+    spans = merge_spans(song_flags_from_scores(speech, sing, music), starts_sec)
+    sing_fl = sing_flags_from_scores(speech, sing, music)
+    sing_starts = [t for t, f in zip(starts_sec, sing_fl, strict=True) if f]
+    sing_spans = [(a, b) for (a, b) in spans if any(a <= t < b for t in sing_starts)]
+    speech_spans = merge_spans(
+        speech_flags_from_scores(speech, sing, music), starts_sec
+    )
+    return spans, sing_spans, speech_spans
+
+
 def detect_song_spans(
     wav_path: Path, *, batch: int = 32, progress=None
 ) -> tuple[
@@ -708,10 +725,7 @@ def detect_song_spans(
     if wp is None:
         return [], [], []
     P, starts_sec = wp
-    spans = merge_spans(song_flags(P), starts_sec)
-    sing_starts = [t for t, f in zip(starts_sec, sing_flags(P), strict=True) if f]
-    sing_spans = [(a, b) for (a, b) in spans if any(a <= t < b for t in sing_starts)]
-    speech_spans = merge_spans(speech_flags(P), starts_sec)
+    spans, sing_spans, speech_spans = spans_from_scores(*reduce_scores(P), starts_sec)
     log.info(
         "song-detect: %d span(s) (%d with singing), %.1fs total; %d clean-dialogue span(s)",
         len(spans),

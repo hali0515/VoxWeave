@@ -6,6 +6,38 @@ import pytest
 
 from voxweave import artifacts, pipeline, translate
 from voxweave.progress import Reporter
+from voxweave.realign import render_cues
+
+
+def render_translated_vtt(blocks, trans, to_iso=None):
+    """Translated blocks -> VTT, the way the translate pipeline renders them."""
+    return render_cues(translate.translated_rows(blocks, trans, to_iso))
+
+
+def _completion(content):
+    """A finished (``finish_reason == "stop"``) non-streaming response, SDK-shaped."""
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=content), finish_reason="stop"
+            )
+        ]
+    )
+
+
+def _stream(pieces):
+    """SDK-shaped stream chunks: ``finish_reason`` None until the final "stop" chunk."""
+    for p in pieces:
+        yield SimpleNamespace(
+            choices=[
+                SimpleNamespace(delta=SimpleNamespace(content=p), finish_reason=None)
+            ]
+        )
+    yield SimpleNamespace(
+        choices=[
+            SimpleNamespace(delta=SimpleNamespace(content=None), finish_reason="stop")
+        ]
+    )
 
 
 class FakeClient:
@@ -18,9 +50,7 @@ class FakeClient:
 
     def _create(self, *, model, messages, **kw):
         self.calls.append(messages)
-        content = self._contents.pop(0)
-        msg = SimpleNamespace(content=content)
-        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+        return _completion(self._contents.pop(0))
 
 
 class FakeStreamClient:
@@ -32,16 +62,8 @@ class FakeStreamClient:
 
     def _create(self, *, model, messages, stream=False, **kw):
         if stream:
-            return (
-                SimpleNamespace(
-                    choices=[SimpleNamespace(delta=SimpleNamespace(content=p))]
-                )
-                for p in self._pieces
-            )
-        full = "".join(self._pieces)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=full))]
-        )
+            return _stream(self._pieces)
+        return _completion("".join(self._pieces))
 
 
 class _RecordingReporter(Reporter):
@@ -120,7 +142,7 @@ def test_render_timestamped():
         {"text": "hi", "start": 1.0, "end": 2.5},
         {"text": "yo", "start": 3.0, "end": 4.0},
     ]
-    out = translate.render_translated_vtt(blocks, {0: "你好", 1: "喲"})
+    out = render_translated_vtt(blocks, {0: "你好", 1: "喲"})
     assert out.startswith("WEBVTT\n\n")
     assert "00:00:01.000 --> 00:00:02.500\n你好" in out
     assert "00:00:03.000 --> 00:00:04.000\n喲" in out
@@ -128,7 +150,7 @@ def test_render_timestamped():
 
 def test_render_falls_back_to_original_when_missing():
     blocks = [{"text": "keepme", "start": 1.0, "end": 2.0}]
-    out = translate.render_translated_vtt(blocks, {})
+    out = render_translated_vtt(blocks, {})
     assert "keepme" in out
 
 
@@ -137,7 +159,7 @@ def test_render_no_timestamps_plain_blocks():
         {"text": "a", "start": None, "end": None},
         {"text": "b", "start": None, "end": None},
     ]
-    out = translate.render_translated_vtt(blocks, {0: "甲", 1: "乙"})
+    out = render_translated_vtt(blocks, {0: "甲", 1: "乙"})
     assert "-->" not in out
     assert out.startswith("WEBVTT\n\n")
     assert "甲" in out and "乙" in out
@@ -653,7 +675,7 @@ def test_strip_punct_keeps_name_joiner():
 
 def test_render_strips_translated_punctuation():
     blocks = [{"text": "x", "start": 1.0, "end": 2.0}]
-    out = translate.render_translated_vtt(blocks, {0: "喂「等一下」……"})
+    out = render_translated_vtt(blocks, {0: "喂「等一下」……"})
     assert "喂 等一下" in out
     assert "「" not in out and "…" not in out
 
@@ -690,7 +712,7 @@ def _cue_lines(vtt: str) -> list[str]:
 
 def test_render_translated_wraps_long_zh_to_two_lines():
     blocks = [{"start": 1.0, "end": 4.0, "text": "source"}]
-    out = translate.render_translated_vtt(blocks, {0: "字" * 30}, to_iso="zh")
+    out = render_translated_vtt(blocks, {0: "字" * 30}, to_iso="zh")
     lines = _cue_lines(out)
     assert len(lines) == 2  # 60 visual width -> balanced two lines
     assert "".join(lines) == "字" * 30  # content preserved
@@ -723,13 +745,13 @@ def test_layout_translated_cjk_fold_still_applies_kinsoku():
 
 def test_render_translated_short_zh_stays_single_line():
     blocks = [{"start": 1.0, "end": 4.0, "text": "source"}]
-    out = translate.render_translated_vtt(blocks, {0: "字" * 10}, to_iso="zh")
+    out = render_translated_vtt(blocks, {0: "字" * 10}, to_iso="zh")
     assert len(_cue_lines(out)) == 1
 
 
 def test_render_translated_no_iso_keeps_legacy_no_wrap():
     blocks = [{"start": 1.0, "end": 4.0, "text": "source"}]
-    out = translate.render_translated_vtt(blocks, {0: "字" * 30})
+    out = render_translated_vtt(blocks, {0: "字" * 30})
     assert len(_cue_lines(out)) == 1
 
 
@@ -763,10 +785,7 @@ class FlakyClient:
         if self.fail_times > 0:
             self.fail_times -= 1
             raise ConnectionError("transient network error")
-        content = self._contents.pop(0)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
-        )
+        return _completion(self._contents.pop(0))
 
 
 def _payload(n):
@@ -798,7 +817,7 @@ def test_translate_cues_raises_after_retries_exhausted(monkeypatch):
 
 def test_window_failure_persists_completed_windows(tmp_path, monkeypatch):
     monkeypatch.setattr(translate, "_sleep", lambda _s: None)
-    # window 1 (cues 0-1) succeeds; window 2 (cues 2-3) fails every attempt
+    # window 1 (cues 1-2) succeeds; window 2 (cues 3-4) fails every attempt
     client = FlakyClient([_resp(range(2))], fail_times=0)
     orig = client._create
 
@@ -1088,18 +1107,8 @@ class DashEchoClient:
     def _create(self, *, model, messages, stream=False, **kw):
         content = self._payload(messages)
         if stream:
-            return iter(
-                [
-                    SimpleNamespace(
-                        choices=[
-                            SimpleNamespace(delta=SimpleNamespace(content=content))
-                        ]
-                    )
-                ]
-            )
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
-        )
+            return _stream([content])
+        return _completion(content)
 
 
 def _received_cues(messages):
@@ -1128,7 +1137,7 @@ def test_dash_cue_renders_two_speaker_lines():
     payload = translate.build_payload(blocks)
     client = DashEchoClient({"Hello": "你好", "Bye": "再见"})
     trans = translate.translate_cues(payload, to="zh", model="m", client=client)
-    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    out = render_translated_vtt(blocks, trans, to_iso="zh")
     assert _cue_lines(out) == ["-你好", "-再见"]
     assert out.count("-->") == 1  # still one cue
 
@@ -1140,7 +1149,7 @@ def test_dash_cue_strips_model_prepended_dash_and_reapplies_our_own():
     payload = translate.build_payload(blocks)
     client = DashEchoClient({"Hello": "- 你好", "Bye": "—再见"})
     trans = translate.translate_cues(payload, to="zh", model="m", client=client)
-    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    out = render_translated_vtt(blocks, trans, to_iso="zh")
     assert _cue_lines(out) == ["-你好", "-再见"]
 
 
@@ -1159,7 +1168,7 @@ def test_dash_cue_halves_never_merge_or_wrap_even_over_budget():
     long = "字" * 30  # width 60: a normal cue would wrap this to two lines
     client = DashEchoClient({"A": long, "B": "短"})
     trans = translate.translate_cues(payload, to="zh", model="m", client=client)
-    lines = _cue_lines(translate.render_translated_vtt(blocks, trans, to_iso="zh"))
+    lines = _cue_lines(render_translated_vtt(blocks, trans, to_iso="zh"))
     assert len(lines) == 2  # not 3+; the long half was NOT wrapped
     assert lines[0] == "-" + long  # over-budget half stays on one line
     assert lines[1] == "-短"
@@ -1175,7 +1184,7 @@ def test_dash_cue_conserves_count_in_mixed_batch():
     payload = translate.build_payload(blocks)
     client = DashEchoClient({"plain one": "甲", "A": "a", "B": "b", "plain two": "乙"})
     trans = translate.translate_cues(payload, to="zh", model="m", client=client)
-    out = translate.render_translated_vtt(blocks, trans)
+    out = render_translated_vtt(blocks, trans)
     assert out.count("-->") == 3  # three cues in, three cues out
     assert "-a\n-b" in out  # dash cue kept its two speaker lines
 
@@ -1184,7 +1193,7 @@ def test_dash_cue_missing_translation_falls_back_to_source_two_lines():
     # both halves missing -> fall back to the source cue, still exactly two lines,
     # still unwrapped (dash structure preserved even on fallback)
     blocks = [{"text": "-Hello\n-Bye", "start": 1.0, "end": 2.0}]
-    out = translate.render_translated_vtt(blocks, {}, to_iso="zh")
+    out = render_translated_vtt(blocks, {}, to_iso="zh")
     assert _cue_lines(out) == ["-Hello", "-Bye"]
 
 
@@ -1205,7 +1214,7 @@ def test_single_dash_line_is_ordinary_cue():
     assert "parts" not in payload[0]
     client = DashEchoClient({"-just one line": "仅一行"})
     trans = translate.translate_cues(payload, to="zh", model="m", client=client)
-    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    out = render_translated_vtt(blocks, trans, to_iso="zh")
     assert _cue_lines(out) == ["仅一行"]  # single line, no re-applied dash
 
 
@@ -1218,9 +1227,7 @@ def test_three_dash_lines_is_ordinary_cue():
     trans = translate.translate_cues(payload, to="zh", model="m", client=client)
     cues = _received_cues(client.calls[0])
     assert len(cues) == 1  # one unit, not expanded
-    assert _cue_lines(translate.render_translated_vtt(blocks, trans, to_iso="zh")) == [
-        "甲乙丙"
-    ]
+    assert _cue_lines(render_translated_vtt(blocks, trans, to_iso="zh")) == ["甲乙丙"]
 
 
 def test_lyric_flagged_dash_lines_not_treated_as_dual_speaker():
@@ -1230,7 +1237,7 @@ def test_lyric_flagged_dash_lines_not_treated_as_dual_speaker():
     assert "parts" not in payload[0]
     client = DashEchoClient({"-la -la": "啦啦"})
     trans = translate.translate_cues(payload, to="zh", model="m", client=client)
-    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    out = render_translated_vtt(blocks, trans, to_iso="zh")
     assert "♪ 啦啦 ♪" in out
     assert "-啦" not in out  # not rendered as a dash cue
 
@@ -1245,7 +1252,7 @@ def test_dash_cue_round_trips_through_vtt_parse():
     payload = translate.build_payload(blocks)
     client = DashEchoClient({"Hello": "你好", "Bye": "再见"})
     trans = translate.translate_cues(payload, to="zh", model="m", client=client)
-    out = translate.render_translated_vtt(blocks, trans, to_iso="zh")
+    out = render_translated_vtt(blocks, trans, to_iso="zh")
     assert _cue_lines(out) == ["-你好", "-再见"]
 
 
@@ -1354,10 +1361,23 @@ def test_call_raises_incomplete_on_non_stop_finish_reason():
     assert translate._retryable(exc)
 
 
-def test_call_accepts_stop_and_tolerates_shapes_without_finish_field():
+def test_call_accepts_stop_and_treats_a_missing_finish_reason_as_incomplete():
     assert translate._call(FinishClient([("{}", "stop")]), "m", _MSGS) == "{}"
-    # Minimal fakes (no finish_reason attribute at all) are trusted as complete.
-    assert translate._call(FakeClient(["{}"]), "m", _MSGS) == "{}"
+    # The SDK exposes a finish_reason the server left out as None; a client object
+    # without the attribute at all is read the same way: nothing says it finished.
+    bare = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **_kw: SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))]
+                )
+            )
+        )
+    )
+    for client in (FinishClient([("{}", None)]), bare):
+        with pytest.raises(translate.IncompleteResponse) as failure:
+            translate._call(client, "m", _MSGS)
+        assert failure.value.finish_reason is None
 
 
 def test_call_stream_without_finish_chunk_is_incomplete():
@@ -1458,8 +1478,9 @@ def test_partial_window_coverage_is_logged_not_raised(caplog):
         out = translate.translate_cues(_payload(3), to="zh", model="m", client=client)
     assert out == {0: "tx 0"}
     assert len(client.calls) == 1
+    # 1-based cue numbers, as players and the PartialTranslationError count them
     assert any(
-        "2 of 3 cues missing from the response: 1, 2" in r.message
+        "window 1 (cues 1-3): 2 of 3 cues missing from the response: 2, 3" in r.message
         for r in caplog.records
     )
 

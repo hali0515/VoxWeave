@@ -343,6 +343,7 @@ def test_get_whisper_dispatches_to_mlx(monkeypatch):
 def test_mlx_get_whisper_reloads_on_size_change(monkeypatch):
     monkeypatch.setattr(backend_mlx, "_whisper", None)
     monkeypatch.setattr(backend_mlx, "_whisper_id", None)
+    monkeypatch.setitem(sys.modules, "mlx_whisper", types.ModuleType("mlx_whisper"))
     monkeypatch.setattr(
         backend_mlx, "_hf_snapshot", lambda repo, cache: f"/snap/{repo.split('/')[-1]}"
     )
@@ -374,6 +375,22 @@ def test_load_missing_mlx_audio_raises_friendly(monkeypatch):
     monkeypatch.setitem(sys.modules, "mlx_audio", None)
     with pytest.raises(RuntimeError, match=r"voxweave\[mps\]"):
         backend_mlx._load("mlx-community/Qwen3-ASR-0.6B-8bit", "/tmp/cache")
+
+
+def test_get_whisper_missing_mlx_whisper_fails_at_load(monkeypatch):
+    # A missing mlx_whisper is a load failure (propagated once by backend's ASR pass),
+    # not something to rediscover in every chunk's transcribe() call.
+    monkeypatch.setattr(backend_mlx, "_whisper", None)
+    monkeypatch.setattr(backend_mlx, "_whisper_id", None)
+    monkeypatch.setitem(sys.modules, "mlx_whisper", None)
+
+    def _no_download(*_a, **_k):
+        raise AssertionError("nothing may download without mlx_whisper")
+
+    monkeypatch.setattr(backend_mlx, "_hf_snapshot", _no_download)
+    with pytest.raises(RuntimeError, match=r"voxweave\[mps\].*mlx_whisper"):
+        backend_mlx.get_whisper("large-v3")
+    assert backend_mlx._whisper is None
 
 
 def test_release_is_noop_without_mlx(monkeypatch):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 import subprocess
 import tempfile
@@ -12,31 +11,10 @@ import soundfile as sf
 from voxweave import config
 from voxweave.align_failures import CanonicalFailure
 
-log = logging.getLogger("voxweave")
-
-
-def _env_int(name: str, default: int) -> int:
-    """Import-time int knob via the tolerant ``config._env_int``: a malformed value falls
-    back to ``default`` instead of raising (which would break every CLI command, even
-    ``--help``), with a warning naming the variable."""
-    raw = os.environ.get(name, "").strip()
-    if raw:
-        try:
-            int(raw)
-        except ValueError:
-            log.warning("ignoring %s=%r (not an integer); using %s", name, raw, default)
-    return config._env_int(name, default)
-
-
-def _env_float(name: str, default: float) -> float:
-    """Float counterpart of :func:`_env_int` (``config._env_float``, warning on a typo)."""
-    raw = os.environ.get(name, "").strip()
-    if raw:
-        try:
-            float(raw)
-        except ValueError:
-            log.warning("ignoring %s=%r (not a number); using %s", name, raw, default)
-    return config._env_float(name, default)
+# Import-time numeric knobs: a malformed value warns (once, naming the variable) and falls back
+# to the default instead of raising, which would break every CLI command, even ``--help``.
+_env_int = config._env_int
+_env_float = config._env_float
 
 
 SAMPLE_RATE = 16000

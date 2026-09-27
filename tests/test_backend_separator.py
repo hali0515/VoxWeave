@@ -81,3 +81,72 @@ def test_separate_vocals_removes_temp_flac_when_the_write_fails(monkeypatch, tmp
     with pytest.raises(OSError, match="No space left"):
         backend.separate_vocals(tmp_path / "in.wav")
     assert made and not any(p.exists() for p in made)
+
+
+def test_separator_model_dir_follows_the_cache_root_without_import_side_effects(
+    tmp_path,
+):
+    # The explicit-ckpt directory defaults to VOXWEAVE_CACHE_ROOT like every other
+    # model path, and importing the backend touches no directory (it used to rename
+    # a pre-rename ~/.cache/qsub into place at import time).
+    import os
+    import subprocess
+    import sys
+
+    home = tmp_path / "home"
+    legacy = home / ".cache" / "qsub"
+    legacy.mkdir(parents=True)
+    root = tmp_path / "models"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("VOXWEAVE_")}
+    env.update(HOME=str(home), VOXWEAVE_CACHE_ROOT=str(root))
+    probe = (
+        "from voxweave import backend; "
+        "print(backend.MODEL_DIR); print(backend.SEPARATOR_CKPT)"
+    )
+    # mirror -S so the child imports the same voxweave as this interpreter
+    flags = ["-S"] if sys.flags.no_site else []
+    out = subprocess.run(
+        [sys.executable, *flags, "-c", probe],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert out == [str(root), str(root / "vocals_mel_band_roformer.ckpt")]
+    assert legacy.is_dir() and not (home / ".cache" / "voxweave").exists()
+
+
+def test_separate_vocals_scopes_tf32_to_the_forward(monkeypatch, tmp_path):
+    # TF32 matmuls speed up the roformer, but the policy is process-wide: it must be
+    # back to what it was once separation returns, or later fp32 stages (PANNs, the
+    # wav2vec2 aligner) would compute differently on a vocals-cache miss than on a hit
+    torch = pytest.importorskip("torch")
+    import soundfile as sf
+
+    monkeypatch.delenv("VOXWEAVE_TF32", raising=False)
+    seen: list[str] = []
+
+    def fake_demix(*_a, **_k):
+        seen.append(torch.get_float32_matmul_precision())
+        return torch.zeros(2, 64)
+
+    monkeypatch.setattr(
+        sf, "read", lambda *a, **k: (np.zeros((64, 2), dtype=np.float32), 44100)
+    )
+    monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: "off")
+    monkeypatch.setattr(backend, "get_device", lambda: "cuda:0")
+    monkeypatch.setattr(
+        backend, "_load_separator", lambda autocast=None: (object(), {}, {})
+    )
+    monkeypatch.setattr(backend, "_demix", fake_demix)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+
+    before = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        out = backend.separate_vocals(tmp_path / "in.wav")
+        out.unlink()
+        assert seen == ["high"]
+        assert torch.get_float32_matmul_precision() == "highest"
+    finally:
+        torch.set_float32_matmul_precision(before)

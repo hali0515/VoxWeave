@@ -648,3 +648,38 @@ def test_rescue_speech_segments_no_speech_spans():
     from voxweave.songdet import rescue_speech_segments
 
     assert rescue_speech_segments([], [{"start": 0.0, "end": 5.0}]) == []
+
+
+def test_union_spans_sorts_and_merges_overlapping_or_touching():
+    assert songdet._union_spans([]) == []
+    assert songdet._union_spans([(5.0, 6.0), (1.0, 3.0), (2.0, 4.0), (4.0, 4.5)]) == [
+        (1.0, 4.5),
+        (5.0, 6.0),
+    ]
+
+
+def test_spans_from_scores_matches_the_probability_path():
+    # detect_song_spans, scenario replays and the capture script all derive spans
+    # through spans_from_scores; it must equal the (n, 527) flag helpers exactly
+    rng = np.random.default_rng(7)
+    probs = (rng.random((240, songdet.PANNS_CLASSES)) * 0.05).astype(np.float32)
+    probs[40:90, IDX_SING] = 0.9  # a sung stretch
+    probs[120:170, IDX_MUSIC] = 0.8  # instrumental
+    probs[120:170, IDX_SPEECH] = 0.05
+    probs[190:230, IDX_SPEECH] = 0.9  # clean dialogue
+    probs[190:230, IDX_SING] = 0.01
+    probs[190:230, IDX_MUSIC] = 0.01
+    starts = [float(i) for i in range(len(probs))]
+
+    spans, sing_spans, speech_spans = songdet.spans_from_scores(
+        *songdet.reduce_scores(probs), starts
+    )
+
+    expected = merge_spans(song_flags(probs), starts)
+    sing_starts = [t for t, f in zip(starts, sing_flags(probs)) if f]
+    assert spans == expected and spans
+    assert sing_spans == [
+        (a, b) for a, b in expected if any(a <= t < b for t in sing_starts)
+    ]
+    assert sing_spans and len(sing_spans) < len(spans)
+    assert speech_spans == merge_spans(speech_flags(probs), starts) and speech_spans

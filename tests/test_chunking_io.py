@@ -5,7 +5,8 @@ Three separate costs are pinned here:
   staying sample-identical to the full-read-then-slice reference.
 - the silero VAD model must be loaded once per process, with an explicit release hook.
 - PANNs must have the same explicit release hook so the pipeline can free its VRAM.
-Plus the separator's TF32 opt-out, which is pure flag plumbing and needs no real model.
+Plus the separator's TF32 scope and opt-out, which are pure flag plumbing and need no
+real model.
 """
 
 import math
@@ -219,7 +220,7 @@ def test_songdet_release_model_is_safe_when_nothing_is_loaded(monkeypatch):
     assert songdet._model is None
 
 
-# --- separator TF32: on by default on cuda, opt-out via VOXWEAVE_TF32 ---
+# --- separator TF32: on for the cuda forward only, opt-out via VOXWEAVE_TF32 ---
 
 
 def _fake_separator_env(monkeypatch, tmp_path, *, device: str):
@@ -262,33 +263,68 @@ def _fake_separator_env(monkeypatch, tmp_path, *, device: str):
     return precisions, checkpoint, torch_stub
 
 
-def test_load_separator_enables_tf32_on_cuda(monkeypatch, tmp_path):
+def test_load_separator_leaves_the_matmul_policy_alone(monkeypatch, tmp_path):
+    # TF32 is scoped to the separation forward (_separation_matmul_precision); loading
+    # the model must not flip the process-wide policy for every later stage
     monkeypatch.delenv("VOXWEAVE_TF32", raising=False)
     precisions, _checkpoint, _torch_stub = _fake_separator_env(
         monkeypatch, tmp_path, device="cuda"
     )
     backend._load_separator()
-    assert precisions == ["high"]
+    assert precisions == []
+
+
+def _precision_stub(monkeypatch, start: str = "highest") -> list[str]:
+    """Stub torch's matmul-precision flag; returns the list of values it was set to."""
+    state = {"value": start}
+    sets: list[str] = []
+
+    def _set(value: str) -> None:
+        sets.append(value)
+        state["value"] = value
+
+    torch_stub = types.ModuleType("torch")
+    torch_stub.get_float32_matmul_precision = lambda: state["value"]  # type: ignore[attr-defined]
+    torch_stub.set_float32_matmul_precision = _set  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+    return sets
+
+
+def test_separation_enables_tf32_on_cuda_and_restores_the_policy(monkeypatch):
+    monkeypatch.delenv("VOXWEAVE_TF32", raising=False)
+    sets = _precision_stub(monkeypatch, start="highest")
+    with backend._separation_matmul_precision("cuda:0"):
+        assert sets == ["high"]
+    # restored: later fp32 stages see the same policy on a vocals-cache hit and miss
+    assert sets == ["high", "highest"]
+
+
+def test_separation_restores_the_policy_when_the_forward_fails(monkeypatch):
+    monkeypatch.delenv("VOXWEAVE_TF32", raising=False)
+    sets = _precision_stub(monkeypatch, start="medium")
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        with backend._separation_matmul_precision("cuda"):
+            raise RuntimeError("CUDA out of memory")
+    assert sets == ["high", "medium"]
 
 
 @pytest.mark.parametrize("value", ["0", "false", "off", "FALSE", "Off"])
-def test_load_separator_tf32_opt_out(monkeypatch, tmp_path, value):
+def test_separation_tf32_opt_out(monkeypatch, value):
     # env is read at call time, not import time, so operators can flip it per run
     monkeypatch.setenv("VOXWEAVE_TF32", value)
-    precisions, _checkpoint, _torch_stub = _fake_separator_env(
-        monkeypatch, tmp_path, device="cuda"
-    )
-    backend._load_separator()
-    assert precisions == []
+    sets = _precision_stub(monkeypatch)
+    with backend._separation_matmul_precision("cuda:0"):
+        pass
+    assert sets == []
 
 
-def test_load_separator_leaves_tf32_alone_off_cuda(monkeypatch, tmp_path):
+def test_separation_leaves_tf32_alone_off_cuda(monkeypatch):
     monkeypatch.delenv("VOXWEAVE_TF32", raising=False)
-    precisions, _checkpoint, _torch_stub = _fake_separator_env(
-        monkeypatch, tmp_path, device="cpu"
-    )
-    backend._load_separator()
-    assert precisions == []
+    sets = _precision_stub(monkeypatch)
+    for dev in ("cpu", "mps"):
+        with backend._separation_matmul_precision(dev):
+            pass
+    assert sets == []
 
 
 def test_load_separator_stamps_the_autocast_mode_it_is_given(monkeypatch, tmp_path):

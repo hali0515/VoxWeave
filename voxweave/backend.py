@@ -6,14 +6,13 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Callable, Sequence
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, nullcontext
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, overload
 
 from voxweave import config
-from voxweave.align_common import interp_missing as interp_missing  # re-export
 from voxweave.align_ctc import align_blocks_full_ctc, align_text_ctc, release_ctc
 from voxweave.align_mms import (
     _is_mms_name,
@@ -28,7 +27,6 @@ from voxweave.runtime import (
     _empty_cache,
     _hf_download,
     _hf_snapshot,
-    _load_yaml as _load_yaml,  # re-export for compatibility/tests
     _model_dtype,
     _parse_yaml,
     _require,
@@ -110,22 +108,10 @@ def _select_engine(name: str | None) -> tuple[str, str]:
     return "qwen", resolve_asr_model(name)
 
 
-# Separator ckpt + companion yaml default to ~/.cache/voxweave/; model class frozen in voxweave.vendor.
-MODEL_DIR = Path(
-    os.environ.get("VOXWEAVE_MODEL_DIR", Path.home() / ".cache" / "voxweave")
-)
-# One-time migration from pre-rename ~/.cache/qsub; if it fails weights re-download from HF.
-_LEGACY_MODEL_DIR = Path.home() / ".cache" / "qsub"
-if (
-    not os.environ.get("VOXWEAVE_MODEL_DIR")
-    and not MODEL_DIR.exists()
-    and _LEGACY_MODEL_DIR.exists()
-):
-    try:
-        _LEGACY_MODEL_DIR.rename(MODEL_DIR)
-        log.info("migrated model cache %s -> %s", _LEGACY_MODEL_DIR, MODEL_DIR)
-    except OSError as e:
-        log.warning("could not migrate model cache %s (%r)", _LEGACY_MODEL_DIR, e)
+# Where an explicitly placed separator ckpt + companion yaml are looked for: VOXWEAVE_MODEL_DIR,
+# else the model cache root (VOXWEAVE_CACHE_ROOT, default ~/.cache/voxweave). The model class is
+# frozen in voxweave.vendor.
+MODEL_DIR = Path(os.environ.get("VOXWEAVE_MODEL_DIR") or config.CACHE_ROOT).expanduser()
 SEPARATOR_CKPT = os.environ.get(
     "VOXWEAVE_SEPARATOR_CKPT", str(MODEL_DIR / "vocals_mel_band_roformer.ckpt")
 )
@@ -145,28 +131,10 @@ _BUNDLED_SEPARATOR_CONFIG = (
 )
 
 
-def _env_int(name: str, default: int) -> int:
-    """Import-time int knob via the tolerant ``config._env_int``: a malformed value falls
-    back to ``default`` instead of raising (which would break every CLI command, even
-    ``--help``), with a warning naming the variable."""
-    raw = os.environ.get(name, "").strip()
-    if raw:
-        try:
-            int(raw)
-        except ValueError:
-            log.warning("ignoring %s=%r (not an integer); using %s", name, raw, default)
-    return config._env_int(name, default)
-
-
-def _env_float(name: str, default: float) -> float:
-    """Float counterpart of :func:`_env_int` (``config._env_float``, warning on a typo)."""
-    raw = os.environ.get(name, "").strip()
-    if raw:
-        try:
-            float(raw)
-        except ValueError:
-            log.warning("ignoring %s=%r (not a number); using %s", name, raw, default)
-    return config._env_float(name, default)
+# Import-time numeric knobs: a malformed value warns (once, naming the variable) and falls back
+# to the default instead of raising, which would break every CLI command, even ``--help``.
+_env_int = config._env_int
+_env_float = config._env_float
 
 
 # Empty -> float16 on cuda, int8 on cpu/mps (ctranslate2/faster-whisper is CUDA-or-CPU only).
@@ -188,7 +156,9 @@ ASR_BATCH_MIN_CHECK_SEC = _env_float("VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC", 2.0)
 # Separator is not kept resident (self-loads, self-releases).
 _asr = None  # qwen_asr.Qwen3ASRModel
 _asr_id = None  # currently loaded ASR repo id (reloaded on --asr-model change)
-# Standalone aligner for the align command (no ASR needed, so we skip the full Qwen3ASRModel stack).
+# Standalone Qwen3-ForcedAligner (loaded without the Qwen3ASRModel stack): align_text's aligner
+# for languages with no CTC/MMS aligner (zh/yue by default) and its fallback when that aligner
+# fails, in transcribe and align alike.
 _aligner = None  # qwen_asr.Qwen3ForcedAligner
 _whisper = None  # faster_whisper.WhisperModel
 _whisper_id = None  # currently loaded whisper size string
@@ -303,10 +273,36 @@ _FALSE_ENV_VALUES = frozenset({"0", "false", "off"})
 
 
 def _tf32_enabled() -> bool:
-    """TF32 matmuls are on by default; VOXWEAVE_TF32=0/false/off opts out. Read per call."""
+    """TF32 matmuls for the separator forward are on by default; VOXWEAVE_TF32=0/false/off
+    opts out. Read per call."""
     return (
         os.environ.get("VOXWEAVE_TF32", "").strip().casefold() not in _FALSE_ENV_VALUES
     )
+
+
+@contextmanager
+def _separation_matmul_precision(dev: str) -> Iterator[None]:
+    """TF32 matmuls for the separator forward only; the previous policy is restored on exit.
+
+    The roformer is attention-heavy and separation dominates wall clock; TF32 matmuls on
+    Ampere+ cut that substantially and the stem difference is below the noise floor of the
+    downstream 16k ASR. VOXWEAVE_TF32=0 keeps strict fp32 matmuls, and off CUDA nothing
+    changes. The matmul policy is process-wide in torch, so it must not outlive the
+    separation: left on, every later fp32 CUDA stage (PANNs song/SDH scoring, the wav2vec2
+    CTC aligner) would run with TF32 matmuls only on runs that separated, and a
+    vocals-cache hit would not reproduce the first run's numbers.
+    """
+    if not (dev.startswith("cuda") and _tf32_enabled()):
+        yield
+        return
+    import torch
+
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
 
 
 def _load_separator(autocast: str | None = None):
@@ -371,11 +367,6 @@ def _load_separator(autocast: str | None = None):
     sd = _strip_state_dict(loaded)
     model.load_state_dict(sd)
     dev = get_device()
-    if dev.startswith("cuda") and _tf32_enabled():
-        # The roformer is attention-heavy and separation dominates wall clock; TF32 matmuls
-        # on Ampere+ cut that substantially and the stem difference is below the noise floor
-        # of the downstream 16k ASR. VOXWEAVE_TF32=0 restores strict fp32 matmuls.
-        torch.set_float32_matmul_precision("high")
     model.to(dev).eval()
     log.info("loaded separator ckpt=%s on %s", resolved_checkpoint, dev)
     separator_identity: dict[str, object] = {
@@ -525,8 +516,9 @@ def separate_vocals(
     autocast = config.conf_separate_autocast()
     model, cfg, separator_identity = _load_separator(autocast=autocast)
     try:
-        # vocals: [ch, t]
-        vocals = _demix(model, mix, cfg, progress=progress, autocast=autocast)
+        with _separation_matmul_precision(get_device()):
+            # vocals: [ch, t]
+            vocals = _demix(model, mix, cfg, progress=progress, autocast=autocast)
     finally:
         del model
         _empty_cache()
@@ -723,8 +715,8 @@ def _engine_language(engine: str, language: str | None) -> str | None:
     validates exactly that form, so a raw ISO code failed every chunk ("Unsupported
     language: Ja"), and mlx-audio matches the same names case-insensitively. Whisper gets
     the ISO code. Either spelling is accepted for every engine; an unknown value raises
-    ValueError naming the supported set (transcribe_chunks/transcribe_align check this
-    before any model loads, so a typo cannot fail every chunk after a whole ASR pass).
+    ValueError naming the supported set (transcribe_chunks checks this before any model
+    loads, so a typo cannot fail every chunk after a whole ASR pass).
     """
     if not language or not language.strip():
         return None
@@ -795,6 +787,32 @@ def _asr_postprocess(
     return det, text, align_lang
 
 
+class _EngineLoadError(Exception):
+    """Carries an ASR engine load failure past the per-chunk containment.
+
+    Loading is deterministic -- a missing package, an unknown model id, no network --
+    so containing it per chunk would only repeat the same failed load (for a bad id, a
+    download attempt) once per chunk and report it after the whole pass, or, under
+    ``--hybrid``, quietly produce single-engine output. :func:`_asr_chunk_safe`
+    re-raises :attr:`error`, the original exception, instead.
+    """
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _load_engine(engine: str, model_id: str) -> Any:
+    """The loaded ``engine`` ("whisper" or "qwen") singleton for ``model_id``.
+
+    A load failure raises :class:`_EngineLoadError` wrapping the original error.
+    """
+    try:
+        return _get_whisper(model_id) if engine == "whisper" else _get_asr(model_id)
+    except Exception as e:  # noqa: BLE001 -- re-raised by _asr_chunk_safe, never swallowed
+        raise _EngineLoadError(e) from e
+
+
 def _asr_only(
     engine: str,
     wav_path: Path,
@@ -806,10 +824,11 @@ def _asr_only(
 
     First pass of the two-pass peak strategy: alignment deferred to pass two after ASR is released.
     The raw engine output goes through _asr_postprocess (language reconciliation,
-    align_lang), the same step the batched Qwen pass applies per result.
+    align_lang), the same step the batched Qwen pass applies per result. A model that
+    cannot be loaded raises :class:`_EngineLoadError` (see :func:`_load_engine`).
     """
     if engine == "whisper":
-        model = _get_whisper(model_id)
+        model = _load_engine("whisper", model_id)
         segments, info = model.transcribe(
             str(wav_path),
             language=_engine_language("whisper", language),
@@ -823,47 +842,12 @@ def _asr_only(
         raw_det = info.language
         src = "whisper"
     else:  # qwen
-        model = _get_asr(model_id)
+        model = _load_engine("qwen", model_id)
         r = model.transcribe(str(wav_path), **_qwen_asr_kwargs(language, context))[0]
         raw_det = r.language or None
         raw_text = r.text
         src = "ASR"
     return _asr_postprocess(raw_det, raw_text, language, src)
-
-
-def _transcribe_qwen_align(
-    wav_path: Path,
-    language: str | None,
-    model_id: str,
-    context: str | None,
-) -> tuple[str | None, str, list[dict]]:
-    """Qwen3-ASR single chunk: ASR then forced alignment via align_text.
-
-    ja/en -> CTC (blank absorbs silence, prevents Qwen NAR from drifting weak tokens);
-    zh/yue -> align_text falls back to Qwen3ForcedAligner internally.
-    Full-episode batches use transcribe_chunks two-pass strategy to avoid co-resident ASR+aligner.
-    """
-    det, text, align_lang = _asr_only("qwen", wav_path, language, model_id, context)
-    if not text.strip():
-        _empty_cache()
-        return det, "", []
-    units = align_text(wav_path, text, align_lang)
-    _empty_cache()  # alignment matrix grows with audio length; reclaim after each chunk to prevent VRAM creep
-    return det, text, units
-
-
-def _transcribe_whisper_align(
-    wav_path: Path,
-    language: str | None,
-    model_id: str,
-    context: str | None,
-) -> tuple[str | None, str, list[dict]]:
-    """Whisper text + align_text units, single chunk. Same (lang, text, units) contract as qwen path."""
-    det, text, align_lang = _asr_only("whisper", wav_path, language, model_id, context)
-    if not text.strip():
-        return det, "", []
-    units = align_text(wav_path, text, align_lang)
-    return det, text, units
 
 
 _FUSION_PUNCT = set("。、！？，,.!?")
@@ -920,25 +904,6 @@ def _fuse_chunk(
     return det_w or det_q, fused, units_w
 
 
-def _transcribe_fusion(
-    wav_path: Path,
-    language: str | None,
-    context: str | None,
-) -> tuple[str | None, str, list[dict]]:
-    """Dual-ASR fusion, single chunk (used by transcribe_align and tests): whisper + Qwen co-resident -> merge.
-
-    Full-episode batches use transcribe_chunks three-pass strategy to avoid both models in VRAM simultaneously.
-    """
-    qid = resolve_asr_model(config.conf_fusion_qwen())
-    w_res = _transcribe_whisper_align(
-        wav_path, language, config.conf_fusion_whisper(), context
-    )
-    if not w_res[1].strip():  # whisper empty -> use Qwen only
-        return _transcribe_qwen_align(wav_path, language, qid, context)
-    q_res = _transcribe_qwen_align(wav_path, language, qid, context)
-    return _fuse_chunk(w_res, q_res, language)
-
-
 def chunk_pass_count(asr_model: str | None) -> int:
     """Passes per chunk for transcribe_chunks: fusion=3, others=2.
 
@@ -967,6 +932,28 @@ def _weighted_align_lang(asr_out: list[tuple[str | None, str, str]]) -> str | No
             key = to_iso_or(align_lang, None) or align_lang
             weight[key] += n
     return weight.most_common(1)[0][0] if weight else None
+
+
+def _warn_vad_mask_ignored_by_qwen(align_lang: str | None) -> None:
+    """Warn once per file when --vad-mask is on but Qwen aligns the file's language.
+
+    The VAD emission mask is wired into the wav2vec2 CTC pass only (MMS warns in
+    align_blocks_full_mms), so on a Qwen-aligned language it silently does nothing.
+    """
+    if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() != "1":
+        return
+    from voxweave.lang import is_supported, to_iso
+
+    if not align_lang or not is_supported(align_lang):
+        return
+    iso = to_iso(align_lang)
+    if config.align_model_for(iso):
+        return
+    log.warning(
+        "--vad-mask / VOXWEAVE_VAD_EMISSION_MASK has no effect on Qwen alignment"
+        " (language %s); only the wav2vec2 CTC aligner applies it",
+        iso,
+    )
 
 
 def _full_pass_units(
@@ -1060,11 +1047,19 @@ def _asr_chunk_safe(
     run, so hours of prior chunks are not thrown away. This is the per-chunk unit
     of _asr_pass: batch size 1, whisper and MLX go through it directly; a batched
     Qwen group whose call raised is redone chunk by chunk here, as is a single
-    chunk whose batched result failed the qwen-asr #207 content floor."""
+    chunk whose batched result failed the qwen-asr #207 content floor.
+
+    A model that cannot be loaded is not a chunk failure: it would fail the same
+    way on every chunk, so its original error propagates at once."""
     try:
         return _asr_only(engine, wav, language, model_id, context)
+    except _EngineLoadError as e:
+        load_error = e.error
     except Exception as e:  # noqa: BLE001 -- one bad chunk must not kill the run
         return _asr_failed(e, idx, total, failures)
+    # raised outside the handler: the load failure itself, its cause and context
+    # untouched, not chained to the carrier
+    raise load_error
 
 
 def _asr_failed(
@@ -1202,7 +1197,8 @@ def _asr_pass(
     alone is re-run through the legacy per-chunk call. A group whose batched call
     raises (or returns the wrong count) is redone chunk by chunk through
     _asr_chunk_safe, so one poisoned chunk degrades alone and its failure is
-    recorded exactly as on the per-chunk path.
+    recorded exactly as on the per-chunk path. On every path a model that cannot
+    be loaded raises at once instead (see _EngineLoadError).
     """
     n = len(wav_paths)
     out: list[tuple[str | None, str, str]] = [(None, "", "")] * n
@@ -1226,10 +1222,11 @@ def _asr_pass(
         if len(group) == 1:  # nothing to pad against: legacy single-path call
             _per_chunk(group)
             continue
+        # MLX is excluded by _asr_batch_size, so this is the torch Qwen3ASRModel, whose
+        # transcribe() decodes a list of paths as one padded batch. Loaded outside the
+        # group's containment: a load failure is not a chunk failure.
+        model: Any = _get_asr(model_id)
         try:
-            # MLX is excluded by _asr_batch_size, so this is the torch Qwen3ASRModel,
-            # whose transcribe() decodes a list of paths as one padded batch
-            model: Any = _get_asr(model_id)
             results = model.transcribe([str(wav_paths[i]) for i in group], **kwargs)
             if len(results) != len(group):
                 raise RuntimeError(
@@ -1280,8 +1277,12 @@ def transcribe_chunks(
     speech_spans: list[tuple[float, float]] | None = None,
     song_spans: list[tuple[float, float]] | None = None,
 ) -> list[tuple[str | None, str, list[dict]]]:
-    """Transcribe a list of chunks -> [(lang, text, units)] matching the transcribe_align contract.
+    """Transcribe a list of chunks -> [(lang, text, units)], one per chunk, in input order.
 
+    Every engine (qwen / whisper / fusion) returns this same contract, so the pipeline
+    stays engine-agnostic. A model that cannot be loaded (missing package, unknown
+    model id, no network) raises at once rather than failing chunk by chunk; that
+    includes either engine of fusion, which is never quietly reduced to one engine.
     Pass structure is fixed: all-chunks ASR pass(es), then one alignment pass (fusion:
     whisper ASR -> Qwen ASR -> align + merge). Each ASR pass is _asr_pass: with config
     ``[batch].asr`` > 1 (opt-in; default 1) the torch Qwen engine decodes chunks in
@@ -1334,16 +1335,34 @@ def transcribe_chunks(
         if release_between_passes:
             _release_qwen_asr()
         # both engines failing everywhere = broken run; one engine surviving
-        # anywhere still fuses into usable output
+        # anywhere still fuses into usable output, but never silently: a whole
+        # engine lost means the file is not a fusion transcript at all
         if len(w_fail) >= n:
             _raise_if_all_failed(q_fail, n)
+        for lost, fails, kept in (
+            ("whisper", w_fail, "Qwen-only (no whisper text)"),
+            ("Qwen", q_fail, "whisper-only (no Qwen punctuation)"),
+        ):
+            if n and len(fails) >= n:
+                e = fails[-1]
+                log.warning(
+                    "hybrid ASR: %s failed on all %d chunks (last error: %s: %s); "
+                    "this transcript is %s",
+                    lost,
+                    n,
+                    type(e).__name__,
+                    e,
+                    kept,
+                )
         # pass C: align both texts (whisper units carry the timing; Qwen units only
         # position punctuation), full-file where the language allows, then merge
+        w_align_lang = _weighted_align_lang(w_asr)
+        _warn_vad_mask_ignored_by_qwen(w_align_lang)
         full_w = _full_pass_units(
             full_wav,
             bounds,
             [t for _, t, _ in w_asr],
-            _weighted_align_lang(w_asr),
+            w_align_lang,
             speech_spans=speech_spans,
             song_spans=song_spans,
         )
@@ -1389,11 +1408,13 @@ def transcribe_chunks(
     if release_between_passes:
         _release_whisper() if engine == "whisper" else _release_qwen_asr()
     _raise_if_all_failed(failures, n)
+    file_align_lang = _weighted_align_lang(asr_out)
+    _warn_vad_mask_ignored_by_qwen(file_align_lang)
     full_units = _full_pass_units(
         full_wav,
         bounds,
         [t for _, t, _ in asr_out],
-        _weighted_align_lang(asr_out),
+        file_align_lang,
         speech_spans=speech_spans,
         song_spans=song_spans,
     )
@@ -1411,35 +1432,14 @@ def transcribe_chunks(
     return out2
 
 
-def transcribe_align(
-    wav_path: Path,
-    language: str | None,
-    asr_model: str | None = None,
-    context: str | None = None,
-) -> tuple[str | None, str, list[dict]]:
-    """Local ASR + forced alignment -> (detected language | None, punctuated text, units).
-
-    Engine selected from asr_model: whisper size -> hybrid; fusion alias -> dual-ASR; else -> Qwen.
-    All engines return the same contract; pipeline is engine-agnostic.
-    """
-    engine, model_id = _select_engine(asr_model)
-    # an unknown --language fails here, before any model loads
-    _engine_language(engine, language)
-    if engine == "fusion":
-        return _transcribe_fusion(wav_path, language, context)
-    if engine == "whisper":
-        return _transcribe_whisper_align(wav_path, language, model_id, context)
-    return _transcribe_qwen_align(wav_path, language, model_id, context)
-
-
-# ───────────────────────────── forced alignment (align command, independent singleton) ────────────────────
+# ───────────────────────────── Qwen forced aligner (independent singleton) ────────────────────────────────
 
 
 def _get_aligner():
-    """Lazy-load Qwen3ForcedAligner singleton for the align command (reused across windows).
+    """Lazy-load the Qwen3ForcedAligner singleton (reused across chunks and align windows).
 
-    Loads only the aligner, not the full Qwen3ASRModel stack, since the align command already
-    has text and only needs alignment. Saves the ASR half of VRAM.
+    Loads only the aligner, not the full Qwen3ASRModel stack: alignment already has its
+    text, so the ASR half of the VRAM is never spent. Serves align_text's Qwen route.
     """
     global _aligner
     if _aligner is None:
@@ -1504,7 +1504,7 @@ def _get_whisper(model_id: str):
 
 
 # --------------------------------------------------------------------------- #
-# wav2vec2 CTC forced alignment (WhisperX-equivalent; English default, per-language selection in voxweave.config)
+# per-chunk forced alignment dispatch: CTC/MMS per voxweave.config, Qwen aligner otherwise
 # --------------------------------------------------------------------------- #
 
 

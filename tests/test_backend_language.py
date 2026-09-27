@@ -170,5 +170,3 @@ def test_unknown_language_fails_before_any_model_loads(
     wavs = _stub_chunks(tmp_path, 3)
     with pytest.raises(ValueError, match="unsupported language 'xx'"):
         backend.transcribe_chunks(wavs, "xx", asr_model=asr_model)
-    with pytest.raises(ValueError, match="unsupported language 'xx'"):
-        backend.transcribe_align(wavs[0], "xx", asr_model=asr_model)

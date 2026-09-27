@@ -254,11 +254,16 @@ def get_whisper(model_id: str):
     """Lazy-load the MLX whisper adapter singleton, reloading if the requested size changes.
 
     Mirrors backend._get_whisper: snapshot-downloads the converted repo into VoxWeave's ASR cache,
-    then hands the local dir to mlx_whisper.transcribe (which lru-caches the loaded weights)."""
+    then hands the local dir to mlx_whisper.transcribe (which lru-caches the loaded weights).
+    A missing mlx_whisper package fails here, at load time, not on every chunk's transcribe."""
     global _whisper, _whisper_id
     if _whisper is not None and _whisper_id != model_id:
         release_whisper()
     if _whisper is None:
+        try:
+            import mlx_whisper  # noqa: F401  # pyright: ignore[reportMissingImports]
+        except ModuleNotFoundError as e:
+            raise _require(e.name or "mlx_whisper") from e
         repo = _mlx_whisper_repo(model_id)
         log.info("loading MLX whisper=%s", repo)
         _whisper = _MlxWhisper(_hf_snapshot(repo, config.ASR_CACHE))

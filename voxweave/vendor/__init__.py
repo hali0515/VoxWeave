@@ -1,5 +1,5 @@
-"""Frozen third-party model code: the Mel-Band Roformer separator (this module),
-ReDimNet2 (``redimnet2/``) and SpeechBrain ECAPA-TDNN (``speechbrain_ecapa/``), each
+"""Frozen third-party model code: the Mel-Band Roformer separator
+(``mel_band_roformer.py`` + ``attend.py``), ReDimNet2 (``redimnet2/``) and SpeechBrain ECAPA-TDNN (``speechbrain_ecapa/``), each
 under its upstream license (see THIRD_PARTY_NOTICES.md and the subpackage LICENSE files).
 
 Mel-Band Roformer source: lucidrains/BS-RoFormer (MIT), taken from the audio-separator

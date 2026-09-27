@@ -33,6 +33,12 @@ def _block_import(monkeypatch, *names):
     monkeypatch.setattr(builtins, "__import__", _blocked)
 
 
+def _transcribe_one(wav, language, **kwargs):
+    """One chunk through the production entry point -> its (lang, text, units)."""
+    (result,) = backend.transcribe_chunks([wav], language, **kwargs)
+    return result
+
+
 def test_strip_state_dict_unwraps_and_deprefixes():
     # Lightning wraps with a state_dict layer + model. prefix; both should be stripped
     sd = {"state_dict": {"model.a": 1, "model.b": 2}}
@@ -43,14 +49,18 @@ def test_strip_state_dict_plain_passthrough():
     assert backend._strip_state_dict({"a": 1, "b": 2}) == {"a": 1, "b": 2}
 
 
-def test_transcribe_align_missing_models_raises_friendly(monkeypatch, tmp_path):
-    # qwen-asr import blocked -> friendly RuntimeError pointing to voxweave[cuda]/[mps], not bare ModuleNotFoundError
+def test_transcribe_chunks_missing_models_raises_friendly(monkeypatch, tmp_path):
+    # qwen-asr import blocked -> friendly RuntimeError pointing to voxweave[cuda]/[mps],
+    # not bare ModuleNotFoundError, and raised as itself rather than as a per-chunk failure
     _block_import(monkeypatch, "qwen_asr")
     backend._asr = None  # ensure not loaded
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]"):
-        backend.transcribe_align(wav, language=None, asr_model="qwen3-asr-1.7b")
+    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]") as failure:
+        backend.transcribe_chunks([wav], None, asr_model="qwen3-asr-1.7b")
+    assert "chunks" not in str(failure.value)
+    assert isinstance(failure.value.__cause__, ModuleNotFoundError)
+    assert not isinstance(failure.value.__context__, backend._EngineLoadError)
 
 
 def test_get_asr_raises_qwen_decode_ceiling_when_supported(monkeypatch):
@@ -125,7 +135,7 @@ def test_get_asr_mirrors_conf_batch_into_max_inference_batch_size(monkeypatch):
         backend._asr_id = None
 
 
-def test_transcribe_align_forwards_context(monkeypatch, tmp_path):
+def test_qwen_asr_forwards_context(monkeypatch, tmp_path):
     # --context bias: when non-empty, forwarded to model.transcribe(context=...); ASR-only so return_time_stamps=False
     calls: dict = {}
 
@@ -144,9 +154,7 @@ def test_transcribe_align_forwards_context(monkeypatch, tmp_path):
     )
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    backend.transcribe_align(
-        wav, None, asr_model="qwen3-asr-1.7b", context="艾米莉亚, 帕克"
-    )
+    _transcribe_one(wav, None, asr_model="qwen3-asr-1.7b", context="艾米莉亚, 帕克")
     # bare term lists are auto-framed for the Qwen system slot (see format_qwen_context)
     assert calls.get("context") == "Proper nouns: 艾米莉亚, 帕克."
     assert (
@@ -154,7 +162,7 @@ def test_transcribe_align_forwards_context(monkeypatch, tmp_path):
     )  # ASR-only, built-in aligner not requested
 
 
-def test_transcribe_align_omits_context_when_empty(monkeypatch, tmp_path):
+def test_qwen_asr_omits_context_when_empty(monkeypatch, tmp_path):
     # no context -> kwarg is omitted entirely; preserves legacy behavior (older qwen-asr lacks this param)
     calls: dict = {}
 
@@ -173,7 +181,7 @@ def test_transcribe_align_omits_context_when_empty(monkeypatch, tmp_path):
     )
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    backend.transcribe_align(wav, None, asr_model="qwen3-asr-1.7b")
+    _transcribe_one(wav, None, asr_model="qwen3-asr-1.7b")
     assert "context" not in calls
 
 
@@ -199,7 +207,7 @@ def test_qwen_align_routes_all_langs_through_align_text(monkeypatch, tmp_path):
     monkeypatch.setattr(backend, "align_text", _fake_align)
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    lang, text, units = backend.transcribe_align(wav, None, asr_model="qwen3-asr-1.7b")
+    lang, text, units = _transcribe_one(wav, None, asr_model="qwen3-asr-1.7b")
     assert lang == "Japanese" and text == "はい"
     assert units == [{"text": "はい", "start": 33.6, "end": 33.9}]
     assert seen == {"text": "はい", "lang": "Japanese"}
@@ -234,7 +242,7 @@ def test_qwen_align_uses_han_script_to_choose_multilingual_label(monkeypatch, tm
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
 
-    lang, got, _units = backend.transcribe_align(wav, None, asr_model="qwen3-asr-1.7b")
+    lang, got, _units = _transcribe_one(wav, None, asr_model="qwen3-asr-1.7b")
 
     assert (lang, got) == ("Chinese", text)
     assert seen["lang"] == "Chinese"
@@ -251,18 +259,16 @@ def test_qwen_align_empty_text_skips_align(monkeypatch, tmp_path):
 
     monkeypatch.setattr(backend, "_get_asr", lambda m=None: _Model())
     monkeypatch.setattr(backend, "_empty_cache", lambda: None)
-
-    def _boom(*a, **k):
-        raise AssertionError("align_text should not be called on empty text")
-
-    monkeypatch.setattr(backend, "align_text", _boom)
+    aligned: list = []  # recorded, not raised: alignment failures are contained per chunk
+    monkeypatch.setattr(backend, "align_text", lambda *a, **k: aligned.append(a) or [])
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    assert backend.transcribe_align(wav, None, asr_model="qwen3-asr-1.7b") == (
+    assert _transcribe_one(wav, None, asr_model="qwen3-asr-1.7b") == (
         "Japanese",
         "",
         [],
     )
+    assert aligned == []
 
 
 def test_align_text_missing_models_raises_friendly(monkeypatch, tmp_path):
@@ -489,7 +495,7 @@ def test_resolve_separator_falls_back_to_bundled_config(monkeypatch, tmp_path):
     assert rck == ck
     assert rcf == backend._BUNDLED_SEPARATOR_CONFIG
     assert rcf.exists()
-    cfg = backend._load_yaml(rcf)
+    cfg = runtime._parse_yaml(rcf.read_text())
     assert cfg["model"]["dim"] == 384 and cfg["model"]["num_bands"] == 60
 
 
@@ -1050,40 +1056,17 @@ def test_select_engine_routes_qwen_named():
     assert backend._select_engine("openai/whatever") == ("qwen", "openai/whatever")
 
 
-def test_transcribe_align_routes_fusion(monkeypatch, tmp_path):
-    # default (asr_model=None) -> _transcribe_fusion
-    wav = tmp_path / "a.wav"
-    wav.write_bytes(b"x")
-    called = {}
-
-    def _fake_fusion(wav_path, language, context):
-        called["fusion"] = True
-        return "ja", "畑です。", [{"text": "畑", "start": 0.0, "end": 0.2}]
-
-    monkeypatch.setattr(backend, "_transcribe_fusion", _fake_fusion)
-    lang, text, units = backend.transcribe_align(wav, None, asr_model="fusion")
-    assert called.get("fusion") and lang == "ja" and text == "畑です。"
-
-
-def test_fusion_merges_whisper_text_with_qwen_punct(monkeypatch, tmp_path):
+def test_fusion_merges_whisper_text_with_qwen_punct():
     # whisper produces accurate words without punctuation, Qwen produces punctuation positions -> fused text = whisper words + Qwen punctuation
-    wav = tmp_path / "a.wav"
-    wav.write_bytes(b"x")
     w_units = [
         {"text": "畑", "start": 1.0, "end": 1.2},
         {"text": "です", "start": 1.2, "end": 1.6},
         {"text": "次", "start": 2.5, "end": 2.7},
     ]
     # Qwen path: text has punctuation, units are aligner output (no punctuation) -> after reinject, punctuation carries timestamps
-    monkeypatch.setattr(
-        backend,
-        "_transcribe_whisper_align",
-        lambda *a, **k: ("ja", "畑です次", w_units),
-    )
-    monkeypatch.setattr(
-        backend,
-        "_transcribe_qwen_align",
-        lambda *a, **k: (
+    lang, text, units = backend._fuse_chunk(
+        ("ja", "畑です次", w_units),
+        (
             "Japanese",
             "裸です。次。",
             [
@@ -1093,8 +1076,8 @@ def test_fusion_merges_whisper_text_with_qwen_punct(monkeypatch, tmp_path):
                 {"text": "次", "start": 2.5, "end": 2.7},
             ],
         ),
+        None,
     )
-    lang, text, units = backend._transcribe_fusion(wav, None, None)
     assert "。" in text  # Qwen punctuation is present
     assert "畑" in text and "裸" not in text  # text is from whisper (畑, not 裸)
     assert units == w_units  # units come from whisper
@@ -1421,6 +1404,99 @@ def test_transcribe_chunks_fusion_survives_one_engine_failure(monkeypatch, tmp_p
     assert len(out) == 2
     # chunk 0: whisper side degraded to empty, qwen side intact
     assert fused[0][0][1] == "" and fused[0][1][1] == "qwen-c0.wav"
+
+
+def _stub_wavs(tmp_path, n: int) -> list[Path]:
+    wavs = [tmp_path / f"c{i}.wav" for i in range(n)]
+    for w in wavs:
+        w.write_bytes(b"x")
+    return wavs
+
+
+def test_transcribe_chunks_model_load_failure_fails_fast(monkeypatch, tmp_path):
+    # a model that cannot load (bad id, no network) fails the same way on every
+    # chunk: it is raised once, as itself, instead of retried per chunk and
+    # reported as "ASR failed on all N chunks" after the whole pass
+    loads: list[str] = []
+    boom = RuntimeError("repository 'Qwen/Qwen3-ASR-9B' not found")
+
+    def _get_asr(mid=None):
+        loads.append(mid)
+        raise boom
+
+    monkeypatch.setattr(backend, "_get_asr", _get_asr)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    with pytest.raises(RuntimeError) as failure:
+        backend.transcribe_chunks(
+            _stub_wavs(tmp_path, 3), None, asr_model="Qwen3-ASR-9B"
+        )
+    assert failure.value is boom
+    assert loads == ["Qwen/Qwen3-ASR-9B"]
+
+
+def test_batched_asr_model_load_failure_fails_fast(monkeypatch, tmp_path):
+    # the batched Qwen pass must not redo a failed load chunk by chunk either
+    monkeypatch.setenv("VOXWEAVE_ASR_BATCH", "2")
+    loads: list[str] = []
+    boom = RuntimeError("no network")
+
+    def _get_asr(mid=None):
+        loads.append(mid)
+        raise boom
+
+    monkeypatch.setattr(backend, "_get_asr", _get_asr)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    with pytest.raises(RuntimeError) as failure:
+        backend.transcribe_chunks(_stub_wavs(tmp_path, 4), None, asr_model="0.6b")
+    assert failure.value is boom
+    assert len(loads) == 1
+
+
+def test_fusion_missing_engine_fails_before_the_other_pass(monkeypatch, tmp_path):
+    # --hybrid asks for both engines: a whisper engine that cannot load stops the
+    # run at once rather than quietly producing a Qwen-only transcript
+    boom = RuntimeError("faster-whisper engine requires the voxweave[cuda] install")
+
+    def _no_whisper(mid):
+        raise boom
+
+    def _no_qwen(mid=None):
+        raise AssertionError("the Qwen pass must not run after whisper failed to load")
+
+    monkeypatch.setattr(backend, "_get_whisper", _no_whisper)
+    monkeypatch.setattr(backend, "_get_asr", _no_qwen)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    with pytest.raises(RuntimeError) as failure:
+        backend.transcribe_chunks(_stub_wavs(tmp_path, 2), None, asr_model="fusion")
+    assert failure.value is boom
+
+
+def test_fusion_warns_loudly_when_one_engine_fails_every_chunk(
+    monkeypatch, tmp_path, caplog
+):
+    # an engine that loaded but then failed on every chunk still leaves usable
+    # output from the other one, but the run must say it is not a fusion transcript
+    def _asr(engine, w, lang, mid, ctx):
+        if engine == "whisper":
+            raise RuntimeError("CUDA error: device-side assert")
+        return ("ja", f"qwen-{w.name}", "ja")
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(
+        backend, "align_text", lambda w, t, a: [{"text": t, "start": 0.0, "end": 0.2}]
+    )
+    monkeypatch.setattr(backend, "_release_whisper", lambda: None)
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: None)
+    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        out = backend.transcribe_chunks(
+            _stub_wavs(tmp_path, 2), None, asr_model="fusion"
+        )
+    assert [text for _, text, _ in out] == ["qwen-c0.wav", "qwen-c1.wav"]
+    summary = [r.message for r in caplog.records if r.message.startswith("hybrid ASR")]
+    assert len(summary) == 1
+    assert "whisper failed on all 2 chunks" in summary[0]
+    assert "Qwen-only" in summary[0]
 
 
 # --- batched Qwen ASR pass ([batch].asr) ------------------------------------ #
@@ -2047,7 +2123,7 @@ def test_whisper_align_basic_returns_contract(monkeypatch, tmp_path):
     monkeypatch.setattr(backend, "align_text", _fake_align)
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    lang, text, units = backend.transcribe_align(wav, None, asr_model="large-v3-turbo")
+    lang, text, units = _transcribe_one(wav, None, asr_model="large-v3-turbo")
     assert lang == "en"
     assert text == "Hello world"
     assert units == [{"text": "hello", "start": 0.0, "end": 1.0}]
@@ -2076,7 +2152,7 @@ def test_whisper_align_repairs_english_label_for_han_heavy_text(monkeypatch, tmp
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
 
-    lang, got, _units = backend.transcribe_align(wav, None, asr_model="large-v3-turbo")
+    lang, got, _units = _transcribe_one(wav, None, asr_model="large-v3-turbo")
 
     assert (lang, got) == ("zh", text)
     assert seen["lang"] == "zh"
@@ -2097,9 +2173,7 @@ def test_whisper_align_explicit_language_beats_transcript_script(monkeypatch, tm
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
 
-    lang, _text, _units = backend.transcribe_align(
-        wav, "en", asr_model="large-v3-turbo"
-    )
+    lang, _text, _units = _transcribe_one(wav, "en", asr_model="large-v3-turbo")
 
     assert lang == "en"
     assert model.calls["language"] == "en"
@@ -2119,7 +2193,7 @@ def test_whisper_align_override_language_maps_to_iso(monkeypatch, tmp_path):
     )
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    backend.transcribe_align(wav, "japanese", asr_model="large-v3")
+    _transcribe_one(wav, "japanese", asr_model="large-v3")
     # whisper language= receives iso, alignment receives the override full name
     assert model.calls.get("language") == "ja"
     assert align_calls.get("lang") == "japanese"
@@ -2140,7 +2214,7 @@ def test_whisper_align_unsupported_lang_falls_back_to_en(monkeypatch, tmp_path):
     )
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    lang, text, units = backend.transcribe_align(wav, None, asr_model="large-v3")
+    lang, text, units = _transcribe_one(wav, None, asr_model="large-v3")
     assert lang == "th"  # detected language returned as-is
     assert align_calls.get("lang") == "en"  # alignment falls back to en
 
@@ -2153,23 +2227,21 @@ def test_whisper_align_context_maps_to_initial_prompt(monkeypatch, tmp_path):
     )
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    backend.transcribe_align(wav, None, asr_model="large-v3", context="艾米莉亚")
+    _transcribe_one(wav, None, asr_model="large-v3", context="艾米莉亚")
     assert model.calls.get("initial_prompt") == "艾米莉亚"
     assert model.calls.get("hotwords") == "艾米莉亚"
 
 
 def test_whisper_align_empty_text_skips_alignment(monkeypatch, tmp_path):
     model = _fake_whisper([], "en")  # no segments -> empty text
-
-    def _boom(*a, **k):
-        raise AssertionError("align_text should not be called on empty text")
-
+    aligned: list = []  # recorded, not raised: alignment failures are contained per chunk
     monkeypatch.setattr(backend, "_get_whisper", lambda mid: model)
-    monkeypatch.setattr(backend, "align_text", _boom)
+    monkeypatch.setattr(backend, "align_text", lambda *a, **k: aligned.append(a) or [])
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    lang, text, units = backend.transcribe_align(wav, None, asr_model="large-v3")
+    lang, text, units = _transcribe_one(wav, None, asr_model="large-v3")
     assert (lang, text, units) == ("en", "", [])
+    assert aligned == []
 
 
 def test_whisper_align_cantonese_uses_zh_for_whisper(monkeypatch, tmp_path):
@@ -2186,19 +2258,22 @@ def test_whisper_align_cantonese_uses_zh_for_whisper(monkeypatch, tmp_path):
     )
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"x")
-    backend.transcribe_align(wav, "yue", asr_model="large-v3")
+    _transcribe_one(wav, "yue", asr_model="large-v3")
     assert model.calls.get("language") == "zh"
     assert align_calls.get("lang") == "yue"
 
 
-def test_transcribe_align_whisper_missing_dep_raises_friendly(monkeypatch, tmp_path):
-    # select whisper engine via the public transcribe_align entry point; faster-whisper import blocked -> friendly voxweave[cuda] error
+def test_transcribe_chunks_whisper_missing_dep_raises_friendly(monkeypatch, tmp_path):
+    # select the whisper engine via the production entry point; faster-whisper import
+    # blocked -> the friendly voxweave[cuda] error itself, before a second chunk is tried
     _block_import(monkeypatch, "faster_whisper")
     backend._whisper = None
-    wav = tmp_path / "a.wav"
-    wav.write_bytes(b"x")
-    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]"):
-        backend.transcribe_align(wav, None, asr_model="large-v3-turbo")
+    wavs = [tmp_path / "a.wav", tmp_path / "b.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match=r"voxweave\[cuda\]") as failure:
+        backend.transcribe_chunks(wavs, None, asr_model="large-v3-turbo")
+    assert "chunks" not in str(failure.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -2419,7 +2494,7 @@ def test_interp_missing_monotonic():
         },  # zero-length -> interpolate from both anchors
         {"text": "c", "start": 3.0, "end": 3.5},
     ]
-    out = backend.interp_missing(units)
+    out = align_common.interp_missing(units)
     assert len(out) == 3
     assert 1.5 <= out[1]["start"] <= 3.0 and out[1]["start"] <= out[1]["end"]
 
@@ -2429,13 +2504,13 @@ def test_interp_missing_single_anchor():
         {"text": "a", "start": 1.0, "end": 1.5},
         {"text": "b", "start": 0.0, "end": 0.0},  # only forward anchor -> ffill
     ]
-    out = backend.interp_missing(units)
+    out = align_common.interp_missing(units)
     assert out[1]["start"] == 1.5
 
 
 def test_interp_missing_all_invalid_noop():
     units = [{"text": "a", "start": 0.0, "end": 0.0}]
-    out = backend.interp_missing(units)
+    out = align_common.interp_missing(units)
     assert (
         len(out) == 1 and out == units
     )  # no anchors -> return unchanged without crashing
@@ -2447,7 +2522,7 @@ def test_interp_missing_no_unit_lost():
         {"text": "b", "start": 1.0, "end": 1.5},
         {"text": "c", "start": 2.0, "end": 2.0},
     ]
-    out = backend.interp_missing(units)
+    out = align_common.interp_missing(units)
     assert len(out) == len(units)  # never drops a unit
 
 

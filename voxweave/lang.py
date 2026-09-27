@@ -51,10 +51,10 @@ _ASR_ISO_TO_NAME = {
 }
 _ASR_NAME_TO_ISO = {name: iso for iso, name in _ASR_ISO_TO_NAME.items()}
 
-# ISO-639-1 -> ISO-639-3 for uroman/ctc-forced-aligner.
-# zh maps to "chi" not "zho": preprocess_text checks for "chi" to enable per-character mode.
-# Only the 11 aligner languages above reach this today (to_iso rejects the rest); the
-# ar..pl entries are reserved for a future [align] language expansion.
+# ISO-639-1 -> ISO-639-3 for uroman/ctc-forced-aligner (MMS) and container language tags
+# (pack). zh maps to "chi" not "zho": preprocess_text checks for "chi" to enable
+# per-character mode. Both callers pass one of the 11 aligner languages above (to_iso /
+# to_iso_or reject the rest), so exactly those are listed.
 _ISO1_TO_ISO3 = {
     "en": "eng",
     "zh": "chi",
@@ -67,15 +67,6 @@ _ISO1_TO_ISO3 = {
     "it": "ita",
     "pt": "por",
     "ru": "rus",
-    "ar": "ara",
-    "hi": "hin",
-    "nl": "nld",
-    "tr": "tur",
-    "vi": "vie",
-    "th": "tha",
-    "id": "ind",
-    "uk": "ukr",
-    "pl": "pol",
 }
 
 

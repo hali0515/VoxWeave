@@ -30,7 +30,6 @@ from voxweave.speakers import voice_text_for_block
 from voxweave.translate import (
     IncompleteResponse,
     _call,
-    _call_options,
     _loads_salvage,
     _make_client,
     build_payload,
@@ -42,7 +41,8 @@ from voxweave.translate import (
 
 log = logging.getLogger("voxweave")
 
-# Built-in only; env / conf [llm] resolve at call time (see translate.TRANSLATE_MODEL).
+# Built-in only: env / conf [llm] are resolved at call time (config.resolve_llm_model) by
+# the CLI and pipeline, never at import (a library import must not read the user conf).
 FIX_MODEL = config.DEFAULT_LLM_MODEL
 # Preceding cue texts handed to a half after a split, so it keeps a little of the
 # whole-transcript context the single unsplit request has (proper-noun continuity).
@@ -355,7 +355,7 @@ def _request_fixes(
 
     def attempt(json_mode: bool) -> list[dict]:
         try:
-            raw = _call(client, model, messages, **_call_options(None, json_mode))
+            raw = _call(client, model, messages, json_mode=json_mode)
         except IncompleteResponse as exc:
             if exc.finish_reason == "length":
                 raise _OutputCapped(exc) from exc
