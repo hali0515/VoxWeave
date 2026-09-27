@@ -498,7 +498,13 @@ def run_locked_segmentation_adapter(
     *,
     shadow_enabled: bool,
 ) -> SegmentationAdapterResult:
-    """Consume one adapter role and produce immutable legacy/v2 delivery status."""
+    """Consume one adapter role and produce immutable legacy/v2 delivery status.
+
+    The v2 delivery is built when the shadow switch asks for it or when the
+    registry selects the boundary family for this context. In the second case
+    v2 is the selected output, so its failure is raised with its canonical cause
+    instead of being recorded as a shadow status.
+    """
     if type(shadow_enabled) is not bool:
         raise TypeError("segmentation adapter switch must be an exact bool")
     record = _legacy_record(context, issued)
@@ -507,23 +513,26 @@ def run_locked_segmentation_adapter(
         "adapter",
         consumer="run_locked_segmentation_adapter",
     )
+    selected = context.engine_family == "boundary-v2"
     boundary: SegmentationDelivery | None = None
-    if not shadow_enabled:
+    if not (shadow_enabled or selected):
         status = V2Status("not-requested", None)
     else:
         try:
             boundary = _build_boundary_delivery(record)
         except SegmentationProductionError as exc:
+            if selected:
+                raise
             status = V2Status("invalid", exc.failure)
-        except Exception:
-            status = V2Status(
-                "invalid",
-                CanonicalFailure(
-                    "shadow-internal-error",
-                    "segmentation-adapter",
-                    "w1-stage",
-                ),
+        except Exception as exc:
+            failure = CanonicalFailure(
+                "shadow-internal-error",
+                "segmentation-adapter",
+                "w1-stage",
             )
+            if selected:
+                raise SegmentationProductionError(failure) from exc
+            status = V2Status("invalid", failure)
         else:
             status = V2Status("valid", None)
     result = object.__new__(SegmentationAdapterResult)

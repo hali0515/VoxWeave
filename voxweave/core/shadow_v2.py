@@ -170,6 +170,20 @@ def _restamp_by_footprint(
     return out
 
 
+def _refined_partition(
+    parent_partition: Sequence[int], origin: Sequence[int]
+) -> list[int]:
+    """Re-express parent-unit cuts as refined-unit cuts through ``origin``.
+
+    ``origin`` is monotone and names every parent, so parent ``p`` begins at the
+    first refined unit it owns.
+    """
+    first_child: dict[int, int] = {}
+    for index, parent in enumerate(origin):
+        first_child.setdefault(parent, index)
+    return [first_child[cut] for cut in parent_partition]
+
+
 def _origins_by_footprint(
     fallback_ranges: Sequence[Sequence[int]],
     partition: Sequence[int] | None,
@@ -1196,12 +1210,12 @@ def _shadow_v2_artifact(
         stage="legacy-overlay",
     )
 
-    # Adjacent typed fallbacks adopt COMPLETE v1 cues, so two of them can expand
-    # onto the same cue and the raw-stage document validator then sees that cue
-    # twice. That is a reporting artifact of the fallback contract, not a
-    # conservation result, so it is flagged where a reader meets it rather than
-    # left to be mistaken for evidence. It cannot arise on the public corpus,
-    # where the C13 gate forbids fallbacks outright.
+    # Typed fallbacks adopt COMPLETE v1 cues, and the optimizer's adoption plan
+    # grows neighbouring fallbacks until their ranges tile. An overlap here means
+    # that invariant broke: the raw-stage document validator then sees a v1 cue
+    # twice, a reporting artifact rather than a conservation result, so it is
+    # flagged where a reader meets it instead of being mistaken for evidence. It
+    # cannot arise on the public corpus, where the C13 gate forbids fallbacks.
     overlapping = any(
         left[1] > right[0] for left, right in zip(fallback_ranges, fallback_ranges[1:])
     )
@@ -1624,8 +1638,13 @@ def _shadow_v2_artifact(
         f"{SHADOW_LANE_FINALIZER}/v2-speaker-off": "optimizer-selection",
     }
     if split.refined_parent_count and refiner_comparison["materialized"]:
-        refiner_partition = _document_partition(
-            refiner_off.solutions, len(document.units)
+        # The counterfactual is solved over the parent units, but every row of
+        # the artifact is read against the refined ``units`` block. A parent
+        # cut is a refined cut at the parent's first child, and each parent's
+        # children join back to its surface, so the row keeps its cue text.
+        refiner_partition = _refined_partition(
+            _document_partition(refiner_off.solutions, len(document.units)),
+            split.origin,
         )
         refiner_authority = register_optimizer_selection(refiner_off, ledger=ledger)
         refiner_stream = phase1_from_optimizer_selection(
@@ -1648,7 +1667,7 @@ def _shadow_v2_artifact(
             refiner_finalized,
             refiner_stream,
             refiner_partition,
-            document=document,
+            document=shadow_document,
             origin="v2",
             evidence=FinalizeEvidence(
                 shots=tuple(document.shot_changes or ()),

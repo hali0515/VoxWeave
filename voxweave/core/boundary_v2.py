@@ -223,7 +223,9 @@ def build_cost_context(
 ) -> CostContext:
     """Bundle everything a cost term needs that is not the edge or the cut.
 
-    The preview defaults to the mirror of today's cleanup pass; P5 hands in the
+    The preview defaults to experimental_policy_1's frozen preview (extensions
+    clamp at the next cue's start); the mirror of today's cleanup pass is
+    ``LegacyCleanupPreview(two_frame_extension_floor=True)``. P5 hands in the
     finalizer's own preview and nothing else here changes.
     """
     resolved_speakers = speakers
@@ -309,6 +311,17 @@ def _document_nodes(lattice: IntervalLattice, layer: AtomLayer) -> tuple[int, ..
     return tuple(out)
 
 
+def _phase1_unit_facts(
+    ctx: CostContext, low: int, high: int
+) -> tuple[float | None, float | None, str]:
+    """The acoustic anchors and owned footprint phase 1 reads for ``[low, high)``."""
+    speech_start, speech_end = speech_span_units(ctx.units[low:high])
+    footprint = _join(
+        [unit.surface for unit in ctx.units[low:high]], ctx.profile.language
+    )
+    return speech_start, speech_end, footprint
+
+
 def _base_edge_cost(
     lattice: IntervalLattice,
     edge: Edge,
@@ -332,11 +345,8 @@ def _base_edge_cost(
     if not isinstance(ctx.speaker_evidence, UnitSpeakers):
         return edge_cost(edge, lattice.atoms, **common)
 
-    low = lattice.unit_bound(edge.start_node)
-    high = lattice.unit_bound(edge.end_node)
-    speech_start, speech_end = speech_span_units(ctx.units[low:high])
-    owned_footprint = _join(
-        [unit.surface for unit in ctx.units[low:high]], ctx.profile.language
+    speech_start, speech_end, owned_footprint = _phase1_unit_facts(
+        ctx, lattice.unit_bound(edge.start_node), lattice.unit_bound(edge.end_node)
     )
     return edge_cost(
         edge,
@@ -994,10 +1004,11 @@ def materialize_cues(
     make every later reader fall through to a character cursor and report a total
     diff for reasons that have nothing to do with boundaries.
 
-    One divergence is unavoidable and deliberate. v1 falls back to the *parent
-    cue's* bounds for an untimed chunk, and a v2 partition has no parent cue, so
-    the fallback here is the previous cue's end (or ``fallback_start`` at the
-    front). The acoustic anchors take no fallback at all in either engine:
+    One divergence is unavoidable and deliberate. v1 lays an untimed chunk over
+    the stretch between the nearest real bounds inside its parent cue (and short
+    made-up cues borrow display time from their siblings), and a v2 partition has
+    no parent cue, so the fallback here is the previous cue's end (or
+    ``fallback_start`` at the front). The acoustic anchors take no fallback at all in either engine:
     invented display time must never be laundered into the evidence layer.  If
     ``units`` contains derived provenance, each cue's exact start/end is taken
     only from its first/last owned aligner unit; an all-aligner stream retains
@@ -1106,26 +1117,48 @@ def score_v1_global(
     matters because the interesting v1 partitions are exactly the ones the
     lattice would refuse. Those refusals are recorded separately as typed
     disagreements instead of being priced as infinities.
+
+    With a speaker track (the P5 rows) v1 is judged and priced under the rules
+    the speaker lattice and its tables use: canonical ``FinalText`` admission in
+    every language, and the phase-1 input bounds, acoustic anchors and owned
+    footprint in the edge price. Scoring v1 under the policy-1 packer and span
+    defaults instead would compare two partitions under two different policies.
     """
     profile = ctx.profile
     lang = profile.language
     atoms = layer.atoms
     count = len(atoms)
     bounds = [layer.unit_bound(node) for node in range(count + 1)]
+    speaker_rows = isinstance(ctx.speaker_evidence, UnitSpeakers)
 
     nodes: list[int] = []
     rounded: list[dict[str, Any]] = []
+    # The node every v1 cue boundary landed on, in v1 cue order. Rounding can
+    # collapse several v1 cuts onto one node (or onto a document end), so a
+    # chain cue is matched to the v1 cue whose landed span it is -- never to the
+    # v1 cue that merely shares its position in the shortened chain.
+    landed: list[int] = [0]
     for cut in sorted(set(v1.cuts)):
         if not 0 < cut < layer.unit_count:
+            landed.append(0 if cut <= 0 else count)
             continue
         position = bisect.bisect_left(bounds, cut)
+        if bounds[position] != cut:
+            # Includes a cut inside the last atom, which rounds up onto the
+            # document end and so vanishes from the chain: still a finding.
+            rounded.append(
+                {"landed_unit": bounds[position], "node": position, "unit": cut}
+            )
+        landed.append(position)
         if 0 < position < count:
-            if bounds[position] != cut:
-                rounded.append(
-                    {"landed_unit": bounds[position], "node": position, "unit": cut}
-                )
             nodes.append(position)
+    landed.append(count)
     chain = (0, *sorted(set(nodes)), count)
+    v1_cue_for_span = {
+        span: index
+        for index, span in enumerate(zip(landed, landed[1:]))
+        if span[0] < span[1]
+    }
 
     barriers = {
         barrier.node
@@ -1134,12 +1167,13 @@ def score_v1_global(
     }
     packer = (
         None
-        if _no_spaces(lang)
+        if _no_spaces(lang) or speaker_rows
         else IncrementalPacker(lang, profile.max_line_length, profile.max_lines)
     )
     canonical_work = CanonicalWork()
     parts: list[CostBreakdown] = []
     disagreements: list[dict[str, Any]] = []
+    previous_end = 0.0
 
     for cue_index, (left, right) in enumerate(zip(chain, chain[1:])):
         if left >= right:
@@ -1170,19 +1204,38 @@ def score_v1_global(
             waiver=None,
         )
         unit_range = (layer.unit_bound(left), layer.unit_bound(right))
-        base = edge_cost(
-            edge,
-            atoms,
-            profile=profile,
-            preview=ctx.preview,
-            next_start=ctx.next_start_after(right),
-            sentence_cross_count=sum(
+        common = {
+            "profile": profile,
+            "preview": ctx.preview,
+            "next_start": ctx.next_start_after(right),
+            "sentence_cross_count": sum(
                 1 for node in ctx.sentence_nodes if left < node < right
             ),
-        )
+        }
+        if speaker_rows:
+            input_start, input_end = _resolve_edge_input_bounds(
+                edge, previous_end=previous_end
+            )
+            previous_end = input_end
+            speech_start, speech_end, footprint = _phase1_unit_facts(
+                ctx, unit_range[0], unit_range[1]
+            )
+            base = edge_cost(
+                edge,
+                atoms,
+                **common,
+                input_start=input_start,
+                input_end=input_end,
+                speech_start=speech_start,
+                speech_end=speech_end,
+                expected_footprint=footprint,
+            )
+        else:
+            base = edge_cost(edge, atoms, **common)
         if isinstance(ctx.speaker_evidence, UnitSpeakers):
-            if cue_index < len(v1.cues):
-                evidence_span = evidence_span_from_cue(v1.cues[cue_index])
+            v1_index = v1_cue_for_span.get((left, right))
+            if v1_index is not None and v1_index < len(v1.cues):
+                evidence_span = evidence_span_from_cue(v1.cues[v1_index])
             elif (
                 low is not None
                 and high is not None
@@ -1326,6 +1379,99 @@ def _adopt_v1(
         reason=reason,
         cuts=tuple(bounds[index][1] for index in picked[:-1]),
     )
+
+
+#: Why a solvable interval carries v1 cues: a neighbouring fallback's complete
+#: v1 cues reach into it.
+ADOPTION_ABSORBED: str = "absorbed-by-fallback"
+
+
+def _adoption_plan(
+    lattices: Sequence[IntervalLattice],
+    v1: V1Partition | None,
+    unit_count: int,
+) -> dict[int, AdoptedV1]:
+    """Every fallback interval's adoption, grown until the adoptions tile.
+
+    A covering v1 cue can straddle a barrier, so a fallback's complete cues can
+    reach into the neighbouring interval, before or after it. Keeping that
+    neighbour's own cues as well would own the straddled units twice, and the
+    document pass would report the duplicate against the neighbour -- as a false
+    exit-driving v2 violation when the neighbour was optimized. So a fallback
+    absorbs every interval its adoption touches, repeating until the adopted
+    span starts and ends on both an interval boundary and a v1 cue boundary.
+    Inside that span each member carries the v1 cues that start in it, so the
+    members' ranges still tile the stream in interval order; a member whose
+    units all sit inside an earlier member's cue carries an empty range. An
+    adoption that reaches no neighbour is exactly :func:`_adopt_v1`'s.
+    """
+    if v1 is None or not v1.cues:
+        return {}
+    bounds = owned_unit_ids(v1.cuts, unit_count)
+    spans = [(item.interval.unit_start, item.interval.unit_end) for item in lattices]
+    plan: dict[int, AdoptedV1] = {}
+    for seed, seed_lattice in enumerate(lattices):
+        infeasible = seed_lattice.infeasible
+        if infeasible is None or seed in plan:
+            continue
+        low, high = spans[seed]
+        first = last = seed
+        while True:
+            picked = [
+                index for index, (a, b) in enumerate(bounds) if a < high and b > low
+            ]
+            grown_low = min([low, *(bounds[index][0] for index in picked)])
+            grown_high = max([high, *(bounds[index][1] for index in picked)])
+            touched = [
+                position
+                for position, (start, end) in enumerate(spans)
+                if start < grown_high and end > grown_low
+            ]
+            grown_first = min([first, *touched])
+            grown_last = max([last, *touched])
+            grown_low = min(grown_low, spans[grown_first][0])
+            grown_high = max(grown_high, spans[grown_last][1])
+            if (grown_low, grown_high, grown_first, grown_last) == (
+                low,
+                high,
+                first,
+                last,
+            ):
+                break
+            low, high, first, last = grown_low, grown_high, grown_first, grown_last
+        if first == last:
+            plan[seed] = _adopt_v1(
+                seed_lattice.interval, infeasible.reason, v1, unit_count
+            )
+            continue
+        members = range(first, last + 1)
+        owned: dict[int, list[int]] = {position: [] for position in members}
+        for index in picked:
+            owner = first
+            for position in members:
+                if spans[position][0] <= bounds[index][0]:
+                    owner = position
+            owned[owner].append(index)
+        cursor = low
+        for position in members:
+            indices = owned[position]
+            covered = (
+                (bounds[indices[0]][0], bounds[indices[-1]][1])
+                if indices
+                else (cursor, cursor)
+            )
+            cursor = covered[1]
+            terminal = lattices[position].infeasible
+            plan[position] = AdoptedV1(
+                unit_range=covered,
+                fallback_expansion_units=None
+                if covered == spans[position]
+                else covered,
+                cues=tuple(v1.cues[index] for index in indices if index < len(v1.cues)),
+                reason=ADOPTION_ABSORBED if terminal is None else terminal.reason,
+                cuts=tuple(bounds[index][1] for index in indices[:-1]),
+            )
+    return plan
 
 
 # ------------------------------------------------------- interval solutions
@@ -1484,19 +1630,23 @@ def optimize_interval(
     units: Sequence[SourceUnit],
     v1: V1Partition | None = None,
     fallback_start: float = 0.0,
+    adopted: AdoptedV1 | None = None,
 ) -> IntervalSolution:
     """Solve one interval, or adopt v1's cues for it and say why.
 
     ``ctx`` is a deviation from the reviewed signature: the validator needs the
     resolved display profile and materialization needs the language, and both
     already ride on the cost context rather than being threaded a second time.
+    ``adopted`` is the document's adoption plan for this interval (see
+    :func:`_adoption_plan`); without one an infeasible interval adopts alone.
     """
     interval = lattice.interval
     profile = ctx.profile
     lang = profile.language
 
-    if lattice.infeasible is not None:
+    if adopted is None and lattice.infeasible is not None:
         adopted = _adopt_v1(interval, lattice.infeasible.reason, v1, len(units))
+    if adopted is not None:
         low, high = adopted.unit_range
         return IntervalSolution(
             interval=interval,
@@ -1505,7 +1655,18 @@ def optimize_interval(
             adopted=adopted,
             cues=adopted.cues,
             partition_units=adopted.cuts,
-            validator_raw=check_partition(
+            # An empty range with no cue has nothing to conserve: its units
+            # belong to a cue an earlier member of the same fallback adopted.
+            validator_raw=PartitionCheckResult(
+                origin="v1",
+                stage="raw",
+                violations=(),
+                waivers=(),
+                cue_count=0,
+                unit_count=0,
+            )
+            if low == high and not adopted.cues
+            else check_partition(
                 [cut - low for cut in adopted.cuts],
                 adopted.cues,
                 units=units[low:high],
@@ -2052,7 +2213,8 @@ def optimize_document(
     solutions: list[IntervalSolution] = []
     resolved_lattices: list[IntervalLattice] = []
     fallback_start = 0.0
-    for raw_interval_lattice in lattice.lattices:
+    adoptions = _adoption_plan(lattice.lattices, v1, len(document.units))
+    for position, raw_interval_lattice in enumerate(lattice.lattices):
         interval_lattice = (
             _cache_candidate_evidence(
                 raw_interval_lattice,
@@ -2080,6 +2242,7 @@ def optimize_document(
             units=document.units,
             v1=v1,
             fallback_start=fallback_start,
+            adopted=adoptions.get(position),
         )
         solutions.append(solution)
         resolved_lattices.append(solution.lattice)
