@@ -99,7 +99,7 @@ def sha256_file(path: Path) -> str:
             while chunk := stream.read(1024 * 1024):
                 digest.update(chunk)
     except OSError as exc:
-        raise ExecutionEnvironmentError(f"cannot hash {path.name}: {exc}") from exc
+        raise ExecutionEnvironmentError(f"cannot read {path}: {exc}") from exc
     return digest.hexdigest()
 
 

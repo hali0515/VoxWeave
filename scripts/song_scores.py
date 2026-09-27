@@ -31,7 +31,13 @@ from voxweave.pipeline import CACHE_DIRNAME
 def _vocals_source(media: Path) -> Path | None:
     """Existing separated-vocals cache for ``media`` (legacy first), without claiming one."""
     legacy = media.parent / CACHE_DIRNAME / f"{media.stem}.vocals.32k.flac"
-    managed = artifacts.inspect_paths(media)
+    try:
+        managed = artifacts.inspect_paths(media)
+    except artifacts.ArtifactMarkerError as exc:
+        # An unreadable or foreign claim is a reason to skip the managed cache,
+        # not to abort a read-only diagnostic.
+        print(f"WARNING: ignoring the artifact cache: {exc}")
+        managed = None
     for candidate in (legacy, managed.vocals_cache if managed else None):
         if candidate is not None and candidate.is_file():
             return candidate

@@ -18,7 +18,7 @@ Every case replays through the same function ``process`` and ``split`` call, so
 this harness cannot drift away from what ships. No media, no model, no network:
 a case is JSON, and a replay is arithmetic plus the segmenters.
 
-The four gated metrics (design doc 4.5):
+The four gated metrics:
 
 ``len_break_mid_phrase_rate``
     Of the internal cue boundaries that acoustic silence did *not* force, how
@@ -52,7 +52,7 @@ Subcommands::
     validate-corpus   schema + coverage + size + digest, no replay
     evaluate          replay, measure, compare to baseline, write the report
     record-baseline   promote a report to the tracked baseline (never run by CI)
-    shadow            P5: measure the full finalizer lane/row matrix beside v1
+    shadow            measure the unshipped shadow lane/row matrix beside v1
     compare-video-dir legacy: run the same metrics over private media siblings
 
 A run that measures (exit 0 or 1) ends stdout with a machine summary::
@@ -80,6 +80,13 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from voxweave.core.shadow_lanes import (
+    LANE_CORE as SHADOW_LANE_CORE,
+    LANE_DISPLAY as SHADOW_LANE_LEGACY_DISPLAY,
+    LANE_FINALIZER as SHADOW_LANE_FINALIZER,
+    LANE_LEGACY as SHADOW_LANE_DELIVERY,
+)
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = _SCRIPTS_DIR.parent
@@ -1014,9 +1021,11 @@ _STRANDED_WARN_S = 5.0
 #: vowel is fine, a unit stretched across silence is an alignment overhang.
 _LONG_UNIT_S = 1.0
 
-#: Wall/run sizes at or above this are worth a warning line; mirrors
-#: ``voxweave.realign.ZERO_DURATION_MAX_RUN`` (the repair pass gives up past
-#: this run length, so anything this long survived into the shipped units).
+#: Wall/run sizes at or above this are worth a warning line. The value borrows
+#: the scale of ``voxweave.realign.ZERO_DURATION_MAX_RUN`` but is not that
+#: limit: the repair pass still relocates runs of exactly that length and
+#: counts punctuation units in its runs, while these counters see lexical units
+#: only, so a warning does not by itself mean the repair gave up on the run.
 _ZERO_SHAPE_WARN = 8
 
 
@@ -2278,20 +2287,48 @@ def print_summary(report: Mapping[str, Any]) -> None:
         print()
         print("  gates")
         for result in results:
-            marker = {
-                "pass": "ok  ",
-                "fail": "FAIL",
-                "insufficient_samples": "n<min",
-                "disabled": "off ",
-            }.get(str(result["status"]), "?   ")
-            reasons = "; ".join(result["reasons"])
-            print(
-                f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
-                f" {result['mode']:<8} {_gate_value_cell(result)}"
-                + (f"  {reasons}" if reasons else "")
-            )
+            _print_gate_row(result)
     for warning in report.get("warnings") or ():
         print(f"  warning: {warning}")
+
+
+def _structurally_zero(result: Mapping[str, Any]) -> bool:
+    """A mid-phrase gate on a spaced language: one unit is one word, so it cannot fail."""
+    group = str(result["group"])
+    return (
+        result["metric"] == "len_break_mid_phrase_rate"
+        and group in cc.CALIBRATION_LANGUAGES
+        and not _has_multichar_phrases(group)
+    )
+
+
+def _print_gate_row(result: Mapping[str, Any]) -> None:
+    marker = {
+        "pass": "ok  ",
+        "fail": "FAIL",
+        "insufficient_samples": "n<min",
+        "disabled": "off ",
+    }.get(str(result["status"]), "?   ")
+    reasons = list(result["reasons"])
+    if _structurally_zero(result):
+        reasons.append("structurally 0: word-level phrases, this gate cannot fail")
+    note = "; ".join(reasons)
+    print(
+        f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
+        f" {result['mode']:<8} {_gate_value_cell(result)}"
+        + (f"  {note}" if note else "")
+    )
+
+
+#: Heading per shadow gate family; ``{lane}`` is the gated lane.
+_SHADOW_GATE_FAMILY_TITLES = {
+    "N1-finalizer-v2-vs-tracked-baseline": (
+        "non-inferiority gates ({lane}, v2 vs the tracked v1 baseline)"
+    ),
+    "N3a-finalizer-vs-legacy-display": (
+        "finalizer vs legacy display gates (same committed v1 input)"
+    ),
+}
 
 
 def machine_summary(
@@ -2714,12 +2751,8 @@ SHADOW_REPORT_KIND = "segmentation-shadow-report"
 #: quality run that may follow in the same process.
 SHADOW_ENV = "VOXWEAVE_SEG_V2_SHADOW"
 
-#: P5's lane/row matrix, named by ``voxweave.core.shadow_v2.SHADOW_LANE_*``
-#: (re-exported by ``pipeline``).
-SHADOW_LANE_CORE = "core_partition_pre_overlay"
-SHADOW_LANE_DELIVERY = "delivery_v1_legacy"
-SHADOW_LANE_FINALIZER = "delivery_finalizer"
-SHADOW_LANE_LEGACY_DISPLAY = "legacy_display"
+#: P5's lane/row matrix; the SHADOW_LANE_* names are imported from
+#: ``voxweave.core.shadow_lanes``, which defines them once.
 SHADOW_LANES = (
     SHADOW_LANE_CORE,
     SHADOW_LANE_DELIVERY,
@@ -2804,10 +2837,10 @@ PERTURB_SAMPLE_RATE = 0.10
 PERTURB_JITTER_DRAWS = 3
 
 #: One-at-a-time weight ablation: term name -> the ``boundary_cost`` constants
-#: that make it up. ``pause_cut`` is absent on purpose -- its amplitude reaches
-#: the ramp through a *keyword default* bound at definition time, so rebinding
-#: ``W_PAUSE`` would not change a single score. It is ablated by zeroing the term
-#: function instead, which is what "this term contributes nothing" means anyway.
+#: that make it up. ``pause_cut`` is absent on purpose: it is ablated by zeroing
+#: the term function, which is what "this term contributes nothing" means.
+#: ``pause_cut_cost`` reads ``W_PAUSE`` at call time, so rebinding it would scale
+#: the ramp, but not ``PAUSE_MISSING_BOUNDS_COST``, which no amplitude reaches.
 ABLATION_WEIGHTS: dict[str, tuple[str, ...]] = {
     "balance": ("W_BALANCE",),
     "cue_base": ("CUE_BASE",),
@@ -2883,19 +2916,33 @@ def shadow_artifact_of(case: Case, result: Any) -> dict[str, Any]:
             f"{case.relpath}: the replay returned no shadow artifact",
             [
                 f"the hook is gated on {SHADOW_ENV}=1 and this run pinned it on",
-                "the installed voxweave predates the P5 hook, or the flag was"
+                "the installed voxweave predates the shadow hook, or the flag was"
                 " consumed by a different process",
             ],
         )
+    error = artifact.get("error") or {}
+    if isinstance(error, Mapping) and error.get("reason") == "invalid-profile":
+        # The hook wraps AD3-2's refusal in an incomplete envelope; the refused
+        # knobs ride on its diagnostic ({key, reason, value}, value may be
+        # "nan"/"inf").
+        diagnostic = artifact.get("diagnostic") or {}
+        raise cc.CalibrationError(
+            f"{case.relpath}: the shadow optimizer refuses a display-profile knob"
+            " that has no defined meaning",
+            [
+                f"{v.get('key')}={v.get('value')}: {v.get('reason')}"
+                for v in diagnostic.get("invalid_profile") or ()
+            ],
+        )
     if "error" in artifact:
-        error = artifact["error"]
         raise cc.CalibrationError(
             f"{case.relpath}: the shadow lane failed on this document",
             [f"{error.get('type')}: {error.get('detail')}"],
         )
     if "invalid_profile" in artifact:
         raise cc.CalibrationError(
-            f"{case.relpath}: the display profile is not interpretable (AD3-2)",
+            f"{case.relpath}: the shadow optimizer refuses a display-profile knob"
+            " that has no defined meaning",
             [
                 f"{v.get('key')}={v.get('value')}: {v.get('reason')}"
                 for v in artifact["invalid_profile"]
@@ -3628,6 +3675,16 @@ def finalizer_vs_legacy_gates(
     return results
 
 
+#: N3b's absolute floor for the ja speaker counterfactual: expressed turn-change
+#: cuts per raw in-speech turn change. 21 of 136 is a fixed target of the P5
+#: shadow specification, which is not part of this repository. When the corpus
+#: cannot reach it (``possible_rate`` below), the gate reports ``stopped``, which
+#: ``p5-authorized-deferrals.txt`` adjudicates.
+N3B_EXPRESSED_RATE_TARGET = 21.0 / 136.0
+#: N3b's floor for the share of expressible ja turn changes the row expressed.
+N3B_EXPRESSIBLE_HIT_TARGET = 0.5
+
+
 def speaker_gate_block(shadow_cases: Sequence[ShadowCase]) -> dict[str, Any]:
     """N3b's four ja gates plus non-blocking zh/en diagnostics."""
 
@@ -3683,7 +3740,7 @@ def speaker_gate_block(shadow_cases: Sequence[ShadowCase]) -> dict[str, Any]:
         language: aggregate_language(language) for language in cc.CALIBRATION_LANGUAGES
     }
     ja = diagnostics["ja"]
-    target = 21.0 / 136.0
+    target = N3B_EXPRESSED_RATE_TARGET
     possible_rate = (
         0.0
         if ja["raw_in_speech_turn_changes"] == 0
@@ -3736,10 +3793,10 @@ def speaker_gate_block(shadow_cases: Sequence[ShadowCase]) -> dict[str, Any]:
             "status": (
                 "pass"
                 if ja["expressible_hit_rate"] is not None
-                and ja["expressible_hit_rate"] >= 0.5
+                and ja["expressible_hit_rate"] >= N3B_EXPRESSIBLE_HIT_TARGET
                 else "fail"
             ),
-            "target": 0.5,
+            "target": N3B_EXPRESSIBLE_HIT_TARGET,
             "value": ja["expressible_hit_rate"],
         },
     ]
@@ -4618,7 +4675,7 @@ def run_coarse_gates(
         )
         frozen_projection_gap = (
             isinstance(raw_error, Mapping)
-            and raw_error.get("detail") == "v1 source partition could not be projected"
+            and raw_error.get("reason") == "v1-unprojected"
             and isinstance(unavailable_comparison, Mapping)
             and unavailable_comparison.get("status") == "refined-counterfactual"
             and isinstance(diagnostic, Mapping)
@@ -4626,8 +4683,7 @@ def run_coarse_gates(
         )
         frozen_optimizer_gap = (
             isinstance(raw_error, Mapping)
-            and raw_error.get("detail")
-            == "optimizer selection authority unavailable for one or more rows"
+            and raw_error.get("reason") == "optimizer-selection-unavailable"
             and isinstance(unavailable_comparison, Mapping)
             and unavailable_comparison.get("status") == "unmaterialized"
             and unavailable_comparison.get("reason")
@@ -4647,11 +4703,10 @@ def run_coarse_gates(
         )
         final_row = artifact["lanes"][SHADOW_LANE_FINALIZER]["rows"].get("v2") or {}
         errors = _coarse_start_errors(source, final_row.get("cues") or ())
-        ordered = sorted(errors)
-        p90 = (
-            None if not ordered else ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
-        )
-        maximum = max(ordered, default=None)
+        # The one pinned percentile definition (type 7), like every other
+        # calibration percentile.
+        p90 = cc.percentile(errors, 90.0)
+        maximum = max(errors, default=None)
         adopted = sum(bool(item["adopted_v1"]) for item in artifact["intervals"])
         raw_validator = artifact["validator"].get("raw") or {}
         finalizer_validator = artifact["validator"].get("finalizer") or {}
@@ -6130,22 +6185,17 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
                     f"  {_ratio_cell(row['forbidden_end_rate']):<20}"
                 )
     results = report["gate_results"]
-    if results:
+    families: dict[str, list[Mapping[str, Any]]] = {}
+    for result in results:
+        families.setdefault(str(result.get("family")), []).append(result)
+    for family, rows in families.items():
+        title = _SHADOW_GATE_FAMILY_TITLES.get(family, family).format(
+            lane=report["gated_lane"]
+        )
         print()
-        print(f"  non-inferiority gates ({report['gated_lane']}, v2 vs v1 baseline)")
-        for result in results:
-            marker = {
-                "pass": "ok  ",
-                "fail": "FAIL",
-                "insufficient_samples": "n<min",
-                "disabled": "off ",
-            }.get(str(result["status"]), "?   ")
-            reasons = "; ".join(result["reasons"])
-            print(
-                f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
-                f" {result['mode']:<8} {_gate_value_cell(result)}"
-                + (f"  {reasons}" if reasons else "")
-            )
+        print(f"  {title}")
+        for result in rows:
+            _print_gate_row(result)
     coverage = report["coverage"]
     print()
     print(
@@ -6169,7 +6219,7 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
     failures = coverage["failures"]
     if failures:
         print()
-        print("  C13 coverage failures")
+        print("  coverage failures")
         for line in failures[:OFFENDER_LIMIT]:
             print(f"    {line}")
     perturbation = report.get("perturbation")
@@ -6188,9 +6238,10 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
             p2 = classes["P2-shot"]
             p3 = classes["P3-speaker-cliffs"]
             print(
-                f"  P1/P2/P3    unit={p1['attempted']}/{p1['failures']}"
-                f" shot={p2['effective']}/{p2['attempted']}"
-                f" speaker={len(p3['probes'])}/{len(p3['failures'])}"
+                f"  P1 unit     attempted={p1['attempted']} failures={p1['failures']}"
+                f"  P2 shot effective={p2['effective']}/{p2['attempted']}"
+                f"  P3 speaker probes={len(p3['probes'])}"
+                f" failures={len(p3['failures'])}"
             )
     coarse = report.get("coarse_gates")
     if coarse:
@@ -6222,6 +6273,12 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
 
 def cmd_shadow(args: argparse.Namespace) -> int:
     command_started = time.perf_counter()
+    ignored = _perturbation_options_without_perturb(args)
+    if ignored:
+        raise cc.CalibrationError(
+            f"{', '.join(ignored)} only apply with --perturb",
+            ["add --perturb, or drop the perturbation options"],
+        )
     corpus = load_corpus(args.corpus)
     cases = list(corpus.cases)
     partial = False
@@ -6506,14 +6563,27 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             near_cliff_only=bool(args.perturb_near_cliff_only),
         )
         if not perturbation["exhaustive"]:
+            truncated = [
+                str(block["case"])
+                for block in perturbation["single_gap"]
+                if int(block["coverage"]["planned_probes"])
+                > sum(block["coverage"]["selected_by_magnitude"].values())
+            ]
+            cause = (
+                "--perturb-max-probes truncated the near-cliff set of "
+                + ", ".join(truncated)
+                if truncated
+                else "a perturbed case had no gap to probe"
+            )
             warnings.append(
-                "--perturb-max-probes truncated the near-cliff set: this run is not"
-                " exhaustive coverage and must not be reported as such"
+                f"{cause}: this run is not exhaustive coverage and must not be"
+                " reported as such"
             )
         if perturbation["near_cliff_only"]:
             warnings.append(
                 "--perturb-near-cliff-only skipped the seeded 10% sample of"
-                " non-near-cliff gaps: a bounded AD-2 slice, not full coverage"
+                " non-near-cliff gaps: a bounded perturbation slice, not full"
+                " coverage"
             )
         warnings.extend(perturbation["classes"]["P3-speaker-cliffs"]["warnings"])
     perturbation_wall_s = time.perf_counter() - perturbation_started
@@ -6617,6 +6687,29 @@ def cmd_shadow(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def _non_negative_int(raw: str) -> int:
+    """argparse type: an integer >= 0 (a negative slice bound would drop probes)."""
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {raw!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {value}")
+    return value
+
+
+def _perturbation_options_without_perturb(args: argparse.Namespace) -> list[str]:
+    """``--perturb-*`` options that were given although ``--perturb`` was not."""
+    given = {
+        "--perturb-case": bool(args.perturb_case),
+        "--perturb-mode": bool(args.perturb_mode),
+        "--perturb-magnitude": bool(args.perturb_magnitude),
+        "--perturb-near-cliff-only": bool(args.perturb_near_cliff_only),
+        "--perturb-max-probes": bool(args.perturb_max_probes),
+    }
+    return [] if args.perturb else [flag for flag, used in given.items() if used]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="calib_segmentation.py",
@@ -6696,7 +6789,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     shadow = sub.add_parser(
         "shadow",
-        help="P5: measure the complete shadow lane/row matrix (separate from `quality`)",
+        help=(
+            "measure the unshipped shadow lane/row matrix beside v1 (separate from"
+            " `quality`)"
+        ),
     )
     shadow.add_argument("--corpus", default=str(DEFAULT_CORPUS))
     shadow.add_argument(
@@ -6714,7 +6810,10 @@ def build_parser() -> argparse.ArgumentParser:
     shadow.add_argument(
         "--check",
         action="store_true",
-        help="apply the exits: 1 on a C13/gate/perturbation failure, 2 on invalid",
+        help=(
+            "apply the exits: 1 on a coverage, gate or perturbation failure,"
+            " 2 on an invalid run"
+        ),
     )
     shadow.add_argument(
         "--allow-environment-drift",
@@ -6731,7 +6830,10 @@ def build_parser() -> argparse.ArgumentParser:
     shadow.add_argument(
         "--perturb",
         action="store_true",
-        help="also run the AD-2 perturbation probes (expensive; see --perturb-case)",
+        help=(
+            "also run the boundary-stability perturbation probes (expensive; see"
+            " --perturb-case). The other --perturb-* options require it"
+        ),
     )
     shadow.add_argument(
         "--perturb-case",
@@ -6757,13 +6859,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--perturb-near-cliff-only",
         action="store_true",
         help="probe only near-cliff gaps (skip the seeded 10%% sample): a bounded"
-        " AD-2 slice cheap enough for the frozen Makefile target",
+        " slice cheap enough for the routine make target",
     )
     shadow.add_argument(
         "--perturb-max-probes",
-        type=int,
+        type=_non_negative_int,
         default=0,
-        help="0 = exhaustive near-cliff coverage; any cap marks the run non-exhaustive",
+        help=(
+            "cap on single-gap probes per perturbed case (0 = no cap); a cap that"
+            " cuts any case's plan short marks the run non-exhaustive"
+        ),
     )
     shadow.set_defaults(func=cmd_shadow)
 

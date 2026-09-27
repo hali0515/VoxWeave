@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Refresh only the P6 oracle execution triplet for one package release."""
+"""Refresh only the P6 oracle execution triplet for a release or a lock change.
+
+A package release changes the version, the lock digest and the container
+digest; a dependency-only ``uv.lock`` change moves just the two digests. Both
+go through the same preflight: the candidate record must validate and compare
+cleanly before the manifest is rewritten.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +33,8 @@ EXPECTED_ROOT = REPO_ROOT / "calibration" / "p6-oracle" / "expected"
 EXECUTION_FIELDS = frozenset(
     {"package_version", "dependency_lock_sha256", "container_digest"}
 )
+#: What a dependency-only ``uv.lock`` change (same package version) moves.
+LOCK_ONLY_FIELDS = frozenset({"dependency_lock_sha256", "container_digest"})
 
 
 class RefreshInvalid(Exception):
@@ -188,10 +196,15 @@ def _candidate_manifest(raw: bytes) -> tuple[bytes, dict[str, Any]]:
         for key in set(execution) | set(candidate["execution"])
         if execution.get(key) != candidate["execution"].get(key)
     }
-    if changed != EXECUTION_FIELDS:
+    if not changed:
         _invalid(
-            "release refresh requires exactly package version, lock digest, and "
-            f"container digest changes; observed {sorted(changed)}"
+            "the execution record already matches this checkout; nothing to refresh"
+        )
+    if changed not in (EXECUTION_FIELDS, LOCK_ONLY_FIELDS):
+        _invalid(
+            "release refresh requires either a release (package version, lock"
+            " digest and container digest) or a dependency-only lock change (lock"
+            f" and container digests); observed {sorted(changed)}"
         )
     return candidate_raw, candidate
 

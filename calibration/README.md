@@ -53,13 +53,15 @@ Rules that are not negotiable:
 - Matching hypothesis to reference is text-driven. Timestamps are what is under test and
   must never be used to pair units.
 
-`scripts/calib_alignment.py` has four subcommands (`--help` lists their flags):
+`scripts/calib_alignment.py` has four subcommands (`--help` lists their flags). Run
+them with the project's platform extra (`--extra mps` on Apple Silicon): a bare
+`uv run` re-syncs the environment without it and drops the inference stack.
 
 ```bash
-uv run python scripts/calib_alignment.py inspect-tracks MEDIA --lang ja [--json]
-uv run python scripts/calib_alignment.py report --manifest M [--json-out P]
-uv run python scripts/calib_alignment.py check --manifest M --baseline B
-uv run python scripts/calib_alignment.py record-baseline --manifest M --report R --output O
+uv run --extra cuda python scripts/calib_alignment.py inspect-tracks MEDIA --lang ja [--hypothesis H] [--json]
+uv run --extra cuda python scripts/calib_alignment.py report --manifest M [--json-out P]
+uv run --extra cuda python scripts/calib_alignment.py check --manifest M --baseline B [--report R]
+uv run --extra cuda python scripts/calib_alignment.py record-baseline --manifest M --report R --output O
 ```
 
 `report` writes `build/calibration/alignment-report.json` unless `--json-out` says
@@ -80,8 +82,9 @@ cases and kept in the report, never averaged per case, so a 60 s clip cannot out
 Case data is tracked in Git, so it should be redistributable (self-recorded, CC,
 public-domain, or consented). `third-party` is the explicit maintainer escape hatch:
 the case is honestly marked `redistributable: false`, and tracking it is the repo
-owner's decision, never the tool's default. The current `third-party` cases (all of
-`zh-*` and `ja-*`) are tracked under that explicit owner decision, recorded 2026-08.
+owner's decision, never the tool's default. Every current case (`en-*`, `zh-*` and
+`ja-*`) is `third-party` and is tracked under that explicit owner decision, recorded
+2026-08.
 Timestamps are rebased to 0, speakers are `S0/S1/...`, and
 no audio, video, source filename or real speaker name is stored. Private extension
 corpora are supplied through `VOXWEAVE_CALIB_ROOT` and are reported separately — they
@@ -99,18 +102,30 @@ allowed = baseline_value + max(absolute_tolerance, baseline_value * relative_tol
 passed = current <= allowed and (absolute_max is None or current <= absolute_max)
 ```
 
-Updating a baseline is a reviewed, human action:
+Updating a baseline is a reviewed, human action: write a fresh report, review it, then
+promote it.
 
 ```bash
-uv run python scripts/calib_segmentation.py record-baseline \
+make quality-segmentation           # writes build/calibration/segmentation-report.json
+make quality-record-segmentation    # promotes that report to segmentation/baseline.json
+```
+
+When the corpus or the metric definition changed, `make quality-segmentation` refuses
+the old baseline (exit 2) before writing a report, so write the report without it:
+
+```bash
+uv run --extra cuda python scripts/calib_segmentation.py evaluate \
   --corpus calibration/segmentation/corpus.json \
-  --report build/calibration/segmentation-report.json \
-  --output calibration/segmentation/baseline.json
+  --json-out build/calibration/segmentation-report.json
 ```
 
 - `record-baseline` is never run by CI and is not part of any default `make` target.
 - It refuses to run unless the report is valid and the corpus digest matches, so a
   regression cannot be laundered into a new baseline by rerunning the harness.
+- Gate levels (`blocking` / `warning`) are kept from the baseline being replaced;
+  only the thresholds come from the report. `--gates-from-report` resets the levels
+  to the report's on purpose (a report evaluated without a baseline carries
+  all-warning levels).
 - A mismatch in corpus digest, `metric_definition_version` or recorded dependency
   versions is exit 2: re-record deliberately and review the diff, do not paper over it.
 - Never grandfather a currently bad value into the absolute target. If head misses the

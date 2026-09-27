@@ -1881,3 +1881,57 @@ def test_no_subtitle_parser_survives_in_the_ruler() -> None:
     assert "Dialogue:" not in source
     assert "0:s:0" not in source
     assert "ffmpeg" not in source
+
+
+def test_negative_perturb_max_probes_is_refused(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A negative cap used to slice probes off the end of every case's plan.
+    with pytest.raises(SystemExit) as excinfo:
+        calib.build_parser().parse_args(
+            ["shadow", "--perturb", "--perturb-max-probes", "-3"]
+        )
+    assert excinfo.value.code == 2
+    assert "must be >= 0" in capsys.readouterr().err
+
+
+def test_perturbation_options_without_perturb_are_invalid(tmp_path: Path) -> None:
+    args = calib.build_parser().parse_args(
+        [
+            "shadow",
+            "--corpus",
+            str(tmp_path / "never-read.json"),
+            "--perturb-case",
+            "en-01",
+            "--perturb-max-probes",
+            "2",
+        ]
+    )
+
+    with pytest.raises(cc.CalibrationError) as excinfo:
+        calib.cmd_shadow(args)
+
+    assert "--perturb-case, --perturb-max-probes only apply with --perturb" in str(
+        excinfo.value
+    )
+
+
+def test_spaced_language_mid_phrase_gate_is_labelled_structural(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def row(group: str) -> dict[str, Any]:
+        return {
+            "group": group,
+            "metric": "len_break_mid_phrase_rate",
+            "mode": "blocking",
+            "status": "pass",
+            "reasons": [],
+            "value": 0.0,
+        }
+
+    for group in ("en", "ja", "all"):
+        calib._print_gate_row(row(group))
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "cannot fail" in lines[0]
+    assert all("cannot fail" not in line for line in lines[1:])
