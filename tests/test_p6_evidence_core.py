@@ -18,7 +18,7 @@ def test_evidence_core_independently_recomputes_surface_reasons_and_digest(tmp_p
     assert core.blocks[0].authority_unit_ids == ("r0",)
     assert core.blocks[0].speech_start == 0.2
     assert core.blocks[0].speech_end == 0.8
-    assert len(core.core_digest) == 64
+    assert core.receipt_digest == reference.claimed_receipt_digest
 
 
 def test_evidence_core_rejects_producer_reason_or_surface_scalar_corruption(tmp_path):

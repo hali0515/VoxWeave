@@ -519,7 +519,11 @@ class AcquisitionAdmissionLedger:
 
 class FreshSealBroken(RuntimeError):
     def __init__(self, failure: CanonicalFailure):
-        super().__init__(f"{failure.kind}/{failure.phase}/{failure.detail_code}")
+        super().__init__(
+            f"{failure.kind}/{failure.phase}/{failure.detail_code}: an internal"
+            " alignment record changed after it was sealed. This is a VoxWeave bug,"
+            " not a problem with your files; please report it with this message"
+        )
         self.failure = failure
 
 
@@ -790,14 +794,6 @@ _VERIFIED_FRESH: dict[int, _VerifiedRecord] = {}
 _FRESH_SESSIONS: dict[int, _SessionRecord] = {}
 _FRESH_LOCK = threading.RLock()
 _ISSUER_TOKEN = object()
-
-
-def _is_sha256(value: object) -> bool:
-    return (
-        type(value) is str
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
 
 
 def _stable_fact_digest(value: object) -> str:
@@ -1239,7 +1235,6 @@ class FreshAlignmentIssuer:
         backend_model_config_facts: object | None,
         route_input_facts: object | None,
         ledger: AcquisitionAdmissionLedger | None,
-        verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None,
     ) -> None:
         if token is not _ISSUER_TOKEN:
             raise TypeError("FreshAlignmentIssuer is private")
@@ -1300,7 +1295,6 @@ class FreshAlignmentIssuer:
             },
         )
         self.ledger = ledger or AcquisitionAdmissionLedger()
-        self.verifier_cut_mutator = verifier_cut_mutator
         self.observed: list[_ObservedPhysicalCall] = []
         self.raw_cursor = 0
         self.sealed = False
@@ -1317,8 +1311,6 @@ class FreshAlignmentIssuer:
         sample_rate: int | None = None,
         sample_count: int | None = None,
         nominal_end_seconds: float | None = None,
-        backend_model_config_digest: str | None = None,
-        route_input_digest: str | None = None,
     ) -> None:
         """AO-07 callback: retain identity/length only; recurse only at sealing."""
         if self.sealed:
@@ -1450,16 +1442,9 @@ class FreshAlignmentIssuer:
                     "sample-geometry", None, "physical-origin-mismatch"
                 )
 
-        model_digest = backend_model_config_digest or self.backend_model_config_digest
-        input_digest = route_input_digest or self.route_input_digest
-        if not _is_sha256(model_digest) or not _is_sha256(input_digest):
-            geometry_failure = StrictFailureLocator(
-                "sample-geometry", None, "sample-geometry"
-            )
-            model_digest = self.backend_model_config_digest
-            input_digest = self.route_input_digest
-        assert isinstance(model_digest, str)
-        assert isinstance(input_digest, str)
+        # Every call shares the issuer's validated source-fact digests.
+        model_digest = self.backend_model_config_digest
+        input_digest = self.route_input_digest
         with align_runtime_activity("AO-07", "raw-id-and-call-observation"):
             self.observed.append(
                 _ObservedPhysicalCall(
@@ -1548,7 +1533,6 @@ def begin_fresh_alignment(
     backend_model_config_facts: object | None = None,
     route_input_facts: object | None = None,
     ledger: AcquisitionAdmissionLedger | None = None,
-    _verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None = None,
 ) -> FreshAlignmentSession:
     """Issue an opaque session; the private backend seam owns its observations."""
     issuer = FreshAlignmentIssuer(
@@ -1565,7 +1549,6 @@ def begin_fresh_alignment(
         backend_model_config_facts=backend_model_config_facts,
         route_input_facts=route_input_facts,
         ledger=ledger,
-        verifier_cut_mutator=_verifier_cut_mutator,
     )
     session = object.__new__(FreshAlignmentSession)
     binding = secrets.token_hex(32)
@@ -1752,8 +1735,17 @@ def _assemble_call_capture(
     legacy_slice_digest = _stable_digest(legacy.receipt)
     try:
         legacy_absolute_digest = _stable_digest(legacy.block_units)
-    except Exception:
-        legacy_absolute_digest = None
+    except Exception as exc:
+        # A retained unit outside the JSON domain (e.g. a non-float time) cannot be
+        # sealed; every later consumer would reject a missing digest, so fail here
+        # with the unit's own error instead.
+        _attach_canonical_failure(
+            exc,
+            kind="legacy-time-transform-failed",
+            phase="legacy-time-transform",
+            detail_code="retained-unit-operand",
+        )
+        raise
     physical = PhysicalCallReceipt(
         call_index=call.call_index,
         source_block_indices=call.source_block_indices,
@@ -1939,7 +1931,6 @@ def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment
             route_claims=claims,
             iso=issuer.language,
             _limits=profile,
-            _verifier_cut_mutator=issuer.verifier_cut_mutator,
         )
     if distribution.work.status == "seal-mismatch":
         terminal = distribution.work.terminal_call_index
@@ -2026,6 +2017,25 @@ def _fresh_record(
         ):
             raise ValueError("fresh alignment is unissued, changed, or cross-context")
         return record
+
+
+def _release_fresh_alignments(context: IssuedAlignContext) -> None:
+    """Forget the sessions, sealed acquisitions and transfers issued for ``context``.
+
+    Their records hold deep copies of every captured unit; see
+    :func:`voxweave.align_orchestration.release_align_selection`.
+    """
+    with _FRESH_LOCK:
+        for key in [key for key, row in _FRESH.items() if row.context is context]:
+            del _FRESH[key]
+        for key in [
+            key for key, row in _VERIFIED_FRESH.items() if row.context is context
+        ]:
+            del _VERIFIED_FRESH[key]
+        for key in [
+            key for key, row in _FRESH_SESSIONS.items() if row.issuer.context is context
+        ]:
+            del _FRESH_SESSIONS[key]
 
 
 def _bind_fresh_adapter_payload(

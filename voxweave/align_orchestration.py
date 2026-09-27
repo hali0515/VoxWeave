@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -9,13 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from voxweave import candidate_encoder
+from voxweave import align_inputs, candidate_encoder
 from voxweave.align_acquisition import (
     IssuedFreshAlignment,
     _bind_fresh_adapter_payload,
     _fresh_producer_core_inputs,
     _fresh_reference_core_inputs,
     _fresh_seed,
+    _release_fresh_alignments,
 )
 from voxweave.align_adapter import (
     AlignDelivery,
@@ -25,19 +27,25 @@ from voxweave.align_adapter import (
     PersistedAlignUnit,
     SourceBlockDecoration,
     _adapter_semantic_observation,
+    _release_align_results,
     issue_align_evaluated_result,
     run_locked_align_adapter,
 )
 from voxweave.align_context import (
     IssuedAlignContext,
     issue_align_context,
+    release_context,
     retire_live_context_roles,
     verify_context_expected_vtt_generation,
-    verify_context_roles_terminal,
 )
 from voxweave.align_distribution import AuthorityDistributionReceipt
-from voxweave.align_evidence import FinalAlignEvidence, bind_align_evidence
+from voxweave.align_evidence import (
+    FinalAlignEvidence,
+    _release_evidence,
+    bind_align_evidence,
+)
 from voxweave.align_evidence_core import (
+    EvidenceCore,
     build_evidence_core,
     evaluate_ald6,
     project_evidence_core,
@@ -346,8 +354,6 @@ def build_align_selection(
     """Run the sole AO-14 through AO-21 align selection schedule."""
     if not isinstance(acquisition, IssuedFreshAlignment):
         raise TypeError("align selection requires one issued fresh acquisition")
-    from voxweave import align_inputs
-
     source_indices = _original_source_indices(blocks)
     v2_policy_status = align_inputs.validate_v2_policy(legacy_policy)
     try:
@@ -463,7 +469,13 @@ def build_align_selection(
             _fresh_reference_core_inputs(context, acquisition)
         )
         if not evaluate_ald6(producer_core, reference_core).passed:
-            raise RuntimeError("independent EvidenceCore projection disagreed")
+            raise RuntimeError(
+                "internal alignment consistency check failed: the independent"
+                " evidence projection disagrees with the aligner output"
+                f" ({_first_core_difference(producer_core, reference_core)});"
+                " no subtitle file was written. This is a VoxWeave bug; please"
+                " report it with this message"
+            )
 
     comparison = None
     if adapter_result.v2_status.kind == "valid":
@@ -508,9 +520,11 @@ def build_align_selection(
     with align_runtime_activity("AO-19", "composite-candidate-encode"):
         candidates = candidate_encoder.encode_align_candidates(context, result)
     with align_runtime_activity("AO-20", "selector-and-independent-projection"):
-        legacy_candidate = candidates.outcome_for("legacy-v1")
-        if not isinstance(legacy_candidate, candidate_encoder.EncodedCandidate):
-            raise RuntimeError("legacy alignment candidate is unavailable")
+        # The legacy candidate is required whichever family is selected: its hashes
+        # are recorded. A failed encode names its cause (SelectedCandidateError).
+        legacy_candidate = candidate_encoder._select_candidate(
+            context, candidates, "legacy-v1"
+        )
         selected = candidate_encoder.select_align_candidate(context, candidates)
         verified = candidate_encoder.verify_selected_align_projection(
             context, result, selected
@@ -554,12 +568,39 @@ def build_align_selection(
     )
 
 
-def retire_align_selection(selection: AlignSelection | IssuedAlignContext) -> None:
-    context = (
-        selection if isinstance(selection, IssuedAlignContext) else selection.context
-    )
+def retire_align_selection(context: IssuedAlignContext) -> None:
+    """Retire every still-live role of ``context`` at the end of an align run.
+
+    Afterwards no role is live, so the run needs no separate terminal-role check.
+    """
     retire_live_context_roles(context)
-    verify_context_roles_terminal(context)
+
+
+def release_align_selection(context: IssuedAlignContext) -> None:
+    """Forget every in-process record of a finished align invocation; idempotent.
+
+    The context, acquisition, adapter and candidate registries keep deep copies of
+    the whole alignment for as long as the process lives, so a process that runs
+    many aligns (a harness or a library caller) would grow without bound. Call this
+    once nothing will use ``context`` again, after the optional shadow observer and
+    whether the align succeeded or failed; afterwards every authority check on it
+    fails as unissued.
+    """
+    _release_evidence(context)
+    candidate_encoder._release_candidates(context)
+    _release_align_results(context)
+    _release_fresh_alignments(context)
+    release_context(context)
+
+
+def _first_core_difference(producer: EvidenceCore, reference: EvidenceCore) -> str:
+    """Name the first EvidenceCore field on which the two projections differ."""
+    for member in dataclasses.fields(producer):
+        if member.compare and getattr(producer, member.name) != getattr(
+            reference, member.name
+        ):
+            return f"first difference: {member.name.lstrip('_')}"
+    return "no field differs"
 
 
 __all__ = [
@@ -568,5 +609,6 @@ __all__ = [
     "build_align_selection",
     "file_sha256",
     "issue_public_align_context",
+    "release_align_selection",
     "retire_align_selection",
 ]

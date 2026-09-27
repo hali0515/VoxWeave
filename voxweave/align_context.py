@@ -125,7 +125,7 @@ class _ContextRecord:
     public_seal: tuple[object, ...]
     role_order: tuple[str, ...]
     roles: dict[str, _RoleRecord]
-    events: list[ContextRoleEvent]
+    event_count: int
 
 
 _ISSUED: dict[int, _ContextRecord] = {}
@@ -208,7 +208,7 @@ def _register(
         public_seal=_public_seal(context),
         role_order=role_order,
         roles={role: _RoleRecord() for role in role_order},
-        events=[],
+        event_count=0,
     )
     with _LOCK:
         _ISSUED[id(context)] = record
@@ -381,8 +381,8 @@ def consume_context_role(
             )
         role_record.terminal = "consumed"
         role_record.consumer = consumer
-        event = ContextRoleEvent(role, "consumed", consumer, len(record.events))
-        record.events.append(event)
+        event = ContextRoleEvent(role, "consumed", consumer, record.event_count)
+        record.event_count += 1
         return event
 
 
@@ -399,15 +399,23 @@ def retire_live_context_roles(
                 continue
             role_record.terminal = "retired"
             role_record.consumer = consumer
-            event = ContextRoleEvent(role, "retired", consumer, len(record.events))
-            record.events.append(event)
+            event = ContextRoleEvent(role, "retired", consumer, record.event_count)
+            record.event_count += 1
             retired.append(event)
     return tuple(retired)
 
 
-def role_events(context: IssuedContext) -> tuple[ContextRoleEvent, ...]:
+def release_context(context: IssuedContext) -> None:
+    """Forget ``context`` once its invocation is over; idempotent.
+
+    The registry otherwise keeps every issued context and its stable input for the
+    life of the process. Afterwards every authority check on ``context`` fails as
+    ``context-unissued``.
+    """
     with _LOCK:
-        return tuple(_record_for(context).events)
+        record = _ISSUED.get(id(context))
+        if record is not None and record.context is context:
+            del _ISSUED[id(context)]
 
 
 def role_vector(context: IssuedContext) -> tuple[Literal["C", "R", "L"], ...]:

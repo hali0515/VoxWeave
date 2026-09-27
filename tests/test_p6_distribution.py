@@ -15,7 +15,6 @@ def _valid_job(
     surfaces=("word",),
     iso="en",
     profile=None,
-    verifier_mutator=None,
 ):
     d = _module()
     blocks = (d.AuthorityBlock(0, block_text),)
@@ -34,17 +33,6 @@ def _valid_job(
     route = (d.RouteExpectation(0, 0, "call", 0),)
 
     def build():
-        if verifier_mutator is not None:
-            return d._build_context_authority_distribution(
-                blocks=blocks,
-                delivery_route=route,
-                calls=calls,
-                skipped_blocks=(),
-                route_claims=claims,
-                iso=iso,
-                _limits=d.capture_authority_limit_profile(),
-                _verifier_cut_mutator=verifier_mutator,
-            )
         return d.build_authority_distribution(
             blocks=blocks,
             delivery_route=route,
@@ -435,9 +423,19 @@ def test_compound_interval_and_character_denial_is_one_event_in_counter_order():
     assert receipt.work.calls[0].allocator.counters.normalize_chars == 2
 
 
-def test_verifier_disagreement_is_transient_seal_mismatch_with_empty_reasons():
+def test_verifier_disagreement_is_transient_seal_mismatch_with_empty_reasons(
+    monkeypatch,
+):
     d = _module()
-    receipt = _valid_job(verifier_mutator=lambda cuts: tuple(reversed(cuts)))
+    verifier_lane = d._run_verifier_lane
+
+    def disagreeing_verifier(*args, **kwargs):
+        result = verifier_lane(*args, **kwargs)
+        assert result.cuts is not None
+        return d.replace(result, cuts=tuple(reversed(result.cuts)))
+
+    monkeypatch.setattr(d, "_run_verifier_lane", disagreeing_verifier)
+    receipt = _valid_job()
     assert receipt.status == "invalid"
     assert receipt.work.status == "seal-mismatch"
     assert receipt.reasons == ()

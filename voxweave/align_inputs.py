@@ -130,7 +130,13 @@ def resolve_align_profile(
     effective_iso: str,
     stored_iso: str | None = None,
 ) -> ProfileResolution:
-    """Apply the closed §7.1 source order without mutating the carrier."""
+    """Resolve the align display profile without mutating the carrier.
+
+    Sources, in order: an unsupported effective language is invalid; a stored language
+    that differs from it, an absent or unsupported segmentation manifest, or a manifest
+    without a profile falls back to the language defaults; otherwise the stored profile
+    must be exactly well-formed (same language, the closed key set, in-domain values).
+    """
     iso = canonical_registry_iso(effective_iso)
     if iso is None:
         return _invalid("manifest-absent", "profile-language")
@@ -154,10 +160,8 @@ def resolve_align_profile(
     raw = segmentation["profile"]
     if not isinstance(raw, Mapping):
         return _invalid(source, "profile-shape")
-    expected = ("max_line_length", "max_lines", *THRESHOLD_KEYS)
-    if tuple(raw) != expected and set(raw) != set(expected):
-        return _invalid(source, "profile-shape")
-    if len(raw) != len(expected):
+    # Key order is not significant: only the exact key set is.
+    if set(raw) != {"max_line_length", "max_lines", *THRESHOLD_KEYS}:
         return _invalid(source, "profile-shape")
     max_line_length = raw.get("max_line_length")
     max_lines = raw.get("max_lines")

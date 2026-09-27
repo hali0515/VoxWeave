@@ -9,7 +9,7 @@ a model; ``align_ctc`` / ``align_mms`` own their singletons.
 from __future__ import annotations
 
 import logging
-import os
+import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +67,39 @@ def _project_legacy_owner(
     return shift_units(list(owner), origin_seconds)
 
 
+def _env_float_in_range(
+    name: str,
+    default: float,
+    *,
+    low: float,
+    high: float = math.inf,
+    low_inclusive: bool = True,
+) -> float:
+    """Import-time float knob limited to ``[low, high]`` (``(low, high]`` when
+    ``low_inclusive`` is false).
+
+    Parsed by ``config._env_float`` (a typo warns and falls back instead of breaking
+    every command at import); a nonfinite or out-of-range value also warns and falls
+    back to ``default`` rather than hanging or failing deep inside an alignment.
+    """
+    value = config._env_float(name, default)
+    too_low = value < low if low_inclusive else value <= low
+    if not math.isfinite(value) or too_low or value > high:
+        bound = "at least" if low_inclusive else "greater than"
+        limit = f" and at most {high:g}" if math.isfinite(high) else ""
+        log.warning(
+            "ignoring %s=%r (must be %s %g%s); using %s",
+            name,
+            value,
+            bound,
+            low,
+            limit,
+            default,
+        )
+        return default
+    return value
+
+
 _CTC_STRIDE = 320  # wav2vec2 @16k downsamples 320x -> 50fps (20ms/frame)
 # Single global forced-align DP is O(T*L); cap audio length so it stays in memory. Movies past
 # this are auto-split at silence anchors (plan_dp_chunks) when cue timestamps are available.
@@ -74,14 +107,18 @@ _CTC_STRIDE = 320  # wav2vec2 @16k downsamples 320x -> 50fps (20ms/frame)
 CTC_MAX_DP_FRAMES = config.conf_ctc_max_dp_frames()
 # Per-chunk DP budget as a fraction of CTC_MAX_DP_FRAMES: leaves headroom so an off-by-a-bit
 # silence anchor never pushes a chunk's O(T*L) trellis past the memory cap.
-CTC_DP_CHUNK_FRAC = float(os.environ.get("VOXWEAVE_CTC_DP_CHUNK_FRAC", "0.8"))
+CTC_DP_CHUNK_FRAC = _env_float_in_range(
+    "VOXWEAVE_CTC_DP_CHUNK_FRAC", 0.8, low=0.0, high=1.0, low_inclusive=False
+)
 # Even within budget, the single global pass is cropped to the transcribed cue envelope
 # [first_bound - pad, last_bound + pad]: skipped songs BEFORE the first cue / AFTER the last
 # are excised from the ASR text but not from `wav`, and a routing-free monotone DP would
 # stretch the leading/trailing sentence's head across that untranscribed region (a sung OP's
 # romaji vocals emit spurious char probabilities the DP latches onto). This pad keeps a small
 # lead-in so a word onset just before its cue boundary is never clipped.
-CTC_ENVELOPE_PAD_SEC = float(os.environ.get("VOXWEAVE_CTC_ENVELOPE_PAD_SEC", "2.0"))
+CTC_ENVELOPE_PAD_SEC = _env_float_in_range(
+    "VOXWEAVE_CTC_ENVELOPE_PAD_SEC", 2.0, low=0.0
+)
 
 
 def _strip_trailing_punct(word: str) -> str:
@@ -93,10 +130,13 @@ def _strip_trailing_punct(word: str) -> str:
 
 
 def interp_missing(units: list[dict]) -> list[dict]:
-    """Fill zero-length spans (end<=start) by linear interpolation from neighboring valid spans. Never drops a unit.
+    """Re-place zero-length spans (end<=start) between their valid neighbours. Never drops a unit.
 
-    Last-resort fallback; OOV chars already get spans via wildcard so this rarely triggers.
-    Two anchors -> linear by index; one side only -> ffill/bfill; no anchors -> as-is. Pure function.
+    Each such unit becomes a point (start == end) interpolated from neighbouring valid spans:
+    two anchors -> linear by index; one side only -> ffill/bfill; no anchors -> as-is. Pure
+    function. Its one caller (wav2vec2 CTC, no-space languages) keeps it only as a guard:
+    every merged CTC token span covers at least one frame, so in practice no unit arrives
+    zero-length and nothing changes.
     """
     out = [dict(u) for u in units]
     valid = [i for i, u in enumerate(out) if u["end"] > u["start"]]
@@ -366,7 +406,13 @@ def _execute_dp_calls(
     legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
     legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
-    """Execute prepared calls, then perform only the deferred AO-08/AO-09 work."""
+    """Execute prepared calls, then perform only the deferred AO-08/AO-09 work.
+
+    The full-pass aligners prepare their calls with :func:`_prepare_dp_calls` (under
+    their preparation invoker) and run them here with ``pass_physical_geometry=True``,
+    which hands each ``pass_fn`` its sample geometry as keywords; without it ``pass_fn``
+    is called as ``pass_fn(wav_slice, texts, offset_s)``.
+    """
     from voxweave.timestamps import shift_units
 
     def run_pass(call: _PreparedDpCall):
@@ -428,42 +474,9 @@ def _execute_dp_calls(
     return out
 
 
-def _dp_chunked_pass(
-    wav,
-    sr: int,
-    norm: list[str],
-    bounds: Sequence[tuple[float, float] | None] | None,
-    pass_fn,
-    label: str,
-    *,
-    crop_to_envelope: bool = False,
-    pass_physical_geometry: bool = False,
-    legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-    legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-) -> list[list[dict]]:
-    """Run one geometry-aware alignment pass under the global-DP memory budget.
-
-    The historical three-argument ``pass_fn(wav_slice, texts, offset_s)`` contract
-    remains the default for low-level callers. CTC/MMS opt into physical geometry.
-    Full-pass public callers may separately run :func:`_prepare_dp_calls` under
-    AO-06 and then call :func:`_execute_dp_calls`, keeping backend and legacy
-    projection work outside that preparation owner.
-    """
-    calls = _prepare_dp_calls(
-        wav,
-        sr,
-        norm,
-        bounds,
-        label,
-        crop_to_envelope=crop_to_envelope,
-    )
-    return _execute_dp_calls(
-        calls,
-        pass_fn,
-        pass_physical_geometry=pass_physical_geometry,
-        legacy_distribution_invoker=legacy_distribution_invoker,
-        legacy_shift_invoker=legacy_shift_invoker,
-    )
+def _run_directly(operation: Callable[[], Any]) -> Any:
+    """Default phase invoker: run ``operation`` with no surrounding bookkeeping."""
+    return operation()
 
 
 def _preflight_over_budget_hints(

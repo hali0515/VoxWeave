@@ -81,7 +81,7 @@ def _untimed_remedy(
     return (
         "audio longer than the single-pass alignment budget"
         f"{budget} is aligned in pieces split at cue timestamps. Align a VTT that"
-        " keeps its cue timing lines (`voxweave process` writes them unless"
+        " keeps its cue timing lines (`voxweave <media>` writes them unless"
         " --no-timestamps is given), or raise VOXWEAVE_CTC_MAX_DP_FRAMES (config"
         " key ctc_max_dp_frames) to align the whole file in one pass, which needs"
         " more memory"

@@ -18,9 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from voxweave import realign
-from voxweave.subformats import decode_subtitle_bytes, sniff_format
-
 
 class FrozenJSONDomainError(TypeError):
     """A selected value cannot be represented in the closed JSON sum type."""
@@ -434,7 +431,21 @@ class SiblingJSONSnapshot:
     lexical: FrozenJSON
     strict_input_status: StrictInputStatus
     carriers: tuple[tuple[str, RawJSONCarrier], ...]
-    digest: str
+
+    @property
+    def digest(self) -> str:
+        """Seal over presence, exact bytes and both projections.
+
+        Computed on demand: encoding both trees costs about as much as building
+        them, and nothing on the align path reads it.
+        """
+        return _sibling_digest(
+            present=self.present,
+            size=self.size,
+            sha256=self.sha256,
+            semantic=self.legacy_semantic,
+            lexical=self.lexical,
+        )
 
     def thaw_legacy(self) -> dict[str, Any]:
         value = thaw_json(self.legacy_semantic)
@@ -492,13 +503,6 @@ def decode_sibling_json_snapshot(name: str, raw: bytes | None) -> SiblingJSONSna
             lexical=lexical,
             strict_input_status=StrictInputStatus("valid", None),
             carriers=tuple((key, RawJSONCarrier(False, None)) for key in _CARRIER_KEYS),
-            digest=_sibling_digest(
-                present=False,
-                size=None,
-                sha256=None,
-                semantic=semantic,
-                lexical=lexical,
-            ),
         )
 
     try:
@@ -538,13 +542,6 @@ def decode_sibling_json_snapshot(name: str, raw: bytes | None) -> SiblingJSONSna
         lexical=lexical,
         strict_input_status=strict_status,
         carriers=tuple((key, _last_occurrence(lexical, key)) for key in _CARRIER_KEYS),
-        digest=_sibling_digest(
-            present=True,
-            size=len(raw),
-            sha256=raw_sha256,
-            semantic=semantic_frozen,
-            lexical=lexical,
-        ),
     )
 
 
@@ -563,12 +560,16 @@ class SubtitleSnapshot:
     name: str
     size: int
     sha256: str
-    decoded_text: str
     blocks: tuple[ParsedVTTBlock, ...]
 
 
 def decode_subtitle_snapshot(name: str, raw: bytes) -> SubtitleSnapshot:
     """Decode exact V0 and parse VTT directly without timestamp sorting."""
+    # Deferred: the frozen-JSON primitives above are a leaf layer for many modules
+    # and must not pull in the subtitle parser (and through it the voice stack).
+    from voxweave import realign
+    from voxweave.subformats import decode_subtitle_bytes, sniff_format
+
     text = decode_subtitle_bytes(raw, Path(name).name)
     sniffed = sniff_format(text)
     if sniffed == "ass":
@@ -605,7 +606,6 @@ def decode_subtitle_snapshot(name: str, raw: bytes) -> SubtitleSnapshot:
         name=Path(name).name,
         size=len(raw),
         sha256=hashlib.sha256(raw).hexdigest(),
-        decoded_text=text,
         blocks=tuple(blocks),
     )
 
@@ -618,7 +618,6 @@ class AlignBlockContent:
     speaker: str | None
     speakers: tuple[tuple[str | None, str], ...] | None
     alignment_text: str
-    content_sha256: str
 
 
 @dataclass(frozen=True)
@@ -704,7 +703,9 @@ def decode_align_snapshot(
         ):
             raise ValueError("predecoded sibling snapshot does not match exact J0")
         sibling = sibling_snapshot
-    separator = "" if effective_iso in realign.NO_SPACE_LANGS else " "
+    from voxweave.realign import NO_SPACE_LANGS
+
+    separator = "" if effective_iso in NO_SPACE_LANGS else " "
     contents: list[AlignBlockContent] = []
     block_values: list[FrozenJSON] = []
     bounds: list[RouteBound] = []
@@ -727,7 +728,6 @@ def decode_align_snapshot(
                 speaker=block.speaker,
                 speakers=block.speakers,
                 alignment_text=alignment_text,
-                content_sha256=frozen_json_digest(frozen),
             )
         )
         start, end = block.start, block.end

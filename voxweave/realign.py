@@ -509,9 +509,11 @@ def route_blocks(
 ) -> list[tuple[float, float] | None]:
     """Rough audio interval for each edited block (used only for window positioning, not in final output).
 
-    Per-cue Qwen align path only; the en/ja full-pass aligners need no routing. If blocks
-    already carry timestamps (re-run scenario), those are used directly; otherwise falls back
-    to character-level matching against the old word_segments.
+    Per-cue Qwen align path only; the en/ja full-pass aligners need no routing. If every
+    block carries timestamps (re-run scenario), those are used directly; otherwise all blocks
+    are routed by character-level matching against the old word_segments. The two time
+    sources are never mixed: an edited VTT's timestamps and the sibling JSON's word times can
+    disagree, and mixing them could hand neighbouring cues inconsistent windows.
     """
     if blocks and all(b["start"] is not None and b["end"] is not None for b in blocks):
         return [(b["start"], b["end"]) for b in blocks]
@@ -1230,7 +1232,8 @@ def render_cues(rows: list[tuple[float | None, float | None, str]]) -> str:
 def render_vtt(blocks: list[dict], spans: list[tuple[float, float]]) -> str:
     """Block text + timestamps → standard timestamped VTT string. Lyric-flagged
     blocks get their music-note wrap restored; speaker metadata is restored as
-    WebVTT voice tags around the final display text."""
+    WebVTT voice tags around the final display text. This is the align output
+    renderer (:func:`voxweave.align_projector.project_align_vtt_bytes`)."""
     return render_cues(
         [
             (

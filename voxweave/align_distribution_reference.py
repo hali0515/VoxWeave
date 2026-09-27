@@ -232,18 +232,22 @@ def _route_mismatch(
     for expected in range(count):
         if expected not in present:
             return RouteMismatch("gap", None, expected, None)
-    for duplicated in range(count):
-        positions = [
-            position for position, index in enumerate(observed) if index == duplicated
-        ]
-        if len(positions) > 1:
-            position = positions[1]
-            return RouteMismatch(
-                "overlap",
-                position,
-                position if position < count else None,
-                observed[position],
-            )
+    repeats: dict[int, int] = {}
+    first_seen: set[int] = set()
+    for position, index in enumerate(observed):
+        if index not in first_seen:
+            first_seen.add(index)
+        elif index not in repeats:
+            repeats[index] = position
+    in_range = sorted(index for index in repeats if 0 <= index < count)
+    if in_range:
+        position = repeats[in_range[0]]
+        return RouteMismatch(
+            "overlap",
+            position,
+            position if position < count else None,
+            observed[position],
+        )
     for position, index in enumerate(observed):
         if index < 0 or index >= count:
             return RouteMismatch(
@@ -474,9 +478,18 @@ def _surface_chars(
     ) + sum(len(surface) for surface in call.unit_surfaces)
 
 
+def _owner_positions(
+    claims: tuple[RouteClaim, ...],
+) -> dict[tuple[str, int], tuple[int, ...]]:
+    owners: dict[tuple[str, int], list[int]] = {}
+    for position, claim in enumerate(claims):
+        owners.setdefault((claim.owner_kind, claim.owner_index), []).append(position)
+    return {key: tuple(positions) for key, positions in owners.items()}
+
+
 def _base_row(
     call: AuthorityCallInput,
-    claims: tuple[RouteClaim, ...],
+    owners: dict[tuple[str, int], tuple[int, ...]],
     blocks_by_source: dict[int, AuthorityBlock],
     limits: CallWorkLimits,
     *,
@@ -484,11 +497,7 @@ def _base_row(
 ) -> AuthorityCallWorkReceipt:
     return AuthorityCallWorkReceipt(
         call.call_index,
-        tuple(
-            position
-            for position, claim in enumerate(claims)
-            if claim.owner_kind == "call" and claim.owner_index == call.call_index
-        ),
+        owners.get(("call", call.call_index), ()),
         call.source_block_indices,
         call.raw_node_range,
         len(call.source_block_indices),
@@ -509,15 +518,11 @@ def _base_row(
 
 def _skip_rows(
     skipped: tuple[AuthoritySkippedBlockInput, ...],
-    claims: tuple[RouteClaim, ...],
+    owners: dict[tuple[str, int], tuple[int, ...]],
 ) -> tuple[AuthoritySkippedBlockReceipt, ...]:
     return tuple(
         AuthoritySkippedBlockReceipt(
-            tuple(
-                position
-                for position, claim in enumerate(claims)
-                if claim.owner_kind == "skip" and claim.owner_index == skip_index
-            ),
+            owners.get(("skip", skip_index), ()),
             item.delivery_index,
             item.source_index,
             item.route_skip_reason,
@@ -675,10 +680,8 @@ def replay_authority_distribution(
             )
     claims = work.route_claims
     mismatch = _route_mismatch(claims, tuple(route), calls, skipped)
-    base_rows = tuple(
-        _base_row(call, claims, blocks_by_source, call_limits) for call in calls
-    )
-    skip_rows = _skip_rows(skipped, claims)
+    claim_positions = _owner_positions(claims)
+    skip_rows = _skip_rows(skipped, claim_positions)
     raw_ids = tuple(unit_id for call in calls for unit_id in call.raw_unit_ids)
     preflight: str | None = None
     terminal: int | None = None
@@ -704,7 +707,10 @@ def replay_authority_distribution(
             totals=_ZERO,
             terminal_call_index=terminal,
             denied=None,
-            rows=base_rows,
+            rows=tuple(
+                _base_row(call, claim_positions, blocks_by_source, call_limits)
+                for call in calls
+            ),
             skip_rows=skip_rows,
         )
         expected = AuthorityDistributionReceipt(
@@ -733,7 +739,7 @@ def replay_authority_distribution(
             rows.append(
                 _base_row(
                     call,
-                    claims,
+                    claim_positions,
                     blocks_by_source,
                     call_limits,
                     prior_terminal=True,
@@ -741,7 +747,7 @@ def replay_authority_distribution(
             )
             continue
         denied = budget.start_call(call.call_index)
-        row = _base_row(call, claims, blocks_by_source, call_limits)
+        row = _base_row(call, claim_positions, blocks_by_source, call_limits)
         if denied is not None:
             rows.append(
                 AuthorityCallWorkReceipt(

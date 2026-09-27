@@ -46,7 +46,6 @@ from voxweave.align_snapshot import (
     frozen_json_digest,
     thaw_json,
 )
-from voxweave.core.langsets import LANGUAGES_WITHOUT_SPACES
 from voxweave.core.segdoc import SourceUnit
 from voxweave.core.subunit import speech_span_units
 from voxweave.engine_registry import engine_family_for
@@ -132,10 +131,6 @@ class EvidenceCore:
     authority_work: AuthorityJobWorkReceipt
     call_surface_chars: tuple[int | None, ...]
     _projection: FrozenObject = field(repr=False, compare=True)
-
-    @property
-    def core_digest(self) -> str:
-        return self.receipt_digest
 
 
 @dataclass(frozen=True)
@@ -661,7 +656,7 @@ def _p_profile(value: object) -> dict[str, Any]:
 
 
 def build_evidence_core(facts: EvidenceCoreProducerInputs) -> EvidenceCore:
-    """Project the producer's complete §9 value without reference helpers."""
+    """Project the producer's complete EvidenceCore value without reference helpers."""
     if not isinstance(facts, EvidenceCoreProducerInputs):
         raise TypeError("producer EvidenceCore inputs have the wrong type")
     if not _p_sha(facts.context_content_digest) or not _p_sha(facts.receipt_digest):
@@ -748,16 +743,8 @@ def build_evidence_core(facts: EvidenceCoreProducerInputs) -> EvidenceCore:
 
 # ---------------------------------------------------------------------------
 # Reference projector C.  Every field helper below is a separate implementation;
-# none calls the producer section above.
-
-
-def _r_sha(value: object) -> bool:
-    if type(value) is not str or len(value) != 64:
-        return False
-    for character in value:
-        if character not in "0123456789abcdef":
-            return False
-    return True
+# none calls the producer section above.  It recomputes every digest it compares
+# (context, receipt, physical calls) instead of shape-checking the claimed ones.
 
 
 def _r_stable_value(value: Any) -> Any:
@@ -1133,8 +1120,11 @@ def _r_capture(call: ReferencePhysicalCallFacts) -> StrictCaptureResult:
 
 
 def _r_legacy_count(text: str, language: str) -> int:
+    # The legacy slicer counts characters only for the aligners' no-space set.
+    from voxweave.realign import NO_SPACE_LANGS
+
     stripped = (text or "").strip()
-    if language in LANGUAGES_WITHOUT_SPACES:
+    if language in NO_SPACE_LANGS:
         return sum(1 for character in stripped if character.isalnum())
     return len(stripped.split())
 
@@ -1944,7 +1934,7 @@ def _r_profile(value: object) -> dict[str, Any]:
 
 
 def project_evidence_core(facts: EvidenceCoreReferenceInputs) -> EvidenceCore:
-    """Independently reconstruct every §9 field before selected outputs exist."""
+    """Independently reconstruct every EvidenceCore field before selected outputs exist."""
     if not isinstance(facts, EvidenceCoreReferenceInputs):
         raise TypeError("reference EvidenceCore inputs have the wrong type")
     context_digest = _r_context_digest(facts)

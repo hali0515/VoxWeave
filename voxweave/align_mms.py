@@ -5,7 +5,7 @@ OOV-wildcard-without-anchor on rare kanji (cue-tail collapse / drift). Same
 model as whisperx --align_backend ctc. Must run full-audio rather than per-cue:
 the ONNX/cython path accumulates heap corruption on repeated small calls
 (crashes at ~180-226 calls). Movie-length audio is DP-chunked at silence
-anchors via ``align_common._dp_chunked_pass``.
+anchors via ``align_common._prepare_dp_calls``.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from voxweave.align_common import (
     _DeferredLegacyProjection,
     _PreparedDpCall,
     _distribute_units,
-    _dp_chunked_pass,
+    _run_directly,
     _execute_dp_calls,
     _load_mono,
     _preflight_over_budget_hints,
@@ -259,14 +259,22 @@ def align_blocks_full_mms(
     full-length O(T*L) trellis — the same movie-length wall as the wav2vec2 path. Past
     CTC_MAX_DP_FRAMES (MMS-300m is a wav2vec2 backbone: same 320x downsample at 16k, so the
     budget applies unchanged) the audio is DP-chunked at silence anchors via cue `bounds`
-    (see _dp_chunked_pass). The handful of resulting large ONNX calls stays far below the
+    (see _prepare_dp_calls). The handful of resulting large ONNX calls stays far below the
     ~180-call heap-corruption regime.
     """
     if (_legacy_distribution_invoker is None) != (_legacy_shift_invoker is None):
         raise ValueError("legacy projection phase invokers must be supplied together")
 
-    prepared_calls: list[_PreparedDpCall] | None = None
-    if _preparation_invoker is None:
+    if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() == "1":
+        # The VAD emission mask is wired into the wav2vec2 CTC pass only; MMS emissions
+        # stay unmasked pending ja truth validation.
+        log.warning(
+            "--vad-mask / VOXWEAVE_VAD_EMISSION_MASK has no effect on MMS alignment"
+            " (language %s); only the wav2vec2 CTC aligner applies it",
+            iso,
+        )
+
+    def prepare_full_pass() -> list[_PreparedDpCall]:
         wav = _read_wav_16k(wav_path)
         if mute_spans:
             # excised song intervals: no transcript belongs there by construction, so zeroing
@@ -275,40 +283,22 @@ def align_blocks_full_mms(
             wav = mute_spans_in_wav(wav, MMS_SR, mute_spans)
         norm = [(t or "").strip() for t in texts]
         _preflight_over_budget_hints(wav, MMS_SR, norm, bounds)
-    else:
-
-        def prepare_full_pass() -> tuple[list[str], Any, list[_PreparedDpCall]]:
-            prepared_wav = _read_wav_16k(wav_path)
-            if mute_spans:
-                prepared_wav = mute_spans_in_wav(
-                    prepared_wav,
-                    MMS_SR,
-                    mute_spans,
-                )
-            prepared_norm = [(text or "").strip() for text in texts]
-            _preflight_over_budget_hints(
-                prepared_wav,
-                MMS_SR,
-                prepared_norm,
-                bounds,
-            )
-            calls = _prepare_dp_calls(
-                prepared_wav,
-                MMS_SR,
-                prepared_norm,
-                bounds,
-                "MMS",
-                crop_to_envelope=crop_to_envelope,
-            )
-            return prepared_norm, prepared_wav, calls
-
-        norm, wav, prepared_calls = cast(
-            tuple[list[str], Any, list[_PreparedDpCall]],
-            _preparation_invoker(prepare_full_pass),
+        return _prepare_dp_calls(
+            wav,
+            MMS_SR,
+            norm,
+            bounds,
+            "MMS",
+            crop_to_envelope=crop_to_envelope,
         )
 
-    # offset_s is part of the _dp_chunked_pass pass_fn contract (used by the CTC
-    # path's emission masking); MMS does not mask yet, pending ja truth validation.
+    prepared_calls = cast(
+        list[_PreparedDpCall],
+        (_preparation_invoker or _run_directly)(prepare_full_pass),
+    )
+
+    # MMS does not mask emissions, so offset_s is not needed for that; it still places
+    # this call's deferred legacy units and its observed geometry on the file timeline.
     source_cursor = 0
 
     def _pass(
@@ -368,19 +358,6 @@ def align_blocks_full_mms(
             raise RuntimeError("MMS flat result was not observed before distribution")
         return out
 
-    if prepared_calls is None:
-        return _dp_chunked_pass(
-            wav,
-            MMS_SR,
-            norm,
-            bounds,
-            _pass,
-            "MMS",
-            crop_to_envelope=crop_to_envelope,
-            pass_physical_geometry=True,
-            legacy_distribution_invoker=_legacy_distribution_invoker,
-            legacy_shift_invoker=_legacy_shift_invoker,
-        )
     return _execute_dp_calls(
         prepared_calls,
         _pass,

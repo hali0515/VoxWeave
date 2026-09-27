@@ -364,7 +364,12 @@ _LOCK = threading.RLock()
 
 class EvidenceBindingError(RuntimeError):
     def __init__(self, failure: CanonicalFailure):
-        super().__init__(f"{failure.kind}/{failure.phase}/{failure.detail_code}")
+        super().__init__(
+            f"{failure.kind}/{failure.phase}/{failure.detail_code}: align stopped"
+            " because its alignment evidence failed an internal consistency check;"
+            " no subtitle file was written. This is a VoxWeave bug, not a problem"
+            " with your files; please report it with this message"
+        )
         self.failure = failure
 
 
@@ -372,6 +377,16 @@ def _binding_failure(detail: str = "evidence-binding") -> EvidenceBindingError:
     return EvidenceBindingError(
         CanonicalFailure("final-evidence-invalid", "evidence-bind", detail)
     )
+
+
+def _release_evidence(context: IssuedAlignContext) -> None:
+    """Forget the evidence bound for ``context``.
+
+    See :func:`voxweave.align_orchestration.release_align_selection`.
+    """
+    with _LOCK:
+        for key in [key for key, row in _EVIDENCE.items() if row.context is context]:
+            del _EVIDENCE[key]
 
 
 def _is_sha256(value: object) -> bool:
@@ -993,10 +1008,9 @@ def _validate_physical_calls(
                     or not math.isfinite(end)
                 ):
                     _invalid("legacy retained unit bounds are not finite numbers")
-                if start > end:
-                    _invalid(
-                        f"legacy retained unit {owner_index}:{unit_index} is reversed"
-                    )
+                # No start <= end check: the legacy lane records the aligner's units
+                # verbatim, and an aligner may return a reversed one. The strict
+                # authority lane is what judges it (and invalidates authority).
                 if kind == "identity":
                     absolute_start, absolute_end = start, end
                 else:
@@ -1007,7 +1021,6 @@ def _validate_physical_calls(
                     or type(absolute_end) not in (int, float)
                     or not math.isfinite(absolute_start)
                     or not math.isfinite(absolute_end)
-                    or absolute_start > absolute_end
                 ):
                     _invalid("legacy absolute unit projection is invalid")
                 absolute_owner.append(
