@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 from voxweave import fsio, lang
@@ -49,6 +50,10 @@ _PACK_AUDIO_ALLOW = {
 # subs like hdmv_pgs/dvd_subtitle cannot and are dropped when the target
 # container will not store them as-is).
 _TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+
+# Text subtitle codecs Matroska cannot store: pack into mkv converts them to
+# srt instead of stream-copying (3GPP timed text / tx3g probes as mov_text).
+_MKV_CONVERT_SUB_CODECS = {"mov_text", "tx3g"}
 
 # Audio codecs safe to stream-copy into mp4; anything else is re-encoded to AAC.
 # The mov/mp4 muxer stores flac/opus/dts natively, so those copy rather than
@@ -225,13 +230,17 @@ def resolve_media(vtt: Path, media: Path | None) -> Path:
     return found
 
 
-def _timed_subtitle_check(sub: Path) -> None:
-    """Raise early (with the standard hint) when the subtitle file parses to no
-    timestamped cues (e.g. a plain-text VTT edit draft)."""
-    from voxweave.export import _timed_rows
+def _timed_subtitle_check(sub: Path) -> list[dict]:
+    """Load the subtitle file's cue blocks, raising early (with the standard
+    hint) unless every cue is timed: a plain-text VTT edit draft has nothing to
+    show, and a partly timed file would lose its untimed cues. Shared by pack
+    and burn; export runs the same check."""
+    from voxweave.export import require_timed_blocks
     from voxweave.subformats import load_subtitle_blocks
 
-    _timed_rows(load_subtitle_blocks(Path(sub)))
+    blocks = load_subtitle_blocks(Path(sub))
+    require_timed_blocks(blocks, Path(sub).name)
+    return blocks
 
 
 def _utf8_subtitle(sub: Path, temp_dirs: list[Path]) -> Path:
@@ -259,21 +268,32 @@ def _utf8_subtitle(sub: Path, temp_dirs: list[Path]) -> Path:
     return copy
 
 
-def default_output(media: Path, container: str, tag: str) -> Path:
-    """Sibling output path "<stem>.<container>"; "<stem>.<tag>.<container>" when
-    that would overwrite the source."""
+def default_output(
+    media: Path,
+    container: str,
+    tag: str,
+    languages: Sequence[str | None] = (),
+) -> Path:
+    """Sibling output path "<stem>.<lang>...<tag>.<container>", e.g.
+    "ep.zh.ja.pack.mkv" or "ep.zh.burn.mp4".
+
+    ``languages`` are the subtitle languages (argument order, de-duplicated;
+    unknown ones are left out), so a pack/burn for one language never
+    overwrites another's; rerunning the same command replaces its own output.
+    The tag is always there, so the name never equals the source's and the
+    subtitle-to-media lookup ("ep.zh.vtt" tries "ep.zh.<ext>", then
+    "ep.<ext>") never picks up a product.
+    """
     from voxweave.pipeline import swap_ext
 
-    out = swap_ext(media, f".{container}")
-    if out.resolve() == Path(media).resolve():
-        out = swap_ext(media, f".{tag}.{container}")
-    return out
+    codes = [code for code in dict.fromkeys(languages) if code]
+    return swap_ext(media, "." + ".".join([*codes, tag, container]))
 
 
 def _check_output_clear_of_source(out: Path, media: Path) -> Path:
     """Reject an output path that resolves to the source media: ffmpeg reading
-    and writing the same file truncates the source. Only reachable via an
-    explicit ``-o`` (default_output already sidesteps the collision)."""
+    and writing the same file truncates the source. Reachable via an explicit
+    ``-o`` (or a default name that is a link to the source)."""
     if Path(out).resolve() == Path(media).resolve():
         raise ValueError(
             f"output {Path(out).name} is the source media; pick a different -o/--output"
@@ -303,7 +323,8 @@ def _check_pack_compat(container: str, streams: list[dict]) -> None:
     """Reject stream-copying source codecs the target container cannot hold.
 
     Raised before any ffmpeg run so the caller gets a clear message (and the
-    mkv escape hatch) instead of a cryptic muxer failure. mkv holds everything.
+    mkv escape hatch) instead of a cryptic muxer failure. mkv holds every
+    video/audio codec (text subtitles it cannot hold are converted to srt).
     """
     checks = (
         ("video", _PACK_VIDEO_ALLOW.get(container)),
@@ -337,9 +358,11 @@ def build_pack_cmd(
     (VTT/SRT/ASS) appended as a subtitle track (everything stream-copied, new
     subs transcoded to the container's text codec; ASS into mkv is kept as-is).
 
-    mkv targets carry every source stream (including attachments/fonts); mp4 and
-    webm targets keep video+audio and only those existing subtitle tracks that
-    are text-based (image subs cannot become mov_text/webvtt and are dropped).
+    mkv targets carry every source stream (including attachments/fonts; text
+    subtitles Matroska cannot store, like mov_text, are converted to srt); mp4
+    and webm targets keep video+audio and only those existing subtitle tracks
+    that are text-based (image subs cannot become mov_text/webvtt and are
+    dropped). Only the first packed track is left flagged default.
     """
     sub_codec = SUB_CODEC[container]
     subs = [s for s in source_streams if s.get("codec_type") == "subtitle"]
@@ -347,28 +370,34 @@ def build_pack_cmd(
     for vtt in vtts:
         cmd += ["-i", str(vtt)]
 
+    # source subtitle streams in output order (output s:0, s:1, ...)
+    kept: list[dict] = []
     if container == "mkv":
         cmd += ["-map", "0"]
-        kept_subs = len(subs)
+        kept = subs
     else:
         cmd += ["-map", "0:v", "-map", "0:a?"]
-        kept_subs = 0
         for s in subs:
             if s.get("codec_name") in _TEXT_SUB_CODECS:
                 cmd += ["-map", f"0:{s['index']}"]
-                kept_subs += 1
+                kept.append(s)
             else:
                 logger.warning(
                     "dropping %s subtitle track (not representable in %s)",
                     s.get("codec_name"),
                     container,
                 )
+    kept_subs = len(kept)
     for i in range(len(vtts)):
         cmd += ["-map", f"{i + 1}:0"]
 
     cmd += ["-c", "copy"]
     if container == "mkv":
-        # existing subs stream-copy; only the appended files are transcoded
+        # existing subs stream-copy unless Matroska cannot store their codec;
+        # the appended files are transcoded
+        for i, s in enumerate(kept):
+            if s.get("codec_name") in _MKV_CONVERT_SUB_CODECS:
+                cmd += [f"-c:s:{i}", "srt"]
         for i, vtt in enumerate(vtts):
             cmd += [f"-c:s:{kept_subs + i}", _packed_sub_codec(vtt, container)]
     else:
@@ -393,7 +422,12 @@ def build_pack_cmd(
         if iso:
             cmd += [f"-metadata:s:{spec}", f"language={lang.to_iso3(iso)}"]
         cmd += [f"-metadata:s:{spec}", f"title={track_title(iso)}"]
-    # the first packed track is what the user just produced — make players pick it
+    # the first packed track is what the user just produced — make players pick
+    # it, and only it: a kept source track still flagged default can win.
+    # "-default" drops just that flag (forced/hearing_impaired stay).
+    for i, s in enumerate(kept):
+        if (s.get("disposition") or {}).get("default") == 1:
+            cmd += [f"-disposition:s:{i}", "-default"]
     cmd += [f"-disposition:s:{kept_subs}", "default"]
     cmd += [str(out)]
     return cmd
@@ -426,7 +460,11 @@ def pack(
             f"unsupported container {cont!r} (choose from {', '.join(SUB_CODEC)})"
         )
     out = _check_output_clear_of_source(
-        output or default_output(src, cont, "pack"), src
+        output
+        or default_output(
+            src, cont, "pack", [detect_subtitle_language(v) for v in vtts]
+        ),
+        src,
     )
     streams = probe_streams(src)
     _check_pack_compat(cont, streams)  # raise before any ffmpeg run
@@ -785,7 +823,7 @@ def burn(
     the video bitrate is capped at the source's, so the output is no larger
     than the source."""
     from voxweave.export import _timed_rows, ass_header, render_ass
-    from voxweave.subformats import load_subtitle_blocks, require_subtitle
+    from voxweave.subformats import require_subtitle
 
     rep = reporter or Reporter()
     native_ass = Path(vtt).suffix.lower() in (".ass", ".ssa")
@@ -803,13 +841,8 @@ def burn(
     if native_ass:
         rows = None
     else:
-        blocks = load_subtitle_blocks(Path(vtt))
-        rows = _timed_rows(blocks)
-        timed_blocks = [
-            block
-            for block in blocks
-            if block.get("start") is not None and block.get("end") is not None
-        ]
+        timed_blocks = _timed_subtitle_check(Path(vtt))  # every cue is timed
+        rows = _timed_rows(timed_blocks, name=Path(vtt).name)
 
     streams = probe_streams(src)
     videos = [s for s in streams if s.get("codec_type") == "video"]
@@ -846,7 +879,9 @@ def burn(
     enc = pick_encoder(codec, force=encoder)
     q = quality if quality is not None else _DEFAULT_QUALITY.get(enc, 23)
     out = _check_output_clear_of_source(
-        output or default_output(src, container, "burn"), src
+        output
+        or default_output(src, container, "burn", [detect_subtitle_language(vtt)]),
+        src,
     )
 
     tmp_ass: Path | None = None

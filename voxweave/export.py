@@ -1,10 +1,13 @@
 """Export subtitles between formats (VTT/SRT/ASS in, VTT/SRT/ASS out).
 
 The VTT + JSON pair stays the source of truth; export renders presentation
-formats from it. SRT is a plain re-rendering (inline ``<i>`` tags pass through
-unchanged -- mainstream players honor them). ASS carries a Default dialogue
-style and translates ``<i>``/``</i>`` into ``{\\i1}``/``{\\i0}`` override tags,
-giving styled features (lyrics italics, raised positioning) a native target.
+formats from it. SRT is a plain re-rendering (inline ``<i>`` tags and the
+``{\\an8}`` position tag pass through -- mainstream players honor them). ASS
+carries a Default dialogue style, translates ``<i>``/``</i>`` into
+``{\\i1}``/``{\\i0}`` override tags and keeps ``{\\anN}``/``{\\aN}`` position
+tags as real overrides, giving styled features (lyrics italics, raised
+positioning) a native target. WebVTT output drops position tags (it has no
+inline form for them).
 Foreign SRT/ASS files can also be exported to VTT to enter the voxweave
 editing workflow (they carry no word-level JSON, so align works from scratch).
 """
@@ -72,6 +75,9 @@ _ASS_HEADER = ass_header()
 _ITALIC_OPEN_RE = re.compile(r"<i>", re.IGNORECASE)
 _ITALIC_CLOSE_RE = re.compile(r"</i>", re.IGNORECASE)
 _OTHER_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+# The position tag mainstream SRT players honor ({\an8} = top center), plus the
+# legacy SSA numbering ({\a6}: 1-3 bottom, 5-7 top, 9-11 middle).
+_POSITION_TAG_RE = re.compile(r"\{\\(an[1-9]|a(?:1[01]|[1235679]))\}")
 
 
 def _srt_ts(seconds: float) -> str:
@@ -93,28 +99,58 @@ def _ass_ts(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
 
+def require_timed_blocks(blocks: Sequence[Mapping[str, Any]], name: str) -> None:
+    """Raise ValueError unless every cue of the file ``name`` carries timestamps.
+
+    A file without any is a plain-text edit draft. A partly timed one is refused
+    too, as translate refuses it for SRT/ASS: every timed output (SRT/ASS
+    export, burn, pack) would silently lose its untimed cues. The message names
+    the first untimed cues (1-based, in file order) and the fix."""
+    untimed = [
+        (n, b)
+        for n, b in enumerate(blocks, start=1)
+        if b.get("start") is None or b.get("end") is None
+    ]
+    if not untimed:
+        return
+    if name.lower().endswith(".vtt"):
+        remedy = f"run 'voxweave align {name}' first"
+    else:
+        remedy = "add their timing lines first"
+    if len(untimed) == len(blocks):
+        raise ValueError(
+            f"{name}: no cue timestamps found (plain-text edit draft?); {remedy}"
+        )
+    shown = ", ".join(str(n) for n, _b in untimed[:5])
+    if len(untimed) > 5:
+        shown += f", ... {len(untimed)} in all"
+    first = " ".join(str(untimed[0][1].get("text", "")).split())
+    if len(first) > 40:
+        first = first[:37] + "..."
+    raise ValueError(
+        f"{name} has cues without timestamps (cue {shown}; first: {first!r}); {remedy}"
+    )
+
+
 def _timed_rows(
     blocks: list[dict],
+    *,
+    name: str,
 ) -> list[tuple[float, float, str]]:
-    """Cue blocks -> (start, end, text) rows; raises when the file carries no
-    timestamps at all (a plain-text edit draft -- run ``align`` first).
+    """Cue blocks of the file ``name`` -> (start, end, text) rows; raises unless
+    every cue is timed (see :func:`require_timed_blocks`).
 
     Lyric-flagged blocks (parsers strip the music-note wrap into the flag) get
     their display wrap restored here so renderers see the on-screen text."""
-    rows = [
+    require_timed_blocks(blocks, name)
+    return [
         (
             float(b["start"]),
             float(b["end"]),
             f"♪ {b['text']} ♪" if b.get("lyric") else str(b["text"]),
         )
         for b in blocks
-        if b.get("start") is not None and b.get("end") is not None
     ]
-    if not rows:
-        raise ValueError(
-            "no cue timestamps found (plain-text edit draft?); run 'voxweave align' first"
-        )
-    return rows
 
 
 def _srt_speaker_text(text: str, block: Mapping[str, Any] | None) -> str:
@@ -131,31 +167,44 @@ def _srt_speaker_text(text: str, block: Mapping[str, Any] | None) -> str:
     return f"{speaker}: {text}" if speaker else text
 
 
+def _split_position(text: str) -> tuple[str | None, str]:
+    """Cue text -> (its position override such as ``"an8"`` or None, the text
+    without position tags). Only the first tag counts, as in libass."""
+    tags = _POSITION_TAG_RE.findall(text)
+    return (tags[0] if tags else None), _POSITION_TAG_RE.sub("", text)
+
+
 def render_srt(
     rows: list[tuple[float, float, str]],
     *,
     blocks: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
-    """Render numbered SRT cues, including speaker-name prefixes when supplied."""
+    """Render numbered SRT cues, including speaker-name prefixes when supplied.
+    A ``{\\an8}``-style position tag is kept, at the start of the cue."""
     out: list[str] = []
     for n, (start, end, text) in enumerate(rows, start=1):
         out.append(str(n))
         out.append(f"{_srt_ts(start)} --> {_srt_ts(end)}")
         block = blocks[n - 1] if blocks is not None and n - 1 < len(blocks) else None
-        out.append(_srt_speaker_text(text, block))
+        position, text = _split_position(text)
+        body = _srt_speaker_text(text, block)
+        out.append(f"{{\\{position}}}{body}" if position else body)
         out.append("")
     return "\n".join(out).rstrip() + "\n"
 
 
 def _ass_text(text: str) -> str:
     """Cue text -> ASS event text: ``\\N`` line breaks, ``<i>`` to ``{\\i1}``
-    overrides, other tags dropped, brace characters neutralized (ASS reads
+    overrides, a ``{\\an8}``/``{\\a6}`` position tag to a leading override of
+    its own, other tags dropped, brace characters neutralized (ASS reads
     ``{...}`` as override blocks)."""
+    position, text = _split_position(text)
     t = text.replace("{", "(").replace("}", ")")
     t = _ITALIC_OPEN_RE.sub(r"{\\i1}", t)
     t = _ITALIC_CLOSE_RE.sub(r"{\\i0}", t)
     t = _OTHER_TAG_RE.sub("", t)
-    return t.replace("\n", "\\N")
+    t = t.replace("\n", "\\N")
+    return f"{{\\{position}}}{t}" if position else t
 
 
 def render_ass(
@@ -198,7 +247,10 @@ def render_vtt_rows(
     *,
     blocks: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
-    """Render timed rows as WebVTT, restoring any speaker voice tags."""
+    """Render timed rows as WebVTT, restoring any speaker voice tags. SRT-style
+    position tags are dropped: WebVTT has no inline form for them and the cue
+    writer emits no cue settings."""
+    rows = [(s, e, _POSITION_TAG_RE.sub("", t)) for s, e, t in rows]
     if blocks is None:
         return render_cues([(s, e, t) for s, e, t in rows])
     return render_cues(
@@ -236,21 +288,16 @@ def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
             f"pick another --format (e.g. -f {example})"
         )
     blocks = load_subtitle_blocks(sub_path)
-    timed_blocks = [
-        block
-        for block in blocks
-        if block.get("start") is not None and block.get("end") is not None
-    ]
-    rows = _timed_rows(blocks)
+    rows = _timed_rows(blocks, name=sub_path.name)  # raises unless all are timed
     out: list[Path] = []
     for fmt in dict.fromkeys(formats):  # dedupe, keep order
         path = swap_ext(sub_path, f".{fmt}")
         if fmt == "srt":
-            rendered = render_srt(rows, blocks=timed_blocks)
+            rendered = render_srt(rows, blocks=blocks)
         elif fmt == "ass":
-            rendered = render_ass(rows, blocks=timed_blocks)
+            rendered = render_ass(rows, blocks=blocks)
         else:
-            rendered = render_vtt_rows(rows, blocks=timed_blocks)
+            rendered = render_vtt_rows(rows, blocks=blocks)
         fsio.atomic_write_text(path, rendered)
         out.append(path)
     return out

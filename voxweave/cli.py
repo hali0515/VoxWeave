@@ -877,8 +877,9 @@ def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
     "--output",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
-    help="Output path (default: <media stem>.<container>, or <stem>.pack.<container>"
-    " when that would overwrite the source).",
+    help="Output path (default: <media stem>.<languages>.pack.<container> next to the"
+    " source, e.g. episode.zh.ja.pack.mkv; the languages come from the subtitle file"
+    " names, just .pack when none has one).",
 )
 def cmd_pack(
     vtts: tuple[Path, ...],
@@ -891,7 +892,8 @@ def cmd_pack(
 
     Each track is titled "VoxWeave <Language>" with the container language tag set
     from the filename (episode.zh.vtt -> chi / "VoxWeave Chinese"); the first
-    packed track is flagged default. ASS keeps its styling in mkv targets.
+    packed track is flagged default and the source's own subtitle tracks lose
+    their default flag. ASS keeps its styling in mkv targets.
     Existing streams are preserved (mp4/webm targets drop image-based subtitle
     tracks they cannot store).
     """
@@ -975,8 +977,9 @@ def cmd_pack(
     "--output",
     type=click.Path(dir_okay=False, path_type=Path),
     default=None,
-    help="Output path (default: <media stem>.<container>, or <stem>.burn.<container>"
-    " when that would overwrite the source).",
+    help="Output path (default: <media stem>.<language>.burn.<container> next to the"
+    " source, e.g. episode.zh.burn.mp4; <media stem>.burn.<container> when the"
+    " subtitle file name has no language).",
 )
 def cmd_burn(
     vtt: Path,

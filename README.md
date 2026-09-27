@@ -713,7 +713,11 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 SRT/ASS/VTT out (written next to the input; the VTT + JSON pair stays the source of truth
 for voxweave-produced subtitles). ASS output carries a Default style; lyric cues (`♪ ... ♪`)
 render italic. Named VTT cues become `NAME: text` in SRT and use the ASS Dialogue `Name`
-field. Foreign SRT/ASS files can be exported to VTT to enter the editing workflow.
+field. The SRT position tag `{\an8}` (raise to the top) stays in SRT output, becomes a real
+override in ASS and is dropped from VTT. Foreign SRT/ASS files can be exported to VTT to
+enter the editing workflow. Every cue needs timestamps: a plain-text edit draft, or a file in
+which only some cues are timed, is refused with the untimed cues named (run `align` on a VTT
+first; an SRT needs its missing timing lines).
 
 ```bash
 voxweave export episode.vtt --format srt
@@ -729,19 +733,23 @@ Repeat `-f, --format` to request multiple output formats in one run.
 (VTT/SRT/ASS) added as proper subtitle tracks. Pure stream copy (instant, lossless,
 reversible); each track is titled `VoxWeave <Language>` with the container language tag
 taken from the filename (`episode.zh.vtt` → `chi` / "VoxWeave Chinese"), and the first
-packed track is flagged default so players select it. ASS inputs keep their styling in
-mkv targets (mp4/webm store text-only codecs, so styling is dropped there).
+packed track is flagged default (the source tracks lose that flag) so players select it.
+ASS inputs keep their styling in mkv targets (mp4/webm store text-only codecs, so styling
+is dropped there).
 
 ```bash
-voxweave pack episode.zh.vtt                    # finds episode.<ext>, keeps its container
-voxweave pack episode.zh.vtt episode.ja.vtt     # several tracks at once
+voxweave pack episode.zh.vtt                    # finds episode.<ext>, keeps its container -> episode.zh.pack.mkv
+voxweave pack episode.zh.vtt episode.ja.vtt     # several tracks at once -> episode.zh.ja.pack.mkv
 voxweave pack episode.zh.vtt --container mp4    # mov_text in mp4 (image subs are dropped)
 voxweave pack episode.zh.vtt --media other.mkv -o out.mkv
 ```
 
-mkv targets keep every source stream (including attachments); mp4/webm targets keep
-video+audio and existing _text_ subtitle tracks only. HEVC video muxed into mp4 is tagged
-`hvc1` for Apple players.
+The output goes next to the source as `<media stem>.<languages>.pack.<container>`, the
+languages taken from the subtitle file names (just `.pack` when none has one), so packing
+another language never replaces an earlier result; `-o` picks any other path. mkv targets
+keep every source stream (including attachments; mov_text subtitles, which Matroska cannot
+store, are converted to SRT); mp4/webm targets keep video+audio and existing _text_
+subtitle tracks only. HEVC video muxed into mp4 is tagged `hvc1` for Apple players.
 
 ### Burn (hard subtitles)
 
@@ -751,10 +759,12 @@ at the actual frame size (same look as `export`, lyric cues italic); ASS/SSA inp
 libass as-is, keeping its own styling. The video is re-encoded at constant quality with
 hardware acceleration when available: **NVENC** on NVIDIA, **VideoToolbox** on macOS,
 libx264/libx265/libsvt-av1 software fallback. Audio is stream-copied (mp4 targets re-encode
-mp4-incompatible codecs to AAC).
+mp4-incompatible codecs to AAC). The output goes next to the source as
+`<media stem>.<language>.burn.<container>` (`episode.burn.mp4` when the subtitle file name
+carries no language) unless `-o` names one.
 
 ```bash
-voxweave burn episode.zh.vtt                          # hevc, auto hw encoder, -> episode.mp4
+voxweave burn episode.zh.vtt                          # hevc, auto hw encoder, -> episode.zh.burn.mp4
 voxweave burn episode.zh.vtt --codec h264             # legacy-device compatibility
 voxweave burn episode.zh.vtt --codec av1 --container mkv   # max compression, recent hardware
 voxweave burn episode.zh.vtt --quality 20 --font "Noto Sans CJK SC"

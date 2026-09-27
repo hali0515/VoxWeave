@@ -160,6 +160,41 @@ behaviour, for example when burning an AV1 or VP9 source to h264, which needs mo
 the source for the same picture. When the source rate cannot be read, `burn` warns and
 encodes without a cap.
 
+### `pack` and `burn` name their output after the subtitle language
+
+Without `-o`, the output used to be `<media stem>.<container>` (`.pack`/`.burn` was added
+only when that name was the source itself), so packing or burning a second language into
+the same media silently replaced the first result. The default name now always carries the
+command and the subtitle languages taken from the subtitle file names:
+
+- `burn episode.zh.vtt` writes `episode.zh.burn.mp4` (was `episode.mp4`);
+  `burn episode.vtt` writes `episode.burn.mp4`.
+- `pack episode.zh.vtt episode.ja.vtt` writes `episode.zh.ja.pack.mkv` (languages in
+  argument order, each once); with no language in any file name it is `episode.pack.mkv`.
+
+Running the same command again still replaces its own previous output. Scripts that pick up
+the old name should pass `-o` or use the new one.
+
+### `pack` into mkv keeps mov_text subtitles and a single default track
+
+Packing into mkv (the default for `.mov` sources) failed when the source carried mov_text
+(3GPP timed text) subtitles, which Matroska cannot store; those tracks are now converted to
+SRT. The first packed track was flagged default, but a source subtitle track flagged default
+kept its flag, so players could still pick the old track; that flag is now cleared (other
+flags such as forced stay).
+
+### Subtitle conversion refuses partly timed files and keeps `{\an8}`
+
+- `export`, `burn` and `pack` refuse a subtitle file in which only some cues have
+  timestamps, as `translate` does for SRT/ASS, instead of silently leaving the untimed cues
+  out. The error names the first untimed cues; run `voxweave align` on a VTT, or add the
+  missing timing lines to an SRT.
+- The SRT position tag `{\an8}` (and the SSA form `{\a6}`) no longer shows up as literal
+  `(\an8)` text in ASS export or burned video: it is kept as an ASS override, stays in SRT
+  output and is dropped from VTT output.
+- ASS vector drawings (`{\p1}m 0 0 l ...`) are no longer read as dialogue; an event that only
+  draws a shape produces no cue.
+
 ## 0.17.0
 
 Two performance settings were added, both off by default, and successful runs gained

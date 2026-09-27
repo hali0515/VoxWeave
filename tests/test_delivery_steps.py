@@ -128,7 +128,7 @@ def test_burn_steps_follow_input_format(delivery_inputs, monkeypatch, native_ass
     assert f"[{total}/{total}] encode video" in result.stderr
     assert "Burn done" in result.stderr
     assert ("prepare subtitles" in result.stderr) is not native_ass
-    assert result.stdout.strip() == str(media.with_suffix(".mp4"))
+    assert result.stdout.strip() == str(media.with_name("episode.burn.mp4"))
     assert "frame=" not in result.stdout + result.stderr
     assert media.read_bytes() == b"media"
 
@@ -188,7 +188,7 @@ def test_ffmpeg_progress_failure_retains_early_error_and_tail(monkeypatch):
 
 def test_burn_failure_preserves_existing_output(delivery_inputs, monkeypatch):
     media, subtitle = delivery_inputs
-    output = media.with_suffix(".mp4")
+    output = media.with_name("episode.burn.mp4")
     output.write_bytes(b"previous output")
     monkeypatch.setattr(mux, "pick_encoder", lambda codec, *, force: "libx264")
 

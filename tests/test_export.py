@@ -11,6 +11,7 @@ from voxweave.export import (
     export_subtitles,
     render_ass,
     render_srt,
+    render_vtt_rows,
 )
 from voxweave.subformats import parse_ass_blocks
 
@@ -188,6 +189,81 @@ def test_ass_header_strips_commas_from_font_name():
     style_line = next(line for line in h.splitlines() if line.startswith("Style:"))
     assert "Weird Font" in style_line
     assert style_line.count(",") == default_commas
+
+
+def test_ass_keeps_srt_position_tag_as_override():
+    # {\an8} is the de facto SRT "raise to the top" tag; ASS must receive it as
+    # a real override, never as literal "(\an8)" text
+    ass = render_ass([(0.0, 1.0, "{\\an8}Top line {raw}")])
+    assert "Default,,0,0,0,,{\\an8}Top line (raw)" in ass
+    assert "(\\an8)" not in ass
+    # legacy SSA numbering (\a6 = top center) is an ASS override as well
+    assert "Default,,0,0,0,,{\\a6}Top" in render_ass([(0.0, 1.0, "{\\a6}Top")])
+    # only the first position tag counts (as in libass); the tag moves to the front
+    ass = render_ass([(0.0, 1.0, "<i>Hi</i>{\\an8} there{\\an2}")])
+    assert "Default,,0,0,0,,{\\an8}{\\i1}Hi{\\i0} there" in ass
+
+
+def test_srt_and_vtt_never_show_position_tag_as_text():
+    rows = [(0.0, 1.0, "{\\an8}Top line")]
+    # SRT players honor the tag, so it stays (at the start of the cue)
+    assert "\n{\\an8}Top line\n" in render_srt(rows)
+    # the VTT writer has no cue settings: the tag is dropped, the text kept
+    vtt = render_vtt_rows(rows)
+    assert "\\an8" not in vtt and "\nTop line\n" in vtt
+
+
+def test_export_srt_position_tag_to_ass_and_vtt(tmp_path):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n{\\an8}Sign on the wall\n", encoding="utf-8"
+    )
+    export_subtitles(srt, ("ass", "vtt"))
+    ass = (tmp_path / "ep.ass").read_text(encoding="utf-8")
+    assert "Default,,0,0,0,,{\\an8}Sign on the wall" in ass
+    vtt = (tmp_path / "ep.vtt").read_text(encoding="utf-8")
+    assert "an8" not in vtt and "Sign on the wall" in vtt
+
+
+def test_export_rejects_partly_timed_vtt(tmp_path):
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text(
+        "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nfirst\n\njust text\n\n"
+        "00:00:02.000 --> 00:00:03.000\nthird\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError) as info:
+        export_subtitles(vtt, ("srt", "ass"))
+    msg = str(info.value)
+    assert "ep.vtt has cues without timestamps (cue 2" in msg
+    assert "voxweave align ep.vtt" in msg
+    assert not (tmp_path / "ep.srt").exists() and not (tmp_path / "ep.ass").exists()
+
+
+def test_export_partly_timed_error_lists_only_the_first_few(tmp_path):
+    vtt = tmp_path / "ep.vtt"
+    cues = ["00:00:00.000 --> 00:00:01.000\ntimed"] + [f"loose {n}" for n in range(8)]
+    vtt.write_text("WEBVTT\n\n" + "\n\n".join(cues) + "\n", encoding="utf-8")
+    with pytest.raises(
+        ValueError, match=r"\(cue 2, 3, 4, 5, 6, \.\.\. 8 in all; first: 'loose 0'\)"
+    ):
+        export_subtitles(vtt, ("srt",))
+
+
+def test_export_partly_timed_srt_names_the_fix(tmp_path):
+    # a blank line inside an SRT cue body splits off an untimed fragment; align
+    # takes VTT only, so the fix is the timing line itself
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nfirst\n\nstray second line\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nsecond\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError) as info:
+        export_subtitles(srt, ("vtt",))
+    msg = str(info.value)
+    assert "(cue 2; first: 'stray second line')" in msg
+    assert "add their timing lines" in msg and "align" not in msg
 
 
 def test_export_restores_lyric_wrap(tmp_path):
