@@ -323,8 +323,6 @@ def test_untimed_text_past_the_last_real_bound_borrows_display_time():
         [parent],
         max_line_length=16,
         max_lines=2,
-        min_duration=0.8,
-        desired_wps=3.0,
         lang="zh",
         thresholds=SplitThresholds(),
     )
@@ -572,8 +570,6 @@ def test_en_len_break_avoids_forbidden_token():
         [cue],
         max_line_length=14,
         max_lines=1,
-        min_duration=0.0,
-        desired_wps=4.0,
         lang="en",
         thresholds=SplitThresholds(min_cue_s=0.0),
     )
@@ -746,8 +742,6 @@ def test_build_atoms_degrades_instead_of_raising_on_desync():
         [{"text": "上涨92%了", "start": 0.0, "end": 0.2, "word_data": wd}],
         max_line_length=18,
         max_lines=1,
-        min_duration=0.0,
-        desired_wps=4.0,
         lang="zh",
     )
     assert "".join(c["text"] for c in cues) == "上涨92%了"

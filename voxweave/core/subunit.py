@@ -604,12 +604,12 @@ def assert_refinement_conserved(
     if original and tuple(sorted(set(origin))) != tuple(range(len(original))):
         raise RefinementConservationError("origin map does not cover every parent")
 
-    for parent_index, parent in enumerate(original):
-        surfaces = [
-            item.surface
-            for item, owner in zip(refined, origin)
-            if owner == parent_index
-        ]
+    # One pass groups the children by parent; the checks above guarantee every
+    # owner indexes ``original``.
+    children: list[list[str]] = [[] for _ in original]
+    for item, owner in zip(refined, origin):
+        children[owner].append(item.surface)
+    for parent_index, (parent, surfaces) in enumerate(zip(original, children)):
         if _join(surfaces, lang) != parent.surface:
             raise RefinementConservationError(
                 f"parent {parent_index} changed its character stream"

@@ -525,6 +525,26 @@ def _check_cycle(
         return ["cycle adoption without cycle evidence"]
     if not cycle.members:
         return ["cycle evidence declares no members"]
+    # Shape first: a member that is not one (start, end) pair per cue cannot be
+    # swept at all, and the sweep would fail on it with an IndexError instead of
+    # a finding.
+    malformed = [
+        position
+        for position, member in enumerate((*cycle.members, cycle.adopted))
+        if len(member) != len(cues) or any(len(pair) != 2 for pair in member)
+    ]
+    if malformed:
+        for position in malformed:
+            label = (
+                "adopted state"
+                if position == len(cycle.members)
+                else f"member {position}"
+            )
+            problems.append(
+                f"cycle {label} is not one (start, end) pair per cue of the "
+                f"{len(cues)}-cue stream"
+            )
+        return problems
     if replayed not in cycle.members:
         problems.append("the replayed state is not a member of the declared cycle")
     for position, member in enumerate(cycle.members):
@@ -681,7 +701,7 @@ def replay_trace(
 
     if replayed != delivered:
         problems.append(f"replayed state {replayed} is not the delivered {delivered}")
-    if trace.terminal == "fixed-point":
+    if trace.terminal == "fixed-point" and len(delivered) == len(seed):
         stepped = sweep(delivered, seed, profile=profile, evidence=evidence)
         if stepped != delivered:
             problems.append(

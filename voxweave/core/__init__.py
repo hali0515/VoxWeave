@@ -41,7 +41,8 @@ imports ``voxweave.align_delta_registry``; ``finalizer`` lazily imports
   display-duration preview, delivered text, the policy delta registry.
 - ``finalizer`` / ``trace_validator`` / ``partition_check`` / ``authority`` —
   the TimelineFinalizer, its independent checks and sealed issuance.
-- ``shadow_v2`` / ``shadow_schema`` — the shadow lane and its artifact contract.
+- ``shadow_v2`` / ``shadow_schema`` / ``shadow_lanes`` — the shadow lane, its
+  artifact contract and the lane names both share.
 - ``align_seed`` / ``align_compare`` — P6 align seed construction and semantic
   comparison.
 """

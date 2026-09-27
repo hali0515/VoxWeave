@@ -344,8 +344,6 @@ class RawSpeakerEvent:
     event_id: str
     index: int
     time: float
-    left_label: str
-    right_label: str
 
 
 @dataclass(frozen=True)
@@ -780,7 +778,7 @@ def _raw_events(turns: Sequence[Turn]) -> tuple[RawSpeakerEvent, ...]:
         if time is None or not _finite(time):
             continue
         index = len(out)
-        out.append(RawSpeakerEvent(f"e{index}", index, float(time), left[2], right[2]))
+        out.append(RawSpeakerEvent(f"e{index}", index, float(time)))
     return tuple(out)
 
 
@@ -968,18 +966,15 @@ def _lineage(
 ) -> tuple[
     tuple[tuple[str, BucketKind], ...],
     tuple[LiveSpeakerEvent, ...],
-    int,
 ]:
     # Precedence is applied before the first injective reservation.  A terminal
     # event cannot consume the only attribution transition that an eligible
     # event needs, and an out-of-H event never enters this function at all.
     terminal: dict[str, BucketKind] = {}
     eligible: list[RawSpeakerEvent] = []
-    unexpressible_count = 0
     for event in in_speech_events:
         if _structurally_unexpressible(event, parent_units):
             terminal[event.event_id] = "unexpressible"
-            unexpressible_count += 1
             continue
         boundary = _nearest_parent_boundary(event, parent_units)
         if boundary is not None:
@@ -1028,7 +1023,7 @@ def _lineage(
                 event.event_id, event.index, final_positions[event.event_id]
             )
         )
-    return tuple(buckets), tuple(live), unexpressible_count
+    return tuple(buckets), tuple(live)
 
 
 def speaker_evidence(
@@ -1409,7 +1404,7 @@ def measure_speaker_events(
     in_speech = tuple(
         event for event in evidence.raw_events if _event_in_speech(event, spans)
     )
-    base_buckets, live_events, _unexpressible = _lineage(
+    base_buckets, live_events = _lineage(
         in_speech,
         evidence.parent_speakers,
         evidence.parent_units,
@@ -1422,7 +1417,6 @@ def measure_speaker_events(
     expressed_ids = {match.event_id for match in matches}
     event_buckets: dict[str, str] = {}
     counts = {kind: 0 for kind in BUCKET_KINDS}
-    raw_by_id = {event.event_id: event for event in evidence.raw_events}
     for event in in_speech:
         event_id = event.event_id
         bucket: str
@@ -1441,11 +1435,7 @@ def measure_speaker_events(
             live_events, _boundary_points(off_boundaries)
         )
         off_ids = {match.event_id for match in off_matches}
-        attributable = sum(
-            event_id not in off_ids
-            for event_id in expressed_ids
-            if event_id in raw_by_id
-        )
+        attributable = sum(event_id not in off_ids for event_id in expressed_ids)
     raw_count = len(in_speech)
     if sum(counts.values()) != raw_count:
         raise SpeakerEvidenceError("speaker bucket conservation failed")

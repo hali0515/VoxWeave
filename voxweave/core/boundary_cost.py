@@ -31,6 +31,7 @@ different claims:
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
@@ -329,10 +330,19 @@ def ramp_integral_mean(
 
 
 def pause_cut_cost(evidence: PauseEvidence) -> float:
-    """Price one boundary's pause evidence."""
+    """Price one boundary's pause evidence.
+
+    The uncertainty band is the one the evidence records, and the amplitude is
+    read at call time rather than frozen into ``ramp_integral_mean``'s defaults.
+    """
     if evidence.effective_ms is None or evidence.ramp_ms is None:
         return PAUSE_MISSING_BOUNDS_COST
-    return ramp_integral_mean(evidence.effective_ms, evidence.ramp_ms)
+    return ramp_integral_mean(
+        evidence.effective_ms,
+        evidence.ramp_ms,
+        amplitude=W_PAUSE,
+        uncertainty_ms=evidence.uncertainty_ms,
+    )
 
 
 # --------------------------------------------------------------- breakdowns
@@ -431,6 +441,11 @@ class CostContext:
     speaker_evidence: Any = None
     sing_spans: Sequence[tuple[float, float]] | None = None
     speaker_weight: float = 0.0
+
+    @functools.cached_property
+    def sorted_sentence_nodes(self) -> tuple[int, ...]:
+        """``sentence_nodes`` in ascending order, for bisecting per edge."""
+        return tuple(sorted(self.sentence_nodes))
 
     def next_start_after(self, document_node: int) -> float | None:
         """The first known start at or after a document atom-stream node.

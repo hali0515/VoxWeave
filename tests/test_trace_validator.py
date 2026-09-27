@@ -699,6 +699,31 @@ def test_adopting_a_non_minimal_member_is_rejected():
     assert any("numeric minimum" in problem for problem in problems)
 
 
+@pytest.mark.parametrize(
+    "members",
+    [((),), (((0.0, 1.0), (1.0, 2.0)),), (((0.0,),),)],
+    ids=["empty-member", "extra-cue", "half-pair"],
+)
+def test_malformed_cycle_members_are_findings_not_crashes(members):
+    """A member that is not one (start, end) pair per cue cannot be swept."""
+    prof, cues, shots, result = _cycle_run()
+    cycle = result.trace.cycle
+    assert cycle is not None
+    trace = dataclasses.replace(
+        result.trace, cycle=dataclasses.replace(cycle, members=members)
+    )
+    seed = fin.phase1_stream(cues, profile=prof)
+    problems = tv.replay_trace(
+        trace,
+        seed,
+        profile=prof,
+        evidence=fin.FinalizeEvidence(shots=shots),
+        policy=fin.FinalizePolicy(),
+        delivered=tuple((c["start"], c["end"]) for c in result.cues),
+    )
+    assert any("member 0 is not one (start, end) pair" in p for p in problems)
+
+
 # ======================================================== E. the stability check
 
 

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 from voxweave.core.boundary_cost import POLICY_VERSION
-from voxweave.core.policy_delta import DELTA_REGISTRY, delta_registry_bytes
+from voxweave.core.policy_delta import DELTA_REGISTRY, delta_registry_data
 
 
 EXPECTED_DELTA_REGISTRY_BYTES = (
@@ -51,7 +53,10 @@ EXPECTED_DELTA_REGISTRY_BYTES = (
 
 def test_delta_registry_has_the_frozen_typed_bytes():
     assert POLICY_VERSION == 2
-    assert delta_registry_bytes() == EXPECTED_DELTA_REGISTRY_BYTES
+    serialized = json.dumps(
+        delta_registry_data(), ensure_ascii=False, separators=(",", ":")
+    ).encode()
+    assert serialized == EXPECTED_DELTA_REGISTRY_BYTES
 
 
 def test_policy_two_has_exactly_one_speaker_partition_delta():

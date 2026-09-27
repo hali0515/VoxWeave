@@ -77,8 +77,7 @@ from .timing import (
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MIN_DURATION = 3.0  # reading-speed pad for single cues
-DEFAULT_DESIRED_WPS = 4.0  # target reading speed (English wps)
+DEFAULT_DESIRED_WPS = 4.0  # reading speed (English wps) behind an untimed estimate
 
 # Comma line-break: split into separate cues at commas, but only when both
 # sides are at least this long (visual chars). Shorter clauses stay attached
@@ -1964,18 +1963,18 @@ def split_long_cues_with_word_timings(
     cues: list[Cue],
     max_line_length: int,
     max_lines: int,
-    min_duration: float,
-    desired_wps: float,
     lang: str,
+    *,
     speech_spans: list[tuple[float, float]] | None = None,
     thresholds: SplitThresholds | None = None,
 ) -> list[Cue]:
     """Pack each cue's atoms into reading-sized cues using gap/duration/length breaks.
 
-    ``min_duration`` / ``desired_wps`` are kept for back-compat (unused on the atom-based path).
     ``thresholds=None`` is the legacy length-break-only path: ``do_new=False`` disables the
     gap/duration breaks, so the threshold values are never read (the default instance is a
-    never-read placeholder there).
+    never-read placeholder there). The optional arguments are keyword-only, so a caller
+    still passing the removed ``min_duration``/``desired_wps`` positionally gets a
+    ``TypeError`` instead of having them bound to other parameters.
     """
     do_new = thresholds is not None
     ctx = SplitContext(
@@ -2090,11 +2089,9 @@ def smart_split_segments(
     lang: str,
     max_line_length: int | None = None,
     max_lines: int | None = None,
-    min_duration: float = DEFAULT_MIN_DURATION,
-    desired_wps: float = DEFAULT_DESIRED_WPS,
+    *,
     split_at_comma: bool = True,
     comma_split_min_len: int | None = None,
-    *,
     speech_spans: list[tuple[float, float]] | None = None,
     thresholds: SplitThresholds | dict | None = None,
     shot_changes: list[float] | None = None,
@@ -2103,6 +2100,9 @@ def smart_split_segments(
 
     Each segment must have ``text`` and ``words`` (with ``start``/``end``).
     Returns a flat list of cues with ``text``, ``start``, ``end``, ``word_data``.
+    Everything after ``max_lines`` is keyword-only, so a caller still passing the
+    removed ``min_duration``/``desired_wps`` positionally gets a ``TypeError``
+    instead of having them bound to ``split_at_comma``/``comma_split_min_len``.
 
     ``split_at_comma`` (default on) breaks at commas unless either side is
     shorter than ``comma_split_min_len`` visual chars. With ``thresholds`` set
@@ -2150,8 +2150,6 @@ def smart_split_segments(
         all_cues,
         max_line_length=max_line_length,
         max_lines=max_lines,
-        min_duration=min(min_duration, 5.0 / 6.0),
-        desired_wps=desired_wps,
         lang=lang,
         speech_spans=speech_spans,
         thresholds=th,

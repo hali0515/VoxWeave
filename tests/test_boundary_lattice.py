@@ -1172,16 +1172,17 @@ def test_a_line_break_is_not_charged_a_separator():
 def test_punctuation_a_digit_keeps_in_the_stream_is_not_charged(canonical_spaced):
     """Bug pin: a cue that strips a trailing ``.`` was charged for it.
 
-    Atom displays come from the stream joined without spaces, where ``de.`` is
-    followed by ``5`` and the dot survives ``[.,](?!\\d)``. Inside a cue the join
-    puts a space there and the dot is stripped, so ``abc de`` fits a 6-cell line.
-    Charging the dot demanded a second cut the single offered node cannot give,
-    and typed a legal partition ``coarse-granularity``.
+    On the stream joined without spaces, ``de.`` is followed by ``5`` and the
+    dot survives ``[.,](?!\\d)``. Inside a cue the join puts a space there and
+    the dot is stripped, so ``abc de`` fits a 6-cell line, and the atom's display
+    (its own text normalized alone, AD3-1) is ``de``. Charging the dot demanded a
+    second cut the single offered node cannot give, and typed a legal partition
+    ``coarse-granularity``.
     """
     prof = profile(max_line_length=6, max_lines=1, max_cue_s=0.0)
     doc = document([("abc de.", 0.0, 1.0), ("5 xyz", 1.0, 2.0)], prof=prof)
     lattice = build_document_lattice(doc, canonical_spaced=canonical_spaced).lattices[0]
-    assert [atom.display for atom in lattice.atoms] == ["abc", "de.", "5", "xyz"]
+    assert [atom.display for atom in lattice.atoms] == ["abc", "de", "5", "xyz"]
     assert lattice.nodes == (0, 2, 4)
     check = granularity_check(lattice.atoms, lattice.nodes, prof)
     assert (check.required_cuts, check.available_cuts) == (1, 1)

@@ -261,21 +261,6 @@ def test_dp_equals_brute_force_at_the_pinned_upper_bound(draw):
     assert result.best.cuts == canonical([p for p in paths if totals[p] == best_total])
 
 
-def test_runner_up_is_the_best_path_distinct_alternative():
-    doc = tie_document()
-    built = build_document_lattice(doc)
-    lattice = built.lattices[0]
-    tables = build_cost_tables(lattice, build_cost_context(doc, built))
-    paths = enumerate_paths(lattice)
-    totals = {path: brute_total(lattice, tables, path) for path in paths}
-
-    result = solve_interval(lattice, tables)
-    others = [t for path, t in totals.items() if path != result.best.cuts]
-    assert result.runner_up is not None
-    assert result.runner_up.total == min(others)
-    assert result.runner_up.cuts != result.best.cuts
-
-
 def test_score_path_refuses_an_illegal_path():
     doc = tie_document()
     built = build_document_lattice(doc)

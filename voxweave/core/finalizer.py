@@ -54,6 +54,7 @@ from .authority import (
     AuthorityKind,
     AuthorityLedger,
     Capability,
+    FactoryEvent,
 )
 from .canonical_text import (
     CanonicalWork,
@@ -62,9 +63,10 @@ from .canonical_text import (
     line_budget,
     over_wide_token,
 )
+from .layout import _join, _reading_chars
 from .partition_check import EPS, ReportTag, Waiver
 from .schema import Cue, Unit
-from .segdoc import DisplayProfile
+from .segdoc import DisplayProfile, SourceUnit
 from .timing import (
     CHAIN_MAX_GAP_S,
     HELD_WORD_MAX_GAP_S,
@@ -81,10 +83,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, never a runtime import
 
     from .boundary_lattice import Edge, LatticeAtom
     from .boundary_v2 import DocumentSolution, IntervalSolution
-    from .segdoc import SegDocument, SourceUnit
+    from .segdoc import SegDocument
 
 __all__ = [
-    "DELTA_IDS",
     "FINALIZER_WAIVER_KINDS",
     "REPORT_KINDS",
     "RULE_IDS",
@@ -159,18 +160,6 @@ RULE_IDS: tuple[str, ...] = (
 #: this module global at call time -- binding it as a default argument would let
 #: a budget fixture pass while measuring the shipped value.
 SWEEP_BUDGET: int = 10_000
-
-#: Registry rows this module can fire (spec section 9).
-DELTA_IDS: tuple[str, ...] = (
-    "FD-1",
-    "FD-2",
-    "FD-3",
-    "FD-4",
-    "FD-6",
-    "FD-7",
-    "FD-8",
-    "FD-9",
-)
 
 TERMINALS: tuple[str, ...] = ("budget-exhausted", "cycle-adoption", "fixed-point")
 
@@ -618,8 +607,6 @@ def phase1_cue(
 
 def _raw_reading_chars(text: str) -> int:
     """The load the LEGACY preview charges, kept only to detect FD-1 firing."""
-    from .layout import _reading_chars
-
     return _reading_chars(text)
 
 
@@ -1668,8 +1655,6 @@ def register_optimizer_selection(
     ``adopted_v1 == 0`` (gate N4), so a refusal here is a broken precondition,
     not a supported mode.
     """
-    from dataclasses import replace as _replace
-
     edges: list[Edge] = []
     atoms: list[LatticeAtom] = []
     for interval in solution.solutions:
@@ -1682,7 +1667,7 @@ def register_optimizer_selection(
         atoms.extend(interval.lattice.atoms)
         for edge in _selected_edges(interval):
             edges.append(
-                _replace(
+                replace(
                     edge,
                     start_node=edge.start_node + offset,
                     end_node=edge.end_node + offset,
@@ -1813,8 +1798,6 @@ def _mint_stream(
         kind=kind,
         payload=_stream_payload(cues, profile, row_id, evaluation_id),
     )
-    from .authority import FactoryEvent
-
     ledger.record(
         FactoryEvent(
             evaluation_id=evaluation_id,
@@ -1872,7 +1855,6 @@ def phase1_from_fresh_alignment(
     """Mint W1 only from one genuine, context-bound admitted fresh receipt."""
     from voxweave.align_acquisition import _consume_verified_fresh_alignment
     from voxweave.core.align_seed import AlignSeedResult, materialize_seed_cues
-    from voxweave.core.segdoc import SourceUnit
     from voxweave.core.speaker_evidence import (
         lyric_for_evidence,
         make_evidence_span,
@@ -2004,8 +1986,6 @@ def phase1_from_optimizer_selection(
     owned_ranges = unit_ranges if len(unit_ranges) == len(cues) else None
     footprints: list[str] | None = None
     if owned_ranges is not None:
-        from .layout import _join
-
         footprints = [
             _join(
                 [
