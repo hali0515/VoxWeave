@@ -539,7 +539,8 @@ def test_reinject_punct_fallback_no_alnum():
 
 def test_reinject_then_smart_split_unglues_and_strips_punct():
     # end-to-end: reinject punctuation → smart_split → output has spaces, no punctuation, split by sentence
-    smart_split = pytest.importorskip("voxweave.core.smart_split")
+    from voxweave.core import smart_split
+
     units = [
         {"text": "Listen", "start": 0.0, "end": 0.5},
         {"text": "up", "start": 0.6, "end": 0.9},

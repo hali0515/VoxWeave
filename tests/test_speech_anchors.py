@@ -603,60 +603,6 @@ def test_diarize_split_piece_without_timed_atoms_gets_none_not_display_bounds(
     assert _speech(out[2]) == (2.0, 2.5)
 
 
-# --- writer projection -------------------------------------------------------
-
-
-def test_write_siblings_projects_the_anchors_out(tmp_path):
-    src = tmp_path / "clip.mkv"
-    cues = [
-        {
-            "text": "hi",
-            "start": 0.0,
-            "end": 1.25,
-            "word_data": [{"text": "hi", "start": 0.0, "end": 1.0}],
-            "lyric": True,
-            "speech_start": 0.0,
-            "speech_end": 1.0,
-        }
-    ]
-    units = [{"text": "hi", "start": 0.0, "end": 1.0}]
-    pipeline._write_siblings(src, cues, units, "en")
-
-    data = json.loads((tmp_path / "clip.json").read_text(encoding="utf-8"))
-    assert data["segments"] == [
-        {
-            "text": "hi",
-            "start": 0.0,
-            "end": 1.25,
-            "word_data": [{"text": "hi", "start": 0.0, "end": 1.0}],
-            "lyric": True,
-        }
-    ]
-    # the in-memory cue is untouched by the projection
-    assert _speech(cues[0]) == (0.0, 1.0)
-
-
-def test_write_siblings_drops_only_the_anchor_keys(tmp_path):
-    """Drop-list, not whitelist: any other key a cue carries still ships."""
-    src = tmp_path / "clip.mkv"
-    cues = [
-        {
-            "text": "hi",
-            "start": 0.0,
-            "end": 1.0,
-            "word_data": [],
-            "speech_start": 0.0,
-            "speech_end": 1.0,
-            "future_key": {"nested": 1},
-        }
-    ]
-    pipeline._write_siblings(src, cues, [], "en")
-    data = json.loads((tmp_path / "clip.json").read_text(encoding="utf-8"))
-    assert data["segments"][0]["future_key"] == {"nested": 1}
-    assert "speech_start" not in data["segments"][0]
-    assert "speech_end" not in data["segments"][0]
-
-
 # --- end to end --------------------------------------------------------------
 
 

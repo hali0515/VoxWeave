@@ -8,15 +8,6 @@ from voxweave.cli import cli
 from voxweave.ui import RichReporter
 
 
-@pytest.fixture(autouse=True)
-def _isolate_config(tmp_path, monkeypatch):
-    # CLI tests must not read the developer's real ~/.config/voxweave.conf (non-hermetic: user settings
-    # like asr_model would pollute default-value assertions). Point to an empty tmp path so
-    # ensure_default_config writes the commented template (asr_model commented out) and
-    # conf_asr_model() returns None, exercising the built-in defaults.
-    monkeypatch.setenv("VOXWEAVE_CONFIG", str(tmp_path / "voxweave.conf"))
-
-
 def _media(tmp_path):
     m = tmp_path / "a.wav"
     m.write_bytes(b"x")
@@ -123,12 +114,12 @@ def test_media_shorthand_routes_to_process(tmp_path):
     assert m.called
 
 
-def test_split_passes_kwargs(tmp_path):
+def test_render_passes_kwargs(tmp_path):
     j = tmp_path / "a.json"
     j.write_text("{}", encoding="utf-8")
     out = tmp_path / "a.vtt"
     with patch("voxweave.pipeline.split", return_value=out) as m:
-        r = CliRunner().invoke(cli, ["split", str(j), "--max-lines", "2"])
+        r = CliRunner().invoke(cli, ["render", str(j), "--max-lines", "2"])
     assert r.exit_code == 0, r.output
     reporter = m.call_args.kwargs["reporter"]
     assert isinstance(reporter, RichReporter)
@@ -164,12 +155,12 @@ def test_process_semantic_model_flag_is_removed(tmp_path):
         ["--semantic-model", "local/custom"],
     ],
 )
-def test_split_semantic_flags_are_removed(tmp_path, args):
+def test_render_semantic_flags_are_removed(tmp_path, args):
     j = tmp_path / "a.json"
     j.write_text("{}", encoding="utf-8")
     out = tmp_path / "a.vtt"
     with patch("voxweave.pipeline.split", return_value=out) as m:
-        r = CliRunner().invoke(cli, ["split", str(j), *args])
+        r = CliRunner().invoke(cli, ["render", str(j), *args])
     assert r.exit_code == 2
     assert not m.called
 
@@ -329,12 +320,12 @@ def test_align_conf_default_separate_off(tmp_path):
     assert m.call_args.kwargs["separate"] is False
 
 
-def test_split_conf_default_timestamps_off(tmp_path):
+def test_render_conf_default_timestamps_off(tmp_path):
     _write_conf(tmp_path, "[defaults]\ntimestamps = false\n")
     j = tmp_path / "a.json"
     j.write_text("{}", encoding="utf-8")
     with patch("voxweave.pipeline.split", return_value=tmp_path / "a.vtt") as m:
-        r = CliRunner().invoke(cli, ["split", str(j)])
+        r = CliRunner().invoke(cli, ["render", str(j)])
     assert r.exit_code == 0, r.output
     assert m.call_args.kwargs["timestamps"] is False
 

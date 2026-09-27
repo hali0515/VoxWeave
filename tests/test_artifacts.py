@@ -290,8 +290,7 @@ def test_transcribe_debug_sink_is_rooted_in_the_artifact_claim(tmp_path, monkeyp
     captured: dict[str, object] = {}
 
     class CapturingSink:
-        def __init__(self, stem, *, root=None, **_kwargs):
-            captured["stem"] = stem
+        def __init__(self, root):
             captured["root"] = root
 
     class Stop(RuntimeError):
@@ -307,8 +306,5 @@ def test_transcribe_debug_sink_is_rooted_in_the_artifact_claim(tmp_path, monkeyp
     with pytest.raises(Stop, match="stop after sink"):
         pipeline.transcribe(media, separate=False, debug=True)
 
-    assert captured == {
-        "stem": "episode",
-        "root": artifacts.claim_paths(media).debug,
-    }
+    assert captured == {"root": artifacts.claim_paths(media).debug}
     assert not (tmp_path / "debug").exists()

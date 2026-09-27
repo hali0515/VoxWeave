@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml runs this workflow on the tagged commit before it publishes.
+  workflow_call:
 
 # Cancel superseded runs on the same branch/PR.
 concurrency:
@@ -43,13 +45,15 @@ jobs:
       # Mirrors `make dev`: core + [cuda] extra + dev group (pytest, pyright).
       # The cuda wheels install fine on a CPU runner; all model paths are
       # lazy-imported or mocked in tests, so nothing touches a GPU.
+      # --locked: a pyproject change without its uv.lock update fails here
+      # instead of being re-resolved silently (the oracle pins the lock digest).
       - name: Sync environment
-        run: uv sync --extra cuda --dev --python "${{ steps.oracle-python.outputs.version }}"
+        run: uv sync --locked --extra cuda --dev --python "${{ steps.oracle-python.outputs.version }}"
 
+      # The Makefile pins the ruff version, so a ruff release that changes
+      # its style cannot turn untouched code red.
       - name: Lint
-        run: |
-          uv run --no-project --with ruff ruff check .
-          uv run --no-project --with ruff ruff format --check .
+        run: make lint-check
 
       # Every project `uv run` must name the cuda extra: the lock resolves
       # forked dependency sets, and a bare `uv run` re-syncs to the base fork
@@ -67,7 +71,7 @@ jobs:
   # baseline (calibration/segmentation/baseline.json). Three gates are
   # `blocking` (mid-phrase, over-7s, cps_p90); forbidden_end is configured
   # `warning` but promotes to blocking per language once the baseline and the
-  # current run both reach min_samples (ja and zh do; en does not yet). Flipping
+  # current run both reach min_samples (zh does; en and ja do not yet). Flipping
   # a gate mode is a reviewed edit of the tracked baseline, not a code change.
   #
   # Zero GPU, zero network, no media: the corpus is tracked JSON replayed through
@@ -86,7 +90,7 @@ jobs:
       # environment_drift refuses a different minor (segmenter behaviour moves
       # with the interpreter), so this job pins the same 3.13 line.
       - name: Sync environment
-        run: uv sync --extra cuda --dev --python 3.13
+        run: uv sync --locked --extra cuda --dev --python 3.13
 
       - name: Segmentation quality gate
         run: make quality-segmentation

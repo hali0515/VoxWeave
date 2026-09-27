@@ -43,7 +43,7 @@ dependencies = [
   "beartype>=0.18",
   "librosa>=0.10",
   "pyyaml>=6",
-  # wav2vec2 CTC forced alignment for English (WhisperX-equivalent; backend.align_text_ctc).
+  # wav2vec2 CTC forced alignment for English (WhisperX-equivalent; align_ctc.align_text_ctc).
   # Tracks torch ABI; lower bound only.
   "torchaudio>=2.1",
   # Speaker diarization (--diarize): pyannote.audio 4.x supports the default
@@ -53,7 +53,7 @@ dependencies = [
   # The onnxruntime build is platform-selected via the [cuda]/[mps] extras (onnxruntime-gpu on
   # CUDA, plain onnxruntime on macOS) — see [project.optional-dependencies] + [tool.uv] below.
   # unidecode is an undeclared implicit dep of ctc-forced-aligner.preprocess_text.
-  # Model auto-downloads to ~/.cache/ctc-forced-aligner on first run.
+  # The MMS-300m ONNX model downloads into ~/.cache/voxweave/align on first use.
   "ctc-forced-aligner>=1.0.2",
   "unidecode>=1.3",
   # Subtitle layout/re-wrap: smart_split logic lives in voxweave.core; PySBD is its runtime dep.
@@ -99,15 +99,16 @@ cuda = [
   # transformers 5.x needs hub>=1.0, so the pin cannot live in core deps.
   "huggingface-hub<1.0",
 ]
-# Apple Silicon (macOS / MPS) build. ASR + forced alignment are served by the native MLX ports
-# from mlx-audio (Metal kernels + quantization; see voxweave.backend_mlx) — faster and lower-memory
-# than the torch models on MPS, and the only way to run ja/CJK alignment on the GPU (onnxruntime
-# has no Metal provider). mlx is Apple-Silicon-only, so it carries a darwin+arm64 marker.
-# qwen-asr is excluded from core on darwin (its transformers==4.57.6 pin conflicts with mlx-audio's
-# transformers>=5.5), so the MLX backend is the ASR/alignment path on macOS. onnxruntime (CPU/CoreML)
-# is kept for the torch fallback's CTC aligners (VOXWEAVE_BACKEND=torch). faster-whisper is omitted
-# (ctranslate2 has no Metal backend); the hybrid/fusion engines' whisper text comes from mlx-whisper
-# (the Metal port) instead — see voxweave.backend_mlx.get_whisper. torch's macOS wheel ships MPS in.
+# Apple Silicon (macOS / MPS) build. Qwen3-ASR and the Qwen3 forced aligner are served by their
+# native MLX ports from mlx-audio (Metal kernels + quantization; see voxweave.backend_mlx) — faster
+# and lower-memory than the torch models on MPS. mlx is Apple-Silicon-only, so it carries a
+# darwin+arm64 marker. qwen-asr is excluded here (its transformers==4.57.6 pin conflicts with
+# mlx-audio's transformers>=5.5), so MLX serves ASR and the Qwen aligner route (zh/yue, or a CTC
+# failure). The CTC aligners keep the [cuda] routing: English wav2vec2 on torch-MPS, and the ja
+# MMS aligner on this CPU onnxruntime (onnxruntime has no Metal provider, and CoreML is avoided
+# because its Metal context crashes beside MLX). faster-whisper is omitted (ctranslate2 has no
+# Metal backend); the hybrid/fusion engines' whisper text comes from mlx-whisper (the Metal port)
+# instead — see voxweave.backend_mlx.get_whisper. torch's macOS wheel ships MPS in.
 mps = [
   "onnxruntime>=1.20; sys_platform == 'darwin'",
   "mlx-audio>=0.4.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
@@ -131,7 +132,8 @@ dev = ["pytest>=8", "pyright>=1.1.390", "jsonschema>=4,<5"]
 # correct (and only) build, while on Linux the marker is false so it is dropped and the [cuda]
 # extra's onnxruntime-gpu satisfies `import onnxruntime` with the CUDA provider intact.
 # NOTE: this section only applies to the project workflow (`make dev` / uv sync). `uv tool install`
-# ignores it, so the Makefile passes the same rule via `--overrides overrides.txt` — keep both in sync.
+# ignores it, so the Makefile passes the same rule via `--overrides overrides.txt` and the README's
+# PyPI install command passes it inline — keep all three in sync.
 override-dependencies = ["onnxruntime; sys_platform == 'darwin'"]
 # [cuda] (qwen-asr -> transformers==4.57.6) and [mps] (mlx-audio -> transformers>=5.5) are mutually
 # exclusive: declaring them conflicting lets uv resolve each in its own fork instead of trying to
@@ -177,6 +179,6 @@ extend-exclude = ["voxweave/vendor"]
 
 [tool.ruff.lint]
 # Pin the rule set explicitly: newer ruff releases broaden the implicit default
-# selection, which turns a version bump into hundreds of findings on an
-# untouched tree (CI runs unpinned ruff).
+# selection, which would turn a bump of the ruff version (pinned in the Makefile,
+# used by CI) into hundreds of findings on an untouched tree.
 select = ["E4", "E7", "E9", "F"]

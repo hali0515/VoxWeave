@@ -20,8 +20,21 @@ Copyright (c) 2023 Phil Wang
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction... (full MIT terms; see the upstream
-repository for the complete text).
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
 ### ReDimNet2 — `voxweave/vendor/redimnet2/`
@@ -60,10 +73,11 @@ Each is governed by its own license — verify before commercial use.
 | Model                                                         | Used for                 | License (verify upstream)                                       |
 | ------------------------------------------------------------- | ------------------------ | --------------------------------------------------------------- |
 | Kim Mel-Band RoFormer vocals (`KimberleyJSN/melbandroformer`) | vocal separation         | MIT (author granted on the HF repo / GitHub issue #18, 2026-04) |
-| Qwen3-ASR (`Qwen/Qwen3-ASR-*`)                                | ASR                      | Qwen license / Apache-2.0 — read the model card                 |
-| wav2vec2-large-xlsr-53-japanese (`jonatasgrosman/...`)        | JA CTC alignment         | Apache-2.0 (verify)                                             |
-| torchaudio WAV2VEC2_ASR_LARGE_LV60K_960H                      | EN CTC alignment         | as distributed by torchaudio                                    |
-| PANNs Cnn14                                                   | song/music detection     | Apache/MIT (verify)                                             |
+| Qwen3-ASR (`Qwen/Qwen3-ASR-*`)                                | ASR                      | Apache-2.0 (model card)                                         |
+| Qwen3-ForcedAligner (`Qwen/Qwen3-ForcedAligner-0.6B`)         | zh/yue alignment         | Apache-2.0 (model card)                                         |
+| MMS-300m forced aligner ONNX (`deskpai/ctc_forced_aligner`)   | ja alignment (default)   | CC-BY-NC-4.0 (model card) - non-commercial                      |
+| wav2vec2 LV60K-self (`facebook/wav2vec2-large-960h-lv60-self`) | en CTC alignment         | Apache-2.0 (model card)                                         |
+| PANNs Cnn14 (`thelou1s/panns-inference`)                      | song/music detection     | Apache-2.0 (model card)                                         |
 | silero-vad                                                    | voice activity detection | MIT                                                             |
 | pyannote speaker-diarization-community-1 (`pyannote/speaker-diarization-community-1`) | speaker diarization (`--diarize`, default pipeline) | CC-BY-4.0 - attribution required (gated; accept the model-card conditions on Hugging Face) |
 | pyannote speaker-diarization-3.1 (`pyannote/speaker-diarization-3.1`)                 | speaker diarization (`--diarize --diarize-model 3.1`, opt-in legacy) | MIT (gated separately; also requires accepting `pyannote/segmentation-3.0`) |

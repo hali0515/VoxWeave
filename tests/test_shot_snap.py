@@ -12,7 +12,6 @@ import json
 import logging
 import shutil
 import subprocess
-import time
 
 import pytest
 
@@ -389,25 +388,29 @@ def test_job_keeps_cuts_around_undecodable_stderr_bytes(monkeypatch, tmp_path):
     assert _detect_shot_changes(tmp_path / "v.mkv") == [1.5, 3.5]
 
 
-@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
 def test_job_reaps_a_fast_failing_child_before_collection(monkeypatch, tmp_path):
     # Audio-only media makes ffmpeg exit at once; the drain thread reaps it on
-    # EOF so it does not linger as a zombie for the whole transcription.
+    # EOF so it does not linger as a zombie for the whole transcription. The
+    # fake child records its exit status only when polled or waited on, and
+    # nothing but the drain thread touches it before ``result``.
+    launches = _install_popen(monkeypatch, rc=3)
+    job = shotdet.ShotDetectionJob().start(tmp_path / "a.wav")
+    job._join_drain()
+    proc = launches[0][2]
+    assert proc.returncode == 3
+    assert proc.wait_timeouts == []
+    assert job.result() is None
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
+def test_job_settles_none_for_a_real_fast_failing_child(monkeypatch, tmp_path):
     monkeypatch.setattr(
         shotdet, "_ffmpeg_command", lambda _media, _th: ["sh", "-c", "exit 3"]
     )
     job = shotdet.ShotDetectionJob().start(tmp_path / "a.wav")
-    job._join_drain()
-    assert job._proc is not None
-    # The drain thread polls once when the pipe hits EOF; the exit status can
-    # land a few milliseconds after the child closes stderr, so the reap is
-    # best-effort and is asserted under a short deadline, not on that one poll.
-    deadline = time.monotonic() + 5.0
-    while job._proc.returncode is None and time.monotonic() < deadline:
-        job._proc.poll()
-        time.sleep(0.01)
-    assert job._proc.returncode == 3
     assert job.result() is None
+    assert job._proc is not None
+    assert job._proc.returncode == 3
 
 
 def test_job_drain_failure_settles_none_not_partial_cuts(monkeypatch, tmp_path, caplog):

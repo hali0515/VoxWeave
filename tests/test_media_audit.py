@@ -139,7 +139,9 @@ def _fake_chat_client(contents):
     def create(*, model, messages, **kw):
         calls.append(messages)
         msg = SimpleNamespace(content=queue.pop(0))
-        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=msg, finish_reason="stop")]
+        )
 
     client = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=create))

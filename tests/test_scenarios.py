@@ -33,13 +33,7 @@ def _replay(fx: dict):
     sing = np.array(sc["sing"], dtype="float32")
     music = np.array(sc["music"], dtype="float32")
     t = sc["t"]
-    song = songdet.merge_spans(songdet.song_flags_from_scores(speech, sing, music), t)
-    sing_fl = songdet.sing_flags_from_scores(speech, sing, music)
-    sing_starts = [tt for tt, f in zip(t, sing_fl) if f]
-    sing_spans = [(a, b) for (a, b) in song if any(a <= x < b for x in sing_starts)]
-    speech_spans = songdet.merge_spans(
-        songdet.speech_flags_from_scores(speech, sing, music), t
-    )
+    song, sing_spans, speech_spans = songdet.spans_from_scores(speech, sing, music, t)
     segs = [{"start": a, "end": b} for a, b in fx["vad_segs"]]
     # silences captured by newer fixtures; older ones replay without snapping (None)
     silences = [(a, b) for a, b in fx["silences"]] if fx.get("silences") else None
@@ -67,9 +61,10 @@ def test_scenario_song_skip(path: Path):
     final, kept, chunks = _replay(fx)
 
     # 1) final song spans == golden snapshot (logic changes surface here; re-run capture intentionally)
+    assert "expected_song_spans" in a, f"{path.stem}: no expected_song_spans golden"
     got = [[round(x, 1), round(y, 1)] for x, y in final]
-    assert got == a.get("expected_song_spans", got), (
-        f"{path.stem}: song spans changed {got} != {a.get('expected_song_spans')}"
+    assert got == a["expected_song_spans"], (
+        f"{path.stem}: song spans changed {got} != {a['expected_song_spans']}"
     )
 
     # 2) every timestamp that should have speech must fall within a retained VAD segment (regression anchor: must not be swallowed by song-skip)

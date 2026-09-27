@@ -64,6 +64,18 @@ def _lock_worker(path, exclusive, connection):
     connection.close()
 
 
+def _recv(connection, timeout: float = 30.0):
+    """Receive from the lock worker, failing instead of hanging on a dead child."""
+    assert connection.poll(timeout), "the lock worker sent nothing (did it crash?)"
+    return connection.recv()
+
+
+def _stop(process) -> None:
+    if process.is_alive():
+        process.kill()
+        process.join(10)
+
+
 def test_new_store_is_valid_and_revision_zero():
     store = voicestore.new_voice_store("Show", _provenance())
     validated = voicestore.validate_voice_store(store)
@@ -276,18 +288,18 @@ def test_realpath_and_symlink_spellings_share_exclusive_process_lock(tmp_path):
             assert handle.store_path == real
             assert handle.lock_path == Path(f"{real}.lock")
             process.start()
-            assert parent.recv() == "started"
+            # Only the child may hold the sending end, so its death ends recv.
+            child.close()
+            assert _recv(parent) == "started"
             assert not parent.poll(0.2)
         assert parent.poll(2)
         acquired = parent.recv()
         assert acquired == ("acquired", str(real), str(real) + ".lock")
         parent.send("release")
-        process.join(2)
+        process.join(10)
         assert process.exitcode == 0
     finally:
-        if process.is_alive():
-            process.terminate()
-            process.join()
+        _stop(process)
 
 
 def test_shared_store_locks_do_not_block_each_other(tmp_path):
@@ -299,16 +311,15 @@ def test_shared_store_locks_do_not_block_each_other(tmp_path):
     try:
         with voicestore.shared_store_lock(real):
             process.start()
-            assert parent.recv() == "started"
+            child.close()
+            assert _recv(parent) == "started"
             assert parent.poll(2)
             assert parent.recv()[0] == "acquired"
             parent.send("release")
-        process.join(2)
+        process.join(10)
         assert process.exitcode == 0
     finally:
-        if process.is_alive():
-            process.terminate()
-            process.join()
+        _stop(process)
 
 
 def test_a_shared_store_lock_needs_no_write_access(tmp_path, monkeypatch):

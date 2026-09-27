@@ -32,9 +32,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import jsonschema  # noqa: F401  (dev group; a missing one must fail, not skip)
 import pytest
-
-pytest.importorskip("jsonschema")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -1384,7 +1383,6 @@ def test_align_shadow_help_hides_the_worker_and_describes_each_command() -> None
 
 
 def test_align_shadow_environment_drift_names_the_field(tmp_path: Path) -> None:
-    pytest.importorskip("voxweave.engine_registry")
     manifest = json.loads(ALIGN_SHADOW_MANIFEST.read_text(encoding="utf-8"))
     manifest["environment"]["timezone"] = "Mars/Olympus_Mons"
     path = tmp_path / "manifest.json"

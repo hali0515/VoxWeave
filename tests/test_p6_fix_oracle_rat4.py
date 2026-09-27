@@ -128,6 +128,7 @@ def _oracle_command(*arguments: str) -> subprocess.CompletedProcess[str]:
         check=False,
         text=True,
         capture_output=True,
+        timeout=900,
     )
 
 
@@ -253,12 +254,12 @@ def test_p6_source_registry_and_dependency_gate_is_checked():
 def test_p6_oracle_pytest_lane_is_hermetic_under_hostile_locale():
     environment = dict(os.environ)
     environment.update({"LANG": "zh_CN.UTF-8", "LC_ALL": "zh_CN.UTF-8"})
+    # The running interpreter, not `uv run`: a nested uv would re-sync the
+    # developer's environment (and could re-lock) from inside a test.
     result = subprocess.run(
         [
-            "uv",
-            "run",
-            "--extra",
-            "cuda",
+            sys.executable,
+            "-m",
             "pytest",
             "-q",
             str(Path(__file__).resolve()),
@@ -274,6 +275,7 @@ def test_p6_oracle_pytest_lane_is_hermetic_under_hostile_locale():
         check=False,
         text=True,
         capture_output=True,
+        timeout=1800,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
 
@@ -282,11 +284,14 @@ def test_canonical_p6_oracle_gate_target_pins_hostile_locale(tmp_path):
     environment = dict(os.environ)
     environment.update({"LANG": "zh_CN.UTF-8", "LC_ALL": "zh_CN.UTF-8"})
     report = tmp_path / "p6-oracle-report.json"
+    # The target's own environment pinning is what is under test; the runner
+    # starts under this interpreter so the test never re-syncs the environment.
     result = subprocess.run(
         [
             "make",
             "quality-p6-oracle",
             "VARIANT=cuda",
+            f"P6_ORACLE_PYTHON={sys.executable}",
             f"P6_ORACLE_REPORT={report}",
         ],
         cwd=REPO_ROOT,
@@ -294,6 +299,7 @@ def test_canonical_p6_oracle_gate_target_pins_hostile_locale(tmp_path):
         check=False,
         text=True,
         capture_output=True,
+        timeout=1800,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert json.loads(report.read_bytes())["status"] == "match"

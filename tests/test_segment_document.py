@@ -91,18 +91,18 @@ def _segment_case(case: dict, **kwargs) -> pipeline.SegmentationResult:
     )
 
 
-# Raw acoustic anchors are in-memory-only cue state: ``_write_siblings`` projects
-# them out so the persisted ``segments[]`` keeps its legacy shape byte for byte.
+# Raw acoustic anchors are in-memory-only cue state: the sibling writer
+# (``segmentation_projector``) leaves them out of the persisted ``segments[]``.
 SPEECH_KEYS = ("speech_start", "speech_end")
 
 
 def _projected(cues: list) -> list[dict]:
-    """The cue stream as ``_write_siblings`` persists it (anchors dropped)."""
+    """The cue stream as the sibling JSON persists it (anchors dropped)."""
     return [{k: v for k, v in cue.items() if k not in SPEECH_KEYS} for cue in cues]
 
 
 def _render(result: pipeline.SegmentationResult) -> str:
-    """Reproduce the VTT body _write_siblings writes for these cues."""
+    """Reproduce the VTT body the sibling writer produces for these cues."""
     return realign.render_cues(
         [
             (c.get("start"), c.get("end"), pipeline.lyric_display_text(c))

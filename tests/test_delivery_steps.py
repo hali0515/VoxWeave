@@ -254,7 +254,9 @@ def test_speaker_service_url_and_session_updates_use_separate_streams(
         speaker_ids=("SPEAKER_00",),
         pristine_mapping_generation=None,
     )
-    monkeypatch.setattr(speakers, "create_speaker_audition", lambda path: audition)
+    monkeypatch.setattr(
+        speakers, "create_speaker_audition", lambda path, **_kwargs: audition
+    )
 
     def fake_serve(**kwargs):
         assert kwargs["host"] == host

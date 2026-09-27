@@ -354,8 +354,8 @@ def test_split_regenerates_a_stale_manifest(tmp_path):
 def test_process_writes_a_segmentation_manifest(tmp_path):
     """``process`` is the primary user path and re-segments, so it REGENERATES.
 
-    Pinned separately from ``split``: both call sites pass ``result.manifest`` to
-    ``_write_siblings``, and dropping the kwarg from the process one alone left
+    Pinned separately from ``split``: both call sites hand ``result.manifest`` to
+    the sibling writer, and dropping it from the process one alone left
     the whole suite green -- every ``voxweave <media>`` output would silently
     lose the key while CI stayed happy.
     """
@@ -511,60 +511,6 @@ def test_align_labels_even_without_a_sibling_json(tmp_path, monkeypatch):
     )
     _run_align(media, vtt, lang_override="zh")
     assert seen == [{}]
-
-
-# --- the writers -------------------------------------------------------------
-
-
-def test_dump_sibling_json_omits_segmentation_without_a_manifest(tmp_path):
-    path = tmp_path / "x.json"
-    pipeline._dump_sibling_json(
-        path,
-        language="en",
-        segments=[],
-        units=[],
-        vad_speech=None,
-    )
-    assert "segmentation" not in _read(path)
-
-
-def test_dump_sibling_json_appends_the_manifest_last(tmp_path):
-    path = tmp_path / "x.json"
-    manifest = {"engine": "legacy-v1"}
-    pipeline._dump_sibling_json(
-        path,
-        language="en",
-        segments=[],
-        units=[],
-        vad_speech=[(0.0, 1.0)],
-        speaker_turns=[(0.0, 1.0, "SPEAKER_00")],
-        manifest=manifest,
-    )
-    data = _read(path)
-    assert list(data)[-1] == "segmentation"
-    assert data["segmentation"] == manifest
-
-
-def test_dump_sibling_json_does_not_mutate_the_caller_manifest(tmp_path):
-    path = tmp_path / "x.json"
-    manifest = {"engine": "legacy-v1", "degraded": []}
-    before = copy.deepcopy(manifest)
-    pipeline._dump_sibling_json(
-        path, language="en", segments=[], units=[], vad_speech=None, manifest=manifest
-    )
-    assert manifest == before
-
-
-def test_write_siblings_forwards_the_manifest(tmp_path):
-    src = tmp_path / "clip.mkv"
-    cues = [{"text": "hi", "start": 0.0, "end": 1.0, "word_data": []}]
-    units = [{"text": "hi", "start": 0.0, "end": 1.0}]
-    pipeline._write_siblings(
-        src, cues, units, "en", manifest={"engine": "legacy-v1", "manifest_version": 1}
-    )
-    data = _read(tmp_path / "clip.json")
-    assert data["segmentation"] == {"engine": "legacy-v1", "manifest_version": 1}
-    assert list(data)[-1] == "segmentation"
 
 
 # --- align: preserve, never regenerate, never invent -------------------------

@@ -10,6 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+# A dev-group dependency of the borrowed calibration helpers: imported here so a
+# missing one fails collection loudly instead of skipping this whole module.
+import jsonschema  # noqa: F401
 import pytest
 
 from tests.test_calib_shadow import calib, cc

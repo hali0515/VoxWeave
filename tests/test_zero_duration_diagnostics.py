@@ -290,7 +290,7 @@ def test_noop_sink_positions_units_without_instrumentation(tmp_path):
 
 
 def _sink(tmp_path) -> FileDebugSink:
-    return FileDebugSink("clip", base=tmp_path / "debug")
+    return FileDebugSink(tmp_path / "debug" / "clip")
 
 
 def test_file_sink_writes_snapshots_and_health(tmp_path):
@@ -357,7 +357,7 @@ def test_chunk_level_affected_rate(tmp_path):
     src = tmp_path / "src.wav"
     src.write_bytes(b"RIFFfake")
     sink = _sink(tmp_path)
-    common = {"wav": src, "start": 0.0, "end": 1.0, "raw": "r", "text": "t"}
+    common = {"wav": src, "start": 0.0, "end": 1.0, "text": "t"}
     sink.chunk(
         0, lang="Japanese", units=[{"text": "あ", "start": 0.0, "end": 0.2}], **common
     )
@@ -390,7 +390,6 @@ def test_undetected_chunk_language_falls_back_to_the_pass_language(tmp_path):
         wav=src,
         start=0.0,
         end=1.0,
-        raw="r",
         text="t",
         lang=None,
         units=[{"text": "い", "start": 1.0, "end": 1.0}],

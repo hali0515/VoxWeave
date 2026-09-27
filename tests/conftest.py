@@ -4,6 +4,51 @@ from pathlib import Path
 
 import pytest
 
+# Opt-in gates of the real-model tests: they choose what runs, not how it runs,
+# so they are the only VOXWEAVE_* variables a test run inherits.
+_REAL_MODEL_GATES = ("VOXWEAVE_RUN_DIARIZE_C1_GPU_E2E", "VOXWEAVE_REAL_WEIGHT_TESTS")
+_OPT_IN_TEST_ENV = frozenset(
+    {
+        *_REAL_MODEL_GATES,
+        "VOXWEAVE_DIARIZE_C1_E2E_WAV",
+        "VOXWEAVE_DIARIZE_C1_E2E_WAV_SHA256",
+    }
+)
+# Where a developer keeps real weights (and the token for gated ones). Kept only
+# when a real-model gate is set, so those tests find the weights already on disk
+# instead of skipping or downloading them again under ~/.cache/voxweave.
+_REAL_MODEL_WEIGHT_ENV = frozenset(
+    {"VOXWEAVE_CACHE_ROOT", "VOXWEAVE_MODEL_DIR", "VOXWEAVE_HF_TOKEN"}
+)
+
+
+def _isolate_process_environment() -> None:
+    """Drop inherited user knobs before any test module imports voxweave.
+
+    Documented VOXWEAVE_* variables change defaults that tests assert, and some
+    are read once at import time, so a developer's shell settings would leak
+    into (and break) the suite. The LLM endpoint variables are dropped for the
+    same reason. Unless a real-model gate is set, Hugging Face access is cut
+    too: no inherited token, and offline mode, so a fake that misses a seam
+    fails fast instead of reaching huggingface.co (or waiting out its retries
+    when offline).
+    """
+    gated = any(os.environ.get(gate) == "1" for gate in _REAL_MODEL_GATES)
+    keep = _OPT_IN_TEST_ENV | _REAL_MODEL_WEIGHT_ENV if gated else _OPT_IN_TEST_ENV
+    for name in tuple(os.environ):
+        if name.startswith("VOXWEAVE_") and name not in keep:
+            del os.environ[name]
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL"):
+        os.environ.pop(name, None)
+    if gated:
+        return
+    for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        os.environ.pop(name, None)
+    os.environ["HF_HUB_OFFLINE"] = "1"
+
+
+_isolate_process_environment()
+
 
 @pytest.fixture(autouse=True)
 def _isolate_voxweave_cache(tmp_path: Path) -> Iterator[None]:

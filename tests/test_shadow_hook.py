@@ -179,7 +179,7 @@ def test_flag_off_returns_no_shadow(shadow_off):
 def test_only_the_exact_string_one_turns_the_shadow_on(
     monkeypatch: pytest.MonkeyPatch, value: str
 ):
-    """``--no-<flag>`` writes the literal ``"0"``, which is a truthy string."""
+    """Only ``"1"`` enables it: ``"0"`` or ``"false"`` are truthy strings, not "on"."""
     monkeypatch.setenv(FLAG, value)
     assert _segment(_case_plain()).shadow is None
 
@@ -227,7 +227,11 @@ def test_off_path_imports_no_v2_module(tmp_path: Path):
         encoding="utf-8",
     )
     proc = subprocess.run(
-        [sys.executable, str(script)], capture_output=True, text=True, check=True
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=300,
     )
     report = json.loads(proc.stdout.splitlines()[-1])
     assert report["shadow"] is None
