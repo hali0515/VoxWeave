@@ -17,8 +17,8 @@ jieba, fugashi) that ``providers`` records.
   the lyric display wrap) and the persisted span/turn inputs they read.
 - ``unit_repair`` — pre-segmentation repair of aligner artifacts in the unit
   stream.
-- ``kinsoku`` / ``breakpoints`` / ``conjunctions`` / ``gap_split`` /
-  ``langsets`` — leaf tables and scoring shared by the above.
+- ``kinsoku`` / ``breakpoints`` / ``gap_split`` / ``langsets`` — leaf
+  tables and scoring shared by the above.
 
 **Records** -- what one segmentation ran on and with.
 

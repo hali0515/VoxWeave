@@ -316,6 +316,21 @@ arguments are now keyword-only: everything after `max_lines` in `smart_split_seg
 by keyword or positionally, including through `pipeline.split(..., **kwargs)`, raises
 `TypeError`: drop it, and pass the remaining optional arguments by keyword.
 
+`thresholds` is now required by both functions. Their length-break-only mode
+(`thresholds=None`: no gap or duration breaks and none of the cue-stream timing passes) is
+retired; omitting `thresholds` or passing `None` raises `TypeError` instead of falling back to
+it. Pass `config.gap_thresholds(lang)` (what `pipeline` uses), a mapping, or a
+`SplitThresholds` (`SplitThresholds()` for the defaults). Subtitles VoxWeave writes do not
+change: the pipeline always passed thresholds. The pieces only that mode used are gone:
+`split_sentence_heuristically`, `voxweave.core.conjunctions`,
+`voxweave.core.breakpoints.legal_break_index` and `SplitContext.do_new` (construct
+`SplitContext` without it). `split_at_sentence_end` no longer takes `max_line_length`,
+`max_lines` or `defer_length_split`, and its `split_at_comma`/`comma_split_min_len` are
+keyword-only: call it as `split_at_sentence_end(text, words, lang)`, since it never splits
+for length; `split_long_cues_with_word_timings` does. A segment with text but no word
+timings is no longer split at conjunctions: its sentences and comma clauses are wrapped to
+the line budget with proportional timing.
+
 ### Library API: `pipeline` split into smaller modules
 
 `voxweave.pipeline` keeps `transcribe`, `process`, `split` and `align`. The helpers it also
@@ -370,6 +385,16 @@ from their old modules.
 - After an episode is re-diarized, the audition page's Save and Split work again: a saved
   mapping entry for a speaker id that no longer exists is ignored (and reported) instead of
   failing the page.
+- Media with very long file names work: a cache name that would exceed the filesystem's
+  file-name limit (such as the episode lock, for a stem of about 243 bytes or more) is
+  shortened to `<stem, cut to fit>--<sha1(stem)[:8]><suffix>`, while names that fit are
+  unchanged. A deliverable beside the media whose name cannot fit (`<stem>.json`,
+  `<stem>.sdh.vtt`, a translation, a `pack`/`burn` output) is never shortened: the command now
+  stops before any work and names the file, instead of failing at the final write.
+- After **Split this speaker** is applied, the audition page offers **Undo this split**, which
+  restores the files the split rewrote from its one-level snapshot. It is refused, with the
+  reason on the page, when one of those files or the media changed since the split. Restart
+  `voxweave speakers serve` afterwards, as after the split itself.
 
 ## 0.17.0
 

@@ -108,7 +108,7 @@ def test_split_at_sentence_end_stamps_the_raw_clause_span():
         {"word": "are", "start": 2.4, "end": 2.6},
         {"word": "you", "start": 2.7, "end": 3.0},
     ]
-    cues = split_at_sentence_end("Hello there. How are you", word_data, "en", 42, 2)
+    cues = split_at_sentence_end("Hello there. How are you", word_data, "en")
     assert [c["text"] for c in cues] == ["Hello there.", "How are you"]
     assert _speech(cues[0]) == (0.0, 0.9) == (cues[0]["start"], cues[0]["end"])
     assert _speech(cues[1]) == (2.0, 3.0) == (cues[1]["start"], cues[1]["end"])
@@ -117,7 +117,7 @@ def test_split_at_sentence_end_stamps_the_raw_clause_span():
 def test_split_at_sentence_end_fabricated_timing_carries_no_anchor():
     """The prev_end / word-count fallback invents time; it is not evidence."""
     word_data = [{"word": "Hello"}, {"word": "there."}, {"word": "How"}]
-    cues = split_at_sentence_end("Hello there. How", word_data, "en", 42, 2)
+    cues = split_at_sentence_end("Hello there. How", word_data, "en")
     assert [(c["start"], c["end"]) for c in cues] == [(0.0, 1.0), (1.0, 2.0)]
     assert all(_speech(c) == (None, None) for c in cues)
 

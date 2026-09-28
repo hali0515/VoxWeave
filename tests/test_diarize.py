@@ -131,7 +131,10 @@ def test_speaker_split_survives_embedded_latin_atom():
     timestamps: ``GPT`` swallowed ``世界``'s span and the tail atoms got
     ``start=end=None``, which made the speaker boundary land mid-phrase.
     """
-    from voxweave.core.smart_split import split_long_cues_with_word_timings
+    from voxweave.core.smart_split import (
+        SplitThresholds,
+        split_long_cues_with_word_timings,
+    )
 
     text = "你好GPT世界真棒学习"
     word_data = [
@@ -143,6 +146,9 @@ def test_speaker_split_survives_embedded_latin_atom():
         max_line_length=18,
         max_lines=1,
         lang="zh",
+        # The duration cap sits above the fixture's 10.9s span, so only the
+        # line budget could break it.
+        thresholds=SplitThresholds(max_cue_s=11.0),
     )
     assert len(packed) == 1  # the fixture must reach the formatter as one cue
 
@@ -185,10 +191,13 @@ def test_speaker_split_after_real_smart_split_with_punctuation():
     with entries the text no longer shows (here the comma). Reconciling the two
     sides is what keeps every entry with its own atom.
     """
-    from voxweave.core.smart_split import smart_split_segments
+    from voxweave.core.smart_split import SplitThresholds, smart_split_segments
 
     cues = smart_split_segments(
-        [_char_seg("上涨,是3.75元了")], "zh", max_line_length=18, thresholds=None
+        [_char_seg("上涨,是3.75元了")],
+        "zh",
+        max_line_length=18,
+        thresholds=SplitThresholds(),
     )
     assert len(cues) == 1
     assert cues[0]["text"] == "上涨 是3.75元了"  # comma stripped, decimal kept
@@ -220,10 +229,13 @@ def test_trailing_dropped_punctuation_entry_stays_in_the_last_piece():
     last-run rule that entry would be dropped from the emitted cue and from the
     sibling JSON, silently shortening the stream.
     """
-    from voxweave.core.smart_split import smart_split_segments
+    from voxweave.core.smart_split import SplitThresholds, smart_split_segments
 
     cues = smart_split_segments(
-        [_char_seg("你好,朋友。")], "zh", max_line_length=18, thresholds=None
+        [_char_seg("你好,朋友。")],
+        "zh",
+        max_line_length=18,
+        thresholds=SplitThresholds(),
     )
     assert len(cues) == 1
     assert cues[0]["text"] == "你好 朋友"

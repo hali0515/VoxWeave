@@ -29,13 +29,13 @@ def test_sentence_boundary_inside_token_keeps_pairing():
     # pysbd splits the single token 哈哈哈哈哈！哇。 at the fullwidth ！ -> one unit
     # counted as two tokens -> every cue after it shifts by one word (the PHM bug).
     text = "so funny 哈哈哈哈哈！哇。 and now we keep talking"
-    cues = split_at_sentence_end(text, _word_data(text), "en", 42, 2)
+    cues = split_at_sentence_end(text, _word_data(text), "en")
     _assert_paired(cues)
 
 
 def test_clean_sentence_boundaries_unchanged():
     text = "alpha beta gamma. delta epsilon zeta."
-    cues = split_at_sentence_end(text, _word_data(text), "en", 42, 2)
+    cues = split_at_sentence_end(text, _word_data(text), "en")
     assert [c["text"].strip() for c in cues] == [
         "alpha beta gamma.",
         "delta epsilon zeta.",
@@ -51,14 +51,14 @@ def test_comma_inside_quoted_token_keeps_pairing():
         'At least I never have to hear you say "I told you so,"'
         " even though you were right."
     )
-    cues = split_at_sentence_end(text, _word_data(text), "en", 42, 2)
+    cues = split_at_sentence_end(text, _word_data(text), "en")
     _assert_paired(cues)
 
 
 def test_token_final_comma_still_splits():
     # Normal comma at a token boundary keeps splitting into separate cues.
     text = "after we finished the entire harvest celebration, everyone went back home to rest."
-    cues = split_at_sentence_end(text, _word_data(text), "en", 42, 2)
+    cues = split_at_sentence_end(text, _word_data(text), "en")
     assert len(cues) == 2
     assert cues[0]["text"].strip().endswith("celebration,")
     _assert_paired(cues)
@@ -72,7 +72,7 @@ def test_extra_unit_resyncs_following_clause(caplog):
     ghost = {"word": "ghost", "start": 1.45, "end": 1.49}
     word_data.insert(3, ghost)
     with caplog.at_level(logging.WARNING):
-        cues = split_at_sentence_end(text, word_data, "en", 42, 2)
+        cues = split_at_sentence_end(text, word_data, "en")
     second = cues[1]
     assert [w["word"] for w in second["word_data"]] == ["delta", "epsilon", "zeta."]
     assert second["start"] == 1.5
@@ -87,7 +87,7 @@ def test_unrecoverable_desync_warns_and_degrades(caplog):
     word_data = _word_data(text)
     del word_data[2]  # "gamma" unit lost upstream
     with caplog.at_level(logging.WARNING):
-        cues = split_at_sentence_end(text, word_data, "en", 42, 2)
+        cues = split_at_sentence_end(text, word_data, "en")
     assert cues and cues[0]["text"].split()[0] == "alpha"
     assert any("desync" in r.message for r in caplog.records)
 
@@ -105,7 +105,7 @@ def test_no_space_ghost_unit_resyncs():
     # shifting every cue's timing.
     text = "今日は。晴れ。"
     word_data = _char_word_data("ん" + text)  # ghost ん at index 0
-    cues = split_at_sentence_end(text, word_data, "ja", 18, 1)
+    cues = split_at_sentence_end(text, word_data, "ja")
     assert cues[0]["text"].startswith("今日")
     # first real char 今 sits at unit index 1 -> start 0.2, not the ghost's 0.0
     assert cues[0]["start"] == 0.2
@@ -128,7 +128,7 @@ def test_no_space_units_with_trailing_space_do_not_warn(caplog):
     word_data[9]["word"] = "t "
     word_data[10]["word"] = "的 "
     with caplog.at_level(logging.WARNING):
-        cues = split_at_sentence_end(text, word_data, "zh", 20, 1)
+        cues = split_at_sentence_end(text, word_data, "zh")
     assert not any("desync" in r.message for r in caplog.records)
     for cue in cues:
         got = [w["word"].strip() for w in cue["word_data"]]
@@ -138,7 +138,7 @@ def test_no_space_units_with_trailing_space_do_not_warn(caplog):
 def test_no_space_clean_stream_pairs_exactly():
     text = "今日は。晴れ。"
     word_data = _char_word_data(text)
-    cues = split_at_sentence_end(text, word_data, "ja", 18, 1)
+    cues = split_at_sentence_end(text, word_data, "ja")
     for cue in cues:
         chars = [w["word"] for w in cue["word_data"]]
         assert chars == [c for c in cue["text"] if not c.isspace()]

@@ -406,8 +406,7 @@ def test_vad_confirmed_split():
 
 
 def test_budoux_atom_not_split_midphrase():
-    # thresholds=TH is required: it is what activates the BudouX len-break gate (do_new path);
-    # without it the test becomes vacuous
+    # the BudouX phrase starts are the only legal len-break points for ja
     pytest.importorskip("budoux")
     # です is a single phrase node: even if length exceeds the budget, it must not be split into で|す
     words = [
@@ -743,6 +742,7 @@ def test_build_atoms_degrades_instead_of_raising_on_desync():
         max_line_length=18,
         max_lines=1,
         lang="zh",
+        thresholds=SplitThresholds(),
     )
     assert "".join(c["text"] for c in cues) == "上涨92%了"
 
@@ -1266,7 +1266,7 @@ def test_len_break_prefers_subthreshold_breath_over_connected_edge():
         atoms.append({"text": char, "start": clock, "end": clock + 0.1})
         clock += 0.1
     incoming = {"text": "申", "start": clock, "end": clock + 0.1}
-    ctx = SplitContext("zh", 18, 1, SplitThresholds(), True, None)
+    ctx = SplitContext("zh", 18, 1, SplitThresholds(), None)
 
     assert (
         _best_len_break_pos(

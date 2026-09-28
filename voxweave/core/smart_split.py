@@ -2,18 +2,14 @@
 
 Two stages:
 1. ``split_at_sentence_end`` — PySBD (or regex fallback) sentence boundaries,
-   then clause splitting. With ``thresholds`` and word timings -- every
-   production call, since the pipeline always passes thresholds -- length
-   splitting is deferred (``defer_length_split``): each sentence is only grouped
-   into comma clauses by ``_comma_clauses`` and stage 2 does all length
-   breaking. Only the legacy length-break-only mode (``thresholds=None``) runs
-   ``split_sentence_heuristically`` (comma clauses, then terminal/conjunction
-   and even splits until each clause fits the budget).
+   each grouped into comma clauses by ``_comma_clauses``. Stage 1 never splits
+   for length: stage 2 does all length breaking.
 2. ``split_long_cues_with_word_timings`` — word-level greedy packing into
-   cues fitting ``max_lines × max_line_length``, with gap/duration breaks.
+   cues fitting ``max_lines × max_line_length``, with gap/duration breaks
+   (a clause without word timings is wrapped by ``_split_without_timings``).
 
 A stage-1 clause boundary is a cue boundary going into stage 2 but not
-necessarily in the output: in gap-aware mode ``_repair_bound_particle_cues``
+necessarily in the output: ``_repair_bound_particle_cues``
 (zh/yue/ja: merges or repartitions a connected edge that strands a particle),
 ``_merge_micro_cues`` and ``_glue_short_cues`` (see ``timing``) can fold
 adjacent cues across it. Each of those folds gates on a sub-pause gap, so none
@@ -26,7 +22,6 @@ cue-stream timing polish (glue/merge/cleanup/shot-snap) lives in ``timing``.
 
 from __future__ import annotations
 
-import functools
 import logging
 import math
 import re
@@ -35,8 +30,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import Any, cast
 
-from .breakpoints import legal_break_index, phrase_atoms
-from .conjunctions import conjunctions_by_language, get_comma
+from .breakpoints import phrase_atoms
 from .gap_split import gap_qualifies
 from .kinsoku import (
     line_end_penalty,
@@ -88,7 +82,7 @@ DEFAULT_COMMA_SPLIT_MIN_LEN_CJK = 6  # zh/yue/ja/ko: chars are ~2x visual width
 FORCE_BREAK_FACTOR = 1.5  # boundary-less run may exceed the line budget by at most this before a forced cut
 
 # Display floor for a cue built from text the aligner left untimed, used when the
-# profile's own min_cue_s is off (or on the legacy path, which has no profile).
+# profile's own min_cue_s is off.
 UNTIMED_MIN_DISPLAY_S = 0.5
 
 # Cursor recovery: how many later clauses may be probed for a resync point when a
@@ -452,220 +446,6 @@ def _phrase_boundary_atoms(atoms: list[dict], text: str, lang: str) -> set[int]:
     return boundary
 
 
-def _snap_mid_to_phrase_boundary(
-    toks: list[str], text: str, lang: str, target: int
-) -> int:
-    """Snap a midpoint index to the best nearby phrase boundary.
-
-    Raw ``mid = n//2`` can land inside a phrase (e.g. splitting です into で|す).
-    Among legal boundaries, prefer one whose left side does not end on a sticky
-    token (の/的/...), then the one nearest ``target``. Falls back to ``target``
-    when the whole clause is a single phrase.
-    """
-    atoms = [{"text": t} for t in toks]
-    boundaries = sorted(_phrase_boundary_atoms(atoms, text, lang))
-    n = len(toks)
-    # Only consider boundaries 1..n-1 (index 0 = start of first phrase, not a
-    # valid split point; index n = after last atom, also not valid).
-    valid = [b for b in boundaries if 0 < b < n]
-    if not valid:
-        # degenerate: whole clause is one BudouX phrase (no internal boundary) → midpoint
-        return max(1, min(target, n - 1))
-
-    def left_pen(b: int) -> int:
-        # penalty of the word ending just before the break: atoms from the last
-        # phrase start below b through b-1 (whole-word semantics for zh tables)
-        ws = max((x for x in boundaries if x < b), default=0)
-        return line_end_penalty("".join(toks[ws:b]), lang)
-
-    return min(valid, key=lambda b: (left_pen(b), abs(b - target)))
-
-
-@functools.cache  # one pattern per language; avoids recompiling per clause
-def _build_split_pattern(lang: str) -> re.Pattern:
-    comma = get_comma(lang)
-    extra_terminals = ";。！？" if _no_spaces(lang) else ";"
-    conj = conjunctions_by_language.get(lang, set())
-    terminal_class = re.escape(comma) + "".join(re.escape(c) for c in extra_terminals)
-    if conj:
-        conj_alt = "|".join(re.escape(c) for c in sorted(conj, key=len, reverse=True))
-        if _no_spaces(lang):
-            # No whitespace boundary; split right after terminal or right before conjunction
-            return re.compile(rf"(?<=[{terminal_class}])|(?={conj_alt})")
-        return re.compile(rf"(?<=[{terminal_class}])\s+|(?<=\s)(?=\b(?:{conj_alt})\b)")
-    if _no_spaces(lang):
-        return re.compile(rf"(?<=[{terminal_class}])")
-    return re.compile(rf"(?<=[{terminal_class}])\s+")
-
-
-def split_sentence_heuristically(
-    sentence: str,
-    max_line_length: int,
-    max_lines: int,
-    lang: str,
-    split_at_comma: bool = True,
-    comma_split_min_len: int | None = None,
-) -> list[str]:
-    if split_at_comma:
-        if comma_split_min_len is None:
-            comma_split_min_len = default_comma_split_min_len(lang)
-        clauses = _comma_clauses(sentence, lang, comma_split_min_len)
-    else:
-        clauses = [sentence]
-    out: list[str] = []
-    for clause in clauses:
-        out.extend(_fit_split_clause(clause, max_line_length, max_lines, lang))
-    return [p for p in out if p]
-
-
-def _repack_parts(
-    parts: list[str], max_line_length: int, max_lines: int, lang: str
-) -> list[str]:
-    """Greedily merge adjacent terminal/conjunction parts back up to the budget.
-
-    The split pattern marks *candidate* break points, not mandates: keeping every
-    part separate shatters a long sentence into fragment cues ("and bought milk" |
-    "and eggs"). Mirrors the accumulate-then-flush behavior of _comma_clauses.
-    """
-    sep = "" if _no_spaces(lang) else " "
-    packed: list[str] = []
-    for part in parts:
-        if packed:
-            cand = packed[-1] + sep + part
-            if _fits_budget(cand, max_line_length, max_lines, lang):
-                packed[-1] = cand
-                continue
-            balanced = _rebalance_adjacent_parts(
-                packed[-1], part, max_line_length, max_lines, lang
-            )
-            if balanced is not None:
-                packed[-1], part = balanced
-        packed.append(part)
-    return packed
-
-
-def _visual_midpoint_index(tokens: list[str], lang: str) -> int:
-    """Token boundary nearest the visual midpoint (never 0 or len(tokens))."""
-    if len(tokens) < 2:
-        return 1
-    return min(
-        range(1, len(tokens)),
-        key=lambda i: abs(
-            _vis_width(_join(tokens[:i], lang)) - _vis_width(_join(tokens[i:], lang))
-        ),
-    )
-
-
-def _split_part_to_budget(
-    part: str, max_line_length: int, max_lines: int, lang: str
-) -> list[str]:
-    """Recursively split a multi-token part until every result fits.
-
-    A single indivisible token is deliberately returned intact: text-only
-    splitting here would desynchronise it from its one aligned ``word_data``
-    unit.  The timed atom stage owns the token-internal emergency fallback.
-    """
-    part = part.strip()
-    if not part or _fits_budget(part, max_line_length, max_lines, lang):
-        return [part] if part else []
-    tokens = _tokens(part, lang)
-    if len(tokens) < 2:
-        return [part]
-    target = _visual_midpoint_index(tokens, lang)
-    if _no_spaces(lang):
-        mid = _snap_mid_to_phrase_boundary(tokens, part, lang, target)
-    else:
-        mid = legal_break_index(tokens, lang, target)
-    if not 0 < mid < len(tokens):
-        return [part]
-    left, right = _join(tokens[:mid], lang), _join(tokens[mid:], lang)
-    return _split_part_to_budget(
-        left, max_line_length, max_lines, lang
-    ) + _split_part_to_budget(right, max_line_length, max_lines, lang)
-
-
-def _rebalance_adjacent_parts(
-    left: str,
-    right: str,
-    max_line_length: int,
-    max_lines: int,
-    lang: str,
-) -> tuple[str, str] | None:
-    """Move a legal boundary between two fitting parts to remove a short side.
-
-    This runs only inside one sentence/clause after overlong parts have already
-    been split.  It never merges the pair; both new sides must independently fit
-    the display budget, preserve order, and improve visual balance.
-    """
-    sep = "" if _no_spaces(lang) else " "
-    combined = left.rstrip() + sep + right.lstrip()
-    tokens = _tokens(combined, lang)
-    if len(tokens) < 2:
-        return None
-    # line_end_penalty scores the trailing *word* (zh whole-word tables, ja
-    # multi-kana まで/より), so a no-space side is scored on the phrase it ends
-    # with rather than on its last glyph.
-    if _no_spaces(lang):
-        atoms = [{"text": token} for token in tokens]
-        candidates = sorted(_phrase_boundary_atoms(atoms, combined, lang) - {0})
-        phrase_start = dict(zip(candidates, [0, *candidates]))
-        left_words = phrase_atoms(left.rstrip(), lang)
-        old_trailing = left_words[-1] if left_words else ""
-    else:
-        candidates = list(range(1, len(tokens)))
-        phrase_start = {i: i - 1 for i in candidates}
-        old_tokens = _tokens(left, lang)
-        old_trailing = old_tokens[-1] if old_tokens else ""
-    old_imbalance = abs(_vis_width(left) - _vis_width(right))
-    old_penalty = line_end_penalty(old_trailing, lang) if old_trailing else 0
-    choices: list[tuple[int, int, int, str, str]] = []
-    for i in candidates:
-        new_left = _join(tokens[:i], lang)
-        new_right = _join(tokens[i:], lang)
-        if not new_left or not new_right:
-            continue
-        if not _fits_budget(new_left, max_line_length, max_lines, lang):
-            continue
-        if not _fits_budget(new_right, max_line_length, max_lines, lang):
-            continue
-        imbalance = abs(_vis_width(new_left) - _vis_width(new_right))
-        if imbalance >= old_imbalance:
-            continue
-        penalty = line_end_penalty(_join(tokens[phrase_start[i] : i], lang), lang)
-        if penalty > old_penalty:
-            continue
-        choices.append((penalty, imbalance, -_vis_width(new_left), new_left, new_right))
-    if not choices:
-        return None
-    _penalty, _imbalance, _left_width, new_left, new_right = min(choices)
-    return new_left, new_right
-
-
-def _fit_split_clause(
-    clause: str,
-    max_line_length: int,
-    max_lines: int,
-    lang: str,
-) -> list[str]:
-    """Keep a clause whole if it fits ``max_lines``; otherwise split at
-    terminals/conjunctions (repacked to the budget), then fall back to an even
-    token split."""
-    clause = clause.strip()
-    if not clause:
-        return []
-    if _fits_budget(clause, max_line_length, max_lines, lang):
-        return [clause]
-
-    pattern = _build_split_pattern(lang)
-    candidate_parts = [p.strip() for p in pattern.split(clause) if p and p.strip()]
-    fitted_parts: list[str] = []
-    for part in candidate_parts:
-        fitted_parts.extend(
-            _split_part_to_budget(part, max_line_length, max_lines, lang)
-        )
-    return _repack_parts(fitted_parts, max_line_length, max_lines, lang)
-
-
 def _segment_sentences(text: str, lang: str) -> list[str]:
     """Sentence boundaries from pysbd, falling back to a terminal-punctuation regex.
 
@@ -817,32 +597,23 @@ class _ClausePlan:
 def _clause_plans(
     text: str,
     lang: str,
-    max_line_length: int,
-    max_lines: int,
     split_at_comma: bool,
     comma_split_min_len: int | None,
-    defer_length_split: bool,
 ) -> list[_ClausePlan]:
-    """Segment ``text`` into cue clauses, each with its ``word_data`` footprint."""
+    """Segment ``text`` into cue clauses, each with its ``word_data`` footprint.
+
+    Clauses are sentences, grouped into comma clauses when ``split_at_comma``;
+    none is split for length here (stage 2 owns every length break).
+    """
     sentences = _snap_sentence_breaks(text, _segment_sentences(text, lang), lang)
+    min_len = (
+        default_comma_split_min_len(lang)
+        if comma_split_min_len is None
+        else comma_split_min_len
+    )
     plans: list[_ClausePlan] = []
     for sent in sentences:
-        if defer_length_split:
-            min_len = (
-                default_comma_split_min_len(lang)
-                if comma_split_min_len is None
-                else comma_split_min_len
-            )
-            clauses = _comma_clauses(sent, lang, min_len) if split_at_comma else [sent]
-        else:
-            clauses = split_sentence_heuristically(
-                sent,
-                max_line_length,
-                max_lines,
-                lang,
-                split_at_comma,
-                comma_split_min_len,
-            )
+        clauses = _comma_clauses(sent, lang, min_len) if split_at_comma else [sent]
         for clause in clauses:
             clause = clause.strip()
             if not clause:
@@ -971,22 +742,16 @@ def split_at_sentence_end(
     text: str,
     word_data: list[Unit],
     lang: str,
-    max_line_length: int,
-    max_lines: int,
+    *,
     split_at_comma: bool = True,
     comma_split_min_len: int | None = None,
-    *,
-    defer_length_split: bool = False,
 ) -> list[Cue]:
-    plans = _clause_plans(
-        text,
-        lang,
-        max_line_length,
-        max_lines,
-        split_at_comma,
-        comma_split_min_len,
-        defer_length_split,
-    )
+    """Stage 1: one cue per sentence or comma clause, timed from its units.
+
+    The line budget plays no part here; ``split_long_cues_with_word_timings``
+    breaks the clauses for length.
+    """
+    plans = _clause_plans(text, lang, split_at_comma, comma_split_min_len)
     cues: list[Cue] = []
     cursor = 0
     # Content verification needs unit texts; legacy callers without a "word"
@@ -1034,9 +799,8 @@ class SplitThresholds:
     """Gap-aware segmentation knobs — one typed source for field names + defaults.
 
     Built from ``config.gap_thresholds()``'s mapping at the ``smart_split_segments`` boundary via
-    :meth:`from_mapping`. Passing ``thresholds=None`` to ``smart_split_segments`` selects the
-    legacy length-break-only path (gap/duration breaks and the cleanup pass are skipped), so these
-    values are only read in gap-aware mode.
+    :meth:`from_mapping`. ``smart_split_segments`` and ``split_long_cues_with_word_timings``
+    require one; ``SplitThresholds()`` gives these defaults.
     """
 
     clause_ms: int = 400
@@ -1049,7 +813,7 @@ class SplitThresholds:
     # into the following gap, capped at LINGER_CAP_S past speech end. lag_out_s is
     # a flat tail pad applied to every cue end (0 = off). config.gap_thresholds
     # supplies per-language values; the dataclass defaults keep both off so direct
-    # constructions (tests/legacy) preserve exact timing.
+    # constructions (tests) preserve exact timing.
     cps: float = 0.0
     lag_out_s: float = 0.0
     # Shot-change pairing window (0 = off): a cue boundary within this of a
@@ -1072,15 +836,12 @@ class SplitContext:
     Bundles the invariants of one ``split_long_cues_with_word_timings`` call so
     they travel into the packing loop (``_pack_atoms_into_chunks`` /
     ``_classify_atom_break``) as one value instead of five parallel parameters.
-    ``do_new=False`` is the legacy length-break-only path: gap/duration breaks
-    are disabled and ``th`` is a never-read placeholder.
     """
 
     lang: str
     max_line_length: int
     max_lines: int
     th: SplitThresholds
-    do_new: bool
     speech_spans: list[tuple[float, float]] | None = None
 
 
@@ -1276,17 +1037,13 @@ def _classify_atom_break(
     # phrase start. Guards against CTC timing errors on OOV chars creating spurious intra-word gaps
     # (e.g. 酒造り: 番酒造 OOV drift makes a 2.1s gap between 造 and り, but BudouX keeps 番酒造りが
     # as one phrase, suppressing the spurious split). The dur_break cap is exempt and always cuts.
-    gap_break = (
-        ctx.do_new
-        and at_boundary
-        and gap_qualifies(
-            prev.get("end"),
-            atom.get("start"),
-            ctx.speech_spans,
-            clause_ms=th.clause_ms,
-            vad_skip_ms=th.vad_skip_ms,
-            offline_ms=th.offline_ms,
-        )
+    gap_break = at_boundary and gap_qualifies(
+        prev.get("end"),
+        atom.get("start"),
+        ctx.speech_spans,
+        clause_ms=th.clause_ms,
+        vad_skip_ms=th.vad_skip_ms,
+        offline_ms=th.offline_ms,
     )
     # In the clause_ms..vad_skip_ms zone, suppress the gap-split if it would strand a sticky
     # token at line end: ja 大樹の|村, zh ...的|... , en a hesitation after "the". True
@@ -1317,8 +1074,7 @@ def _classify_atom_break(
         len_break = True
     start0 = _span_start(cur)
     dur_break = (
-        ctx.do_new
-        and start0 is not None
+        start0 is not None
         and atom.get("end") is not None
         and (atom["end"] - start0) > th.max_cue_s
     )
@@ -1388,9 +1144,7 @@ def _surface_parts_for_limits(
     parts = _hard_wrap_surface(text, line_budget)
     duration = max(0.0, end - start)
     duration_parts = (
-        math.ceil(duration / ctx.th.max_cue_s)
-        if ctx.do_new and ctx.th.max_cue_s > 0
-        else 1
+        math.ceil(duration / ctx.th.max_cue_s) if ctx.th.max_cue_s > 0 else 1
     )
     coarse_timed_atom = duration_parts > 1 and _vis_width(text) > line_budget / 2
     if len(parts) == 1 and not coarse_timed_atom:
@@ -1673,11 +1427,7 @@ def _spread_untimed_cues(cues: list[Cue], ctx: SplitContext) -> list[Cue]:
     to lend. Mutates and returns ``cues``.
     """
     n = len(cues)
-    floor = (
-        ctx.th.min_cue_s
-        if ctx.do_new and ctx.th.min_cue_s > 0
-        else UNTIMED_MIN_DISPLAY_S
-    )
+    floor = ctx.th.min_cue_s if ctx.th.min_cue_s > 0 else UNTIMED_MIN_DISPLAY_S
     made_up = [
         c.get("speech_start") is None or c.get("speech_end") is None for c in cues
     ]
@@ -1959,6 +1709,18 @@ def _repair_bound_particle_cues(
     return work
 
 
+def _required_thresholds(value: object, caller: str) -> SplitThresholds:
+    """The typed thresholds a caller must pass; a missing value is a TypeError."""
+    if isinstance(value, SplitThresholds):
+        return value
+    if isinstance(value, dict):
+        return SplitThresholds.from_mapping(value)
+    raise TypeError(
+        f"{caller}() needs thresholds (a SplitThresholds or a mapping such as "
+        f"config.gap_thresholds(lang)), not {type(value).__name__}"
+    )
+
+
 def split_long_cues_with_word_timings(
     cues: list[Cue],
     max_line_length: int,
@@ -1966,23 +1728,20 @@ def split_long_cues_with_word_timings(
     lang: str,
     *,
     speech_spans: list[tuple[float, float]] | None = None,
-    thresholds: SplitThresholds | None = None,
+    thresholds: SplitThresholds,
 ) -> list[Cue]:
     """Pack each cue's atoms into reading-sized cues using gap/duration/length breaks.
 
-    ``thresholds=None`` is the legacy length-break-only path: ``do_new=False`` disables the
-    gap/duration breaks, so the threshold values are never read (the default instance is a
-    never-read placeholder there). The optional arguments are keyword-only, so a caller
-    still passing the removed ``min_duration``/``desired_wps`` positionally gets a
-    ``TypeError`` instead of having them bound to other parameters.
+    ``thresholds`` is required (``SplitThresholds()`` gives the defaults). The
+    arguments after ``lang`` are keyword-only, so a caller still passing the
+    removed ``min_duration``/``desired_wps`` positionally gets a ``TypeError``
+    instead of having them bound to other parameters.
     """
-    do_new = thresholds is not None
     ctx = SplitContext(
         lang=lang,
         max_line_length=max_line_length,
         max_lines=max_lines,
-        th=thresholds if thresholds is not None else SplitThresholds(),
-        do_new=do_new,
+        th=_required_thresholds(thresholds, "split_long_cues_with_word_timings"),
         speech_spans=speech_spans,
     )
     new_cues: list[Cue] = []
@@ -2001,7 +1760,7 @@ def split_long_cues_with_word_timings(
         )
         boundary = (
             _phrase_boundary_atoms(atoms, cue["text"], lang)
-            if do_new and _no_spaces(lang)
+            if _no_spaces(lang)
             else None
         )
         if boundary is not None:
@@ -2093,7 +1852,7 @@ def smart_split_segments(
     split_at_comma: bool = True,
     comma_split_min_len: int | None = None,
     speech_spans: list[tuple[float, float]] | None = None,
-    thresholds: SplitThresholds | dict | None = None,
+    thresholds: SplitThresholds | dict,
     shot_changes: list[float] | None = None,
 ) -> list[Cue]:
     """Run the full smart-split pipeline over aligned segments.
@@ -2104,14 +1863,18 @@ def smart_split_segments(
     removed ``min_duration``/``desired_wps`` positionally gets a ``TypeError``
     instead of having them bound to ``split_at_comma``/``comma_split_min_len``.
 
+    ``thresholds`` is required: a :class:`SplitThresholds`, or a mapping such as
+    ``config.gap_thresholds(lang)`` (partial mappings fill the dataclass
+    defaults). Omitting it, or passing ``None``, raises ``TypeError``.
+
     ``split_at_comma`` (default on) breaks at commas unless either side is
-    shorter than ``comma_split_min_len`` visual chars. With ``thresholds`` set
-    (as every production call does), the sentence/comma clauses are packed by
-    the timed atom stage and then the cue-stream folds run:
-    ``_repair_bound_particle_cues``, ``_merge_micro_cues`` and
+    shorter than ``comma_split_min_len`` visual chars. The sentence/comma
+    clauses are packed by the timed atom stage and then the cue-stream folds
+    run: ``_repair_bound_particle_cues``, ``_merge_micro_cues`` and
     ``_glue_short_cues`` can each merge adjacent cues across a clause boundary
     when the gap between them is below a real pause.
     """
+    th = _required_thresholds(thresholds, "smart_split_segments")
     if max_line_length is None:
         max_line_length = default_max_line_length(lang)
     if max_lines is None:
@@ -2121,13 +1884,6 @@ def smart_split_segments(
     # stages honour the same configured profile instead of the renderer silently
     # falling back to its built-in 42-column default.
     render_width = _line_budget_width(max_line_length, lang)
-    # Accept a plain mapping (config.gap_thresholds / tests) and normalize to the typed form once.
-    # th is None ⟺ legacy length-break-only mode (no gap/duration breaks, no cleanup pass).
-    th = (
-        SplitThresholds.from_mapping(thresholds)
-        if isinstance(thresholds, dict)
-        else thresholds
-    )
     all_cues: list[Cue] = []
     for segment in segments:
         text = segment.get("text", "")
@@ -2139,11 +1895,8 @@ def smart_split_segments(
                 text,
                 words,
                 lang,
-                max_line_length,
-                max_lines,
-                split_at_comma,
-                comma_split_min_len,
-                defer_length_split=th is not None and bool(words),
+                split_at_comma=split_at_comma,
+                comma_split_min_len=comma_split_min_len,
             )
         )
     cues = split_long_cues_with_word_timings(
@@ -2154,50 +1907,47 @@ def smart_split_segments(
         speech_spans=speech_spans,
         thresholds=th,
     )
-    if th is not None:  # cleanup opt-in; legacy callers skip this
-        cues = _repair_bound_particle_cues(
+    cues = _repair_bound_particle_cues(
+        cues,
+        lang=lang,
+        max_line_length=max_line_length,
+        max_lines=max_lines,
+        max_cue_s=th.max_cue_s,
+        connected_gap_s=th.clause_ms / 1000.0,
+    )
+    cues = _merge_micro_cues(
+        cues,
+        lang,
+        max_gap_s=th.glue_gap_s,
+        max_line_length=max_line_length,
+        max_cue_s=th.max_cue_s,
+        min_cue_s=th.min_cue_s,
+        max_lines=max_lines,
+    )
+    cues = _glue_short_cues(
+        cues,
+        lang,
+        max_gap_s=th.glue_gap_s,
+        max_line_length=max_line_length,
+        max_lines=max_lines,
+        max_cue_s=th.max_cue_s,
+    )
+    cues = _cleanup_cues(
+        cues,
+        min_cue_s=th.min_cue_s,
+        max_cue_s=th.max_cue_s,
+        cps=th.cps,
+        lag_out_s=th.lag_out_s,
+    )
+    if shot_changes:
+        cues = _snap_to_shots(
             cues,
-            lang=lang,
-            max_line_length=max_line_length,
-            max_lines=max_lines,
-            max_cue_s=th.max_cue_s,
-            connected_gap_s=th.clause_ms / 1000.0,
-        )
-        cues = _merge_micro_cues(
-            cues,
-            lang,
-            max_gap_s=th.glue_gap_s,
-            max_line_length=max_line_length,
-            max_cue_s=th.max_cue_s,
-            min_cue_s=th.min_cue_s,
-            max_lines=max_lines,
-        )
-        cues = _glue_short_cues(
-            cues,
-            lang,
-            max_gap_s=th.glue_gap_s,
-            max_line_length=max_line_length,
-            max_lines=max_lines,
+            sorted(shot_changes),
+            snap_s=th.shot_snap_s,
             max_cue_s=th.max_cue_s,
         )
-        cues = _cleanup_cues(
-            cues,
-            min_cue_s=th.min_cue_s,
-            max_cue_s=th.max_cue_s,
-            cps=th.cps,
-            lag_out_s=th.lag_out_s,
-        )
-        if shot_changes:
-            cues = _snap_to_shots(
-                cues,
-                sorted(shot_changes),
-                snap_s=th.shot_snap_s,
-                max_cue_s=th.max_cue_s,
-            )
     for cue in cues:
-        cue["text"] = strip_punct_for_subtitles(cue["text"])
-        if th is not None:  # stutter merging opt-in alongside gap-aware mode
-            cue["text"] = _merge_stutters(cue["text"])
+        cue["text"] = _merge_stutters(strip_punct_for_subtitles(cue["text"]))
         # Display soft-wrap: fold over-budget cues into <=max_lines lines without
         # changing cue boundaries. Long Latin phrases inside CJK also collapse here.
         cue["text"] = wrap_cue_text(

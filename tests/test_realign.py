@@ -557,7 +557,9 @@ def test_reinject_then_smart_split_unglues_and_strips_punct():
             {"word": u["text"], "start": u["start"], "end": u["end"]} for u in pu
         ],
     }
-    cues = smart_split.smart_split_segments([seg], lang="en")
+    cues = smart_split.smart_split_segments(
+        [seg], lang="en", thresholds=smart_split.SplitThresholds()
+    )
     joined = " ".join(c["text"] for c in cues)
     assert "Listenup" not in joined  # English words not fused together
     assert "Listen up" in joined  # inter-word space present
