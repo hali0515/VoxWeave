@@ -693,6 +693,12 @@ def test_audition_split_ui_contract_is_inert_until_the_server_probe(matches):
         "[data-speaker], #save, .use-suggestion, .split-speaker, "
         ".split-apply, .split-cancel" in page
     )
+    # Undo is offered only once a split is applied, and posts an empty body.
+    assert page.count("renderSplitApplied(host);") == 1
+    assert "finishSplit();\n      renderSplitApplied(host);" in page
+    assert "Undo this split" in page and 'class="split-undo"' not in page
+    assert "postJSON('split-undo', {})" in page
+    assert "result.undone !== true" in page
     if matches is None:
         assert 'class="suggestions"' not in page
     else:

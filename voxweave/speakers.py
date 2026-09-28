@@ -1090,7 +1090,9 @@ async function postJSON(path, payload) {
   let responsePayload = {};
   try { responsePayload = await response.json(); } catch (_) {}
   if (!response.ok) {
-    throw new Error(splitErrorMessage(responsePayload, `${path} ${response.status}`));
+    const error = new Error(splitErrorMessage(responsePayload, `${path} ${response.status}`));
+    error.status = response.status;
+    throw error;
   }
   return responsePayload;
 }
@@ -1136,6 +1138,45 @@ function finishSplit() {
   for (const control of document.querySelectorAll(
     '[data-speaker], #save, .use-suggestion, .split-speaker, .split-apply, .split-cancel'
   )) control.disabled = true;
+}
+
+// The applied state: the server has ended this session, so the page only
+// offers taking the split back (one level, through /split-undo).
+function renderSplitApplied(host) {
+  const undo = document.createElement('button');
+  undo.type = 'button';
+  undo.className = 'split-undo';
+  undo.textContent = 'Undo this split';
+  const actions = document.createElement('div');
+  actions.className = 'split-confirm-actions';
+  actions.append(undo);
+  const error = splitStatus('', 'split-error');
+  host.replaceChildren(
+    splitStatus('split applied — restart `voxweave speakers` to re-audition'),
+    actions,
+    error,
+  );
+  undo.addEventListener('click', async () => {
+    undo.disabled = true;
+    error.textContent = '';
+    try {
+      const result = await postJSON('split-undo', {});
+      if (!result || result.undone !== true) {
+        throw new Error('The server returned an invalid undo confirmation.');
+      }
+      host.replaceChildren(splitStatus(
+        'split undone — the previous speakers are restored; restart `voxweave speakers` to audition again'
+      ));
+    } catch (requestError) {
+      const message = requestError instanceof Error && requestError.message
+        ? requestError.message : 'the server did not answer';
+      // 409 is a refusal: the server checked before writing, so nothing changed.
+      error.textContent = requestError?.status === 409
+        ? `${message}. Nothing was restored.`
+        : `Undo failed: ${message}`;
+      undo.disabled = false;
+    }
+  });
 }
 
 function renderSplitProposal(card, speakerId, proposal) {
@@ -1197,7 +1238,7 @@ function renderSplitProposal(card, speakerId, proposal) {
         throw new Error('The server returned an invalid split confirmation.');
       }
       finishSplit();
-      host.replaceChildren(splitStatus('split applied — restart `voxweave speakers` to re-audition'));
+      renderSplitApplied(host);
     } catch (requestError) {
       error.textContent = requestError instanceof Error ? requestError.message : 'Split could not be applied.';
       apply.disabled = false;

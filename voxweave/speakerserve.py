@@ -1381,7 +1381,9 @@ def _decoded_undo_record(
 
 def _load_undo(path: Path) -> tuple[str, dict[str, tuple[Path, bytes, int, str]]]:
     if not path.is_file():
-        raise SplitConflict("there is no speaker split to undo")
+        raise SplitConflict(
+            "there is no speaker split to undo: it was already undone or purged"
+        )
     raw = path.read_bytes()
     value = strict_json_object_loads(
         raw,
@@ -1412,6 +1414,14 @@ def _load_undo(path: Path) -> tuple[str, dict[str, tuple[Path, bytes, int, str]]
     }
 
 
+# How an undo refusal names each file it checks; the page shows the message as is.
+_UNDO_FILE_LABELS = {
+    "sibling": "the transcript JSON",
+    "voiceprints": "the voiceprints",
+    "mapping": "the speaker mapping",
+}
+
+
 def _undo_split(server: SpeakerHTTPServer) -> None:
     undo_path = artifacts.speaker_split_undo_path(server.media_path)
     with episode_lock(server.media_path):
@@ -1424,33 +1434,38 @@ def _undo_split(server: SpeakerHTTPServer) -> None:
             }
         except OSError as exc:
             raise SplitConflict(
-                "artifact storage changed since the split; undo refused"
+                "undo refused: the episode's artifact storage changed since the split"
             ) from exc
         for field, expected_path in current_paths.items():
             recorded_path, _before, _size, _digest = records[field]
             if recorded_path != expected_path:
                 raise SplitConflict(
-                    f"{field} storage changed since the split; undo refused"
+                    f"undo refused: the storage of {_UNDO_FILE_LABELS[field]} "
+                    f"({expected_path.name}) changed since the split"
                 )
         try:
             current_fingerprint = media_fingerprint(server.media_path)
         except OSError as exc:
-            raise SplitConflict("media changed since the split; undo refused") from exc
+            raise SplitConflict(
+                "undo refused: the media file changed since the split"
+            ) from exc
         if current_fingerprint != fingerprint:
-            raise SplitConflict("media changed since the split; undo refused")
+            raise SplitConflict("undo refused: the media file changed since the split")
 
         current: dict[str, bytes] = {}
         for field, path in current_paths.items():
+            changed = SplitConflict(
+                f"undo refused: {_UNDO_FILE_LABELS[field]} ({path.name}) "
+                "changed since the split"
+            )
             try:
                 raw = path.read_bytes()
             except OSError as exc:
-                raise SplitConflict(
-                    f"{field} changed since the split; undo refused"
-                ) from exc
+                raise changed from exc
             _recorded_path, before, expected_size, expected_hash = records[field]
             matches_after = len(raw) == expected_size and _sha256(raw) == expected_hash
             if raw != before and not matches_after:
-                raise SplitConflict(f"{field} changed since the split; undo refused")
+                raise changed
             current[field] = raw
 
         sibling_before = records["sibling"][1]

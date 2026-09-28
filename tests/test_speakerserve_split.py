@@ -133,6 +133,7 @@ def _running_split_server(
     provenance: Mapping[str, object] | None = None,
     provider_identity: turnembed.EmbeddingIdentity | None = None,
     sibling_extra: Mapping[str, object] | None = None,
+    page: str = "<!doctype html><title>split audition</title>",
 ) -> Iterator[
     tuple[
         speakerserve.SpeakerHTTPServer,
@@ -244,7 +245,7 @@ def _running_split_server(
 
     logs: list[str] = []
     server = speakerserve.make_server(
-        page="<!doctype html><title>split audition</title>",
+        page=page,
         media_path=media,
         mapping_path=mapping_path,
         sibling_path=sibling_path,
@@ -1389,6 +1390,193 @@ def test_undo_treats_a_deleted_rewritten_input_as_changed(
         assert paths["sidecar"].read_bytes() == sidecar_after
         assert not paths["mapping"].exists()
         assert paths["undo"].is_file()
+
+
+def _audition_page() -> str:
+    return speakers._render_audition_html(
+        "episode.mkv",
+        "episode.speakers.json",
+        {
+            "SPEAKER_00": [((0.0, 3.0), "data:audio/mpeg;base64,Y2xpcA==")],
+            "SPEAKER_01": [((3.0, 6.0), "data:audio/mpeg;base64,Y2xpcA==")],
+        },
+    )
+
+
+def _page_post(
+    server: speakerserve.SpeakerHTTPServer,
+    page: str,
+    route: str,
+    value: object,
+):
+    """POST ``route`` the way the audition page's ``postJSON`` sends it.
+
+    The page names the route relative to ``/``, takes its token from
+    ``/serve-info`` and runs same-origin, so the browser adds the page's Origin.
+    """
+    assert f"postJSON('{route}', " in page
+    status, _headers, body = _request(server, "GET", "/serve-info")
+    assert status == 200
+    token = json.loads(body)["token"]
+    return _post(server, f"/{route}", value, token=token, origin=server.origin)
+
+
+def test_page_undo_control_restores_a_confirmed_split(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = _audition_page()
+    with _running_split_server(tmp_path, monkeypatch, page=page) as (
+        server,
+        paths,
+        originals,
+        logs,
+        _observations,
+    ):
+        status, _headers, served = _request(server, "GET", "/")
+        assert status == 200
+        assert served == page.encode("utf-8")
+        # The control exists only in the applied state the confirm renders.
+        assert "finishSplit();\n      renderSplitApplied(host);" in page
+        assert "undo.textContent = 'Undo this split';" in page
+        assert "postJSON('split-undo', {})" in page
+
+        status, _headers, body = _page_post(
+            server, page, "split", {"speaker_id": "SPEAKER_00"}
+        )
+        assert status == 200, body
+        proposal = json.loads(body)
+        status, _headers, body = _page_post(
+            server,
+            page,
+            "split-confirm",
+            {"speaker_id": "SPEAKER_00", "assignment": proposal["assignment"]},
+        )
+        assert (status, json.loads(body)) == (200, {"new_id": "SPEAKER_02"})
+        assert server.session_terminal
+        split_bytes = {
+            field: paths[field].read_bytes()
+            for field in ("sibling", "sidecar", "mapping")
+        }
+        assert split_bytes != {
+            field: originals[field] for field in ("sibling", "sidecar", "mapping")
+        }
+
+        # The undo goes through the same guard stack as /save and /split-confirm.
+        token = json.loads(_request(server, "GET", "/serve-info")[2])["token"]
+        refused = (
+            _post(server, "/split-undo", {}, origin=server.origin),
+            _post(server, "/split-undo", {}, token=token, origin="http://evil.test"),
+            _request(
+                server,
+                "POST",
+                "/split-undo",
+                body=b"{}",
+                headers={
+                    "Cookie": "voxweave_session_0=wrong",
+                    "Content-Type": "application/json",
+                    "X-VoxWeave-Token": token,
+                },
+            ),
+        )
+        assert [status for status, _headers, _body in refused] == [403, 403, 403]
+        assert {
+            field: paths[field].read_bytes()
+            for field in ("sibling", "sidecar", "mapping")
+        } == split_bytes
+
+        status, headers, body = _page_post(server, page, "split-undo", {})
+
+        assert status == 200
+        assert headers["Cache-Control"] == "no-store"
+        assert json.loads(body) == {"undone": True}
+        assert paths["sibling"].read_bytes() == originals["sibling"]
+        assert paths["sidecar"].read_bytes() == originals["sidecar"]
+        assert paths["mapping"].read_bytes() == originals["mapping"]
+        assert not paths["undo"].exists()
+        assert server.session_terminal
+        assert logs[-2:] == [
+            "Restored the previous speaker split generation",
+            "Restart `voxweave speakers serve` to re-audition",
+        ]
+        assert (
+            "split undone — the previous speakers are restored; restart "
+            "`voxweave speakers` to audition again" in page
+        )
+
+        # One level only: a second undo is refused with a readable reason.
+        status, _headers, body = _page_post(server, page, "split-undo", {})
+        assert status == 409
+        assert json.loads(body) == {
+            "error": "there is no speaker split to undo: it was already undone or purged"
+        }
+
+
+@pytest.mark.parametrize(
+    ("changed", "message"),
+    (
+        (
+            "sibling",
+            "undo refused: the transcript JSON (episode.json) changed since the split",
+        ),
+        (
+            "sidecar",
+            "undo refused: the voiceprints (episode.voiceprints.json) changed "
+            "since the split",
+        ),
+        (
+            "mapping",
+            "undo refused: the speaker mapping (episode.speakers.json) changed "
+            "since the split",
+        ),
+    ),
+)
+def test_page_undo_shows_a_refusal_and_restores_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed: str,
+    message: str,
+) -> None:
+    page = _audition_page()
+    with _running_split_server(tmp_path, monkeypatch, page=page) as (
+        server,
+        paths,
+        _originals,
+        _logs,
+        _observations,
+    ):
+        status, _headers, body = _page_post(
+            server, page, "split", {"speaker_id": "SPEAKER_00"}
+        )
+        proposal = json.loads(body)
+        status, _headers, body = _page_post(
+            server,
+            page,
+            "split-confirm",
+            {"speaker_id": "SPEAKER_00", "assignment": proposal["assignment"]},
+        )
+        assert status == 200, body
+        paths[changed].write_bytes(paths[changed].read_bytes() + b" ")
+        before_undo = {
+            field: paths[field].read_bytes()
+            for field in ("sibling", "sidecar", "mapping")
+        }
+
+        status, _headers, body = _page_post(server, page, "split-undo", {})
+
+        assert status == 409
+        assert json.loads(body) == {"error": message}
+        assert {
+            field: paths[field].read_bytes()
+            for field in ("sibling", "sidecar", "mapping")
+        } == before_undo
+        assert paths["undo"].is_file()
+        # The page shows a 409 as the server's reason, not as a generic failure,
+        # and keeps the control so the undo can be retried.
+        assert "error.status = response.status;" in page
+        assert "requestError?.status === 409" in page
+        assert "`${message}. Nothing was restored.`" in page
+        assert "undo.disabled = false;" in page
 
 
 # --------------------------------------------------------------------------
