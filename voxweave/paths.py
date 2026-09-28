@@ -7,12 +7,18 @@ implementation instead of reaching up into the orchestration module.
 
 from __future__ import annotations
 
+import errno
 import logging
+import os
 from pathlib import Path
 
 from voxweave import lang
 
 log = logging.getLogger("voxweave")
+
+# Bytes per file name when the filesystem cannot say (every filesystem voxweave
+# targets allows at least this).
+DEFAULT_NAME_MAX = 255
 
 # Extensions tried when locating the source media by stem (align only receives the VTT).
 MEDIA_EXTS = (
@@ -47,6 +53,65 @@ def swap_ext(path: Path, new_ext: str) -> Path:
     if path.suffix:
         return path.with_name(path.name[: -len(path.suffix)] + new_ext)
     return path.with_name(path.name + new_ext)
+
+
+def name_limit(directory: Path) -> int:
+    """Longest file name, in bytes, the filesystem holding ``directory`` accepts.
+
+    ``directory`` may not exist yet: its nearest existing ancestor answers for
+    it, since that is where it would be created. Falls back to 255.
+    """
+    for candidate in (Path(directory), *Path(directory).parents):
+        try:
+            return int(os.pathconf(candidate, "PC_NAME_MAX"))
+        except FileNotFoundError:
+            continue
+        except (AttributeError, OSError, ValueError):
+            break
+    return DEFAULT_NAME_MAX
+
+
+def name_bytes(name: str) -> int:
+    """Length of ``name`` as the filesystem stores it (UTF-8 bytes)."""
+    return len(os.fsencode(name))
+
+
+class OutputNameTooLongError(OSError):
+    """A deliverable's file name exceeds its filesystem's name limit."""
+
+    def __init__(self, path: Path, size: int, limit: int) -> None:
+        super().__init__(errno.ENAMETOOLONG, os.strerror(errno.ENAMETOOLONG), str(path))
+        self.size = size
+        self.limit = limit
+
+    def __str__(self) -> str:
+        return (
+            f"cannot write {self.filename}: its file name is {self.size} bytes and "
+            f"this filesystem allows at most {self.limit}; give the input a "
+            "shorter name (or pass a shorter output path) and run again"
+        )
+
+
+def name_fits(path: Path) -> bool:
+    """Whether ``path``'s file name is short enough to exist on its filesystem."""
+    path = Path(path)
+    return name_bytes(path.name) <= name_limit(path.parent)
+
+
+def require_output_name(path: Path) -> Path:
+    """Return ``path``, or raise if its file name cannot exist on its filesystem.
+
+    Deliverables beside the media (``<stem>.json``, ``.vtt``, derived and
+    translated subtitles, pack/burn outputs) keep their user-facing names and
+    are never shortened, so a name that is too long is refused up front, before
+    a command does any work, instead of failing at the final write.
+    """
+    path = Path(path)
+    size = name_bytes(path.name)
+    limit = name_limit(path.parent)
+    if size > limit:
+        raise OutputNameTooLongError(path, size, limit)
+    return path
 
 
 def detect_subtitle_language(sub: Path) -> str | None:

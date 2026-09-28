@@ -416,8 +416,13 @@ be reproduced (for example, when a bound separated-vocals cache is missing or st
 confirmed split rewrites `speaker_turns` and the bound voiceprint centroids (recomputed with the
 capture's centroid recipe) and asks you to restart `voxweave speakers serve` to audition and name
 the new id. It also saves the files it rewrote as a one-level snapshot in the episode cache
-(`speaker-split.undo.json`), but neither the page nor a command restores it yet: to take a split
-back, transcribe the episode again with `--diarize --voiceprints`, which diarizes it from scratch.
+(`speaker-split.undo.json`). Until you restart, the card offers **Undo this split**, which
+restores the transcript JSON, the voiceprints and the speaker mapping from that snapshot. The
+undo is refused, and the page says which file is the reason, when one of them changed after the
+split (or the media did), or when there is no snapshot left; a refused undo restores nothing.
+Either way, restart `voxweave speakers serve` to audition again. The page offers the undo only
+in the session that applied the split; after a restart, take a split back by transcribing the
+episode again with `--diarize --voiceprints`, which diarizes it from scratch.
 `voxweave speakers purge` deletes the snapshot.
 
 Voice matching across episodes is a separate, opt-in layer. Capture centroids with
@@ -1173,6 +1178,16 @@ standalone subtitle command with no discoverable sibling media, it claims that i
 instead. If another same-stem file in the same directory already owns the plain stem
 (`episode.mkv` next to `episode.mp3`), VoxWeave uses `<stem>--<sha1-of-file-name-first-8>/`
 for the second claim.
+
+Every cache name above keeps its plain form while it fits the filesystem's file-name limit
+(`NAME_MAX`, 255 bytes on most filesystems, counted in UTF-8 bytes). Only a name that would not
+fit is shortened: `<stem, cut to fit>--<first 8 hex digits of sha1(stem)><suffix>`, for example
+`<stem>.episode.lock` once the media stem reaches about 243 bytes, or the collision directory
+at about 246. The shortened name is deterministic, and an entry is found under
+whichever form it was written. Deliverables beside the media (`<stem>.json`, `<stem>.vtt`,
+derived and translated subtitles, `pack`/`burn` outputs) are never shortened: when one of them
+would not fit, the command stops before doing any work and names the file, so rename the media
+(or pass a shorter `-o`) and run it again.
 
 Existing adjacent machine sidecars remain compatible: when an adjacent
 `<stem>.speakers.json`, `<stem>.speakers.suggest.json`, `<stem>.voiceprints.json`, translation

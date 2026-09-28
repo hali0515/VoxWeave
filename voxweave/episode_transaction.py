@@ -13,6 +13,7 @@ overwrite); the voiceprint sidecar and durable align evidence stay ``0o600``.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import stat
@@ -504,6 +505,10 @@ def _cleanup_after_primary(
     try:
         cleanup.path.unlink(missing_ok=True)
     except OSError as exc:
+        # A name too long to exist (a long media stem plus a legacy sidecar
+        # suffix) is absent too, as artifacts.path_present treats it.
+        if exc.errno == errno.ENAMETOOLONG:
+            return
         raise ArtifactCleanupError(cleanup, exc, outputs=outputs) from exc
 
 

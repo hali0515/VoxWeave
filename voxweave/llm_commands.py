@@ -29,7 +29,7 @@ from voxweave import asrfix as asrfix_mod
 from voxweave import translate as translate_mod
 from voxweave.export import render_ass, render_srt
 from voxweave.lang import to_iso_or
-from voxweave.paths import swap_ext
+from voxweave.paths import require_output_name, swap_ext
 from voxweave.progress import NestedReporter, Reporter
 from voxweave.subformats import (
     load_subtitle_blocks,
@@ -87,6 +87,7 @@ def translate(
     concurrency = config.resolve_llm_concurrency(concurrency)
     window_cues = config.resolve_llm_window_cues(window_cues)
     ext = ".ass" if vtt_path.suffix.lower() == ".ssa" else vtt_path.suffix.lower()
+    out_path = require_output_name(swap_ext(vtt_path, f".{to}{ext}"))
     rep = reporter or Reporter()
     rep.plan(("read subtitles", "translate cues", "write translation"))
     rep.step("read subtitles")
@@ -205,7 +206,6 @@ def translate(
             if ext == ".srt"
             else render_ass(timed, blocks=timed_blocks)
         )
-    out_path = swap_ext(vtt_path, f".{to}{ext}")
     fsio.atomic_write_text(out_path, content)
     try:
         live_progress_candidates = artifacts.translation_progress_candidates(
@@ -296,6 +296,10 @@ def correct(
     """
     # --apply overwrites the input as VTT
     vtt_path = pipeline.require_vtt(Path(vtt_path))
+    # The review sidecar keeps its name beside the input: refuse before the LLM call.
+    sidecar_path = (
+        None if apply else require_output_name(swap_ext(vtt_path, ".asrfix.vtt"))
+    )
     # None = env VOXWEAVE_FIX_MODEL > conf [llm].model > built-in (see translate()).
     model = model or config.resolve_llm_model(None, task_envvar="VOXWEAVE_FIX_MODEL")
     if apply and align_after and media_path is not None:
@@ -354,7 +358,8 @@ def correct(
         out_path = vtt_path
     else:
         rep.stage("write sidecar VTT + audit json")
-        out_path = swap_ext(vtt_path, ".asrfix.vtt")
+        assert sidecar_path is not None
+        out_path = sidecar_path
         audit_path = artifacts.asrfix_audit_path(owner, vtt_path)
         fsio.atomic_write_text(out_path, rendered)
         try:

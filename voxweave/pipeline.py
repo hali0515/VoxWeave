@@ -66,7 +66,7 @@ from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
 # Path, sidecar, vocals-cache and segmentation helpers moved to their own
 # modules; the public names stay importable from here.
 from voxweave.paths import MEDIA_EXTS as MEDIA_EXTS
-from voxweave.paths import find_subtitle_media, swap_ext
+from voxweave.paths import find_subtitle_media, require_output_name, swap_ext
 from voxweave.progress import Reporter, progress_bridge
 from voxweave.segmentation import (
     SEGMENTATION_ENGINE as SEGMENTATION_ENGINE,
@@ -1370,6 +1370,11 @@ def process(
     picks how its turns are grouped into speakers.
     """
     media_path = Path(media_path)
+    # The deliverables keep their names beside the media: refuse one that cannot
+    # exist before any audio work, not at the final write.
+    writes_sdh = sdh and word_segments is None
+    for suffix in (".json", ".vtt", *((".sdh.vtt",) if writes_sdh else ())):
+        require_output_name(swap_ext(media_path, suffix))
     rep = reporter or Reporter()
     steps = ["inspect source"]
     if word_segments is None:
@@ -2424,6 +2429,7 @@ def align(
     smart_split is not touched. All models run in-process (no network calls).
     """
     vtt_path = require_vtt(Path(vtt_path))  # align overwrites the input as VTT
+    require_output_name(swap_ext(vtt_path, ".json"))  # refuse before the model work
     explicit_media_requested = media_path is not None
     rep = reporter or Reporter()
     rep.plan(("read subtitles", "prepare audio", "align subtitles", "write outputs"))

@@ -33,7 +33,7 @@ from voxweave import fsio, lang
 from voxweave.paths import (
     detect_subtitle_language as detect_subtitle_language,
 )
-from voxweave.paths import find_subtitle_media, swap_ext
+from voxweave.paths import find_subtitle_media, require_output_name, swap_ext
 from voxweave.progress import Reporter
 
 logger = logging.getLogger(__name__)
@@ -339,12 +339,13 @@ def default_output(
 def _check_output_clear_of_source(out: Path, media: Path) -> Path:
     """Reject an output path that resolves to the source media: ffmpeg reading
     and writing the same file truncates the source. Reachable via an explicit
-    ``-o`` (or a default name that is a link to the source)."""
+    ``-o`` (or a default name that is a link to the source). An output name too
+    long for its filesystem is refused here too, before ffmpeg runs."""
     if Path(out).resolve() == Path(media).resolve():
         raise ValueError(
             f"output {Path(out).name} is the source media; pick a different -o/--output"
         )
-    return Path(out)
+    return require_output_name(Path(out))
 
 
 def _default_container(media: Path) -> str:
@@ -947,6 +948,11 @@ def burn(
         raise ValueError(f"unsupported container {container!r} (choose mp4 or mkv)")
     require_subtitle(vtt)
     src = resolve_media(vtt, media)
+    out = _check_output_clear_of_source(
+        output
+        or default_output(src, container, "burn", [detect_subtitle_language(vtt)]),
+        src,
+    )
     timed_blocks = None
     if native_ass:
         rows = None
@@ -988,11 +994,6 @@ def burn(
     rep.step("select encoder")
     enc = pick_encoder(codec, force=encoder)
     q = quality if quality is not None else _DEFAULT_QUALITY.get(enc, 23)
-    out = _check_output_clear_of_source(
-        output
-        or default_output(src, container, "burn", [detect_subtitle_language(vtt)]),
-        src,
-    )
 
     tmp_ass: Path | None = None
     temp_dirs: list[Path] = []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import math
 import os
 from collections.abc import Mapping
@@ -1184,7 +1185,13 @@ def write_suggest(path: Path, value: Mapping[str, object]) -> None:
 
 
 def delete_suggest(path: Path) -> None:
-    Path(path).unlink(missing_ok=True)
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError as exc:
+        # A legacy name too long to exist (a long media stem plus the suffix)
+        # is absent too.
+        if exc.errno != errno.ENAMETOOLONG:
+            raise
 
 
 __all__ = [
