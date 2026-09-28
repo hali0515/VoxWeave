@@ -914,8 +914,10 @@ def transcribe(
         # vad_spans are persisted to .json (vad_speech) for reuse by split.
         # SNAP_VAD_THRESHOLD (0.25) catches attenuated back-channels. The original is the
         # full-band stem on a fresh separation, or the source media itself on a vocals-cache
-        # hit (no stem exists then) -- both decoded to the same 16k mono, so a re-run gets
-        # the same reference as the first run. --no-separate reuses the chunking VAD
+        # hit (no stem exists then). The two decode to slightly different 16k PCM, so a
+        # re-run's reference can differ a little from the first run's (VAD at this
+        # threshold has absorbed the difference on the clips checked so far; the samples
+        # themselves are not identical). --no-separate reuses the chunking VAD
         # (silero default 0.5): the decoded 16k input already IS the original audio.
         if separate:
             orig16k = decode_to_wav(fullband if fullband is not None else media_path)

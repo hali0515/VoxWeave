@@ -311,7 +311,7 @@ def acquire_16k(
     fingerprint: str | None = None,
     separator: Mapping[str, object] | None = None,
     legacy_16k: bool = False,
-    purpose: str = "run",
+    purpose: str,
     on_separated: Callable[[Path, Path], None] | None = None,
 ) -> Acquired16k:
     """Produce the 16 kHz input for ``media``, reusing or refreshing the vocals cache.

@@ -238,7 +238,7 @@ def pause_evidence(
     the classifier's 50 ms epsilon is the slack a *boolean* needs, and applying
     it to a fraction would quantize a continuous measurement for no reason.
     "True" means the covered *union*: overlapping spans (which a hand-edited or
-    foreign sibling JSON can carry, since ``_spans_in`` neither sorts nor merges)
+    foreign sibling JSON can carry, since ``overlay.spans_in`` neither sorts nor merges)
     would otherwise have their shared time counted twice and could push the
     fraction past 1.0, under-reporting the effective silence and making the cut
     look more expensive than the evidence says.

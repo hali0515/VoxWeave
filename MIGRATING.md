@@ -357,6 +357,12 @@ Code that imported or patched private `pipeline` helpers finds them here:
 `voxweave.mux.detect_subtitle_language` and `voxweave.subformats.SUBTITLE_EXTS` still import
 from their old modules.
 
+A name re-exported from `pipeline` is a second binding: patching it on `pipeline` does not reach
+the module that reads it. Patch the defining module instead, for example
+`voxweave.vocals.decode_to_wav` or `voxweave.vocals.CACHE_DUR_TOL_SEC` for the 16 kHz input
+flow. Modules `pipeline` only held as imports (`translate_mod`, `asrfix_mod`, `subprocess`,
+`validate_cache_pair`, ...) are no longer reachable through it.
+
 ### Smaller changes
 
 - `--language` accepts ISO codes such as `ja` with the Qwen engine; before, every chunk failed
