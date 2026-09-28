@@ -3,7 +3,7 @@
 # file's inter-unit gap distribution; offline follows at the same ratio.
 import pytest
 
-from voxweave import pipeline
+from voxweave import segmentation
 from voxweave.core.gap_split import adaptive_clause_ms
 
 
@@ -42,13 +42,13 @@ def _units(n, gap_s):
 def test_pipeline_gate_off_by_default(monkeypatch):
     monkeypatch.delenv("VOXWEAVE_GAP_ADAPTIVE", raising=False)
     th = {"clause_ms": 400, "offline_ms": 700}
-    assert pipeline._maybe_adaptive_thresholds(th, _units(100, 0.6)) is th
+    assert segmentation._maybe_adaptive_thresholds(th, _units(100, 0.6)) is th
 
 
 def test_pipeline_gate_on_rescales(monkeypatch):
     monkeypatch.setenv("VOXWEAVE_GAP_ADAPTIVE", "1")
     th = {"clause_ms": 400, "vad_skip_ms": 1000, "offline_ms": 700}
-    out = pipeline._maybe_adaptive_thresholds(th, _units(100, 0.6))
+    out = segmentation._maybe_adaptive_thresholds(th, _units(100, 0.6))
     assert out["clause_ms"] == pytest.approx(round(600 * 1.15), abs=2)
     # offline keeps the static clause:offline ratio
     assert out["offline_ms"] == pytest.approx(out["clause_ms"] * 1.75, abs=2)
@@ -58,4 +58,4 @@ def test_pipeline_gate_on_rescales(monkeypatch):
 def test_pipeline_gate_on_but_sparse_keeps_static(monkeypatch):
     monkeypatch.setenv("VOXWEAVE_GAP_ADAPTIVE", "1")
     th = {"clause_ms": 400, "offline_ms": 700}
-    assert pipeline._maybe_adaptive_thresholds(th, _units(10, 0.6)) is th
+    assert segmentation._maybe_adaptive_thresholds(th, _units(10, 0.6)) is th

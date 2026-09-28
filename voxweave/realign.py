@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
 
+from voxweave.core.overlay import wrap_lyric
 from voxweave.speakers import (
     strip_srt_speaker_prefixes,
     strip_voice_tags,
@@ -1239,9 +1240,7 @@ def render_vtt(blocks: list[dict], spans: list[tuple[float, float]]) -> str:
             (
                 a,
                 e,
-                voice_text_for_block(
-                    f"♪ {b['text']} ♪" if b.get("lyric") else b["text"], b
-                ),
+                voice_text_for_block(wrap_lyric(b["text"], b.get("lyric")), b),
             )
             for b, (a, e) in zip(blocks, spans)
         ]

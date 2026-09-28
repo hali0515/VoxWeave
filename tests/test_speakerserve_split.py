@@ -22,6 +22,7 @@ from voxweave.voicebase import (
     write_voiceprints,
 )
 from voxweave.voicestore import load_voice_store, new_voice_store
+from voxweave import vocals
 
 
 CAPTURE_ID = "c" + "1" * 32
@@ -332,7 +333,7 @@ def test_prepare_split_wav_reproduces_unseparated_capture_and_ignores_cache(
         return output
 
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "cache_vocals_path",
         lambda _media: pytest.fail("raw capture must ignore a vocals cache"),
     )
@@ -384,7 +385,7 @@ def test_prepare_split_wav_validates_and_reproduces_separated_capture(
         calls.append((Path(source), kwargs))
         return output
 
-    monkeypatch.setattr(pipeline, "cache_vocals_path", lambda _media: cache)
+    monkeypatch.setattr(vocals, "cache_vocals_path", lambda _media: cache)
     monkeypatch.setattr("voxweave.chunking.decode_to_wav", fake_decode)
 
     result = speakerserve._prepare_split_wav(
@@ -449,7 +450,7 @@ def test_prepare_split_wav_refuses_unbound_separated_cache(
     else:
         cache.write_bytes(b"changed cache bytes")
 
-    monkeypatch.setattr(pipeline, "cache_vocals_path", lambda _media: cache)
+    monkeypatch.setattr(vocals, "cache_vocals_path", lambda _media: cache)
     monkeypatch.setattr(
         "voxweave.chunking.decode_to_wav",
         lambda *_args, **_kwargs: pytest.fail("invalid cache must not be decoded"),

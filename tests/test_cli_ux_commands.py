@@ -12,7 +12,7 @@ import rich_click as click
 from click.testing import CliRunner
 
 from voxweave import cli as cli_module
-from voxweave import config, export, mux, pipeline
+from voxweave import config, export, llm_commands, mux, pipeline
 from voxweave.progress import Reporter
 
 
@@ -49,7 +49,7 @@ def cli_case(tmp_path, monkeypatch):
     targets = {
         "transcribe": (pipeline, "process"),
         "render": (pipeline, "split"),
-        "translate": (pipeline, "translate"),
+        "translate": (llm_commands, "translate"),
         "export": (export, "export_subtitles"),
         "pack": (mux, "pack"),
         "burn": (mux, "burn"),

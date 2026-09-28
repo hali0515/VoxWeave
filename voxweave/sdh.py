@@ -19,6 +19,8 @@ from typing import Any
 
 import numpy as np
 
+from voxweave.core.overlay import lyric_display_text
+
 log = logging.getLogger("voxweave")
 
 # AudioSet display name -> SDH label (lowercase per Netflix SDH convention).
@@ -169,7 +171,6 @@ def render_sdh_vtt(
     Lyric-flagged dialogue keeps its music-note wrap; event labels are never
     italicized (Netflix SDH rule).
     """
-    from voxweave.pipeline import lyric_display_text
     from voxweave.realign import render_cues
 
     rows = [(c.get("start"), c.get("end"), lyric_display_text(c)) for c in cues]

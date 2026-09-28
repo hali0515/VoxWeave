@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from voxweave import pipeline
+from voxweave.core import overlay
 from voxweave.config import gap_thresholds
 from voxweave.core import shadow_v2
 from voxweave.core.boundary_cost import (
@@ -399,10 +400,10 @@ def _segment(case: dict, **kwargs) -> pipeline.SegmentationResult:
     return pipeline.segment_document(
         language=case["language"],
         word_segments=case["word_segments"],
-        vad_speech=pipeline._spans_in(case.get("vad_speech")),
+        vad_speech=overlay.spans_in(case.get("vad_speech")),
         shot_changes=[float(t) for t in case.get("shot_changes") or []] or None,
-        sing_spans=pipeline._spans_in(case.get("sing_spans")),
-        speaker_turns=pipeline._turns_in(case.get("speaker_turns")),
+        sing_spans=overlay.spans_in(case.get("sing_spans")),
+        speaker_turns=overlay.turns_in(case.get("speaker_turns")),
         **kwargs,
     )
 

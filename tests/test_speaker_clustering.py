@@ -29,6 +29,7 @@ from voxweave import (
     voiceembed,
 )
 from voxweave.voicebase import canonical_json_bytes
+from voxweave import vocals
 
 MODEL = "pyannote/speaker-diarization-community-1"
 ENV = "VOXWEAVE_DIARIZE_CLUSTERING"
@@ -767,6 +768,7 @@ def _stub_asr(tmp_path: Path, monkeypatch, *, language="English") -> Path:
     wav = tmp_path / "speech.wav"
     sf.write(wav, _signal(6.0, 16000), 16000, subtype="FLOAT")
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_a, **_k: wav)
+    monkeypatch.setattr(vocals, "decode_to_wav", lambda *_a, **_k: wav)
     monkeypatch.setattr(
         pipeline,
         "vad_speech_segments",
@@ -988,7 +990,7 @@ def test_transcribe_rejects_a_bad_knob_before_audio_work(
 ):
     monkeypatch.setenv(ENV, "spectral")
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "decode_to_wav",
         lambda *_a, **_k: pytest.fail("must fail before decoding"),
     )

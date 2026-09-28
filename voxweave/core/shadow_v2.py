@@ -1,19 +1,19 @@
 """BoundaryOptimizer v2 shadow lane, measured beside the shipped v1 answer.
 
-This is the code that used to sit inside :mod:`voxweave.pipeline` between the
-v1 engine call and the legacy overlays. It moved here verbatim so the pipeline
-module carries only the hook: ``pipeline.segment_document`` reads
+This is the code that used to sit inside the v1 segmentation entry point between
+the engine call and the legacy overlays. It moved here verbatim so
+:func:`voxweave.segmentation.segment_document` carries only the hook: it reads
 :data:`SEG_V2_SHADOW_ENV` first and reaches :func:`run_shadow` only when the
 flag is on. Every v2 module the lane needs (optimizer, finalizer, schema
 validator, ...) is imported lazily inside the function that uses it, never at
 module scope, so a flag-off run still pulls none of them into the process.
 
-Import direction: this module never imports :mod:`voxweave.pipeline` at module
-scope. The handful of pipeline helpers the lane replays (``mark_lyric_cues``,
-``_copied_spans``, ``_copied_turns``, ``_resnap_shots``, ``LYRIC_MIN_OVERLAP``)
-are imported lazily inside the functions that use them; by the time any of
-those runs ``pipeline`` is already loaded, because it is the only caller. The
-lane constants below are re-exported from ``pipeline`` for downstream readers.
+Import direction: this module never imports :mod:`voxweave.pipeline` or
+:mod:`voxweave.segmentation`. The production overlays the lane replays
+(``mark_lyric_cues``, ``copied_spans``, ``copied_turns``, ``resnap_shots``,
+``LYRIC_MIN_OVERLAP``) come from :mod:`voxweave.core.overlay`, the leaf the
+v1 entry point runs them from. The lane constants below are re-exported from
+``pipeline`` for downstream readers.
 """
 
 from __future__ import annotations
@@ -24,6 +24,13 @@ import logging
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from voxweave.core.overlay import (
+    LYRIC_MIN_OVERLAP,
+    copied_spans,
+    copied_turns,
+    mark_lyric_cues,
+    resnap_shots,
+)
 from voxweave.core.providers import degradation_capture
 from voxweave.core.schema import Cue, Unit
 from voxweave.core.segdoc import SegDocument
@@ -63,8 +70,6 @@ SHADOW_LANE_CORE = LANE_CORE
 SHADOW_LANE_DELIVERY_LEGACY = LANE_LEGACY
 SHADOW_LANE_FINALIZER = LANE_FINALIZER
 SHADOW_LANE_LEGACY_DISPLAY = LANE_DISPLAY
-# Compatibility name for downstream readers that imported the P4 constant.
-SHADOW_LANE_DELIVERY = SHADOW_LANE_DELIVERY_LEGACY
 
 #: Machine-readable causes of a ``segmentation-shadow-incomplete`` envelope,
 #: carried as ``error.reason`` beside the human ``error.detail``.
@@ -358,18 +363,9 @@ def _shadow_overlay_cues(
     overlays on the real cue stream immediately after the hook returns, so a
     formatter that mutated its ``turns`` list here would change shipped bytes.
     """
-    # Deferred: these are the production overlays and stay in ``pipeline``; the
-    # lane must never import that module at module scope (see module docstring).
-    from voxweave.pipeline import (
-        _copied_spans,
-        _copied_turns,
-        _resnap_shots,
-        mark_lyric_cues,
-    )
-
     out: list[Cue] = [copy.deepcopy(cue) for cue in cues]
-    mark_lyric_cues(out, _copied_spans(document.sing_spans))
-    turns = _copied_turns(document.speaker_turns)
+    mark_lyric_cues(out, copied_spans(document.sing_spans))
+    turns = copied_turns(document.speaker_turns)
     if turns:
         from voxweave.diarize import apply_speaker_format
 
@@ -381,7 +377,7 @@ def _shadow_overlay_cues(
             max_line_length=document.profile.max_line_length,
             max_lines=document.profile.max_lines,
         )
-        out = _resnap_shots(
+        out = resnap_shots(
             out, list(document.shot_changes or ()) or None, dict(thresholds)
         )
     return out
@@ -644,7 +640,6 @@ def _shadow_diff_classification(
         lyric_for_evidence,
     )
     from voxweave.core.timing import LINGER_CAP_S, TWO_FRAME_S
-    from voxweave.pipeline import LYRIC_MIN_OVERLAP
 
     finalizer = finalizer_row["finalizer"]
     producer_fired = set(finalizer.get("deltas_fired") or ())
@@ -1062,7 +1057,7 @@ def _incomplete(
     ``reason`` is one of :data:`INCOMPLETE_REASONS`; ``detail`` is the human
     sentence. The optimizer artifact carries empty placeholder degradation
     ledgers, while the real ones ride on this envelope (``shadow_degraded``
-    from :func:`run_shadow`, ``production_degraded`` from the pipeline hook), so
+    from :func:`run_shadow`, ``production_degraded`` from the segmentation hook), so
     the placeholders are dropped rather than left to contradict them.
     """
     if reason not in INCOMPLETE_REASONS:
@@ -1129,7 +1124,6 @@ def _shadow_v2_artifact(
         speaker_evidence,
     )
     from voxweave.core.subunit import empty_refine_result, refine_document
-    from voxweave.pipeline import _copied_spans, mark_lyric_cues
 
     # Capture the committed v1 bytes before any legacy overlay. The finalizer
     # input is a separate evidence-stamped copy; the delivery tripwire retains
@@ -1363,7 +1357,7 @@ def _shadow_v2_artifact(
         comparator_cues = [copy.deepcopy(cue) for cue in capture.cues]
         for cue in comparator_cues:
             cue.pop("lyric", None)
-        mark_lyric_cues(comparator_cues, _copied_spans(shadow_document.sing_spans))
+        mark_lyric_cues(comparator_cues, copied_spans(shadow_document.sing_spans))
         comparator_row = _shadow_stream_block(
             comparator_cues,
             v1_partition,
@@ -1806,7 +1800,7 @@ def run_shadow(
 ) -> dict[str, Any]:
     """Measure BoundaryOptimizer v2 beside the shipped v1 answer.
 
-    ``pipeline._maybe_shadow_v2`` has already read :data:`SEG_V2_SHADOW_ENV` and
+    ``segmentation._maybe_shadow_v2`` has already read :data:`SEG_V2_SHADOW_ENV` and
     only enters here when it is on, so the optimizer is imported only after the
     flag passes: an off run costs one environment read and a branch and never
     pulls a v2 module into the process at all.

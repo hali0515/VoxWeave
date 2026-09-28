@@ -30,6 +30,10 @@ from collections.abc import Collection, Sequence
 from pathlib import Path
 
 from voxweave import fsio, lang
+from voxweave.paths import (
+    detect_subtitle_language as detect_subtitle_language,
+)
+from voxweave.paths import find_subtitle_media, swap_ext
 from voxweave.progress import Reporter
 
 logger = logging.getLogger(__name__)
@@ -250,19 +254,6 @@ def probe_streams(media: Path) -> list[dict]:
     return json.loads(proc.stdout).get("streams", [])
 
 
-def detect_subtitle_language(sub: Path) -> str | None:
-    """ISO code from a language-tagged subtitle filename ("X.zh.vtt" -> "zh"), else None."""
-    from voxweave.subformats import SUBTITLE_EXTS
-
-    p = Path(sub)
-    stem = p.name
-    if p.suffix.lower() in SUBTITLE_EXTS:
-        stem = stem[: -len(p.suffix)]
-    if "." not in stem:
-        return None
-    return lang.to_iso_or(stem.rsplit(".", 1)[1], None)
-
-
 def track_title(iso: str | None) -> str:
     """Subtitle track title: "VoxWeave Chinese" when the language is known, else "VoxWeave"."""
     return f"VoxWeave {lang.display_name(iso)}" if iso else "VoxWeave"
@@ -273,14 +264,13 @@ def resolve_media(vtt: Path, media: Path | None) -> Path:
 
     Translated/derived subtitles carry suffix tags ("X.zh.vtt", "X.sdh.vtt",
     "X.asrfix.vtt") while the media is named "X.<ext>", so the lookup peels
-    those tags. The lookup itself is pipeline's, the one shared implementation.
+    those tags. The lookup itself is :func:`voxweave.paths.find_subtitle_media`,
+    the one shared implementation.
     """
-    from voxweave.pipeline import _find_subtitle_media
-
     if media is not None:
         return Path(media)
     vtt = Path(vtt)
-    found = _find_subtitle_media(vtt)
+    found = find_subtitle_media(vtt)
     if found is None:
         raise FileNotFoundError(
             f"no sibling media found for {vtt.name}; pass --media explicitly"
@@ -342,8 +332,6 @@ def default_output(
     subtitle-to-media lookup ("ep.zh.vtt" tries "ep.zh.<ext>", then
     "ep.<ext>") never picks up a product.
     """
-    from voxweave.pipeline import swap_ext
-
     codes = [code for code in dict.fromkeys(languages) if code]
     return swap_ext(media, "." + ".".join([*codes, tag, container]))
 

@@ -24,9 +24,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from voxweave import artifacts, fsio, voicelibrary
+from voxweave import artifacts, fsio, sidecars, voicelibrary
 from voxweave.chunking import FFMPEG_TIMEOUT
+from voxweave.core.overlay import spans_in, turns_in
 from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
+from voxweave.paths import swap_ext
 from voxweave.songdet import subtract_spans
 from voxweave.voicebase import (
     VOICES_STORE_MAX_BYTES,
@@ -1337,23 +1339,21 @@ def _delete_stale_suggest_for_refusal(
     sibling_path: Path,
     sibling_bytes: bytes | None,
 ) -> None:
-    from voxweave import pipeline
-
     with episode_lock(media):
-        if artifacts.path_present(pipeline.speakers_mapping_path(media)):
+        if artifacts.path_present(sidecars.speakers_mapping_path(media)):
             return
         if sibling_bytes is None:
             # Initial sibling read failures have no exact observation to
             # compare. The episode lock and absent completion marker exclude a
             # cooperating successful generator, so any suggestion is stale.
-            delete_suggest(pipeline.speakers_suggest_path(media))
+            delete_suggest(sidecars.speakers_suggest_path(media))
             return
         try:
             unchanged = sibling_path.read_bytes() == sibling_bytes
         except OSError:
             return
         if unchanged:
-            delete_suggest(pipeline.speakers_suggest_path(media))
+            delete_suggest(sidecars.speakers_suggest_path(media))
 
 
 def _publish_audition(
@@ -1365,8 +1365,6 @@ def _publish_audition(
     before_mapping_install: Callable[[], None] | None = None,
 ) -> fsio.FileGeneration | None:
     """Publish state and identify the exact skeleton generation this call installed."""
-    from voxweave import pipeline
-
     if suggest_record is None:
         legacy_mapping = artifacts.legacy_path(media, ".speakers.json")
         legacy_suggest = artifacts.legacy_path(media, ".speakers.suggest.json")
@@ -1387,7 +1385,7 @@ def _publish_audition(
             )
         )
     else:
-        suggest_paths = (pipeline.speakers_suggest_path(media),)
+        suggest_paths = (sidecars.speakers_suggest_path(media),)
 
     def delete_suggestions() -> None:
         for path in suggest_paths:
@@ -1453,8 +1451,6 @@ def create_speaker_audition(
     folder's name), unless ``voices`` names an explicit per-show store, which
     keeps its pre-library behavior.
     """
-    from voxweave import pipeline
-
     if voices is not None and voices_dir is not None:
         raise ValueError("use either a voices store or a voice library, not both")
     media = Path(media)
@@ -1462,7 +1458,7 @@ def create_speaker_audition(
         raise FileNotFoundError(f"media file not found: {media}")
     quoted_media = shlex.quote(str(media))
     manual_hint = f"use `voxweave speakers serve {quoted_media} --manual`"
-    json_path = pipeline.swap_ext(media, ".json")
+    json_path = swap_ext(media, ".json")
     sibling_bytes: bytes | None = None
     try:
         if not json_path.exists():
@@ -1501,7 +1497,7 @@ def create_speaker_audition(
                 source=json_path.name,
             )
             pair = _declared_voiceprint_pair(data)
-            sidecar_path = pipeline.voiceprints_path(media)
+            sidecar_path = sidecars.voiceprints_path(media)
             sidecar_bytes, sidecar = _load_voiceprints_exact(sidecar_path)
         except (OSError, Phase2DataError) as exc:
             _delete_stale_suggest_for_refusal(
@@ -1538,7 +1534,7 @@ def create_speaker_audition(
         )
         raise
 
-    turns = pipeline._turns_in(data.get("speaker_turns"))
+    turns = turns_in(data.get("speaker_turns"))
     if not turns:
         _delete_stale_suggest_for_refusal(
             media,
@@ -1548,8 +1544,8 @@ def create_speaker_audition(
         raise RuntimeError(
             f"{json_path.name} has no speaker_turns; run voxweave {quoted_media} --diarize first"
         )
-    vad_speech = pipeline._spans_in(data.get("vad_speech"))
-    sing_spans = pipeline._spans_in(data.get("sing_spans"))
+    vad_speech = spans_in(data.get("vad_speech"))
+    sing_spans = spans_in(data.get("sing_spans"))
     picks = select_snippets(turns, vad_speech, sing_spans)
 
     def generate_from(
@@ -1589,7 +1585,7 @@ def create_speaker_audition(
         }
 
         def publish_locked(store_handle=None) -> SpeakerAudition:
-            active_mapping_path = pipeline.speakers_mapping_path(media)
+            active_mapping_path = sidecars.speakers_mapping_path(media)
             current_data = data
             current_sidecar = sidecar
             current_sibling_bytes = json_path.read_bytes()
@@ -1603,14 +1599,14 @@ def create_speaker_audition(
                     max_bytes=max(1, len(current_sibling_bytes)),
                     source=json_path.name,
                 )
-                current_sidecar_bytes = pipeline.voiceprints_path(media).read_bytes()
+                current_sidecar_bytes = sidecars.voiceprints_path(media).read_bytes()
                 if current_sidecar_bytes != sidecar_bytes:
                     raise RuntimeError(
                         "input changed during speaker generation; re-run"
                     )
                 current_sidecar = _voiceprints_from_bytes(
                     current_sidecar_bytes,
-                    source=pipeline.voiceprints_path(media).name,
+                    source=sidecars.voiceprints_path(media).name,
                 )
                 validate_voiceprint_conjunction(
                     current_sidecar,
@@ -1760,14 +1756,12 @@ class _EnrollmentEvidence:
 
 
 def _enrollment_paths(media: Path) -> _StagedEnrollment:
-    from voxweave import pipeline
-
     if not media.is_file():
         raise FileNotFoundError(f"media file not found: {media}")
     staged = _StagedEnrollment(
-        json_path=pipeline.swap_ext(media, ".json"),
-        sidecar_path=pipeline.voiceprints_path(media),
-        mapping_path=pipeline.speakers_mapping_path(media),
+        json_path=swap_ext(media, ".json"),
+        sidecar_path=sidecars.voiceprints_path(media),
+        mapping_path=sidecars.speakers_mapping_path(media),
     )
     if not staged.mapping_path.exists():
         raise FileNotFoundError(
@@ -2068,9 +2062,7 @@ def _accepted_suggestions(
     Only a record bound to the current capture and voiceprints is trusted; any
     other record is stale and ignored (enrollment then falls back to names).
     """
-    from voxweave import pipeline
-
-    path = pipeline.speakers_suggest_path(media)
+    path = sidecars.speakers_suggest_path(media)
     try:
         record = load_suggest(path)
     except FileNotFoundError:
@@ -2276,8 +2268,6 @@ def _enroll_into_library(
 
 def purge_voiceprints(media: Path) -> tuple[Path, ...]:
     """Delete the complete per-episode biometric/derived artifact set."""
-    from voxweave import pipeline
-
     media = Path(media)
     removed: list[Path] = []
     with episode_lock(media):
@@ -2293,7 +2283,7 @@ def purge_voiceprints(media: Path) -> tuple[Path, ...]:
                 "speaker_suggest",
             ),
             artifacts.speaker_split_undo_path(media),
-            pipeline.speakers_html_path(media),
+            sidecars.speakers_html_path(media),
         )
         for target in targets:
             if artifacts.path_present(target):

@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from voxweave import artifacts, fsio, turnembed, voiceembed
+from voxweave import artifacts, fsio, sidecars, turnembed, vocals, voiceembed
+from voxweave.core.overlay import spans_in
 from voxweave.ngrok import NgrokOrigins
 from voxweave.voicebase import (
     MAX_PROVENANCE_STRING_BYTES,
@@ -390,9 +391,7 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/serve-info":
             try:
                 with self.server.action_lock:
-                    from voxweave import pipeline
-
-                    mapping_path = pipeline.speakers_mapping_path(
+                    mapping_path = sidecars.speakers_mapping_path(
                         self.server.media_path
                     )
                     speakers, stale, generation = _mapping_entries(
@@ -505,9 +504,7 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         document = {"version": 1, "speakers": ordered}
         try:
             with episode_lock(self.server.media_path):
-                from voxweave import pipeline
-
-                mapping_path = pipeline.speakers_mapping_path(self.server.media_path)
+                mapping_path = sidecars.speakers_mapping_path(self.server.media_path)
                 fsio.atomic_write_text(
                     mapping_path,
                     json.dumps(document, ensure_ascii=False, indent=2) + "\n",
@@ -666,7 +663,6 @@ def _validated_speaker_request(value: object, speaker_ids: Sequence[str]) -> str
 
 def _prepare_split_wav(media_path: Path, staged: _StagedSplit) -> Path:
     """Reproduce the audio transform recorded by the bound voiceprints."""
-    from voxweave import pipeline
     from voxweave.chunking import decode_to_wav
     from voxweave.vocalscache import (
         cache_lock,
@@ -674,7 +670,7 @@ def _prepare_split_wav(media_path: Path, staged: _StagedSplit) -> Path:
         validate_cache_pair,
     )
 
-    audio_filter = pipeline.ASR_LOUDNORM if staged.audio_normalized else None
+    audio_filter = vocals.ASR_LOUDNORM if staged.audio_normalized else None
     if not staged.audio_separated:
         return decode_to_wav(
             media_path,
@@ -685,7 +681,7 @@ def _prepare_split_wav(media_path: Path, staged: _StagedSplit) -> Path:
 
     if staged.audio_separator is None:
         raise SplitConflict("separated voiceprints lack a resolved separator identity")
-    cache_path = pipeline.cache_vocals_path(media_path)
+    cache_path = vocals.cache_vocals_path(media_path)
     with cache_lock(cache_path) as handle:
         try:
             companion, _validated = load_cache_companion(handle.companion_path)
@@ -781,8 +777,6 @@ def _stage_split_inputs(
     server: SpeakerHTTPServer,
     speaker_id: str,
 ) -> _StagedSplit:
-    from voxweave import pipeline
-
     with episode_lock(server.media_path):
         sibling_bytes = server.sibling_path.read_bytes()
         sibling = strict_json_object_loads(
@@ -800,7 +794,7 @@ def _stage_split_inputs(
             raise turnembed.UnsplittableSpeakerError(
                 "a speaker needs at least two turns to split"
             )
-        sidecar_path = pipeline.voiceprints_path(server.media_path)
+        sidecar_path = sidecars.voiceprints_path(server.media_path)
         try:
             sidecar_bytes = sidecar_path.read_bytes()
         except OSError as exc:
@@ -835,8 +829,8 @@ def _stage_split_inputs(
             audio_normalized=staged.audio_normalized,
             audio_separator=staged.audio_separator,
             embedding_lane=staged.embedding_lane,
-            vad_speech=tuple(pipeline._spans_in(sibling.get("vad_speech")) or ()),
-            sing_spans=tuple(pipeline._spans_in(sibling.get("sing_spans")) or ()),
+            vad_speech=tuple(spans_in(sibling.get("vad_speech")) or ()),
+            sing_spans=tuple(spans_in(sibling.get("sing_spans")) or ()),
         )
 
 
@@ -908,12 +902,10 @@ def _proposal_groups(
 
 
 def _recheck_split_inputs(server: SpeakerHTTPServer, staged: _StagedSplit) -> None:
-    from voxweave import pipeline
-
     with episode_lock(server.media_path):
         if server.sibling_path.read_bytes() != staged.sibling_bytes:
             raise SplitConflict("speaker turns changed during split preview; retry")
-        current_sidecar_path = pipeline.voiceprints_path(server.media_path)
+        current_sidecar_path = sidecars.voiceprints_path(server.media_path)
         if current_sidecar_path != staged.voiceprints_path:
             raise SplitConflict(
                 "voiceprints storage changed during split preview; retry"
@@ -1181,13 +1173,11 @@ def _restore_files(files: Iterable[tuple[Path, bytes, bool]]) -> None:
 
 
 def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
-    from voxweave import pipeline
-
     with episode_lock(server.media_path):
         sibling_bytes = server.sibling_path.read_bytes()
         if sibling_bytes != proposal.sibling_bytes:
             raise SplitConflict("speaker turns changed after the split preview; retry")
-        sidecar_path = pipeline.voiceprints_path(server.media_path)
+        sidecar_path = sidecars.voiceprints_path(server.media_path)
         if sidecar_path != proposal.voiceprints_path:
             raise SplitConflict("voiceprints storage changed after the split preview")
         sidecar_bytes = sidecar_path.read_bytes()
@@ -1210,7 +1200,7 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
         )
         validated = validate_voiceprint_conjunction(sidecar, sibling, fingerprint)
 
-        mapping_path = pipeline.speakers_mapping_path(server.media_path)
+        mapping_path = sidecars.speakers_mapping_path(server.media_path)
         mapping_bytes = mapping_path.read_bytes()
         mapping, mapping_entries = _mapping_document(
             mapping_bytes,
@@ -1321,7 +1311,7 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
             mapping_before=mapping_bytes,
             mapping_after=mapping_after,
         )
-        suggest_path = pipeline.speakers_suggest_path(server.media_path)
+        suggest_path = sidecars.speakers_suggest_path(server.media_path)
         _write_bytes(undo_path, snapshot)
         written: list[tuple[Path, bytes, bool]] = []
         try:
@@ -1423,16 +1413,14 @@ def _load_undo(path: Path) -> tuple[str, dict[str, tuple[Path, bytes, int, str]]
 
 
 def _undo_split(server: SpeakerHTTPServer) -> None:
-    from voxweave import pipeline
-
     undo_path = artifacts.speaker_split_undo_path(server.media_path)
     with episode_lock(server.media_path):
         fingerprint, records = _load_undo(undo_path)
         try:
             current_paths = {
                 "sibling": _absolute(server.sibling_path),
-                "voiceprints": _absolute(pipeline.voiceprints_path(server.media_path)),
-                "mapping": _absolute(pipeline.speakers_mapping_path(server.media_path)),
+                "voiceprints": _absolute(sidecars.voiceprints_path(server.media_path)),
+                "mapping": _absolute(sidecars.speakers_mapping_path(server.media_path)),
             }
         except OSError as exc:
             raise SplitConflict(

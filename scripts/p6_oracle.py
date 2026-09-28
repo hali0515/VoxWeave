@@ -3010,6 +3010,9 @@ def _check_dependencies() -> list[str]:
             "voxweave.segmentation_projector",
             "voxweave.candidate_encoder",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
         "voxweave/core/align_compare.py": {
             "voxweave.align_evidence_core",
@@ -3017,6 +3020,9 @@ def _check_dependencies() -> list[str]:
             "voxweave.segmentation_projector",
             "voxweave.candidate_encoder",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
         "voxweave/reference_projector.py": {
             "voxweave.align_projector",
@@ -3024,15 +3030,24 @@ def _check_dependencies() -> list[str]:
             "voxweave.candidate_encoder",
             "voxweave.episode_transaction",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
         "voxweave/episode_transaction.py": {
             "voxweave.backend",
             "voxweave.candidate_encoder",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
         "voxweave/align_dp_safety.py": {
             "voxweave.backend",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
     }
     failures: list[str] = []

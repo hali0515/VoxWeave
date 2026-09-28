@@ -9,7 +9,8 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
-from voxweave import asrfix, config, pipeline, translate
+from voxweave import asrfix, config, translate
+from voxweave import llm_commands
 from voxweave.cli import cli
 
 
@@ -267,7 +268,7 @@ def test_cli_translate_uses_conf_llm_without_openai_key(conf_at, tmp_path):
     )
     captured = {}
     with patch.object(
-        pipeline,
+        llm_commands,
         "translate",
         lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
     ):
@@ -285,7 +286,7 @@ def test_cli_correct_uses_conf_llm_without_openai_key(conf_at, tmp_path):
     )
     captured = {}
     with patch.object(
-        pipeline,
+        llm_commands,
         "correct",
         lambda path, **kw: (
             captured.update(kw)
@@ -310,7 +311,7 @@ def test_cli_translate_passes_windowing_and_partial_options(conf_at, tmp_path):
     conf_at.write_text('[llm]\napi_key_env = ""\n', encoding="utf-8")
     captured = {}
     with patch.object(
-        pipeline,
+        llm_commands,
         "translate",
         lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
     ):
@@ -332,7 +333,7 @@ def test_cli_translate_passes_windowing_and_partial_options(conf_at, tmp_path):
     assert captured["allow_partial"] is True
     captured.clear()
     with patch.object(
-        pipeline,
+        llm_commands,
         "translate",
         lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
     ):

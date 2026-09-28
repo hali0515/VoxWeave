@@ -3,7 +3,7 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
-from voxweave import pipeline
+from voxweave import llm_commands
 from voxweave.cli import cli
 from voxweave.ui import RichReporter
 
@@ -223,7 +223,7 @@ def test_cli_translate_invokes_pipeline(tmp_path, monkeypatch):
         captured["model"] = kw.get("model")
         return tmp_path / "ep.zh.vtt"
 
-    monkeypatch.setattr(pipeline, "translate", fake_translate)
+    monkeypatch.setattr(llm_commands, "translate", fake_translate)
     runner = CliRunner()
     res = runner.invoke(cli, ["translate", str(vtt), "--to", "zh"])
     assert res.exit_code == 0, res.output
@@ -248,7 +248,7 @@ def test_cli_translate_loads_glossary(tmp_path, monkeypatch):
     g.write_text('{"A": "甲"}', encoding="utf-8")
     captured = {}
     monkeypatch.setattr(
-        pipeline,
+        llm_commands,
         "translate",
         lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
     )
@@ -417,7 +417,7 @@ def test_correct_apply_realign_honours_conf_defaults(tmp_path, monkeypatch):
         tmp_path, "[defaults]\nseparate = false\nnormalize = true\nvad_mask = true\n"
     )
     v = _vtt(tmp_path)
-    with patch("voxweave.pipeline.correct", return_value=_correct_result(v)) as m:
+    with patch("voxweave.llm_commands.correct", return_value=_correct_result(v)) as m:
         r = CliRunner().invoke(cli, ["correct", "--apply", str(v)])
     assert r.exit_code == 0, r.output
     assert m.call_args.kwargs["separate"] is False
@@ -431,7 +431,7 @@ def test_bad_glossary_renders_error_panel(tmp_path, monkeypatch, command):
     v = _vtt(tmp_path)
     g = tmp_path / "g.json"
     g.write_text("{not json", encoding="utf-8")
-    with patch(f"voxweave.pipeline.{command}") as m:
+    with patch(f"voxweave.llm_commands.{command}") as m:
         r = CliRunner().invoke(cli, [command, str(v), "--glossary", str(g)])
     assert r.exit_code == 1
     assert isinstance(r.exception, SystemExit)  # error panel, not a traceback

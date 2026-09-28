@@ -21,6 +21,7 @@ from typing import Final
 from urllib.parse import quote
 
 from voxweave import fsio
+from voxweave.paths import swap_ext
 
 _MARKER_MAX_BYTES: Final = 65_536
 _CACHE_DIR_NAME: Final = "cache"
@@ -116,19 +117,8 @@ def _absolute(path: Path) -> Path:
     return Path(os.path.realpath(os.path.abspath(os.fspath(expanded))))
 
 
-def _swap_ext(path: Path, suffix: str) -> Path:
-    """Sibling rename through pipeline's canonical, dot-safe helper.
-
-    The import is deferred because pipeline imports this module at module scope;
-    reversing that at module scope would close an import cycle.
-    """
-    from voxweave.pipeline import swap_ext
-
-    return swap_ext(path, suffix)
-
-
 def _stem(path: Path) -> str:
-    return _swap_ext(path, "").name
+    return swap_ext(path, "").name
 
 
 def _claim_digest(source: Path) -> str:
@@ -392,12 +382,12 @@ def path_present(path: Path) -> bool:
 
 def legacy_path(source: Path, suffix: str) -> Path:
     """Return a historical media-adjacent machine-sidecar path."""
-    return _swap_ext(Path(source), suffix)
+    return swap_ext(Path(source), suffix)
 
 
 def speaker_mapping_path(source: Path, reference: Path | None = None) -> Path:
     if reference is not None:
-        exact = _swap_ext(Path(reference), ".speakers.json")
+        exact = swap_ext(Path(reference), ".speakers.json")
         if path_present(exact):
             return exact
     legacy = legacy_path(source, ".speakers.json")
@@ -410,7 +400,7 @@ def inspect_speaker_mapping_path(
 ) -> Path:
     """Resolve a mapping for reading without claiming an empty cache directory."""
     if reference is not None:
-        exact = _swap_ext(Path(reference), ".speakers.json")
+        exact = swap_ext(Path(reference), ".speakers.json")
         if path_present(exact):
             return exact
     legacy = legacy_path(source, ".speakers.json")
@@ -436,7 +426,7 @@ def speaker_split_undo_path(source: Path) -> Path:
 
 
 def translation_progress_path(source: Path, subtitle: Path, target: str) -> Path:
-    legacy = _swap_ext(Path(subtitle), f".{target}.progress.json")
+    legacy = swap_ext(Path(subtitle), f".{target}.progress.json")
     return (
         legacy
         if path_present(legacy)
@@ -445,14 +435,14 @@ def translation_progress_path(source: Path, subtitle: Path, target: str) -> Path
 
 
 def align_evidence_path(source: Path, subtitle: Path) -> Path:
-    legacy = _swap_ext(Path(subtitle), ".align-evidence.json")
+    legacy = swap_ext(Path(subtitle), ".align-evidence.json")
     return (
         legacy if path_present(legacy) else claim_paths(source).align_evidence(subtitle)
     )
 
 
 def asrfix_audit_path(source: Path, subtitle: Path) -> Path:
-    legacy = _swap_ext(Path(subtitle), ".asrfix.json")
+    legacy = swap_ext(Path(subtitle), ".asrfix.json")
     return (
         legacy if path_present(legacy) else claim_paths(source).asrfix_audit(subtitle)
     )
@@ -466,7 +456,7 @@ def fixed_candidates(source: Path, suffix: str, attribute: str) -> tuple[Path, .
 
 
 def align_evidence_candidates(source: Path, subtitle: Path) -> tuple[Path, ...]:
-    legacy = _swap_ext(Path(subtitle), ".align-evidence.json")
+    legacy = swap_ext(Path(subtitle), ".align-evidence.json")
     cached = claim_paths(source).align_evidence(subtitle)
     return tuple(dict.fromkeys((legacy, cached)))
 
@@ -476,7 +466,7 @@ def translation_progress_candidates(
     subtitle: Path,
     target: str,
 ) -> tuple[Path, ...]:
-    legacy = _swap_ext(Path(subtitle), f".{target}.progress.json")
+    legacy = swap_ext(Path(subtitle), f".{target}.progress.json")
     try:
         paths = inspect_paths(source)
     except ArtifactMarkerError:

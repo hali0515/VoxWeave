@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from voxweave import artifacts, asrfix, pipeline
+from voxweave import llm_commands
 
 
 class FakeClient:
@@ -253,24 +254,24 @@ def test_pipeline_correct_sidecar_pair_cleaned_on_audit_failure(tmp_path, monkey
     vtt = tmp_path / "ep.vtt"
     vtt.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda payload, **kw: [
             {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "x"}
         ],
     )
-    real_write = pipeline.fsio.atomic_write_text
+    real_write = llm_commands.fsio.atomic_write_text
 
     def flaky_write(dst, text, **kw):
         if str(dst).endswith(".asrfix.json"):
             raise OSError("disk full")
         return real_write(dst, text, **kw)
 
-    monkeypatch.setattr(pipeline.fsio, "atomic_write_text", flaky_write)
+    monkeypatch.setattr(llm_commands.fsio, "atomic_write_text", flaky_write)
     import pytest
 
     with pytest.raises(OSError):
-        pipeline.correct(vtt)
+        llm_commands.correct(vtt)
     assert not (tmp_path / "ep.asrfix.vtt").exists()  # no orphaned half-pair
     assert vtt.read_text(encoding="utf-8").count("hello") == 1  # source untouched
 
@@ -525,7 +526,7 @@ def test_correct_cues_length_skips_the_retry_ladder(monkeypatch, caplog):
     assert not any("vLLM" in r.message for r in caplog.records)
 
 
-# --------------------------- pipeline.correct (E2E with mock) --------------------------- #
+# --------------------------- llm_commands.correct (E2E with mock) --------------------------- #
 def _make_vtt(tmp_path: Path, cues) -> Path:
     lines = ["WEBVTT", ""]
     for i, c in enumerate(cues):
@@ -546,7 +547,7 @@ def test_pipeline_correct_sidecar_does_not_touch_vtt(tmp_path, monkeypatch):
         ]
     )
     monkeypatch.setattr(asrfix, "_make_client", lambda *a, **k: client)
-    res = pipeline.correct(vtt, api_key="x")
+    res = llm_commands.correct(vtt, api_key="x")
     # original VTT untouched
     assert vtt.read_text(encoding="utf-8") == orig_text
     # sidecar written and contains the correction
@@ -570,14 +571,14 @@ def test_pipeline_correct_existing_legacy_audit_is_overwritten_in_place(
     legacy = tmp_path / "ep.asrfix.json"
     legacy.write_text("old", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "x"}
         ],
     )
 
-    result = pipeline.correct(vtt)
+    result = llm_commands.correct(vtt)
 
     assert result["audit"] == legacy
     assert json.loads(legacy.read_bytes())["applied"][0]["fixed"] == "hallo"
@@ -593,7 +594,7 @@ def test_pipeline_correct_invalid_cache_claim_leaves_no_sidecar_pair(
     claim.mkdir(parents=True)
     (claim / "source.json").write_text("invalid", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "x"}
@@ -603,7 +604,7 @@ def test_pipeline_correct_invalid_cache_claim_leaves_no_sidecar_pair(
     import pytest
 
     with pytest.raises(artifacts.ArtifactMarkerError):
-        pipeline.correct(vtt)
+        llm_commands.correct(vtt)
 
     assert not (tmp_path / "ep.asrfix.vtt").exists()
     assert not (tmp_path / "ep.asrfix.json").exists()
@@ -617,7 +618,7 @@ def test_pipeline_correct_apply_overwrites_vtt_no_audit_json(tmp_path, monkeypat
         ]
     )
     monkeypatch.setattr(asrfix, "_make_client", lambda *a, **k: client)
-    res = pipeline.correct(vtt, api_key="x", apply=True)
+    res = llm_commands.correct(vtt, api_key="x", apply=True)
     assert "如今仍是主力" in vtt.read_text(encoding="utf-8")
     assert res["out"] == vtt and res["applied_in_place"] is True
     # apply must NOT leave a new json behind
@@ -641,7 +642,7 @@ def test_pipeline_correct_apply_auto_aligns(tmp_path, monkeypatch):
         return p
 
     monkeypatch.setattr(pipeline, "align", fake_align)
-    res = pipeline.correct(vtt, api_key="x", apply=True, align_after=True)
+    res = llm_commands.correct(vtt, api_key="x", apply=True, align_after=True)
     assert called["path"] == vtt  # re-aligned the in-place file
     assert res["aligned"] is True
 
@@ -657,7 +658,7 @@ def test_pipeline_correct_empty_diff_skips_align(tmp_path, monkeypatch):
     monkeypatch.setattr(
         pipeline, "align", lambda p, **kw: called.setdefault("hit", True)
     )
-    res = pipeline.correct(vtt, api_key="x", apply=True, align_after=True)
+    res = llm_commands.correct(vtt, api_key="x", apply=True, align_after=True)
     assert "hit" not in called  # align never invoked
     assert res["aligned"] is False
 
@@ -669,6 +670,6 @@ def test_pipeline_correct_rejects_unsafe_keeps_text(tmp_path, monkeypatch):
         ['{"fixes":[{"i":0,"orig":"完全不同的原文","fixed":"乱改","reason":"x"}]}']
     )
     monkeypatch.setattr(asrfix, "_make_client", lambda *a, **k: client)
-    res = pipeline.correct(vtt, api_key="x")
+    res = llm_commands.correct(vtt, api_key="x")
     assert "乱改" not in res["out"].read_text(encoding="utf-8")
     assert len(res["rejected"]) == 1 and not res["applied"]

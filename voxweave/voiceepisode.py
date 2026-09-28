@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from voxweave import artifacts
+from voxweave.paths import detect_subtitle_language
 
 _MEDIA_SUFFIXES = (
     ".mkv",
@@ -86,7 +87,7 @@ def _open_lock(path: Path, *, create: bool) -> int:
 def _episode_owner(path: Path) -> Path:
     """Resolve a subtitle/JSON reference to sibling media when one is present.
 
-    The same answer as ``pipeline._artifact_owner`` (so a subtitle and its
+    The same answer as ``sidecars.artifact_owner`` (so a subtitle and its
     media lock the same episode): media present on disk under any peeled
     stem (``ep.zh.vtt`` -> ``ep.zh.*``, then ``ep.*``) wins over media the
     artifact cache only recorded, whatever the stem it was recorded under.
@@ -100,7 +101,6 @@ def _episode_owner(path: Path) -> Path:
     except OSError:
         return value
     order = {suffix: index for index, suffix in enumerate(_MEDIA_SUFFIXES)}
-    from voxweave.mux import detect_subtitle_language
 
     stems = [episode_base_path(value).name]
     while "." in stems[-1]:

@@ -236,7 +236,7 @@ def test_harness_names_match_the_hook_it_reads() -> None:
 
     assert calib.SHADOW_ENV == pipeline.SEG_V2_SHADOW_ENV
     assert calib.SHADOW_LANE_CORE == pipeline.SHADOW_LANE_CORE
-    assert calib.SHADOW_LANE_DELIVERY == pipeline.SHADOW_LANE_DELIVERY
+    assert calib.SHADOW_LANE_DELIVERY == pipeline.SHADOW_LANE_DELIVERY_LEGACY
 
 
 def test_influence_radius_matches_the_optimizer_constant() -> None:

@@ -19,8 +19,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-#: The nine gap/timing knobs ``pipeline.segment_document`` resolves into
-#: ``thresholds_used`` and hands to the engine. Ordered as declared on
+#: The nine gap/timing knobs ``segmentation.segment_document`` resolves (after
+#: the optional adaptive pass) and hands to the engine. Ordered as declared on
 #: :class:`DisplayProfile`.
 THRESHOLD_KEYS: tuple[str, ...] = (
     "clause_ms",
@@ -118,7 +118,7 @@ class DisplayProfile:
     ) -> DisplayProfile:
         """Record already-resolved values; ``float`` coercion is the only change.
 
-        ``thresholds`` is the caller's ``thresholds_used`` mapping, which always
+        ``thresholds`` is the caller's resolved threshold mapping, which always
         carries all nine keys; a missing one means the caller resolved something
         else and raises :class:`KeyError` rather than being papered over with a
         default that did not run. Extra keys are ignored, and the layout pair is
@@ -137,7 +137,7 @@ class DisplayProfile:
 class SegDocument:
     """One segmentation's inputs: units, resolved profile, evidence, manifest.
 
-    The evidence arrays are the same objects ``pipeline.segment_document``
+    The evidence arrays are the same objects ``segmentation.segment_document``
     already copied for the engine (``None`` when absent), and ``manifest`` is the
     dict the pipeline built and persists -- held by reference, so the document
     and the sibling JSON can never disagree about what ran. Because the manifest
@@ -145,7 +145,7 @@ class SegDocument:
     runs and still have it carry the degradation ledger the run fills in.
 
     ``text`` is the exact joined surface stream the v1 engine consumed
-    (``pipeline._units_to_seg``'s ``text``), recorded rather than re-derived: a
+    (``segmentation._units_to_seg``'s ``text``), recorded rather than re-derived: a
     consumer that re-joined ``units`` itself would have to re-implement the
     no-space-language rule and could disagree with what actually ran. ``None``
     means the builder was not handed one.

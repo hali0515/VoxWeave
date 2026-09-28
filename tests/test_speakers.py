@@ -12,6 +12,7 @@ import pytest
 from click.testing import CliRunner
 
 from voxweave import artifacts, config, pipeline, speakers, speakerserve, translate
+from voxweave import llm_commands
 from voxweave.asrfix import render_vtt as render_corrected_vtt
 from voxweave.cli import cli
 from voxweave.export import (
@@ -414,8 +415,8 @@ def test_correct_reapplies_only_unchanged_speaker_lines_by_content(
             }
         ]
 
-    monkeypatch.setattr(pipeline.asrfix_mod, "correct_cues", fake_correct)
-    pipeline.correct(vtt, apply=True)
+    monkeypatch.setattr(llm_commands.asrfix_mod, "correct_cues", fake_correct)
+    llm_commands.correct(vtt, apply=True)
 
     rendered = vtt.read_text(encoding="utf-8")
     assert "\n-Stay here\n<v Ren>-Go now</v>\n" in rendered
@@ -518,7 +519,7 @@ def test_collapsed_names_do_not_bake_into_srt_round_trip(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {
@@ -530,7 +531,7 @@ def test_collapsed_names_do_not_bake_into_srt_round_trip(tmp_path, monkeypatch):
         ],
     )
 
-    pipeline.correct(vtt, apply=True)
+    llm_commands.correct(vtt, apply=True)
     assert "<v " not in vtt.read_text(encoding="utf-8")
     export_subtitles(vtt, ("srt",))
     srt = tmp_path / "episode.srt"
@@ -547,7 +548,7 @@ def test_correct_audit_records_reflowed_text_written_to_vtt(tmp_path, monkeypatc
         encoding="utf-8",
     )
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {
@@ -559,7 +560,7 @@ def test_correct_audit_records_reflowed_text_written_to_vtt(tmp_path, monkeypatc
         ],
     )
 
-    result = pipeline.correct(vtt)
+    result = llm_commands.correct(vtt)
     expected = "-Stay here\n-Go now"
     audit = json.loads(result["audit"].read_text(encoding="utf-8"))
 

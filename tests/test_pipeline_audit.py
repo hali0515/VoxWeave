@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 
 from voxweave import backend, chunking, config, pipeline, songdet
+from voxweave import llm_commands
+from voxweave import vocals
 from voxweave.progress import Reporter
 
 UNITS = [
@@ -41,6 +43,7 @@ def _stub_transcribe_stages(tmp_path, monkeypatch, *, vad):
         return [("en", "hello world", [dict(u) for u in UNITS]) for _ in chunks]
 
     monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
     monkeypatch.setattr(pipeline, "slice_wav", fake_slice)
     monkeypatch.setattr(pipeline, "vad_speech_segments", vad)
     monkeypatch.setattr(backend, "chunk_pass_count", lambda _model: 1)
@@ -83,9 +86,9 @@ def test_original_audio_vad_reference_survives_a_vocals_cache_hit(
     parts = [fullband] + [tmp_path / n for n in ("voc.wav", "16k.wav", "32k.wav")]
     for part in parts:
         part.write_bytes(b"x")
-    monkeypatch.setattr(pipeline, "_vocals_cache_fresh", lambda *_a: cache_hit)
-    monkeypatch.setattr(pipeline, "_separate_to_16k_32k", lambda *_a, **_k: parts)
-    monkeypatch.setattr(pipeline, "_encode_flac", lambda *_a: None)
+    monkeypatch.setattr(vocals, "_vocals_cache_fresh", lambda *_a: cache_hit)
+    monkeypatch.setattr(vocals, "_separate_to_16k_32k", lambda *_a, **_k: parts)
+    monkeypatch.setattr(vocals, "_encode_flac", lambda *_a: None)
 
     result = pipeline.transcribe(media, cache_vocals=cache)
 
@@ -145,10 +148,11 @@ def test_separation_cleans_its_temps_on_keyboard_interrupt(tmp_path, monkeypatch
         raise KeyboardInterrupt
 
     monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
     monkeypatch.setattr(backend, "separate_vocals", interrupted)
 
     with pytest.raises(KeyboardInterrupt):
-        pipeline._separate_to_16k_32k(media, reporter=Reporter(), normalize=False)
+        vocals._separate_to_16k_32k(media, reporter=Reporter(), normalize=False)
 
     assert made and not any(path.exists() for path in made)
 
@@ -180,9 +184,9 @@ def test_ffprobe_unavailable_is_reported_as_such(
     def run(*_args, **_kwargs):
         raise error
 
-    monkeypatch.setattr(pipeline.subprocess, "run", run)
+    monkeypatch.setattr(vocals.subprocess, "run", run)
     with caplog.at_level(logging.WARNING, logger="voxweave"):
-        assert pipeline._vocals_cache_fresh(cache, media) is False  # re-separate
+        assert vocals._vocals_cache_fresh(cache, media) is False  # re-separate
 
     assert message in caplog.text
     assert "cannot validate the vocals cache" in caplog.text
@@ -192,12 +196,12 @@ def test_ffprobe_unavailable_is_reported_as_such(
 def test_ffprobe_failure_on_the_file_is_still_unreadable(tmp_path, monkeypatch, caplog):
     media, cache = _paths(tmp_path)
     monkeypatch.setattr(
-        pipeline.subprocess,
+        vocals.subprocess,
         "run",
         lambda *_a, **_k: subprocess.CompletedProcess([], 1, "", "Invalid data"),
     )
     with caplog.at_level(logging.WARNING, logger="voxweave"):
-        assert pipeline._vocals_cache_fresh(cache, media) is False
+        assert vocals._vocals_cache_fresh(cache, media) is False
 
     assert "vocals cache unreadable" in caplog.text
 
@@ -388,7 +392,7 @@ def _fix_hello(monkeypatch, calls: list | None = None):
             calls.append(payload)
         return [{"i": 0, "orig": "hello", "fixed": "hallo", "reason": "typo"}]
 
-    monkeypatch.setattr(pipeline.asrfix_mod, "correct_cues", fixes)
+    monkeypatch.setattr(llm_commands.asrfix_mod, "correct_cues", fixes)
 
 
 def test_correct_rejects_missing_explicit_media_before_the_llm_call(
@@ -400,7 +404,7 @@ def test_correct_rejects_missing_explicit_media_before_the_llm_call(
     _fix_hello(monkeypatch, calls)
 
     with pytest.raises(FileNotFoundError, match="source media for episode.vtt") as e:
-        pipeline.correct(
+        llm_commands.correct(
             vtt, apply=True, align_after=True, media_path=tmp_path / "gone.mkv"
         )
 
@@ -421,7 +425,7 @@ def test_correct_keeps_the_diff_when_realignment_fails_after_commit(
     monkeypatch.setattr(pipeline, "align", no_media)
     with caplog.at_level(logging.WARNING, logger="voxweave"):
         with pytest.raises(FileNotFoundError, match="source media"):
-            pipeline.correct(vtt, apply=True, align_after=True)
+            llm_commands.correct(vtt, apply=True, align_after=True)
 
     assert "hallo" in vtt.read_text(encoding="utf-8")  # committed before align
     assert "'hello' -> 'hallo'" in caplog.text

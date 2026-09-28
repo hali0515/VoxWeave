@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 from voxweave import pipeline, realign
+from voxweave.core import overlay
 
 # --- fixtures ---------------------------------------------------------------
 
@@ -83,10 +84,10 @@ def _segment_case(case: dict, **kwargs) -> pipeline.SegmentationResult:
     return pipeline.segment_document(
         language=case["language"],
         word_segments=case["word_segments"],
-        vad_speech=pipeline._spans_in(case.get("vad_speech")),
+        vad_speech=overlay.spans_in(case.get("vad_speech")),
         shot_changes=[float(t) for t in case.get("shot_changes") or []] or None,
-        sing_spans=pipeline._spans_in(case.get("sing_spans")),
-        speaker_turns=pipeline._turns_in(case.get("speaker_turns")),
+        sing_spans=overlay.spans_in(case.get("sing_spans")),
+        speaker_turns=overlay.turns_in(case.get("speaker_turns")),
         **kwargs,
     )
 
@@ -119,10 +120,10 @@ def test_inputs_are_not_mutated():
     for name, build in CASES.items():
         case = build()
         units = case["word_segments"]
-        vad = pipeline._spans_in(case.get("vad_speech"))
+        vad = overlay.spans_in(case.get("vad_speech"))
         shots = [float(t) for t in case.get("shot_changes") or []] or None
-        sings = pipeline._spans_in(case.get("sing_spans"))
-        turns = pipeline._turns_in(case.get("speaker_turns"))
+        sings = overlay.spans_in(case.get("sing_spans"))
+        turns = overlay.turns_in(case.get("speaker_turns"))
         before = copy.deepcopy((units, vad, shots, sings, turns))
 
         pipeline.segment_document(
@@ -228,7 +229,7 @@ def test_repeated_calls_are_identical():
         ), name
         assert first.units == second.units, name
         assert first.language == second.language, name
-        assert first.thresholds_used == second.thresholds_used, name
+        assert first.manifest == second.manifest, name
         assert first.diagnostics == second.diagnostics, name
 
 
@@ -237,9 +238,9 @@ def test_same_inputs_reused_across_calls_stay_stable():
     state carried over from the first pass)."""
     case = _case_speakers()
     units = case["word_segments"]
-    vad = pipeline._spans_in(case["vad_speech"])
+    vad = overlay.spans_in(case["vad_speech"])
     shots = [float(t) for t in case["shot_changes"]]
-    turns = pipeline._turns_in(case["speaker_turns"])
+    turns = overlay.turns_in(case["speaker_turns"])
     kwargs = {
         "language": "en",
         "word_segments": units,
@@ -258,18 +259,25 @@ def test_same_inputs_reused_across_calls_stay_stable():
 # --- resolved context -------------------------------------------------------
 
 
+def _profile_thresholds(result) -> dict:
+    """The nine gap/duration thresholds the run recorded as having used."""
+    from voxweave.core.segdoc import THRESHOLD_KEYS
+
+    return {key: result.manifest["profile"][key] for key in THRESHOLD_KEYS}
+
+
 def test_thresholds_default_to_the_language_profile_and_can_be_overridden():
     from voxweave.config import gap_thresholds
 
     default = pipeline.segment_document(language="en", word_segments=PLAIN_UNITS)
-    assert default.thresholds_used == gap_thresholds("en")
+    assert _profile_thresholds(default) == gap_thresholds("en")
 
     override = dict(gap_thresholds("en"))
     override["clause_ms"] = 10_000
     forced = pipeline.segment_document(
         language="en", word_segments=PLAIN_UNITS, thresholds=override
     )
-    assert forced.thresholds_used == override
+    assert _profile_thresholds(forced) == override
 
 
 def test_absent_optional_context_is_reported_as_empty():

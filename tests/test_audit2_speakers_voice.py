@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from voxweave import artifacts, pipeline, voiceepisode
+from voxweave import artifacts, voiceepisode
+from voxweave import sidecars
 
 
 def _media(path: Path) -> Path:
@@ -24,7 +25,7 @@ def test_live_media_under_a_peeled_stem_beats_a_recorded_tagged_source(tmp_path)
     subtitle = tmp_path / "episode.zh.vtt"
     subtitle.write_text("WEBVTT\n", encoding="utf-8")
 
-    assert pipeline._artifact_owner(subtitle) == live
+    assert sidecars.artifact_owner(subtitle) == live
     assert voiceepisode._episode_owner(subtitle) == live
     assert voiceepisode.episode_lock_path(subtitle) == voiceepisode.episode_lock_path(
         live
@@ -38,5 +39,5 @@ def test_a_recorded_source_still_owns_its_subtitles_when_no_media_is_on_disk(tmp
     subtitle = tmp_path / "episode.zh.vtt"
     subtitle.write_text("WEBVTT\n", encoding="utf-8")
 
-    assert pipeline._artifact_owner(subtitle) == media
+    assert sidecars.artifact_owner(subtitle) == media
     assert voiceepisode._episode_owner(subtitle) == media

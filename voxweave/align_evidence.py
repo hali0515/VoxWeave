@@ -54,6 +54,7 @@ from voxweave.align_snapshot import (
 )
 from voxweave.candidate_encoder import _verified_hash_binding
 from voxweave.engine_registry import EngineFamily
+from voxweave.paths import find_sibling_media, find_subtitle_media, swap_ext
 from voxweave.voicebase import media_fingerprint
 
 
@@ -2084,10 +2085,8 @@ def _media_integrity(
         ):
             return False
         try:
-            from voxweave.pipeline import _find_sibling_media
-
-            resolved = _find_sibling_media(vtt_path)
-        except (ImportError, OSError):
+            resolved = find_sibling_media(vtt_path)
+        except OSError:
             return False
         if resolved is None or resolved.suffix.lower() != suffix:
             return False
@@ -2150,10 +2149,6 @@ def verify_align_evidence(
     corpus_root: Path | None = None,
 ) -> AlignEvidenceVerification:
     """Verify canonical sidecar bytes and live selected-primary/media links."""
-    # Deferred: pipeline owns the canonical sibling-path helper, and importing it at
-    # module scope would tie this leaf verifier to the pipeline import graph.
-    from voxweave.pipeline import swap_ext
-
     target = Path(vtt_path)
     legacy_evidence = swap_ext(target, ".align-evidence.json")
     artifact_media = (
@@ -2161,10 +2156,8 @@ def verify_align_evidence(
     )
     if artifact_media is None:
         try:
-            from voxweave.pipeline import _find_subtitle_media
-
-            artifact_media = _find_subtitle_media(target)
-        except (ImportError, OSError):
+            artifact_media = find_subtitle_media(target)
+        except OSError:
             artifact_media = None
     if artifacts.path_present(legacy_evidence):
         evidence_path = legacy_evidence

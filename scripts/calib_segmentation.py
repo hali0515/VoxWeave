@@ -10,7 +10,7 @@ How it works::
       -> calibration/segmentation/cases/*.json   one captured word_segments
          stream + the production replay inputs (vad_speech, shot_changes,
          sing_spans, speaker_turns) + the config that produced it
-      -> voxweave.pipeline.segment_document   the *production* entry point
+      -> voxweave.segmentation.segment_document   the *production* entry point
       -> four metrics, micro-aggregated per language
       -> one-sided comparison against calibration/segmentation/baseline.json
 
@@ -683,7 +683,7 @@ def replay(case: Case) -> Any:
     re-run. Whatever the case does not carry stays empty -- a replay may never
     invent an input the capture did not record.
     """
-    from voxweave.pipeline import segment_document
+    from voxweave.segmentation import segment_document
 
     doc = case.doc
     turns = [
@@ -2584,7 +2584,7 @@ def _sibling_json(media: Path) -> Path:
     """Sibling ``.json``, replacing only the trailing extension.
 
     Never ``Path.with_suffix``: a name with an interior dot would be truncated at
-    the first one (same contract as ``pipeline.swap_ext``).
+    the first one (same contract as ``paths.swap_ext``).
     """
     return media.with_name(media.name[: -len(media.suffix)] + ".json")
 
@@ -2657,7 +2657,7 @@ def cmd_compare_video_dir(args: argparse.Namespace) -> int:
     """Legacy: run the corpus metrics over a directory of private media siblings.
 
     This is the knob-validation path referenced from ``gap_split.adaptive_clause_ms``
-    and ``pipeline._maybe_adaptive_thresholds``: run it twice, once with
+    and ``segmentation._maybe_adaptive_thresholds``: run it twice, once with
     ``VOXWEAVE_GAP_ADAPTIVE=1``, and compare the four numbers. It reads sibling
     JSON only -- no subtitle track is extracted and no ASS is parsed here; a
     commercial release track is the *alignment* ruler's ground truth, not this

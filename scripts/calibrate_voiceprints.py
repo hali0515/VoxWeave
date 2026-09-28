@@ -369,10 +369,11 @@ class Episode:
 
 
 def load_episode(media: Path, *, use_vocals_cache: bool) -> Episode:
-    from voxweave import artifacts, pipeline
+    from voxweave import artifacts, vocals
+    from voxweave.paths import swap_ext
     from voxweave.voicebase import strict_turn_projection
 
-    sibling = pipeline.swap_ext(media, ".json")
+    sibling = swap_ext(media, ".json")
     try:
         document = json.loads(sibling.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -382,7 +383,7 @@ def load_episode(media: Path, *, use_vocals_cache: bool) -> Episode:
         raise ValueError(f"{media}: {sibling.name} has no speaker_turns (--diarize)")
     source, separated = media, False
     if use_vocals_cache:
-        legacy = media.parent / pipeline.CACHE_DIRNAME / f"{media.stem}.vocals.32k.flac"
+        legacy = media.parent / vocals.CACHE_DIRNAME / f"{media.stem}.vocals.32k.flac"
         managed = artifacts.inspect_paths(media)
         for candidate in (legacy, managed.vocals_cache if managed else None):
             # A cache that no longer matches the media duration (replaced
@@ -390,7 +391,7 @@ def load_episode(media: Path, *, use_vocals_cache: bool) -> Episode:
             if (
                 candidate is not None
                 and candidate.is_file()
-                and pipeline._vocals_cache_fresh(candidate, media)
+                and vocals._vocals_cache_fresh(candidate, media)
             ):
                 source, separated = candidate, True
                 break
@@ -399,14 +400,14 @@ def load_episode(media: Path, *, use_vocals_cache: bool) -> Episode:
 
 def decode_episode(episode: Episode, *, normalize: bool) -> Path:
     """Decode ``episode``'s audio to a temporary 16 kHz WAV the caller deletes."""
-    from voxweave import pipeline
+    from voxweave import vocals
     from voxweave.chunking import decode_to_wav
 
     return decode_to_wav(
         episode.audio_source,
         sample_rate=voiceembed.SAMPLE_RATE,
         mono=True,
-        audio_filter=pipeline.ASR_LOUDNORM if normalize else None,
+        audio_filter=vocals.ASR_LOUDNORM if normalize else None,
     )
 
 

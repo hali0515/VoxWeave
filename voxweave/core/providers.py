@@ -30,7 +30,7 @@ CPython starts a new :class:`threading.Thread` with a fresh empty context, so a
 capture established on one thread is invisible to worker threads it spawns --
 a degradation raised off-thread is dropped from the manifest even though its
 once-per-process warning still reaches the log. Nothing in the segmentation path
-is threaded today (``pipeline.segment_document`` runs the whole engine inline),
+is threaded today (``segmentation.segment_document`` runs the whole engine inline),
 so no event is currently lost; anything that later moves provider work onto a
 pool has to carry the context across itself (``contextvars.copy_context()``) or
 the manifest will under-report.

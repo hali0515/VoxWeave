@@ -14,6 +14,7 @@ import pytest
 from click.testing import CliRunner
 
 from voxweave import backend, config, pipeline, vocalscache
+from voxweave import vocals
 from voxweave.cli import cli
 from voxweave.voicebase import media_fingerprint
 from voxweave.vocalscache import (
@@ -147,11 +148,12 @@ def test_bound_align_cache_miss_publishes_a_companion_the_next_run_reuses(
     decoded = tmp_path / "decoded.wav"
     decoded.write_bytes(b"decoded")
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
-    monkeypatch.setattr(pipeline, "_separate_to_16k_32k", fake_separate)
+    monkeypatch.setattr(vocals, "_separate_to_16k_32k", fake_separate)
     monkeypatch.setattr(
-        pipeline, "_encode_flac", lambda _src, dst: Path(dst).write_bytes(b"flac")
+        vocals, "_encode_flac", lambda _src, dst: Path(dst).write_bytes(b"flac")
     )
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_a, **_k: decoded)
+    monkeypatch.setattr(vocals, "decode_to_wav", lambda *_a, **_k: decoded)
 
     def prepare() -> Path:
         return pipeline._prepare_16k_for_align(

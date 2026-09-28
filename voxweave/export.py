@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from voxweave import fsio
+from voxweave.core.overlay import lyric_display_text
+from voxweave.paths import swap_ext
 from voxweave.realign import fmt_ts, render_cues
 from voxweave.speakers import (
     sanitize_ass_speaker_name,
@@ -147,7 +149,7 @@ def _timed_rows(
         (
             float(b["start"]),
             float(b["end"]),
-            f"♪ {b['text']} ♪" if b.get("lyric") else str(b["text"]),
+            lyric_display_text(b),
         )
         for b in blocks
     ]
@@ -274,7 +276,6 @@ def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
     """Render ``sub_path`` (VTT/SRT/ASS/SSA) into each requested format next to
     it; return the written paths. Unknown format names and a target format equal
     to the source raise ValueError."""
-    from voxweave.pipeline import swap_ext
     from voxweave.subformats import load_subtitle_blocks
 
     unknown = [f for f in formats if f not in _EXPORT_FORMATS]

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from voxweave import config, fsio
+from voxweave.core.overlay import wrap_lyric
 from voxweave.speakers import voice_text_for_block
 
 log = logging.getLogger("voxweave")
@@ -333,7 +334,7 @@ def translated_rows(
                 strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]),
                 to_iso,
             )
-            rendered = f"♪ {t} ♪" if b.get("lyric") else t
+            rendered = wrap_lyric(t, b.get("lyric"))
         if voice_tags:
             return voice_text_for_block(
                 rendered, _speaker_block_for_rendered(b, rendered)

@@ -316,6 +316,32 @@ arguments are now keyword-only: everything after `max_lines` in `smart_split_seg
 by keyword or positionally, including through `pipeline.split(..., **kwargs)`, raises
 `TypeError`: drop it, and pass the remaining optional arguments by keyword.
 
+### Library API: `pipeline` split into smaller modules
+
+`voxweave.pipeline` keeps `transcribe`, `process`, `split` and `align`. The helpers it also
+held moved to their own modules, and its other public names (`swap_ext`, `require_vtt`,
+`MEDIA_EXTS`, `segment_document`, `SegmentationResult`, `cache_vocals_path`, the
+`speakers_*_path` and `voiceprints_path` helpers, `lyric_display_text`, ...) stay importable
+from `pipeline`. Three things changed:
+
+- `pipeline.translate` and `pipeline.correct` are now `voxweave.llm_commands.translate` and
+  `voxweave.llm_commands.correct`, with the same signatures. `correct --apply` calls
+  `pipeline.align`, so `pipeline` cannot import them back.
+- `SHADOW_LANE_DELIVERY` is gone from `pipeline` and `voxweave.core.shadow_v2`; use
+  `SHADOW_LANE_DELIVERY_LEGACY`, which has the same value.
+- `SegmentationResult` no longer has `thresholds_used`: read the thresholds a run used from
+  `result.manifest["profile"]` (the nine gap/duration keys, as the engine ran them). The
+  field was positional, so construct a `SegmentationResult` by keyword.
+
+Code that imported or patched private `pipeline` helpers finds them here:
+`voxweave.paths` (`swap_ext`, `find_sibling_media`, `find_subtitle_media`),
+`voxweave.sidecars` (`artifact_owner` and the speaker and voiceprint sidecar paths),
+`voxweave.vocals` (the vocals cache and `acquire_16k`, the one 16 kHz input flow shared by
+`transcribe` and `align`), `voxweave.segmentation` (`segment_document`) and
+`voxweave.core.overlay` (`spans_in`, `turns_in`, lyric marking and the shot re-snap).
+`voxweave.mux.detect_subtitle_language` and `voxweave.subformats.SUBTITLE_EXTS` still import
+from their old modules.
+
 ### Smaller changes
 
 - `--language` accepts ISO codes such as `ja` with the Qwen engine; before, every chunk failed

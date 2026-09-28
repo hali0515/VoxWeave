@@ -11,20 +11,21 @@ import rich_click as click
 from rich.console import Console
 from rich.table import Table
 
-from voxweave import artifacts, pipeline
+from voxweave import artifacts, sidecars
 from voxweave.cli_compat import DefaultGroup, warn_deprecated
 from voxweave.cli_voices import VOICES_DIR_DEFAULT, VoicesDirPath
+from voxweave.paths import MEDIA_EXTS, swap_ext
 
 
 class SpeakersGroup(DefaultGroup):
     """Keep a bare episode path as the audition shortcut."""
 
-    media_extensions = (*pipeline.MEDIA_EXTS, ".vtt", ".json")
+    media_extensions = (*MEDIA_EXTS, ".vtt", ".json")
 
 
 def _episode_owner(episode: Path, *, require_media: bool = False) -> Path:
-    owner = pipeline._artifact_owner(episode)
-    if require_media and owner.suffix.lower() not in pipeline.MEDIA_EXTS:
+    owner = sidecars.artifact_owner(episode)
+    if require_media and owner.suffix.lower() not in MEDIA_EXTS:
         raise FileNotFoundError(
             f"source media not found for {episode}; pass the episode's media path"
         )
@@ -65,14 +66,14 @@ def _list_episode(episode: Path) -> dict[str, Any]:
     from voxweave.voicebase import strict_json_object_loads, strict_turn_projection
 
     owner = _episode_owner(episode)
-    sibling_path = pipeline.swap_ext(owner, ".json")
+    sibling_path = swap_ext(owner, ".json")
     raw = sibling_path.read_bytes()
     sibling = strict_json_object_loads(
         raw, max_bytes=max(1, len(raw)), source=sibling_path.name
     )
     turns = strict_turn_projection(sibling.get("speaker_turns", []))
     labels = sorted({label for _start, _end, label in turns})
-    mapping_path = pipeline.inspect_speakers_mapping_path(owner, reference=sibling_path)
+    mapping_path = sidecars.inspect_speakers_mapping_path(owner, reference=sibling_path)
     names = (
         load_speaker_mapping_bytes(
             mapping_path.read_bytes(), labels, source=mapping_path.name

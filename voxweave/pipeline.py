@@ -1,35 +1,28 @@
 from __future__ import annotations
 
-import copy
 import hashlib
-import importlib.metadata
 import json
 import logging
 import math
 import os
-import platform
-import stat
-import subprocess
 import threading
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, cast
 
-from voxweave import asrfix as asrfix_mod
 from voxweave import (
     artifacts,
     backend,
     chunking,
     config,
     episode_transaction,
-    fsio,
     realign,
     songdet,
 )
-from voxweave import translate as translate_mod
+from voxweave import sdh as sdh_mod
 from voxweave.chunking import (
     decode_to_wav,
     pack_speech_segments,
@@ -42,13 +35,12 @@ from voxweave.align_runtime import (
     align_runtime_activity,
     bind_align_runtime_identity,
 )
-from voxweave.core.providers import degradation_capture, provider_snapshot
-from voxweave.core.schema import Cue
-from voxweave.core.segdoc import (
-    THRESHOLD_KEYS,
-    DisplayProfile,
-    SegDocument,
-    build_seg_document,
+from voxweave.core.overlay import (
+    LYRIC_MIN_OVERLAP as LYRIC_MIN_OVERLAP,
+    lyric_display_text as lyric_display_text,
+    mark_lyric_cues as mark_lyric_cues,
+    spans_in,
+    turns_in,
 )
 
 # The v2 shadow lane lives in ``voxweave.core.shadow_v2``; its flag and lane
@@ -58,7 +50,6 @@ from voxweave.core.segdoc import (
 from voxweave.core.shadow_v2 import (
     SEG_V2_SHADOW_ENV as SEG_V2_SHADOW_ENV,
     SHADOW_LANE_CORE as SHADOW_LANE_CORE,
-    SHADOW_LANE_DELIVERY as SHADOW_LANE_DELIVERY,
     SHADOW_LANE_DELIVERY_LEGACY as SHADOW_LANE_DELIVERY_LEGACY,
     SHADOW_LANE_FINALIZER as SHADOW_LANE_FINALIZER,
     SHADOW_LANE_LEGACY_DISPLAY as SHADOW_LANE_LEGACY_DISPLAY,
@@ -71,7 +62,32 @@ from voxweave.lang import (
     transcript_content_weight,
 )
 from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
-from voxweave.progress import Reporter
+
+# Path, sidecar, vocals-cache and segmentation helpers moved to their own
+# modules; the public names stay importable from here.
+from voxweave.paths import MEDIA_EXTS as MEDIA_EXTS
+from voxweave.paths import find_subtitle_media, swap_ext
+from voxweave.progress import Reporter, progress_bridge
+from voxweave.segmentation import (
+    SEGMENTATION_ENGINE as SEGMENTATION_ENGINE,
+    SEGMENTATION_MANIFEST_VERSION as SEGMENTATION_MANIFEST_VERSION,
+    SegmentationResult as SegmentationResult,
+    resolve_segmentation_manifest,
+    segment_document,
+)
+from voxweave.sidecars import (
+    align_evidence_candidates,
+    artifact_owner,
+    inspect_speakers_mapping_path,
+    speaker_suggest_candidates,
+    speakers_html_path,
+    voiceprints_candidates,
+    voiceprints_path,
+)
+from voxweave.sidecars import (
+    speakers_mapping_path as speakers_mapping_path,
+    speakers_suggest_path as speakers_suggest_path,
+)
 from voxweave.songdet import (
     detect_song_spans,
     excise_spans_from_segments,
@@ -81,7 +97,18 @@ from voxweave.songdet import (
     rescue_speech_segments,
     subtract_spans,
 )
+from voxweave.speakers import named_speaker_ids
+from voxweave.subformats import require_subtitle
 from voxweave.timestamps import shift_units
+from voxweave.vocals import (
+    ASR_LOUDNORM as ASR_LOUDNORM,
+    CACHE_DIRNAME as CACHE_DIRNAME,
+    CACHE_DUR_TOL_SEC as CACHE_DUR_TOL_SEC,
+    SONGDET_SR,
+    acquire_16k,
+    cache_vocals_path,
+)
+from voxweave.vocals import cache_16k_path as cache_16k_path
 from voxweave.voicebase import (
     Phase2DataError,
     VOICEPRINTS_MAX_BYTES,
@@ -94,16 +121,6 @@ from voxweave.voicebase import (
     strict_json_object_loads,
     utc_timestamp,
     validate_voiceprints_mapping,
-)
-from voxweave.vocalscache import (
-    cache_companion_path,
-    cache_lock,
-    cache_publish_path,
-    cache_write_window,
-    classify_cache_decode_failure,
-    load_cache_companion,
-    publish_cache_companion,
-    validate_cache_pair,
 )
 
 if TYPE_CHECKING:
@@ -133,10 +150,6 @@ MAX_CHUNK_SEC = config._env_float("VOXWEAVE_MAX_CHUNK_SEC", 120.0)
 # Real OP/ED runs 30-90s; short instrumental BGM scattered through speech would hurt ASR
 # if dropped (env VOXWEAVE_MIN_SONG_SKIP_SEC).
 MIN_SONG_SKIP_SEC = config._env_float("VOXWEAVE_MIN_SONG_SKIP_SEC", 8.0)
-# Loudness normalization applied only to the 16k VAD/ASR path; 44.1k separation path is untouched.
-ASR_LOUDNORM = os.environ.get("VOXWEAVE_LOUDNORM", "loudnorm=I=-16:TP=-1.5:LRA=11")
-# PANNs Cnn14 is trained at 32k.
-SONGDET_SR = 32000
 # Sensitive VAD threshold for snapping zero-duration units to original (pre-separation)
 # audio. Silero default 0.5 misses back-channels (はい/ええ) attenuated by vocal separation;
 # 0.25 catches them. Used only for snap positioning, not for chunk boundary decisions.
@@ -154,34 +167,6 @@ MIN_CUE_SEC = config._env_float("VOXWEAVE_MIN_CUE_SEC", 0.0)
 # VOXWEAVE_TINY_CUE_SEC=0 disables.
 TINY_CUE_SEC = config._env_float("VOXWEAVE_TINY_CUE_SEC", 0.2)
 TINY_CUE_TARGET = config._env_float("VOXWEAVE_TINY_CUE_TARGET", 0.5)
-
-
-# Vocals cache: per-media artifact claim ``vocals.32k.flac`` (32k mono, no BGM).
-# Shared by process and align; PANNs eats it directly, ASR/alignment downsample to 16k.
-# Existing media-adjacent 32k/16k caches remain writeback/read compatibility lanes.
-# A cache hit also requires the durations to match (_vocals_cache_fresh): a replaced or
-# trimmed source silently invalidates the old separation, so it is re-run and overwritten.
-CACHE_DIRNAME = "cache"
-# Max |cache - media| duration drift still treated as the same source. Covers
-# container-vs-stream duration jitter; real source edits move duration by seconds.
-CACHE_DUR_TOL_SEC = config._env_float("VOXWEAVE_CACHE_DUR_TOL_SEC", 0.5)
-# Extensions tried when locating the source media by stem (align only receives the VTT).
-MEDIA_EXTS = (
-    ".mkv",
-    ".mp4",
-    ".webm",
-    ".mov",
-    ".avi",
-    ".ts",
-    ".m4v",
-    ".flac",
-    ".wav",
-    ".m4a",
-    ".mp3",
-    ".aac",
-    ".opus",
-    ".ogg",
-)
 
 
 @dataclass(frozen=True)
@@ -465,199 +450,6 @@ def _select_transcript_language(
     return weights.most_common(1)[0][0] if weights else "english"
 
 
-def _progress_bridge(rep: Reporter, label: str):
-    """Convert the ``(done, total)`` callback from backend/songdet into a Reporter task bar.
-
-    Keeps backend/songdet free of any rich dependency.
-    """
-    started = {"v": False}
-
-    def cb(done: int, total: int) -> None:
-        if not started["v"]:
-            rep.task(label, total)
-            started["v"] = True
-        rep.advance(1)
-
-    return cb
-
-
-class _NestedReporter(Reporter):
-    """Forward work details without replacing the enclosing command's step plan."""
-
-    def __init__(self, parent: Reporter) -> None:
-        self.parent = parent
-
-    def step(self, label: str) -> None:
-        # Nested steps stay inside the enclosing step: its clock keeps running and
-        # the timings belong to the outer plan.
-        return
-
-    def finish(self) -> None:
-        self.parent.finish()
-
-    def timings(self) -> dict[str, float]:
-        return self.parent.timings()
-
-    def stage(self, label: str) -> None:
-        self.parent.stage(label)
-
-    def status(self, label: str) -> None:
-        self.parent.status(label)
-
-    def task(self, label: str, total: int) -> None:
-        self.parent.task(label, total)
-
-    def advance(self, n: int = 1) -> None:
-        self.parent.advance(n)
-
-    def download(self, label: str, done: int, total: int | None) -> None:
-        self.parent.download(label, done, total)
-
-
-def cache_vocals_path(media_path: Path) -> Path:
-    """Resolve the vocals cache, preserving an existing legacy cache pair."""
-    media_path = Path(media_path)
-    legacy = media_path.parent / CACHE_DIRNAME / f"{media_path.stem}.vocals.32k.flac"
-    if (
-        artifacts.path_present(legacy)
-        or artifacts.path_present(cache_companion_path(legacy))
-        or artifacts.path_present(Path(f"{legacy.resolve()}.lock"))
-    ):
-        return legacy
-    managed = artifacts.claim_paths(media_path).vocals_cache
-    for candidate in (
-        managed,
-        Path(f"{managed}.meta.json"),
-        Path(f"{managed}.lock"),
-    ):
-        try:
-            metadata = candidate.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise artifacts.ArtifactMarkerError(
-                f"cannot inspect managed vocals cache node {candidate}: {exc}"
-            ) from exc
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise artifacts.ArtifactMarkerError(
-                f"managed vocals cache node is not a regular file: {candidate}"
-            )
-    return managed
-
-
-def cache_16k_path(media_path: Path) -> Path:
-    """Return the legacy 16k vocals cache path: <media_dir>/cache/<stem>.16k.flac (read-only backward compat)."""
-    media_path = Path(media_path)
-    return media_path.parent / CACHE_DIRNAME / f"{media_path.stem}.16k.flac"
-
-
-class _ProbeUnavailable(RuntimeError):
-    """ffprobe itself could not answer (not installed, or timed out): says nothing
-    about whether the probed file is readable."""
-
-
-def _probe_duration(path: Path) -> float | None:
-    """Media duration in seconds via ffprobe, or None if unreadable.
-
-    Raises :class:`_ProbeUnavailable` when ffprobe is missing from PATH or times
-    out, so callers do not mistake a tool problem for an unreadable file.
-    """
-    try:
-        proc = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(path),
-            ],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except FileNotFoundError as e:
-        raise _ProbeUnavailable("ffprobe not found on PATH") from e
-    except subprocess.TimeoutExpired as e:
-        raise _ProbeUnavailable(f"ffprobe timed out on {path.name}") from e
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        return float(proc.stdout.strip())
-    except ValueError:
-        return None
-
-
-def _vocals_cache_fresh(cache: Path, media: Path) -> bool:
-    """True if the cached vocals still match the source media duration.
-
-    An unreadable cache is stale (truncated/corrupt flac must not be trusted);
-    an unprobeable media keeps the cache hit — decoding will surface the real
-    error later, and burning a separation pass on a maybe-valid cache helps nobody.
-    When ffprobe itself is unavailable (missing or timed out) the cache cannot be
-    validated, so it is re-separated too, but the warning names the real cause.
-    """
-    try:
-        cache_dur = _probe_duration(cache)
-    except _ProbeUnavailable as e:
-        log.warning("%s; cannot validate the vocals cache, re-separating: %s", e, cache)
-        return False
-    if cache_dur is None:
-        log.warning("vocals cache unreadable, re-separating: %s", cache)
-        return False
-    try:
-        media_dur = _probe_duration(media)
-    except _ProbeUnavailable as e:
-        log.warning("%s; keeping the vocals cache unvalidated: %s", e, cache)
-        return True
-    if media_dur is None:
-        return True
-    if abs(cache_dur - media_dur) <= CACHE_DUR_TOL_SEC:
-        return True
-    log.warning(
-        "vocals cache stale (cache %.2fs vs media %.2fs), re-separating: %s",
-        cache_dur,
-        media_dur,
-        cache,
-    )
-    return False
-
-
-def _encode_flac(src_wav: Path, dst_flac: Path) -> None:
-    """Encode wav to flac for caching (lossless); caller treats failure as non-fatal.
-
-    Atomic: an interrupted encode must not leave a truncated flac at the cache
-    path — every later run would treat it as a cache hit and fail obscurely.
-    """
-    dst_flac.parent.mkdir(parents=True, exist_ok=True)
-    with cache_publish_path(dst_flac) as tmp:
-        subprocess.run(
-            ["ffmpeg", "-nostdin", "-y", "-i", str(src_wav), "-c:a", "flac", str(tmp)],
-            check=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-
-def swap_ext(path: Path, new_ext: str) -> Path:
-    """Replace the trailing extension of path with new_ext (include leading dot; "" removes it).
-
-    Do NOT use ``Path.with_suffix`` for sibling paths: filenames with interior dots
-    (e.g. YouTube titles containing ``...``) cause with_suffix to misidentify the first
-    interior dot as the suffix, silently truncating the name. This function only replaces
-    ``path.suffix``, leaving interior dots untouched.
-    """
-    if path.suffix:
-        return path.with_name(path.name[: -len(path.suffix)] + new_ext)
-    return path.with_name(path.name + new_ext)
-
-
 def require_vtt(path: Path) -> Path:
     """Reject non-VTT inputs for align/correct; return the path unchanged.
 
@@ -666,189 +458,7 @@ def require_vtt(path: Path) -> Path:
     file with VTT content. translate/pack/burn/export accept the other formats
     via :func:`voxweave.subformats.require_subtitle`.
     """
-    from voxweave.subformats import require_subtitle
-
     return require_subtitle(path, exts=(".vtt",))
-
-
-def _find_sibling_media(ref: Path) -> Path | None:
-    """Find the source media alongside ref by stem, matching extensions case-insensitively.
-
-    Returns the best candidate by ``MEDIA_EXTS`` order (``.mkv`` before ``.mp4`` ...);
-    when more than one media sibling exists the ambiguity is logged and the selection
-    stays deterministic. ``None`` when no sibling is found.
-    """
-    ref = Path(ref)
-    base = swap_ext(ref, "").name  # stem without the reference extension (dot-safe)
-    order = {ext: i for i, ext in enumerate(MEDIA_EXTS)}
-    matches: list[tuple[int, Path]] = []
-    parent = ref.parent if str(ref.parent) else Path(".")
-    if parent.exists():
-        for p in parent.iterdir():
-            if p.is_file() and swap_ext(p, "").name == base:
-                rank = order.get(p.suffix.lower())
-                if rank is not None:
-                    matches.append((rank, p))
-    if not matches:
-        return None
-    matches.sort(key=lambda m: (m[0], str(m[1])))
-    if len(matches) > 1:
-        log.warning(
-            "multiple sibling media files for %s: %s; using %s",
-            ref.name,
-            [m[1].name for m in matches],
-            matches[0][1].name,
-        )
-    return matches[0][1]
-
-
-def _find_subtitle_media(ref: Path) -> Path | None:
-    """Find exact-stem media, then peel closed subtitle-derived suffix tags."""
-    found = _find_sibling_media(ref)
-    if found is not None:
-        return found
-    from voxweave.mux import detect_subtitle_language
-
-    carrier = swap_ext(ref, "")
-    while carrier.suffix:
-        tag = carrier.suffix[1:].casefold()
-        if tag not in {"asrfix", "sdh"} and detect_subtitle_language(carrier) is None:
-            return None
-        found = _find_sibling_media(carrier)
-        if found is not None:
-            return found
-        carrier = swap_ext(carrier, "")
-    return None
-
-
-def _artifact_owner(reference: Path) -> Path:
-    """Return live or cache-recorded media, else the standalone source itself."""
-    value = Path(reference)
-    if value.suffix.lower() in MEDIA_EXTS:
-        return value
-    live = _find_subtitle_media(value)
-    if live is not None:
-        return live
-    from voxweave.mux import detect_subtitle_language
-
-    normalized_parent = Path(os.path.realpath(os.fspath(value.parent)))
-    carrier = swap_ext(value, "")
-    order = {suffix: index for index, suffix in enumerate(MEDIA_EXTS)}
-    while True:
-        recorded = sorted(
-            (
-                order[source.suffix.lower()],
-                str(source),
-                source,
-            )
-            for source in artifacts.claimed_sources(normalized_parent, carrier.name)
-            if source.suffix.lower() in order
-        )
-        if recorded:
-            return recorded[0][2]
-        if not carrier.suffix:
-            break
-        tag = carrier.suffix[1:].casefold()
-        if tag not in {"asrfix", "sdh"} and detect_subtitle_language(carrier) is None:
-            break
-        carrier = swap_ext(carrier, "")
-    return value
-
-
-def _vocals_to_16k(voc32: Path, *, normalize: bool) -> Path:
-    """Decode 32 kHz mono vocals to the 16 kHz ASR/diarization input (a temp wav).
-
-    ``voc32`` is either a first run's fresh 32k wav or the ``vocals.32k.flac``
-    the vocals cache stores (a lossless copy of it). Every such decode (a first
-    run, and a cache hit in ``transcribe`` or ``align``) goes through here, so a
-    re-run feeds ASR and diarization exactly the samples its first run did:
-    loudnorm measures its input, and a different source, rate or filter would
-    move the speaker turns between runs.
-    """
-    return decode_to_wav(voc32, audio_filter=ASR_LOUDNORM if normalize else None)
-
-
-@overload
-def _separate_to_16k_32k(
-    media: Path,
-    *,
-    reporter: Reporter,
-    normalize: bool,
-    return_separator_identity: Literal[False] = False,
-) -> tuple[Path, Path, Path, Path]: ...
-
-
-@overload
-def _separate_to_16k_32k(
-    media: Path,
-    *,
-    reporter: Reporter,
-    normalize: bool,
-    return_separator_identity: Literal[True],
-) -> tuple[Path, Path, Path, Path, dict[str, object]]: ...
-
-
-def _separate_to_16k_32k(
-    media: Path,
-    *,
-    reporter: Reporter,
-    normalize: bool,
-    return_separator_identity: bool = False,
-) -> tuple[Path, Path, Path, Path] | tuple[Path, Path, Path, Path, dict[str, object]]:
-    """Decode full-band 44.1k stereo -> Roformer separate -> resample, returning
-    ``(fullband, vocals, wav_16k, voc32_32k)`` and, when requested, the
-    load-bound separator identity as a fifth item.
-
-    The full-band 44.1k stereo feed is a hard constraint (Roformer is trained at 44.1k);
-    downsampling to 16k/32k happens only after separation. Callers own temp bookkeeping,
-    debug dumps, and caching of the returned paths.
-
-    The 16k ASR/diarization input is derived from the 32k mono vocals, never from the
-    44.1k stereo stem: ``voc32`` is exactly what the vocals cache stores, so a first run
-    and a later cache hit (which decodes ``vocals.32k.flac`` with the same filter) feed
-    loudnorm the same samples. Normalizing the stereo stem instead measured 2.5-2.6 dB
-    louder and moved ~10-14% of diarization frames between the two runs.
-
-    On a clean return the caller registers the paths in its own ``tmp`` list (cleaned in its
-    ``finally``). Since that registration only runs after this returns, the helper self-cleans
-    its partial outputs if a later step raises (or is interrupted) — otherwise an OOM/ffmpeg
-    failure or a Ctrl-C mid-separation would orphan the already-decoded temp files.
-    """
-    created: list[Path] = []
-    try:
-        reporter.stage("decode fullband 44.1k")
-        fullband = decode_to_wav(media, sample_rate=44100, mono=False)
-        created.append(fullband)
-        reporter.stage("vocal separation (Roformer)")
-        if return_separator_identity:
-            vocals, separator_identity = backend.separate_vocals(
-                fullband,
-                progress=_progress_bridge(reporter, "vocal separation (Roformer)"),
-                return_identity=True,
-            )
-        else:
-            vocals = backend.separate_vocals(
-                fullband,
-                progress=_progress_bridge(reporter, "vocal separation (Roformer)"),
-            )
-        created.append(vocals)
-        reporter.stage("resample 16k")
-        voc32 = decode_to_wav(
-            vocals, sample_rate=SONGDET_SR
-        )  # 32k mono: PANNs + cache source
-        created.append(voc32)
-        # Same source and filter as a vocals-cache hit (32k mono -> 16k mono).
-        wav = _vocals_to_16k(voc32, normalize=normalize)
-        created.append(wav)
-        if return_separator_identity:
-            return fullband, vocals, wav, voc32, separator_identity
-        return fullband, vocals, wav, voc32
-    except BaseException:
-        # BaseException: a Ctrl-C mid-separation must not orphan the multi-hundred-MB
-        # full-band WAV either.
-        for p in created:
-            p.unlink(missing_ok=True)
-        raise
 
 
 def _load_sibling_json_bytes(
@@ -907,36 +517,6 @@ def _replay_voiceprint_pair(
         log.warning("%s: dropping invalid voiceprint replay pair: %s", source, exc)
         return None
     return capture, media
-
-
-def resolve_segmentation_manifest(data: Mapping[str, Any]) -> Mapping[str, Any]:
-    """The segmentation manifest of a loaded sibling document.
-
-    Every sibling written before P3 carries no ``segmentation`` key at all, and
-    that absence is itself the label: such a document was produced by the legacy
-    v1 engine, so it resolves to ``{"engine": "legacy-v1", "inferred": True}``
-    rather than to nothing. ``inferred`` distinguishes the deduction from a
-    recorded manifest, which is returned exactly as stored (a non-mapping value
-    is not one and falls back to the inference).
-
-    The engine name here is a literal on purpose and must NOT become
-    :data:`SEGMENTATION_ENGINE`: that constant tracks whichever engine this build
-    runs, while a manifest-less file was written by v1 no matter what this build
-    does now.
-    """
-    found = data.get("segmentation")
-    if isinstance(found, Mapping):
-        return found
-    return {"engine": "legacy-v1", "inferred": True}
-
-
-def _load_cues(vtt_path: Path) -> list[dict]:
-    """Parse subtitle cue blocks by extension (VTT/SRT/ASS/SSA); raise if the
-    file has no cues. Used by translate (align and correct decode the exact bytes
-    they snapshot instead)."""
-    from voxweave.subformats import load_subtitle_blocks
-
-    return load_subtitle_blocks(Path(vtt_path))
 
 
 def plan_song_skip(
@@ -1086,7 +666,6 @@ def transcribe(
         if debug_root is None:
             debug_root = artifacts.claim_paths(media_path).debug
         dbg = FileDebugSink(root=debug_root)
-    af = ASR_LOUDNORM if normalize else None
     tmp: list[
         Path
     ] = []  # intermediate files (fullband/vocals/16k/32k wav), deleted at end
@@ -1102,100 +681,31 @@ def transcribe(
             voiceprints = _prefetch_voiceprint_models(
                 voiceprint_model, lang_override, rep
             )
-        vocals: Path | None = None
-        fullband: Path | None = None
-        voc32: Path | None = None  # 32k mono vocals: PANNs input + cache source
-        separator_identity: dict[str, object] | None = None
         if separate and voiceprints:
             require_sha256(source_fingerprint, "capture media fingerprint")
-        if separate:
-            cache_hit = False
-            if cache_vocals is not None:
-                with cache_lock(Path(cache_vocals)) as cache_handle:
-                    cache_path = cache_handle.cache_path
-                    if cache_path.exists():
-                        if voiceprints:
-                            try:
-                                companion, _validated = load_cache_companion(
-                                    cache_handle.companion_path
-                                )
-                                current_separator = backend.separator_identity()
-                                validated = validate_cache_pair(
-                                    companion,
-                                    cache_path,
-                                    media_fingerprint=source_fingerprint or "",
-                                    separator=current_separator,
-                                )
-                                separator_identity = validated.separator.as_mapping()
-                                cache_hit = True
-                            except (OSError, Phase2DataError):
-                                log.info(
-                                    "vocals cache is not bound to this capture; re-separating: %s",
-                                    cache_path,
-                                )
-                        else:
-                            cache_hit = _vocals_cache_fresh(cache_path, media_path)
-                    if cache_hit:
-                        # Keep the cache lock through decoder completion. A validated
-                        # hash followed by an unlocked open is not a stable read.
-                        rep.stage("vocals cache (32k)")
-                        log.info("reuse cached vocals %s", cache_path)
-                        voc32 = cache_path
-                        try:
-                            wav = _vocals_to_16k(voc32, normalize=normalize)
-                        except BaseException as exc:
-                            classify_cache_decode_failure(exc)
-                            raise
-                        tmp.append(wav)
-            if cache_hit:
-                # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
-                pass
-            else:
-                if voiceprints:
-                    (
-                        fullband,
-                        vocals,
-                        wav,
-                        voc32,
-                        separator_identity,
-                    ) = _separate_to_16k_32k(
-                        media_path,
-                        reporter=rep,
-                        normalize=normalize,
-                        return_separator_identity=True,
-                    )
-                else:
-                    fullband, vocals, wav, voc32 = _separate_to_16k_32k(
-                        media_path, reporter=rep, normalize=normalize
-                    )
-                # Own every temp before anything else can raise (a debug dump
-                # onto a full disk would otherwise leave them in /tmp).
-                tmp.extend((fullband, vocals, voc32, wav))
-                dbg.audio("00_fullband_44k.wav", fullband)
-                dbg.audio("01_vocals.flac", vocals)
-                log.info("separated vocals (local Roformer)")
-                if cache_vocals is not None:
-                    try:
-                        with cache_write_window(Path(cache_vocals)) as cache_handle:
-                            _encode_flac(voc32, cache_handle.cache_path)
-                            if voiceprints:
-                                publish_cache_companion(
-                                    cache_handle.cache_path,
-                                    media_fingerprint=source_fingerprint or "",
-                                    separator=separator_identity or {},
-                                    companion_path=cache_handle.companion_path,
-                                )
-                        log.info("cached vocals 32k → %s", cache_vocals)
-                    except (
-                        OSError,
-                        subprocess.CalledProcessError,
-                        Phase2DataError,
-                    ) as e:
-                        log.warning("cache vocals failed (non-fatal): %r", e)
-        else:
-            rep.stage("decode 16k")
-            wav = decode_to_wav(media_path, audio_filter=af)
-            tmp.append(wav)
+
+        def dump_separation(fullband: Path, vocals: Path) -> None:
+            dbg.audio("00_fullband_44k.wav", fullband)
+            dbg.audio("01_vocals.flac", vocals)
+            log.info("separated vocals (local Roformer)")
+
+        acquired = acquire_16k(
+            media_path,
+            separate=separate,
+            normalize=normalize,
+            reporter=rep,
+            tmp=tmp,
+            cache=cache_vocals,
+            # A capture binds the cache to the snapshot it separated; otherwise
+            # the duration check against the source decides.
+            fingerprint=(source_fingerprint or "") if voiceprints else None,
+            purpose="capture",
+            on_separated=dump_separation,
+        )
+        wav = acquired.wav
+        fullband = acquired.fullband
+        voc32 = acquired.voc32  # 32k mono vocals: PANNs input + cache source
+        separator_identity = acquired.separator
         dbg.audio("02_speech_16k.wav", wav)
 
         # Song detection must run on clean separated vocals; BGM causes speech/music confusion.
@@ -1213,7 +723,7 @@ def transcribe(
                     rep.step("detect songs")
                     rep.stage("song detection (PANNs)")
                     song_spans, sing_spans, speech_spans = detect_song_spans(
-                        voc32, progress=_progress_bridge(rep, "song detection (PANNs)")
+                        voc32, progress=progress_bridge(rep, "song detection (PANNs)")
                     )
                     if song_spans:
                         log.info(
@@ -1321,9 +831,7 @@ def transcribe(
             cwav = slice_wav(wav, ch["start"], ch["end"])
             tmp_chunks.append(cwav)
             cwavs.append(cwav)
-        from voxweave.config import conf_load_strategy
-
-        strategy = conf_load_strategy()
+        strategy = config.conf_load_strategy()
         rep.chunks(len(chunks) * backend.chunk_pass_count(asr_model))
         # full_wav + bounds let CTC/MMS languages run ONE full-file alignment pass over
         # the whole audio (chunk windows as DP silence anchors) instead of N per-chunk
@@ -1580,486 +1088,6 @@ def transcribe(
             c.unlink(missing_ok=True)
 
 
-def _spans_in(raw: Any) -> list[tuple[float, float]] | None:
-    """Parse a persisted ``vad_speech`` array (``[[start, end], ...]``) to float tuples.
-
-    Malformed entries (wrong arity, non-numeric bounds) are skipped with a warning
-    rather than crashing the whole re-split. None if absent/empty or nothing survives.
-    """
-    if not raw:
-        return None
-    out: list[tuple[float, float]] = []
-    for entry in raw:
-        try:
-            s, e = entry
-            out.append((float(s), float(e)))
-        except (TypeError, ValueError):
-            log.warning("skipping malformed vad_speech entry: %r", entry)
-    return out or None
-
-
-def _turns_in(raw: Any) -> list[tuple[float, float, str]] | None:
-    """Parse persisted ``speaker_turns`` (``[[start, end, label], ...]``).
-
-    This is the byte-preserving production replay seam: numeric bounds are only
-    coerced to ``float``.  Reversed, point and non-finite legacy values survive
-    exactly as they did before P5; the shadow's speaker-evidence consumer owns
-    normalization on its detached document copy after the feature flag.
-
-    Malformed entries (wrong arity or non-numeric bounds) are skipped with a
-    warning. None if absent/empty or nothing survives.
-    """
-    if not raw:
-        return None
-    out: list[tuple[float, float, str]] = []
-    for entry in raw:
-        try:
-            s, e, lb = entry
-            out.append((float(s), float(e), str(lb)))
-        except (TypeError, ValueError):
-            log.warning("skipping malformed speaker_turns entry: %r", entry)
-    return out or None
-
-
-def _maybe_adaptive_thresholds(th: dict, units: list[dict]) -> dict:
-    """Scale clause/offline gap thresholds to this file's gap distribution.
-
-    EXPERIMENTAL, default off: opt in via VOXWEAVE_GAP_ADAPTIVE=1. Replaces the
-    static clause_ms (and offline_ms at the same clause:offline ratio) with a
-    per-file estimate from the inter-unit gap distribution; vad_skip_ms is
-    untouched. Validate against scripts/calib_segmentation.py before trusting.
-    """
-    if os.environ.get("VOXWEAVE_GAP_ADAPTIVE", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return th
-    from voxweave.core.gap_split import adaptive_clause_ms
-
-    gaps_ms: list[float] = []
-    for prev, nxt in zip(units, units[1:]):
-        pe, ns = prev.get("end"), nxt.get("start")
-        if pe is not None and ns is not None:
-            gaps_ms.append((float(ns) - float(pe)) * 1000.0)
-    clause = adaptive_clause_ms(gaps_ms)
-    if clause is None:
-        return th
-    ratio = th["offline_ms"] / th["clause_ms"] if th.get("clause_ms") else 1.75
-    out = dict(th)
-    out["clause_ms"] = clause
-    out["offline_ms"] = round(clause * ratio)
-    log.info(
-        "adaptive gap thresholds: clause %dms offline %dms (static %s/%s)",
-        out["clause_ms"],
-        out["offline_ms"],
-        th.get("clause_ms"),
-        th.get("offline_ms"),
-    )
-    return out
-
-
-def _resnap_shots(
-    cues: list[Cue], shot_changes: list[float] | None, thresholds: dict
-) -> list[Cue]:
-    """Re-apply shot snapping after speaker formatting rewrote the cue stream.
-
-    smart_split snaps boundaries to shot changes as its last timing step, but
-    speaker formatting splits cues at speaker turns and runs another timing
-    cleanup, which moves those boundaries again -- so a formatted cue can end up
-    flashing across a cut that the first snap had cleared. Snapping once more
-    with the same cuts and the same duration cap restores the invariant;
-    ``_snap_to_shots`` leaves boundaries that already sit in a landing zone
-    untouched, so the extra pass is a no-op when formatting changed nothing.
-    """
-    if not shot_changes:
-        return cues
-    from voxweave.core.smart_split import SplitThresholds
-    from voxweave.core.timing import _snap_to_shots
-
-    th = SplitThresholds.from_mapping(thresholds)
-    return _snap_to_shots(
-        cues, sorted(shot_changes), snap_s=th.shot_snap_s, max_cue_s=th.max_cue_s
-    )
-
-
-# A cue is a lyric when at least this fraction of its span overlaps detected singing.
-LYRIC_MIN_OVERLAP = 0.5
-
-
-def mark_lyric_cues(
-    cues: Sequence[Cue], sing_spans: list[tuple[float, float]] | None
-) -> None:
-    """Flag cues whose span mostly overlaps detected singing (``lyric=True``).
-
-    The stored cue text stays clean; display layers (the VTT rows rendered by
-    ``segmentation_projector`` / ``align_projector``, SRT/ASS export) wrap flagged
-    cues with music notes per the Netflix lyric convention. Runs in place after
-    smart_split so flags ride the final cues.
-    """
-    if not sing_spans:
-        return
-    for c in cues:
-        start, end = c.get("start"), c.get("end")
-        if start is None or end is None or end - start <= 0:
-            continue
-        overlap = sum(max(0.0, min(end, b) - max(start, a)) for a, b in sing_spans)
-        if overlap / (end - start) >= LYRIC_MIN_OVERLAP:
-            c["lyric"] = True
-
-
-def lyric_display_text(cue: Mapping[str, Any]) -> str:
-    """Cue display text: lyric cues get the Netflix music-note wrap (note + space
-    at the start and end of the subtitle), others pass through unchanged."""
-    text = str(cue["text"])
-    return f"♪ {text} ♪" if cue.get("lyric") else text
-
-
-def _units_to_seg(units: list[dict], iso: str) -> dict:
-    """Flatten word_segments into a single segment dict for smart_split.
-
-    Units already carry punctuation from reinject_punct. No-space languages join without
-    separator; smart_split uses punctuation for sentence breaking and converts it to spaces.
-    Surfaces are read through the tolerant accessor: units legally carry their text under
-    ``text`` or ``word`` (see ``schema.Unit``), and replayed sibling JSONs use either.
-    """
-    from voxweave.core.smart_split import _unit_text
-
-    sep = "" if iso in realign.NO_SPACE_LANGS else " "
-    words = [
-        {"word": _unit_text(u), "start": u["start"], "end": u["end"]} for u in units
-    ]
-    return {
-        "start": units[0]["start"],
-        "end": units[-1]["end"],
-        "text": sep.join(_unit_text(u) for u in units),
-        "words": words,
-    }
-
-
-#: Shape version of the sibling JSON's ``segmentation`` block. Bump when a field
-#: changes meaning; a reader that does not know the version must not guess.
-SEGMENTATION_MANIFEST_VERSION = 1
-#: The segmentation engine this build runs. P3 records the pre-strangler one so a
-#: later document can be told apart from every file written before the manifest.
-SEGMENTATION_ENGINE = "legacy-v1"
-
-
-def _voxweave_version() -> str:
-    """Installed voxweave version, or ``"unknown"`` running from a source tree."""
-    try:
-        return importlib.metadata.version("voxweave")
-    except importlib.metadata.PackageNotFoundError:
-        return "unknown"
-
-
-@dataclass(frozen=True)
-class SegmentationResult:
-    """Output of :func:`segment_document`: the cue stream plus what produced it.
-
-    ``units`` is the (copied) unit stream after punctuation snapping -- the same
-    stream the callers persist as ``word_segments``, so a replay writes back what
-    it actually split. ``thresholds_used`` is the effective gap/duration mapping
-    after the optional adaptive pass, and ``diagnostics`` records which optional
-    passes ran (all values deterministic, so two identical inputs compare equal).
-
-    ``manifest`` is the ``SegmentationManifest`` the callers persist as the
-    sibling JSON's ``segmentation`` key, and ``document`` is the
-    :class:`~voxweave.core.segdoc.SegDocument` holding that same manifest object
-    -- minted before the engine runs, so it describes the inputs rather than
-    summarizing the output. Both are additive and default to ``None`` so
-    existing constructors keep working; in legacy-v1 the engine consumes
-    neither.
-
-    ``shadow`` is the BoundaryOptimizer v2 measurement artifact, present only
-    when :data:`SEG_V2_SHADOW_ENV` is on. It is *returned* rather than written
-    because ``segment_document`` is pinned pure; persisting it is a caller's or
-    the harness's job. Nothing in the shipped output depends on it -- a run with
-    the flag on and a run with it off produce byte-identical siblings.
-    """
-
-    cues: list[Cue]
-    language: str
-    units: list[dict]
-    thresholds_used: dict
-    diagnostics: dict[str, Any]
-    manifest: dict[str, Any] | None = None
-    document: SegDocument | None = None
-    shadow: dict[str, Any] | None = None
-
-
-def _copied_spans(
-    spans: Sequence[tuple[float, float]] | None,
-) -> list[tuple[float, float]] | None:
-    """Copy a span sequence to plain float tuples; empty/absent -> ``None``.
-
-    Mirrors :func:`_spans_in`: "no spans recorded" and "empty array" are the same
-    thing for every consumer of persisted spans.
-    """
-    return [(float(s), float(e)) for s, e in spans] if spans else None
-
-
-def _copied_turns(
-    turns: Sequence[tuple[float, float, str]] | None,
-) -> list[tuple[float, float, str]] | None:
-    """Copy speaker turns to plain tuples; empty/absent -> ``None`` (see :func:`_turns_in`)."""
-    return (
-        [(float(s), float(e), str(label)) for s, e, label in turns] if turns else None
-    )
-
-
-# --------------------------------------------------------- v2 shadow lane
-
-
-def _maybe_shadow_v2(
-    document: SegDocument, cues: Sequence[Cue], *, thresholds: Mapping[str, Any]
-) -> dict[str, Any] | None:
-    """Measure BoundaryOptimizer v2 beside the shipped v1 answer, or do nothing.
-
-    The flag is read FIRST and the lane (:func:`voxweave.core.shadow_v2.run_shadow`)
-    is entered only after it passes, so an off run costs one environment read
-    and a branch and never pulls a v2 module into the process at all: the lane
-    module itself imports nothing at module scope that the v1 engine does not
-    already load, and every optimizer import inside it is deferred to the call.
-    Nothing in the lane may fail the run: ``run_shadow`` records an unexpected
-    error as a typed ``error`` block and the shipped cues are returned untouched.
-    """
-    if os.environ.get(SEG_V2_SHADOW_ENV, "").strip() != "1":
-        return None
-    from voxweave.core.shadow_v2 import run_shadow
-
-    return run_shadow(document, cues, thresholds=thresholds)
-
-
-def segment_document(
-    *,
-    language: str,
-    word_segments: Sequence[Mapping[str, Any]],
-    vad_speech: Sequence[tuple[float, float]] | None = (),
-    shot_changes: Sequence[float] | None = (),
-    sing_spans: Sequence[tuple[float, float]] | None = (),
-    speaker_turns: Sequence[tuple[float, float, str]] | None = (),
-    thresholds: Mapping[str, Any] | None = None,
-    smart_split_kwargs: Mapping[str, Any] | None = None,
-    annotate_speakers: bool = False,
-) -> SegmentationResult:
-    """Turn aligned word segments into the final cue stream. Pure and deterministic.
-
-    This is the single segmentation orchestration shared by :func:`process` (the
-    post-ASR half), :func:`split` (sibling-JSON replay) and offline calibration
-    replay -- nobody re-implements the adapter logic around ``smart_split``.
-    The pass order is exactly what production runs:
-
-    1. snap sentence-break punctuation onto word boundaries (zh only),
-    2. repair stranded word tails (``repair_stranded_tails``) on the stream cue
-       formation sees; ``result.units`` keeps the raw aligner timings,
-    3. flatten the units into one segment,
-    4. resolve the effective thresholds (optional adaptive gap scaling),
-    5. record the manifest and mint the :class:`SegDocument` (see below),
-    6. ``smart_split_segments`` (content breaks + timing cleanup + shot snap),
-    7. lyric marking from ``sing_spans``,
-    8. speaker formatting from ``speaker_turns`` (which re-runs timing cleanup),
-    9. re-snap to ``shot_changes`` because step 8 moved boundaries again.
-
-    Step 5 sits *before* the engine on purpose: the document is the single
-    authority describing what this segmentation runs on, so a later engine takes
-    it as input instead of being reverse-engineered from its own output. Only
-    ``degraded`` cannot be known that early; the manifest reserves the key at
-    build time and the ledger is written into it once the capture closes, so the
-    persisted block is byte-identical either way.
-
-    With :data:`SEG_V2_SHADOW_ENV` on, the v2 optimizer is measured between steps
-    6 and 7 and its artifact is returned on ``result.shadow``. It ships nothing:
-    the cue stream, the units and the persisted manifest are byte-identical to a
-    run with the flag off.
-
-    No filesystem writes, no model loads, no ASR. Every input sequence is copied
-    before use, so callers can reuse their own lists afterwards.
-
-    ``vad_speech`` distinguishes absent (``None``/empty -> single-gap-threshold
-    degradation in ``gap_split``) from real spans; ``shot_changes``,
-    ``sing_spans`` and ``speaker_turns`` treat absent and empty alike.
-    ``thresholds`` defaults to ``config.gap_thresholds(language)``.
-    ``smart_split_kwargs`` forwards layout overrides (``max_line_length``,
-    ``max_lines``, ...) to ``smart_split_segments``; ``max_line_length`` also
-    reaches the speaker formatter so both measure the same budget. The layout
-    pair is resolved here rather than inside the engine, so the manifest records
-    the values that actually ran instead of re-deriving them from a second copy
-    of the defaulting rule.
-    """
-    from voxweave.config import gap_thresholds
-    from voxweave.core.layout import default_max_line_length, default_max_lines
-    from voxweave.core.smart_split import SplitThresholds, smart_split_segments
-
-    iso = language
-    units: list[dict] = [copy.deepcopy(dict(u)) for u in word_segments]
-    speech_spans = _copied_spans(vad_speech)
-    cuts = [float(t) for t in shot_changes] if shot_changes else None
-    sings = _copied_spans(sing_spans)
-    turns = _copied_turns(speaker_turns)
-    extra: dict[str, Any] = dict(smart_split_kwargs or {})
-    # Resolve the layout pair once and hand the resolved values to the engine:
-    # passing them explicitly is what the engine would have defaulted to anyway,
-    # so output is unchanged, and the manifest/profile can then quote what ran.
-    max_line_length = extra.get("max_line_length")
-    if max_line_length is None:
-        max_line_length = default_max_line_length(iso)
-    max_lines = extra.get("max_lines")
-    if max_lines is None:
-        max_lines = default_max_lines(iso)
-    extra["max_line_length"] = max_line_length
-    extra["max_lines"] = max_lines
-
-    # zh: Qwen punctuation can drift up to one character; snap to jieba word boundary
-    # to prevent smart_split from splitting mid-word (e.g. 数据|中心 instead of 数据中心).
-    snapped = realign.snap_break_punct(units, iso)
-    # Stranded word tails (aligner parked a word-final char across dead air) are
-    # repaired only on the stream cue formation sees; ``result.units`` keeps the
-    # raw aligner timings, so persisted siblings stay alignment evidence and
-    # every replay re-derives the repair.
-    from voxweave.core.unit_repair import repair_stranded_tails
-
-    repaired = repair_stranded_tails(snapped, iso, speech_spans)
-    seg = _units_to_seg(repaired, iso)
-    base = dict(thresholds) if thresholds is not None else gap_thresholds(iso)
-    effective = _maybe_adaptive_thresholds(base, snapped)
-    # The nine threshold values the engine really ran on: ``effective`` is the
-    # caller's mapping, which ``smart_split_segments`` normalizes through
-    # ``SplitThresholds.from_mapping`` (partial mappings fill dataclass defaults).
-    # Quoting that same normalization keeps the profile honest for a partial
-    # mapping AND keeps the recorder strict -- ``DisplayProfile.from_resolved``
-    # still raises on a missing key, it is just never handed an incomplete one.
-    resolved_th = SplitThresholds.from_mapping(effective)
-    profile_thresholds = {key: getattr(resolved_th, key) for key in THRESHOLD_KEYS}
-    # Mirror the ONLY consumer, ``align_ctc.align_blocks_full_ctc``, which masks
-    # iff the value is exactly "1". ``--no-vad-mask`` writes the literal "0",
-    # which is truthy as a string, so ``bool()`` would record masking as ON for
-    # the run that explicitly turned it off.
-    vad_mask_on = os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() == "1"
-    manifest: dict[str, Any] = {
-        "manifest_version": SEGMENTATION_MANIFEST_VERSION,
-        "engine": SEGMENTATION_ENGINE,
-        "voxweave": _voxweave_version(),
-        "python": platform.python_version(),
-        "language": iso,
-        # Verbatim: the profile's whole value is saying what ran, so no clamp and
-        # no renormalization (the tree carries two disagreeing default sets).
-        "profile": {
-            "max_line_length": max_line_length,
-            "max_lines": max_lines,
-            **profile_thresholds,
-        },
-        "env": {
-            # True only when the adaptive pass actually replaced values, not
-            # merely because the opt-in env var was set: the pass can hand back a
-            # fresh dict whose estimate happens to equal the static one.
-            "gap_adaptive": effective != base,
-            "vad_emission_mask": vad_mask_on,
-        },
-        "providers": provider_snapshot(iso),
-        # Placeholder in its final position: the ledger only exists once the run
-        # is over, but the key is inserted here so the persisted key order does
-        # not depend on when the value arrives.
-        "degraded": [],
-    }
-    # The document is the single authority for this segmentation, so it is minted
-    # before the engine runs, not reconstructed from its output. It holds the
-    # manifest by reference, which is what lets ``degraded`` be filled in below
-    # without the document and the sibling JSON drifting apart.
-    document = build_seg_document(
-        language=iso,
-        units=repaired,
-        profile=DisplayProfile.from_resolved(
-            iso,
-            profile_thresholds,
-            max_line_length=max_line_length,
-            max_lines=max_lines,
-        ),
-        manifest=manifest,
-        vad_speech=speech_spans,
-        shot_changes=cuts,
-        sing_spans=sings,
-        speaker_turns=turns,
-        text=seg["text"],
-    )
-    # Everything the language providers touch runs inside the capture, so the
-    # manifest can say which fallbacks actually fired on this document. Nothing
-    # above reaches a provider (``_units_to_seg`` joins surfaces, the threshold
-    # passes read config/env, and ``provider_snapshot`` only *reports* identity),
-    # so narrowing the window to the engine run drops no event.
-    with degradation_capture() as degraded:
-        cues = smart_split_segments(
-            [seg],
-            lang=iso,
-            speech_spans=speech_spans,
-            thresholds=effective,
-            shot_changes=cuts,
-            **extra,
-        )
-        # Immediately after the v1 answer and before any overlay: the shadow
-        # sees exactly the stream v1 produced from exactly the inputs v1 read.
-        shadow = _maybe_shadow_v2(document, cues, thresholds=effective)
-        mark_lyric_cues(cues, sings)
-        split_cue_count = len(cues)
-        if turns:
-            from voxweave.diarize import apply_speaker_format
-
-            # Same thresholds AND line budget as smart_split so speaker splits get the
-            # same timing polish and wrap width the deterministic layout just used.
-            cues = apply_speaker_format(
-                cues,
-                turns,
-                iso,
-                thresholds=effective,
-                max_line_length=max_line_length,
-                max_lines=max_lines,
-                annotate_speakers=annotate_speakers,
-            )
-            # ... and its cleanup can push a boundary back across a cut, so snap again.
-            cues = _resnap_shots(cues, cuts, effective)
-    # Fill the reserved key in place: assigning an existing key never reorders a
-    # dict, so the persisted ``segmentation`` block is byte-identical to the one
-    # built after the run.
-    manifest["degraded"] = degraded
-    if shadow is not None:
-        # AD3-5/AD4-4: two origin-typed ledgers and never one merged ``degraded``.
-        # ``production_degraded`` can only be copied here, once the outer capture
-        # has closed and the manifest's reserved key holds the real list;
-        # ``shadow_degraded`` was collected by the hook's own nested capture.
-        shadow["production_degraded"] = copy.deepcopy(manifest["degraded"])
-        # AD3-5's other half. Without it an artifact reader cannot tell which
-        # language providers the measured run actually resolved -- and a run
-        # whose ja POS tagger fell back to the character table is measuring a
-        # different boundary decision than one whose tagger loaded.
-        shadow["providers"] = copy.deepcopy(manifest["providers"])
-    diagnostics: dict[str, Any] = {
-        "unit_count": len(snapped),
-        "punct_snapped": snapped is not units,
-        "adaptive_thresholds": effective is not base,
-        "speech_span_count": len(speech_spans or ()),
-        "shot_change_count": len(cuts or ()),
-        "sing_span_count": len(sings or ()),
-        "speaker_turn_count": len(turns or ()),
-        "split_cue_count": split_cue_count,
-        "lyric_cue_count": sum(1 for c in cues if c.get("lyric")),
-        "speaker_formatted": bool(turns),
-        "shot_resnapped": bool(turns and cuts),
-        "cue_count": len(cues),
-        "shadow_v2": shadow is not None,
-    }
-    return SegmentationResult(
-        cues=cues,
-        language=iso,
-        units=snapped,
-        thresholds_used=effective,
-        diagnostics=diagnostics,
-        manifest=manifest,
-        document=document,
-        shadow=shadow,
-    )
-
-
 def _reconcile_word_segment_language(
     language: str | None,
     units: list[dict],
@@ -2218,73 +1246,6 @@ def _reconcile_word_segment_language(
     return effective_iso, rebuilt
 
 
-def voiceprints_path(path: Path) -> Path:
-    return artifacts.voiceprints_path(_artifact_owner(Path(path)))
-
-
-def speakers_suggest_path(path: Path) -> Path:
-    return artifacts.speaker_suggest_path(_artifact_owner(Path(path)))
-
-
-def speakers_mapping_path(path: Path, *, reference: Path | None = None) -> Path:
-    return artifacts.speaker_mapping_path(
-        _artifact_owner(Path(path)),
-        reference=reference,
-    )
-
-
-def inspect_speakers_mapping_path(
-    path: Path,
-    *,
-    reference: Path | None = None,
-) -> Path:
-    owner = _artifact_owner(Path(path))
-    if reference is not None and owner == Path(path):
-        from voxweave.mux import detect_subtitle_language
-
-        ref = Path(reference)
-        exact = swap_ext(ref, ".speakers.json")
-        if artifacts.path_present(exact):
-            return exact
-        if detect_subtitle_language(ref) is not None:
-            untagged = swap_ext(swap_ext(ref, ""), ".speakers.json")
-            if artifacts.path_present(untagged):
-                return untagged
-    return artifacts.inspect_speaker_mapping_path(
-        owner,
-        reference=reference,
-    )
-
-
-def _voiceprints_candidates(path: Path) -> tuple[Path, ...]:
-    return artifacts.fixed_candidates(
-        _artifact_owner(Path(path)),
-        ".voiceprints.json",
-        "voiceprints",
-    )
-
-
-def _speaker_suggest_candidates(path: Path) -> tuple[Path, ...]:
-    return artifacts.fixed_candidates(
-        _artifact_owner(Path(path)),
-        ".speakers.suggest.json",
-        "speaker_suggest",
-    )
-
-
-def _align_evidence_candidates(
-    subtitle: Path,
-    *,
-    media: Path | None = None,
-) -> tuple[Path, ...]:
-    owner = Path(media) if media is not None else _artifact_owner(Path(subtitle))
-    return artifacts.align_evidence_candidates(owner, Path(subtitle))
-
-
-def speakers_html_path(path: Path) -> Path:
-    return swap_ext(Path(path), ".speakers.html")
-
-
 def _voiceprint_capture_from_generation(
     generation: episode_transaction.FileGeneration,
 ) -> str | None:
@@ -2322,8 +1283,6 @@ def _warn_stale_speaker_names(
         mapping = inspect_speakers_mapping_path(media_path)
         if not raw_old or not artifacts.path_present(mapping):
             return
-        from voxweave.speakers import named_speaker_ids
-
         named = named_speaker_ids(mapping)
         old = [(float(s), float(e), str(label)) for s, e, label in raw_old]
     except (OSError, RuntimeError, UnicodeError, ValueError, TypeError):
@@ -2789,11 +1748,11 @@ def _finish_process_from_units(
     if machine_artifact is None:
         cleanup.extend(
             episode_transaction.ArtifactCleanup(path, "voiceprints-unlink")
-            for path in _voiceprints_candidates(media_path)
+            for path in voiceprints_candidates(media_path)
         )
     cleanup.extend(
         episode_transaction.ArtifactCleanup(path, "suggest-unlink")
-        for path in _speaker_suggest_candidates(media_path)
+        for path in speaker_suggest_candidates(media_path)
     )
     cleanup.extend(
         (
@@ -2804,7 +1763,7 @@ def _finish_process_from_units(
     )
     cleanup.extend(
         episode_transaction.ArtifactCleanup(path, "evidence-unlink")
-        for path in _align_evidence_candidates(
+        for path in align_evidence_candidates(
             swap_ext(media_path, ".vtt"), media=media_path
         )
     )
@@ -2868,13 +1827,11 @@ def _write_sdh_sidecar(
     """Detect non-speech events on the ORIGINAL mix (effects are stripped from the
     separated-vocals stem) and write ``<stem>.sdh.vtt`` (dialogue + event tags).
     Returns None when panns-inference is missing (warned, non-fatal)."""
-    from voxweave import sdh as sdh_mod
-
     rep.stage("SDH event detection (PANNs)")
     wav32 = decode_to_wav(media_path, sample_rate=SONGDET_SR)
     try:
         events = sdh_mod.detect_events(
-            wav32, progress=_progress_bridge(rep, "SDH event detection (PANNs)")
+            wav32, progress=progress_bridge(rep, "SDH event detection (PANNs)")
         )
     except ModuleNotFoundError as e:
         log.warning(
@@ -2932,7 +1889,7 @@ def split(
     rep = reporter or Reporter()
     rep.plan(("read subtitle data", "layout subtitles", "write outputs"))
     rep.step("read subtitle data")
-    artifact_owner = _artifact_owner(json_path)
+    owner = artifact_owner(json_path)
     try:
         input_bytes = json_path.read_bytes()
     except OSError as exc:
@@ -2970,12 +1927,12 @@ def split(
     log.debug("replaying %s (%s)", json_path.name, resolve_segmentation_manifest(data))
     units = data["word_segments"]
     iso, units = _reconcile_word_segment_language(data.get("language", "en"), units)
-    speech_spans = _spans_in(data.get("vad_speech"))
+    speech_spans = spans_in(data.get("vad_speech"))
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
-    sing_spans = _spans_in(data.get("sing_spans"))
-    speaker_turns = _turns_in(data.get("speaker_turns"))
+    sing_spans = spans_in(data.get("sing_spans"))
+    speaker_turns = turns_in(data.get("speaker_turns"))
     mapping_path = artifacts.speaker_mapping_path(
-        artifact_owner,
+        owner,
         reference=json_path,
     )
     mapping_generation = episode_transaction.capture_speaker_mapping(
@@ -3031,11 +1988,11 @@ def split(
     if pair_declared and voiceprint_pair is None:
         cleanup.extend(
             episode_transaction.ArtifactCleanup(path, "voiceprints-unlink")
-            for path in _voiceprints_candidates(artifact_owner)
+            for path in voiceprints_candidates(owner)
         )
         cleanup.extend(
             episode_transaction.ArtifactCleanup(path, "suggest-unlink")
-            for path in _speaker_suggest_candidates(artifact_owner)
+            for path in speaker_suggest_candidates(owner)
         )
         cleanup.append(
             episode_transaction.ArtifactCleanup(
@@ -3044,16 +2001,16 @@ def split(
         )
     cleanup.extend(
         episode_transaction.ArtifactCleanup(path, "evidence-unlink")
-        for path in _align_evidence_candidates(
+        for path in align_evidence_candidates(
             swap_ext(json_path, ".vtt"),
-            media=artifact_owner,
+            media=owner,
         )
     )
     rep.step("write outputs")
     try:
         episode_transaction.commit_primary_outputs(
             command="split",
-            episode_path=artifact_owner,
+            episode_path=owner,
             json_path=json_path,
             vtt_path=swap_ext(json_path, ".vtt"),
             expected_json=expected_json,
@@ -3092,106 +2049,24 @@ def _prepare_16k_for_align(
     media = Path(media)
     cache_owner = Path(cache_media) if cache_media is not None else media
     bound = source_fingerprint is not None
-    af = ASR_LOUDNORM if normalize else None
+    cache: Path | None = None
+    separator_identity: dict[str, object] | None = None
     if separate:
         cache = cache_vocals_path(cache_owner)
         separator_identity = backend.separator_identity() if bound else None
-        with cache_lock(cache) as cache_handle:
-            cache_hit = False
-            if cache_handle.cache_path.exists():
-                if bound:
-                    try:
-                        companion, _validated = load_cache_companion(
-                            cache_handle.companion_path
-                        )
-                        validate_cache_pair(
-                            companion,
-                            cache_handle.cache_path,
-                            media_fingerprint=source_fingerprint or "",
-                            separator=separator_identity or {},
-                        )
-                        cache_hit = True
-                    except (OSError, Phase2DataError):
-                        log.info(
-                            "vocals cache is not bound to this align source; "
-                            "re-separating: %s",
-                            cache_handle.cache_path,
-                        )
-                else:
-                    cache_hit = _vocals_cache_fresh(
-                        cache_handle.cache_path,
-                        cache_owner,
-                    )
-            if cache_hit:
-                reporter.stage("vocals cache (32k)")
-                log.info("reuse cached vocals %s", cache_handle.cache_path)
-                try:
-                    wav = _vocals_to_16k(cache_handle.cache_path, normalize=normalize)
-                except BaseException as exc:
-                    classify_cache_decode_failure(exc)
-                    raise
-                tmp.append(wav)
-                return wav
-        if not bound:
-            legacy = cache_16k_path(cache_owner)
-            if any(
-                artifacts.path_present(candidate)
-                for candidate in (
-                    legacy,
-                    cache_companion_path(legacy),
-                    Path(f"{legacy.resolve()}.lock"),
-                )
-            ):
-                with cache_lock(legacy) as legacy_handle:
-                    if legacy_handle.cache_path.exists() and _vocals_cache_fresh(
-                        legacy_handle.cache_path,
-                        cache_owner,
-                    ):
-                        reporter.stage("vocals cache (16k legacy)")
-                        log.info("reuse legacy 16k vocals %s", legacy_handle.cache_path)
-                        try:
-                            wav = decode_to_wav(
-                                legacy_handle.cache_path,
-                                audio_filter=af,
-                            )
-                        except BaseException as exc:
-                            classify_cache_decode_failure(exc)
-                            raise
-                        tmp.append(wav)
-                        return wav
-        separated_by: dict[str, object] | None = None
-        if bound:
-            fullband, vocals, wav, voc32, separated_by = _separate_to_16k_32k(
-                media,
-                reporter=reporter,
-                normalize=normalize,
-                return_separator_identity=True,
-            )
-        else:
-            fullband, vocals, wav, voc32 = _separate_to_16k_32k(
-                media, reporter=reporter, normalize=normalize
-            )
-        tmp.extend((fullband, vocals, wav, voc32))
-        try:
-            with cache_write_window(cache) as cache_handle:
-                _encode_flac(voc32, cache_handle.cache_path)
-                if bound:
-                    # Same protocol as transcribe's capture lane: without a
-                    # companion no later bound run could reuse these vocals.
-                    publish_cache_companion(
-                        cache_handle.cache_path,
-                        media_fingerprint=source_fingerprint or "",
-                        separator=separated_by or {},
-                        companion_path=cache_handle.companion_path,
-                    )
-            log.info("cached vocals 32k → %s", cache)
-        except (OSError, subprocess.CalledProcessError, Phase2DataError) as e:
-            log.warning("cache vocals failed (non-fatal): %r", e)
-        return wav
-    reporter.stage("decode 16k")
-    wav = decode_to_wav(media, audio_filter=af)
-    tmp.append(wav)
-    return wav
+    return acquire_16k(
+        media,
+        separate=separate,
+        normalize=normalize,
+        reporter=reporter,
+        tmp=tmp,
+        cache=cache,
+        owner=cache_owner,
+        fingerprint=source_fingerprint,
+        separator=separator_identity,
+        legacy_16k=True,
+        purpose="align source",
+    ).wav
 
 
 @dataclass(frozen=True)
@@ -3630,7 +2505,7 @@ def align(
             raise
 
     with align_runtime_activity("AO-03", "selected-media-identity"):
-        media = Path(media_path) if media_path else _find_subtitle_media(vtt_path)
+        media = Path(media_path) if media_path else find_subtitle_media(vtt_path)
         if media is None or not media.exists():
             raise _media_not_found_error(vtt_path)
         try:
@@ -3969,7 +2844,7 @@ def align(
                 tmp_chunks=tmp_chunks,
                 # vad_speech persisted by transcribe (same media timeline): lets the CTC
                 # full pass mask non-speech emissions; absent/empty -> no masking
-                speech_spans=_spans_in(data.get("vad_speech")),
+                speech_spans=spans_in(data.get("vad_speech")),
                 raw_call_observer=capture_raw_call,
                 qwen_invoker=invoke_qwen_call,
                 backend_invoker=invoke_backend_call,
@@ -4021,9 +2896,9 @@ def align(
 
             # Preserve vad_speech / shot_changes from the original JSON (computed by
             # transcribe from the original media; align does not recompute them).
-            keep_vad = _spans_in(data.get("vad_speech"))
+            keep_vad = spans_in(data.get("vad_speech"))
             keep_shots = [float(t) for t in data.get("shot_changes") or []] or None
-            keep_sing = _spans_in(data.get("sing_spans"))
+            keep_sing = spans_in(data.get("sing_spans"))
             keep_turns = sibling_snapshot.carrier("speaker_turns")
             # align never re-segments, so the segmentation manifest is preserved
             # verbatim (and stays absent when the document never had one).
@@ -4076,11 +2951,11 @@ def align(
             if pair_declared and not preserve_pair:
                 cleanup.extend(
                     episode_transaction.ArtifactCleanup(path, "voiceprints-unlink")
-                    for path in _voiceprints_candidates(media)
+                    for path in voiceprints_candidates(media)
                 )
                 cleanup.extend(
                     episode_transaction.ArtifactCleanup(path, "suggest-unlink")
-                    for path in _speaker_suggest_candidates(media)
+                    for path in speaker_suggest_candidates(media)
                 )
                 cleanup.append(
                     episode_transaction.ArtifactCleanup(
@@ -4106,7 +2981,7 @@ def align(
             evidence_path = artifacts.align_evidence_path(media, vtt_path)
             cleanup.extend(
                 episode_transaction.ArtifactCleanup(path, "evidence-unlink")
-                for path in _align_evidence_candidates(vtt_path, media=media)
+                for path in align_evidence_candidates(vtt_path, media=media)
                 if path != evidence_path
             )
             evidence_artifact = episode_transaction.EvidencePublication(
@@ -4218,377 +3093,3 @@ def align(
         aligned_unit_count,
     )
     return vtt_path
-
-
-def translate(
-    vtt_path: Path,
-    *,
-    to: str = "zh",
-    context: str | None = None,
-    glossary: dict[str, str] | str | None = None,
-    model: str | None = None,
-    base_url: str | None = None,
-    api_key: str | None = None,
-    reasoning_effort: str | None = None,
-    concurrency: int | None = None,
-    window_cues: int | None = None,
-    allow_partial: bool = False,
-    reporter: Reporter | None = None,
-) -> Path:
-    """Translate subtitle cues via an OpenAI-compatible endpoint; write
-    <stem>.<to>.<ext> (source untouched).
-
-    Accepts VTT/SRT/ASS/SSA; the output mirrors the input format (SSA is written
-    back as ASS). Output cue count always equals input cue count.
-
-    ``concurrency`` / ``window_cues`` (None = env > conf ``[llm]`` > built-in 8 /
-    100) run bounded windows in parallel; ``concurrency=1`` is the single
-    whole-episode request with translated-tail continuity. Missing translations
-    are retried once, sequentially. Cues still missing afterwards fail the run
-    with :class:`voxweave.translate.PartialTranslationError` and keep the
-    progress sidecar so a rerun resumes; ``allow_partial=True`` writes the file
-    anyway with those cues back-filled from the source text (logged).
-    """
-    from voxweave.subformats import require_subtitle
-
-    vtt_path = require_subtitle(Path(vtt_path))
-    # None = env VOXWEAVE_TRANSLATE_MODEL > conf [llm].model > built-in, read now
-    # rather than at import so a library caller sees the current config.
-    model = model or config.resolve_llm_model(
-        None, task_envvar="VOXWEAVE_TRANSLATE_MODEL"
-    )
-    base_url = config.resolve_llm_base_url(base_url)
-    reasoning_effort = config.resolve_llm_reasoning_effort(reasoning_effort)
-    concurrency = config.resolve_llm_concurrency(concurrency)
-    window_cues = config.resolve_llm_window_cues(window_cues)
-    ext = ".ass" if vtt_path.suffix.lower() == ".ssa" else vtt_path.suffix.lower()
-    rep = reporter or Reporter()
-    rep.plan(("read subtitles", "translate cues", "write translation"))
-    rep.step("read subtitles")
-    blocks = _load_cues(vtt_path)
-    if any(b.get("start") is None for b in blocks):
-        if ext != ".vtt":
-            raise ValueError(
-                f"{vtt_path.name} has cues without timestamps; cannot render {ext}"
-            )
-        log.warning(
-            "%s has no timestamps; translated output will be plain-text blocks (run align first)",
-            vtt_path.name,
-        )
-
-    payload = translate_mod.build_payload(blocks)
-    # Progress sidecar: completed windows survive a mid-run failure (network,
-    # rate limit), so rerunning the same command resumes instead of restarting.
-    progress_owner = _artifact_owner(vtt_path)
-    progress_path = artifacts.translation_progress_path(
-        progress_owner,
-        vtt_path,
-        to,
-    )
-    progress_candidates = artifacts.translation_progress_candidates(
-        progress_owner,
-        vtt_path,
-        to,
-    )
-    tx_kwargs: dict[str, Any] = dict(
-        to=to,
-        model=model,
-        context=context,
-        glossary=glossary,
-        base_url=base_url,
-        api_key=api_key,
-        reasoning_effort=reasoning_effort,
-        progress_path=progress_path,
-        progress_sig=translate_mod.payload_signature(payload),
-        concurrency=concurrency,
-        window_cues=window_cues,
-    )
-    rep.step("translate cues")
-    rep.stage(f"translate {len(payload)} cues -> {to}")
-    try:
-        trans = translate_mod.translate_cues(payload, **tx_kwargs, reporter=rep)
-
-        missing = translate_mod.validate_and_fill(blocks, trans)
-        if missing:
-            rep.stage(f"retry translate {len(missing)} cues")
-            retry_payload = [payload[i] for i in missing]
-            # Continuity tail: hand the retry window the already-translated cues that
-            # precede the first gap so the model keeps register/terminology consistent.
-            tail = [
-                (payload[j]["t"], trans[j])
-                for j in range(missing[0])
-                if trans.get(j, "").strip()
-            ][-translate_mod.CONTEXT_TAIL :]
-            # The retry stage is sequential (translated-tail continuity); after a
-            # concurrent main stage it keeps the operator's window size so a large
-            # gap is not re-requested as one oversized window.
-            retry_kwargs: dict[str, Any] = {**tx_kwargs, "concurrency": 1}
-            if concurrency > 1:
-                retry_kwargs["batch"] = window_cues
-            trans.update(
-                translate_mod.translate_cues(
-                    retry_payload, **retry_kwargs, tail=tail, reporter=rep
-                )
-            )
-            still = translate_mod.validate_and_fill(blocks, trans)
-            if still and not allow_partial:
-                raise translate_mod.PartialTranslationError(still, len(blocks))
-            if still:
-                log.warning(
-                    "%d of %d cues still untranslated after retry; --allow-partial: "
-                    "back-filling them with source text: %s",
-                    len(still),
-                    len(blocks),
-                    still,
-                )
-    except Exception as exc:
-        if progress_path.exists():
-            # PartialTranslationError is not an interruption: the run finished and
-            # refused to write a part-source file.
-            log.warning(
-                "%s; progress saved to %s -- rerun the same command to resume",
-                "translation incomplete"
-                if isinstance(exc, translate_mod.PartialTranslationError)
-                else "translation interrupted",
-                progress_path.name,
-            )
-        raise
-
-    rep.step("write translation")
-    rep.stage(f"write translated {ext.lstrip('.').upper()}")
-    rows = translate_mod.translated_rows(
-        blocks,
-        trans,
-        to_iso=to_iso_or(to, None),
-        voice_tags=ext == ".vtt",
-    )
-    if ext == ".vtt":
-        content = realign.render_cues(rows)
-    else:
-        from voxweave.export import render_ass, render_srt
-
-        timed = [
-            (float(s), float(e), t)
-            for s, e, t in rows
-            if s is not None and e is not None
-        ]
-        timed_blocks = [
-            translate_mod._speaker_block_for_rendered(block, text)
-            for block, (start, end, text) in zip(blocks, rows)
-            if start is not None and end is not None
-        ]
-        content = (
-            render_srt(timed, blocks=timed_blocks)
-            if ext == ".srt"
-            else render_ass(timed, blocks=timed_blocks)
-        )
-    out_path = swap_ext(vtt_path, f".{to}{ext}")
-    fsio.atomic_write_text(out_path, content)
-    try:
-        live_progress_candidates = artifacts.translation_progress_candidates(
-            progress_owner,
-            vtt_path,
-            to,
-        )
-    except (artifacts.ArtifactMarkerError, OSError) as exc:
-        live_progress_candidates = None
-        log.warning("translation progress cleanup authority changed: %s", exc)
-    cleanup_failed = live_progress_candidates != progress_candidates
-    if not cleanup_failed:
-        for candidate in (
-            path for path in progress_candidates if path != progress_path
-        ):
-            try:
-                candidate.unlink(missing_ok=True)
-            except OSError as exc:
-                cleanup_failed = True
-                log.warning(
-                    "translation progress cleanup failed for %s: %s", candidate, exc
-                )
-    if cleanup_failed:
-        log.warning(
-            "translation progress cleanup is incomplete; preserving selected lane %s",
-            progress_path,
-        )
-    else:
-        try:
-            progress_path.unlink(missing_ok=True)
-        except OSError as exc:
-            log.warning(
-                "translation progress cleanup failed for selected lane %s: %s",
-                progress_path,
-                exc,
-            )
-    log.info("wrote %s (%d cues → %s)", out_path.name, len(blocks), to)
-    return out_path
-
-
-def _warn_correction_not_realigned(vtt_path: Path, applied: Sequence[Mapping]) -> None:
-    """Warn that ``vtt_path`` was corrected but not re-aligned, listing the diff."""
-    shown = [
-        f"  #{fix.get('i')}: {fix.get('orig')!r} -> {fix.get('fixed')!r}"
-        for fix in applied[:20]
-    ]
-    if len(applied) > len(shown):
-        shown.append(f"  ... and {len(applied) - len(shown)} more")
-    log.warning(
-        "%s was corrected in place (%d change(s)) but re-alignment failed, so its"
-        " timing is stale; run `voxweave align %s` (add --media if the source is not"
-        " beside it) to refresh it. Applied changes:\n%s",
-        vtt_path.name,
-        len(applied),
-        vtt_path,
-        "\n".join(shown),
-    )
-
-
-def correct(
-    vtt_path: Path,
-    *,
-    glossary: dict[str, str] | str | None = None,
-    model: str | None = None,
-    base_url: str | None = None,
-    api_key: str | None = None,
-    apply: bool = False,
-    align_after: bool = False,
-    media_path: Path | None = None,
-    separate: bool = True,
-    normalize: bool = False,
-    lang_override: str | None = None,
-    reporter: Reporter | None = None,
-) -> dict[str, Any]:
-    """LLM ASR correction (run before align): send VTT to the LLM for a conservative diff.
-
-    Default (review): writes adjacent sidecar ``<stem>.asrfix.vtt`` plus an audit in the
-    per-media artifact cache or an existing adjacent legacy audit lane, source untouched.
-    ``apply``: overwrites the original VTT in place and writes **no audit json** (the diff is
-    shown in the summary). When ``align_after`` and a real change was applied, immediately
-    re-runs :func:`align` to refresh timestamps (text edits change word counts) and update the
-    sibling ``<stem>.json``. An explicit ``media_path`` that does not exist is rejected before
-    the LLM call; if the re-alignment fails after the in-place write, the applied diff is
-    logged (re-running correct would find nothing left to change) before the error propagates.
-
-    Returns ``{out, audit, applied, rejected, n_cues, applied_in_place, aligned}``.
-    """
-    vtt_path = require_vtt(Path(vtt_path))  # --apply overwrites the input as VTT
-    # None = env VOXWEAVE_FIX_MODEL > conf [llm].model > built-in (see translate()).
-    model = model or config.resolve_llm_model(None, task_envvar="VOXWEAVE_FIX_MODEL")
-    if apply and align_after and media_path is not None:
-        # --apply commits before the re-alignment, so a --media that align would
-        # reject must fail here, before the LLM call and the in-place overwrite.
-        if not Path(media_path).exists():
-            raise _media_not_found_error(vtt_path)
-    artifact_owner = (
-        Path(media_path) if media_path is not None else _artifact_owner(vtt_path)
-    )
-    rep = reporter or Reporter()
-    steps = ["read subtitles", "correct text", "write correction"]
-    if apply and align_after:
-        steps.append("check and refresh timing")
-    rep.plan(steps)
-    rep.step("read subtitles")
-    try:
-        vtt_input_bytes = vtt_path.read_bytes()
-    except OSError as exc:
-        _attach_canonical_failure(
-            exc,
-            kind="subtitle-snapshot-failed",
-            phase="snapshot",
-            detail_code="vtt-read",
-        )
-        raise
-    from voxweave.subformats import load_subtitle_blocks_bytes
-
-    blocks = load_subtitle_blocks_bytes(vtt_path, vtt_input_bytes)
-
-    payload = asrfix_mod.build_payload(blocks)
-    rep.step("correct text")
-    rep.stage(f"LLM correction {len(payload)} cues (model={model})")
-    fixes = asrfix_mod.correct_cues(
-        payload, model=model, glossary=glossary, base_url=base_url, api_key=api_key
-    )
-    new_texts, applied, rejected = asrfix_mod.apply_fixes(blocks, fixes)
-    rendered = asrfix_mod.render_vtt(blocks, new_texts)
-
-    rep.step("write correction")
-    audit_path: Path | None = None
-    if apply:
-        # in-place edit: overwrite the original, no sidecar json (diff lives in the summary)
-        rep.stage("overwrite VTT in place")
-        rendered_bytes = rendered.encode("utf-8")
-        episode_transaction.commit_correction(
-            episode_path=artifact_owner,
-            vtt_path=vtt_path,
-            expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
-            rendered_vtt_bytes=rendered_bytes,
-            evidence_paths=artifacts.align_evidence_candidates(
-                artifact_owner,
-                vtt_path,
-            ),
-        )
-        out_path = vtt_path
-    else:
-        rep.stage("write sidecar VTT + audit json")
-        out_path = swap_ext(vtt_path, ".asrfix.vtt")
-        audit_path = artifacts.asrfix_audit_path(artifact_owner, vtt_path)
-        fsio.atomic_write_text(out_path, rendered)
-        try:
-            fsio.atomic_write_text(
-                audit_path,
-                json.dumps(
-                    {"applied": applied, "rejected": rejected},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                private=True,
-            )
-        except Exception:
-            # Sidecar VTT + audit JSON are a pair; if the audit write fails, unlink
-            # the VTT so no orphaned half-pair is left behind (source stays untouched).
-            out_path.unlink(missing_ok=True)
-            raise
-    log.info(
-        "asrfix %s: %d applied / %d rejected → %s",
-        vtt_path.name,
-        len(applied),
-        len(rejected),
-        out_path.name,
-    )
-
-    # apply means "change the file for real" -> refresh timing right away (only worth it
-    # if something actually changed; an empty diff leaves the VTT identical).
-    aligned = False
-    if apply and align_after:
-        rep.step("check and refresh timing")
-        if not applied:
-            rep.stage("no text changes; alignment not needed")
-    if apply and align_after and applied:
-        try:
-            align(
-                out_path,
-                media_path=media_path,
-                separate=separate,
-                normalize=normalize,
-                lang_override=lang_override,
-                reporter=_NestedReporter(rep),
-                _expected_vtt_sha256=hashlib.sha256(
-                    rendered.encode("utf-8")
-                ).hexdigest(),
-            )
-        except BaseException:
-            # The text is already committed: re-running correct finds nothing left to
-            # change, so keep the diff the summary would have shown and say how to
-            # finish the job.
-            _warn_correction_not_realigned(out_path, applied)
-            raise
-        aligned = True
-
-    return {
-        "out": out_path,
-        "audit": audit_path,
-        "applied": applied,
-        "rejected": rejected,
-        "n_cues": len(blocks),
-        "applied_in_place": apply,
-        "aligned": aligned,
-    }

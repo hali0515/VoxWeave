@@ -395,12 +395,12 @@ def _episode_files(tmp_path):
 
 
 def test_fresh_vocals_cache_is_scored(tmp_path, monkeypatch):
-    from voxweave import pipeline
+    from voxweave import vocals
 
     media, cache = _episode_files(tmp_path)
     checked = []
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "_vocals_cache_fresh",
         lambda candidate, source: checked.append((candidate, source)) or True,
     )
@@ -412,10 +412,10 @@ def test_fresh_vocals_cache_is_scored(tmp_path, monkeypatch):
 
 
 def test_stale_vocals_cache_falls_back_to_the_mix(tmp_path, monkeypatch):
-    from voxweave import pipeline
+    from voxweave import vocals
 
     media, _cache = _episode_files(tmp_path)
-    monkeypatch.setattr(pipeline, "_vocals_cache_fresh", lambda _c, _m: False)
+    monkeypatch.setattr(vocals, "_vocals_cache_fresh", lambda _c, _m: False)
 
     episode = calib.load_episode(media, use_vocals_cache=True)
 

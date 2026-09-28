@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from voxweave import episode_transaction as et
+from voxweave import llm_commands
 from voxweave import fsio
 
 
@@ -127,7 +128,7 @@ def test_sdh_and_correction_are_deliverables(tmp_path, umask_022):
 
 
 def test_cache_machine_data_is_private(tmp_path, umask_022, monkeypatch):
-    from voxweave import artifacts, pipeline, translate, vocalscache
+    from voxweave import artifacts, translate, vocalscache
 
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"media")
@@ -145,11 +146,11 @@ def test_cache_machine_data_is_private(tmp_path, umask_022, monkeypatch):
     vtt = tmp_path / "episode.vtt"
     vtt.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda payload, **kw: [{"i": 0, "orig": "hello", "fixed": "hallo"}],
     )
-    pipeline.correct(vtt)
+    llm_commands.correct(vtt)
     (audit,) = tmp_path.rglob("*.asrfix.json")
     assert _mode(audit) == 0o600
     assert _mode(tmp_path / "episode.asrfix.vtt") == 0o644  # a deliverable

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from voxweave import vocals
 
 pytest.importorskip("jsonschema")
 
@@ -831,7 +832,6 @@ def test_vocals_cache_lookup_claims_nothing(tmp_path: Path) -> None:
 def test_stale_vocals_cache_is_not_reused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from voxweave import pipeline
 
     media = tmp_path / "ep.mkv"
     media.write_bytes(b"")
@@ -844,7 +844,7 @@ def test_stale_vocals_cache_is_not_reused(
         checked.append((cache, source))
         return verdict
 
-    monkeypatch.setattr(pipeline, "_vocals_cache_fresh", fresh)
+    monkeypatch.setattr(vocals, "_vocals_cache_fresh", fresh)
 
     verdict = False
     assert capture._fresh_vocals_cache(media) is None
@@ -856,12 +856,12 @@ def test_stale_vocals_cache_is_not_reused(
 def test_managed_vocals_cache_is_found_by_inspection(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from voxweave import artifacts, pipeline
+    from voxweave import artifacts
 
     media = tmp_path / "ep.mkv"
     media.write_bytes(b"")
     managed = artifacts.claim_paths(media).vocals_cache
     managed.write_bytes(b"flac")
-    monkeypatch.setattr(pipeline, "_vocals_cache_fresh", lambda _c, _m: True)
+    monkeypatch.setattr(vocals, "_vocals_cache_fresh", lambda _c, _m: True)
 
     assert capture._fresh_vocals_cache(media) == managed

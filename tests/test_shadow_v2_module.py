@@ -1,11 +1,12 @@
-"""The v2 shadow lane's home is ``voxweave.core.shadow_v2``; ``pipeline`` keeps the hook.
+"""``voxweave.core.shadow_v2`` holds the v2 shadow lane; ``segmentation`` keeps the hook.
 
 The move is a seam, and a seam only holds if both sides agree on it:
 
 * the flag and lane names ``pipeline`` re-exports are the very objects
   ``shadow_v2`` defines, so a reader of either module sees one truth;
-* ``shadow_v2`` never imports ``pipeline`` at module scope -- the pipeline
-  imports it eagerly for the constants, so the reverse edge would be a cycle;
+* ``shadow_v2`` never imports ``pipeline`` or ``segmentation`` -- both import
+  it eagerly for the constants, so the reverse edge would be a cycle; the
+  overlays it replays come from the ``core.overlay`` leaf;
 * the hook resolves the lane from ``shadow_v2``'s globals at call time, so a
   monkeypatch on ``shadow_v2`` is what a run actually executes, and a flag-off
   run never reaches the lane at all.
@@ -20,11 +21,11 @@ from typing import Any
 from tests.test_shadow_hook import _case_plain, _segment
 from voxweave import pipeline
 from voxweave.core import shadow_v2
+from voxweave.core.segdoc import THRESHOLD_KEYS
 
 RE_EXPORTS = (
     "SEG_V2_SHADOW_ENV",
     "SHADOW_LANE_CORE",
-    "SHADOW_LANE_DELIVERY",
     "SHADOW_LANE_DELIVERY_LEGACY",
     "SHADOW_LANE_FINALIZER",
     "SHADOW_LANE_LEGACY_DISPLAY",
@@ -34,7 +35,9 @@ RE_EXPORTS = (
 def test_pipeline_re_exports_the_lane_constants_by_identity() -> None:
     for name in RE_EXPORTS:
         assert getattr(pipeline, name) is getattr(shadow_v2, name), name
-    assert shadow_v2.SHADOW_LANE_DELIVERY == shadow_v2.SHADOW_LANE_DELIVERY_LEGACY
+    # The P4 compatibility alias is retired: one name per lane.
+    assert not hasattr(shadow_v2, "SHADOW_LANE_DELIVERY")
+    assert not hasattr(pipeline, "SHADOW_LANE_DELIVERY")
 
 
 def _module_scope_imports(tree: ast.Module) -> list[ast.Import | ast.ImportFrom]:
@@ -65,6 +68,20 @@ def test_shadow_v2_never_imports_pipeline_at_module_scope() -> None:
             assert "pipeline" not in {alias.name for alias in node.names}
 
 
+def test_shadow_v2_imports_neither_pipeline_nor_segmentation_anywhere() -> None:
+    upward = {"voxweave.pipeline", "voxweave.segmentation"}
+    for node in ast.walk(ast.parse(inspect.getsource(shadow_v2))):
+        if isinstance(node, ast.Import):
+            names = {alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            names = {node.module or ""}
+            if node.module == "voxweave":
+                names |= {f"voxweave.{alias.name}" for alias in node.names}
+        else:
+            continue
+        assert not names & upward, ast.dump(node)
+
+
 def test_hook_resolves_the_lane_from_shadow_v2_at_call_time(monkeypatch) -> None:
     calls: list[dict[str, Any]] = []
 
@@ -87,7 +104,10 @@ def test_hook_resolves_the_lane_from_shadow_v2_at_call_time(monkeypatch) -> None
     assert on.shadow["kind"] == "sentinel"
     assert len(calls) == 1
     assert calls[0]["document"] is on.document
-    assert calls[0]["thresholds"] == on.thresholds_used
+    # the lane measures with the thresholds v1 ran, which the manifest quotes
+    assert calls[0]["thresholds"] == {
+        key: on.manifest["profile"][key] for key in THRESHOLD_KEYS
+    }
     # ``segment_document`` still stamps its two origin-typed blocks onto
     # whatever the lane returned; nothing else in the hook touches the artifact.
     assert set(on.shadow) == {"kind", "production_degraded", "providers"}

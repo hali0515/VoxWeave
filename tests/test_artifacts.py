@@ -10,7 +10,9 @@ from pathlib import Path
 import pytest
 
 from voxweave import artifacts, pipeline
+from voxweave import sidecars
 from voxweave.voiceepisode import episode_lock, episode_lock_path
+from voxweave import vocals
 
 
 def _media(path: Path) -> Path:
@@ -193,7 +195,7 @@ def test_derived_subtitles_share_media_owner_and_lock(tmp_path):
     ):
         subtitle = tmp_path / name
         subtitle.write_text("WEBVTT\n", encoding="utf-8")
-        assert pipeline._artifact_owner(subtitle) == media
+        assert sidecars.artifact_owner(subtitle) == media
         assert episode_lock_path(subtitle) == expected
 
 
@@ -205,9 +207,9 @@ def test_exact_derived_stem_media_wins_and_unknown_tag_is_not_stripped(tmp_path)
     derived.write_text("WEBVTT\n", encoding="utf-8")
     unknown.write_text("WEBVTT\n", encoding="utf-8")
 
-    assert pipeline._artifact_owner(derived) == exact
-    assert pipeline._artifact_owner(unknown) == unknown
-    assert pipeline._artifact_owner(unknown) != base
+    assert sidecars.artifact_owner(derived) == exact
+    assert sidecars.artifact_owner(unknown) == unknown
+    assert sidecars.artifact_owner(unknown) != base
 
 
 def test_same_stem_media_collision_uses_one_publication_lock_domain(tmp_path):
@@ -277,7 +279,7 @@ def test_cached_media_owner_remains_discoverable_after_media_is_removed(tmp_path
     transcript.write_text('{"language":"en","word_segments":[]}', encoding="utf-8")
     media.unlink()
 
-    assert pipeline._artifact_owner(transcript) == media.resolve()
+    assert sidecars.artifact_owner(transcript) == media.resolve()
     assert (
         pipeline.inspect_speakers_mapping_path(transcript, reference=transcript)
         == paths.speaker_mapping
@@ -298,7 +300,7 @@ def test_transcribe_debug_sink_is_rooted_in_the_artifact_claim(tmp_path, monkeyp
 
     monkeypatch.setattr(pipeline, "FileDebugSink", CapturingSink)
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "decode_to_wav",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(Stop("stop after sink")),
     )

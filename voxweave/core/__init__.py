@@ -13,6 +13,8 @@ jieba, fugashi) that ``providers`` records.
   gap-aware atom packing) and the ``smart_split_segments`` orchestrator.
 - ``timing`` — timing-only polish over the final cue stream (glue/merge,
   duration cleanup, shot-change snapping).
+- ``overlay`` — the overlays after the engine (lyric flags, shot re-snap,
+  the lyric display wrap) and the persisted span/turn inputs they read.
 - ``unit_repair`` — pre-segmentation repair of aligner artifacts in the unit
   stream.
 - ``kinsoku`` / ``breakpoints`` / ``conjunctions`` / ``gap_split`` /
@@ -32,7 +34,7 @@ which imports upward: ``align_seed`` imports ``voxweave.align_acquisition``,
 ``align_distribution``, ``align_failures`` and ``realign``; ``align_compare``
 imports ``voxweave.align_delta_registry``; ``finalizer`` lazily imports
 ``voxweave.align_acquisition``; ``shadow_v2`` lazily imports
-``voxweave.pipeline`` and ``voxweave.diarize``.
+``voxweave.diarize``.
 
 - ``boundary_lattice`` / ``boundary_cost`` / ``boundary_v2`` — the hard-legal
   lattice, the cost model and the exact whole-interval solver.

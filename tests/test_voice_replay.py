@@ -7,6 +7,7 @@ import pytest
 from click.testing import CliRunner
 
 from voxweave import backend, episode_transaction, pipeline
+from voxweave import vocals
 from voxweave.cli import cli
 from voxweave.mediasnapshot import SnapshotUnavailable
 from voxweave.voicebase import media_fingerprint
@@ -436,11 +437,11 @@ def test_bound_align_rejects_duration_only_and_legacy_cache(tmp_path, monkeypatc
         Path(destination).write_bytes(b"new cache")
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
-    monkeypatch.setattr(pipeline, "_probe_duration", lambda _path: 10.0)
-    monkeypatch.setattr(pipeline, "_separate_to_16k_32k", fake_separate)
-    monkeypatch.setattr(pipeline, "_encode_flac", fake_encode)
+    monkeypatch.setattr(vocals, "_probe_duration", lambda _path: 10.0)
+    monkeypatch.setattr(vocals, "_separate_to_16k_32k", fake_separate)
+    monkeypatch.setattr(vocals, "_encode_flac", fake_encode)
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "decode_to_wav",
         lambda *_args, **_kwargs: pytest.fail("unbound cache must not be decoded"),
     )
@@ -498,10 +499,11 @@ def test_bound_align_validates_cache_while_lock_is_held(tmp_path, monkeypatch):
         return decoded
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
-    monkeypatch.setattr(pipeline, "cache_lock", tracking_lock)
+    monkeypatch.setattr(vocals, "cache_lock", tracking_lock)
     monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "_separate_to_16k_32k",
         lambda *_args, **_kwargs: pytest.fail("validated cache must be a hit"),
     )

@@ -199,10 +199,10 @@ def parse_range(spec: str) -> Window:
 def sibling_json_for(media: Path) -> Path:
     """The sibling ``.json`` next to ``media`` (``--with-units auto``).
 
-    Uses ``pipeline.swap_ext``: ``Path.with_suffix`` truncates at the first
+    Uses ``paths.swap_ext``: ``Path.with_suffix`` truncates at the first
     interior dot, which real release filenames are full of.
     """
-    from voxweave.pipeline import swap_ext
+    from voxweave.paths import swap_ext
 
     return swap_ext(Path(media), ".json")
 
@@ -639,12 +639,12 @@ def scenario_out(args: argparse.Namespace) -> Path:
 def _fresh_vocals_cache(media: Path) -> Path | None:
     """A fresh separated-vocals cache for ``media``, looked up without side effects.
 
-    ``pipeline.cache_vocals_path`` claims (creates) the artifact directory; a
+    ``vocals.cache_vocals_path`` claims (creates) the artifact directory; a
     capture only reads, so it inspects the legacy and the managed location and
     applies the pipeline's duration check before trusting either.
     """
     from voxweave import artifacts
-    from voxweave.pipeline import CACHE_DIRNAME, _vocals_cache_fresh
+    from voxweave.vocals import CACHE_DIRNAME, _vocals_cache_fresh
 
     legacy = media.parent / CACHE_DIRNAME / f"{media.stem}.vocals.32k.flac"
     managed = artifacts.inspect_paths(media)
@@ -669,12 +669,12 @@ def capture_songdet(args: argparse.Namespace) -> Path:
     from voxweave import backend, songdet
     from voxweave.chunking import decode_to_wav, silence_gaps, vad_speech_segments
     from voxweave.pipeline import (
-        ASR_LOUDNORM,
         MAX_CHUNK_SEC,
         MIN_SONG_SKIP_SEC,
         SONG_FINE_SILENCE_MS,
         plan_song_skip,
     )
+    from voxweave.vocals import ASR_LOUDNORM
 
     media = Path(args.media)
     af = ASR_LOUDNORM if args.normalize else None

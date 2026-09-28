@@ -13,12 +13,11 @@ import logging
 import re
 from pathlib import Path
 
+from voxweave import sidecars
+from voxweave.paths import SUBTITLE_EXTS
 from voxweave.realign import _parse_ts, parse_vtt_blocks
 
 log = logging.getLogger("voxweave")
-
-# Subtitle formats the file-based commands (export/translate/pack/burn) accept.
-SUBTITLE_EXTS = (".vtt", ".srt", ".ass", ".ssa")
 
 # Fallback Events field order (the standard v4.00+ layout) when no Format line
 # precedes the first Dialogue line.
@@ -266,7 +265,6 @@ def load_subtitle_blocks_bytes(path: Path, data: bytes) -> list[dict]:
     if is_ass:
         blocks = parse_ass_blocks(text)
     elif p.suffix.lower() == ".srt":
-        from voxweave.pipeline import inspect_speakers_mapping_path
         from voxweave.speakers import load_speaker_display_names
 
         # The mapping only lets "Name: line" speaker labels be recognised; a
@@ -274,7 +272,7 @@ def load_subtitle_blocks_bytes(path: Path, data: bytes) -> list[dict]:
         known_names: list[str] = []
         label = p.name
         try:
-            mapping_path = inspect_speakers_mapping_path(p, reference=p)
+            mapping_path = sidecars.inspect_speakers_mapping_path(p, reference=p)
             label = mapping_path.name
             if mapping_path.exists():
                 known_names = load_speaker_display_names(mapping_path)

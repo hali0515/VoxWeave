@@ -18,6 +18,7 @@ import pytest
 from tests.test_calib_shadow import calib, cc
 from tests.test_shadow_hook import _case_speakers, _segment
 from voxweave import backend, pipeline
+from voxweave.core import overlay
 from voxweave.core import shadow_v2
 
 
@@ -462,4 +463,4 @@ def test_authorized_deferral_allowlist_is_exact_and_unknown_stops_are_invalid() 
 def test_shadow_normalization_is_detached_from_production_turns(monkeypatch) -> None:
     monkeypatch.setenv(pipeline.SEG_V2_SHADOW_ENV, "1")
     raw = [(2.0, 1.0, "A"), (3.0, 3.0, "B"), (math.inf, 4.0, "C")]
-    assert pipeline._turns_in(raw) == raw
+    assert overlay.turns_in(raw) == raw

@@ -1342,7 +1342,7 @@ def test_replay_is_deterministic(corpus_path: Path) -> None:
         first = calib.replay(case)
         second = calib.replay(case)
         assert cc.canonical_digest(first.cues) == cc.canonical_digest(second.cues)
-        assert first.thresholds_used == second.thresholds_used
+        assert first.manifest == second.manifest
 
 
 def test_replay_uses_the_captured_thresholds_not_the_environment(
@@ -1356,7 +1356,7 @@ def test_replay_uses_the_captured_thresholds_not_the_environment(
     monkeypatch.setenv("VOXWEAVE_CPS", "1.0")
     after = calib.replay(case)
     assert cc.canonical_digest(before.cues) == cc.canonical_digest(after.cues)
-    assert after.thresholds_used["max_cue_s"] == pytest.approx(7.0)
+    assert after.manifest["profile"]["max_cue_s"] == pytest.approx(7.0)
 
 
 def test_replay_pins_gap_adaptive_to_the_captured_value(

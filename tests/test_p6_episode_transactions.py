@@ -7,6 +7,9 @@ import json
 import pytest
 
 from voxweave import artifacts, episode_transaction, pipeline, sdh, songdet
+from voxweave import llm_commands
+from voxweave import paths
+from voxweave import vocals
 
 
 def _vtt(text: str = "hello", *, settings: str = "") -> str:
@@ -38,7 +41,7 @@ def test_align_expected_generation_rejects_before_media_or_backend(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("generation mismatch reached media/backend work")
 
-    monkeypatch.setattr(pipeline, "_find_sibling_media", forbidden)
+    monkeypatch.setattr(paths, "find_sibling_media", forbidden)
     with pytest.raises(InputStaleError) as caught:
         pipeline.align(vtt, _expected_vtt_sha256="0" * 64)
     assert caught.value.failure.detail_code == "vtt-generation"
@@ -59,9 +62,9 @@ def test_correct_apply_stale_generation_mutates_nothing(tmp_path, monkeypatch):
         vtt.write_text(concurrent, encoding="utf-8")
         return [{"i": 0, "orig": "hello", "fixed": "hallo", "reason": "typo"}]
 
-    monkeypatch.setattr(pipeline.asrfix_mod, "correct_cues", concurrent_fix)
+    monkeypatch.setattr(llm_commands.asrfix_mod, "correct_cues", concurrent_fix)
     with pytest.raises(InputStaleError) as caught:
-        pipeline.correct(vtt, apply=True)
+        llm_commands.correct(vtt, apply=True)
     assert caught.value.failure.detail_code == "correct-generation"
     assert vtt.read_text(encoding="utf-8") == concurrent
     assert evidence.read_text(encoding="utf-8") == '{"kept":true}\n'
@@ -80,14 +83,14 @@ def test_correct_all_rejected_canonical_rewrite_deletes_stale_evidence(
     cached_evidence = artifacts.claim_paths(media).align_evidence(vtt)
     cached_evidence.write_text("cached stale", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {"i": 0, "orig": "wrong", "fixed": "ignored", "reason": "bad quote"}
         ],
     )
 
-    result = pipeline.correct(vtt, apply=True, align_after=True)
+    result = llm_commands.correct(vtt, apply=True, align_after=True)
 
     assert result["applied"] == []
     assert result["aligned"] is False
@@ -112,10 +115,10 @@ def test_correct_byte_identical_rewrite_retains_evidence(tmp_path, monkeypatch):
     evidence = tmp_path / "episode.align-evidence.json"
     evidence.write_text("still-current", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod, "correct_cues", lambda _payload, **_kwargs: []
+        llm_commands.asrfix_mod, "correct_cues", lambda _payload, **_kwargs: []
     )
 
-    result = pipeline.correct(vtt, apply=True, align_after=True)
+    result = llm_commands.correct(vtt, apply=True, align_after=True)
 
     assert vtt.read_text(encoding="utf-8") == original
     assert evidence.read_text(encoding="utf-8") == "still-current"
@@ -137,7 +140,7 @@ def test_correct_retires_cached_evidence_created_at_commit_seam(tmp_path, monkey
         return real_commit(**kwargs)
 
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "typo"}
@@ -149,7 +152,7 @@ def test_correct_retires_cached_evidence_created_at_commit_seam(tmp_path, monkey
         create_evidence_then_commit,
     )
 
-    pipeline.correct(vtt, apply=True)
+    llm_commands.correct(vtt, apply=True)
 
     assert not cached.exists()
 
@@ -160,7 +163,7 @@ def test_correct_real_fix_hands_exact_committed_hash_to_align(tmp_path, monkeypa
     evidence = tmp_path / "episode.align-evidence.json"
     evidence.write_text("stale", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "typo"}
@@ -174,7 +177,7 @@ def test_correct_real_fix_hands_exact_committed_hash_to_align(tmp_path, monkeypa
         return path
 
     monkeypatch.setattr(pipeline, "align", fake_align)
-    result = pipeline.correct(vtt, apply=True, align_after=True)
+    result = llm_commands.correct(vtt, apply=True, align_after=True)
 
     committed = vtt.read_bytes()
     assert seen["path"] == vtt
@@ -193,6 +196,7 @@ def test_process_injected_words_is_media_free_with_absent_nominal_path(
 
     monkeypatch.setattr(pipeline, "transcribe", forbidden)
     monkeypatch.setattr(pipeline, "decode_to_wav", forbidden)
+    monkeypatch.setattr(vocals, "decode_to_wav", forbidden)
     monkeypatch.setattr(pipeline, "media_fingerprint", forbidden)
     monkeypatch.setattr(songdet, "release_model", forbidden)
 
@@ -374,6 +378,7 @@ def test_sdh_generation_change_retains_existing_auxiliary(
         lambda *_args, **_kwargs: ("en", _units(), None, [], [], None),
     )
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(songdet, "release_model", lambda: released.append("panns"))
 
     def concurrent_event_detection(*_args, **_kwargs):

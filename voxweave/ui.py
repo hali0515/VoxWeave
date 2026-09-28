@@ -24,6 +24,7 @@ from rich.progress import (
 from rich.table import Column, Table
 from rich.text import Text
 
+from voxweave.paths import swap_ext
 from voxweave.progress import Reporter
 
 # Logs/errors to stderr; result paths to stdout so `voxweave x | ...` pipelines work cleanly.
@@ -424,8 +425,6 @@ def summary_panel(
     normalized: bool = False,
 ) -> None:
     """Print transcription success panel: paths, language, cue count, and flags."""
-    from voxweave.pipeline import swap_ext
-
     vtt = Path(vtt_path)
     json_path = swap_ext(vtt, ".json")  # sibling derivation: never Path.with_suffix
     lines = [f"VTT  : {vtt}", f"JSON : {json_path}"]

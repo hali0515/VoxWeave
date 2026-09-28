@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from voxweave import backend, chunking, diarize, pipeline, shotdet, songdet
+from voxweave import llm_commands
+from voxweave import vocals
 from voxweave.progress import Reporter
 
 
@@ -122,14 +124,15 @@ def stub_transcription(tmp_path, monkeypatch):
     # model needs a token even though pyannote itself is faked below.
     monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     monkeypatch.setattr(pipeline, "decode_to_wav", audio)
+    monkeypatch.setattr(vocals, "decode_to_wav", audio)
     monkeypatch.setattr(pipeline, "slice_wav", audio)
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "_separate_to_16k_32k",
         lambda *_a, **_k: tuple(audio() for _ in range(4)),
     )
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "_encode_flac",
         lambda source, destination: destination.write_bytes(source.read_bytes()),
     )
@@ -312,12 +315,12 @@ def test_process_cache_hit_keeps_audio_preparation_step(
     cache = tmp_path / "vocals.flac"
     cache.write_bytes(b"cached audio")
     monkeypatch.setattr(pipeline, "cache_vocals_path", lambda _media: cache)
-    monkeypatch.setattr(pipeline, "_vocals_cache_fresh", lambda *_a: True)
+    monkeypatch.setattr(vocals, "_vocals_cache_fresh", lambda *_a: True)
 
     def unexpected_separation(*_args, **_kwargs):
         pytest.fail("a cache hit must not run separation")
 
-    monkeypatch.setattr(pipeline, "_separate_to_16k_32k", unexpected_separation)
+    monkeypatch.setattr(vocals, "_separate_to_16k_32k", unexpected_separation)
     rep = RecordingReporter()
     pipeline.process(media, skip_songs=True, shot_snap=False, reporter=rep)
 
@@ -359,9 +362,9 @@ def test_translate_retry_stays_in_the_same_step(tmp_path, monkeypatch):
         rep.advance()
         return {0: "hello translated"} if len(calls) == 1 else {1: "world translated"}
 
-    monkeypatch.setattr(pipeline.translate_mod, "translate_cues", translate)
+    monkeypatch.setattr(llm_commands.translate_mod, "translate_cues", translate)
     original = vtt.read_bytes()
-    out = pipeline.translate(vtt, reporter=rep)
+    out = llm_commands.translate(vtt, reporter=rep)
 
     rep.assert_complete(("read subtitles", "translate cues", "write translation"))
     assert len(calls) == 2
@@ -387,7 +390,9 @@ def test_correct_nested_alignment_preserves_outer_plan(
     rep = RecordingReporter()
     fixes = [{"i": 0, "orig": "hello", "fixed": "hallo", "reason": "test"}]
     monkeypatch.setattr(
-        pipeline.asrfix_mod, "correct_cues", lambda *_a, **_k: fixes if changed else []
+        llm_commands.asrfix_mod,
+        "correct_cues",
+        lambda *_a, **_k: fixes if changed else [],
     )
     aligned = []
 
@@ -404,7 +409,9 @@ def test_correct_nested_alignment_preserves_outer_plan(
         return path
 
     monkeypatch.setattr(pipeline, "align", align)
-    result = pipeline.correct(vtt, apply=apply, align_after=align_after, reporter=rep)
+    result = llm_commands.correct(
+        vtt, apply=apply, align_after=align_after, reporter=rep
+    )
 
     expected = ["read subtitles", "correct text", "write correction"]
     if apply and align_after:

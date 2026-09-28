@@ -223,9 +223,9 @@ def pause_evidence(
     to a confirmed pause.
 
     One honest scoping note about that third value. The segmentation pipeline
-    cannot currently produce it: ``pipeline._copied_spans`` -- the only writer of
+    cannot currently produce it: ``overlay.copied_spans`` -- the only writer of
     ``SegDocument.vad_speech`` on that path -- collapses an empty span list to
-    ``None``, mirroring ``_spans_in``'s persisted-sibling contract that "no spans
+    ``None``, mirroring ``spans_in``'s persisted-sibling contract that "no spans
     recorded" and "empty array" mean the same thing. So the empty-list branch is
     reachable only from a direct caller (a test, or a future capture path that
     distinguishes them). It is implemented rather than removed because the

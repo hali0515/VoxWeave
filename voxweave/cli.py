@@ -7,7 +7,7 @@ from pathlib import Path
 
 import rich_click as click
 
-from voxweave import artifacts, config, pipeline
+from voxweave import artifacts, config, llm_commands, pipeline
 from voxweave.cli_compat import (
     HELP_REQUESTED,
     DefaultGroup,
@@ -800,7 +800,7 @@ def cmd_translate(
         api_key_env, model, base_url, task_envvar="VOXWEAVE_TRANSLATE_MODEL"
     )
     out = _run(
-        lambda rep: pipeline.translate(
+        lambda rep: llm_commands.translate(
             vtt,
             to=to,
             context=context,
@@ -1087,7 +1087,7 @@ def cmd_correct(
         api_key_env, model, base_url, task_envvar="VOXWEAVE_FIX_MODEL"
     )
     res = _run(
-        lambda rep: pipeline.correct(
+        lambda rep: llm_commands.correct(
             vtt,
             glossary=load_glossary(glossary) if glossary else None,
             api_key=api_key,

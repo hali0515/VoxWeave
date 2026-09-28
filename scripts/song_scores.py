@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 
 from voxweave import artifacts, songdet
-from voxweave.pipeline import CACHE_DIRNAME
+from voxweave.vocals import CACHE_DIRNAME
 
 
 def _vocals_source(media: Path) -> Path | None:

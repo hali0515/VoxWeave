@@ -25,6 +25,7 @@ import json
 import logging
 
 from voxweave import config
+from voxweave.core.overlay import wrap_lyric
 from voxweave.realign import render_cues
 from voxweave.speakers import voice_text_for_block
 from voxweave.translate import (
@@ -254,9 +255,7 @@ def render_vtt(blocks: list[dict], texts: list[str]) -> str:
             (
                 block.get("start"),
                 block.get("end"),
-                voice_text_for_block(
-                    f"♪ {text} ♪" if block.get("lyric") else text, block
-                ),
+                voice_text_for_block(wrap_lyric(text, block.get("lyric")), block),
             )
             for block, text in zip(blocks, texts)
         ]
