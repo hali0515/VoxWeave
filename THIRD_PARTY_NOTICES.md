@@ -57,14 +57,6 @@ License 2.0; the license text is shipped as
 `voxweave/vendor/speechbrain_ecapa/LICENSE` and each module header lists the
 upstream files and the modifications.
 
-### Subtitle splitting — `voxweave/core/smart_split.py`
-
-The subtitle-splitting pipeline (`split_at_sentence_end`,
-`split_long_cues_with_word_timings`, etc.) is adapted from
-[dashed/whisperx-subtitles-replicate](https://github.com/dashed/whisperx-subtitles-replicate)
-(`predict.py`), which is MIT-licensed. Modified to add CJK / no-space language
-awareness and the voxweave-specific cue heuristics.
-
 ## Models downloaded at runtime (NOT bundled in this repository)
 
 voxweave orchestrates the following models; users download the weights themselves.
