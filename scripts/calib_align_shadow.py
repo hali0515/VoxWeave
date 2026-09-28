@@ -110,10 +110,12 @@ def _load_json(path: Path) -> Any:
             parse_constant=_reject_constant,
             object_pairs_hook=_object_without_duplicates,
         )
-    except HarnessInvalid:
-        raise
+    except HarnessInvalid as exc:
+        raise HarnessInvalid(f"{path}: {exc}") from exc
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HarnessInvalid("JSON input is unavailable or invalid") from exc
+        raise HarnessInvalid(
+            f"{path}: JSON input is unavailable or invalid ({exc})"
+        ) from exc
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -123,9 +125,20 @@ def _canonical_bytes(value: object) -> bytes:
 
 
 def _write_json(path: Path, value: object) -> None:
+    """Write via a same-directory temp file + ``os.replace``: never a torn report."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(_canonical_bytes(value))
+    payload = _canonical_bytes(value)
+    descriptor, temporary = tempfile.mkstemp(
+        dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+        os.replace(temporary, target)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -157,16 +170,16 @@ def _closed_mapping(
 
 def _safe_path(root: Path, raw: object) -> Path:
     if type(raw) is not str or not raw:
-        raise HarnessInvalid("case path is empty or non-string")
+        raise HarnessInvalid(f"case path {raw!r} is empty or non-string")
     relative = Path(raw)
     if relative.is_absolute() or ".." in relative.parts:
-        raise HarnessInvalid("case path is absolute or traverses its root")
+        raise HarnessInvalid(f"case path {raw!r} is absolute or traverses {root}")
     base = root.resolve()
     candidate = (base / relative).resolve()
     try:
         candidate.relative_to(base)
     except ValueError as exc:
-        raise HarnessInvalid("case path escapes its root") from exc
+        raise HarnessInvalid(f"case path {raw!r} escapes {base}") from exc
     return candidate
 
 
@@ -174,15 +187,18 @@ def _validate_file_fact(root: Path, value: object) -> Mapping[str, Any]:
     fact = _closed_mapping(value, ("path", "size", "sha256"), label="file fact")
     path = _safe_path(root, fact["path"])
     if not path.is_file():
-        raise HarnessInvalid("declared corpus file is missing")
+        raise HarnessInvalid(f"declared corpus file is missing: {path}")
     raw = path.read_bytes()
-    if (
-        type(fact["size"]) is not int
-        or fact["size"] != len(raw)
-        or not _is_sha256(fact["sha256"])
-        or fact["sha256"] != _sha256_bytes(raw)
-    ):
-        raise HarnessInvalid("declared corpus file fact does not match")
+    if type(fact["size"]) is not int or fact["size"] != len(raw):
+        raise HarnessInvalid(
+            f"declared corpus file size does not match: {path} "
+            f"(declared {fact['size']!r}, actual {len(raw)})"
+        )
+    if not _is_sha256(fact["sha256"]) or fact["sha256"] != _sha256_bytes(raw):
+        raise HarnessInvalid(
+            f"declared corpus file sha256 does not match: {path} "
+            f"(declared {fact['sha256']!r}, actual {_sha256_bytes(raw)!r})"
+        )
     return fact
 
 
@@ -271,8 +287,16 @@ def _validate_manifest(path: Path) -> Mapping[str, Any]:
         ("python_major_minor", "platform", "locale", "timezone", "hash_seed"),
         label="environment",
     )
-    if dict(environment) != _environment_projection():
-        raise HarnessInvalid("runtime environment does not match the manifest")
+    observed = _environment_projection()
+    drift = [
+        f"{key}: manifest pins {environment[key]!r}, runtime has {observed[key]!r}"
+        for key in observed
+        if environment[key] != observed[key]
+    ]
+    if drift:
+        raise HarnessInvalid(
+            "runtime environment does not match the manifest (" + "; ".join(drift) + ")"
+        )
     cases = manifest["cases"]
     if not isinstance(cases, list) or not cases:
         raise HarnessInvalid("manifest cases are missing")
@@ -733,7 +757,7 @@ def _worker_command(
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
-        "_worker",
+        WORKER_COMMAND,
         "--manifest",
         str(manifest_path),
         "--case-id",
@@ -950,7 +974,13 @@ def _check_baseline(
     manifest_path: Path,
     manifest: Mapping[str, Any],
     report: Mapping[str, Any],
-) -> bool:
+) -> list[str]:
+    """Return how each case differs from the baseline (empty when it matches).
+
+    A header mismatch -- the manifest, a schema or the registry changed -- is not
+    a regression: this run has no standing against that baseline, so it raises
+    :class:`HarnessInvalid` (exit 2) instead.
+    """
     baseline = _closed_mapping(
         _load_json(baseline_path),
         (
@@ -962,7 +992,7 @@ def _check_baseline(
             "registry_sha256",
             "cases",
         ),
-        label="baseline",
+        label=f"baseline {baseline_path}",
     )
     expected_header = {
         "schema_version": 1,
@@ -972,21 +1002,102 @@ def _check_baseline(
         "report_schema_sha256": _sha256_path(REPORT_SCHEMA_PATH),
         "registry_sha256": manifest["registry_sha256"],
     }
-    return all(baseline[key] == value for key, value in expected_header.items()) and (
-        baseline["cases"] == _baseline_cases(report)
-    )
+    for key, value in expected_header.items():
+        if baseline[key] != value:
+            raise HarnessInvalid(
+                f"baseline {baseline_path} {key} is {baseline[key]!r} but this run "
+                f"has {value!r}; it was recorded against different inputs"
+            )
+    actual_cases = _baseline_cases(report)
+    expected_cases = baseline["cases"]
+    if not isinstance(expected_cases, Mapping) or set(expected_cases) != set(
+        actual_cases
+    ):
+        raise HarnessInvalid(
+            f"baseline {baseline_path} cases do not name the manifest's case ids"
+        )
+    differences: list[str] = []
+    for case_id, actual in actual_cases.items():
+        expected = expected_cases[case_id]
+        if expected == actual:
+            continue
+        fields = (
+            sorted(
+                key
+                for key in set(expected) | set(actual)
+                if expected.get(key) != actual.get(key)
+            )
+            if isinstance(expected, Mapping)
+            else ["the whole case entry"]
+        )
+        differences.append(f"{case_id}: {', '.join(fields)} differ from the baseline")
+    return differences
+
+
+def _run_labels(report: Mapping[str, Any], outcome: str) -> list[str]:
+    labels: list[str] = []
+    for case in report["cases"]:
+        for run in case["runs"]:
+            if run["outcome"] != outcome:
+                continue
+            shadow = "on" if run["shadow_enabled"] else "off"
+            label = f"{case['id']} (shadow {shadow}, observer {run['observer']}"
+            if run["injection"]:
+                label += f", injection {run['injection']}"
+            labels.append(label + ")")
+    return labels
+
+
+def _print_problem(message: str, details: Sequence[str]) -> None:
+    print(message, file=sys.stderr)
+    for detail in details:
+        print(f"  - {detail}", file=sys.stderr)
+
+
+#: Internal subcommand each case variant runs under, in a fresh interpreter.
+#: Dispatched before the public parser so it never shows up in ``--help``.
+WORKER_COMMAND = "_worker"
+
+_COMMAND_HELP = {
+    "report": "run every manifest case through the public align API and write "
+    "the report",
+    "check": "run the report, then compare it with a tracked baseline (read-only)",
+}
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Run the tracked align-shadow corpus through the public align "
+        "API and verify each case's outcome.",
+        epilog="exit codes: 0 = every case matched; 1 = a case (or, for check, the "
+        "baseline) differs; 2 = invalid input or the harness could not measure.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     for command in ("report", "check"):
-        child = subparsers.add_parser(command)
-        child.add_argument("--manifest", type=Path, required=True)
-        child.add_argument("--json-out", type=Path, required=True)
+        child = subparsers.add_parser(
+            command, help=_COMMAND_HELP[command], description=_COMMAND_HELP[command]
+        )
+        child.add_argument(
+            "--manifest", type=Path, required=True, help="align-shadow manifest JSON"
+        )
+        child.add_argument(
+            "--json-out", type=Path, required=True, help="report JSON to write"
+        )
         if command == "check":
-            child.add_argument("--baseline", type=Path, required=True)
-    worker = subparsers.add_parser("_worker", help=argparse.SUPPRESS)
+            child.add_argument(
+                "--baseline",
+                type=Path,
+                required=True,
+                help="tracked baseline JSON to compare against",
+            )
+    return parser
+
+
+def _worker_parser() -> argparse.ArgumentParser:
+    worker = argparse.ArgumentParser(
+        prog=f"{Path(__file__).name} {WORKER_COMMAND}",
+        description="Internal: run one case variant and write its result JSON.",
+    )
     worker.add_argument("--manifest", type=Path, required=True)
     worker.add_argument("--case-id", required=True)
     worker.add_argument("--shadow", choices=("0", "1"), required=True)
@@ -995,7 +1106,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     worker.add_argument("--result-out", type=Path, required=True)
     worker.add_argument("--injection", action="append", default=[])
-    return parser
+    return worker
 
 
 def main(
@@ -1003,31 +1114,59 @@ def main(
     *,
     _injections: frozenset[str] = frozenset(),
 ) -> int:
-    arguments = _parser().parse_args(argv)
-    if arguments.command == "_worker":
-        return _worker_main(arguments)
-    if _injections - ALLOWED_INJECTIONS:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv[:1] == [WORKER_COMMAND]:
+        return _worker_main(_worker_parser().parse_args(raw_argv[1:]))
+    arguments = _parser().parse_args(raw_argv)
+    unknown = sorted(_injections - ALLOWED_INJECTIONS)
+    if unknown:
+        print(
+            f"align-shadow harness invalid: unknown injection {unknown}",
+            file=sys.stderr,
+        )
         return 2
     try:
         manifest_path = arguments.manifest.resolve()
         manifest = _validate_manifest(manifest_path)
         report = _build_report(manifest_path, manifest, _injections)
         _write_json(arguments.json_out, report)
+        written = f"(report: {arguments.json_out})"
         if report["infrastructure_invalid_count"]:
+            count = report["infrastructure_invalid_count"]
+            _print_problem(
+                f"align-shadow harness invalid: {count} run(s) could not be measured"
+                f" {written}",
+                _run_labels(report, "infrastructure-invalid"),
+            )
             return 2
         if report["correctness_failure_count"]:
+            count = report["correctness_failure_count"]
+            _print_problem(
+                f"align-shadow correctness failure: {count} run(s) differ from the"
+                f" manifest's expected outcome {written}",
+                _run_labels(report, "correctness-failure"),
+            )
             return 1
-        if arguments.command == "check" and not _check_baseline(
-            arguments.baseline.resolve(), manifest_path, manifest, report
-        ):
-            return 1
+        if arguments.command == "check":
+            baseline_path = arguments.baseline.resolve()
+            differences = _check_baseline(
+                baseline_path, manifest_path, manifest, report
+            )
+            if differences:
+                _print_problem(
+                    f"align-shadow check failed: {len(differences)} case(s) differ"
+                    f" from {baseline_path} {written}",
+                    differences,
+                )
+                return 1
         return 0
     except HarnessInvalid as exc:
         print(f"align-shadow harness invalid: {exc}", file=sys.stderr)
         return 2
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
         print(
-            f"align-shadow harness unavailable: {type(exc).__name__}", file=sys.stderr
+            f"align-shadow harness unavailable: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
         )
         return 2
 

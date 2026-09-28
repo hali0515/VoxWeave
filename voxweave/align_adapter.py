@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import secrets
 import threading
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -252,7 +253,7 @@ def _adapter_result(
     object.__setattr__(result, "legacy", legacy)
     object.__setattr__(result, "v2", v2)
     object.__setattr__(result, "v2_status", status)
-    object.__setattr__(result, "_binding", __import__("secrets").token_hex(32))
+    object.__setattr__(result, "_binding", secrets.token_hex(32))
     with _LOCK:
         _ADAPTERS[id(result)] = _AdapterRecord(
             context,
@@ -470,7 +471,7 @@ def _w1_delivery(
             )
         )
     ordered_units = tuple(getattr(seed, "ordered_units", ()))
-    if seed_blocks is None or len(seed_blocks) != len(finalized.cues):
+    if len(seed_blocks) != len(finalized.cues):
         raise AlignAdapterError(
             CanonicalFailure("finalizer-output-invalid", "w1-finalizer", "cue-schema")
         )
@@ -741,12 +742,9 @@ def issue_align_evaluated_result(
     record = _adapter_record(context, adapter_result)
     if not isinstance(evidence_core, EvidenceCore):
         raise TypeError("evidence_core must be an EvidenceCore")
-    evidence_receipt = getattr(
-        evidence_core, "receipt_digest", evidence_core.core_digest
-    )
     if (
         evidence_core.context_content_digest != context.context_content_digest
-        or adapter_result.receipt_digest != evidence_receipt
+        or adapter_result.receipt_digest != evidence_core.receipt_digest
     ):
         raise ValueError("evaluated evidence is not bound to the adapter receipt")
 
@@ -794,8 +792,6 @@ def issue_align_evaluated_result(
         )
         raise AlignAdapterError(failure)
 
-    import secrets
-
     result = object.__new__(AlignEvaluatedResult)
     object.__setattr__(result, "context_content_digest", context.context_content_digest)
     object.__setattr__(result, "receipt_digest", adapter_result.receipt_digest)
@@ -822,6 +818,18 @@ def issue_align_evaluated_result(
             result._issuance_nonce,
         )
     return result
+
+
+def _release_align_results(context: IssuedAlignContext) -> None:
+    """Forget the adapter and evaluated results issued for ``context``.
+
+    See :func:`voxweave.align_orchestration.release_align_selection`.
+    """
+    with _LOCK:
+        for key in [key for key, row in _ADAPTERS.items() if row.context is context]:
+            del _ADAPTERS[key]
+        for key in [key for key, row in _EVALUATED.items() if row.context is context]:
+            del _EVALUATED[key]
 
 
 def _evaluated_record(

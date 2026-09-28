@@ -88,6 +88,21 @@ def test_dash_cue_normalizes_prewrapped_text_to_two_lines():
         assert _vis_width(ln) <= 42
 
 
+def test_persisted_turns_in_any_order_format_like_sorted_turns():
+    # Turns read back from a sibling JSON may be lists and in any order; the
+    # public entries sort them, so the overlap scan's early exit stays valid.
+    shuffled = [list(turn) for turn in reversed(EN_DASH_TURNS)]
+    expected = format_speaker_cues([_en_dash_cue()], EN_DASH_TURNS, "en")
+
+    assert expected[0]["text"].startswith("-")
+    assert format_speaker_cues([_en_dash_cue()], shuffled, "en") == expected
+    assert apply_speaker_format(
+        [_en_dash_cue()], shuffled, "en", annotate_speakers=True
+    ) == apply_speaker_format(
+        [_en_dash_cue()], EN_DASH_TURNS, "en", annotate_speakers=True
+    )
+
+
 def test_max_lines_one_override_reaches_dual_gate():
     at_two = apply_speaker_format([_en_dash_cue()], EN_DASH_TURNS, "en", max_lines=2)
     at_one = apply_speaker_format([_en_dash_cue()], EN_DASH_TURNS, "en", max_lines=1)

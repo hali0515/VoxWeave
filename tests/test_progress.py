@@ -1,6 +1,6 @@
 """Reporter interface contract + pipeline progress bridge (no rich / no models)."""
 
-from voxweave import pipeline, progress
+from voxweave import progress
 from voxweave.progress import Reporter
 
 
@@ -50,7 +50,7 @@ def test_chunks_chunk_done_delegate_to_task_advance():
 def test_progress_bridge_starts_task_once_then_advances():
     # backend/songdet sequential callbacks (done=1,2,3, total=3) -> first call creates task, subsequent calls advance(1)
     rep = _RecordingReporter()
-    cb = pipeline._progress_bridge(rep, "人声分离 (Roformer)")
+    cb = progress.progress_bridge(rep, "人声分离 (Roformer)")
     cb(1, 3)
     cb(2, 3)
     cb(3, 3)
@@ -106,7 +106,7 @@ def test_nested_reporter_keeps_the_clock_on_the_enclosing_step(monkeypatch):
     clock = _Clock()
     monkeypatch.setattr(progress.time, "monotonic", clock)
     parent = Reporter()
-    nested = pipeline._NestedReporter(parent)
+    nested = progress.NestedReporter(parent)
     parent.step("check and refresh timing")
     clock.now += 4.0
     nested.plan(["read subtitles", "align subtitles"])

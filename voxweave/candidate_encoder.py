@@ -40,6 +40,12 @@ class CandidateNotRequested:
 @dataclass(frozen=True)
 class CandidateFailure:
     failure: CanonicalFailure
+    # The exception that stopped the encoder, kept so selection can report it.
+    cause: BaseException | None = field(default=None, compare=False, repr=False)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> CandidateFailure:
+        # Exceptions are not reliably deep-copyable; the cause is shared, not copied.
+        return CandidateFailure(deepcopy(self.failure, memo), self.cause)
 
 
 @dataclass(frozen=True)
@@ -119,8 +125,9 @@ _LOCK = threading.RLock()
 
 
 class SelectedCandidateError(RuntimeError):
-    def __init__(self, failure: CanonicalFailure):
-        super().__init__(f"{failure.kind}/{failure.phase}/{failure.detail_code}")
+    def __init__(self, failure: CanonicalFailure, problem: str | None = None):
+        code = f"{failure.kind}/{failure.phase}/{failure.detail_code}"
+        super().__init__(code if problem is None else f"{problem} [{code}]")
         self.failure = failure
 
 
@@ -168,19 +175,21 @@ def _encode_family(
 
 def _encoder_failure(
     detail_code: Literal["main-json-encode", "vtt-encode"] = "main-json-encode",
+    cause: BaseException | None = None,
 ) -> CandidateFailure:
     return CandidateFailure(
-        CanonicalFailure("preencode-failed", "encoder", detail_code)
+        CanonicalFailure("preencode-failed", "encoder", detail_code), cause
     )
 
 
-def _renderer_stage_failure() -> CandidateFailure:
+def _renderer_stage_failure(cause: BaseException | None = None) -> CandidateFailure:
     return CandidateFailure(
         CanonicalFailure(
             "shadow-internal-error",
             "renderer-stage",
             "renderer-stage",
-        )
+        ),
+        cause,
     )
 
 
@@ -202,9 +211,9 @@ def encode_align_candidates(
             record.projection_inputs,
         )
     except AlignProjectionEncodeError as exc:
-        legacy = _encoder_failure(exc.detail_code)
-    except Exception:
-        legacy = _encoder_failure()
+        legacy = _encoder_failure(exc.detail_code, exc.__cause__ or exc)
+    except Exception as exc:
+        legacy = _encoder_failure(cause=exc)
     outcomes.append(("legacy-v1", legacy))
 
     if result.v2_status.kind == "not-requested":
@@ -227,9 +236,9 @@ def encode_align_candidates(
                 record.projection_inputs,
             )
         except AlignProjectionEncodeError as exc:
-            boundary = _encoder_failure(exc.detail_code)
-        except Exception:
-            boundary = _renderer_stage_failure()
+            boundary = _encoder_failure(exc.detail_code, exc.__cause__ or exc)
+        except Exception as exc:
+            boundary = _renderer_stage_failure(exc)
     outcomes.append(("boundary-v2", boundary))
 
     return _issue_candidate_set(context, result, tuple(outcomes))
@@ -296,14 +305,30 @@ def _select_candidate(
     _candidate_set_record(context, candidate_set)
     outcome = candidate_set.outcome_for(family)
     if not isinstance(outcome, EncodedCandidate):
-        raise SelectedCandidateError(
+        error = SelectedCandidateError(
             CanonicalFailure(
                 "selected-render-invalid",
                 "renderer",
                 "selected-candidate-missing",
-            )
+            ),
+            _missing_candidate_problem(family, outcome),
+        )
+        raise error from (
+            outcome.cause if isinstance(outcome, CandidateFailure) else None
         )
     return outcome
+
+
+def _missing_candidate_problem(family: EngineFamily, outcome: CandidateOutcome) -> str:
+    """Say why the ``family`` subtitle output is missing, cause first."""
+    if not isinstance(outcome, CandidateFailure):
+        return f"the {family} subtitle output was not built"
+    failure = outcome.failure
+    reason = f"{failure.kind}/{failure.phase}/{failure.detail_code}"
+    if outcome.cause is not None:
+        cause = str(outcome.cause) or type(outcome.cause).__name__
+        reason = f"{cause}; {reason}"
+    return f"could not render the {family} subtitle output ({reason})"
 
 
 def _render_failure(
@@ -391,6 +416,22 @@ def verify_selected_align_projection(
             verified,
         )
     return verified
+
+
+def _release_candidates(context: IssuedContext) -> None:
+    """Forget the candidate sets, encodings and verified bindings of ``context``.
+
+    See :func:`voxweave.align_orchestration.release_align_selection`.
+    """
+    with _LOCK:
+        for key in [key for key, row in _SETS.items() if row.context is context]:
+            del _SETS[key]
+        for key in [key for key, row in _ENCODED.items() if row.context is context]:
+            del _ENCODED[key]
+        for binding in [
+            binding for binding, row in _VERIFIED.items() if row.context is context
+        ]:
+            del _VERIFIED[binding]
 
 
 def _verified_hash_binding(

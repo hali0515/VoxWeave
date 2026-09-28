@@ -29,8 +29,17 @@ therefore scores the pre-snap duration and treats snap displacement as its own
 cut-local feature.
 
 :class:`DisplayTimingPreview` is the swap seam. P4 ships
-:class:`LegacyCleanupPreview`, a faithful mirror of today's pass; P5 hands in
-the finalizer's own preview and the cost model does not change a line.
+:class:`LegacyCleanupPreview`, a mirror of the pass (built with
+``two_frame_extension_floor=True`` it is a faithful mirror of today's pass; the
+no-argument instance keeps the extension clamp experimental_policy_1 was frozen
+with); P5 hands in the finalizer's own preview. The seam is not transparent to
+the cost model:
+``boundary_cost`` branches on ``isinstance(preview, LegacyCleanupPreview)``.
+Under the legacy preview it prices layout (lines, balance, width) from the
+packed edge and ``rendered_layout`` and reading load from the edge's
+punctuation-stripped display text, which keeps experimental_policy_1 frozen;
+under any other preview it prices both from the preview's own ``final_text``
+and ``reading_chars``. Only the duration terms read the preview uniformly.
 """
 
 from __future__ import annotations
@@ -164,10 +173,21 @@ class LegacyCleanupPreview:
     ``next_start``, which is what makes this per-candidate mirror possible at
     all rather than merely approximate.
 
-    Stateless and frozen: one instance can be shared, and its identity carries
-    no configuration (the thresholds ride on every call, because the optimizer
-    may score against more than one profile).
+    Stateless and frozen: one instance can be shared. Its one field picks which
+    extension clamp it mirrors; the thresholds ride on every call, because the
+    optimizer may score against more than one profile.
+
+    ``two_frame_extension_floor`` is that clamp. Today's pass stops the
+    min-duration, linger and tail-pad extensions ``TWO_FRAME_S`` before the next
+    cue's start; ``LegacyCleanupPreview(two_frame_extension_floor=True)`` is the
+    bit-for-bit mirror of it. The no-argument instance keeps the clamp AT
+    ``next_start`` that the pass used when experimental_policy_1 was frozen:
+    ``boundary_v2`` builds that policy on the no-argument seam, and
+    ``boundary_cost`` treats that seam as the policy's identity, so following
+    the pass there would change the policy's partitions under the same name.
     """
+
+    two_frame_extension_floor: bool = False
 
     def preview_display_span(
         self,
@@ -207,7 +227,10 @@ class LegacyCleanupPreview:
             if next_start is None:
                 cur_end = want
             elif next_start - cur_end > TWO_FRAME_S:
-                cur_end = min(want, next_start)
+                if self.two_frame_extension_floor:
+                    cur_end = min(want, next_start - TWO_FRAME_S)
+                else:  # experimental_policy_1's frozen clamp
+                    cur_end = min(want, next_start)
             # else: the gap is already at/under the 2-frame floor -- no extension.
 
         # chaining: close small inter-cue gaps to 2 frames

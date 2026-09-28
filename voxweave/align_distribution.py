@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Literal
@@ -48,7 +48,6 @@ _PRODUCTION_CALL_VALUES = (1_000_000, 4_000_000, 1_000_000, 64_000_000)
 _PRODUCTION_JOB_VALUES = (4_096, 4_000_000, 16_000_000, 4_000_000, 256_000_000)
 
 COUNTER_ORDER = ("calls", "states", "edges", "intervals", "normalize_chars")
-SCOPE_ORDER = ("job", "call")
 
 
 @dataclass(frozen=True)
@@ -91,6 +90,10 @@ class AuthorityLimitProfileError(RuntimeError):
     def __init__(self, detail_code: str, message: str):
         super().__init__(message)
         self.detail_code = detail_code
+        # The limit profile is bound to the align context it was captured for.
+        self.failure = CanonicalFailure(
+            "context-authority-invalid", "context", detail_code
+        )
 
 
 def _profile_digest(
@@ -377,18 +380,23 @@ def project_route_mismatch(
     for expected in range(count):
         if expected not in present:
             return RouteMismatch("gap", None, expected, None)
-    for duplicated in range(count):
-        positions = [
-            position for position, index in enumerate(observed) if index == duplicated
-        ]
-        if len(positions) > 1:
-            position = positions[1]
-            return RouteMismatch(
-                "overlap",
-                position,
-                position if position < count else None,
-                observed[position],
-            )
+    # Second claim position of each delivery index; the lowest duplicated index wins.
+    second_position: dict[int, int] = {}
+    seen: set[int] = set()
+    for position, index in enumerate(observed):
+        if index in seen:
+            second_position.setdefault(index, position)
+        else:
+            seen.add(index)
+    duplicated = [index for index in second_position if 0 <= index < count]
+    if duplicated:
+        position = second_position[min(duplicated)]
+        return RouteMismatch(
+            "overlap",
+            position,
+            position if position < count else None,
+            observed[position],
+        )
     for position, index in enumerate(observed):
         if index < 0 or index >= count:
             return RouteMismatch(
@@ -733,6 +741,12 @@ def _run_allocator_lane(
                         _join_surfaces(surfaces, lo, hi, iso)
                     )
                 if block_cache[index] != interval_cache[key]:
+                    # normalize_text only grows when a unit is appended: the one
+                    # context-sensitive rule (a "." or "," survives before a digit)
+                    # can only revive the old last character.  Once the interval is
+                    # longer than the block, no longer interval from lo can match.
+                    if len(interval_cache[key]) > len(block_cache[index]):
+                        break
                     continue
                 if hi not in ways[index + 1]:
                     denied = budget.reserve(
@@ -860,6 +874,12 @@ def _run_verifier_lane(
                         _join_surfaces(surfaces, lower, upper, iso)
                     )
                 if normalized_blocks[block_index] != normalized_intervals[interval]:
+                    # Same monotone stop as the allocator: a normalized interval
+                    # never shrinks as upper grows, so an overlong one ends the scan.
+                    if len(normalized_intervals[interval]) > len(
+                        normalized_blocks[block_index]
+                    ):
+                        break
                     continue
                 if upper not in reachable[block_index + 1]:
                     denied = budget.reserve(
@@ -911,23 +931,32 @@ def _surface_chars(
     ) + sum(len(surface) for surface in call.unit_surfaces)
 
 
+_ClaimPositions = dict[tuple[str, int], tuple[int, ...]]
+
+
+def _claim_positions(claims: tuple[RouteClaim, ...]) -> _ClaimPositions:
+    """Route-claim positions per ``(owner_kind, owner_index)``, in claim order.
+
+    Built once per job so per-call and per-skip receipts do not rescan every claim.
+    """
+    grouped: dict[tuple[str, int], list[int]] = {}
+    for position, claim in enumerate(claims):
+        grouped.setdefault((claim.owner_kind, claim.owner_index), []).append(position)
+    return {owner: tuple(positions) for owner, positions in grouped.items()}
+
+
 def _base_call_receipt(
     call: AuthorityCallInput,
-    claims: tuple[RouteClaim, ...],
+    positions_by_owner: _ClaimPositions,
     blocks_by_source: dict[int, AuthorityBlock],
     limits: CallWorkLimits,
     *,
     prior_terminal: bool = False,
 ) -> AuthorityCallWorkReceipt:
-    positions = tuple(
-        position
-        for position, claim in enumerate(claims)
-        if claim.owner_kind == "call" and claim.owner_index == call.call_index
-    )
     lane_status = "not-run-prior-terminal" if prior_terminal else "not-run"
     return AuthorityCallWorkReceipt(
         call_index=call.call_index,
-        route_claim_positions=positions,
+        route_claim_positions=positions_by_owner.get(("call", call.call_index), ()),
         source_block_indices=call.source_block_indices,
         raw_node_range=call.raw_node_range,
         block_count=len(call.source_block_indices),
@@ -945,15 +974,12 @@ def _base_call_receipt(
 
 
 def _skip_receipts(
-    skipped: tuple[AuthoritySkippedBlockInput, ...], claims: tuple[RouteClaim, ...]
+    skipped: tuple[AuthoritySkippedBlockInput, ...],
+    positions_by_owner: _ClaimPositions,
 ) -> tuple[AuthoritySkippedBlockReceipt, ...]:
     return tuple(
         AuthoritySkippedBlockReceipt(
-            route_claim_positions=tuple(
-                position
-                for position, claim in enumerate(claims)
-                if claim.owner_kind == "skip" and claim.owner_index == skip_index
-            ),
+            route_claim_positions=positions_by_owner.get(("skip", skip_index), ()),
             delivery_index=skip.delivery_index,
             source_index=skip.source_index,
             route_skip_reason=skip.route_skip_reason,
@@ -1063,7 +1089,6 @@ def _build_authority_distribution_impl(
     route_claims: tuple[RouteClaim, ...],
     iso: str,
     profile: AuthorityLimitProfile,
-    _verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None = None,
 ) -> AuthorityDistributionReceipt:
     """Run preflight, producer, and verifier under one sealed effective profile."""
     effective_profile = validate_authority_limit_profile(profile)
@@ -1090,11 +1115,8 @@ def _build_authority_distribution_impl(
     mismatch = project_route_mismatch(
         route_claims, delivery_route, calls, skipped_blocks
     )
-    base_rows = tuple(
-        _base_call_receipt(call, route_claims, blocks_by_source, effective_profile.call)
-        for call in calls
-    )
-    skip_rows = _skip_receipts(skipped_blocks, route_claims)
+    positions_by_owner = _claim_positions(route_claims)
+    skip_rows = _skip_receipts(skipped_blocks, positions_by_owner)
     all_raw_ids = tuple(unit_id for call in calls for unit_id in call.raw_unit_ids)
     preflight_status: str | None = None
     terminal_call: int | None = None
@@ -1118,7 +1140,12 @@ def _build_authority_distribution_impl(
             totals=ZERO_COUNTERS,
             terminal_call_index=terminal_call,
             denied=None,
-            call_rows=base_rows,
+            call_rows=tuple(
+                _base_call_receipt(
+                    call, positions_by_owner, blocks_by_source, effective_profile.call
+                )
+                for call in calls
+            ),
             skip_rows=skip_rows,
         )
         reasons = project_authority_reasons(work)
@@ -1145,7 +1172,7 @@ def _build_authority_distribution_impl(
             rows.append(
                 _base_call_receipt(
                     call,
-                    route_claims,
+                    positions_by_owner,
                     blocks_by_source,
                     effective_profile.call,
                     prior_terminal=True,
@@ -1155,7 +1182,7 @@ def _build_authority_distribution_impl(
         call_denied = budget.reserve_call(call.call_index)
         if call_denied is not None:
             row = _base_call_receipt(
-                call, route_claims, blocks_by_source, effective_profile.call
+                call, positions_by_owner, blocks_by_source, effective_profile.call
             )
             rows.append(
                 replace(
@@ -1176,7 +1203,7 @@ def _build_authority_distribution_impl(
         )
         allocator = _run_allocator_lane(call_blocks, call.unit_surfaces, iso, budget)
         row = _base_call_receipt(
-            call, route_claims, blocks_by_source, effective_profile.call
+            call, positions_by_owner, blocks_by_source, effective_profile.call
         )
         allocator_receipt = WorkLaneReceipt(
             "complete" if allocator.status == "unique" else allocator.status,
@@ -1213,10 +1240,7 @@ def _build_authority_distribution_impl(
             terminal_call_index = call.call_index
             stopped = True
             continue
-        verifier_cuts = verifier.cuts
-        if verifier_cuts is not None and _verifier_cut_mutator is not None:
-            verifier_cuts = _verifier_cut_mutator(verifier_cuts)
-        if verifier.status != "unique" or verifier_cuts != allocator.cuts:
+        if verifier.status != "unique" or verifier.cuts != allocator.cuts:
             rows.append(
                 replace(
                     row,
@@ -1319,7 +1343,6 @@ def _build_context_authority_distribution(
     route_claims: tuple[RouteClaim, ...],
     iso: str,
     _limits: AuthorityLimitProfile,
-    _verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None = None,
 ) -> AuthorityDistributionReceipt:
     """Private context-bound path used only by the sole acquisition issuer."""
     return _build_authority_distribution_impl(
@@ -1330,7 +1353,6 @@ def _build_context_authority_distribution(
         route_claims=route_claims,
         iso=iso,
         profile=_limits,
-        _verifier_cut_mutator=_verifier_cut_mutator,
     )
 
 
@@ -1415,8 +1437,17 @@ class LegacyDistributionResult:
 
 
 def _legacy_count(text: str, iso: str) -> int:
+    """Owner size exactly as ``align_common._distribute_units`` counts it.
+
+    The legacy lane mirrors that slicer, so it uses the aligners' own no-space set
+    (``realign.NO_SPACE_LANGS``), not the wider layout set: a th/lo/my full pass is
+    sliced by words there, and counting characters here would disagree with the
+    delivered units.
+    """
+    from voxweave.realign import NO_SPACE_LANGS
+
     stripped = (text or "").strip()
-    if iso in LANGUAGES_WITHOUT_SPACES:
+    if iso in NO_SPACE_LANGS:
         return sum(1 for character in stripped if character.isalnum())
     return len(stripped.split())
 

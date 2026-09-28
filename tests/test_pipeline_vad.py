@@ -1,28 +1,6 @@
 # tests/test_pipeline_vad.py
 import json
 from pathlib import Path
-from voxweave import pipeline
-
-
-def test_write_siblings_persists_vad_speech(tmp_path: Path):
-    src = tmp_path / "ep.mkv"
-    src.write_bytes(b"x")
-    cues = [{"text": "a", "start": 0.0, "end": 1.0}]
-    units = [{"text": "a", "start": 0.0, "end": 1.0}]
-    vad = [(0.0, 1.0), (2.0, 3.0)]
-    pipeline._write_siblings(src, cues, units, "en", vad_speech=vad)
-    data = json.loads((tmp_path / "ep.json").read_text())
-    assert data["vad_speech"] == [[0.0, 1.0], [2.0, 3.0]]
-
-
-def test_write_siblings_empty_vad_when_none(tmp_path: Path):
-    src = tmp_path / "ep2.mkv"
-    src.write_bytes(b"x")
-    cues = [{"text": "a", "start": 0.0, "end": 1.0}]
-    units = [{"text": "a", "start": 0.0, "end": 1.0}]
-    pipeline._write_siblings(src, cues, units, "en")  # no vad_speech kwarg
-    data = json.loads((tmp_path / "ep2.json").read_text())
-    assert data["vad_speech"] == []
 
 
 def test_split_uses_persisted_vad(tmp_path: Path, monkeypatch):

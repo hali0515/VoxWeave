@@ -1,8 +1,9 @@
 """Closed RAT-2 evidence binding and independent durable verification.
 
-The producer receives only already-issued context/acquisition values and the
-independently projected EvidenceCore. The path verifier deliberately does not
-consult any in-memory issuer registry.
+The binder receives only already-issued context/acquisition values and the
+producer EvidenceCore, which AO-16 has already checked against the independent
+reference projection. The path verifier deliberately does not consult any
+in-memory issuer registry.
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ from voxweave.align_snapshot import (
 )
 from voxweave.candidate_encoder import _verified_hash_binding
 from voxweave.engine_registry import EngineFamily
+from voxweave.paths import find_sibling_media, find_subtitle_media, swap_ext
 from voxweave.voicebase import media_fingerprint
 
 
@@ -331,10 +333,6 @@ class SelectedOutputs:
     json_present: Literal[True]
     json_sha256: str
 
-    @property
-    def main_json_sha256(self) -> str:
-        return self.json_sha256
-
 
 @dataclass(frozen=True, init=False)
 class FinalAlignEvidence:
@@ -367,7 +365,12 @@ _LOCK = threading.RLock()
 
 class EvidenceBindingError(RuntimeError):
     def __init__(self, failure: CanonicalFailure):
-        super().__init__(f"{failure.kind}/{failure.phase}/{failure.detail_code}")
+        super().__init__(
+            f"{failure.kind}/{failure.phase}/{failure.detail_code}: align stopped"
+            " because its alignment evidence failed an internal consistency check;"
+            " no subtitle file was written. This is a VoxWeave bug, not a problem"
+            " with your files; please report it with this message"
+        )
         self.failure = failure
 
 
@@ -375,6 +378,16 @@ def _binding_failure(detail: str = "evidence-binding") -> EvidenceBindingError:
     return EvidenceBindingError(
         CanonicalFailure("final-evidence-invalid", "evidence-bind", detail)
     )
+
+
+def _release_evidence(context: IssuedAlignContext) -> None:
+    """Forget the evidence bound for ``context``.
+
+    See :func:`voxweave.align_orchestration.release_align_selection`.
+    """
+    with _LOCK:
+        for key in [key for key, row in _EVIDENCE.items() if row.context is context]:
+            del _EVIDENCE[key]
 
 
 def _is_sha256(value: object) -> bool:
@@ -996,10 +1009,9 @@ def _validate_physical_calls(
                     or not math.isfinite(end)
                 ):
                     _invalid("legacy retained unit bounds are not finite numbers")
-                if start > end:
-                    _invalid(
-                        f"legacy retained unit {owner_index}:{unit_index} is reversed"
-                    )
+                # No start <= end check: the legacy lane records the aligner's units
+                # verbatim, and an aligner may return a reversed one. The strict
+                # authority lane is what judges it (and invalidates authority).
                 if kind == "identity":
                     absolute_start, absolute_end = start, end
                 else:
@@ -1010,7 +1022,6 @@ def _validate_physical_calls(
                     or type(absolute_end) not in (int, float)
                     or not math.isfinite(absolute_start)
                     or not math.isfinite(absolute_end)
-                    or absolute_start > absolute_end
                 ):
                     _invalid("legacy absolute unit projection is invalid")
                 absolute_owner.append(
@@ -1308,6 +1319,7 @@ def _project_route_mismatch(
             "expected_delivery_index": position,
             "observed_delivery_index": observed[position],
         }
+    skip_ordinal = 0
     for position, claim in enumerate(claims):
         route = route_entries[position]
         owner_kind = claim["owner_kind"]
@@ -1316,9 +1328,12 @@ def _project_route_mismatch(
             owner_kind == "skip" and owner_index < len(skips)
         )
         expected_kind = "skip" if route["action"] == "qwen-skip" else "call"
-        expected_owner = (
-            route["delivery_index"] if expected_kind == "skip" else route["call_index"]
-        )
+        if expected_kind == "skip":
+            # A skip is owned by its ordinal among the plan's qwen-skip entries.
+            expected_owner = skip_ordinal
+            skip_ordinal += 1
+        else:
+            expected_owner = route["call_index"]
         if (
             not exists
             or claim["source_index"] != route["source_index"]
@@ -2070,10 +2085,8 @@ def _media_integrity(
         ):
             return False
         try:
-            from voxweave.pipeline import _find_sibling_media
-
-            resolved = _find_sibling_media(vtt_path)
-        except (ImportError, OSError):
+            resolved = find_sibling_media(vtt_path)
+        except OSError:
             return False
         if resolved is None or resolved.suffix.lower() != suffix:
             return False
@@ -2087,7 +2100,9 @@ def _media_integrity(
 
 
 def _w1_usable_audit(root: Mapping[str, Any]) -> bool:
-    """Return the unsigned section 9.3 usability audit conjunction."""
+    """Return the unsigned W1 usability conjunction: production limit profile,
+    valid V2 admission, full (non-default) source facts, and owner ranges that
+    cover every raw unit exactly once."""
     try:
         history = root["input_history"]
         source_facts = root["source_facts"]
@@ -2134,10 +2149,6 @@ def verify_align_evidence(
     corpus_root: Path | None = None,
 ) -> AlignEvidenceVerification:
     """Verify canonical sidecar bytes and live selected-primary/media links."""
-    # Deferred: pipeline owns the canonical sibling-path helper, and importing it at
-    # module scope would tie this leaf verifier to the pipeline import graph.
-    from voxweave.pipeline import swap_ext
-
     target = Path(vtt_path)
     legacy_evidence = swap_ext(target, ".align-evidence.json")
     artifact_media = (
@@ -2145,10 +2156,8 @@ def verify_align_evidence(
     )
     if artifact_media is None:
         try:
-            from voxweave.pipeline import _find_subtitle_media
-
-            artifact_media = _find_subtitle_media(target)
-        except (ImportError, OSError):
+            artifact_media = find_subtitle_media(target)
+        except OSError:
             artifact_media = None
     if artifacts.path_present(legacy_evidence):
         evidence_path = legacy_evidence

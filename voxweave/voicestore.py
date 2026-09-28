@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import errno
 import fcntl
 import os
 import secrets
@@ -29,6 +30,7 @@ from voxweave.voicebase import (
     require_string,
     require_utc_timestamp,
     require_version_one,
+    sanitize_speaker_name,
     utc_timestamp,
     validate_provenance,
     validate_vector,
@@ -127,10 +129,6 @@ def normalize_speaker_key(
 ) -> str:
     """Apply exactly NFC(sanitize_speaker_name(raw)), never casefold/NFKC."""
     value = require_string(raw, field, max_bytes=max_bytes)
-    # Lazy import avoids a cycle when the future integration wave imports this
-    # module from voxweave.speakers.
-    from voxweave.speakers import sanitize_speaker_name
-
     normalized = unicodedata.normalize("NFC", sanitize_speaker_name(value))
     require_string(normalized, f"normalized {field}", max_bytes=max_bytes)
     return normalized
@@ -316,12 +314,34 @@ def store_lock_path(path: Path) -> Path:
 
 @contextmanager
 def store_lock(path: Path, *, exclusive: bool) -> Iterator[StoreLockHandle]:
-    """Take the canonical persistent flock and yield the one resolved target."""
+    """Take the canonical persistent flock and yield the one resolved target.
+
+    A shared lock does not need write access: where the lock file cannot be
+    opened for writing (a read-only mount, a lock file another user owns) it
+    is opened read-only, and when that fails too the store is read unlocked
+    (writers replace it atomically), as ``voicelibrary.read_legacy_store``
+    does.
+    """
     resolved = canonical_store_path(path)
     lock = Path(f"{resolved}.lock")
-    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor: int | None
     try:
-        os.fchmod(descriptor, 0o600)
+        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        if exclusive or exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise
+        try:
+            descriptor = os.open(lock, os.O_RDONLY)
+        except OSError:
+            descriptor = None
+    if descriptor is None:
+        yield StoreLockHandle(store_path=resolved, lock_path=lock)
+        return
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+        except OSError:
+            pass
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         fcntl.flock(descriptor, mode)
         yield StoreLockHandle(store_path=resolved, lock_path=lock)
@@ -376,20 +396,23 @@ def resolve_identity_id(store: Mapping[str, object], raw_name: str) -> str | Non
     return next(iter(owners), None)
 
 
-def _default_identity_id() -> str:
+def new_identity_id() -> str:
+    """A random identity id (shared with the voice library)."""
     return f"v{secrets.token_hex(6)}"
 
 
-def _default_exemplar_id() -> str:
+def new_exemplar_id() -> str:
+    """A random exemplar id (shared with the voice library)."""
     return f"x{secrets.token_hex(4)}"
 
 
-def _mint_unique_id(
+def mint_unique_id(
     factory: Callable[[], str],
     used: set[str],
     validator: Callable[[object], str],
     kind: str,
 ) -> str:
+    """A validated id from ``factory`` that is not in ``used``."""
     for _attempt in range(1024):
         candidate = validator(factory())
         if candidate not in used:
@@ -397,9 +420,10 @@ def _mint_unique_id(
     raise EnrollmentRefusal(f"could not mint a unique {kind} id")
 
 
-def _event_time(at: str | datetime | None) -> str:
+def event_time(at: str | datetime | None, field: str = "enrollment timestamp") -> str:
+    """``at`` validated as a UTC timestamp, or now when it is not a string."""
     if isinstance(at, str):
-        return require_utc_timestamp(at, "enrollment timestamp")
+        return require_utc_timestamp(at, field)
     return utc_timestamp(at)
 
 
@@ -479,7 +503,7 @@ def plan_indexed_enrollment(
         if not replace_episode:
             raise EnrollmentRefusal(
                 f"source media for {episode!r} is already enrolled; "
-                "use --replace-episode"
+                "use `speakers enroll --replace`"
             )
         return IndexedPlan("replace", target=media_hit)
     if episode_hit is not None:
@@ -487,7 +511,7 @@ def plan_indexed_enrollment(
             old_capture = existing[episode_hit].capture_id
             raise EnrollmentRefusal(
                 f"episode {episode!r} already has capture {old_capture}; "
-                "use --replace-episode"
+                "use `speakers enroll --replace`"
             )
         return IndexedPlan("replace", target=episode_hit)
 
@@ -510,8 +534,8 @@ def enroll_exemplar(
     vector: object,
     replace_episode: bool = False,
     at: str | datetime | None = None,
-    identity_id_factory: Callable[[], str] = _default_identity_id,
-    exemplar_id_factory: Callable[[], str] = _default_exemplar_id,
+    identity_id_factory: Callable[[], str] = new_identity_id,
+    exemplar_id_factory: Callable[[], str] = new_exemplar_id,
 ) -> EnrollmentResult:
     """Apply the final capture→source-media→episode enrollment relation.
 
@@ -528,7 +552,7 @@ def enroll_exemplar(
     incoming_vector = list(
         validate_vector(vector, dim=validated.embedding_dim, field="incoming vector")
     )
-    event_at = _event_time(at)
+    event_at = event_time(at)
 
     result_store = cast(dict[str, object], copy.deepcopy(dict(store)))
     identities = cast(dict[str, object], result_store["identities"])
@@ -541,7 +565,7 @@ def enroll_exemplar(
     used_identity_ids = set(identities)
     identity_id = next(iter(owners), None)
     if identity_id is None:
-        identity_id = _mint_unique_id(
+        identity_id = mint_unique_id(
             identity_id_factory,
             used_identity_ids,
             require_identity_id,
@@ -584,7 +608,7 @@ def enroll_exemplar(
     replacement = exemplars[plan.target] if plan.target is not None else None
 
     used_exemplar_ids = _active_exemplar_ids(identities)
-    new_exemplar_id = _mint_unique_id(
+    new_exemplar_id = mint_unique_id(
         exemplar_id_factory,
         used_exemplar_ids,
         require_exemplar_id,
@@ -675,8 +699,12 @@ __all__ = [
     "VoiceStoreError",
     "canonical_store_path",
     "enroll_exemplar",
+    "event_time",
     "exclusive_store_lock",
     "load_voice_store",
+    "mint_unique_id",
+    "new_exemplar_id",
+    "new_identity_id",
     "new_voice_store",
     "normalize_episode",
     "normalize_show",

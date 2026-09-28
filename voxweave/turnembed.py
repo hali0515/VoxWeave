@@ -23,8 +23,8 @@ from typing import Any, overload
 import numpy as np
 
 from voxweave import config, runtime, voiceembed
-from voxweave.diarize import _snapshot_commit
-from voxweave.diarize import _canonical_embedding_source as _canonical_source
+from voxweave.diarize import snapshot_commit
+from voxweave.diarize import canonical_embedding_source as _canonical_source
 from voxweave.voicebase import MAX_EMBEDDING_DIM, MIN_EMBEDDING_DIM
 
 EMBEDDING_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
@@ -244,7 +244,7 @@ def _embedding_source(
     authority: _EmbeddingAuthority,
     cached_path: Path,
 ) -> str:
-    commit = _snapshot_commit(
+    commit = snapshot_commit(
         cached_path,
         authority.checkpoint,
         filename=EMBEDDING_CHECKPOINT_FILE,
@@ -430,33 +430,42 @@ def _load_inference(
     return inference, identity
 
 
-def _resident_matches(expected_identity: EmbeddingIdentity | None) -> bool:
-    identity = _inference_identity
-    if identity is None:
-        return False
-    if expected_identity is not None:
-        return identity == expected_identity
-    try:
-        authority = _parse_embedding_source(identity.model)
-    except TurnEmbeddingError:
-        return False
-    return authority.checkpoint == EMBEDDING_MODEL and authority.subfolder is None
-
-
-def _get_inference(
-    expected_identity: EmbeddingIdentity | None = None,
-) -> Any:
+def _get_inference(expected_identity: EmbeddingIdentity) -> Any:
+    """The resident legacy-lane model, (re)loaded to match ``expected_identity``."""
     global _inference, _inference_identity
     with _inference_lock:
         if _inference is not None and _inference_identity is None:
             raise TurnEmbeddingError(
                 "speaker embedding inference has no checkpoint identity"
             )
-        if _inference is None or not _resident_matches(expected_identity):
+        if _inference is None or _inference_identity != expected_identity:
             loaded, identity = _load_inference(expected_identity)
             _inference_identity = identity
             _inference = loaded
         return _inference
+
+
+def release() -> None:
+    """Drop the resident turn embedders (both lanes) and free their VRAM.
+
+    ``speakers serve`` calls this after each split preview: an audition stays
+    open for as long as someone names speakers, and a model idle between
+    previews should not hold GPU memory all that time.
+    """
+    global _inference, _inference_identity
+    with _inference_lock:
+        had_model = _inference is not None
+        _inference = None
+        _inference_identity = None
+    voiceembed.release()
+    if not had_model:
+        return
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _turn_bounds(turn: object, index: int) -> tuple[float, float]:
@@ -533,19 +542,28 @@ def _minimum_samples(inference: object) -> int:
 
 def turn_embeddings(
     wav_path: Path,
-    turns: Sequence[object],
+    turns: AttestedTurnRequest,
 ) -> AttestedTurnEmbeddings:
     """Return one normalized embedding for each turn index.
 
-    Audio is decoded to 16 kHz mono in memory. Turns shorter than two seconds
-    or the model's safe lower bound are right-padded with silence. Imports and
-    model construction stay lazy so CPU-only tests can replace the inference
-    boundary without importing pyannote.
+    ``turns`` carries the identity of the embedder the voiceprints were
+    captured with, and only that embedder is used. Audio is decoded to 16 kHz
+    mono in memory and each turn is embedded like a voiceprint segment: long
+    turns window by window (``voiceembed.WINDOW_SECONDS`` at most, averaged by
+    window length) and short ones repeated cyclically up to the model's minimum
+    (at least two seconds on the legacy lane), since no embedder here masks its
+    pooling. The decoupled lane runs :mod:`voxweave.voiceembed`; the legacy
+    lane loads the recorded pyannote checkpoint. Imports and model construction
+    stay lazy so CPU-only tests can replace the inference boundary without
+    importing pyannote.
     """
-    expected_identity = (
-        turns.identity if isinstance(turns, AttestedTurnRequest) else None
-    )
-    if expected_identity is not None and expected_identity.lane != LANE_LEGACY:
+    if not isinstance(turns, AttestedTurnRequest):
+        raise TurnEmbeddingError(
+            "turn embeddings need the embedder identity of the voiceprint "
+            "capture they reproduce"
+        )
+    expected_identity = turns.identity
+    if expected_identity.lane != LANE_LEGACY:
         return _decoupled_turn_embeddings(Path(wav_path), turns, expected_identity)
     if not turns:
         with _inference_lock:
@@ -577,17 +595,30 @@ def turn_embeddings(
             last = min(len(waveform), math.ceil(end * SAMPLE_RATE))
             if first >= len(waveform) or last <= first:
                 raise TurnEmbeddingError(f"turn {index} falls outside the audio")
-            segment = waveform[first:last]
-            if len(segment) < minimum_samples:
-                segment = np.pad(segment, (0, minimum_samples - len(segment)))
-            tensor = torch.from_numpy(np.ascontiguousarray(segment)).reshape(1, 1, -1)
+            rows: list[list[float]] = []
+            weights: list[float] = []
+            for low, high in voiceembed.window_bounds(first, last):
+                segment = voiceembed.repeat_to_length(
+                    waveform[low:high], minimum_samples
+                )
+                tensor = torch.from_numpy(np.ascontiguousarray(segment)).reshape(
+                    1, 1, -1
+                )
+                try:
+                    embedded = inference(tensor)
+                except Exception as exc:
+                    raise TurnEmbeddingError(
+                        f"speaker embedding inference failed for turn {index}: {exc}"
+                    ) from exc
+                rows.append(_embedding_row(embedded, index=index))
+                weights.append(float(high - low))
             try:
-                embedded = inference(tensor)
-            except Exception as exc:
+                pooled = voiceembed.weighted_unit_mean(rows, weights)
+            except (ValueError, voiceembed.VoiceEmbeddingError) as exc:
                 raise TurnEmbeddingError(
-                    f"speaker embedding inference failed for turn {index}: {exc}"
+                    f"turn embedding {index} windows do not combine: {exc}"
                 ) from exc
-            vector = _embedding_row(embedded, index=index)
+            vector = _normalized_vector(pooled, field=f"turn embedding {index}")
             if not MIN_EMBEDDING_DIM <= len(vector) <= MAX_EMBEDDING_DIM:
                 raise TurnEmbeddingError(
                     f"turn embedding {index} has unsupported dimension {len(vector)}"
@@ -784,5 +815,6 @@ __all__ = [
     "bisect_embeddings",
     "normalized_centroid",
     "recipe_centroids",
+    "release",
     "turn_embeddings",
 ]

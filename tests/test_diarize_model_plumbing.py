@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from voxweave import backend, chunking, diarize, pipeline, songdet
 from voxweave.cli import cli
+from voxweave import vocals
 
 
 LEGACY_MODEL = "pyannote/speaker-diarization-3.1"
@@ -73,6 +74,8 @@ def test_process_forwards_diarize_model_to_transcribe(
         return "en", units, [(0.0, 1.0)], [], [], None
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    # process() preflights diarization; the gated model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
 
     pipeline.process(
         media,
@@ -92,6 +95,7 @@ def test_transcribe_forwards_diarize_model_to_diarize_turns(
     wav = tmp_path / "speech.wav"
     wav.write_bytes(b"wav")
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(
         pipeline,
         "vad_speech_segments",

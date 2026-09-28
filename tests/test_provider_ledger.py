@@ -32,10 +32,12 @@ SLOTS = ("sentences", "atoms", "pos")
 
 @pytest.fixture(autouse=True)
 def _reset_warned():
-    """The once-per-process warning latch is module state; tests own it."""
+    """The once-per-process log latches are module state; tests own them."""
     providers._WARNED.clear()
+    providers._NOTED.clear()
     yield
     providers._WARNED.clear()
+    providers._NOTED.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -412,6 +414,55 @@ def test_supported_pysbd_language_records_nothing():
     with providers.degradation_capture() as ledger:
         _segment_sentences("One. Two.", "en")
     assert ledger == []
+
+
+# --------------------------------- designed fallbacks log at DEBUG, not WARNING
+
+
+def test_expected_fallback_is_recorded_but_logged_once_at_debug(caplog):
+    with caplog.at_level(logging.DEBUG, logger="voxweave"):
+        with providers.degradation_capture() as ledger:
+            providers.note_degraded("atoms", "synthetic:designed", expected=True)
+            providers.note_degraded("atoms", "synthetic:designed", expected=True)
+    assert _reasons(ledger) == {("atoms", "synthetic:designed"): 2}
+    records = [r for r in caplog.records if r.name == "voxweave"]
+    assert [r.levelno for r in records] == [logging.DEBUG]
+
+
+def test_expected_fallback_does_not_consume_the_warning_latch(caplog):
+    """A designed fallback must not silence a real failure under the same pair."""
+    with caplog.at_level(logging.DEBUG, logger="voxweave"):
+        providers.note_degraded("sentences", "synthetic:shared", expected=True)
+        providers.note_degraded("sentences", "synthetic:shared")
+    records = [r for r in caplog.records if r.name == "voxweave"]
+    assert [r.levelno for r in records] == [logging.DEBUG, logging.WARNING]
+
+
+def test_pysbd_unsupported_language_is_logged_at_debug_only(caplog):
+    # pysbd has no yue/pt/ko model by design: every run in those languages
+    # would otherwise warn.
+    with caplog.at_level(logging.DEBUG, logger="voxweave"):
+        with providers.degradation_capture() as ledger:
+            _segment_sentences("我哋今日。好嘢。", "yue")
+    assert _reasons(ledger) == {("sentences", "pysbd-language-unsupported:regex"): 1}
+    records = [r for r in caplog.records if r.name == "voxweave"]
+    assert records and all(r.levelno == logging.DEBUG for r in records)
+
+
+def test_pysbd_crash_on_a_supported_language_still_warns(monkeypatch, caplog):
+    import pysbd
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("synthetic pysbd crash")
+
+    monkeypatch.setattr(pysbd, "Segmenter", _boom)
+    with caplog.at_level(logging.DEBUG, logger="voxweave"):
+        with providers.degradation_capture() as ledger:
+            sentences = _segment_sentences("One. Two.", "en")
+    assert sentences == ["One.", "Two."]
+    assert _reasons(ledger) == {("sentences", "pysbd-language-unsupported:regex"): 1}
+    records = [r for r in caplog.records if r.name == "voxweave"]
+    assert [r.levelno for r in records] == [logging.WARNING]
 
 
 # --------------------------------- a measurement lane may not take the latch

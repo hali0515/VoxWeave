@@ -6,10 +6,17 @@ media directory's own ``cache/`` root, so artifacts travel with the media when
 the directory moves.  An existing adjacent sidecar remains the read and
 write-back lane for compatibility.  Claim markers record only the source file
 name (never an absolute path) so a relocated media directory keeps its claims.
+
+Names derived from a stem (the claim directory itself, the episode lock and the
+per-subtitle progress, evidence and audit files) keep their plain form whenever
+it fits the filesystem's name limit.  Only a name that would not fit is
+shortened, deterministically, by :func:`fitted_name`; an entry is found under
+either form (:func:`_entry`), so the form chosen when it was written stands.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -20,9 +27,12 @@ from typing import Final
 from urllib.parse import quote
 
 from voxweave import fsio
+from voxweave.paths import name_bytes, name_fits, name_limit, swap_ext
 
 _MARKER_MAX_BYTES: Final = 65_536
 _CACHE_DIR_NAME: Final = "cache"
+# Shortened names end in "--" + this many hex digits of sha1(stem), then the suffix.
+_STEM_DIGEST_CHARS: Final = 8
 
 
 class ArtifactMarkerError(RuntimeError):
@@ -50,15 +60,17 @@ class ArtifactPaths:
     def translation_progress(self, subtitle: Path, target: str) -> Path:
         """Return an input-specific translation progress path."""
         encoded = quote(target, safe="-_.")
-        return self.directory / f"{_stem(Path(subtitle))}.{encoded}.progress.json"
+        return _entry(
+            self.directory, _stem(Path(subtitle)), f".{encoded}.progress.json"
+        )
 
     def align_evidence(self, subtitle: Path) -> Path:
         """Return an input-specific durable alignment-evidence path."""
-        return self.directory / f"{_stem(Path(subtitle))}.align-evidence.json"
+        return _entry(self.directory, _stem(Path(subtitle)), ".align-evidence.json")
 
     def asrfix_audit(self, subtitle: Path) -> Path:
         """Return an input-specific ASR-correction audit path."""
-        return self.directory / f"{_stem(Path(subtitle))}.asrfix.json"
+        return _entry(self.directory, _stem(Path(subtitle)), ".asrfix.json")
 
     @property
     def debug(self) -> Path:
@@ -115,23 +127,77 @@ def _absolute(path: Path) -> Path:
     return Path(os.path.realpath(os.path.abspath(os.fspath(expanded))))
 
 
-def _swap_ext(path: Path, suffix: str) -> Path:
-    """Sibling rename through pipeline's canonical, dot-safe helper.
-
-    The import is deferred because pipeline imports this module at module scope;
-    reversing that at module scope would close an import cycle.
-    """
-    from voxweave.pipeline import swap_ext
-
-    return swap_ext(path, suffix)
-
-
 def _stem(path: Path) -> str:
-    return _swap_ext(path, "").name
+    return swap_ext(path, "").name
 
 
 def _claim_digest(source: Path) -> str:
     return hashlib.sha1(source.name.encode(), usedforsecurity=False).hexdigest()[:8]
+
+
+def _stem_digest(stem: str) -> str:
+    digest = hashlib.sha1(os.fsencode(stem), usedforsecurity=False).hexdigest()
+    return digest[:_STEM_DIGEST_CHARS]
+
+
+def fitted_name(directory: Path, stem: str, suffix: str = "") -> str:
+    """Name a new cache entry ``stem + suffix`` inside ``directory``.
+
+    The plain name is kept whenever it fits the filesystem's limit
+    (``PC_NAME_MAX`` in UTF-8 bytes, 255 when unknown). Only a name that would
+    not fit becomes ``<stem cut to fit>--<sha1(stem)[:8]><suffix>``: the suffix
+    stays whole and the stem loses whole characters from its end, so the result
+    is deterministic and never ends in a broken multi-byte character.
+    """
+    name = f"{stem}{suffix}"
+    limit = name_limit(directory)
+    if name_bytes(name) <= limit:
+        return name
+    tail = f"--{_stem_digest(stem)}{suffix}"
+    budget = limit - name_bytes(tail)
+    prefix = stem
+    while prefix and name_bytes(prefix) > budget:
+        prefix = prefix[:-1]
+    return f"{prefix}{tail}"
+
+
+def _is_shortened_form(name: str, stem: str, suffix: str) -> bool:
+    """Whether ``name`` is :func:`fitted_name`'s shortened form of ``stem + suffix``.
+
+    The length of the kept stem prefix depends on the name limit it was made
+    under, so any prefix of the stem is accepted.
+    """
+    tail = f"--{_stem_digest(stem)}{suffix}"
+    return name.endswith(tail) and stem.startswith(name[: -len(tail)])
+
+
+def _entry(directory: Path, stem: str, suffix: str = "") -> Path:
+    """Locate the cache entry ``stem + suffix`` inside ``directory``.
+
+    An entry that already exists is used under whichever form it was written:
+    the plain name, the shortened one for this filesystem, or a shortened one
+    made under another name limit (a directory moved between filesystems).
+    Otherwise the entry gets :func:`fitted_name`.
+    """
+    plain = directory / f"{stem}{suffix}"
+    try:
+        if path_present(plain):
+            return plain
+        fitted = directory / fitted_name(directory, stem, suffix)
+        if fitted != plain and path_present(fitted):
+            return fitted
+        try:
+            names = sorted(entry.name for entry in os.scandir(directory))
+        except (FileNotFoundError, NotADirectoryError):
+            return fitted
+    except OSError as exc:
+        raise ArtifactMarkerError(
+            f"cannot inspect artifact directory {directory}: {exc}"
+        ) from exc
+    for name in names:
+        if _is_shortened_form(name, stem, suffix):
+            return directory / name
+    return fitted
 
 
 def _marker_text(source_name: str) -> str:
@@ -280,22 +346,18 @@ def _paths(source: Path, directory: Path) -> ArtifactPaths:
         speaker_suggest=directory / "speakers.suggest.json",
         voiceprints=directory / "voiceprints.json",
         speaker_split_undo=directory / "speaker-split.undo.json",
-        episode_lock=directory / f"{source.stem}.episode.lock",
+        episode_lock=_entry(directory, source.stem, ".episode.lock"),
         vocals_cache=directory / "vocals.32k.flac",
     )
 
 
 def _claim_directory(source: Path, directory: Path) -> bool:
+    # Raises ArtifactMarkerError for every OSError itself.
+    _ensure_private_directory(directory)
     try:
-        _ensure_private_directory(directory)
-    except ArtifactMarkerError:
-        raise
-    except OSError as exc:
-        raise ArtifactMarkerError(
-            f"cannot create artifact claim {directory}: {exc}"
-        ) from exc
-    try:
-        fsio.atomic_write_text_new(directory / "source.json", _marker_text(source.name))
+        fsio.atomic_write_text_new(
+            directory / "source.json", _marker_text(source.name), private=True
+        )
     except FileExistsError:
         return _read_marker(directory / "source.json") == source.name
     return True
@@ -306,10 +368,10 @@ def claim_paths(source: Path) -> ArtifactPaths:
     absolute = _absolute(Path(source))
     root = artifacts_root(absolute)
     _ensure_private_directory(root)
-    primary = root / absolute.stem
+    primary = _entry(root, absolute.stem)
     if _claim_directory(absolute, primary):
         return _paths(absolute, primary)
-    fallback = root / f"{absolute.stem}--{_claim_digest(absolute)}"
+    fallback = _entry(root, absolute.stem, f"--{_claim_digest(absolute)}")
     if _claim_directory(absolute, fallback):
         return _paths(absolute, fallback)
     owner = _read_marker(fallback / "source.json")
@@ -324,11 +386,11 @@ def inspect_paths(source: Path) -> ArtifactPaths | None:
     root = artifacts_root(absolute)
     if not _inspect_private_directory(root):
         return None
-    primary = root / absolute.stem
+    primary = _entry(root, absolute.stem)
     owner = _directory_owner(primary)
     if owner == absolute.name:
         return _paths(absolute, primary)
-    fallback = root / f"{absolute.stem}--{_claim_digest(absolute)}"
+    fallback = _entry(root, absolute.stem, f"--{_claim_digest(absolute)}")
     fallback_owner = _directory_owner(fallback)
     if fallback_owner is None:
         return None
@@ -336,6 +398,26 @@ def inspect_paths(source: Path) -> ArtifactPaths | None:
         return _paths(absolute, fallback)
     raise ArtifactCollisionError(
         f"artifact fallback {fallback} belongs to {fallback_owner}, not {absolute}"
+    )
+
+
+def _is_claim_name(name: str, stem: str) -> bool:
+    """Whether ``name`` is a claim directory for ``stem``, in either form.
+
+    That is the primary claim (``<stem>``) or a collision fallback
+    (``<stem>--<8 hex>``), each plain or shortened by :func:`fitted_name`.
+    """
+    if name == stem or _is_shortened_form(name, stem, ""):
+        return True
+    fallback_tail = name[-10:]
+    return (
+        len(fallback_tail) == 10
+        and fallback_tail.startswith("--")
+        and all(character in "0123456789abcdef" for character in fallback_tail[2:])
+        and (
+            name == f"{stem}{fallback_tail}"
+            or _is_shortened_form(name, stem, fallback_tail)
+        )
     )
 
 
@@ -351,16 +433,9 @@ def claimed_sources(directory: Path, stem: str) -> tuple[Path, ...]:
         raise ArtifactMarkerError(
             f"cannot inspect artifact root {root}: {exc}"
         ) from exc
-    prefix = f"{stem}--"
     sources: list[Path] = []
     for entry in sorted(entries, key=lambda path: path.name):
-        fallback_tail = (
-            entry.name[len(prefix) :] if entry.name.startswith(prefix) else ""
-        )
-        if entry.name != stem and not (
-            len(fallback_tail) == 8
-            and all(character in "0123456789abcdef" for character in fallback_tail)
-        ):
+        if not _is_claim_name(entry.name, stem):
             continue
         owner = _directory_owner(entry)
         if owner is not None and Path(owner).stem == stem:
@@ -373,7 +448,7 @@ def episode_domain_lock_path(source: Path) -> Path:
     absolute = _absolute(Path(source))
     root = artifacts_root(absolute)
     _ensure_private_directory(root)
-    lock_root = root / absolute.stem
+    lock_root = _entry(root, absolute.stem)
     _ensure_private_directory(lock_root)
     # The media directory itself scopes the domain, and same-stem siblings
     # (episode.mp4 + episode.mp3) share sibling files, so they share one lock.
@@ -384,19 +459,23 @@ def path_present(path: Path) -> bool:
     """Return false only when a filesystem node is truly absent."""
     try:
         Path(path).lstat()
-    except FileNotFoundError:
-        return False
+    except OSError as exc:
+        # A name too long to exist (ENAMETOOLONG) is absent too: a long media stem
+        # plus a legacy sidecar suffix can exceed NAME_MAX.
+        if exc.errno in (errno.ENOENT, errno.ENAMETOOLONG):
+            return False
+        raise
     return True
 
 
 def legacy_path(source: Path, suffix: str) -> Path:
     """Return a historical media-adjacent machine-sidecar path."""
-    return _swap_ext(Path(source), suffix)
+    return swap_ext(Path(source), suffix)
 
 
 def speaker_mapping_path(source: Path, reference: Path | None = None) -> Path:
     if reference is not None:
-        exact = _swap_ext(Path(reference), ".speakers.json")
+        exact = swap_ext(Path(reference), ".speakers.json")
         if path_present(exact):
             return exact
     legacy = legacy_path(source, ".speakers.json")
@@ -409,7 +488,7 @@ def inspect_speaker_mapping_path(
 ) -> Path:
     """Resolve a mapping for reading without claiming an empty cache directory."""
     if reference is not None:
-        exact = _swap_ext(Path(reference), ".speakers.json")
+        exact = swap_ext(Path(reference), ".speakers.json")
         if path_present(exact):
             return exact
     legacy = legacy_path(source, ".speakers.json")
@@ -435,7 +514,7 @@ def speaker_split_undo_path(source: Path) -> Path:
 
 
 def translation_progress_path(source: Path, subtitle: Path, target: str) -> Path:
-    legacy = _swap_ext(Path(subtitle), f".{target}.progress.json")
+    legacy = swap_ext(Path(subtitle), f".{target}.progress.json")
     return (
         legacy
         if path_present(legacy)
@@ -444,30 +523,37 @@ def translation_progress_path(source: Path, subtitle: Path, target: str) -> Path
 
 
 def align_evidence_path(source: Path, subtitle: Path) -> Path:
-    legacy = _swap_ext(Path(subtitle), ".align-evidence.json")
+    legacy = swap_ext(Path(subtitle), ".align-evidence.json")
     return (
         legacy if path_present(legacy) else claim_paths(source).align_evidence(subtitle)
     )
 
 
 def asrfix_audit_path(source: Path, subtitle: Path) -> Path:
-    legacy = _swap_ext(Path(subtitle), ".asrfix.json")
+    legacy = swap_ext(Path(subtitle), ".asrfix.json")
     return (
         legacy if path_present(legacy) else claim_paths(source).asrfix_audit(subtitle)
     )
+
+
+def _candidates(legacy: Path, cached: Path | None) -> tuple[Path, ...]:
+    # A legacy name too long for its filesystem cannot exist (a long media stem
+    # plus a sidecar suffix), so there is nothing there to invalidate or purge.
+    kept = (legacy,) if name_fits(legacy) else ()
+    return tuple(dict.fromkeys((*kept, *(() if cached is None else (cached,)))))
 
 
 def fixed_candidates(source: Path, suffix: str, attribute: str) -> tuple[Path, ...]:
     """Return deterministic legacy and cache paths for invalidation or purge."""
     legacy = legacy_path(source, suffix)
     cached = getattr(claim_paths(source), attribute)
-    return tuple(dict.fromkeys((legacy, cached)))
+    return _candidates(legacy, cached)
 
 
 def align_evidence_candidates(source: Path, subtitle: Path) -> tuple[Path, ...]:
-    legacy = _swap_ext(Path(subtitle), ".align-evidence.json")
+    legacy = swap_ext(Path(subtitle), ".align-evidence.json")
     cached = claim_paths(source).align_evidence(subtitle)
-    return tuple(dict.fromkeys((legacy, cached)))
+    return _candidates(legacy, cached)
 
 
 def translation_progress_candidates(
@@ -475,7 +561,7 @@ def translation_progress_candidates(
     subtitle: Path,
     target: str,
 ) -> tuple[Path, ...]:
-    legacy = _swap_ext(Path(subtitle), f".{target}.progress.json")
+    legacy = swap_ext(Path(subtitle), f".{target}.progress.json")
     try:
         paths = inspect_paths(source)
     except ArtifactMarkerError:
@@ -483,7 +569,7 @@ def translation_progress_candidates(
             return (legacy,)
         raise
     cached = None if paths is None else paths.translation_progress(subtitle, target)
-    return tuple(dict.fromkeys(path for path in (legacy, cached) if path is not None))
+    return _candidates(legacy, cached)
 
 
 __all__ = [
@@ -497,6 +583,7 @@ __all__ = [
     "claim_paths",
     "claimed_sources",
     "episode_domain_lock_path",
+    "fitted_name",
     "fixed_candidates",
     "inspect_paths",
     "inspect_speaker_mapping_path",

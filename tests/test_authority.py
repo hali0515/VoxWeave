@@ -429,6 +429,36 @@ def test_finalize_refuses_an_unissued_stream():
         )
 
 
+def test_finalize_refuses_a_profile_other_than_the_sealed_one():
+    """The seal covers ``stream.profile``; solving under another profile would
+    deliver cues the seal never vouched for. The refusal comes before the
+    capability is spent, so the honest call still succeeds afterwards."""
+    fin = finalizer()
+    ledger = authority().AuthorityLedger()
+    capture = fin.capture_v1_reference([cue()], ledger=ledger)
+    stream = fin.phase1_from_v1_capture(
+        capture,
+        profile=profile(),
+        ledger=ledger,
+        row_id="delivery_finalizer/v1",
+        evaluation_id="e0",
+    )
+    with pytest.raises(ValueError, match="sealed stream's profile"):
+        fin.finalize(
+            stream,
+            profile=profile(max_line_length=20),
+            evidence=fin.FinalizeEvidence(),
+            policy=fin.FinalizePolicy(),
+        )
+    # An equal (not identical) profile is the sealed profile.
+    fin.finalize(
+        stream,
+        profile=profile(),
+        evidence=fin.FinalizeEvidence(),
+        policy=fin.FinalizePolicy(),
+    )
+
+
 def _document():
     """One small en document the optimizer can solve without a v1 reference."""
     from voxweave.core.segdoc import SegDocument, SourceUnit

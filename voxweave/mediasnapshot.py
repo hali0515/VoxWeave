@@ -15,7 +15,6 @@ import sys
 import time
 from pathlib import Path
 from types import TracebackType
-from typing import Literal
 
 from voxweave.align_failures import CanonicalFailure
 from voxweave.voicebase import Phase2DataError, media_fingerprint_from_fd
@@ -23,7 +22,6 @@ from voxweave.voicebase import Phase2DataError, media_fingerprint_from_fd
 SNAPSHOT_MAX_AGE_SECONDS = 60 * 60
 SNAPSHOT_NAME_RE = re.compile(r"^snapshot-[0-9a-f]{32}\.[A-Za-z0-9]{1,16}$")
 COPY_CHUNK_BYTES = 1024 * 1024
-CopyMethod = Literal["reflink", "copy"]
 
 _FICLONE = 0x40049409
 _COPYFILE_DATA = 1 << 3
@@ -256,7 +254,11 @@ def cleanup_stale_snapshots(
     now: float | None = None,
     max_age_seconds: float = SNAPSHOT_MAX_AGE_SECONDS,
 ) -> tuple[Path, ...]:
-    """Remove only old, regular, unlocked files in the owned namespace."""
+    """Remove only old, regular, unlocked files in the owned namespace.
+
+    Best effort: a file that cannot be inspected, locked or removed is skipped,
+    so a sweep never turns into a failed snapshot.
+    """
     current_time = time.time() if now is None else now
     removed: list[Path] = []
     try:
@@ -268,7 +270,7 @@ def cleanup_stale_snapshots(
             continue
         try:
             path_stat = os.lstat(candidate)
-        except FileNotFoundError:
+        except OSError:
             continue
         if stat.S_ISLNK(path_stat.st_mode) or not stat.S_ISREG(path_stat.st_mode):
             continue
@@ -286,7 +288,7 @@ def cleanup_stale_snapshots(
                 continue
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+            except OSError:  # held by a live snapshot, or no locks here (ENOLCK)
                 continue
             if _same_open_file(candidate, descriptor):
                 try:
@@ -315,7 +317,6 @@ class MediaSnapshot:
         self._snapshot_fd: int | None = None
         self._fingerprint: str | None = None
         self._size: int | None = None
-        self.copy_method: CopyMethod | None = None
         self.free_space_sufficient: bool | None = None
         self._entered = False
         self._used = False
@@ -369,7 +370,6 @@ class MediaSnapshot:
                     destination_fd,
                     self._size,
                 )
-                self.copy_method = "reflink"
             except (OSError, SnapshotUnavailable, Phase2DataError) as clone_error:
                 os.ftruncate(destination_fd, 0)
                 try:
@@ -411,7 +411,6 @@ class MediaSnapshot:
                         ),
                     )
                     raise failure from copy_error
-                self.copy_method = "copy"
             self._entered = True
             return self
         except SnapshotUnavailable:

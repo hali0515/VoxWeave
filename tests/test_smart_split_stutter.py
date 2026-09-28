@@ -37,7 +37,7 @@ def test_stutter_ignores_cjk_and_digits():
 
 
 # --------------------------------------------------------------------------- #
-# smart_split gating: stutter merging is opt-in with thresholds (gap-aware mode)
+# smart_split applies stutter merging to every cue
 # --------------------------------------------------------------------------- #
 def _seg(text, words):
     return {
@@ -59,16 +59,6 @@ def test_stutter_applied_in_production_path():
     )
     joined = " ".join(c["text"] for c in cues)
     assert "I-I" in joined
-
-
-def test_stutter_not_applied_in_legacy_path():
-    # no thresholds (legacy path) -> text left untouched; byte-compatibility preserved
-    words = [
-        {"word": "I", "start": 0.0, "end": 0.2},
-        {"word": "I", "start": 0.3, "end": 0.5},
-    ]
-    cues = smart_split_segments([_seg("I I", words)], lang="en")
-    assert "I-I" not in " ".join(c["text"] for c in cues)
 
 
 # --------------------------------------------------------------------------- #

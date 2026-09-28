@@ -458,3 +458,272 @@ def test_hint_for_unrelated_runtime_error_is_empty() -> None:
 def test_hint_for_cuda_oom_still_wins_over_runtime_error() -> None:
     hint = ui._hint_for(RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB"))
     assert "VOXWEAVE_MAX_CHUNK_SEC" in hint
+
+
+def test_gated_error_escape_hatch_names_the_lane_that_is_tied_to_the_model() -> None:
+    message = str(diarize._gated_model_error(config.DEFAULT_DIARIZE_MODEL))
+    assert (
+        "voice stores built with --voiceprint-model pyannote are tied to the "
+        "diarization model"
+    ) in message
+    assert "per-model" not in message
+
+
+# --- R7: a sub-model's refusal names that sub-model's card -------------------
+
+_SEGMENTATION_MODEL = "pyannote/segmentation-3.0"
+
+
+def _refusal(url: str | None, message: str = "403 Client Error") -> Exception:
+    import requests
+    from huggingface_hub.errors import HfHubHTTPError
+
+    if url is None:
+        return HfHubHTTPError(message)
+    response = requests.Response()
+    response.status_code = 403
+    response.url = url
+    return HfHubHTTPError(message, response=response)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://huggingface.co/{_SEGMENTATION_MODEL}/resolve/main/pytorch_model.bin",
+        f"https://huggingface.co/api/models/{_SEGMENTATION_MODEL}/revision/main",
+        f"https://hf.co/{_SEGMENTATION_MODEL}",
+    ],
+)
+def test_refused_repo_is_read_from_the_response_url(url: str) -> None:
+    assert diarize._refused_hub_repo(_refusal(url)) == _SEGMENTATION_MODEL
+
+
+def test_refused_repo_falls_back_to_the_message() -> None:
+    exc = _refusal(
+        None,
+        "403 Client Error.\n\nCannot access gated repo for url "
+        f"https://huggingface.co/{_SEGMENTATION_MODEL}/resolve/main/config.yaml.",
+    )
+    assert diarize._refused_hub_repo(exc) == _SEGMENTATION_MODEL
+
+
+def test_refused_repo_ignores_non_model_hub_links() -> None:
+    exc = _refusal(
+        None,
+        "401 Client Error. For more details, see "
+        "https://huggingface.co/docs/huggingface_hub/authentication",
+    )
+    assert diarize._refused_hub_repo(exc) is None
+    assert diarize._refused_hub_repo(RuntimeError("no url here")) is None
+
+
+def test_sub_model_refusal_names_its_card_with_the_pipeline_as_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Pipeline:
+        @classmethod
+        def from_pretrained(cls, *_args: object, **_kwargs: object) -> object:
+            raise _refusal(
+                f"https://huggingface.co/{_SEGMENTATION_MODEL}/resolve/main/"
+                "pytorch_model.bin"
+            )
+
+    _install_fake_pyannote(monkeypatch, lambda *_a, **_k: None, Pipeline)
+    monkeypatch.setattr(
+        diarize,
+        "_prepare_pipeline_load",
+        lambda *_a, **_k: _plan(clustering="AgglomerativeClustering"),
+    )
+    monkeypatch.setattr(diarize, "_pipeline", None)
+    monkeypatch.setattr(diarize, "_pipeline_model", None)
+
+    with pytest.raises(RuntimeError) as ei:
+        diarize._get_pipeline("hf_token", _LEGACY_MODEL)
+
+    message = str(ei.value)
+    assert message.startswith(f"could not load {_LEGACY_MODEL}:")
+    assert f"https://hf.co/{_SEGMENTATION_MODEL}" in message
+    assert f"https://hf.co/{_LEGACY_MODEL}" not in message
+    assert "hf auth login" in ui._hint_for(ei.value)
+
+
+def test_refusal_of_the_configured_repo_keeps_the_original_message() -> None:
+    assert str(diarize._gated_model_error(_COMMUNITY_MODEL, _COMMUNITY_MODEL)) == str(
+        diarize._gated_model_error(_COMMUNITY_MODEL)
+    )
+
+
+def test_local_pipeline_never_gets_a_hub_card_url(tmp_path: Path) -> None:
+    local = tmp_path / "my-pipeline"
+    local.mkdir()
+
+    unknown = str(diarize._gated_model_error(str(local)))
+    assert "hf.co" not in unknown
+    assert "model-card" in unknown
+
+    named = str(diarize._gated_model_error(str(local), _SEGMENTATION_MODEL))
+    assert f"https://hf.co/{_SEGMENTATION_MODEL}" in named
+    assert named.count("hf.co") == 1
+    assert str(local) in named
+
+
+# --- R8: a 3.1 config that could not be fetched says so ----------------------
+
+
+def test_fetch_pipeline_config_keeps_the_swallowed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import huggingface_hub
+
+    offline = OSError("offline and no cached config.yaml")
+
+    def boom(*_args: object, **_kwargs: object) -> str:
+        raise offline
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", boom)
+
+    assert diarize._fetch_pipeline_config(_LEGACY_MODEL, "hf_token") == (
+        None,
+        offline,
+    )
+
+
+@pytest.mark.parametrize("model", [_LEGACY_MODEL, f"{_LEGACY_MODEL}@no-such-rev"])
+def test_unfetchable_31_config_reports_the_fetch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+) -> None:
+    import huggingface_hub
+
+    offline = OSError("offline and no cached config.yaml")
+
+    def boom(*_args: object, **_kwargs: object) -> str:
+        raise offline
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", boom)
+
+    class Pipeline:
+        @classmethod
+        def from_pretrained(cls, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("an unverified 3.1 plan must not be constructed")
+
+    with pytest.raises(RuntimeError) as ei:
+        diarize._load_pipeline(Pipeline, "hf_token", model=model)
+
+    message = str(ei.value)
+    assert message == (
+        f"could not fetch config.yaml for {model}: {offline}; check the network / "
+        "revision, or run once online to cache it"
+    )
+    assert ei.value.__cause__ is offline
+
+
+# --- R9: preflight refuses a doomed run before any audio work ----------------
+
+
+@pytest.mark.parametrize(
+    "model", [None, "community-1", "3.1", f"{_LEGACY_MODEL}@{'a' * 40}"]
+)
+def test_preflight_refuses_gated_model_without_token(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str | None,
+) -> None:
+    _no_token(monkeypatch)
+    _forbid_pipeline_load(monkeypatch)
+    monkeypatch.delenv("VOXWEAVE_DIARIZE_MODEL", raising=False)
+    resolved = config.resolve_diarize_model(model)
+
+    with pytest.raises(RuntimeError) as ei:
+        diarize.preflight(model)
+
+    assert str(ei.value) == str(diarize._gated_model_error(resolved))
+
+
+def test_preflight_resolves_the_model_like_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_token(monkeypatch)
+    monkeypatch.setenv("VOXWEAVE_DIARIZE_MODEL", "3.1")
+    with pytest.raises(RuntimeError, match=r"speaker-diarization-3\.1"):
+        diarize.preflight(None)
+
+    monkeypatch.setenv("VOXWEAVE_DIARIZE_MODEL", "acme/open-diarizer")
+    diarize.preflight(None)  # not a bundled gated id: nothing to refuse
+
+
+def test_preflight_accepts_a_token_from_either_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_token(monkeypatch)
+    diarize.preflight("community-1", token="hf_explicit")
+
+    monkeypatch.setattr(config, "conf_hf_token", lambda: "hf_from_config")
+    diarize.preflight("community-1")
+
+
+@pytest.mark.parametrize(
+    ("min_speakers", "max_speakers", "match"),
+    [
+        (0, None, r"^min_speakers must be at least 1 \(here: min_speakers=0\)\.$"),
+        (None, 0, r"^max_speakers must be at least 1 \(here: max_speakers=0\)\.$"),
+        (-2, 3, r"^min_speakers must be at least 1"),
+        (
+            3,
+            2,
+            r"^min_speakers must be smaller than \(or equal to\) max_speakers "
+            r"\(here: min_speakers=3 and max_speakers=2\)\.$",
+        ),
+    ],
+)
+def test_preflight_refuses_impossible_speaker_bounds(
+    min_speakers: int | None,
+    max_speakers: int | None,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        diarize.preflight(
+            "acme/open-diarizer",
+            token="hf_token",
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
+
+
+@pytest.mark.parametrize("bounds", [(None, None), (1, None), (None, 1), (2, 2), (2, 5)])
+def test_preflight_accepts_sane_speaker_bounds(
+    bounds: tuple[int | None, int | None],
+) -> None:
+    diarize.preflight(
+        "acme/open-diarizer",
+        token="hf_token",
+        min_speakers=bounds[0],
+        max_speakers=bounds[1],
+    )
+
+
+def test_run_refuses_impossible_speaker_bounds_before_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_pipeline_load(monkeypatch)
+
+    with pytest.raises(ValueError, match="smaller than"):
+        diarize.diarize_turns(
+            Path("nope.wav"), token="hf_token", min_speakers=3, max_speakers=2
+        )
+
+
+def test_preflight_imports_neither_torch_nor_pyannote() -> None:
+    import subprocess
+
+    code = (
+        "import sys\n"
+        "from voxweave import diarize\n"
+        "diarize.preflight('acme/open-diarizer', min_speakers=1, max_speakers=2)\n"
+        "try:\n"
+        "    diarize.preflight('community-1')\n"
+        "except RuntimeError:\n"
+        "    pass\n"
+        "heavy = [m for m in sys.modules if m == 'torch' or m.startswith('pyannote')]\n"
+        "assert not heavy, heavy\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=120)

@@ -51,9 +51,17 @@ def test_line_end_penalty_high_case_particles(ch):
     assert line_end_penalty("大樹" + ch) == 2
 
 
-@pytest.mark.parametrize("ch", list("とまでより"))
+@pytest.mark.parametrize("ch", ["と", "まで", "より"])
 def test_line_end_penalty_med_binding(ch):
     assert line_end_penalty("彼" + ch) == 1
+
+
+@pytest.mark.parametrize("text", ["ここで", "そうだよ", "終わり", "今ま"])
+def test_line_end_penalty_med_entries_are_whole_particles(text):
+    # The medium table holds と and the two-kana particles まで/より; their
+    # single characters are not entries, so connective で, sentence-final よ
+    # and a word ending in り/ま stay clause-capable.
+    assert line_end_penalty(text) == 0
 
 
 @pytest.mark.parametrize(
@@ -167,6 +175,17 @@ def test_pos_grades_case_particles_by_surface_severity():
     pens = ja_pos_end_penalties(text)
     assert pens is not None
     assert pens[text.index("と")] == 1  # 格助詞と: medium
+    text = "彼より背が高い"
+    pens = ja_pos_end_penalties(text)
+    assert pens is not None
+    assert pens[text.index("り")] == 1  # 格助詞より: medium, matched as a whole
+    # 格助詞で doubles as the connective で and is deliberately not an entry:
+    # its last char used to match the table only because the table was built
+    # from one string and split into single characters.
+    text = "学校で勉強する"
+    pens = ja_pos_end_penalties(text)
+    assert pens is not None
+    assert pens[text.index("で")] == 0
 
 
 def test_pos_penalizes_adverbial_copula_ni():

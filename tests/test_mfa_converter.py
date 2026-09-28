@@ -949,3 +949,161 @@ def test_uncertainty_flag_overrides_the_default(mfa_out: Path, tmp_path: Path) -
     _run(_base_argv(mfa_out, out, "--nominal-uncertainty-s", "0.03"))
     prov = json.loads(out.read_text(encoding="utf-8"))["provenance"]
     assert prov["reference_uncertainty_s"] == pytest.approx(0.03)
+
+
+# --------------------------------------------------------------------------- #
+# Audit regressions
+# --------------------------------------------------------------------------- #
+
+#: Speaker A says an OOV word MFA realized as `spn` while speaker B talks over
+#: it with real phones; selecting A's tier must judge A's word by A's phones.
+TWO_SPEAKER_PHONES_TEXTGRID = """File type = "ooTextFile"
+Object class = "TextGrid"
+
+0
+2
+<exists>
+4
+"IntervalTier"
+"A - words"
+0
+2
+3
+0
+0.5
+"alpha"
+0.5
+1
+"Kaguya"
+1
+2
+""
+"IntervalTier"
+"A - phones"
+0
+2
+3
+0
+0.5
+"AE"
+0.5
+1
+"spn"
+1
+2
+""
+"IntervalTier"
+"B - words"
+0
+2
+3
+0
+0.5
+""
+0.5
+1
+"beta"
+1
+2
+""
+"IntervalTier"
+"B - phones"
+0
+2
+3
+0
+0.5
+""
+0.5
+1
+"B"
+1
+2
+""
+"""
+
+
+def test_oov_phone_check_uses_the_selected_speakers_phone_tier(
+    tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "mfa_out"
+    _write(out_dir / "ep01-0000.TextGrid", TWO_SPEAKER_PHONES_TEXTGRID)
+    out = tmp_path / "ref.json"
+    assert _run(_base_argv(out_dir, out, "--tier", "A - words")) == cc.EXIT_OK
+    reference = json.loads(out.read_text(encoding="utf-8"))
+    by_text = {s["text"]: s for s in reference["segments"]}
+    assert set(by_text) == {"alpha", "Kaguya"}
+    assert by_text["Kaguya"]["excluded"] is True
+    assert by_text["Kaguya"]["exclude_reason"] == mfa.REASON_OOV_PHONES
+    assert not by_text["alpha"].get("excluded")
+
+
+@pytest.mark.parametrize("count", ["inf", "nan"])
+def test_non_finite_textgrid_count_is_invalid(tmp_path: Path, count: str) -> None:
+    text = LONG_TEXTGRID.replace("intervals: size = 7", f"intervals: size = {count}")
+    with pytest.raises(cc.CalibrationError) as excinfo:
+        mfa.parse_textgrid(_write(tmp_path / "bad.TextGrid", text))
+    assert "not finite" in excinfo.value.message
+
+
+def test_missing_tool_version_hint_names_the_real_flag(
+    mfa_out: Path, tmp_path: Path
+) -> None:
+    argv = _base_argv(mfa_out, tmp_path / "ref.json")
+    del argv[argv.index("--mfa-version") : argv.index("--mfa-version") + 2]
+    with pytest.raises(cc.CalibrationError) as excinfo:
+        _run(argv)
+    rendered = excinfo.value.render()
+    assert "--mfa-version" in rendered
+    assert "--tool-version" not in rendered
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"reference_uncertainty_s": "0.02"},
+        {"annotators": "two"},
+        {"annotators": None},
+        {"annotators": 1.5},
+    ],
+    ids=["uncertainty-string", "annotators-string", "annotators-null", "fraction"],
+)
+def test_malformed_provenance_values_are_invalid_input(
+    mfa_out: Path, tmp_path: Path, bad: dict[str, Any]
+) -> None:
+    side = _write(tmp_path / "prov.json", json.dumps({"created_by": "hali", **bad}))
+    with pytest.raises(cc.CalibrationError):
+        _run(_base_argv(mfa_out, tmp_path / "ref.json", "--provenance", str(side)))
+    assert not (tmp_path / "ref.json").exists()
+
+
+def test_null_uncertainty_in_provenance_records_the_nominal_one(
+    mfa_out: Path, tmp_path: Path
+) -> None:
+    side = _write(
+        tmp_path / "prov.json",
+        json.dumps({"created_by": "hali", "reference_uncertainty_s": None}),
+    )
+    out = tmp_path / "ref.json"
+    assert _run(_base_argv(mfa_out, out, "--provenance", str(side))) == cc.EXIT_OK
+    prov = json.loads(out.read_text(encoding="utf-8"))["provenance"]
+    assert prov["reference_uncertainty_s"] == pytest.approx(mfa.NOMINAL_UNCERTAINTY_S)
+
+
+def test_omitted_mfa_command_is_recorded_as_null(mfa_out: Path, tmp_path: Path) -> None:
+    argv = _base_argv(mfa_out, tmp_path / "ref.json")
+    del argv[argv.index("--mfa-command") : argv.index("--mfa-command") + 2]
+    assert _run(argv) == cc.EXIT_OK
+    prov = json.loads((tmp_path / "ref.json").read_text(encoding="utf-8"))["provenance"]
+    assert prov["command"] is None
+
+
+def test_offset_pushing_a_word_before_zero_is_refused(
+    mfa_out: Path, tmp_path: Path
+) -> None:
+    """Without --media-duration too: the alignment loader rejects start < 0."""
+    out = tmp_path / "ref.json"
+    with pytest.raises(cc.CalibrationError) as excinfo:
+        _run(_base_argv(mfa_out, out, "--media-offset", "-1.0"))
+    assert "outside the media" in excinfo.value.message
+    assert not out.exists()

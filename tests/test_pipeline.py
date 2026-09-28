@@ -12,6 +12,9 @@ from pathlib import Path
 import pytest
 
 from voxweave import backend, pipeline
+from voxweave import paths
+from voxweave import vocals as vocals_mod
+from voxweave.core import overlay
 
 # Real filename that triggered the bug: title has interior ``...``
 DOTTED = (
@@ -262,26 +265,11 @@ def test_replay_repair_rejects_malformed_timing_without_relabeling(caplog):
     assert any("malformed source timings" in r.getMessage() for r in caplog.records)
 
 
-def test_write_siblings_drops_ts_line_when_cue_time_missing(tmp_path):
-    # defensive: cue missing start/end (rare) -> falls back to plain text, does not crash (fmt_ts rejects None)
-    cues = [
-        {"text": "a", "start": None, "end": None},
-        {"text": "b", "start": 0.0, "end": 1.0},
-    ]
-    out = pipeline._write_siblings(tmp_path / "x.mkv", cues, [], "en")
-    body = out.read_text(encoding="utf-8")
-    assert "00:00:00.000 --> 00:00:01.000" in body  # second cue has timing
-    # first cue (a) has no timing line: line before "a" must be blank, not "-->"
-    lines = body.splitlines()
-    assert "a" in lines
-    assert lines[lines.index("a") - 1] == ""
-
-
 def test_find_sibling_media_matches_dotted_name(tmp_path):
     media = tmp_path / f"{DOTTED}.webm"
     media.write_bytes(b"x")
     vtt = tmp_path / f"{DOTTED}.vtt"
-    assert pipeline._find_sibling_media(vtt) == media
+    assert paths.find_sibling_media(vtt) == media
 
 
 def test_split_corrupt_sibling_json_raises_readable_error(tmp_path):
@@ -323,11 +311,11 @@ def test_separate_self_cleans_partial_temps_on_failure(tmp_path, monkeypatch):
     def boom(fullband, **kw):
         raise RuntimeError("separation OOM")
 
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", fake_decode)
     monkeypatch.setattr(backend, "separate_vocals", boom)
 
     with pytest.raises(RuntimeError):
-        pipeline._separate_to_16k_32k(
+        vocals_mod._separate_to_16k_32k(
             tmp_path / "m.mkv", reporter=pipeline.Reporter(), normalize=False
         )
     # fullband was decoded before separation failed -> helper must have cleaned it up
@@ -354,10 +342,10 @@ def test_separate_derives_16k_input_from_32k_vocals(tmp_path, monkeypatch, norma
         p.write_bytes(b"x")
         return p
 
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", fake_decode)
     monkeypatch.setattr(backend, "separate_vocals", fake_separate)
 
-    fullband, vocals, wav, voc32 = pipeline._separate_to_16k_32k(
+    fullband, vocals, wav, voc32 = vocals_mod._separate_to_16k_32k(
         tmp_path / "m.mkv", reporter=pipeline.Reporter(), normalize=normalize
     )
 
@@ -392,11 +380,11 @@ def test_separate_cleans_32k_vocals_when_16k_decode_fails(tmp_path, monkeypatch)
         created.append(p)
         return p
 
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", fake_decode)
     monkeypatch.setattr(backend, "separate_vocals", fake_separate)
 
     with pytest.raises(RuntimeError, match="ffmpeg failed"):
-        pipeline._separate_to_16k_32k(
+        vocals_mod._separate_to_16k_32k(
             tmp_path / "m.mkv", reporter=pipeline.Reporter(), normalize=True
         )
     assert len(created) == 3 and not any(p.exists() for p in created)
@@ -414,7 +402,7 @@ def test_transcribe_cleans_separation_temps_when_a_debug_dump_fails(
         path.write_bytes(b"x")
     full, vocals, wav, voc32 = made
     monkeypatch.setattr(
-        pipeline, "_separate_to_16k_32k", lambda *_a, **_k: (full, vocals, wav, voc32)
+        vocals_mod, "_separate_to_16k_32k", lambda *_a, **_k: (full, vocals, wav, voc32)
     )
 
     def full_disk(self, name, path):
@@ -436,38 +424,38 @@ def test_spans_in_skips_malformed_entries_and_warns(caplog):
     # [2] has wrong arity (missing end); [3, "x"] has a non-numeric end.
     # Both must be skipped (not raise) while the well-formed entry survives.
     with caplog.at_level(logging.WARNING, logger="voxweave"):
-        result = pipeline._spans_in([[0, 1], [2], [3, "x"]])
+        result = overlay.spans_in([[0, 1], [2], [3, "x"]])
     assert result == [(0.0, 1.0)]
     assert any("malformed" in r.getMessage().lower() for r in caplog.records)
 
 
 def test_spans_in_all_malformed_returns_none(caplog):
     with caplog.at_level(logging.WARNING, logger="voxweave"):
-        result = pipeline._spans_in([[1], ["a", "b"]])
+        result = overlay.spans_in([[1], ["a", "b"]])
     assert result is None
 
 
 def test_turns_in_skips_malformed_entries_and_warns(caplog):
     # [2] has wrong arity (missing end + label); the well-formed entry survives.
     with caplog.at_level(logging.WARNING, logger="voxweave"):
-        result = pipeline._turns_in([[0, 1, "A"], [2]])
+        result = overlay.turns_in([[0, 1, "A"], [2]])
     assert result == [(0.0, 1.0, "A")]
     assert any("malformed" in r.getMessage().lower() for r in caplog.records)
 
 
 def test_turns_in_all_malformed_returns_none(caplog):
     with caplog.at_level(logging.WARNING, logger="voxweave"):
-        result = pipeline._turns_in([[1], ["a", "b", "c", "d"]])
+        result = overlay.turns_in([[1], ["a", "b", "c", "d"]])
     assert result is None
 
 
 def test_turns_in_retains_zero_duration_reversed_and_nonfinite_turns():
-    assert pipeline._turns_in([[0, 1, "A"], [1, 1, "B"], [2, 1.5, "C"]]) == [
+    assert overlay.turns_in([[0, 1, "A"], [1, 1, "B"], [2, 1.5, "C"]]) == [
         (0.0, 1.0, "A"),
         (1.0, 1.0, "B"),
         (2.0, 1.5, "C"),
     ]
-    nonfinite = pipeline._turns_in([[float("inf"), float("nan"), "D"]])
+    nonfinite = overlay.turns_in([[float("inf"), float("nan"), "D"]])
     assert nonfinite is not None
     assert math.isinf(nonfinite[0][0])
     assert math.isnan(nonfinite[0][1])
@@ -507,7 +495,7 @@ def test_find_sibling_media_case_insensitive_extension(tmp_path):
     media = tmp_path / "ep.MP4"
     media.write_bytes(b"x")
     vtt = tmp_path / "ep.vtt"
-    assert pipeline._find_sibling_media(vtt) == media
+    assert paths.find_sibling_media(vtt) == media
 
 
 def test_find_sibling_media_multiple_candidates_warns_and_is_deterministic(
@@ -521,6 +509,6 @@ def test_find_sibling_media_multiple_candidates_warns_and_is_deterministic(
     mp4.write_bytes(b"x")
     vtt = tmp_path / "ep.vtt"
     with caplog.at_level(logging.WARNING, logger="voxweave"):
-        found = pipeline._find_sibling_media(vtt)
+        found = paths.find_sibling_media(vtt)
     assert found == mkv
     assert any("multiple" in r.getMessage().lower() for r in caplog.records)

@@ -11,6 +11,10 @@ from click.shell_completion import CompletionItem
 
 _WARNED_DEPRECATIONS: set[str] = set()
 
+# ctx.meta key: the subcommand's arguments ask for --help. The group callback
+# runs before the subcommand parses them, so first-run side effects check it.
+HELP_REQUESTED = "voxweave.help_requested"
+
 
 def warn_deprecated(message: str) -> None:
     """Warn once per deprecated spelling per process, never on stdout."""
@@ -97,12 +101,15 @@ class DefaultGroup(click.RichGroup):
 
     def _path_like(self, token: str) -> bool:
         path = Path(token)
-        return (
-            any(sep in token for sep in (os.sep, os.altsep) if sep)
-            or path.suffix.lower()
+        if any(sep in token for sep in (os.sep, os.altsep) if sep) or (
+            path.suffix.lower()
             in (*self.media_extensions, ".vtt", ".srt", ".ass", ".ssa", ".json")
-            or path.exists()
-        )
+        ):
+            return True
+        try:
+            return path.exists()
+        except OSError:  # e.g. ENAMETOOLONG: no such file can exist
+            return False
 
     def _group_prefix_end(self, ctx, args: list[str]) -> int:
         """Consume only actual group options, including their declared arity."""
@@ -155,21 +162,26 @@ class DefaultGroup(click.RichGroup):
                     token.startswith("-") or self._path_like(token)
                 ):
                     args.insert(index, self._TOKEN)
-        return super().parse_args(ctx, args)
+        rest = super().parse_args(ctx, args)
+        head = rest[: rest.index("--")] if "--" in rest else rest
+        ctx.meta[HELP_REQUESTED] = any(arg in ctx.help_option_names for arg in head)
+        return rest
 
     def resolve_command(self, ctx, args):
         try:
             name, command, rest = super().resolve_command(ctx, args)
         except click.UsageError as exc:
             if args and "No such command" in exc.message:
-                matches = difflib.get_close_matches(
-                    args[0],
-                    [n for n, cmd in self.commands.items() if not cmd.hidden],
-                    n=1,
-                )
+                visible = [n for n, cmd in self.commands.items() if not cmd.hidden]
+                possibilities = getattr(exc, "possibilities", None)
+                if possibilities:
+                    # click >= 8.4 suggests from every command, hidden aliases too.
+                    possibilities = [n for n in possibilities if n in visible]
+                    exc.possibilities = possibilities  # pyright: ignore[reportAttributeAccessIssue]
+                matches = difflib.get_close_matches(args[0], visible, n=1)
                 hint = (
                     f" Did you mean '{matches[0]}'?"
-                    if matches and not getattr(exc, "possibilities", None)
+                    if matches and not possibilities
                     else ""
                 )
                 exc.message += hint + " If this is a media file, pass a path (./name)."

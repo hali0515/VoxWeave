@@ -33,6 +33,7 @@ import math
 import os
 import sys
 import tempfile
+import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,13 +56,10 @@ __all__ = [
     "canonical_language_or",
     "die_gate",
     "die_invalid",
-    "exit_code",
     "group_keys",
-    "is_calibration_language",
     "languages_match",
     "load_schema",
     "load_validated_json",
-    "merge_ratios",
     "metric_block",
     "percentile",
     "read_json",
@@ -86,7 +84,7 @@ EXIT_INVALID = 2
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_DIR = REPO_ROOT / "calibration" / "schemas"
 
-#: The only languages the calibration corpora cover (see design doc 3.1 / 4.4).
+#: The only languages the calibration corpora cover.
 CALIBRATION_LANGUAGES = ("en", "ja", "zh")
 
 
@@ -107,13 +105,6 @@ class CalibrationError(Exception):
         return "\n".join(lines)
 
 
-def exit_code(*, valid: bool, gates_passed: bool) -> int:
-    """Map the two independent outcomes onto the shared 0/1/2 contract."""
-    if not valid:
-        return EXIT_INVALID
-    return EXIT_OK if gates_passed else EXIT_GATE_FAILED
-
-
 def die_invalid(message: str, details: Sequence[str] = ()) -> NoReturn:
     """Report an invalid run on stderr and exit 2."""
     print(CalibrationError(message, details).render(), file=sys.stderr)
@@ -130,12 +121,23 @@ def run_cli(main: Callable[[], int]) -> NoReturn:
     """Run ``main`` and exit with the shared contract, mapping errors to 2.
 
     Keeping the mapping here means no harness can accidentally return 1 for a
-    broken manifest, which would read as "quality regressed" in CI.
+    broken manifest, which would read as "quality regressed" in CI. Any other
+    exception (malformed-but-parseable input the checks did not anticipate, or
+    a harness bug) is also exit 2, with its traceback kept on stderr: a crash
+    has no standing to judge quality either.
     """
     try:
         code = main()
     except CalibrationError as exc:
         print(exc.render(), file=sys.stderr)
+        raise SystemExit(EXIT_INVALID) from None
+    except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+        print(
+            f"internal error: {type(exc).__name__}: {exc}\n"
+            "exit 2: the run is invalid, not a quality regression",
+            file=sys.stderr,
+        )
         raise SystemExit(EXIT_INVALID) from None
     raise SystemExit(int(code))
 
@@ -175,6 +177,8 @@ def read_json(path: str | Path) -> Any:
         text = p.read_text(encoding="utf-8")
     except OSError as exc:
         raise CalibrationError(f"cannot read {p}: {exc}") from None
+    except UnicodeDecodeError as exc:
+        raise CalibrationError(f"{p} is not valid UTF-8: {exc}") from None
     try:
         return json.loads(text)
     except json.JSONDecodeError as exc:
@@ -219,7 +223,8 @@ def _jsonschema_module() -> Any:
     except ImportError as exc:  # pragma: no cover - environment problem, not logic
         raise CalibrationError(
             "jsonschema is required for calibration validation "
-            "(dev group: `uv sync --extra cuda --dev`)",
+            "(dev group: `make dev`, i.e. `uv sync --extra <cuda|mps> --dev`; "
+            "or `pip install 'jsonschema>=4,<5'`)",
             [str(exc)],
         ) from None
     return jsonschema
@@ -257,15 +262,20 @@ def schema_errors(
     """
     jsonschema = _jsonschema_module()
     validator = jsonschema.Draft202012Validator(_resolve_schema(schema))
+    # ``relevance`` ranks higher-is-better (``best_match`` takes its max), so
+    # sort descending to keep the most relevant errors when truncating.
+    errors = sorted(
+        validator.iter_errors(instance),
+        key=jsonschema.exceptions.relevance,
+        reverse=True,
+    )
     out: list[str] = []
-    for err in sorted(
-        validator.iter_errors(instance), key=jsonschema.exceptions.relevance
-    ):
+    for err in errors[:limit]:
         where = "/".join(str(part) for part in err.absolute_path) or "<root>"
         out.append(f"{where}: {err.message}")
-        if len(out) >= limit:
-            out.append("... (further errors suppressed)")
-            break
+    dropped = len(errors) - len(out)
+    if dropped > 0:
+        out.append(f"... ({dropped} further errors suppressed)")
     return out
 
 
@@ -390,10 +400,6 @@ def canonical_language(raw: str | None) -> str:
     if iso is None:
         raise CalibrationError(f"unrecognized language tag {raw!r}")
     return iso
-
-
-def is_calibration_language(raw: str | None) -> bool:
-    return canonical_language_or(raw, None) in CALIBRATION_LANGUAGES
 
 
 def require_calibration_language(raw: str | None) -> str:
@@ -563,14 +569,6 @@ class Ratio:
         return {"bad": self.bad, "eligible": self.eligible, "value": self.value}
 
 
-def merge_ratios(parts: Iterable[Ratio]) -> Ratio:
-    """Micro-aggregate ratios: sum numerators and denominators."""
-    total = Ratio()
-    for part in parts:
-        total = total + part
-    return total
-
-
 def group_keys(language: str) -> tuple[str, str]:
     """Reporting groups a sample belongs to: the ``all`` summary and its language."""
     return ("all", require_calibration_language(language))
@@ -599,13 +597,3 @@ class MicroAggregator:
 
     def samples(self, group: str, metric: str) -> list[float]:
         return list(self._samples.get((group, metric), ()))
-
-    def groups(self) -> list[str]:
-        seen = {g for g, _ in self._ratios} | {g for g, _ in self._samples}
-        return sorted(seen)
-
-    def metrics(self, group: str) -> list[str]:
-        seen = {m for g, m in self._ratios if g == group} | {
-            m for g, m in self._samples if g == group
-        }
-        return sorted(seen)

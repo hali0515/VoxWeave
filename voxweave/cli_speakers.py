@@ -11,20 +11,21 @@ import rich_click as click
 from rich.console import Console
 from rich.table import Table
 
-from voxweave import artifacts, pipeline
+from voxweave import artifacts, sidecars
 from voxweave.cli_compat import DefaultGroup, warn_deprecated
-from voxweave.cli_voices import VoicesDirPath
+from voxweave.cli_voices import VOICES_DIR_DEFAULT, VoicesDirPath
+from voxweave.paths import MEDIA_EXTS, swap_ext
 
 
 class SpeakersGroup(DefaultGroup):
     """Keep a bare episode path as the audition shortcut."""
 
-    media_extensions = (*pipeline.MEDIA_EXTS, ".vtt", ".json")
+    media_extensions = (*MEDIA_EXTS, ".vtt", ".json")
 
 
 def _episode_owner(episode: Path, *, require_media: bool = False) -> Path:
-    owner = pipeline._artifact_owner(episode)
-    if require_media and owner.suffix.lower() not in pipeline.MEDIA_EXTS:
+    owner = sidecars.artifact_owner(episode)
+    if require_media and owner.suffix.lower() not in MEDIA_EXTS:
         raise FileNotFoundError(
             f"source media not found for {episode}; pass the episode's media path"
         )
@@ -65,14 +66,14 @@ def _list_episode(episode: Path) -> dict[str, Any]:
     from voxweave.voicebase import strict_json_object_loads, strict_turn_projection
 
     owner = _episode_owner(episode)
-    sibling_path = pipeline.swap_ext(owner, ".json")
+    sibling_path = swap_ext(owner, ".json")
     raw = sibling_path.read_bytes()
     sibling = strict_json_object_loads(
         raw, max_bytes=max(1, len(raw)), source=sibling_path.name
     )
     turns = strict_turn_projection(sibling.get("speaker_turns", []))
     labels = sorted({label for _start, _end, label in turns})
-    mapping_path = pipeline.inspect_speakers_mapping_path(owner, reference=sibling_path)
+    mapping_path = sidecars.inspect_speakers_mapping_path(owner, reference=sibling_path)
     names = (
         load_speaker_mapping_bytes(
             mapping_path.read_bytes(), labels, source=mapping_path.name
@@ -165,8 +166,7 @@ def build_speakers_group(
     @click.option(
         "--voices-dir",
         type=voices_dir_type,
-        help="Voice library directory (default: VOXWEAVE_VOICES_DIR, conf "
-        "[voices].dir, or ~/.local/share/voxweave/voices).",
+        help=f"Voice library directory ({VOICES_DIR_DEFAULT}).",
     )
     @click.option(
         "--voices",
@@ -242,8 +242,7 @@ def build_speakers_group(
     @click.option(
         "--voices-dir",
         type=voices_dir_type,
-        help="Voice library for name suggestions (default: VOXWEAVE_VOICES_DIR, "
-        "conf [voices].dir, or ~/.local/share/voxweave/voices).",
+        help=f"Voice library for name suggestions ({VOICES_DIR_DEFAULT}).",
     )
     @click.option(
         "--voices",
@@ -265,12 +264,21 @@ def build_speakers_group(
         type=click.Choice(["127.0.0.1", "0.0.0.0"]),
         default="127.0.0.1",
         show_default=True,
-        help="HTTP bind address; 0.0.0.0 allows access from other devices.",
+        help=(
+            "HTTP bind address; 0.0.0.0 allows access from other devices. The page opens"
+            " only through the printed access link (/?k=...); anyone who has that link can"
+            " play the audio and edit names, and on the network the connection is plain"
+            " HTTP."
+        ),
     )
     @click.option(
         "--ngrok",
         is_flag=True,
-        help="Discover this port's public URLs from the local ngrok agent automatically.",
+        help=(
+            "Discover this port's public URLs from the local ngrok agent automatically."
+            " Open the tunnel URL with the printed /?k=... appended; anyone who has that"
+            " link can play the audio and edit names."
+        ),
     )
     @click.option(
         "--port",
@@ -368,8 +376,6 @@ def build_speakers_group(
 
         def prepare(_rep: object) -> Any:
             owner = _episode_owner(episode_path, require_media=True)
-            if voices is None and show is None and not manual and not library:
-                return create_speaker_audition(owner)
             return create_speaker_audition(
                 owner, voices=voices, show=show, no_match=manual, **library
             )

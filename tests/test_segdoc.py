@@ -24,7 +24,7 @@ from voxweave.core.segdoc import (
     build_seg_document,
 )
 
-# The nine keys ``segment_document`` resolves into ``thresholds_used``.
+# The nine threshold keys ``segment_document`` resolves and records.
 THRESHOLD_KEYS = (
     "clause_ms",
     "vad_skip_ms",
@@ -118,7 +118,7 @@ def test_from_resolved_does_not_clamp_or_renormalize():
 
 @pytest.mark.parametrize("missing", THRESHOLD_KEYS)
 def test_from_resolved_raises_key_error_on_a_missing_threshold(missing):
-    """The caller passes ``thresholds_used``, which always has all nine; a hole
+    """The caller passes resolved thresholds, which always have all nine; a hole
     means the caller resolved something else and must not be papered over."""
     partial = {k: v for k, v in JA_THRESHOLDS.items() if k != missing}
     with pytest.raises(KeyError):

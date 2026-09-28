@@ -7,13 +7,16 @@ import pytest
 from click.testing import CliRunner
 
 from voxweave import backend, episode_transaction, pipeline
+from voxweave import vocals
 from voxweave.cli import cli
 from voxweave.mediasnapshot import SnapshotUnavailable
 from voxweave.voicebase import media_fingerprint
 from voxweave.vocalscache import (
     cache_companion_path,
     cache_lock as real_cache_lock,
+    load_cache_companion,
     publish_cache_companion,
+    validate_cache_pair,
 )
 
 
@@ -425,19 +428,20 @@ def test_bound_align_rejects_duration_only_and_legacy_cache(tmp_path, monkeypatc
     )
     separated_from: list[Path] = []
 
-    def fake_separate(media, **_kwargs):
+    def fake_separate(media, **kwargs):
         separated_from.append(Path(media))
-        return parts
+        assert kwargs.get("return_separator_identity") is True
+        return (*parts, dict(SEPARATOR))
 
     def fake_encode(_source, destination):
         Path(destination).write_bytes(b"new cache")
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
-    monkeypatch.setattr(pipeline, "_probe_duration", lambda _path: 10.0)
-    monkeypatch.setattr(pipeline, "_separate_to_16k_32k", fake_separate)
-    monkeypatch.setattr(pipeline, "_encode_flac", fake_encode)
+    monkeypatch.setattr(vocals, "_probe_duration", lambda _path: 10.0)
+    monkeypatch.setattr(vocals, "_separate_to_16k_32k", fake_separate)
+    monkeypatch.setattr(vocals, "_encode_flac", fake_encode)
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "decode_to_wav",
         lambda *_args, **_kwargs: pytest.fail("unbound cache must not be decoded"),
     )
@@ -455,7 +459,11 @@ def test_bound_align_rejects_duration_only_and_legacy_cache(tmp_path, monkeypatc
     assert got == parts[2]
     assert separated_from == [source]
     assert cache.read_bytes() == b"new cache"
-    assert not cache_companion_path(cache).exists()
+    # The stale companion is gone; the fresh one binds the new vocals.
+    companion, _validated = load_cache_companion(cache_companion_path(cache))
+    validate_cache_pair(
+        companion, cache, media_fingerprint=fingerprint, separator=SEPARATOR
+    )
 
 
 def test_bound_align_validates_cache_while_lock_is_held(tmp_path, monkeypatch):
@@ -491,10 +499,11 @@ def test_bound_align_validates_cache_while_lock_is_held(tmp_path, monkeypatch):
         return decoded
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
-    monkeypatch.setattr(pipeline, "cache_lock", tracking_lock)
+    monkeypatch.setattr(vocals, "cache_lock", tracking_lock)
     monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
-        pipeline,
+        vocals,
         "_separate_to_16k_32k",
         lambda *_args, **_kwargs: pytest.fail("validated cache must be a hit"),
     )

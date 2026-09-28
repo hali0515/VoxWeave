@@ -24,6 +24,7 @@ from rich.progress import (
 from rich.table import Column, Table
 from rich.text import Text
 
+from voxweave.paths import swap_ext
 from voxweave.progress import Reporter
 
 # Logs/errors to stderr; result paths to stdout so `voxweave x | ...` pipelines work cleanly.
@@ -317,18 +318,22 @@ class RichReporter(Reporter):
             self._progress.update(self._task_id, completed=done, total=total)
 
 
-# Pipeline aborts that leave nothing to write (pipeline.transcribe/split).
+# Pipeline aborts that leave nothing to write (pipeline.transcribe/split/align).
 _PIPELINE_ABORT_MARKERS = (
     "no speech",
     "no aligned",
-    "no alignment",
     "no word segments",
 )
 
 
 def _hint_for(exc: Exception) -> str:
     if isinstance(exc, FileNotFoundError):
-        return "File not found, or ffmpeg is not on PATH."
+        filename = getattr(exc, "filename", None)
+        if filename in ("ffmpeg", "ffprobe"):
+            return f"{filename} is not on PATH: install ffmpeg."
+        if str(filename or "").endswith(".json"):
+            return "Sibling JSON not found: transcribe the media first."
+        return "File not found."
     if type(exc).__module__.startswith("openai"):
         status = getattr(exc, "status_code", None)
         if status in {401, 403}:
@@ -347,18 +352,15 @@ def _hint_for(exc: Exception) -> str:
             )
         return "LLM API error: check the configured endpoint and network access."
     if "out of memory" in str(exc).lower():
-        return (
-            "GPU out of memory: lower VOXWEAVE_MAX_CHUNK_SEC or pick a smaller --model."
-        )
+        return "GPU out of memory: lower VOXWEAVE_MAX_CHUNK_SEC or pick a smaller --asr-model."
     if isinstance(exc, RuntimeError):
         message = str(exc).lower()
         if "cues untranslated" in message:
+            # The message itself already says how to resume or allow partial output.
             return (
-                "Rerun the same command to resume: the translation progress file is "
-                "kept and already-translated cues are not re-requested. Pass "
-                "--allow-partial to write the file with the remaining cues in source "
-                "text. If the same cues keep failing, check the LLM server log "
-                "(structured-output aborts, max_tokens)."
+                "Already-translated cues are not re-requested on a rerun. If the same "
+                "cues keep failing, check the LLM server log (structured-output "
+                "aborts, max_tokens)."
             )
         if "response incomplete" in message:
             return (
@@ -386,9 +388,17 @@ def _hint_for(exc: Exception) -> str:
     return ""
 
 
+def _error_name(exc: Exception) -> str:
+    """Nearest builtin class name: internal exception classes mean nothing to users."""
+    for cls in type(exc).__mro__:
+        if cls.__module__ == "builtins":
+            return cls.__name__
+    return type(exc).__name__
+
+
 def error_panel(exc: Exception) -> None:
     """Render exception as a red panel with a troubleshooting hint."""
-    body = Text(f"{type(exc).__name__}: ", style=_ERROR)
+    body = Text(f"{_error_name(exc)}: ", style=_ERROR)
     body.append(str(exc), style="default")
     hint = _hint_for(exc)
     if hint:
@@ -415,8 +425,6 @@ def summary_panel(
     normalized: bool = False,
 ) -> None:
     """Print transcription success panel: paths, language, cue count, and flags."""
-    from voxweave.pipeline import swap_ext
-
     vtt = Path(vtt_path)
     json_path = swap_ext(vtt, ".json")  # sibling derivation: never Path.with_suffix
     lines = [f"VTT  : {vtt}", f"JSON : {json_path}"]
@@ -426,7 +434,7 @@ def summary_panel(
         lines.append(f"cues : {len(data.get('segments', []))}")
     except (OSError, ValueError):
         pass
-    lines.append(f"sep  : {'on' if separated else 'off (--no-separate)'}")
+    lines.append(f"sep  : {'on' if separated else 'off'}")
     if normalized:
         lines.append("vol  : loudnorm applied")
     if debug_dir is not None:
@@ -474,17 +482,19 @@ def correct_summary_panel(res: dict) -> None:
         t.add_column("Fixed", style=_SUCCESS)
         t.add_column("Reason", style=_MUTED)
         for f in applied[:20]:
+            # Text cells: LLM/cue text such as "[/laughs]" is literal, never markup.
             t.add_row(
                 str(f.get("i")),
-                f.get("orig", ""),
-                f.get("fixed", ""),
-                f.get("reason", ""),
+                Text(str(f.get("orig", ""))),
+                Text(str(f.get("fixed", ""))),
+                Text(str(f.get("reason", ""))),
             )
         console.print(t)
         if len(applied) > 20:
-            console.print(
-                f"[dim]... and {len(applied) - 20} more; see audit JSON for full list[/]"
-            )
+            more = f"... and {len(applied) - 20} more"
+            if res.get("audit"):
+                more += "; see the audit JSON for the full list"
+            console.print(Text(more, style=_MUTED))
 
     if rejected:
         reasons: dict[str, int] = {}
@@ -496,9 +506,22 @@ def correct_summary_panel(res: dict) -> None:
         console.print(message)
 
     if aligned:
-        nxt = "[green]Done[/]: corrections applied and timestamps re-aligned in place."
+        nxt = Text("Done", style=_SUCCESS)
+        nxt.append(": corrections applied and timestamps re-aligned in place.")
+    elif in_place and not applied:
+        nxt = Text("No corrections applied; timestamps unchanged.")
     elif in_place:
-        nxt = "Next: run [bold]voxweave align[/] to reassign timestamps (text changed, timestamps need refresh)"
+        nxt = Text("Next: run ")
+        nxt.append("voxweave align", style="bold")
+        nxt.append(" to refresh timestamps for the corrected text.")
     else:
-        nxt = f"Next: review [bold]{out.name}[/] -> [bold]voxweave correct --apply[/] to overwrite original VTT -> [bold]voxweave align[/]"
+        nxt = Text("Next: review ")
+        nxt.append(out.name, style="bold")
+        nxt.append("; to accept it, replace the VTT with it and run ")
+        nxt.append("voxweave align", style="bold")
+        nxt.append("; or rerun with ")
+        nxt.append("--apply", style="bold")
+        nxt.append(
+            " to let the LLM rewrite the VTT directly (it re-aligns automatically)."
+        )
     console.print(nxt)

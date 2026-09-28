@@ -1,21 +1,19 @@
 """Frozen typed policy/finalizer delta registry from P5 LAW section 9.
 
-The registry is canonical data, not prose attached to a version constant.  Its
-serialization is deliberately owned here and byte-pinned by N17 so a changed
-trigger, relation, direction, field set, or enforcement cannot masquerade as
-the same policy contract.
+The registry is canonical data, not prose attached to a version constant.  The
+artifact data (``delta_registry_data``) is byte-pinned by N17 in its compact
+JSON form so a changed trigger, relation, direction, field set, or enforcement
+cannot masquerade as the same policy contract.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
     "DELTA_REGISTRY",
     "DeltaRecord",
-    "delta_registry_bytes",
     "delta_registry_data",
 ]
 
@@ -148,12 +146,3 @@ DELTA_REGISTRY: tuple[DeltaRecord, ...] = (
 def delta_registry_data() -> list[dict[str, Any]]:
     """Return detached artifact data in the registry's frozen order."""
     return [record.to_dict() for record in DELTA_REGISTRY]
-
-
-def delta_registry_bytes() -> bytes:
-    """Return the N17 canonical UTF-8 serialization."""
-    return json.dumps(
-        delta_registry_data(),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode()

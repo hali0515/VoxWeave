@@ -261,6 +261,47 @@ def test_a_non_positive_gap_is_zero_effective_silence():
     assert pause_cut_cost(ev) == pytest.approx(W_PAUSE)
 
 
+@pytest.mark.parametrize(
+    ("prev_end", "next_start"),
+    [(1.0, 1.0), (1.2, 1.0)],
+    ids=["touching", "overlapping"],
+)
+def test_a_non_positive_gap_inside_vad_speech_is_speech_overlap(prev_end, next_start):
+    """Bug pin: a gap with no length used to be labelled ``silence`` regardless.
+
+    Only the label was wrong -- zero effective silence prices the same under
+    either state -- but the label is what the artifact's ``vad_state`` block and
+    the perturbation runner count.
+    """
+    inside = pause_evidence(
+        prev_end, next_start, speech_spans=[(0.0, 2.0)], profile=profile()
+    )
+    assert inside.vad_state == "speech-overlap"
+    assert inside.overlap_fraction == pytest.approx(1.0)
+    assert inside.effective_ms == 0.0
+    outside = pause_evidence(
+        prev_end, next_start, speech_spans=[(3.0, 4.0)], profile=profile()
+    )
+    assert outside.vad_state == "silence"
+    assert outside.overlap_fraction == 0.0
+    assert pause_cut_cost(inside) == pause_cut_cost(outside) == pytest.approx(W_PAUSE)
+
+
+def test_a_touching_gap_reads_speech_on_the_half_open_span_convention():
+    """A span covers its start instant but not its end, as ``[low, high)`` does."""
+    starts = pause_evidence(1.0, 1.0, speech_spans=[(1.0, 2.0)], profile=profile())
+    ends = pause_evidence(1.0, 1.0, speech_spans=[(0.0, 1.0)], profile=profile())
+    assert starts.vad_state == "speech-overlap"
+    assert ends.vad_state == "silence"
+
+
+def test_an_overlap_stretch_reports_the_fraction_vad_covers():
+    ev = pause_evidence(1.4, 1.0, speech_spans=[(1.2, 3.0)], profile=profile())
+    assert ev.vad_state == "speech-overlap"
+    assert ev.overlap_fraction == pytest.approx(0.5)
+    assert ev.effective_ms == 0.0
+
+
 def test_pause_evidence_features_are_all_recorded():
     ev = pause_evidence(1.0, 1.4, speech_spans=[(1.1, 1.3)], profile=profile())
     features = ev.to_features()
@@ -593,6 +634,34 @@ def test_sum_breakdowns_pools_numeric_features_and_drops_categoricals():
     assert "vad_state" not in pooled.features
     assert pooled.weighted_terms["pause_cut"] == pytest.approx(3.0)
     assert pooled.total == quantize(3.0)
+
+
+def test_sum_breakdowns_keeps_a_feature_only_some_parts_carry():
+    """Bug pin: pooling edges with cuts used to drop every feature.
+
+    Edge and cut breakdowns carry disjoint feature sets, so requiring a key in
+    every part emptied every path aggregate. A key a part does not carry is not
+    part of that part's schema; an explicit ``None`` is an unknown value, and
+    still drops the key rather than summing to a total that is not one.
+    """
+    cut = make_breakdown(
+        {"gap_ms_raw": 100.0, "shot_preview_raw": None, "vad_state": "silence"},
+        {"pause_cut": 1.0},
+    )
+    other_cut = make_breakdown(
+        {"gap_ms_raw": 50.0, "shot_preview_raw": 0.1, "vad_state": "absent"},
+        {"pause_cut": 2.0},
+    )
+    cue = make_breakdown(
+        {"available_s": 1.5, "layout_source": "renderer-single-line"},
+        {"cue_base": 2.0},
+    )
+    pooled = sum_breakdowns([cue, cut, other_cut])
+    assert pooled.features == {
+        "available_s": pytest.approx(1.5),
+        "gap_ms_raw": pytest.approx(150.0),
+    }
+    assert pooled.total == quantize(5.0)
 
 
 def test_sum_breakdowns_of_nothing_is_zero():

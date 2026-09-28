@@ -106,7 +106,7 @@ def test_pyannote4_loader_splits_revision_and_uses_v4_keywords(
     cache_dir = tmp_path / "audio-cache"
     monkeypatch.setattr(diarize.config, "AUDIO_CACHE", str(cache_dir))
     monkeypatch.setattr(
-        diarize, "_pipeline_config_path", lambda *_args, **_kwargs: None
+        diarize, "_fetch_pipeline_config", lambda *_args, **_kwargs: (None, None)
     )
 
     result = diarize._load_pipeline(
@@ -143,7 +143,9 @@ def test_legacy_31_suppresses_only_its_unused_community_plda_and_restores(
     speaker_module = _install_speaker_module(monkeypatch, forbidden_get_plda)
     _PLDAProbePipeline.plda_results = []
     monkeypatch.setattr(
-        diarize, "_pipeline_config_path", lambda *_args, **_kwargs: config_path
+        diarize,
+        "_fetch_pipeline_config",
+        lambda *_args, **_kwargs: (config_path, None),
     )
     monkeypatch.setattr(
         diarize, "_embedding_load_authority", lambda *_args, **_kwargs: None
@@ -180,7 +182,9 @@ def test_legacy_31_refuses_plda_suppression_without_agglomerative_precondition(
 
     speaker_module = _install_speaker_module(monkeypatch, forbidden_get_plda)
     monkeypatch.setattr(
-        diarize, "_pipeline_config_path", lambda *_args, **_kwargs: config_path
+        diarize,
+        "_fetch_pipeline_config",
+        lambda *_args, **_kwargs: (config_path, None),
     )
     monkeypatch.setattr(
         diarize, "_embedding_load_authority", lambda *_args, **_kwargs: None
@@ -215,7 +219,9 @@ def test_community_plan_keeps_remote_model_context_for_structured_subfolders(
         return SimpleNamespace()
 
     monkeypatch.setattr(
-        diarize, "_pipeline_config_path", lambda *_args, **_kwargs: config_path
+        diarize,
+        "_fetch_pipeline_config",
+        lambda *_args, **_kwargs: (config_path, None),
     )
     monkeypatch.setattr(
         diarize, "_embedding_load_authority", lambda *_args, **_kwargs: None

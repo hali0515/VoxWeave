@@ -2,8 +2,8 @@
 
 Nothing about the search is approximate. With the tile machinery deleted, each
 hard interval is solved by one forward shortest-path pass over its whole legal
-edge set, so margins, the runner-up and the selection policy are *whole-interval*
-quantities rather than per-window ones that could disagree at a seam. That is
+edge set, so margins and the selection policy are *whole-interval* quantities
+rather than per-window ones that could disagree at a seam. That is
 only affordable because legality is self-bounding: coalescing gives every atom
 positive display width, so a legal cue spans at most ``band_atoms(profile)``
 atoms and the edge scan's early break provably fires.
@@ -20,7 +20,7 @@ Three properties make the exactness claim testable rather than merely asserted:
   the last cut, then the one before it, and so on -- and that is what the
   brute-force test compares against.
 * **work counters, separately.** DP relaxations count ``(node, outgoing edge)``
-  pairs, not 2-best ranks; spaced packer extensions and no-space canonical
+  pairs; spaced packer extensions and no-space canonical
   character visits are counted independently by the lattice. Each is asserted
   against its resolved bound by tests rather than production asserts, because a
   work bound that fires in production is a crash, not a proof.
@@ -68,6 +68,7 @@ from .boundary_lattice import (
     build_document_lattice,
     _cache_candidate_evidence,
     _canonical_pack_measure,
+    _resolve_candidate_evidence,
     _resolve_edge_input_bounds,
     held_chain_continuous,
     preflight_profile,
@@ -93,19 +94,16 @@ from .subunit import (
     speech_span_units,
 )
 from .speaker_evidence import (
-    EVIDENCE_SPAN_REFUSAL_REVERSED,
     W_SPEAKER_INTERIOR,
     EvidenceSpan,
     SpeakerPricingSummary,
     UnitSpeakers,
     evidence_span_from_cue,
-    lyric_for_evidence,
     make_evidence_span,
     named_multi_cues_unannotated,
     speaker_edge_cost,
     speaker_evidence,
     summarize_speaker_prices,
-    try_make_evidence_span,
 )
 from .timing_preview import DisplayTimingPreview, LegacyCleanupPreview
 
@@ -175,11 +173,8 @@ class CostTables:
     edges: Mapping[tuple[int, int], CostBreakdown]
     cuts: Mapping[int, CostBreakdown]
     speaker_pricing: SpeakerPricingSummary | None = None
-    base_edges: Mapping[tuple[int, int], CostBreakdown] | None = None
     speaker_context: CostContext | None = None
     fallback_start: float = 0.0
-    predecessor_stateful: bool = False
-    speaker_pricing_refused: bool = False
     document_nodes: tuple[int, ...] = ()
 
 
@@ -223,7 +218,9 @@ def build_cost_context(
 ) -> CostContext:
     """Bundle everything a cost term needs that is not the edge or the cut.
 
-    The preview defaults to the mirror of today's cleanup pass; P5 hands in the
+    The preview defaults to experimental_policy_1's frozen preview (extensions
+    clamp at the next cue's start); the mirror of today's cleanup pass is
+    ``LegacyCleanupPreview(two_frame_extension_floor=True)``. P5 hands in the
     finalizer's own preview and nothing else here changes.
     """
     resolved_speakers = speakers
@@ -309,6 +306,23 @@ def _document_nodes(lattice: IntervalLattice, layer: AtomLayer) -> tuple[int, ..
     return tuple(out)
 
 
+def _sentence_cross_count(ctx: CostContext, left: int, right: int) -> int:
+    """How many document sentence-end nodes lie strictly inside ``(left, right)``."""
+    nodes = ctx.sorted_sentence_nodes
+    return max(0, bisect.bisect_left(nodes, right) - bisect.bisect_right(nodes, left))
+
+
+def _phase1_unit_facts(
+    ctx: CostContext, low: int, high: int
+) -> tuple[float | None, float | None, str]:
+    """The acoustic anchors and owned footprint phase 1 reads for ``[low, high)``."""
+    speech_start, speech_end = speech_span_units(ctx.units[low:high])
+    footprint = _join(
+        [unit.surface for unit in ctx.units[low:high]], ctx.profile.language
+    )
+    return speech_start, speech_end, footprint
+
+
 def _base_edge_cost(
     lattice: IntervalLattice,
     edge: Edge,
@@ -322,9 +336,7 @@ def _base_edge_cost(
         "profile": ctx.profile,
         "preview": ctx.preview,
         "next_start": ctx.next_start_after(right),
-        "sentence_cross_count": sum(
-            1 for node in ctx.sentence_nodes if left < node < right
-        ),
+        "sentence_cross_count": _sentence_cross_count(ctx, left, right),
     }
     # The staged policy-1 solve remains the exact legacy experiment. Explicit
     # P5 rows always carry UnitSpeakers (including an absent track), and consume
@@ -332,11 +344,8 @@ def _base_edge_cost(
     if not isinstance(ctx.speaker_evidence, UnitSpeakers):
         return edge_cost(edge, lattice.atoms, **common)
 
-    low = lattice.unit_bound(edge.start_node)
-    high = lattice.unit_bound(edge.end_node)
-    speech_start, speech_end = speech_span_units(ctx.units[low:high])
-    owned_footprint = _join(
-        [unit.surface for unit in ctx.units[low:high]], ctx.profile.language
+    speech_start, speech_end, owned_footprint = _phase1_unit_facts(
+        ctx, lattice.unit_bound(edge.start_node), lattice.unit_bound(edge.end_node)
     )
     return edge_cost(
         edge,
@@ -371,78 +380,13 @@ def _resolve_edge_for_previous(
         )
     ):
         return edge
-
-    unit_range = (
-        lattice.unit_bound(edge.start_node),
-        lattice.unit_bound(edge.end_node),
-    )
-    evidence_span = try_make_evidence_span(
-        ctx.units,
-        unit_range,
-        input_start=input_start,
-        input_end=input_end,
-    )
-    if evidence_span is None:
-        return replace(
-            edge,
-            evidence_span=None,
-            lyric=False,
-            input_start=input_start,
-            input_end=input_end,
-            evidence_deferred=False,
-            evidence_unavailable_reason=EVIDENCE_SPAN_REFUSAL_REVERSED,
-        )
-    return replace(
+    return _resolve_candidate_evidence(
         edge,
-        evidence_span=evidence_span,
-        lyric=lyric_for_evidence(evidence_span, ctx.sing_spans),
-        input_start=input_start,
-        input_end=input_end,
-        evidence_deferred=False,
-        evidence_unavailable_reason=None,
-    )
-
-
-def _speaker_price(
-    lattice: IntervalLattice,
-    edge: Edge,
-    ctx: CostContext,
-    base: CostBreakdown,
-    document_nodes: Sequence[int],
-    *,
-    previous_end: float,
-) -> tuple[Edge, CostBreakdown]:
-    """Resolve one predecessor-dependent edge and compose its speaker term."""
-    if not isinstance(ctx.speaker_evidence, UnitSpeakers):
-        return edge, base
-    resolved = _resolve_edge_for_previous(
         lattice,
-        edge,
-        ctx,
+        units=ctx.units,
+        sing_spans=ctx.sing_spans,
         previous_end=previous_end,
     )
-    if resolved.evidence_unavailable_reason is not None:
-        return resolved, _base_edge_cost(lattice, resolved, ctx, document_nodes)
-    if not isinstance(resolved.evidence_span, EvidenceSpan):
-        raise ValueError("resolved speaker edge has no EvidenceSpan")
-    unit_range = (
-        lattice.unit_bound(edge.start_node),
-        lattice.unit_bound(edge.end_node),
-    )
-    speaker = speaker_edge_cost(
-        ctx.speaker_evidence,
-        unit_range,
-        evidence_span=resolved.evidence_span,
-        sing_spans=ctx.sing_spans,
-        weight=ctx.speaker_weight,
-        suppressed_lyric=resolved.lyric,
-    )
-    # A fabricated start can inherit the selected predecessor's end. That value
-    # is a phase-1 input, so both the speaker term and the base preview price must
-    # be recomputed for the resolved edge rather than retaining a representative
-    # table entry produced with ``fallback_start``.
-    resolved_base = _base_edge_cost(lattice, resolved, ctx, document_nodes)
-    return resolved, _with_speaker_cost(resolved_base, speaker)
 
 
 def build_cost_tables(
@@ -461,10 +405,7 @@ def build_cost_tables(
     profile = ctx.profile
     atoms = lattice.atoms
     edges: dict[tuple[int, int], CostBreakdown] = {}
-    base_edges: dict[tuple[int, int], CostBreakdown] = {}
     speaker_parts: list[CostBreakdown] = []
-    predecessor_stateful = False
-    speaker_pricing_refused = False
     resolved_document_nodes = (
         _document_nodes(lattice, ctx.layer)
         if document_nodes is None
@@ -473,14 +414,8 @@ def build_cost_tables(
     if len(resolved_document_nodes) != len(lattice.atoms) + 1:
         raise ValueError("document-node map does not match interval topology")
     for edge in lattice.edges:
-        priced_edge = edge
-        if isinstance(ctx.speaker_evidence, UnitSpeakers) and edge.evidence_deferred:
-            priced_edge = _resolve_edge_for_previous(
-                lattice, edge, ctx, previous_end=fallback_start
-            )
-        base = _base_edge_cost(lattice, priced_edge, ctx, resolved_document_nodes)
+        base = _base_edge_cost(lattice, edge, ctx, resolved_document_nodes)
         key = (edge.start_node, edge.end_node)
-        base_edges[key] = base
         if isinstance(ctx.speaker_evidence, UnitSpeakers):
             unit_range = (
                 lattice.unit_bound(edge.start_node),
@@ -489,37 +424,18 @@ def build_cost_tables(
             evidence_span = edge.evidence_span
             if not isinstance(evidence_span, EvidenceSpan):
                 if edge.evidence_unavailable_reason is not None:
-                    speaker_pricing_refused = True
                     edges[key] = base
                     continue
-                if not edge.evidence_deferred:
-                    raise ValueError(
-                        "speaker pricing requires cached candidate EvidenceSpan values"
-                    )
-                predecessor_stateful = True
-                representative = _resolve_edge_for_previous(
-                    lattice,
-                    edge,
-                    ctx,
-                    previous_end=fallback_start,
+                raise ValueError(
+                    "speaker pricing requires cached candidate EvidenceSpan values"
                 )
-                evidence_span = representative.evidence_span
-                if representative.evidence_unavailable_reason is not None:
-                    speaker_pricing_refused = True
-                    edges[key] = base
-                    continue
-                if not isinstance(evidence_span, EvidenceSpan):
-                    raise ValueError("deferred candidate did not resolve EvidenceSpan")
-                lyric = representative.lyric
-            else:
-                lyric = edge.lyric
             speaker = speaker_edge_cost(
                 ctx.speaker_evidence,
                 unit_range,
                 evidence_span=evidence_span,
                 sing_spans=ctx.sing_spans,
                 weight=ctx.speaker_weight,
-                suppressed_lyric=lyric,
+                suppressed_lyric=edge.lyric,
             )
             speaker_parts.append(speaker)
             edges[key] = _with_speaker_cost(base, speaker)
@@ -547,13 +463,10 @@ def build_cost_tables(
             if isinstance(ctx.speaker_evidence, UnitSpeakers)
             else None
         ),
-        base_edges=base_edges,
         speaker_context=(
             ctx if isinstance(ctx.speaker_evidence, UnitSpeakers) else None
         ),
         fallback_start=float(fallback_start),
-        predecessor_stateful=predecessor_stateful,
-        speaker_pricing_refused=speaker_pricing_refused,
         document_nodes=resolved_document_nodes,
     )
 
@@ -611,31 +524,15 @@ def _assemble_path(
 ) -> PathResult:
     count = len(lattice.atoms)
     nodes = (0, *cuts, count)
-    edge_index = {(edge.start_node, edge.end_node): edge for edge in lattice.edges}
+    edge_index = {(edge.start_node, edge.end_node) for edge in lattice.edges}
     total = 0.0
-    previous_end = tables.fallback_start
     edge_parts: list[CostBreakdown] = []
     cut_parts: list[CostBreakdown] = []
     for left, right in zip(nodes, nodes[1:]):
         key = (left, right)
         edge = tables.edges.get(key)
-        candidate = edge_index.get(key)
-        if edge is None or candidate is None:
+        if edge is None or key not in edge_index:
             raise ValueError(f"edge({left}, {right}): no legal cue spans these atoms")
-        if tables.speaker_context is not None and tables.predecessor_stateful:
-            if tables.base_edges is None:
-                raise ValueError("speaker cost table has no base-edge authority")
-            candidate, edge = _speaker_price(
-                lattice,
-                candidate,
-                tables.speaker_context,
-                tables.base_edges[key],
-                tables.document_nodes,
-                previous_end=previous_end,
-            )
-            if candidate.input_end is None:
-                raise ValueError("resolved speaker edge has no input end")
-            previous_end = float(candidate.input_end)
         edge_parts.append(edge)
         total = quantize(total + edge.total)
         if right != count:
@@ -670,173 +567,63 @@ def score_path(
 
 @dataclass(frozen=True)
 class DPResult:
-    """The optimum, its best path-distinct alternative, and the work spent."""
+    """The optimum and the work spent finding it."""
 
     best: PathResult
-    runner_up: PathResult | None
     relaxations: int
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "best": self.best.to_dict(),
-            "relaxations": self.relaxations,
-            "runner_up": None if self.runner_up is None else self.runner_up.to_dict(),
-        }
 
 
 def solve_interval(lattice: IntervalLattice, tables: CostTables) -> DPResult:
-    """Exact forward DP over one whole hard interval, keeping two best paths.
+    """Exact forward DP over one whole hard interval.
 
     Nodes are processed in ascending order and every edge runs forward, so by the
     time a node is finalized all of its incoming candidates have been offered:
-    one pass suffices and no queue is needed. Each node keeps its two best
-    ``(total, predecessor, predecessor rank)`` candidates, ordered by total then
-    by the smaller predecessor -- the local tie-break, which induces the path
-    that minimises the last cut, then the one before it, and so on. Two
-    candidates with distinct ``(predecessor, rank)`` are distinct paths by
-    induction, so the runner-up is genuinely path-distinct rather than merely
-    differently priced.
+    one pass suffices and no queue is needed. Each node keeps its best
+    ``(total, predecessor)``, ordered by total then by the smaller predecessor --
+    the local tie-break, which induces the path that minimises the last cut, then
+    the one before it, and so on.
     """
-    if tables.predecessor_stateful:
-        return _solve_interval_with_predecessor_state(lattice, tables)
-
     count = len(lattice.atoms)
-    ranked: dict[int, list[tuple[float, int, int]]] = {0: [(0.0, -1, -1)]}
-    pending: dict[int, list[tuple[float, int, int]]] = {}
+    best: dict[int, tuple[float, int]] = {0: (0.0, -1)}
+    pending: dict[int, list[tuple[float, int]]] = {}
     relaxations = 0
 
     for node in lattice.nodes:
         if node != 0:
-            pool = pending.get(node, [])
-            pool.sort()
-            ranked[node] = pool[:2]
-        entries = ranked.get(node) or []
-        if not entries:
+            pool = pending.get(node)
+            if not pool:
+                continue
+            best[node] = min(pool)
+        entry = best.get(node)
+        if entry is None:
             continue
+        total = entry[0]
         for edge in lattice.edges_from.get(node, ()):
             relaxations += 1
             step = tables.edges[(edge.start_node, edge.end_node)].total
             interior = edge.end_node != count
-            cut = tables.cuts[edge.end_node].total if interior else 0.0
-            for rank, (total, _pred, _pred_rank) in enumerate(entries):
-                value = quantize(total + step)
-                if interior:
-                    value = quantize(value + cut)
-                pending.setdefault(edge.end_node, []).append((value, node, rank))
+            value = quantize(total + step)
+            if interior:
+                value = quantize(value + tables.cuts[edge.end_node].total)
+            pending.setdefault(edge.end_node, []).append((value, node))
 
-    final = ranked.get(count) or []
-    if not final:
+    if count not in best:
         raise ValueError(
             f"interval {lattice.interval.index}: no legal path reaches node {count}"
         )
-
-    def rebuild(rank: int) -> tuple[int, ...]:
-        node, current = count, rank
-        cuts: list[int] = []
-        while node != 0:
-            _total, pred, pred_rank = ranked[node][current]
-            if pred < 0:
-                break
-            if pred != 0:
-                cuts.append(pred)
-            node, current = pred, pred_rank
-        return tuple(reversed(cuts))
-
-    best = _assemble_path(lattice, tables, rebuild(0))
-    runner_up = _assemble_path(lattice, tables, rebuild(1)) if len(final) > 1 else None
-    return DPResult(best=best, runner_up=runner_up, relaxations=relaxations)
-
-
-def _state_path_key(item: tuple[float, tuple[int, ...]]) -> tuple[Any, ...]:
-    """Whole-path order matching the ordinary DP's recursive local tie-break."""
-    total, cuts = item
-    return (total, *reversed(cuts))
-
-
-def _top_two_state_paths(
-    candidates: Sequence[tuple[float, tuple[int, ...]]],
-) -> list[tuple[float, tuple[int, ...]]]:
-    by_path: dict[tuple[int, ...], float] = {}
-    for total, cuts in candidates:
-        prior = by_path.get(cuts)
-        if prior is None or total < prior:
-            by_path[cuts] = total
-    ranked = [(total, cuts) for cuts, total in by_path.items()]
-    ranked.sort(key=_state_path_key)
-    return ranked[:2]
-
-
-def _solve_interval_with_predecessor_state(
-    lattice: IntervalLattice,
-    tables: CostTables,
-) -> DPResult:
-    """Exact two-best DP when an edge start inherits its selected predecessor.
-
-    The state is the preceding resolved edge end.  Keeping two paths per
-    ``(node, end)`` is sufficient: every continuation from that state has the
-    same future costs, so a third path can never become the global runner-up.
-    """
-    ctx = tables.speaker_context
-    bases = tables.base_edges
-    if ctx is None or bases is None:
-        raise ValueError("predecessor-state solve requires speaker cost authority")
-
-    count = len(lattice.atoms)
-    ranked: dict[int, dict[float, list[tuple[float, tuple[int, ...]]]]] = {
-        0: {tables.fallback_start: [(0.0, ())]}
-    }
-    pending: dict[int, dict[float, list[tuple[float, tuple[int, ...]]]]] = {}
-    relaxations = 0
-
-    for node in lattice.nodes:
-        if node != 0:
-            states = pending.get(node, {})
-            ranked[node] = {
-                previous_end: _top_two_state_paths(candidates)
-                for previous_end, candidates in states.items()
-            }
-        states = ranked.get(node, {})
-        if not states:
-            continue
-        for previous_end, entries in states.items():
-            for edge in lattice.edges_from.get(node, ()):
-                relaxations += 1
-                key = (edge.start_node, edge.end_node)
-                resolved, step = _speaker_price(
-                    lattice,
-                    edge,
-                    ctx,
-                    bases[key],
-                    tables.document_nodes,
-                    previous_end=previous_end,
-                )
-                if resolved.input_end is None:
-                    raise ValueError("resolved speaker edge has no input end")
-                next_end = float(resolved.input_end)
-                interior = edge.end_node != count
-                cut = tables.cuts[edge.end_node].total if interior else 0.0
-                bucket = pending.setdefault(edge.end_node, {}).setdefault(next_end, [])
-                for total, cuts in entries:
-                    value = quantize(total + step.total)
-                    next_cuts = cuts
-                    if interior:
-                        value = quantize(value + cut)
-                        next_cuts = (*cuts, edge.end_node)
-                    bucket.append((value, next_cuts))
-
-    final_candidates = [
-        candidate
-        for candidates in ranked.get(count, {}).values()
-        for candidate in candidates
-    ]
-    final = _top_two_state_paths(final_candidates)
-    if not final:
-        raise ValueError(
-            f"interval {lattice.interval.index}: no legal path reaches node {count}"
-        )
-    best = _assemble_path(lattice, tables, final[0][1])
-    runner_up = _assemble_path(lattice, tables, final[1][1]) if len(final) > 1 else None
-    return DPResult(best=best, runner_up=runner_up, relaxations=relaxations)
+    cuts: list[int] = []
+    node = count
+    while node != 0:
+        pred = best[node][1]
+        if pred < 0:
+            break
+        if pred != 0:
+            cuts.append(pred)
+        node = pred
+    return DPResult(
+        best=_assemble_path(lattice, tables, tuple(reversed(cuts))),
+        relaxations=relaxations,
+    )
 
 
 # ---------------------------------------------------------------- selection
@@ -923,30 +710,49 @@ def _pinned_neighbour_margins(
     tables: CostTables,
     selected: PathResult,
 ) -> tuple[float, ...]:
-    """Best single-cut relocation delta with adjacent selected cuts pinned."""
+    """Best single-cut relocation delta with adjacent selected cuts pinned.
+
+    A relocated path shares the selected path's accumulation up to the cut
+    before the moved one, so the fold restarts from that prefix total and only
+    replays the changed edges and the unchanged tail. Totals are therefore the
+    same floats :func:`score_path` would give, without rescoring the whole path
+    (or rebuilding its edge index) once per candidate node.
+    """
     if not selected.cuts:
         return ()
-    edge_keys = {(edge.start_node, edge.end_node) for edge in lattice.edges}
-    chain = (0, *selected.cuts, len(lattice.atoms))
+    count = len(lattice.atoms)
+    chain = (0, *selected.cuts, count)
+    # score_path's accumulation order: an edge, then the cut that opens the
+    # next cue. Edge ``j`` sits at step ``2j`` and the cut after it at ``2j+1``.
+    steps: list[float] = []
+    for left, right in zip(chain, chain[1:]):
+        steps.append(tables.edges[(left, right)].total)
+        if right != count:
+            steps.append(tables.cuts[right].total)
+    prefix = [0.0]
+    for step in steps:
+        prefix.append(quantize(prefix[-1] + step))
+    nodes = sorted(lattice.nodes)
     margins: list[float] = []
     for index, cut in enumerate(selected.cuts):
         previous_node, next_node = chain[index], chain[index + 2]
+        head = prefix[2 * index]
+        tail = steps[2 * index + 3 :]
         alternatives: list[float] = []
-        for candidate in lattice.nodes:
-            if (
-                candidate == cut
-                or not previous_node < candidate < next_node
-                or (previous_node, candidate) not in edge_keys
-                or (candidate, next_node) not in edge_keys
-            ):
+        low = bisect.bisect_right(nodes, previous_node)
+        high = bisect.bisect_left(nodes, next_node)
+        for candidate in nodes[low:high]:
+            if candidate == cut:
                 continue
-            relocated = list(selected.cuts)
-            relocated[index] = candidate
-            try:
-                result = score_path(lattice, tables, relocated)
-            except ValueError:
+            left = tables.edges.get((previous_node, candidate))
+            right = tables.edges.get((candidate, next_node))
+            opened = tables.cuts.get(candidate)
+            if left is None or right is None or opened is None:
                 continue
-            alternatives.append(quantize(result.total - selected.total))
+            total = head
+            for step in (left.total, opened.total, right.total, *tail):
+                total = quantize(total + step)
+            alternatives.append(quantize(total - selected.total))
         if alternatives:
             margins.append(min(alternatives))
     return tuple(margins)
@@ -994,10 +800,11 @@ def materialize_cues(
     make every later reader fall through to a character cursor and report a total
     diff for reasons that have nothing to do with boundaries.
 
-    One divergence is unavoidable and deliberate. v1 falls back to the *parent
-    cue's* bounds for an untimed chunk, and a v2 partition has no parent cue, so
-    the fallback here is the previous cue's end (or ``fallback_start`` at the
-    front). The acoustic anchors take no fallback at all in either engine:
+    One divergence is unavoidable and deliberate. v1 lays an untimed chunk over
+    the stretch between the nearest real bounds inside its parent cue (and short
+    made-up cues borrow display time from their siblings), and a v2 partition has
+    no parent cue, so the fallback here is the previous cue's end (or
+    ``fallback_start`` at the front). The acoustic anchors take no fallback at all in either engine:
     invented display time must never be laundered into the evidence layer.  If
     ``units`` contains derived provenance, each cue's exact start/end is taken
     only from its first/last owned aligner unit; an all-aligner stream retains
@@ -1106,26 +913,48 @@ def score_v1_global(
     matters because the interesting v1 partitions are exactly the ones the
     lattice would refuse. Those refusals are recorded separately as typed
     disagreements instead of being priced as infinities.
+
+    With a speaker track (the P5 rows) v1 is judged and priced under the rules
+    the speaker lattice and its tables use: canonical ``FinalText`` admission in
+    every language, and the phase-1 input bounds, acoustic anchors and owned
+    footprint in the edge price. Scoring v1 under the policy-1 packer and span
+    defaults instead would compare two partitions under two different policies.
     """
     profile = ctx.profile
     lang = profile.language
     atoms = layer.atoms
     count = len(atoms)
     bounds = [layer.unit_bound(node) for node in range(count + 1)]
+    speaker_rows = isinstance(ctx.speaker_evidence, UnitSpeakers)
 
     nodes: list[int] = []
     rounded: list[dict[str, Any]] = []
+    # The node every v1 cue boundary landed on, in v1 cue order. Rounding can
+    # collapse several v1 cuts onto one node (or onto a document end), so a
+    # chain cue is matched to the v1 cue whose landed span it is -- never to the
+    # v1 cue that merely shares its position in the shortened chain.
+    landed: list[int] = [0]
     for cut in sorted(set(v1.cuts)):
         if not 0 < cut < layer.unit_count:
+            landed.append(0 if cut <= 0 else count)
             continue
         position = bisect.bisect_left(bounds, cut)
+        if bounds[position] != cut:
+            # Includes a cut inside the last atom, which rounds up onto the
+            # document end and so vanishes from the chain: still a finding.
+            rounded.append(
+                {"landed_unit": bounds[position], "node": position, "unit": cut}
+            )
+        landed.append(position)
         if 0 < position < count:
-            if bounds[position] != cut:
-                rounded.append(
-                    {"landed_unit": bounds[position], "node": position, "unit": cut}
-                )
             nodes.append(position)
+    landed.append(count)
     chain = (0, *sorted(set(nodes)), count)
+    v1_cue_for_span = {
+        span: index
+        for index, span in enumerate(zip(landed, landed[1:]))
+        if span[0] < span[1]
+    }
 
     barriers = {
         barrier.node
@@ -1134,12 +963,13 @@ def score_v1_global(
     }
     packer = (
         None
-        if _no_spaces(lang)
+        if _no_spaces(lang) or speaker_rows
         else IncrementalPacker(lang, profile.max_line_length, profile.max_lines)
     )
     canonical_work = CanonicalWork()
     parts: list[CostBreakdown] = []
     disagreements: list[dict[str, Any]] = []
+    previous_end = 0.0
 
     for cue_index, (left, right) in enumerate(zip(chain, chain[1:])):
         if left >= right:
@@ -1170,19 +1000,36 @@ def score_v1_global(
             waiver=None,
         )
         unit_range = (layer.unit_bound(left), layer.unit_bound(right))
-        base = edge_cost(
-            edge,
-            atoms,
-            profile=profile,
-            preview=ctx.preview,
-            next_start=ctx.next_start_after(right),
-            sentence_cross_count=sum(
-                1 for node in ctx.sentence_nodes if left < node < right
-            ),
-        )
+        common = {
+            "profile": profile,
+            "preview": ctx.preview,
+            "next_start": ctx.next_start_after(right),
+            "sentence_cross_count": _sentence_cross_count(ctx, left, right),
+        }
+        if speaker_rows:
+            input_start, input_end = _resolve_edge_input_bounds(
+                edge, previous_end=previous_end
+            )
+            previous_end = input_end
+            speech_start, speech_end, footprint = _phase1_unit_facts(
+                ctx, unit_range[0], unit_range[1]
+            )
+            base = edge_cost(
+                edge,
+                atoms,
+                **common,
+                input_start=input_start,
+                input_end=input_end,
+                speech_start=speech_start,
+                speech_end=speech_end,
+                expected_footprint=footprint,
+            )
+        else:
+            base = edge_cost(edge, atoms, **common)
         if isinstance(ctx.speaker_evidence, UnitSpeakers):
-            if cue_index < len(v1.cues):
-                evidence_span = evidence_span_from_cue(v1.cues[cue_index])
+            v1_index = v1_cue_for_span.get((left, right))
+            if v1_index is not None and v1_index < len(v1.cues):
+                evidence_span = evidence_span_from_cue(v1.cues[v1_index])
             elif (
                 low is not None
                 and high is not None
@@ -1328,6 +1175,99 @@ def _adopt_v1(
     )
 
 
+#: Why a solvable interval carries v1 cues: a neighbouring fallback's complete
+#: v1 cues reach into it.
+ADOPTION_ABSORBED: str = "absorbed-by-fallback"
+
+
+def _adoption_plan(
+    lattices: Sequence[IntervalLattice],
+    v1: V1Partition | None,
+    unit_count: int,
+) -> dict[int, AdoptedV1]:
+    """Every fallback interval's adoption, grown until the adoptions tile.
+
+    A covering v1 cue can straddle a barrier, so a fallback's complete cues can
+    reach into the neighbouring interval, before or after it. Keeping that
+    neighbour's own cues as well would own the straddled units twice, and the
+    document pass would report the duplicate against the neighbour -- as a false
+    exit-driving v2 violation when the neighbour was optimized. So a fallback
+    absorbs every interval its adoption touches, repeating until the adopted
+    span starts and ends on both an interval boundary and a v1 cue boundary.
+    Inside that span each member carries the v1 cues that start in it, so the
+    members' ranges still tile the stream in interval order; a member whose
+    units all sit inside an earlier member's cue carries an empty range. An
+    adoption that reaches no neighbour is exactly :func:`_adopt_v1`'s.
+    """
+    if v1 is None or not v1.cues:
+        return {}
+    bounds = owned_unit_ids(v1.cuts, unit_count)
+    spans = [(item.interval.unit_start, item.interval.unit_end) for item in lattices]
+    plan: dict[int, AdoptedV1] = {}
+    for seed, seed_lattice in enumerate(lattices):
+        infeasible = seed_lattice.infeasible
+        if infeasible is None or seed in plan:
+            continue
+        low, high = spans[seed]
+        first = last = seed
+        while True:
+            picked = [
+                index for index, (a, b) in enumerate(bounds) if a < high and b > low
+            ]
+            grown_low = min([low, *(bounds[index][0] for index in picked)])
+            grown_high = max([high, *(bounds[index][1] for index in picked)])
+            touched = [
+                position
+                for position, (start, end) in enumerate(spans)
+                if start < grown_high and end > grown_low
+            ]
+            grown_first = min([first, *touched])
+            grown_last = max([last, *touched])
+            grown_low = min(grown_low, spans[grown_first][0])
+            grown_high = max(grown_high, spans[grown_last][1])
+            if (grown_low, grown_high, grown_first, grown_last) == (
+                low,
+                high,
+                first,
+                last,
+            ):
+                break
+            low, high, first, last = grown_low, grown_high, grown_first, grown_last
+        if first == last:
+            plan[seed] = _adopt_v1(
+                seed_lattice.interval, infeasible.reason, v1, unit_count
+            )
+            continue
+        members = range(first, last + 1)
+        owned: dict[int, list[int]] = {position: [] for position in members}
+        for index in picked:
+            owner = first
+            for position in members:
+                if spans[position][0] <= bounds[index][0]:
+                    owner = position
+            owned[owner].append(index)
+        cursor = low
+        for position in members:
+            indices = owned[position]
+            covered = (
+                (bounds[indices[0]][0], bounds[indices[-1]][1])
+                if indices
+                else (cursor, cursor)
+            )
+            cursor = covered[1]
+            terminal = lattices[position].infeasible
+            plan[position] = AdoptedV1(
+                unit_range=covered,
+                fallback_expansion_units=None
+                if covered == spans[position]
+                else covered,
+                cues=tuple(v1.cues[index] for index in indices if index < len(v1.cues)),
+                reason=ADOPTION_ABSORBED if terminal is None else terminal.reason,
+                cuts=tuple(bounds[index][1] for index in indices[:-1]),
+            )
+    return plan
+
+
 # ------------------------------------------------------- interval solutions
 
 
@@ -1462,11 +1402,16 @@ def _resolve_selected_path(
         replacements.get((edge.start_node, edge.end_node), edge)
         for edge in lattice.edges
     )
-    edges_from: dict[int, tuple[Edge, ...]] = {}
-    for node in lattice.nodes:
-        outgoing = tuple(edge for edge in edges if edge.start_node == node)
-        if outgoing:
-            edges_from[node] = outgoing
+    # One pass over the edges (not one per node): same keys in lattice.nodes
+    # order, same per-node edge order as the edge tuple.
+    nodes = set(lattice.nodes)
+    grouped: dict[int, list[Edge]] = {}
+    for edge in edges:
+        if edge.start_node in nodes:
+            grouped.setdefault(edge.start_node, []).append(edge)
+    edges_from: dict[int, tuple[Edge, ...]] = {
+        node: tuple(grouped[node]) for node in lattice.nodes if node in grouped
+    }
     sealed_lattice = replace(lattice, edges=edges, edges_from=edges_from)
     return sealed_lattice, tuple(resolved)
 
@@ -1479,19 +1424,23 @@ def optimize_interval(
     units: Sequence[SourceUnit],
     v1: V1Partition | None = None,
     fallback_start: float = 0.0,
+    adopted: AdoptedV1 | None = None,
 ) -> IntervalSolution:
     """Solve one interval, or adopt v1's cues for it and say why.
 
     ``ctx`` is a deviation from the reviewed signature: the validator needs the
     resolved display profile and materialization needs the language, and both
     already ride on the cost context rather than being threaded a second time.
+    ``adopted`` is the document's adoption plan for this interval (see
+    :func:`_adoption_plan`); without one an infeasible interval adopts alone.
     """
     interval = lattice.interval
     profile = ctx.profile
     lang = profile.language
 
-    if lattice.infeasible is not None:
+    if adopted is None and lattice.infeasible is not None:
         adopted = _adopt_v1(interval, lattice.infeasible.reason, v1, len(units))
+    if adopted is not None:
         low, high = adopted.unit_range
         return IntervalSolution(
             interval=interval,
@@ -1500,12 +1449,24 @@ def optimize_interval(
             adopted=adopted,
             cues=adopted.cues,
             partition_units=adopted.cuts,
-            validator_raw=check_partition(
+            # An empty range with no cue has nothing to conserve: its units
+            # belong to a cue an earlier member of the same fallback adopted.
+            validator_raw=PartitionCheckResult(
+                origin="v1",
+                stage="raw",
+                violations=(),
+                waivers=(),
+                cue_count=0,
+                unit_count=0,
+            )
+            if low == high and not adopted.cues
+            else check_partition(
                 [cut - low for cut in adopted.cuts],
                 adopted.cues,
                 units=units[low:high],
                 profile=profile,
-                origin="v1",
+                # Units no adopted v1 cue covers are v2's failure to cover them.
+                origin="v1" if adopted.cues else "v2",
                 stage="raw",
             ),
             dp_relaxations=0,
@@ -1692,6 +1653,37 @@ def _document_origins(solutions: Sequence[IntervalSolution]) -> dict[int, str]:
             origins[offset + index] = engine
         offset += len(solution.cues)
     return origins
+
+
+def _whole_partition_origin(
+    solutions: Sequence[IntervalSolution], unit_count: int
+) -> Origin:
+    """Who a document-level tiling failure belongs to.
+
+    The whole-partition row names no cue, so it is attributed by what broke the
+    tiling. v2 owns the plan: interval ranges that must tile the stream in order,
+    the cues of every optimized interval, and a cue for every unit a fallback was
+    handed. Only adopted v1 cues that do not tile their own range are v1's, and
+    that interval's own check already types them so. Everything else, including
+    a stream that tiles and so emits no row, is v2's.
+    """
+    v1_defect = False
+    cursor = 0
+    for solution in solutions:
+        low, high = solution.unit_range
+        if low != cursor:
+            return "v2"
+        cursor = high
+        expected = 0 if low == high else len(solution.partition_units) + 1
+        if len(solution.cues) == expected:
+            continue
+        if solution.adopted is not None and solution.adopted.cues:
+            v1_defect = True
+        else:
+            return "v2"
+    if cursor != unit_count:
+        return "v2"
+    return "v1" if v1_defect else "v2"
 
 
 def _vad_state_totals(solutions: Sequence[IntervalSolution]) -> dict[str, Any]:
@@ -1954,7 +1946,7 @@ def _artifact(
         "v1": None if v1_reference is None else v1_reference.to_dict(),
         "validator": {
             "core": None,
-            # The two counters the module docstring says are cross-checked, and
+            # The two counters are cross-checked here, and
             # the answer stated rather than left for a reader to recompute: the
             # document pass sees cross-interval predicates the per-interval
             # passes cannot, so it may report MORE, but a document pass reporting
@@ -2047,7 +2039,8 @@ def optimize_document(
     solutions: list[IntervalSolution] = []
     resolved_lattices: list[IntervalLattice] = []
     fallback_start = 0.0
-    for raw_interval_lattice in lattice.lattices:
+    adoptions = _adoption_plan(lattice.lattices, v1, len(document.units))
+    for position, raw_interval_lattice in enumerate(lattice.lattices):
         interval_lattice = (
             _cache_candidate_evidence(
                 raw_interval_lattice,
@@ -2075,6 +2068,7 @@ def optimize_document(
             units=document.units,
             v1=v1,
             fallback_start=fallback_start,
+            adopted=adoptions.get(position),
         )
         solutions.append(solution)
         resolved_lattices.append(solution.lattice)
@@ -2095,10 +2089,9 @@ def optimize_document(
         cues,
         units=document.units,
         profile=document.profile,
-        # The whole-partition row belongs to no cue, so it keeps the document's
-        # own character; per-cue rows are attributed to the interval that
-        # produced them.
-        origin="v2" if all(solution.optimized for solution in solutions) else "v1",
+        # Per-cue rows are attributed to the interval that produced them; the
+        # whole-partition row to whatever broke the tiling.
+        origin=_whole_partition_origin(solutions, len(document.units)),
         stage="raw",
         waivers=_document_waivers(solutions),
         origins=cast("Mapping[int, Origin]", origins),
@@ -2134,7 +2127,10 @@ def shadow_artifact(
     speakers: UnitSpeakers | None = None,
     speaker_weight: float | None = None,
 ) -> dict[str, Any]:
-    """The one call the Wave B hook makes."""
+    """Artifact of :func:`optimize_document` — a test/calibration convenience.
+
+    The shadow hook (``shadow_v2``) calls :func:`optimize_document` directly.
+    """
     return optimize_document(
         document,
         v1=v1,

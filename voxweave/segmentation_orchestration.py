@@ -8,10 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from voxweave import segmentation_candidates
+from voxweave import candidate_encoder, segmentation_adapter, segmentation_candidates
 from voxweave.align_context import (
     IssuedSegmentationContext,
     issue_segmentation_context,
+    release_context,
     retire_live_context_roles,
     verify_context_roles_terminal,
 )
@@ -45,13 +46,6 @@ from voxweave.segmentation_adapter import (
 
 
 SegmentationCommand = Literal["process", "split"]
-
-
-def _swap_ext(path: Path, new_ext: str) -> Path:
-    target = Path(path)
-    if target.suffix:
-        return target.with_name(target.name[: -len(target.suffix)] + new_ext)
-    return target.with_name(target.name + new_ext)
 
 
 @dataclass(frozen=True)
@@ -317,17 +311,26 @@ def build_segmentation_selection(
             context, result, verified
         )
     except BaseException:
-        release_split_speaker_mapping_generation(context)
-        retire_live_context_roles(context)
-        verify_context_roles_terminal(context)
+        _retire(context)
         raise
     return SegmentationSelection(context, result, verified, sdh_dialogue)
 
 
+def _retire(context: IssuedSegmentationContext) -> None:
+    release_split_speaker_mapping_generation(context)
+    retire_live_context_roles(context)
+    verify_context_roles_terminal(context)
+    segmentation_adapter.release_context_records(context)
+    segmentation_candidates.release_context_records(context)
+    # Nothing consults the context after retirement (process/split retire it after
+    # their last use), so also forget its candidate sets and the issuance itself;
+    # otherwise every run stays pinned in these registries for the process lifetime.
+    candidate_encoder._release_candidates(context)
+    release_context(context)
+
+
 def retire_segmentation_selection(selection: SegmentationSelection) -> None:
-    release_split_speaker_mapping_generation(selection.context)
-    retire_live_context_roles(selection.context)
-    verify_context_roles_terminal(selection.context)
+    _retire(selection.context)
 
 
 __all__ = [

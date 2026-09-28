@@ -110,17 +110,11 @@ def test_defaults_are_the_frozen_voiceprint_v1_recipe():
     # Any change here is a new recipe: give RECIPE a new id with it.
     assert vp.RECIPE == "voiceprint-v1"
     assert asdict(vp.ClusteringParams()) == {
-        "method": "ahc",
         "anchor_seconds": 1.0,
         "min_piece_seconds": 0.3,
         "min_embed_seconds": 0.05,
         "cut_distance": 0.45,
         "cannot_link_overlap": 0.5,
-        "spectral_pval": 0.012,
-        "spectral_merge_similarity": 0.0,
-        "spectral_max_speakers": 20,
-        "merge_similarity": 0.55,
-        "split_similarity": 0.3,
         "dissolve_seconds": 6.0,
         "local_seconds": 30.0,
         "local_turns": 15,
@@ -189,14 +183,21 @@ def test_nonspeech_turns_are_abstained_and_dropped():
     assert detailed.routes[-6:] == [vp.ROUTE_ABSTAIN] * 6
 
 
-def test_embed_receives_exactly_embedding_spans_in_one_call():
+def test_embed_receives_every_clean_piece_once_in_one_call():
     truth = _alternating(["alice", "bob"], 8)
     turns = [(s, e, "A" if who == "alice" else "B") for s, e, who in truth]
     turns.append((1.0, 2.0, "B"))  # fully inside an A turn: no clean piece
     fake = FakeEmbed(truth)
     vp.cluster_turns(turns, fake)
     assert len(fake.calls) == 1
-    assert fake.calls[0] == vp.embedding_spans(turns)
+    ordered = sorted(turns)
+    pieces = vp.overlap_trimmed_pieces(ordered, vp.ClusteringParams().min_piece_seconds)
+    expected = [
+        span
+        for (start, end, _label), own in zip(ordered, pieces)
+        for span in own or [(start, end)]
+    ]
+    assert fake.calls[0] == list(dict.fromkeys(expected))
     assert (1.0, 2.0) in fake.calls[0]  # whole-span fallback for the overlapped turn
     assert (0.0, 1.0) in fake.calls[0] and (2.0, 3.0) in fake.calls[0]  # trimmed pieces
 
@@ -259,39 +260,15 @@ def test_speaker_bounds_clip_the_cluster_count():
         vp.cluster_turns(turns, fake, min_speakers=3, max_speakers=2)
 
 
-@pytest.mark.parametrize("method", vp.METHODS)
-def test_methods_are_deterministic_and_order_invariant(method):
+def test_clustering_is_deterministic_and_order_invariant():
     truth = _alternating(["alice", "bob", "carol"], 30)
     turns = [(s, e, who[0]) for s, e, who in truth]
-    params = vp.ClusteringParams(method=method)
-    one = vp.cluster_turns(turns, FakeEmbed(truth), params=params)
-    two = vp.cluster_turns(list(reversed(turns)), FakeEmbed(truth), params=params)
+    one = vp.cluster_turns(turns, FakeEmbed(truth))
+    two = vp.cluster_turns(list(reversed(turns)), FakeEmbed(truth))
     assert one.turns == two.turns
     assert one.audit == two.audit
     owners = _partition(one.turns, truth)
     assert sorted(len(v) for v in owners.values()) == [1, 1, 1]
-
-
-def test_refine_splits_a_mixed_label():
-    truth = _alternating(["alice", "bob", "carol"], 30)
-    # pyannote put bob and carol under one label
-    turns = [(s, e, "A" if who == "alice" else "M") for s, e, who in truth]
-    params = vp.ClusteringParams(method="refine", split_similarity=0.5)
-    result = vp.cluster_turns(turns, FakeEmbed(truth), params=params)
-    owners = _partition(result.turns, truth)
-    assert len(owners) == 3
-    assert all(len(v) == 1 for v in owners.values())
-
-
-def test_refine_merges_a_split_label():
-    truth = _alternating(["alice", "bob"], 30)
-    turns = [
-        (s, e, ("A1" if k % 4 == 0 else "A2") if who == "alice" else "B")
-        for k, (s, e, who) in enumerate(truth)
-    ]
-    params = vp.ClusteringParams(method="refine")
-    result = vp.cluster_turns(turns, FakeEmbed(truth), params=params)
-    assert result.audit["counts"]["clusters"] == 2
 
 
 def test_empty_and_passthrough():
@@ -355,8 +332,6 @@ def test_overlap_trimmed_pieces():
 
 
 def test_bad_inputs_raise():
-    with pytest.raises(vp.ClusteringError):
-        vp.ClusteringParams(method="kmeans")
     with pytest.raises(vp.ClusteringError):
         vp.ClusteringParams(tau=1.5)
     turns = [(0.0, 3.0, "a"), (4.0, 7.0, "b")]
@@ -440,13 +415,6 @@ def test_max_speakers_blocked_by_cannot_link_raises(max_speakers):
         )
 
 
-def test_refine_is_held_to_max_speakers_too():
-    truth, turns, knobs = _triangle()
-    params = vp.ClusteringParams(method="refine", **knobs)
-    with pytest.raises(vp.ClusteringError, match=r"left 3 speaker\(s\), outside"):
-        vp.cluster_turns(turns, FakeEmbed(truth), max_speakers=2, params=params)
-
-
 @pytest.mark.parametrize("min_speakers", [5, 7])
 def test_min_speakers_out_of_reach_raises_instead_of_passing_through(min_speakers):
     # Two voices, twelve 3 s anchors: a cluster needs two anchors (6 s) to
@@ -501,11 +469,10 @@ def _bound_cases():
     ]
 
 
-@pytest.mark.parametrize("method", vp.METHODS)
-def test_results_never_leave_the_speaker_bounds(method):
+def test_results_never_leave_the_speaker_bounds():
     bounds = [(lo, hi) for lo in (None, 1, 2, 3, 5) for hi in (None, 1, 2, 3, 6)]
     for truth, turns, knobs in _bound_cases():
-        params = vp.ClusteringParams(method=method, **knobs)
+        params = vp.ClusteringParams(**knobs)
         for lo, hi in bounds:
             if lo is not None and hi is not None and hi < lo:
                 continue
@@ -522,6 +489,21 @@ def test_results_never_leave_the_speaker_bounds(method):
             if vp.PASSTHROUGH in result.audit:
                 continue  # flagged: the caller keeps pyannote's answer
             count = _speakers(result)
-            assert (lo or 1) <= count, (method, lo, hi, count)
-            assert hi is None or count <= hi, (method, lo, hi, count)
+            assert (lo or 1) <= count, (lo, hi, count)
+            assert hi is None or count <= hi, (lo, hi, count)
             assert result.audit["speaker_bounds"]["satisfied"]
+
+
+def test_too_many_anchors_raise_instead_of_running_the_cubic_ahc(monkeypatch):
+    truth = _alternating(["alice", "bob"], 12)
+    turns = [(s, e, "A" if who == "alice" else "B") for s, e, who in truth]
+    monkeypatch.setattr(vp, "MAX_ANCHORS", 11)
+    monkeypatch.setattr(
+        vp,
+        "average_linkage_history",
+        lambda *_args, **_kwargs: pytest.fail("the AHC must not run"),
+    )
+    with pytest.raises(vp.ClusteringError, match="12 anchor turns exceed the 11"):
+        vp.cluster_turns(turns, FakeEmbed(truth))
+    monkeypatch.undo()
+    assert _speakers(vp.cluster_turns(turns, FakeEmbed(truth))) == 2

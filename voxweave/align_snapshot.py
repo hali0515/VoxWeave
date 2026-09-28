@@ -18,9 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from voxweave import realign
-from voxweave.subformats import decode_subtitle_bytes, sniff_format
-
 
 class FrozenJSONDomainError(TypeError):
     """A selected value cannot be represented in the closed JSON sum type."""
@@ -124,8 +121,6 @@ def freeze_json(value: Any) -> FrozenJSON:
             ),
         ):
             return node
-        if node is FROZEN_ABSENT:
-            return FROZEN_ABSENT
         if node is None:
             return FROZEN_NULL
         if type(node) is bool:
@@ -436,7 +431,21 @@ class SiblingJSONSnapshot:
     lexical: FrozenJSON
     strict_input_status: StrictInputStatus
     carriers: tuple[tuple[str, RawJSONCarrier], ...]
-    digest: str
+
+    @property
+    def digest(self) -> str:
+        """Seal over presence, exact bytes and both projections.
+
+        Computed on demand: encoding both trees costs about as much as building
+        them, and nothing on the align path reads it.
+        """
+        return _sibling_digest(
+            present=self.present,
+            size=self.size,
+            sha256=self.sha256,
+            semantic=self.legacy_semantic,
+            lexical=self.lexical,
+        )
 
     def thaw_legacy(self) -> dict[str, Any]:
         value = thaw_json(self.legacy_semantic)
@@ -472,6 +481,14 @@ def _sibling_digest(
     )
 
 
+# Align runs on a hand-edited VTT: the recovery hint must not steer the user
+# into regenerating (and so overwriting) those edits without warning.
+_SIBLING_JSON_RECOVERY_HINT = (
+    "; restore it from a backup, or re-run `voxweave transcribe MEDIA` to"
+    " regenerate it (this also rewrites the VTT, so keep a copy of your edits)"
+)
+
+
 def decode_sibling_json_snapshot(name: str, raw: bytes | None) -> SiblingJSONSnapshot:
     """Build tolerant semantic and strict lexical projections from exact J0."""
     if raw is None:
@@ -486,34 +503,26 @@ def decode_sibling_json_snapshot(name: str, raw: bytes | None) -> SiblingJSONSna
             lexical=lexical,
             strict_input_status=StrictInputStatus("valid", None),
             carriers=tuple((key, RawJSONCarrier(False, None)) for key in _CARRIER_KEYS),
-            digest=_sibling_digest(
-                present=False,
-                size=None,
-                sha256=None,
-                semantic=semantic,
-                lexical=lexical,
-            ),
         )
 
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RuntimeError(
-            f"{name} is corrupt JSON (invalid UTF-8);"
-            " re-run transcribe/process to regenerate it"
+            f"{name} is corrupt JSON (invalid UTF-8){_SIBLING_JSON_RECOVERY_HINT}"
         ) from exc
     try:
         semantic_value = json.loads(text)
         lexical = _lexical_json_loads(text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"{name} is corrupt JSON ({exc.msg} at line {exc.lineno});"
-            " re-run transcribe/process to regenerate it"
+            f"{name} is corrupt JSON ({exc.msg} at line {exc.lineno})"
+            f"{_SIBLING_JSON_RECOVERY_HINT}"
         ) from exc
     if not isinstance(semantic_value, dict) or not isinstance(lexical, FrozenObject):
         raise RuntimeError(
-            f"{name}: expected a JSON object, got {type(semantic_value).__name__};"
-            " re-run transcribe/process to regenerate it"
+            f"{name}: expected a JSON object, got {type(semantic_value).__name__}"
+            f"{_SIBLING_JSON_RECOVERY_HINT}"
         )
     semantic_frozen = freeze_json(semantic_value)
     assert isinstance(semantic_frozen, FrozenObject)
@@ -533,13 +542,6 @@ def decode_sibling_json_snapshot(name: str, raw: bytes | None) -> SiblingJSONSna
         lexical=lexical,
         strict_input_status=strict_status,
         carriers=tuple((key, _last_occurrence(lexical, key)) for key in _CARRIER_KEYS),
-        digest=_sibling_digest(
-            present=True,
-            size=len(raw),
-            sha256=raw_sha256,
-            semantic=semantic_frozen,
-            lexical=lexical,
-        ),
     )
 
 
@@ -558,19 +560,25 @@ class SubtitleSnapshot:
     name: str
     size: int
     sha256: str
-    decoded_text: str
     blocks: tuple[ParsedVTTBlock, ...]
 
 
 def decode_subtitle_snapshot(name: str, raw: bytes) -> SubtitleSnapshot:
     """Decode exact V0 and parse VTT directly without timestamp sorting."""
+    # Deferred: the frozen-JSON primitives above are a leaf layer for many modules
+    # and must not pull in the subtitle parser (and through it the voice stack).
+    from voxweave import realign
+    from voxweave.subformats import decode_subtitle_bytes, sniff_format
+
     text = decode_subtitle_bytes(raw, Path(name).name)
     sniffed = sniff_format(text)
     if sniffed == "ass":
         suffix = Path(name).suffix.lower().lstrip(".") or "no extension"
+        ass_name = Path(name).with_suffix(".ass").name
         raise RuntimeError(
             f"{Path(name).name}: content is ASS/SSA but the extension says {suffix};"
-            " rename the file to its real format"
+            f" align needs WebVTT, so rename it to {ass_name} and convert it with"
+            f" `voxweave export {ass_name} -f vtt`"
         )
     raw_blocks = realign.parse_vtt_blocks(text)
     if not raw_blocks:
@@ -598,7 +606,6 @@ def decode_subtitle_snapshot(name: str, raw: bytes) -> SubtitleSnapshot:
         name=Path(name).name,
         size=len(raw),
         sha256=hashlib.sha256(raw).hexdigest(),
-        decoded_text=text,
         blocks=tuple(blocks),
     )
 
@@ -611,7 +618,6 @@ class AlignBlockContent:
     speaker: str | None
     speakers: tuple[tuple[str | None, str], ...] | None
     alignment_text: str
-    content_sha256: str
 
 
 @dataclass(frozen=True)
@@ -697,7 +703,9 @@ def decode_align_snapshot(
         ):
             raise ValueError("predecoded sibling snapshot does not match exact J0")
         sibling = sibling_snapshot
-    separator = "" if effective_iso in realign.NO_SPACE_LANGS else " "
+    from voxweave.realign import NO_SPACE_LANGS
+
+    separator = "" if effective_iso in NO_SPACE_LANGS else " "
     contents: list[AlignBlockContent] = []
     block_values: list[FrozenJSON] = []
     bounds: list[RouteBound] = []
@@ -720,7 +728,6 @@ def decode_align_snapshot(
                 speaker=block.speaker,
                 speakers=block.speakers,
                 alignment_text=alignment_text,
-                content_sha256=frozen_json_digest(frozen),
             )
         )
         start, end = block.start, block.end

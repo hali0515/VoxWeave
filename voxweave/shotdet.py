@@ -1,15 +1,14 @@
 """Shot-change detection via ffmpeg scene scores.
 
 Cue boundaries that land just off a hard cut flash across it — the classic
-amateur-subtitle tell. ``detect_shot_changes`` decodes the video at reduced
-resolution through ffmpeg's scene-score select filter and returns sorted cut
+amateur-subtitle tell. :class:`ShotDetectionJob` decodes the video at reduced
+resolution through ffmpeg's scene-score select filter and reports sorted cut
 timestamps; smart_split's snap pass then nudges nearby cue boundaries onto
-them. Returns ``None`` when the media has no video stream or ffmpeg fails,
-so audio-only pipelines skip snapping transparently.
+them. The outcome is ``None`` when the media has no video stream or ffmpeg
+fails, so audio-only pipelines skip snapping transparently.
 
-The pass is CPU-only and independent of transcription, so the pipeline runs it
-as a :class:`ShotDetectionJob` started before the GPU stages and collected after
-them; ``detect_shot_changes`` is the blocking convenience over the same job.
+The pass is CPU-only and independent of transcription, so the pipeline starts
+the job before the GPU stages and collects it after them.
 """
 
 from __future__ import annotations
@@ -36,11 +35,27 @@ _CANCEL_GRACE_S = 5.0
 
 
 def _scene_threshold() -> float:
-    raw = os.environ.get("VOXWEAVE_SHOT_SCENE", "")
-    try:
-        return float(raw) if raw.strip() else SCENE_THRESHOLD
-    except ValueError:
+    """``VOXWEAVE_SHOT_SCENE`` (ffmpeg scene score, 0 < t <= 1) or the default.
+
+    An unparsable or out-of-range value warns and falls back to the default:
+    scene scores lie in [0, 1], so gt(scene,t) fires on nearly every frame for
+    t <= 0 and never for t > 1.
+    """
+    raw = os.environ.get("VOXWEAVE_SHOT_SCENE", "").strip()
+    if not raw:
         return SCENE_THRESHOLD
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    if value is None or not 0.0 < value <= 1.0:
+        log.warning(
+            "ignoring VOXWEAVE_SHOT_SCENE=%r (expected a number in (0, 1]); using %s",
+            raw,
+            SCENE_THRESHOLD,
+        )
+        return SCENE_THRESHOLD
+    return value
 
 
 def _ffmpeg_command(media: Path, threshold: float) -> list[str]:
@@ -69,11 +84,10 @@ class ShotDetectionJob:
     """One shot-detection ffmpeg pass running in the background.
 
     ``start`` launches ffmpeg and returns at once so the caller can overlap the
-    pass with GPU work; ``result`` joins it with exactly the outcome
-    :func:`detect_shot_changes` reports (``None`` for no ffmpeg / timeout /
-    non-zero exit / unreadable stderr, sorted unique cut times otherwise) and
-    caches that outcome;
-    ``cancel`` reaps the child when the caller bails out before collecting.
+    pass with GPU work; ``result`` joins it and caches the outcome (``None``
+    for no ffmpeg / no video stream / timeout / non-zero exit / unreadable
+    stderr, sorted unique cut times otherwise); ``cancel`` reaps the child when
+    the caller bails out before collecting.
     A daemon thread drains stderr while ffmpeg runs -- showinfo is chatty and a
     full pipe would block ffmpeg forever. Single consumer: call ``result`` and
     ``cancel`` from the thread that owns the job.
@@ -103,9 +117,9 @@ class ShotDetectionJob:
         hangs looped invocations). ``timeout_s`` is the budget ``result`` grants
         the pass once the caller starts waiting for it, not wall-clock from
         launch: a legitimately slow pass must not be killed just because the
-        work it overlapped took longer than the budget (``detect_shot_changes``
-        waits immediately, so for it the two readings coincide). A missing
-        ffmpeg finishes the job immediately with ``None``.
+        work it overlapped took longer than the budget (a caller that collects
+        immediately sees the two readings coincide). A missing ffmpeg finishes
+        the job immediately with ``None``.
 
         stderr is decoded as UTF-8 with undecodable bytes replaced: ffmpeg
         echoes the input path and container tags verbatim, and a strict decode
@@ -229,17 +243,3 @@ class ShotDetectionJob:
         self._outcome = outcome
         self._finished = True
         return outcome
-
-
-def detect_shot_changes(
-    media: Path,
-    threshold: float | None = None,
-    timeout_s: int = 3600,
-) -> list[float] | None:
-    """Return sorted shot-change timestamps (seconds) for ``media``'s first video
-    stream, or ``None`` when undetectable (no video stream, no ffmpeg, timeout).
-
-    Blocking convenience over :class:`ShotDetectionJob`: start the pass and
-    collect it immediately.
-    """
-    return ShotDetectionJob().start(media, threshold, timeout_s).result()

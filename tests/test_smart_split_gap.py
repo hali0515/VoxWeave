@@ -1,7 +1,11 @@
 # tests/test_smart_split_gap.py
 import pytest
 from voxweave.core.layout import _vis_width
-from voxweave.core.smart_split import smart_split_segments
+from voxweave.core.smart_split import (
+    SplitThresholds,
+    smart_split_segments,
+    split_long_cues_with_word_timings,
+)
 
 # thresholds opt-in (gap-split + dur-cap gated on this); min_cue_s=0 so cleanup
 # never extends short cues and gap-count assertions stay exact.
@@ -120,6 +124,252 @@ def test_coarse_single_atom_is_split_to_display_and_duration_limits():
         assert cue["end"] >= assigned_end
 
 
+def test_untimed_coarse_atom_is_apportioned_between_its_timed_neighbours():
+    # An oversized atom the aligner left untimed used to borrow the WHOLE parent
+    # span: its pieces overlapped the cues built from the timed words around it,
+    # and their made-up bounds were published as acoustic anchors.
+    paragraph = (
+        "这是连续书写的一整段文字用于验证粗粒度对齐不会生成超长且无法阅读的单条字幕"
+    )
+    words = [
+        {"word": "Opening", "start": 0.0, "end": 0.4},
+        {"word": "words", "start": 0.5, "end": 0.9},
+        {"word": "here", "start": 1.0, "end": 1.4},
+        {"word": paragraph, "start": None, "end": None},
+        {"word": "closing", "start": 6.0, "end": 6.4},
+        {"word": "words", "start": 6.5, "end": 6.9},
+    ]
+    segment = {
+        "start": 0.0,
+        "end": 6.9,
+        "text": f"Opening words here {paragraph} closing words",
+        "words": words,
+    }
+    cues = smart_split_segments([segment], "en", thresholds=TH)
+    assert "".join(c["text"].replace(" ", "") for c in cues) == (
+        "Openingwordshere" + paragraph + "closingwords"
+    )
+    for left, right in zip(cues, cues[1:]):
+        assert left["end"] <= right["start"] + 1e-9
+    pieces = [c for c in cues if c["text"].replace(" ", "") in paragraph]
+    assert len(pieces) >= 2
+    assert pieces[0]["start"] == pytest.approx(1.4)
+    assert pieces[-1]["end"] == pytest.approx(6.0)
+    for piece in pieces:
+        assert piece["speech_start"] is None and piece["speech_end"] is None
+        assert all(
+            unit["start"] is None and unit["end"] is None for unit in piece["word_data"]
+        )
+
+
+def test_partially_timed_coarse_atom_keeps_its_real_bound_as_the_anchor():
+    paragraph = (
+        "这是连续书写的一整段文字用于验证粗粒度对齐不会生成超长且无法阅读的单条字幕"
+    )
+    words = [
+        {"word": paragraph, "start": 2.0, "end": None},
+        {"word": "closing", "start": 6.0, "end": 6.4},
+    ]
+    segment = {"start": 0.0, "end": 6.4, "text": f"{paragraph} closing", "words": words}
+    cues = smart_split_segments([segment], "en", thresholds=TH)
+    for left, right in zip(cues, cues[1:]):
+        assert left["end"] <= right["start"] + 1e-9
+    # the window runs from the atom's real start to the next real start (6.0),
+    # not to the parent's end (6.4) where it would overlap "closing"
+    assert cues[0]["start"] == pytest.approx(2.0)
+    assert cues[0]["speech_start"] == pytest.approx(2.0)
+    units = [
+        unit
+        for cue in cues
+        for unit in cue["word_data"]
+        if unit["text"].replace(" ", "") in paragraph
+    ]
+    assert len(units) >= 2
+    # only the bound the atom really had survives as acoustic evidence
+    assert (units[0]["start"], units[0]["end"]) == (2.0, None)
+    assert all(unit["start"] is None and unit["end"] is None for unit in units[1:])
+
+
+def test_untimed_word_packed_apart_from_a_coarse_atom_keeps_its_own_stretch():
+    # The coarse atom is emitted standalone, so the untimed word before it packs
+    # into a chunk of its own with no real time; that chunk used to fall back to
+    # the whole parent span and overlap every piece after it.
+    paragraph = (
+        "这是连续书写的一整段文字用于验证粗粒度对齐不会生成超长且无法阅读的单条字幕"
+    )
+    words = [
+        {"word": "hi", "start": None, "end": None},
+        {"word": paragraph, "start": None, "end": None},
+        {"word": "closing", "start": 6.0, "end": 6.4},
+    ]
+    segment = {
+        "start": 0.0,
+        "end": 6.4,
+        "text": f"hi {paragraph} closing",
+        "words": words,
+    }
+    cues = smart_split_segments([segment], "en", thresholds=TH)
+    assert "".join(c["text"].replace(" ", "").replace("\n", "") for c in cues) == (
+        "hi" + paragraph + "closing"
+    )
+    for left, right in zip(cues, cues[1:]):
+        assert left["end"] <= right["start"] + 1e-9
+    assert cues[0]["start"] == pytest.approx(0.0)
+    assert cues[0]["speech_start"] is None and cues[0]["speech_end"] is None
+
+
+def _assert_visible_and_disjoint(cues):
+    for cue in cues:
+        assert cue["end"] > cue["start"], cue
+    for left, right in zip(cues, cues[1:]):
+        assert left["end"] <= right["start"] + 1e-9
+
+
+def test_untimed_coarse_atom_between_touching_neighbours_borrows_display_time():
+    # CTC often leaves the words around an untimed stretch back to back, so the
+    # stretch between them has no room: the pieces used to come out zero-length
+    # and were never displayed. They borrow display time from the timed cues
+    # beside them instead, without touching anyone's acoustic anchors.
+    paragraph = (
+        "这是连续书写的一整段文字用于验证粗粒度对齐不会生成超长且无法阅读的单条字幕"
+    )
+    words = [
+        {"word": "Opening", "start": 0.0, "end": 0.4},
+        {"word": "words", "start": 0.5, "end": 1.0},
+        {"word": paragraph, "start": None, "end": None},
+        {"word": "closing", "start": 1.0, "end": 1.4},
+        {"word": "words", "start": 1.5, "end": 2.0},
+    ]
+    segment = {
+        "start": 0.0,
+        "end": 2.0,
+        "text": f"Opening words {paragraph} closing words",
+        "words": words,
+    }
+    cues = smart_split_segments([segment], "en", thresholds=TH)
+    assert "".join(c["text"].replace(" ", "").replace("\n", "") for c in cues) == (
+        "Openingwords" + paragraph + "closingwords"
+    )
+    _assert_visible_and_disjoint(cues)
+    assert cues[0]["start"] == pytest.approx(0.0)
+    assert cues[-1]["end"] == pytest.approx(2.0)
+    pieces = [c for c in cues if c["text"].replace("\n", "") in paragraph]
+    assert len(pieces) >= 2
+    for piece in pieces:
+        assert piece["end"] - piece["start"] >= 0.5 - 1e-9
+        assert piece["speech_start"] is None and piece["speech_end"] is None
+        assert all(u["start"] is None and u["end"] is None for u in piece["word_data"])
+    timed = [c for c in cues if c not in pieces]
+    assert [(c["speech_start"], c["speech_end"]) for c in timed] == [
+        (0.0, 1.0),
+        (1.0, 2.0),
+    ]
+    # the lenders give up only what they display beyond the floor
+    assert all(c["end"] - c["start"] >= 0.5 - 1e-9 for c in timed)
+
+
+def test_untimed_stretch_borrows_only_what_its_neighbours_can_spare():
+    # 0.3s between the timed words is too little for two pieces (0.15s each).
+    # The 0.7s they lack comes out of the neighbours' time beyond the floor, in
+    # proportion; the preceding cue alone (0.5s spare) is not enough, so the run
+    # grows to take the following cue in too.
+    paragraph = (
+        "这是连续书写的一整段文字用于验证粗粒度对齐不会生成超长且无法阅读的单条字幕"
+    )
+    words = [
+        {"word": "Opening", "start": 0.0, "end": 0.3},
+        {"word": "words", "start": 0.35, "end": 0.6},
+        {"word": "here", "start": 0.65, "end": 1.0},
+        {"word": paragraph, "start": None, "end": None},
+        {"word": "closing", "start": 1.3, "end": 1.7},
+        {"word": "words", "start": 1.8, "end": 2.2},
+    ]
+    segment = {
+        "start": 0.0,
+        "end": 2.2,
+        "text": f"Opening words here {paragraph} closing words",
+        "words": words,
+    }
+    cues = smart_split_segments([segment], "en", thresholds=TH)
+    _assert_visible_and_disjoint(cues)
+    assert [c["text"] for c in cues][0] == "Opening words here"
+    assert [c["text"] for c in cues][-1] == "closing words"
+    pieces = cues[1:-1]
+    assert len(pieces) == 2
+    assert [c["end"] - c["start"] for c in pieces] == [
+        pytest.approx(0.5),
+        pytest.approx(0.5),
+    ]
+    # spare: 0.5 (1.0 - floor) + 0.4 (0.9 - floor)
+    take = 0.7 / 0.9
+    assert cues[0]["end"] - cues[0]["start"] == pytest.approx(1.0 - 0.5 * take)
+    assert cues[-1]["end"] - cues[-1]["start"] == pytest.approx(0.9 - 0.4 * take)
+    assert (cues[0]["start"], cues[-1]["end"]) == (0.0, 2.2)
+    assert (cues[0]["speech_start"], cues[0]["speech_end"]) == (0.0, 1.0)
+    assert (cues[-1]["speech_start"], cues[-1]["speech_end"]) == (1.3, 2.2)
+
+
+def test_untimed_text_past_the_last_real_bound_borrows_display_time():
+    # A word_data stream that runs out before the text does leaves trailing atoms
+    # with no time, and the parent cue ends at the last real bound, so there is
+    # no room after it either: those cues used to be zero-length at 2.45.
+    text = ("今天天气很好我们一起去公园散步然后在湖边坐了很久看着夕阳慢慢落下" * 2)[:60]
+    word_data = [
+        {"word": ch, "start": i * 0.25, "end": i * 0.25 + 0.2}
+        for i, ch in enumerate(text[:10])
+    ] + [{"word": ch, "start": None, "end": None} for ch in text[10:]]
+    parent = {"text": text, "start": 0.0, "end": 2.45, "word_data": word_data}
+    cues = split_long_cues_with_word_timings(
+        [parent],
+        max_line_length=16,
+        max_lines=2,
+        lang="zh",
+        thresholds=SplitThresholds(),
+    )
+    assert "".join(c["text"] for c in cues) == text
+    assert len(cues) >= 2
+    _assert_visible_and_disjoint(cues)
+    assert cues[0]["start"] == pytest.approx(0.0)
+    assert cues[-1]["end"] == pytest.approx(2.45)
+    assert (cues[0]["speech_start"], cues[0]["speech_end"]) == (0.0, 2.45)
+    for cue in cues[1:]:
+        assert cue["end"] - cue["start"] >= SplitThresholds().min_cue_s - 1e-9
+        assert cue["speech_start"] is None and cue["speech_end"] is None
+
+
+def test_untimed_paragraph_too_long_for_its_parent_still_displays_every_piece():
+    # Even the whole parent span cannot give each piece the floor here; the
+    # pieces then share it by width rather than collapsing to zero, so the
+    # degenerate-collapse merge no longer folds the whole paragraph into one
+    # over-budget cue.
+    paragraph = (
+        "这是连续书写的一整段文字用于验证粗粒度对齐不会生成超长且无法阅读的单条字幕" * 4
+    )
+    first = {
+        "text": f"Opening words {paragraph}",
+        "words": [
+            {"word": "Opening", "start": 0.0, "end": 0.4},
+            {"word": "words", "start": 0.5, "end": 2.0},
+            {"word": paragraph, "start": None, "end": None},
+        ],
+    }
+    second = {
+        "text": "Next line",
+        "words": [
+            {"word": "Next", "start": 2.1, "end": 2.5},
+            {"word": "line", "start": 2.6, "end": 3.0},
+        ],
+    }
+    cues = smart_split_segments([first, second], "en", thresholds=SplitThresholds())
+    assert "".join(c["text"].replace(" ", "").replace("\n", "") for c in cues) == (
+        "Openingwords" + paragraph + "Nextline"
+    )
+    _assert_visible_and_disjoint(cues)
+    assert len(cues) >= 4
+    assert all(c["text"].count("\n") <= 1 for c in cues)
+    assert cues[-1]["text"] == "Next line"
+
+
 def test_timingless_indivisible_token_still_obeys_physical_line_budget():
     token = "无空格粗粒度文本" * 8
     cues = smart_split_segments([{"text": token, "words": []}], "en", thresholds=TH)
@@ -156,8 +406,7 @@ def test_vad_confirmed_split():
 
 
 def test_budoux_atom_not_split_midphrase():
-    # thresholds=TH is required: it is what activates the BudouX len-break gate (do_new path);
-    # without it the test becomes vacuous
+    # the BudouX phrase starts are the only legal len-break points for ja
     pytest.importorskip("budoux")
     # です is a single phrase node: even if length exceeds the budget, it must not be split into で|す
     words = [
@@ -320,8 +569,6 @@ def test_en_len_break_avoids_forbidden_token():
         [cue],
         max_line_length=14,
         max_lines=1,
-        min_duration=0.0,
-        desired_wps=4.0,
         lang="en",
         thresholds=SplitThresholds(min_cue_s=0.0),
     )
@@ -494,9 +741,8 @@ def test_build_atoms_degrades_instead_of_raising_on_desync():
         [{"text": "上涨92%了", "start": 0.0, "end": 0.2, "word_data": wd}],
         max_line_length=18,
         max_lines=1,
-        min_duration=0.0,
-        desired_wps=4.0,
         lang="zh",
+        thresholds=SplitThresholds(),
     )
     assert "".join(c["text"] for c in cues) == "上涨92%了"
 
@@ -1020,7 +1266,7 @@ def test_len_break_prefers_subthreshold_breath_over_connected_edge():
         atoms.append({"text": char, "start": clock, "end": clock + 0.1})
         clock += 0.1
     incoming = {"text": "申", "start": clock, "end": clock + 0.1}
-    ctx = SplitContext("zh", 18, 1, SplitThresholds(), True, None)
+    ctx = SplitContext("zh", 18, 1, SplitThresholds(), None)
 
     assert (
         _best_len_break_pos(

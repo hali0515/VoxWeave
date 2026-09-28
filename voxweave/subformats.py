@@ -13,12 +13,11 @@ import logging
 import re
 from pathlib import Path
 
+from voxweave import sidecars
+from voxweave.paths import SUBTITLE_EXTS
 from voxweave.realign import _parse_ts, parse_vtt_blocks
 
 log = logging.getLogger("voxweave")
-
-# Subtitle formats the file-based commands (export/translate/pack/burn) accept.
-SUBTITLE_EXTS = (".vtt", ".srt", ".ass", ".ssa")
 
 # Fallback Events field order (the standard v4.00+ layout) when no Format line
 # precedes the first Dialogue line.
@@ -39,8 +38,32 @@ _ASS_OVERRIDE_RE = re.compile(r"\{[^}]*\}")
 # \i1 / \i0 anywhere inside an override block, even packed with other tags
 # ({\i1\fad(200,200)}); the (?![0-9]) guard keeps \i10 etc. from matching.
 _ASS_ITALIC_TAG_RE = re.compile(r"\\i([01])(?![0-9])")
+# \pN switches vector-drawing mode (N > 0 on, 0 off); \pos and \pbo never
+# match because a digit must follow the p directly.
+_ASS_DRAWING_TAG_RE = re.compile(r"\\p(\d+)")
 _ITALIC_WRAP_RE = re.compile(r"<i>(.*)</i>\Z", re.DOTALL)
 _ITALIC_TOKEN_RE = re.compile(r"(<i>|</i>)")
+
+
+def _drop_drawings(raw: str) -> str:
+    """Remove vector-drawing commands from ASS event text: the text after a
+    ``\\pN`` (N > 0) override up to a ``\\p0`` or the end of the event is
+    shape commands (``m 0 0 l 1920 0 ...``), not dialogue. Override blocks stay
+    in place for the italic mapping."""
+    out: list[str] = []
+    drawing = False
+    pos = 0
+    for m in _ASS_OVERRIDE_RE.finditer(raw):
+        if not drawing:
+            out.append(raw[pos : m.start()])
+        out.append(m.group(0))
+        toggles = _ASS_DRAWING_TAG_RE.findall(m.group(0))
+        if toggles:
+            drawing = int(toggles[-1]) > 0
+        pos = m.end()
+    if not drawing:
+        out.append(raw[pos:])
+    return "".join(out)
 
 
 def _override_to_italic(m: re.Match) -> str:
@@ -73,12 +96,13 @@ def _ass_plain_text(raw: str) -> str:
     """ASS event text -> cue text: ``\\N``/``\\n`` become line breaks, ``\\h``
     a space, italic overrides become inline ``<i>``/``</i>`` tags (the form the
     SRT/ASS renderers understand) even when packed with other tags, all other
-    override blocks are dropped, and stray italic tags are balanced.
+    override blocks are dropped, vector drawings (``\\p1``) are removed, and
+    stray italic tags are balanced.
 
     A whole-line italic wrap is removed entirely: it is styling (typically a
     song line), and keeping it would mask the music-note lyric detection below.
     """
-    t = _ASS_OVERRIDE_RE.sub(_override_to_italic, raw.strip())
+    t = _ASS_OVERRIDE_RE.sub(_override_to_italic, _drop_drawings(raw.strip()))
     m = _ITALIC_WRAP_RE.fullmatch(t)
     if m and "<i>" not in m.group(1) and "</i>" not in m.group(1):
         t = m.group(1)
@@ -241,23 +265,19 @@ def load_subtitle_blocks_bytes(path: Path, data: bytes) -> list[dict]:
     if is_ass:
         blocks = parse_ass_blocks(text)
     elif p.suffix.lower() == ".srt":
-        from voxweave.pipeline import inspect_speakers_mapping_path
         from voxweave.speakers import load_speaker_display_names
 
-        mapping_path = inspect_speakers_mapping_path(
-            p,
-            reference=p,
-        )
+        # The mapping only lets "Name: line" speaker labels be recognised; a
+        # broken lookup (an unreadable cache marker, say) must not fail the load.
         known_names: list[str] = []
-        if mapping_path.exists():
-            try:
+        label = p.name
+        try:
+            mapping_path = sidecars.inspect_speakers_mapping_path(p, reference=p)
+            label = mapping_path.name
+            if mapping_path.exists():
                 known_names = load_speaker_display_names(mapping_path)
-            except (OSError, RuntimeError, UnicodeError) as exc:
-                log.warning(
-                    "%s: ignoring unreadable speaker mapping: %s",
-                    mapping_path.name,
-                    exc,
-                )
+        except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+            log.warning("%s: ignoring unreadable speaker mapping: %s", label, exc)
         if known_names:
             blocks = parse_vtt_blocks(text, srt_speaker_names=known_names)
         else:

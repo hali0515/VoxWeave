@@ -102,3 +102,52 @@ class Reporter:
     def chunk_done(self) -> None:
         """Signal that one chunk (ASR + alignment) is complete (alias for ``advance``)."""
         self.advance(1)
+
+
+def progress_bridge(rep: Reporter, label: str):
+    """Convert the ``(done, total)`` callback from backend/songdet into a Reporter task bar.
+
+    Keeps backend/songdet free of any rich dependency.
+    """
+    started = {"v": False}
+
+    def cb(done: int, total: int) -> None:
+        if not started["v"]:
+            rep.task(label, total)
+            started["v"] = True
+        rep.advance(1)
+
+    return cb
+
+
+class NestedReporter(Reporter):
+    """Forward work details without replacing the enclosing command's step plan."""
+
+    def __init__(self, parent: Reporter) -> None:
+        self.parent = parent
+
+    def step(self, label: str) -> None:
+        # Nested steps stay inside the enclosing step: its clock keeps running and
+        # the timings belong to the outer plan.
+        return
+
+    def finish(self) -> None:
+        self.parent.finish()
+
+    def timings(self) -> dict[str, float]:
+        return self.parent.timings()
+
+    def stage(self, label: str) -> None:
+        self.parent.stage(label)
+
+    def status(self, label: str) -> None:
+        self.parent.status(label)
+
+    def task(self, label: str, total: int) -> None:
+        self.parent.task(label, total)
+
+    def advance(self, n: int = 1) -> None:
+        self.parent.advance(n)
+
+    def download(self, label: str, done: int, total: int | None) -> None:
+        self.parent.download(label, done, total)

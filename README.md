@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="resources/VoxWeave_icon.png" alt="VoxWeave" width="200"/>
+<img src="https://raw.githubusercontent.com/hali0515/VoxWeave/main/resources/VoxWeave_icon.png" alt="VoxWeave" width="200"/>
 
 # VoxWeave
 
@@ -26,15 +26,15 @@ insert songs. Local-first Qwen3 ASR, forced alignment, and edit-and-resync — C
 > [!NOTE]
 > **Local-first.** Separation, ASR, and forced alignment all run in-process on your GPU — no
 > network endpoints, no audio leaves the machine. Runs on **NVIDIA CUDA** (PyTorch) and on
-> **Apple Silicon**, where ASR + alignment use the native **MLX** Qwen3 models. Weights download
-> once on first run. (Translation and ASR-correction are the only optional features that call an
-> external LLM, and only when you invoke them.)
+> **Apple Silicon**, where ASR and the Qwen aligner use the native **MLX** Qwen3 models. Weights
+> download once on first run. (Translation and ASR-correction are the only optional features
+> that call an external LLM, and only when you invoke them.)
 
 > [!NOTE]
 > **Hardware.** The default pipeline (`Qwen3-ASR-0.6B`, `peak` load strategy) runs in **~8 GB of
 > VRAM** — the separator is freed before ASR + alignment load, so peak ≈ `max(stage)`, not their
 > sum. `--asr-model qwen3-asr-1.7B` adds roughly **+2 GB** and still fits 8 GB under the default `peak`
-> strategy. `load_strategy = "sum"` (concurrent, faster on big cards) makes peak the **sum** of the
+> strategy. `load_strategy = "sum"` (keeps models resident between passes, skipping reloads on big cards) makes peak the **sum** of the
 > resident models — plan for 12 GB+. On **Apple Silicon** the MLX 8-bit weights roughly halve the
 > Qwen footprint (so 1.7B fits comfortably in 16 GB unified memory). `--hybrid` loads a Whisper
 > engine alongside Qwen to trade VRAM for accuracy — it does **not** save memory; the only knob that
@@ -62,7 +62,7 @@ breaks) handles Chinese/Japanese/English as first-class.
   - [Pack soft subtitles (`pack`)](#pack-soft-subtitles)
   - [Burn hard subtitles (`burn`)](#burn-hard-subtitles)
 - [The edit-and-resync workflow](#the-edit-and-resync-workflow)
-- [Migration notes](MIGRATING.md)
+- [Migration notes](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md)
 - [How it works](#how-it-works)
 - [Configuration](#configuration)
   - [Performance knobs](#performance-knobs)
@@ -127,10 +127,17 @@ Override the torch index per-invocation: `make install TORCH_BACKEND=cpu`.
 
 ```bash
 # NVIDIA / Linux:
-uv tool install --torch-backend=cu128 "voxweave[cuda]"   # full pipeline + faster-whisper hybrid
+uv tool install --torch-backend=cu128 \
+  --overrides <(printf "onnxruntime; sys_platform == 'darwin'\n") \
+  "voxweave[cuda]"                                       # full pipeline + faster-whisper hybrid
 # Apple Silicon / macOS:
 uv tool install "voxweave[mps]"                          # full pipeline + MLX Whisper hybrid
 ```
+
+`--torch-backend` in `uv tool install` needs uv 0.9.19 or newer (`uv self update`). On Linux the
+`--overrides` line keeps the CPU `onnxruntime` wheel (pulled in by ctc-forced-aligner) from
+shadowing `onnxruntime-gpu`, which would silently move Japanese MMS alignment onto the CPU; the
+Makefile passes the same rule from `overrides.txt`.
 
 The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
 Japanese/CJK), layout, song-skip, and speaker-diarization support — plus CJK line-break and
@@ -143,7 +150,7 @@ translation — is baked into the **core dependencies**. The variant selects the
   [`mlx-audio`](https://github.com/Blaizzy/mlx-audio) (Metal kernels + quantization). **Alignment**
   keeps the same per-language stack as `[cuda]`: English on wav2vec2 CTC (torch, runs on MPS;
   the forced-align DP falls to CPU as torchaudio has no Metal kernel), Japanese/CJK on the ONNX
-  MMS aligner (CoreML/CPU — onnxruntime has no Metal provider). Only the Qwen fallback (zh·yue,
+  MMS aligner (CPU onnxruntime; CoreML is avoided because its Metal context crashes alongside MLX). Only the Qwen fallback (zh·yue,
   or any CTC failure) is served by the MLX Qwen3-ForcedAligner, since the torch `qwen-asr` aligner
   is absent here. The Whisper hybrid/fusion engines (`--asr-model large-v3`, `--hybrid`) run on the
   native [`mlx-whisper`](https://pypi.org/project/mlx-whisper/) Metal port instead of faster-whisper
@@ -154,12 +161,13 @@ translation — is baked into the **core dependencies**. The variant selects the
 Speaker diarization support ships by default on both variants but remains opt-in at runtime.
 The default model is `pyannote/speaker-diarization-community-1`, which separates and counts
 multiple speakers noticeably better than 3.1. It is gated separately on Hugging Face: before
-using `--diarize`, accept the conditions for the model you select, then authenticate once with
-`hf auth login` or set `VOXWEAVE_HF_TOKEN` / `HF_TOKEN`. Users who have accepted only the 3.1
+using `--diarize`, accept the conditions for the model you select, then set `VOXWEAVE_HF_TOKEN` /
+`HF_TOKEN` or authenticate once with `hf auth login` (a `uv tool` install does not put `hf` on
+PATH; run it as `uvx --from huggingface_hub hf auth login`). Users who have accepted only the 3.1
 gate can keep it with `--diarize-model 3.1`.
 
-Phase-0 measurements used pyannote.audio 4.0.7, the same Japanese 16 kHz test waveform, and an
-RTX PRO 4000 24 GB. Peak allocated CUDA memory was identical in that run:
+Measured with pyannote.audio 4.0.7 on the same Japanese 16 kHz test waveform and an RTX PRO
+4000 24 GB. Peak allocated CUDA memory was identical in that run:
 
 | Short name | Resolved pipeline | Model license | Peak allocated VRAM |
 | ---------- | ----------------- | ------------- | ------------------- |
@@ -173,7 +181,7 @@ for users who have accepted only the existing 3.1 gate.
 per-speaker voiceprints (cross-episode matching and **Split this speaker**) come from a
 dedicated speaker-embedding model chosen per language. Each checkpoint is downloaded once into
 `~/.cache/voxweave/audio/`, pinned by size and SHA-256, and verified at the start of a
-`--voiceprints` run, before any audio work (with `auto` and no `--lang`, both checkpoints). If
+`--voiceprints` run, before any audio work (with `auto` and no `--language`, both checkpoints). If
 that fails, the run warns and continues without voiceprints:
 
 | `--voiceprint-model` | Checkpoint | Languages | Dim | Weights licence / caveats |
@@ -215,8 +223,8 @@ enough to anchor a voiceprint, the run warns and keeps pyannote's speakers. With
 voiceprints are keyed by pyannote's labels. The setting never changes which voice stores an
 episode's voiceprints match. Switching it (or `--diarize-model`) on an episode whose speakers
 you already named renumbers the speakers, while the saved names stay keyed by speaker id:
-`process` warns when a named id's turns changed, and you should review the names with
-`voxweave speakers` before `voxweave speakers enroll` stores a voice under a wrong name.
+a transcription run warns when a named id's turns changed, and you should review the names with
+`voxweave speakers <media>` before `voxweave speakers enroll` stores a voice under a wrong name.
 
 **From source** (for development or pulling new code):
 
@@ -248,7 +256,8 @@ Override the detection per invocation: `make install VARIANT=mps` or
   [`speaker-diarization-community-1`](https://hf.co/pyannote/speaker-diarization-community-1)
   conditions for the default, or the
   [`speaker-diarization-3.1`](https://hf.co/pyannote/speaker-diarization-3.1) conditions (and
-  segmentation-3.0's) before selecting `--diarize-model 3.1`. Then use `hf auth login`,
+  segmentation-3.0's) before selecting `--diarize-model 3.1`. Then use `hf auth login`
+  (`uvx --from huggingface_hub hf auth login` after a `uv tool` install),
   `VOXWEAVE_HF_TOKEN`, or `HF_TOKEN`.
 - The device is auto-detected at runtime (cuda → mps → cpu); override with `VOXWEAVE_DEVICE`. On
   mps the MLX backend is selected automatically; force it either way with `VOXWEAVE_BACKEND=mlx|torch`.
@@ -328,7 +337,7 @@ voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias na
 Unknown command words produce a command error. Bare subtitle or JSON paths are not
 transcribed: use `align` for edited VTT, `export` for subtitle format conversion,
 or `render` for layout from the sibling JSON. These inputs are never automatically
-routed to an in-place editing command. See the [migration notes](MIGRATING.md) for old names.
+routed to an in-place editing command. See the [migration notes](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md) for old names.
 
 <details>
 <summary><b>Options</b></summary>
@@ -339,21 +348,21 @@ routed to an in-place editing command. See the [migration notes](MIGRATING.md) f
 | `--no-separate`                | Skip vocal separation (for clean speech) to save GPU time.                                                                                                                                                                                                                                               |
 | `--no-skip-songs`              | Keep lyrics / transcribe purely musical content (song-skip is on by default).                                                                                                                                                                                                                            |
 | `-m, --asr-model`               | Local ASR model (default `Qwen3-ASR-0.6B`; `qwen3-asr-1.7B` is more accurate).                                                                                                                                                                                                                           |
-| `--context`                    | ASR bias prompt: names/terms likely to appear (comma or newline separated). Bare term lists are auto-framed as `Proper nouns: ...` for Qwen — a bare list actually _regresses_ accuracy ([details](https://github.com/TypeWhisper/typewhisper-mac/issues/321)); prose or pre-framed text passes through. |
+| `--context`                    | ASR bias prompt: names/terms likely to appear (comma or newline separated). Bare term lists are auto-framed as `Proper nouns: ...` for Qwen — a bare list actually _regresses_ accuracy ([details](https://github.com/TypeWhisper/typewhisper-mac/issues/321)); prose or pre-framed text passes through. Same as `VOXWEAVE_ASR_CONTEXT`. |
 | `--hybrid`                     | Dual-ASR fusion: Whisper text + Qwen punctuation. Whisper's error bias is the opposite of Qwen's (it hallucinates rather than omits), so use this when Qwen drops uncertain words.                                                                                                                       |
 | `--normalize/--no-normalize`   | Apply loudness normalization (`loudnorm`) to the 16k ASR input — helps when quiet words get dropped; off by default since it also amplifies noise.                                                                                                                                                       |
-| `--timestamps/--no-timestamps` | VTT carries word-level timestamps (default on); `--no-timestamps` writes a plain-text editing draft.                                                                                                                                                                                                     |
-| `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export).                                                                                                                                                                                              |
+| `--timestamps/--no-timestamps` | VTT carries cue timing lines (word-level precision from alignment; default on); `--no-timestamps` writes a plain-text editing draft.                                                                                                                                                                                                     |
+| `--keep-lyrics`                | Transcribe detected songs instead of skipping them; sung cues are wrapped `♪ ... ♪` (italic in ASS export). Requires vocal separation (warns and has no effect with `--no-separate`).                                                                                                                                                                                              |
 | `--sdh`                        | Also write `<stem>.sdh.vtt`: PANNs non-speech event tags (`[explosion]`, `[phone ringing]`, ...) in speech-free gaps.                                                                                                                                                                                    |
 | `--diarize`                    | Opt in to the default-installed pyannote speaker diarizer: multi-speaker cues split at speaker boundaries; on two-line languages a short exchange becomes a Netflix dual-speaker event (`-line` per speaker). The gated checkpoint requires `VOXWEAVE_HF_TOKEN`, `HF_TOKEN`, config `hf_token`, or a prior `hf auth login`. Speaker turns persist to the sibling JSON, so `voxweave render` replays the formatting without re-running the model. |
 | `--diarize-model`              | Select `community-1` (the default), `3.1`, or any full Hugging Face pipeline id. The same setting is available as `VOXWEAVE_DIARIZE_MODEL` or `[diarize].model`; precedence is CLI > env > config > default. |
 | `--speaker-clustering`         | How `--diarize` groups its turns into speakers: `pyannote` (the default: the pipeline's own clustering) or `voiceprint` (opt-in: regroup with ReDimNet2 voiceprints, recipe `voiceprint-v1`; turns nobody can be attributed to are dropped and their words stay with the surrounding speaker). The same setting is available as `VOXWEAVE_DIARIZE_CLUSTERING` or `[diarize].clustering`; precedence is CLI > env > config > default, and an unknown value is an error. See [Setup](#setup) for the model, its licence and the measured trade-offs. |
 | `--voiceprints/--no-voiceprints` | Opt in to a voice-biometric centroid sidecar for reviewed cross-episode speaker suggestions. Requires a fresh `--diarize` run and is off by default. Precedence: CLI, `VOXWEAVE_VOICEPRINTS`, `[defaults].voiceprints`, then off. |
 | `--voiceprint-model`           | Speaker-embedding model for `--voiceprints`: `auto` (default: `anime-va` for Japanese, `redimnet2` otherwise), `redimnet2`, `anime-va`, or `pyannote` (legacy: the diarization pipeline's own embeddings, which matches pre-existing voice stores). Precedence: CLI, `VOXWEAVE_VOICEPRINT_MODEL`, `[voiceprint].model`, then `auto`; an unknown value is an error, and the CLI value is validated (with a no-effect warning) even when voiceprints are off. See [Setup](#setup) for the models and their licences. |
-| `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count when you know it (e.g. `--max-speakers 2` for an interview) — the single best lever against over-splitting on noisy material.                                                                                                       |
-| `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules).                                                                                                                                                                                               |
-| `--vad-mask/--no-vad-mask`     | Suppress CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                    |
-| `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) under `<media directory>/cache/<stem>/debug/`.                                                                                                                                              |
+| `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count. `--max-speakers` (e.g. `2` for an interview) is the single best lever against over-splitting on noisy material; set `--min-speakers` only when a missing speaker matters more than a split one, since a lower bound above the voices actually found splits voices (see [Setup](#setup)). |
+| `--no-shot-snap`               | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules; `VOXWEAVE_SHOT_SNAP_MS` sets how far from a cut a boundary is moved).                                                                                                                                  |
+| `--vad-mask/--no-vad-mask`     | Suppress wav2vec2 CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Only languages aligned with a wav2vec2 CTC model use it (English by default); Japanese (MMS) and Chinese/Cantonese (Qwen) alignment ignore it. Same as `VOXWEAVE_VAD_EMISSION_MASK=1`. |
+| `--debug`                      | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) under `<media directory>/cache/<stem>/debug/`. Each run replaces the previous bundle.                                                                                                                                              |
 
 The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--voiceprints`, `--timestamps`,
 `--shot-snap`, `--vad-mask`) can have their defaults set persistently via the `[defaults]`
@@ -367,19 +376,29 @@ After a diarized transcription, `voxweave speakers serve <media>` prepares an au
 memory, serves it on `127.0.0.1` by default, and opens it in your browser. The page embeds up to three
 clean, non-overlapping speech clips per diarizer id. Listen, enter names, then select **Save**
 to write them directly to the episode's speaker mapping. The server runs until Ctrl+C; use
-`--no-open` to print the URL without opening a browser, or `--port N` to choose its HTTP
+`--no-open` to print the access link without opening a browser, or `--port N` to choose its HTTP
 port. No audition HTML is written to disk. `voxweave speakers <media>` is the supported
 shorthand for `serve`; `--manual` disables voice matching for that session.
 
 To access the audition from another device, use
-`voxweave speakers serve episode.mkv --host 0.0.0.0 --port 8765 --no-open`, then open
-`http://<server-ip>:8765/` using the server's IP address. This binds all IPv4 interfaces.
+`voxweave speakers serve episode.mkv --host 0.0.0.0 --port 8765 --no-open`, then open the
+printed `http://0.0.0.0:8765/?k=...` link with `0.0.0.0` replaced by the server's IP
+address. This binds all IPv4 interfaces.
 
 For an ngrok tunnel on the same machine, run
 `voxweave speakers episode.mkv --port 9999 --no-open --ngrok` and, in another terminal,
-`ngrok http http://127.0.0.1:9999`. No public domain needs to be supplied: VoxWeave reads
-the local agent API at `127.0.0.1:4040` and refreshes the accepted URLs as tunnels change.
+`ngrok http http://127.0.0.1:9999`. Open the tunnel's URL with the printed `/?k=...`
+appended. No public domain needs to be supplied: VoxWeave reads the local agent API at
+`127.0.0.1:4040` and refreshes the accepted URLs as tunnels change.
 Only tunnels forwarding to this local port are accepted, including HTTPS access and saves.
+
+> [!WARNING]
+> Access is by link. The URL `speakers serve` prints and opens carries a random access key
+> (`?k=...`, new on every start); opening it sets a session cookie, and every request without
+> that cookie is refused, on `127.0.0.1` too. Anyone who has the link can play the episode audio,
+> read and change speaker names and run splits, so share it only with people you trust and stop
+> the server when you are done. With `--host 0.0.0.0` the connection is plain HTTP, so the link
+> and the audio are not encrypted on your network.
 
 ```bash
 voxweave episode.mkv --diarize
@@ -395,9 +414,16 @@ before applying the split. This action requires the episode to have been capture
 were captured with, and the proposal is refused if that embedder or the audio provenance cannot
 be reproduced (for example, when a bound separated-vocals cache is missing or stale). A
 confirmed split rewrites `speaker_turns` and the bound voiceprint centroids (recomputed with the
-capture's centroid recipe), keeps a one-level
-undo snapshot, and asks you to restart `voxweave speakers serve` to audition and name the new id. Undo
-is refused after any rewritten input changes.
+capture's centroid recipe) and asks you to restart `voxweave speakers serve` to audition and name
+the new id. It also saves the files it rewrote as a one-level snapshot in the episode cache
+(`speaker-split.undo.json`). Until you restart, the card offers **Undo this split**, which
+restores the transcript JSON, the voiceprints and the speaker mapping from that snapshot. The
+undo is refused, and the page says which file is the reason, when one of them changed after the
+split (or the media did), or when there is no snapshot left; a refused undo restores nothing.
+Either way, restart `voxweave speakers serve` to audition again. The page offers the undo only
+in the session that applied the split; after a restart, take a split back by transcribing the
+episode again with `--diarize --voiceprints`, which diarizes it from scratch.
+`voxweave speakers purge` deletes the snapshot.
 
 Voice matching across episodes is a separate, opt-in layer. Capture centroids with
 `--diarize --voiceprints`, review the ordinary empty mapping, then enroll only those
@@ -460,24 +486,29 @@ button, or when an identity of the same scope carries that name. Otherwise enrol
 new identity, even if another scope has someone of the same name; if a name is ambiguous within
 a scope, enrollment stops and asks you to rename one (`voxweave voices rename ID NAME`).
 
-**Sharing on a NAS.** Several machines can point `[voices].dir` at the same directory on a NAS.
-Writes take an exclusive `flock` on `.library.lock`; Linux NFS clients emulate it with byte-range
-locks, which works on NFSv4 and on NFSv3 with the lock manager, but a `nolock` mount keeps each
-lock local to its machine, so use a mount with working locks. Every write also checks, just
+**Sharing on a NAS.** Several machines can point `[voices].dir` at the same directory on a NAS,
+as the same user account. Writes take an exclusive `flock` on `.library.lock`; Linux NFS
+clients emulate it with byte-range locks, which works on NFSv4 and on NFSv3 with the lock
+manager, but a `nolock` mount keeps each lock local to its machine, so use a mount with working
+locks. Every write also checks, just
 before replacing each file, that it still holds what the write read, and otherwise stops
 ("re-run the command"). That check narrows the window but is not atomic: without working locks,
 two simultaneous writers can both pass it and one update can be lost. Voice samples such a race
-leaves behind for an identity that no longer exists are ignored by every reader and deleted by
-the next write. `identities.json` lists every space file, so `voices forget` finds all of them
+leaves behind for an identity that `identities.json` does not list are ignored by every reader
+and kept on disk, as are those left when an older `identities.json` is restored; only the
+samples of identities removed with `voices forget` are deleted by the next write.
+`identities.json` lists every space file, so `voices forget` finds all of them
 even when an NFS client's cached directory listing is a minute old, and stops (asking you to
 re-run) if a listed file is not visible yet. Files are replaced by an atomic rename within the
 directory. File-sync services are not a lock and can produce conflicting copies; use a real
-network mount. A library directory created by VoxWeave is private (`0700`, files
-`0600`); a directory you created beforehand keeps its permissions. Only the built-in location
-gets missing parent directories created: for `--voices-dir`, `VOXWEAVE_VOICES_DIR` or
-`[voices].dir` the parent must already exist, so an unmounted share (an empty mount point) makes
-`speakers enroll` fail instead of starting a second library on the local disk, and
-`speakers serve` warns that the library is missing.
+network mount. A library belongs to one user account: every file in it (the lock too) is
+created `0600`, and a directory VoxWeave creates is `0700`; a directory you created beforehand
+keeps its own permissions. Sharing one library between different user accounts is not
+supported: machines that share it must reach it as the same user (the same uid on NFS). Only
+the built-in location gets missing parent directories created: for `--voices-dir`,
+`VOXWEAVE_VOICES_DIR` or `[voices].dir` the parent must already exist, so an unmounted share (an
+empty mount point) makes `speakers enroll` fail instead of starting a second library on the
+local disk, and `speakers serve` warns that the library is missing.
 
 **Privacy.** The library holds voice biometrics of the people you name; the first write into a
 new library prints a notice saying so. `voxweave voices list` and `voxweave voices show ID|NAME`
@@ -505,7 +536,7 @@ only with both `--voices` and `--show`); it cannot be combined with `--voices-di
 A space belongs to one embedding model (see the voiceprint embedders under [Setup](#setup));
 a per-show store captured with another embedder is skipped with a warning that names both
 spaces, and enrollment into such a store is refused. A store built before the dedicated
-embedders keeps working with `--voiceprint-model pyannote` (see [MIGRATING.md](MIGRATING.md)).
+embedders keeps working with `--voiceprint-model pyannote` (see [MIGRATING.md](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md)).
 
 Use `speakers enroll --replace` to replace this episode's prior contribution (the same episode
 label within the same scope, or the same media). Enrolling an already enrolled capture again
@@ -551,6 +582,17 @@ and caches it there. Existing media-adjacent `cache/<stem>.vocals.32k.flac` entr
 legacy read/write-back lane. When a voiceprint pair requires source binding, both managed and
 legacy vocals caches are accepted only when their matching integrity companion validates.
 
+Both VTT forms are accepted: the timestamped VTT and the plain-text editing draft that
+`--no-timestamps` writes. The aligner strips punctuation as a hard constraint; ASR punctuation is
+re-injected by time so the final output has correct spacing and breaks without stray marks.
+
+On media longer than the single-pass alignment budget (about 30 min, `ctc_max_dp_frames`),
+English and Japanese alignment runs in pieces split at silences between cues, so there the VTT
+needs its cue timing lines. Overlapping or nested cues are fine; if a split would still cut a cue
+off from its own audio (for example a cue whose start was mistyped far too early), `align`
+refuses and names the overlapping cues so you can fix their times. Raising `ctc_max_dp_frames`
+aligns the whole file in one pass instead, at the cost of more memory.
+
 ```bash
 voxweave align episode.vtt                 # finds episode.<ext> in the same dir
 voxweave align episode.vtt --media original.mkv
@@ -566,7 +608,7 @@ voxweave align episode.vtt --no-separate   # align on the original audio (clean 
 | `--language`    | Force language (ISO code or full name); default: read from JSON.   |
 | `--no-separate` | Align on the original audio instead of separated vocals.           |
 | `--normalize/--no-normalize` | Apply `loudnorm` to the 16k alignment input.          |
-| `--vad-mask/--no-vad-mask`   | Suppress CTC emissions outside the JSON's `vad_speech` spans (see the transcribe option of the same name). |
+| `--vad-mask/--no-vad-mask`   | Suppress wav2vec2 CTC emissions outside the JSON's `vad_speech` spans (see the transcribe option of the same name; MMS and Qwen alignment ignore it). |
 
 `--separate`, `--normalize`, and `--vad-mask` also honor the `[defaults]` section of
 `~/.config/voxweave.conf` when not passed explicitly.
@@ -584,8 +626,8 @@ voxweave render episode.json --no-timestamps   # plain-text editing draft
 ```
 
 Pass the JSON, its VTT sibling, or the media path; each resolves to the same sibling JSON.
-This command rewrites the working VTT and JSON. Save or align manual VTT edits before
-rendering: the CLI rename does not add a backup or overwrite guard.
+This command rewrites the working VTT and JSON and re-lays out every cue from the word
+timings. It does not back up or protect manual VTT edits: save or `align` them first.
 
 ### ASR correction
 
@@ -593,13 +635,14 @@ rendering: the CLI rename does not add a backup or overwrite guard.
 words, and garbled proper nouns, producing a reviewable diff. Conservative substitution only
 (no completion/rewrite), gated by a code check that the matched text equals the original
 line-for-line. By default writes only an adjacent sidecar `<stem>.asrfix.vtt` plus an audit
-JSON in the episode artifact cache — the original VTT is untouched. Use `--apply` to overwrite,
-**then run `align`** to reassign timing.
+JSON in the episode artifact cache — the original VTT is untouched. To accept a reviewed sidecar,
+replace the VTT with it and run `align`. `--apply` instead lets the LLM rewrite the VTT in place
+and then re-runs alignment automatically (skip that with `--no-align`, and pass `--media` when
+the media is not a same-stem sibling).
 
 ```bash
-voxweave correct episode.vtt --glossary names.json   # review the sidecar
-voxweave correct episode.vtt --glossary names.json --apply
-voxweave align episode.vtt
+voxweave correct episode.vtt --glossary names.json           # review the sidecar
+voxweave correct episode.vtt --glossary names.json --apply   # rewrite in place + re-align
 ```
 
 <details>
@@ -608,7 +651,9 @@ voxweave align episode.vtt
 | Option                         | Description                                                                                                  |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
 | `--glossary`                   | Term/name glossary (`.json` → mapping; other → raw prompt). Strongly recommended for ambiguous proper nouns. |
-| `--apply`                      | Overwrite the original VTT (default: sidecar only, for review).                                              |
+| `--apply`                      | Let the LLM rewrite the original VTT in place, then re-align it (default: sidecar only, for review).        |
+| `--align/--no-align`           | With `--apply`, re-run alignment afterwards to refresh timestamps (default: on).                             |
+| `--media`                      | Media for that re-alignment when it is not a same-stem sibling of the VTT.                                   |
 | `--model`                      | Correction model (default `VOXWEAVE_FIX_MODEL` env, `[llm].model` in the config, or `gpt-6-luna`; `auto` = the endpoint's only served model). |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](#configuration)). |
 
@@ -693,7 +738,11 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 SRT/ASS/VTT out (written next to the input; the VTT + JSON pair stays the source of truth
 for voxweave-produced subtitles). ASS output carries a Default style; lyric cues (`♪ ... ♪`)
 render italic. Named VTT cues become `NAME: text` in SRT and use the ASS Dialogue `Name`
-field. Foreign SRT/ASS files can be exported to VTT to enter the editing workflow.
+field. The SRT position tag `{\an8}` (raise to the top) stays in SRT output, becomes a real
+override in ASS and is dropped from VTT. Foreign SRT/ASS files can be exported to VTT to
+enter the editing workflow. Every cue needs timestamps: a plain-text edit draft, or a file in
+which only some cues are timed, is refused with the untimed cues named (run `align` on a VTT
+first; an SRT needs its missing timing lines).
 
 ```bash
 voxweave export episode.vtt --format srt
@@ -709,19 +758,24 @@ Repeat `-f, --format` to request multiple output formats in one run.
 (VTT/SRT/ASS) added as proper subtitle tracks. Pure stream copy (instant, lossless,
 reversible); each track is titled `VoxWeave <Language>` with the container language tag
 taken from the filename (`episode.zh.vtt` → `chi` / "VoxWeave Chinese"), and the first
-packed track is flagged default so players select it. ASS inputs keep their styling in
-mkv targets (mp4/webm store text-only codecs, so styling is dropped there).
+packed track is flagged default (the source tracks lose that flag) so players select it.
+ASS inputs keep their styling in mkv targets (mp4/webm store text-only codecs, so styling
+is dropped there).
 
 ```bash
-voxweave pack episode.zh.vtt                    # finds episode.<ext>, keeps its container
-voxweave pack episode.zh.vtt episode.ja.vtt     # several tracks at once
+voxweave pack episode.zh.vtt                    # finds episode.<ext>, keeps its container -> episode.zh.pack.mkv
+voxweave pack episode.zh.vtt episode.ja.vtt     # several tracks at once -> episode.zh.ja.pack.mkv
 voxweave pack episode.zh.vtt --container mp4    # mov_text in mp4 (image subs are dropped)
 voxweave pack episode.zh.vtt --media other.mkv -o out.mkv
 ```
 
-mkv targets keep every source stream (including attachments); mp4/webm targets keep
-video+audio and existing _text_ subtitle tracks only. HEVC video muxed into mp4 is tagged
-`hvc1` for Apple players.
+The output goes next to the source as `<media stem>.<languages>.pack.<container>`, the
+languages taken from the subtitle file names (just `.pack` when none has one), so packing
+another language never replaces an earlier result; `-o` picks any other path, and its
+extension (`.mkv`/`.mp4`/`.webm`) picks the container. mkv targets keep every source stream
+(including attachments; mov_text subtitles, which Matroska cannot store, are converted to
+SRT); mp4/webm targets keep video+audio and existing _text_ subtitle tracks only (webm also
+drops cover art). HEVC video muxed into mp4 is tagged `hvc1` for Apple players.
 
 ### Burn (hard subtitles)
 
@@ -731,10 +785,12 @@ at the actual frame size (same look as `export`, lyric cues italic); ASS/SSA inp
 libass as-is, keeping its own styling. The video is re-encoded at constant quality with
 hardware acceleration when available: **NVENC** on NVIDIA, **VideoToolbox** on macOS,
 libx264/libx265/libsvt-av1 software fallback. Audio is stream-copied (mp4 targets re-encode
-mp4-incompatible codecs to AAC).
+mp4-incompatible codecs to AAC). The output goes next to the source as
+`<media stem>.<language>.burn.<container>` (`episode.burn.mp4` when the subtitle file name
+carries no language) unless `-o` names one.
 
 ```bash
-voxweave burn episode.zh.vtt                          # hevc, auto hw encoder, -> episode.mp4
+voxweave burn episode.zh.vtt                          # hevc, auto hw encoder, -> episode.zh.burn.mp4
 voxweave burn episode.zh.vtt --codec h264             # legacy-device compatibility
 voxweave burn episode.zh.vtt --codec av1 --container mkv   # max compression, recent hardware
 voxweave burn episode.zh.vtt --quality 20 --font "Noto Sans CJK SC"
@@ -749,7 +805,7 @@ voxweave burn episode.zh.vtt --quality 20 --font "Noto Sans CJK SC"
 | `--encoder`        | Force a specific ffmpeg encoder (default: auto-probe with a test encode).                                  |
 | `--quality`        | Constant quality: NVENC `-cq` / software `-crf` (lower = better); VideoToolbox `-q:v` (higher = better).   |
 | `--no-bitrate-cap` | Drop the default cap at the source's video bitrate, so constant quality alone decides the size.            |
-| `--container`      | `mp4` (default, maximum compatibility) or `mkv`.                                                           |
+| `--container`      | `mp4` (default, maximum compatibility) or `mkv`; an `-o` ending in `.mkv`/`.mp4` picks it.                 |
 | `--font`           | Subtitle font family (fontconfig resolves fallbacks; e.g. `Noto Sans CJK SC`).                             |
 | `--font-size`      | Override the default 72-at-1080p scaled size.                                                              |
 
@@ -779,7 +835,7 @@ enables DEBUG logging.
 
 ```
 voxweave episode.mkv          # 1. transcribe  -> episode.vtt + episode.json
-  └─ (optional) correct       # 2. LLM ASR fix -> episode.asrfix.vtt (--apply to commit)
+  └─ (optional) correct       # 2. LLM ASR fix -> episode.asrfix.vtt (review it; or --apply to rewrite + re-align)
 edit episode.vtt by hand      # 3. fix wording / line breaks
 voxweave align episode.vtt    # 4. re-derive timestamps from audio (overwrites VTT + JSON)
 voxweave translate episode.vtt --target zh   # 5. context-aware translation
@@ -804,6 +860,7 @@ them. Edit the text freely; `align` puts the timing back.
 
 Precedence: **CLI flag > env var > `~/.config/voxweave.conf` > built-in default.** A commented
 default config is written on first run (migrated automatically from a pre-rename `qsub.conf`).
+Set `VOXWEAVE_CONFIG` to read (and create) the config file somewhere else.
 
 <details>
 <summary><b>Environment variables</b></summary>
@@ -811,7 +868,12 @@ default config is written on first run (migrated automatically from a pre-rename
 **Models**
 
 - `VOXWEAVE_ASR_MODEL` (default `Qwen/Qwen3-ASR-0.6B`; same as `--asr-model`)
+- `VOXWEAVE_ASR_CONTEXT` (default none; the ASR bias prompt, same as `--context`)
 - `VOXWEAVE_ALIGNER_MODEL` (default `Qwen/Qwen3-ForcedAligner-0.6B`)
+- `VOXWEAVE_FUSION_WHISPER` / `VOXWEAVE_FUSION_QWEN` (defaults `large-v3` /
+  `Qwen/Qwen3-ASR-1.7B`; the `--hybrid` sub-models, same as `[fusion]` in the config)
+- `VOXWEAVE_LOAD_STRATEGY` (`peak` default, or `sum`; same as `load_strategy` in the config)
+- `VOXWEAVE_CTC_MAX_DP_FRAMES` (default 90000 ≈ 30 min; same as `ctc_max_dp_frames` in the config)
 - `VOXWEAVE_DIARIZE_MODEL` (default `pyannote/speaker-diarization-community-1`; short names `3.1`
   and `community-1`, or any full Hugging Face pipeline id; same as `--diarize-model`)
 - `VOXWEAVE_DIARIZE_CLUSTERING` (default `[diarize].clustering` in the config, else `pyannote`;
@@ -825,10 +887,13 @@ default config is written on first run (migrated automatically from a pre-rename
   same as `translate --reasoning-effort`; `default` leaves the request field unset)
 - `VOXWEAVE_TRANSLATE_CONCURRENCY` / `VOXWEAVE_TRANSLATE_WINDOW_CUES` (default `[llm].concurrency` /
   `[llm].window_cues`, else 8 / 100; same as `translate --concurrency` / `--window`)
+- `VOXWEAVE_LLM_TIMEOUT_S` (default 300) — seconds one `translate` / `correct` request may take
+  before it is retried; raise it for a slow self-hosted endpoint
 - `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)
 - `VOXWEAVE_BACKEND` (`mlx` | `torch`; default: `mlx` on mps, else `torch`) — picks the ASR/alignment backend
 - `VOXWEAVE_HF_TOKEN` / `HF_TOKEN` — authentication for gated models, including both pyannote
-  diarizers; alternatively authenticate once with `hf auth login`
+  diarizers; alternatively authenticate once with `hf auth login` (after a `uv tool` install:
+  `uvx --from huggingface_hub hf auth login`)
 - `VOXWEAVE_OFFLINE` (`1` to enable) — once all models are cached, sets `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` so loading skips the per-file HEAD revalidation + optional-file probing huggingface_hub/transformers otherwise do on every run (no network on a cache hit). Leave off for the first download.
 - `VOXWEAVE_MLX_ASR_REPO` / `VOXWEAVE_MLX_ALIGNER_REPO` / `VOXWEAVE_MLX_WHISPER_REPO` — MLX backend
   repos. By default the ASR repo tracks `--asr-model` size (`--asr-model 1.7b` → `mlx-community/Qwen3-ASR-1.7B-8bit`)
@@ -845,12 +910,14 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
 
 - `VOXWEAVE_SEPARATOR_REPO` / `VOXWEAVE_SEPARATOR_REPO_FILE` (default `KimberleyJSN/melbandroformer` /
   `MelBandRoformer.ckpt`), or `VOXWEAVE_SEPARATOR_CKPT` / `VOXWEAVE_SEPARATOR_CONFIG` for explicit
-  weights + matching yaml
+  weights + matching yaml (default `vocals_mel_band_roformer.ckpt` / `.yaml` under
+  `VOXWEAVE_MODEL_DIR`, which itself defaults to the cache root)
 - `VOXWEAVE_PANNS_REPO` / `VOXWEAVE_PANNS_REPO_FILE` (default `thelou1s/panns-inference` /
   `Cnn14_mAP=0.431.pth`), or `VOXWEAVE_PANNS_CKPT` for an explicit checkpoint (song-skip CNN)
 - `VOXWEAVE_MMS_REPO` / `VOXWEAVE_MMS_REPO_FILE` (default `deskpai/ctc_forced_aligner` /
   `04ac86b67129634da93aea76e0147ef3.onnx`), or `VOXWEAVE_MMS_MODEL` for an explicit onnx path
-  (Japanese/CJK MMS-300m aligner)
+  (Japanese/CJK MMS-300m aligner; its weights are licensed **CC BY-NC 4.0 (non-commercial)**,
+  see `THIRD_PARTY_NOTICES.md` for every model's licence)
 - `VOXWEAVE_REDIMNET2_CKPT` / `VOXWEAVE_ANIME_VA_CKPT` — an explicit local copy of the
   `redimnet2` / `anime-va` voiceprint checkpoint (offline hosts). Unlike the overrides above,
   the file must still be the pinned checkpoint: its SHA-256 is verified, because the
@@ -878,9 +945,16 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
 
 - `VOXWEAVE_MAX_CHUNK_SEC` (default 120; shorter chunks reduce ASR repetition loops on long segments)
 - `VOXWEAVE_LOUDNORM` (default `loudnorm=I=-16:TP=-1.5:LRA=11`; the `-af` filter for `--normalize`)
-- `VOXWEAVE_MIN_CUE_SEC` (default 0.8; minimum cue display duration in `align`)
+- `VOXWEAVE_MIN_CUE_SEC` (default 0 = off; set e.g. 0.8 to pad `align`-stage cues to a minimum
+  display duration; distinct from the segmentation floor `VOXWEAVE_SEG_MIN_CUE_SEC`)
 - `VOXWEAVE_SNAP_VAD_THRESHOLD` (default 0.25; sensitive VAD used when repositioning
   zero-duration units against the original audio)
+- `VOXWEAVE_SHOT_SCENE` (default 0.3, range (0, 1]; ffmpeg scene-change score above which a
+  frame counts as a shot cut for `--shot-snap`; an invalid value warns and uses the default)
+- `VOXWEAVE_SHOT_SNAP_MS` (default 458 = 11 frames at 24 fps; `0` disables snapping) — how far
+  from a shot cut a cue boundary is still moved onto it, the outermost Netflix adjustment zone
+- `VOXWEAVE_FFMPEG_TIMEOUT` (default 3600) — seconds one ffmpeg audio decode may take; raise it
+  for very long media
 - `VOXWEAVE_SONG_CORE_MERGE_SEC` (default 15; song spans within this gap of a long OP/ED
   cluster into one song "core" that stops the dialogue edge trim — an isolated brief sting
   farther away is trimmed through instead of anchoring dialogue into the excised song)
@@ -905,6 +979,9 @@ HF repo, or to point at an explicit local file (which, if it exists, skips the H
 - `VOXWEAVE_SEP_AUTOCAST` (`off` (default) | `bf16` | `fp16`; same as `[separate].autocast`) —
   mixed precision for the vocal-separation forward pass. CUDA only; ignored on CPU/MPS. An
   unrecognized value warns once and falls back to `off` rather than to the config file
+- `VOXWEAVE_TF32` (default on; `0` / `false` / `off` disables) — TF32 matrix multiplies for the
+  vocal-separation forward pass on CUDA (Ampere or newer). It applies to separation only and is
+  restored afterwards, so later stages keep strict fp32 matrix multiplies
 
 </details>
 
@@ -923,11 +1000,20 @@ commented out).
 # Special value "hybrid" (= --hybrid) -> dual-ASR fusion (whisper text + Qwen punctuation).
 asr_model = "Qwen/Qwen3-ASR-1.7B"        # built-in default: Qwen/Qwen3-ASR-0.6B
 
+# Hugging Face token for the gated diarization models (top-level key; prefer the
+# VOXWEAVE_HF_TOKEN / HF_TOKEN environment variables over storing it here).
+# hf_token = "hf_..."
+
+# Single-pass CTC alignment budget in emission frames (default 90000 ≈ 30 min at 50 fps);
+# longer audio is split at silence anchors. Raise it on large cards for long movies.
+# ctc_max_dp_frames = 150000
+
 # Model load strategy:
 #   "peak" (default) — serial peak-shaving: all-chunk ASR -> release -> all-chunk align;
 #                      ASR and aligner never co-reside, peak VRAM = max(models). Works on 8 GB.
-#   "sum"            — concurrent per-chunk ASR+align; peak VRAM = sum(models), but skips two
-#                      model swap round-trips (faster on large-VRAM cards).
+#   "sum"            — same passes as "peak", but the ASR model(s) stay resident while the aligner
+#                      loads; peak VRAM = sum(models), but skips two model swap round-trips
+#                      (faster on large-VRAM cards).
 load_strategy = "sum"
 
 # Inference batch sizes: windows per GPU forward (env: VOXWEAVE_SEP_BATCH / VOXWEAVE_CTC_BATCH /
@@ -973,8 +1059,9 @@ model = "auto"
 
 # Voice library (= --voices-dir / env VOXWEAVE_VOICES_DIR): where `speakers enroll` saves named
 # voices, shared by every media folder. Default: $XDG_DATA_HOME/voxweave/voices, else
-# ~/.local/share/voxweave/voices. May be a NAS path shared by several machines (needs working
-# NFS locking, see "Voice library"). A relative path is relative to this file's directory.
+# ~/.local/share/voxweave/voices. May be a NAS path shared by several machines of the same user
+# account (needs working NFS locking, see "Voice library"); several accounts cannot share one library.
+# A relative path is relative to this file's directory.
 [voices]
 # dir = "/mnt/nas/voxweave/voices"
 
@@ -986,9 +1073,9 @@ skip_songs = true                        # PANNs music detection + skip before A
 normalize  = false                       # loudnorm on the 16k input (--normalize/--no-normalize)
 diarize    = false                       # pyannote speaker diarization (--diarize/--no-diarize; gated-model token required)
 voiceprints = false                      # opt-in biometric centroid capture; requires diarize
-timestamps = true                        # word-level timestamps in the VTT (--timestamps/--no-timestamps)
+timestamps = true                        # cue timing lines in the VTT (--timestamps/--no-timestamps)
 shot_snap  = true                        # snap cue boundaries onto shot changes (--shot-snap/--no-shot-snap)
-vad_mask   = false                       # suppress CTC emissions outside speech (--vad-mask/--no-vad-mask)
+vad_mask   = false                       # suppress wav2vec2 CTC emissions outside speech; MMS/Qwen ignore it (--vad-mask/--no-vad-mask)
 
 # LLM for translate / correct: any OpenAI-compatible chat-completions endpoint.
 # Precedence per key: CLI option > env (VOXWEAVE_TRANSLATE_MODEL / VOXWEAVE_FIX_MODEL,
@@ -1009,11 +1096,11 @@ qwen    = "Qwen/Qwen3-ASR-1.7B"          # punctuation model; must emit punctuat
 # Per-language forced-alignment model. Key = ISO-639-1 code; unlisted languages use Qwen3-ForcedAligner.
 # Values:
 #   "mms"   — MMS-300m + uroman, full-file single pass (immune to per-cue drift; the gold standard).
-#   HF id   — wav2vec2 CTC via HF transformers; weights land in ~/.cache/voxweave/align (per-cue crop).
+#   HF id   — wav2vec2 CTC via HF transformers, also full-file; weights land in ~/.cache/voxweave/align.
 #   bundle  — torchaudio bundle name, e.g. "WAV2VEC2_ASR_LARGE_LV60K_960H" (same model, cached in ~/.cache/torch).
 #   ""      — explicitly fall back to Qwen for that language.
 [align]
-en = "facebook/wav2vec2-large-960h-lv60-self"  # English: LV60K-self CTC, per-cue crop (HF hub)
+en = "facebook/wav2vec2-large-960h-lv60-self"  # English: LV60K-self CTC, full-file (HF hub)
 ja = "mms"                                      # Japanese: MMS-300m + uroman full-file (= whisperx fork align_ctc)
 # zh  = "mms"                                   # Chinese can also use MMS; default is Qwen (native CJK char-level)
 # yue = ""                                      # force Qwen for Cantonese
@@ -1046,9 +1133,9 @@ re-run alone through the per-chunk call (thresholds: `VOXWEAVE_ASR_BATCH_MIN_CPS
 `VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC`). A batch whose call raises is likewise redone chunk by
 chunk, so one poisoned chunk degrades alone.
 
-Shot-change detection needs no setting: it is a CPU-only ffmpeg pass that now starts before
-transcription and is joined at its workflow step, so it overlaps the GPU stages and the
-`detect shot changes` entry in the timing line is normally ~0s.
+Shot-change detection normally needs no setting (`VOXWEAVE_SHOT_SCENE` tunes its
+sensitivity): it is a CPU-only ffmpeg pass that now starts before transcription and is
+joined at its workflow step, so it overlaps the GPU stages and the `detect shot changes` entry in the timing line is normally ~0s.
 
 ## Data contract
 
@@ -1074,7 +1161,7 @@ cache/episode/
 ├── speakers.json                  # reviewed diarizer-id-to-name mapping
 ├── speakers.suggest.json          # regenerable match suggestions
 ├── voiceprints.json               # optional biometric centroids
-├── speaker-split.undo.json        # guarded one-level split undo
+├── speaker-split.undo.json        # files a confirmed split rewrote (one level)
 ├── vocals.32k.flac                # separated-vocals cache
 ├── vocals.32k.flac.meta.json      # source-bound integrity companion, when required
 ├── vocals.32k.flac.lock           # vocals-cache lock
@@ -1091,6 +1178,16 @@ standalone subtitle command with no discoverable sibling media, it claims that i
 instead. If another same-stem file in the same directory already owns the plain stem
 (`episode.mkv` next to `episode.mp3`), VoxWeave uses `<stem>--<sha1-of-file-name-first-8>/`
 for the second claim.
+
+Every cache name above keeps its plain form while it fits the filesystem's file-name limit
+(`NAME_MAX`, 255 bytes on most filesystems, counted in UTF-8 bytes). Only a name that would not
+fit is shortened: `<stem, cut to fit>--<first 8 hex digits of sha1(stem)><suffix>`, for example
+`<stem>.episode.lock` once the media stem reaches about 243 bytes, or the collision directory
+at about 246. The shortened name is deterministic, and an entry is found under
+whichever form it was written. Deliverables beside the media (`<stem>.json`, `<stem>.vtt`,
+derived and translated subtitles, `pack`/`burn` outputs) are never shortened: when one of them
+would not fit, the command stops before doing any work and names the file, so rename the media
+(or pass a shorter `-o`) and run it again.
 
 Existing adjacent machine sidecars remain compatible: when an adjacent
 `<stem>.speakers.json`, `<stem>.speakers.suggest.json`, `<stem>.voiceprints.json`, translation
@@ -1120,14 +1217,18 @@ crash-temporary file manually when it is no longer needed. Do not remove an acti
 Backups, filesystem snapshots, synced folders, and manual copies are outside VoxWeave's control
 and are not erased by purge; delete them separately according to their retention policy.
 
-Both VTT forms are accepted by `align`. The aligner strips punctuation as a hard constraint;
-ASR punctuation is re-injected by time so the final output has correct spacing and breaks
-without stray marks.
-
 ## Testing
 
-- Unit tests (models mocked, no network): `make test` (= `uv run --extra $(VARIANT) pytest tests/ -v`)
-- Lint / format: `make lint`
+- Unit tests (models mocked, no network): `make test` (= `uv run --extra $(VARIANT) pytest tests/ -v`).
+  The suite ignores inherited `VOXWEAVE_*` settings; with a real-model gate such as
+  `VOXWEAVE_REAL_WEIGHT_TESTS=1` set it keeps `VOXWEAVE_CACHE_ROOT`, `VOXWEAVE_MODEL_DIR` and
+  `VOXWEAVE_HF_TOKEN`, so those tests find weights you already have. Its P6 oracle tests also
+  need the interpreter recorded in `calibration/p6-oracle/manifest.json` (`make dev` syncs it,
+  as CI does), Linux x86_64, a full clone (a shallow one lacks the oracle's reference commits)
+  and the ambient environment the oracle records, which CI sets:
+  `env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 make test`.
+- Lint / format: `make lint` (`make lint-check` is the read-only form CI runs; both use the
+  pinned ruff version)
 
 ## Support
 
@@ -1137,7 +1238,7 @@ If VoxWeave saves you time, you can support development here:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/hali0515/VoxWeave/blob/main/LICENSE).
 
 ## Acknowledgments
 

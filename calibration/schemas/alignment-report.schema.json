@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://voxweave.local/schemas/alignment-report.schema.json",
   "title": "voxweave alignment calibration report",
-  "description": "Output of `scripts/calib_alignment.py evaluate`. One lane per (source_kind, language, reference_id): MFA word samples and commercial cue samples must never be pooled into a single percentile. `coverage`, per-item details and `health` are open objects in v1 and are expected to grow $defs; the fields listed here are the minimum external contract.",
+  "description": "Output of `scripts/calib_alignment.py report` (and of `check` when it computes the report). One lane per (source_kind, language): MFA word samples and commercial cue samples must never be pooled into a single percentile. A lane carries a reference_id only when all its items share one; every item keeps its own. `coverage`, per-item details and `health` are open objects in v1 and are expected to grow $defs; the fields listed here are the minimum external contract.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "metric_definition_version", "manifest_digest", "status", "lanes"],

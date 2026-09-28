@@ -4,7 +4,9 @@
 # (language tag stripped), ffmpeg argv builders (stream mapping, sub codec per
 # container, hvc1 tagging, pixel-format/bit-depth policy, mp4 audio fallback),
 # and encoder selection. No ffmpeg/ffprobe execution; probed data is injected.
+import io
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -76,8 +78,36 @@ def test_resolve_media_missing_raises(tmp_path):
 
 def test_default_output_avoids_overwriting_source(tmp_path):
     media = tmp_path / "ep.mkv"
-    assert mux.default_output(media, "mp4", "burn") == tmp_path / "ep.mp4"
+    assert mux.default_output(media, "mp4", "burn") == tmp_path / "ep.burn.mp4"
     assert mux.default_output(media, "mkv", "pack") == tmp_path / "ep.pack.mkv"
+
+
+def test_default_output_encodes_subtitle_languages(tmp_path):
+    media = tmp_path / "ep.mkv"
+    assert mux.default_output(media, "mp4", "burn", ["zh"]) == (
+        tmp_path / "ep.zh.burn.mp4"
+    )
+    # argument order, de-duplicated, unknown languages left out
+    assert mux.default_output(media, "mkv", "pack", ["zh", None, "ja", "zh"]) == (
+        tmp_path / "ep.zh.ja.pack.mkv"
+    )
+    assert mux.default_output(media, "mkv", "pack", [None]) == tmp_path / "ep.pack.mkv"
+
+
+def test_default_outputs_never_shadow_the_sibling_media(tmp_path):
+    # Products sit next to the source; the subtitle's media lookup ("ep.zh.vtt"
+    # tries "ep.zh.<ext>" before "ep.<ext>") must still find the source.
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    for sub in ("ep.zh.vtt", "ep.vtt", "ep.en.srt"):
+        (tmp_path / sub).write_text(VTT_BODY, encoding="utf-8")
+    for tag, container in (("burn", "mp4"), ("pack", "mkv"), ("pack", "mp4")):
+        for langs in ([], ["zh"], ["en"], ["zh", "ja"]):
+            out = mux.default_output(media, container, tag, langs)
+            assert out != media
+            out.write_bytes(b"product")
+    for sub in ("ep.zh.vtt", "ep.vtt", "ep.en.srt"):
+        assert mux.resolve_media(tmp_path / sub, None) == media
 
 
 # --- pack command construction ----------------------------------------------
@@ -153,6 +183,87 @@ def test_build_pack_cmd_multiple_vtts_index_after_existing():
     assert "-disposition:s:1" in cmd  # only the first new track gets default
 
 
+def test_build_pack_cmd_mkv_converts_mov_text_to_srt():
+    # Matroska cannot store mov_text (3GPP timed text, e.g. from a .mov/.mp4
+    # source); it is converted per stream while other subtitles stay copied.
+    streams = _streams(
+        {"codec_type": "video", "codec_name": "h264"},
+        {"codec_type": "audio", "codec_name": "aac"},
+        {"codec_type": "subtitle", "codec_name": "mov_text"},
+        {"codec_type": "subtitle", "codec_name": "subrip"},
+        {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"},
+    )
+    cmd = mux.build_pack_cmd(
+        Path("ep.mov"),
+        [Path("ep.zh.vtt")],
+        Path("ep.zh.pack.mkv"),
+        container="mkv",
+        source_streams=streams,
+    )
+    assert has_seq(cmd, "-c:v", "copy") and has_seq(cmd, "-c:a", "copy")
+    assert has_seq(cmd, "-c:t", "copy")  # attachments (fonts) ride along
+    assert has_seq(cmd, "-c:s:0", "srt")  # the mov_text track
+    assert has_seq(cmd, "-c:s:1", "copy") and has_seq(cmd, "-c:s:2", "copy")
+    assert has_seq(cmd, "-c:s:3", "srt")  # the appended VTT
+    # one codec option per stream: no blanket -c for the overrides to fight
+    assert "-c" not in cmd
+
+
+def test_build_pack_cmd_clears_existing_default_subtitle():
+    # Only the new track may carry the default flag, or players can keep
+    # picking the old one.
+    streams = _streams(
+        {"codec_type": "video", "codec_name": "h264"},
+        {
+            "codec_type": "subtitle",
+            "codec_name": "subrip",
+            "disposition": {"default": 0},
+        },
+        {
+            "codec_type": "subtitle",
+            "codec_name": "ass",
+            "disposition": {"default": 1, "forced": 1},
+        },
+    )
+    cmd = mux.build_pack_cmd(
+        Path("ep.mkv"),
+        [Path("ep.zh.vtt")],
+        Path("out.mkv"),
+        container="mkv",
+        source_streams=streams,
+    )
+    assert has_seq(cmd, "-disposition:s:1", "-default")  # keeps its other flags
+    assert "-disposition:s:0" not in cmd  # was not default: left alone
+    assert has_seq(cmd, "-disposition:s:2", "default")
+
+
+def test_build_pack_cmd_mp4_clears_default_on_kept_output_index():
+    # mp4 drops the PGS track, so the default subrip lands at output s:0
+    streams = _streams(
+        {"codec_type": "video", "codec_name": "h264"},
+        {
+            "codec_type": "subtitle",
+            "codec_name": "hdmv_pgs_subtitle",
+            "disposition": {"default": 1},
+        },
+        {
+            "codec_type": "subtitle",
+            "codec_name": "subrip",
+            "disposition": {"default": 1},
+        },
+    )
+    cmd = mux.build_pack_cmd(
+        Path("ep.mp4"),
+        [Path("ep.en.vtt")],
+        Path("out.mp4"),
+        container="mp4",
+        source_streams=streams,
+    )
+    assert has_seq(cmd, "-disposition:s:0", "-default")
+    assert has_seq(cmd, "-disposition:s:1", "default")
+    assert "-disposition:s:2" not in cmd
+
+
 def test_pack_rejects_plain_text_draft(tmp_path):
     media = tmp_path / "ep.mkv"
     media.write_bytes(b"")
@@ -160,6 +271,48 @@ def test_pack_rejects_plain_text_draft(tmp_path):
     vtt.write_text("WEBVTT\n\nhello no timestamps\n", encoding="utf-8")
     with pytest.raises(ValueError, match="align"):
         mux.pack([vtt])
+
+
+PARTLY_TIMED_VTT = (
+    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\ntimed\n\n"
+    "untimed one\n\n00:00:02.000 --> 00:00:03.000\nalso timed\n\nuntimed two\n"
+)
+
+
+def test_pack_rejects_partly_timed_subtitle(tmp_path, monkeypatch):
+    (tmp_path / "ep.mkv").write_bytes(b"src")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text(PARTLY_TIMED_VTT, encoding="utf-8")
+    called = []
+    monkeypatch.setattr(mux, "probe_streams", lambda _m: [])
+    monkeypatch.setattr(mux, "_run_ffmpeg", lambda cmd, *, capture: called.append(cmd))
+    with pytest.raises(ValueError) as exc:
+        mux.pack([vtt])
+    msg = str(exc.value)
+    assert "cues without timestamps" in msg and "cue 2, 4" in msg
+    assert "voxweave align ep.zh.vtt" in msg
+    assert not called
+
+
+def test_burn_rejects_partly_timed_subtitle(tmp_path, monkeypatch):
+    (tmp_path / "ep.mkv").write_bytes(b"src")
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text(PARTLY_TIMED_VTT, encoding="utf-8")
+    called = []
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: [
+            {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720}
+        ],
+    )
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "libx264")
+    monkeypatch.setattr(mux, "_run_ffmpeg", lambda cmd, *, capture: called.append(cmd))
+    with pytest.raises(ValueError) as exc:
+        mux.burn(vtt, container="mkv")
+    msg = str(exc.value)
+    assert "cue 2, 4" in msg and "voxweave align ep.vtt" in msg
+    assert not called
 
 
 def test_pack_rejects_unknown_format(tmp_path):
@@ -403,10 +556,14 @@ def test_src_video_bitrate_unknown(tmp_path):
     assert mux.src_video_bitrate({"duration": "1"}, [loud], media) is None
 
 
-def test_filter_escape():
+def test_filter_escape(monkeypatch):
+    # two levels: option value (\ ' : =), then filtergraph (\ ' [ ] , ;)
     assert mux._filter_escape("/tmp/a.ass") == "/tmp/a.ass"
-    assert mux._filter_escape("/tmp/a:b,c.ass") == "/tmp/a\\:b\\,c.ass"
-    assert mux._filter_escape("C:\\tmp\\a.ass") == "C\\:/tmp/a.ass"
+    assert mux._filter_escape("/tmp/a:b,c.ass") == "/tmp/a\\\\:b\\,c.ass"
+    assert mux._filter_escape("/tmp/Ocean's.ass") == "/tmp/Ocean\\\\\\'s.ass"
+    assert mux._filter_escape("/tmp/[x];y.ass") == "/tmp/\\[x\\]\\;y.ass"
+    monkeypatch.setattr(mux.sys, "platform", "win32")
+    assert mux._filter_escape("C:\\tmp\\a.ass") == "C\\\\:/tmp/a.ass"
 
 
 def test_build_burn_cmd_hevc_mp4():
@@ -627,9 +784,58 @@ def test_pack_success_lands_at_output(tmp_path, monkeypatch):
     monkeypatch.setattr(mux, "probe_streams", lambda _m: [])
     monkeypatch.setattr(mux, "_run_ffmpeg", fake_ok)
     out = mux.pack([vtt])
-    assert out == tmp_path / "ep.pack.mkv"
+    assert out == tmp_path / "ep.zh.pack.mkv"
     assert out.read_bytes() == b"muxed"
     assert not list(tmp_path.glob("*.part*"))
+
+
+def test_pack_default_outputs_per_language_do_not_overwrite(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    for name in ("ep.zh.vtt", "ep.ja.vtt", "ep.vtt"):
+        (tmp_path / name).write_text(VTT_BODY, encoding="utf-8")
+
+    def fake_ok(cmd, *, capture):
+        Path(cmd[-1]).write_bytes(" ".join(cmd).encode())
+
+    monkeypatch.setattr(mux, "probe_streams", lambda _m: [])
+    monkeypatch.setattr(mux, "_run_ffmpeg", fake_ok)
+    zh = mux.pack([tmp_path / "ep.zh.vtt"])
+    ja = mux.pack([tmp_path / "ep.ja.vtt"])
+    both = mux.pack([tmp_path / "ep.ja.vtt", tmp_path / "ep.zh.vtt"])
+    plain = mux.pack([tmp_path / "ep.vtt"])
+    assert [p.name for p in (zh, ja, both, plain)] == [
+        "ep.zh.pack.mkv",
+        "ep.ja.pack.mkv",
+        "ep.ja.zh.pack.mkv",
+        "ep.pack.mkv",
+    ]
+    assert b"ep.zh.vtt" in zh.read_bytes()  # not overwritten by the ja run
+    assert mux.pack([tmp_path / "ep.zh.vtt"]) == zh  # a rerun replaces its own
+    assert media.read_bytes() == b"src"
+
+
+def test_burn_default_output_carries_the_subtitle_language(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"src")
+    for name in ("ep.zh.vtt", "ep.vtt"):
+        (tmp_path / name).write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: [
+            {"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720}
+        ],
+    )
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "libx264")
+    monkeypatch.setattr(
+        mux, "_run_ffmpeg", lambda cmd, *, capture: Path(cmd[-1]).write_bytes(b"x")
+    )
+    assert mux.burn(tmp_path / "ep.zh.vtt") == tmp_path / "ep.zh.burn.mp4"
+    # the source container is kept by name, never overwritten
+    assert mux.burn(tmp_path / "ep.vtt") == tmp_path / "ep.burn.mp4"
+    assert mux.burn(tmp_path / "ep.vtt", container="mkv") == tmp_path / "ep.burn.mkv"
+    assert media.read_bytes() == b"src"
 
 
 def test_burn_failure_leaves_no_output(tmp_path, monkeypatch):
@@ -908,3 +1114,222 @@ def test_run_ffmpeg_missing_binary_raises_friendly_error(monkeypatch):
     msg = str(exc.value).lower()
     assert "ffmpeg" in msg
     assert "path" in msg or "install" in msg
+
+
+# --- the -o extension decides the container ---------------------------------
+
+
+def _pack_env(tmp_path, monkeypatch, streams=()):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    commands = []
+
+    def fake_ok(cmd, *, capture):
+        commands.append(cmd)
+        Path(cmd[-1]).write_bytes(b"muxed")
+
+    monkeypatch.setattr(mux, "probe_streams", lambda _m: list(streams))
+    monkeypatch.setattr(mux, "_run_ffmpeg", fake_ok)
+    return vtt, commands
+
+
+def test_pack_output_extension_picks_the_container(tmp_path, monkeypatch):
+    vtt, commands = _pack_env(tmp_path, monkeypatch)
+    out = mux.pack([vtt], output=tmp_path / "out.mp4")  # source is mkv
+    assert out == tmp_path / "out.mp4"
+    assert has_seq(commands[-1], "-c:s", "mov_text")
+    assert "-f" not in commands[-1]  # the extension already selects mp4
+
+
+def test_pack_conflicting_container_follows_the_output_name(
+    tmp_path, monkeypatch, caplog
+):
+    vtt, commands = _pack_env(tmp_path, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        mux.pack([vtt], container="mkv", output=tmp_path / "out.webm")
+    assert has_seq(commands[-1], "-c:s", "webvtt")
+    assert any("not --container mkv" in r.getMessage() for r in caplog.records)
+
+
+def test_pack_unknown_output_extension_forces_the_muxer(tmp_path, monkeypatch):
+    vtt, commands = _pack_env(tmp_path, monkeypatch)
+    mux.pack([vtt], container="mp4", output=tmp_path / "out.m4v")
+    assert commands[-1][-3:-1] == ["-f", "mp4"]
+    assert commands[-1][-1].endswith(".m4v")
+
+
+def test_burn_output_extension_picks_the_container(tmp_path, monkeypatch):
+    media = tmp_path / "ep.mp4"
+    media.write_bytes(b"src")
+    vtt = tmp_path / "ep.vtt"
+    vtt.write_text(VTT_BODY, encoding="utf-8")
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: [
+            {"codec_type": "video", "codec_name": "hevc", "width": 640, "height": 360},
+            {"codec_type": "audio", "codec_name": "truehd"},
+        ],
+    )
+    monkeypatch.setattr(mux, "pick_encoder", lambda codec, force=None: "libx265")
+    commands = []
+
+    def fake_ok(cmd, *, capture):
+        commands.append(cmd)
+        Path(cmd[-1]).write_bytes(b"x")
+
+    monkeypatch.setattr(mux, "_run_ffmpeg", fake_ok)
+    assert mux.burn(vtt, output=tmp_path / "out.mkv") == tmp_path / "out.mkv"
+    assert "-tag:v" not in commands[-1]  # mp4-only tagging is not applied
+    assert has_seq(commands[-1], "-c:a", "copy")  # mkv stores truehd
+    with pytest.raises(ValueError, match="cannot write webm"):
+        mux.burn(vtt, output=tmp_path / "out.webm")
+
+
+# --- pack precheck: mp4 audio, webm cover art --------------------------------
+
+
+def test_pack_precheck_rejects_audio_mp4_cannot_store():
+    streams = [
+        {"codec_type": "video", "codec_name": "h264"},
+        {"codec_type": "audio", "codec_name": "pcm_u8"},
+    ]
+    with pytest.raises(ValueError, match="mp4 cannot store pcm_u8 audio"):
+        mux._check_pack_compat("mp4", streams)
+    # truehd in mp4 needs -strict experimental; mkv stores it
+    streams[1]["codec_name"] = "truehd"
+    with pytest.raises(ValueError, match=r"mkv instead \(--container mkv\)"):
+        mux._check_pack_compat("mp4", streams)
+    # every codec ffmpeg's mp4 muxer stores, including ones mkv cannot hold
+    # (an mp4 source with such audio packs into mp4 by default)
+    for codec in (
+        "aac",
+        "flac",
+        "opus",
+        "pcm_s16le",
+        "mp2",
+        "vorbis",
+        "mp4als",
+        "mpegh_3d_audio",
+        "qcelp",
+        "evrc",
+    ):
+        streams[1]["codec_name"] = codec
+        mux._check_pack_compat("mp4", streams)  # stored natively
+
+
+def test_pack_precheck_hint_follows_the_output_name(monkeypatch, tmp_path):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"")
+    vtt = tmp_path / "ep.zh.vtt"
+    vtt.write_text("WEBVTT\n\n00:00.000 --> 00:01.000\nhi\n", encoding="utf-8")
+    monkeypatch.setattr(
+        mux,
+        "probe_streams",
+        lambda _m: [
+            {"index": 0, "codec_type": "video", "codec_name": "h264"},
+            {"index": 1, "codec_type": "audio", "codec_name": "pcm_u8"},
+        ],
+    )
+    # -o picked mp4, so --container mkv would be overridden: name the -o fix
+    with pytest.raises(ValueError, match=r"an -o name ending in \.mkv"):
+        mux.pack([vtt], media=media, container="mkv", output=tmp_path / "x.mp4")
+    with pytest.raises(ValueError, match=r"\(--container mkv\)"):
+        mux.pack([vtt], media=media, container="mp4")
+
+
+def test_pack_into_webm_drops_cover_art(caplog):
+    streams = [
+        {"index": 0, "codec_type": "video", "codec_name": "vp9"},
+        {"index": 1, "codec_type": "audio", "codec_name": "opus"},
+        {
+            "index": 2,
+            "codec_type": "video",
+            "codec_name": "png",
+            "disposition": {"attached_pic": 1},
+        },
+    ]
+    mux._check_pack_compat("webm", streams)
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        cmd = mux.build_pack_cmd(
+            Path("ep.webm"),
+            [Path("ep.zh.vtt")],
+            Path("ep.zh.pack.webm"),
+            container="webm",
+            source_streams=streams,
+        )
+    assert has_seq(cmd, "-map", "0:v", "-map", "0:a?", "-map", "-0:2")
+    assert any("cover art" in r.getMessage() for r in caplog.records)
+    mp4 = mux.build_pack_cmd(
+        Path("ep.mp4"),
+        [Path("ep.zh.vtt")],
+        Path("ep.zh.pack.mp4"),
+        container="mp4",
+        source_streams=streams,
+    )
+    assert "-0:2" not in mp4  # mp4 keeps cover art
+
+
+# --- ffmpeg warnings after a successful run ----------------------------------
+
+
+def test_successful_pack_run_passes_on_ffmpeg_warnings(monkeypatch, caplog):
+    stderr = "[Parsed_ass_0 @ 0x1] fontselect: no glyph\n" * 3 + "".join(
+        f"warning {i}\n" for i in range(12)
+    )
+    monkeypatch.setattr(mux.subprocess, "run", lambda *a, **k: _Proc(0, stderr=stderr))
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        mux._run_ffmpeg(["ffmpeg", "-i", "x", "out.mkv"], capture=True)
+    [record] = [r for r in caplog.records if "ffmpeg reported" in r.getMessage()]
+    message = record.getMessage()
+    assert message.count("fontselect: no glyph") == 1  # repeats collapse
+    assert "... and 3 more" in message  # 13 distinct lines, 10 shown
+
+
+def test_source_notes_every_decode_prints_are_not_passed_on(monkeypatch, caplog):
+    # ffmpeg prints this for any mp4 with cover art, even when only decoding it
+    stderr = "[in#0 @ 0x55d1] stream 0, timescale not set\n"
+    monkeypatch.setattr(mux.subprocess, "run", lambda *a, **k: _Proc(0, stderr=stderr))
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        mux._run_ffmpeg(["ffmpeg", "-i", "ep.mp4", "out.mp4"], capture=True)
+    assert not [r for r in caplog.records if "ffmpeg reported" in r.getMessage()]
+
+
+def test_successful_encode_passes_on_libass_warnings(monkeypatch, caplog):
+    class Finished:
+        stdout = io.StringIO("progress=end\n")
+        returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    def fake_popen(cmd, **kwargs):
+        # ffmpeg writes raw bytes; a non-UTF-8 file name must not fail the run
+        os.write(
+            kwargs["stderr"].fileno(),
+            b"[Parsed_ass_0 @ 0x1] fontselect: failed to find \xff\n",
+        )
+        return Finished()
+
+    monkeypatch.setattr(mux.subprocess, "Popen", fake_popen)
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        mux._run_ffmpeg_progress(
+            ["ffmpeg", "out.mp4"], mux.Reporter(), total_frames=None
+        )
+    assert any("fontselect" in r.getMessage() for r in caplog.records)
+
+
+def test_pack_command_runs_at_warning_level():
+    cmd = mux.build_pack_cmd(
+        Path("ep.mkv"),
+        [Path("ep.zh.vtt")],
+        Path("ep.zh.pack.mkv"),
+        container="mkv",
+        source_streams=[],
+    )
+    assert has_seq(cmd, "-loglevel", "warning")

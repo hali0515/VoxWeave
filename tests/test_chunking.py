@@ -39,6 +39,28 @@ def test_single_segment_longer_than_max_is_hard_split():
     assert [c["offset"] for c in chunks] == [0.0, 240.0, 480.0]
 
 
+def test_hard_cut_remainder_merges_with_following_segment():
+    # 240.04s of speech leaves a 40ms remainder after the hard cut; it stays the open
+    # block, so the next segment merges into it instead of it being a sliver chunk.
+    segs = [{"start": 0.0, "end": 240.04}, {"start": 241.0, "end": 250.0}]
+    chunks = pack_speech_segments(segs, max_sec=240.0)
+    assert chunks == [
+        {"start": 0.0, "end": 240.0, "offset": 0.0},
+        {"start": 240.0, "end": 250.0, "offset": 240.0},
+    ]
+
+
+def test_hard_cut_remainder_still_closes_when_next_segment_does_not_fit():
+    # remainder 240-300 + next segment up to 500 would span 260s > 240: close at silence
+    segs = [{"start": 0.0, "end": 300.0}, {"start": 301.0, "end": 500.0}]
+    chunks = pack_speech_segments(segs, max_sec=240.0)
+    assert [(c["start"], c["end"]) for c in chunks] == [
+        (0.0, 240.0),
+        (240.0, 300.0),
+        (301.0, 500.0),
+    ]
+
+
 def test_empty_returns_empty():
     assert pack_speech_segments([], max_sec=240.0) == []
 
@@ -174,7 +196,7 @@ def test_decode_command_pins_the_channel_count(tmp_path):
 
     mono = chunking.decode_command(media, out, audio_filter="loudnorm")
     assert mono == [
-        "ffmpeg", "-nostdin", "-y", "-i", str(media),
+        "ffmpeg", "-nostdin", "-hide_banner", "-y", "-i", str(media),
         "-af", "loudnorm",
         "-ac", "1",
         "-ar", "16000", "-f", "wav", str(out),
@@ -184,7 +206,7 @@ def test_decode_command_pins_the_channel_count(tmp_path):
     # before it can reach the stereo-only Roformer.
     fullband = chunking.decode_command(media, out, sample_rate=44100, mono=False)
     assert fullband == [
-        "ffmpeg", "-nostdin", "-y", "-i", str(media),
+        "ffmpeg", "-nostdin", "-hide_banner", "-y", "-i", str(media),
         "-af", "aformat=channel_layouts=mono|stereo",
         "-ar", "44100", "-f", "wav", str(out),
     ]  # fmt: skip
@@ -288,3 +310,121 @@ def test_decode_to_wav_cleans_temp_wav_on_ffmpeg_failure(tmp_path, monkeypatch):
 
     leftover = [p for p in tmp_path.iterdir() if p.suffix == ".wav"]
     assert leftover == []
+
+
+def test_decode_to_wav_missing_ffmpeg_is_friendly_and_cleans_temp(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"x")
+
+    def fake_mkstemp(suffix="", prefix="", dir=None):
+        path = tmp_path / f"{prefix}fake{suffix}"
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+        return fd, str(path)
+
+    def fake_run(*a, **kw):
+        raise FileNotFoundError(2, "No such file or directory", "ffmpeg")
+
+    monkeypatch.setattr(chunking.tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(chunking.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="ffmpeg not found.*PATH") as ei:
+        chunking.decode_to_wav(media)
+    assert isinstance(ei.value.__cause__, FileNotFoundError)
+    assert [p for p in tmp_path.iterdir() if p.suffix == ".wav"] == []
+
+
+def test_decode_to_wav_timeout_names_the_knob_and_cleans_temp(tmp_path, monkeypatch):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"x")
+
+    def fake_mkstemp(suffix="", prefix="", dir=None):
+        path = tmp_path / f"{prefix}fake{suffix}"
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+        return fd, str(path)
+
+    def fake_run(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw["timeout"], stderr=b"size=  1kB")
+
+    monkeypatch.setattr(chunking.tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(chunking.subprocess, "run", fake_run)
+    monkeypatch.setattr(chunking, "FFMPEG_TIMEOUT", 12.0)
+
+    with pytest.raises(RuntimeError) as ei:
+        chunking.decode_to_wav(media)
+    msg = str(ei.value)
+    assert "timed out after 12s" in msg and "VOXWEAVE_FFMPEG_TIMEOUT" in msg
+    assert "clip.mp4" in msg
+    assert [p for p in tmp_path.iterdir() if p.suffix == ".wav"] == []
+
+
+def test_decode_to_wav_error_keeps_only_the_stderr_tail(tmp_path, monkeypatch):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"x")
+    stderr = "\n".join(f"line {i}" for i in range(40)).encode()
+
+    def fake_run(*a, **kw):
+        raise subprocess.CalledProcessError(1, ["ffmpeg"], stderr=stderr)
+
+    monkeypatch.setattr(chunking.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError) as ei:
+        chunking.decode_to_wav(media)
+    msg = str(ei.value)
+    assert "line 39" in msg and "line 32" in msg
+    assert "line 31" not in msg
+
+
+def test_vad_rejects_wrong_sample_rate_with_value_error(tmp_path, monkeypatch):
+    import soundfile as sf
+
+    wav = tmp_path / "a.wav"
+    sf.write(str(wav), np.zeros(800, dtype=np.float32), 8000)
+    monkeypatch.setattr(chunking, "_get_silero_vad", lambda: object())
+    pytest.importorskip("silero_vad")
+    with pytest.raises(ValueError, match="expected 16000 Hz"):
+        chunking.vad_speech_segments(wav)
+
+
+def test_malformed_env_knob_warns_and_keeps_default(monkeypatch, caplog):
+    monkeypatch.setenv("VOXWEAVE_VAD_MIN_SILENCE_MS", "300ms")
+    monkeypatch.setenv("VOXWEAVE_FFMPEG_TIMEOUT", "1h")
+    with caplog.at_level("WARNING", logger="voxweave"):
+        assert chunking._env_int("VOXWEAVE_VAD_MIN_SILENCE_MS", 300) == 300
+        assert chunking._env_float("VOXWEAVE_FFMPEG_TIMEOUT", 3600.0) == 3600.0
+    text = caplog.text
+    assert "VOXWEAVE_VAD_MIN_SILENCE_MS" in text and "VOXWEAVE_FFMPEG_TIMEOUT" in text
+    monkeypatch.setenv("VOXWEAVE_VAD_MIN_SILENCE_MS", " 150 ")
+    assert chunking._env_int("VOXWEAVE_VAD_MIN_SILENCE_MS", 300) == 150
+
+
+def test_malformed_env_knobs_do_not_break_import():
+    # a typo'd knob used to raise at import time, killing every command (even --help)
+    import sys
+
+    env = {
+        **os.environ,
+        "VOXWEAVE_VAD_MIN_SILENCE_MS": "abc",
+        "VOXWEAVE_FFMPEG_TIMEOUT": "1h",
+        "VOXWEAVE_QWEN_MAX_NEW_TOKENS": "1k",
+        "VOXWEAVE_ASR_BATCH_MIN_CPS": "x",
+        "VOXWEAVE_ASR_BATCH_MIN_CHECK_SEC": "2s",
+    }
+    code = (
+        "from voxweave import backend, chunking\n"
+        "print(chunking.VAD_MIN_SILENCE_MS, chunking.FFMPEG_TIMEOUT,"
+        " backend.QWEN_MAX_NEW_TOKENS, backend.ASR_BATCH_MIN_CPS,"
+        " backend.ASR_BATCH_MIN_CHECK_SEC)"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["300", "3600.0", "1024", "0.5", "2.0"]
+    for name in ("VOXWEAVE_VAD_MIN_SILENCE_MS", "VOXWEAVE_QWEN_MAX_NEW_TOKENS"):
+        assert name in proc.stderr

@@ -3,18 +3,9 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
-from voxweave import pipeline
+from voxweave import llm_commands
 from voxweave.cli import cli
 from voxweave.ui import RichReporter
-
-
-@pytest.fixture(autouse=True)
-def _isolate_config(tmp_path, monkeypatch):
-    # CLI tests must not read the developer's real ~/.config/voxweave.conf (non-hermetic: user settings
-    # like asr_model would pollute default-value assertions). Point to an empty tmp path so
-    # ensure_default_config writes the commented template (asr_model commented out) and
-    # conf_asr_model() returns None, exercising the built-in defaults.
-    monkeypatch.setenv("VOXWEAVE_CONFIG", str(tmp_path / "voxweave.conf"))
 
 
 def _media(tmp_path):
@@ -123,12 +114,12 @@ def test_media_shorthand_routes_to_process(tmp_path):
     assert m.called
 
 
-def test_split_passes_kwargs(tmp_path):
+def test_render_passes_kwargs(tmp_path):
     j = tmp_path / "a.json"
     j.write_text("{}", encoding="utf-8")
     out = tmp_path / "a.vtt"
     with patch("voxweave.pipeline.split", return_value=out) as m:
-        r = CliRunner().invoke(cli, ["split", str(j), "--max-lines", "2"])
+        r = CliRunner().invoke(cli, ["render", str(j), "--max-lines", "2"])
     assert r.exit_code == 0, r.output
     reporter = m.call_args.kwargs["reporter"]
     assert isinstance(reporter, RichReporter)
@@ -164,12 +155,12 @@ def test_process_semantic_model_flag_is_removed(tmp_path):
         ["--semantic-model", "local/custom"],
     ],
 )
-def test_split_semantic_flags_are_removed(tmp_path, args):
+def test_render_semantic_flags_are_removed(tmp_path, args):
     j = tmp_path / "a.json"
     j.write_text("{}", encoding="utf-8")
     out = tmp_path / "a.vtt"
     with patch("voxweave.pipeline.split", return_value=out) as m:
-        r = CliRunner().invoke(cli, ["split", str(j), *args])
+        r = CliRunner().invoke(cli, ["render", str(j), *args])
     assert r.exit_code == 2
     assert not m.called
 
@@ -232,7 +223,7 @@ def test_cli_translate_invokes_pipeline(tmp_path, monkeypatch):
         captured["model"] = kw.get("model")
         return tmp_path / "ep.zh.vtt"
 
-    monkeypatch.setattr(pipeline, "translate", fake_translate)
+    monkeypatch.setattr(llm_commands, "translate", fake_translate)
     runner = CliRunner()
     res = runner.invoke(cli, ["translate", str(vtt), "--to", "zh"])
     assert res.exit_code == 0, res.output
@@ -257,7 +248,7 @@ def test_cli_translate_loads_glossary(tmp_path, monkeypatch):
     g.write_text('{"A": "甲"}', encoding="utf-8")
     captured = {}
     monkeypatch.setattr(
-        pipeline,
+        llm_commands,
         "translate",
         lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
     )
@@ -329,12 +320,12 @@ def test_align_conf_default_separate_off(tmp_path):
     assert m.call_args.kwargs["separate"] is False
 
 
-def test_split_conf_default_timestamps_off(tmp_path):
+def test_render_conf_default_timestamps_off(tmp_path):
     _write_conf(tmp_path, "[defaults]\ntimestamps = false\n")
     j = tmp_path / "a.json"
     j.write_text("{}", encoding="utf-8")
     with patch("voxweave.pipeline.split", return_value=tmp_path / "a.vtt") as m:
-        r = CliRunner().invoke(cli, ["split", str(j)])
+        r = CliRunner().invoke(cli, ["render", str(j)])
     assert r.exit_code == 0, r.output
     assert m.call_args.kwargs["timestamps"] is False
 
@@ -398,3 +389,149 @@ def test_process_diarize_default_off(tmp_path):
         r = CliRunner().invoke(cli, [str(media)])
     assert r.exit_code == 0, r.output
     assert m.call_args.kwargs["diarize"] is False
+
+
+def _flat(text: str) -> str:
+    """Collapse rich's wrapping so log lines can be matched as one sentence."""
+    return " ".join(text.split())
+
+
+def _correct_result(v):
+    return {
+        "out": v,
+        "audit": None,
+        "applied": [],
+        "rejected": [],
+        "n_cues": 1,
+        "applied_in_place": True,
+        "aligned": False,
+    }
+
+
+def test_correct_apply_realign_honours_conf_defaults(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("VOXWEAVE_VAD_EMISSION_MASK", "")  # restored after the test
+    _write_conf(
+        tmp_path, "[defaults]\nseparate = false\nnormalize = true\nvad_mask = true\n"
+    )
+    v = _vtt(tmp_path)
+    with patch("voxweave.llm_commands.correct", return_value=_correct_result(v)) as m:
+        r = CliRunner().invoke(cli, ["correct", "--apply", str(v)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["separate"] is False
+    assert m.call_args.kwargs["normalize"] is True
+    assert os.environ["VOXWEAVE_VAD_EMISSION_MASK"] == "1"
+
+
+@pytest.mark.parametrize("command", ["translate", "correct"])
+def test_bad_glossary_renders_error_panel(tmp_path, monkeypatch, command):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    v = _vtt(tmp_path)
+    g = tmp_path / "g.json"
+    g.write_text("{not json", encoding="utf-8")
+    with patch(f"voxweave.llm_commands.{command}") as m:
+        r = CliRunner().invoke(cli, [command, str(v), "--glossary", str(g)])
+    assert r.exit_code == 1
+    assert isinstance(r.exception, SystemExit)  # error panel, not a traceback
+    assert "invalid JSON in glossary g.json" in _flat(r.output)
+    assert not m.called
+
+
+@pytest.mark.parametrize("option", ["--min-speakers", "--max-speakers"])
+def test_speaker_bounds_must_be_positive(tmp_path, option):
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, ["--diarize", option, "0", str(media)])
+    assert r.exit_code == 2
+    assert not m.called
+
+
+def test_min_speakers_above_max_speakers_is_usage_error(tmp_path):
+    media, out = _media(tmp_path)
+    args = ["--diarize", "--min-speakers", "3", "--max-speakers", "2", str(media)]
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, args)
+    assert r.exit_code == 2
+    assert "is greater than" in _flat(r.output)
+    assert not m.called
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--min-speakers", "2"],
+        ["--max-speakers", "4"],
+        ["--diarize-model", "3.1"],
+        ["--speaker-clustering", "pyannote"],
+    ],
+)
+def test_speaker_options_warn_when_diarization_is_off(tmp_path, args):
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out):
+        r = CliRunner().invoke(cli, ["--no-diarize", *args, str(media)])
+    assert r.exit_code == 0, r.output
+    assert (
+        f"{args[0]} has no effect: diarization is off (from CLI --no-diarize)"
+        in _flat(r.output)
+    )
+
+
+def test_keep_lyrics_without_separation_warns(tmp_path):
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, ["--no-separate", "--keep-lyrics", str(media)])
+    assert r.exit_code == 0, r.output
+    assert "--keep-lyrics has no effect" in _flat(r.output)
+    assert m.call_args.kwargs["keep_lyrics"] is True
+
+
+def test_blank_voiceprints_env_counts_as_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOXWEAVE_VOICEPRINTS", "  ")
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out) as m:
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert m.call_args.kwargs["voiceprints"] is False
+
+
+@pytest.mark.parametrize(
+    "args", [["transcribe", "--help"], ["render", "-h"], ["-v", "align", "--help"]]
+)
+def test_subcommand_help_does_not_write_default_config(tmp_path, args):
+    r = CliRunner().invoke(cli, args)
+    assert r.exit_code == 0, r.output
+    assert not (tmp_path / "voxweave.conf").exists()
+    assert "created default config" not in r.output
+
+
+def test_real_run_still_writes_default_config(tmp_path):
+    media, out = _media(tmp_path)
+    with patch("voxweave.pipeline.process", return_value=out):
+        r = CliRunner().invoke(cli, [str(media)])
+    assert r.exit_code == 0, r.output
+    assert (tmp_path / "voxweave.conf").exists()
+
+
+def test_debug_summary_reads_the_claim_without_creating_one(tmp_path):
+    from voxweave import artifacts
+
+    media, out = _media(tmp_path)
+    with (
+        patch("voxweave.pipeline.process", return_value=out),
+        patch("voxweave.cli.summary_panel") as panel,
+    ):
+        r = CliRunner().invoke(cli, ["--debug", str(media)])
+    assert r.exit_code == 0, r.output
+    assert panel.call_args.kwargs["debug_dir"] is None
+    assert artifacts.inspect_paths(media) is None  # nothing claimed for display
+
+    debug_dir = artifacts.claim_paths(media).debug
+    with (
+        patch("voxweave.pipeline.process", return_value=out),
+        patch("voxweave.cli.summary_panel") as panel,
+    ):
+        r = CliRunner().invoke(cli, ["--debug", str(media)])
+    assert r.exit_code == 0, r.output
+    assert panel.call_args.kwargs["debug_dir"] == debug_dir

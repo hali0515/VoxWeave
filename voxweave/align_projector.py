@@ -14,7 +14,6 @@ from voxweave.align_snapshot import (
     encode_frozen_json_document,
     freeze_json,
 )
-from voxweave.speakers import voice_text_for_block
 
 
 @dataclass(frozen=True)
@@ -109,12 +108,13 @@ def project_align_vtt_bytes(
     inputs: AlignProjectionInputs,
 ) -> bytes:
     """Render only the VTT member of one candidate family."""
-    rows = []
-    for cue in delivery.cues:
-        text = f"♪ {cue.text} ♪" if cue.lyric is True else cue.text
-        text = voice_text_for_block(text, _source_block(inputs, cue.source_index))
-        rows.append((cue.start, cue.end, text))
-    return realign.render_cues(rows).encode("utf-8")
+    blocks = [
+        _source_block(inputs, cue.source_index)
+        | {"text": cue.text, "lyric": cue.lyric is True}
+        for cue in delivery.cues
+    ]
+    spans = [(cue.start, cue.end) for cue in delivery.cues]
+    return realign.render_vtt(blocks, spans).encode("utf-8")
 
 
 def project_align_main_json_bytes(

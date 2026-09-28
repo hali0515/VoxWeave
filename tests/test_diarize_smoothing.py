@@ -208,6 +208,8 @@ def test_process_forwards_min_max_speakers_to_transcribe(tmp_path, monkeypatch):
         return "en", units, [(0.0, 0.5)], [], [], None
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    # process() preflights diarization; the gated default model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     pipeline.process(
         media, diarize=True, min_speakers=2, max_speakers=3, shot_snap=False
     )

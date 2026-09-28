@@ -160,19 +160,21 @@ def _encode_family(
 
 def _encoder_failure(
     detail_code: Literal["main-json-encode", "vtt-encode"] = "main-json-encode",
+    cause: BaseException | None = None,
 ) -> CandidateFailure:
     return CandidateFailure(
-        CanonicalFailure("preencode-failed", "encoder", detail_code)
+        CanonicalFailure("preencode-failed", "encoder", detail_code), cause
     )
 
 
-def _renderer_stage_failure() -> CandidateFailure:
+def _renderer_stage_failure(cause: BaseException | None = None) -> CandidateFailure:
     return CandidateFailure(
         CanonicalFailure(
             "shadow-internal-error",
             "renderer-stage",
             "renderer-stage",
-        )
+        ),
+        cause,
     )
 
 
@@ -196,9 +198,9 @@ def encode_segmentation_candidates(
             record.projection_inputs,
         )
     except SegmentationProjectionEncodeError as exc:
-        legacy = _encoder_failure(exc.detail_code)
-    except Exception:
-        legacy = _encoder_failure()
+        legacy = _encoder_failure(exc.detail_code, exc.__cause__ or exc)
+    except Exception as exc:
+        legacy = _encoder_failure(cause=exc)
     outcomes.append(("legacy-v1", legacy))
     if result.v2_status.kind == "not-requested":
         boundary: CandidateOutcome = CandidateNotRequested()
@@ -217,9 +219,9 @@ def encode_segmentation_candidates(
                 record.projection_inputs,
             )
         except SegmentationProjectionEncodeError as exc:
-            boundary = _encoder_failure(exc.detail_code)
-        except Exception:
-            boundary = _renderer_stage_failure()
+            boundary = _encoder_failure(exc.detail_code, exc.__cause__ or exc)
+        except Exception as exc:
+            boundary = _renderer_stage_failure(exc)
     outcomes.append(("boundary-v2", boundary))
     return _issue_candidate_set(context, result, tuple(outcomes))
 
@@ -341,9 +343,31 @@ def project_selected_sdh_dialogue(
     )
 
 
+def release_context_records(context: IssuedSegmentationContext) -> None:
+    """Forget every encoded, selected and verified record bound to ``context``.
+
+    Called once the context's roles are retired; each record carries the
+    rendered VTT and JSON bytes, so keeping them would pin every run's output
+    for the life of the process.
+    """
+    with _LOCK:
+        for registry in (_ENCODED, _VERIFIED):
+            for key in [
+                key for key, record in registry.items() if record.context is context
+            ]:
+                del registry[key]
+        for key in [
+            key
+            for key, (owner, _candidates) in _QUALIFIED_SELECTED.items()
+            if owner is context
+        ]:
+            del _QUALIFIED_SELECTED[key]
+
+
 __all__ = [
     "encode_segmentation_candidates",
     "project_selected_sdh_dialogue",
+    "release_context_records",
     "select_qualified_segmentation_candidate",
     "select_segmentation_candidate",
     "verify_selected_segmentation_projection",

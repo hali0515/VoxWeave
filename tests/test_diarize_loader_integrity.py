@@ -9,7 +9,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-import torch
 
 from voxweave import config, diarize
 
@@ -74,8 +73,8 @@ def test_outer_config_digest_and_document_share_one_file_read(
     monkeypatch.setattr(Path, "open", controlled_open)
     monkeypatch.setattr(
         diarize,
-        "_pipeline_config_path",
-        lambda _model, _token: config_path,
+        "_fetch_pipeline_config",
+        lambda _model, _token: (config_path, None),
     )
     monkeypatch.setattr(
         diarize,
@@ -158,7 +157,7 @@ def test_legacy_and_community_construction_serialize_plda_and_singleton_lifecycl
             return community_pipeline
 
     _install_fake_pyannote(monkeypatch, Pipeline, speaker_module)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(diarize.runtime, "get_device", lambda: "cpu")
     monkeypatch.setattr(diarize, "_pipeline", None)
     monkeypatch.setattr(diarize, "_pipeline_model", None)
 

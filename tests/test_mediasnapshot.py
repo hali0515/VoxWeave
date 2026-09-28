@@ -39,7 +39,6 @@ def test_snapshot_is_private_verified_suffix_preserving_and_exception_safe(tmp_p
         assert private_path.read_bytes() == source.read_bytes()
         assert snapshot.fingerprint == expected
         assert snapshot.size == 4096
-        assert snapshot.copy_method in {"reflink", "copy"}
         assert stat.S_IMODE(private_path.stat().st_mode) == 0o600
         assert stat.S_IMODE(private_path.parent.stat().st_mode) == 0o700
 
@@ -112,7 +111,6 @@ def test_reflink_unsupported_uses_verified_fd_copy(tmp_path, monkeypatch):
     source = tmp_path / "episode.flac"
     source.write_bytes(b"voice" * 1000)
     with mediasnapshot.MediaSnapshot(source, cache_root=tmp_path / "cache") as snapshot:
-        assert snapshot.copy_method == "copy"
         assert snapshot.path.read_bytes() == source.read_bytes()
     assert calls == [5000]
 
@@ -132,7 +130,6 @@ def test_verified_reflink_path_does_not_run_copy_fallback(tmp_path, monkeypatch)
     source = tmp_path / "episode.wav"
     source.write_bytes(b"pcm" * 100)
     with mediasnapshot.MediaSnapshot(source, cache_root=tmp_path / "cache") as snapshot:
-        assert snapshot.copy_method == "reflink"
         assert snapshot.path.read_bytes() == source.read_bytes()
 
 
@@ -267,7 +264,6 @@ def test_free_space_preflight_is_advisory_actual_copy_is_authoritative(
     source = tmp_path / "episode.mp4"
     source.write_bytes(b"A" * 4096)
     with mediasnapshot.MediaSnapshot(source, cache_root=tmp_path / "cache") as snapshot:
-        assert snapshot.copy_method == "copy"
         assert snapshot.free_space_sufficient is False
         assert snapshot.path.read_bytes() == source.read_bytes()
 
@@ -349,6 +345,36 @@ def test_janitor_cleanup_failures_are_best_effort(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "unlink", refuse_residue)
     assert mediasnapshot.cleanup_stale_snapshots(directory, now=now) == ()
     assert residue.exists()
+
+
+def test_janitor_inspection_and_lock_errors_are_skipped(tmp_path, monkeypatch):
+    # A raw OSError here would escape MediaSnapshot.__enter__ untyped and skip
+    # the callers' non-fatal SnapshotUnavailable handling.
+    directory = tmp_path / "snapshots"
+    directory.mkdir()
+    now = time.time()
+    unreadable = directory / ("snapshot-" + "1" * 32 + ".mp4")
+    unlockable = directory / ("snapshot-" + "2" * 32 + ".mp4")
+    for residue in (unreadable, unlockable):
+        residue.write_bytes(b"old")
+        os.utime(residue, (now - 7200, now - 7200))
+    original_lstat = os.lstat
+    original_flock = mediasnapshot.fcntl.flock
+
+    def failing_lstat(path, *args, **kwargs):
+        if Path(path) == unreadable:
+            raise OSError(errno.EIO, "I/O error")
+        return original_lstat(path, *args, **kwargs)
+
+    def no_locks(descriptor, operation):
+        if operation & mediasnapshot.fcntl.LOCK_NB:
+            raise OSError(errno.ENOLCK, "no locks available")
+        return original_flock(descriptor, operation)
+
+    monkeypatch.setattr(mediasnapshot.os, "lstat", failing_lstat)
+    monkeypatch.setattr(mediasnapshot.fcntl, "flock", no_locks)
+    assert mediasnapshot.cleanup_stale_snapshots(directory, now=now) == ()
+    assert unreadable.exists() and unlockable.exists()
 
 
 def test_new_snapshot_runs_crash_residue_janitor(tmp_path):

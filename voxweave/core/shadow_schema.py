@@ -17,12 +17,9 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
-LIVE_SHADOW_SCHEMA_VERSION = 2
+from .shadow_lanes import LANE_CORE, LANE_DISPLAY, LANE_FINALIZER, LANE_LEGACY
 
-LANE_CORE = "core_partition_pre_overlay"
-LANE_LEGACY = "delivery_v1_legacy"
-LANE_FINALIZER = "delivery_finalizer"
-LANE_DISPLAY = "legacy_display"
+LIVE_SHADOW_SCHEMA_VERSION = 2
 
 TOP_LEVEL_KEYS = frozenset(
     {

@@ -242,6 +242,28 @@ def test_load_srt_ignores_unreadable_speaker_sidecar_once(
     assert len(warnings) == 1
 
 
+def test_load_srt_survives_an_unreadable_cache_marker(tmp_path, caplog):
+    # The mapping lookup walks the media directory's cache claims; a broken
+    # marker there must not stop an unrelated SRT from loading.
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAoi: Hello\n",
+        encoding="utf-8",
+    )
+    claim = tmp_path / "cache" / "ep"
+    claim.mkdir(parents=True)
+    (claim / "source.json").write_text("not json", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="voxweave"):
+        blocks = load_subtitle_blocks(srt)
+
+    assert blocks[0]["text"] == "Aoi: Hello"
+    assert any(
+        "ignoring unreadable speaker mapping" in record.message
+        for record in caplog.records
+    )
+
+
 def test_load_ssa_uses_ass_parser(tmp_path):
     ssa = tmp_path / "ep.ssa"
     ssa.write_text(
@@ -472,3 +494,32 @@ def test_parse_vtt_blocks_tolerates_leading_bom():
 
     blocks = parse_vtt_blocks("﻿" + VTT_DOC)
     assert [b["text"] for b in blocks] == ["hello"]
+
+
+ASS_EVENTS = (
+    "[Events]\n"
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+)
+
+
+def test_parse_ass_drawing_only_event_yields_no_cue():
+    # typesetting shapes ({\p1} vector drawings) carry drawing commands, not
+    # dialogue; an event holding only a drawing is not a cue
+    doc = (
+        ASS_EVENTS + "Dialogue: 0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,"
+        "{\\an7\\pos(0,0)\\p1}m 0 0 l 1920 0 1920 1080 0 1080{\\p0}\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,{\\p2}m 0 0 b 10 0 10 10 0 10\n"
+        "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,real line\n"
+    )
+    assert [b["text"] for b in parse_ass_blocks(doc)] == ["real line"]
+
+
+def test_parse_ass_drawing_commands_dropped_around_text():
+    # drawing mode runs from \pN (N > 0) to \p0 or the end of the event;
+    # \pos / \pbo are not drawing toggles
+    doc = (
+        ASS_EVENTS + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,"
+        "{\\pos(10,20)\\pbo5}Sign {\\p1}m 0 0 l 10 0 10 10{\\p0}{\\i1}text{\\i0}"
+        "{\\fsp2\\p4}m 5 5 l 6 6\n"
+    )
+    assert [b["text"] for b in parse_ass_blocks(doc)] == ["Sign <i>text</i>"]

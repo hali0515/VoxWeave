@@ -12,7 +12,7 @@ import rich_click as click
 from click.testing import CliRunner
 
 from voxweave import cli as cli_module
-from voxweave import config, export, mux, pipeline
+from voxweave import config, export, llm_commands, mux, pipeline
 from voxweave.progress import Reporter
 
 
@@ -49,7 +49,7 @@ def cli_case(tmp_path, monkeypatch):
     targets = {
         "transcribe": (pipeline, "process"),
         "render": (pipeline, "split"),
-        "translate": (pipeline, "translate"),
+        "translate": (llm_commands, "translate"),
         "export": (export, "export_subtitles"),
         "pack": (mux, "pack"),
         "burn": (mux, "burn"),
@@ -386,6 +386,26 @@ def test_native_click_suggestion_is_not_duplicated(monkeypatch):
     assert result.exit_code == 2
     assert result.output.count("Did you mean") == 1
     assert "pass a path" in result.output
+
+
+def test_unknown_verb_never_suggests_a_hidden_alias(cli_case):
+    hidden = _invoke(cli_case, ["spli"])
+    assert hidden.exit_code == 2
+    assert "'split'" not in hidden.output
+    visible = _invoke(cli_case, ["rendr"])
+    assert visible.exit_code == 2
+    # rich-click colours the panel under GITHUB_ACTIONS; compare the plain text.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", visible.output)
+    flat = " ".join(plain.replace("│", " ").split())
+    assert flat.count("Did you mean 'render'?") == 1
+
+
+def test_overlong_token_is_an_unknown_command_not_a_crash(cli_case):
+    result = _invoke(cli_case, ["a" * 5000])
+    assert result.exit_code == 2
+    assert "No such command" in result.output
+    assert not isinstance(result.exception, OSError)
+    cli_case.calls["transcribe"].assert_not_called()
 
 
 def test_speakers_list_does_not_create_first_run_config(tmp_path, monkeypatch):

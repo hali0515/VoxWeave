@@ -5,6 +5,8 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 *.lock
+# ...but the project lockfile is tracked (and digest-pinned by the P6 oracle)
+!uv.lock
 build/
 dist/
 debug/
@@ -12,7 +14,7 @@ cache/
 
 TODO.md
 
-# 私有项目说明, 不入库
+# private project notes, not tracked
 CLAUDE.md
 
 # private session handoff log

@@ -300,7 +300,7 @@ def test_same_episode_needs_replace_within_its_scope(tmp_path):
         turns_digest=None,
         episode="ep01",
     )
-    with pytest.raises(voicestore.EnrollmentRefusal, match="replace-episode"):
+    with pytest.raises(voicestore.EnrollmentRefusal, match="speakers enroll --replace"):
         _enroll(root, [_entry(identity_id="v000000000001")], source=later)
     ids = _Ids()
     ids.exemplar = 10
@@ -862,12 +862,25 @@ def test_only_the_built_in_location_is_marked_default(tmp_path, monkeypatch):
     assert not voicelibrary.resolve_voices_dir().default
 
 
-def test_existing_shared_directory_keeps_its_mode(tmp_path):
-    root = tmp_path / "shared"
-    root.mkdir(mode=0o770)
-    os.chmod(root, 0o770)
+def test_existing_directory_keeps_its_mode_but_the_files_stay_private(tmp_path):
+    # One account per library: a pre-created directory is not narrowed, but
+    # nothing inside it is ever readable by another account.
+    root = tmp_path / "prepared"
+    root.mkdir(mode=0o755)
+    os.chmod(root, 0o755)
     _enroll(root, [_entry()])
-    assert stat.S_IMODE(root.stat().st_mode) == 0o770
+    assert stat.S_IMODE(root.stat().st_mode) == 0o755
+    (root / "identities.json").chmod(0o644)
+    _enroll(root, [_entry(name="Ren", vector=_unit(1))], source=_source(2))
+    files = [p for p in root.rglob("*") if p.is_file()]
+    assert {p.name for p in files} >= {
+        ".library.lock",
+        "identities.json",
+        "history.jsonl",
+    }
+    assert {p: stat.S_IMODE(p.stat().st_mode) for p in files} == {
+        p: 0o600 for p in files
+    }
 
 
 def test_misfiled_spaces_are_rejected(tmp_path):
@@ -880,12 +893,16 @@ def test_misfiled_spaces_are_rejected(tmp_path):
         _read(root, spaces=["pyannote-000000000000"])
 
 
-def test_orphan_exemplars_are_skipped_on_read_and_deleted_by_a_writer(tmp_path, caplog):
-    # What a forget racing an enrollment on a mount without working locks
-    # leaves behind: vectors of an identity identities.json no longer has.
+def test_orphan_exemplars_are_skipped_on_read_and_kept_unless_forgotten(
+    tmp_path, caplog
+):
+    # Vectors of an identity identities.json does not list: left by a forget
+    # racing an enrollment on a mount without working locks, a manual edit,
+    # or an identities.json rolled back to an older copy.
     root = tmp_path / "voices"
     _enroll(root, [_entry(), _entry("Kazuma", _unit(1), label="SPEAKER_01")])
     [name] = _read(root).spaces
+    space_file = root / "spaces" / f"{name}.json"
     identities = root / "identities.json"
     document = json.loads(identities.read_text())
     del document["identities"]["v000000000002"]
@@ -896,21 +913,115 @@ def test_orphan_exemplars_are_skipped_on_read_and_deleted_by_a_writer(tmp_path, 
             state = _read(root, spaces=spaces)
             assert list(state.space_exemplars(name)) == ["v000000000001"]
             assert state.orphans == {name: {"v000000000002": 1}}
-    assert "unknown identities" in caplog.text
-    assert b"v000000000002" in (root / "spaces" / f"{name}.json").read_bytes()
+    assert "ignored but kept" in caplog.text
+    assert b"v000000000002" in space_file.read_bytes()
 
-    # Any write deletes them: here, forgetting the only remaining person.
+    # A write keeps them: here, forgetting the only remaining person.
     with voicelibrary.library_lock(root, exclusive=True):
         state = voicelibrary.read_state(root)
         change, removed = voicelibrary.forget_identity(state, "v000000000001")
         voicelibrary.commit(state, change)
     assert removed == {name: 1}
-    assert b"vector" not in (root / "spaces" / f"{name}.json").read_bytes()
+    on_disk = json.loads(space_file.read_text())
+    assert list(on_disk["exemplars"]) == ["v000000000002"]
+    assert _read(root).orphans == {name: {"v000000000002": 1}}
+    assert not [r for r in _history(root) if r["action"] == "orphan"]
+
+    # Orphans of a forgotten (tombstoned) id are deleted by the next write
+    # that read their space, even one that changes another space.
+    document = json.loads(identities.read_text())
+    document["forgotten"] = [*document["forgotten"], "v000000000002"]
+    identities.write_text(json.dumps(document))
+    ids = _Ids()
+    ids.identity = ids.exemplar = 10
+    with voicelibrary.library_lock(root, exclusive=True):
+        other, _fingerprint = voicelibrary.space_identity(_decoupled("other-model"))
+        state = voicelibrary.read_state(root, include=[other])
+        change, _outcomes = voicelibrary.enroll_entries(
+            state,
+            provenance=_decoupled("other-model"),
+            scope="Show A",
+            source=_source(),
+            entries=[_entry("Megumin", _unit(2))],
+            replace_episode=False,
+            at=NOW,
+            identity_id_factory=ids.identity_id,
+            exemplar_id_factory=ids.exemplar_id,
+        )
+        voicelibrary.commit(state, change)
+    assert b"vector" not in space_file.read_bytes()
     assert _read(root).orphans == {}
     orphan_row = next(r for r in _history(root) if r["action"] == "orphan")
     assert orphan_row["space"] == name
     assert orphan_row["identities"] == ["v000000000002"]
     assert orphan_row["exemplars"] == 1
+
+
+def test_a_rolled_back_identities_json_does_not_delete_newer_voices(tmp_path):
+    # A partial backup restore or a sync conflict leaves an older
+    # identities.json: the voices enrolled since must survive every writer.
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry("Aqua", _unit(0))], ids=ids)
+    identities = root / "identities.json"
+    old_identities = identities.read_bytes()
+    _enroll(root, [_entry("Kazuma", _unit(1))], source=_source(2), ids=ids)
+    [name] = _read(root).spaces
+    space_file = root / "spaces" / f"{name}.json"
+    kazuma = json.loads(space_file.read_text())["exemplars"]["v000000000002"]
+
+    identities.write_bytes(old_identities)
+    assert _read(root).orphans == {name: {"v000000000002": 1}}
+    _enroll(root, [_entry("Megumin", _unit(2))], source=_source(3), ids=ids)
+    _enroll(
+        root,
+        [_entry("Darkness", _unit(3))],
+        provenance=_decoupled("other-model"),
+        source=_source(4),
+        ids=ids,
+    )
+    assert json.loads(space_file.read_text())["exemplars"]["v000000000002"] == kazuma
+    assert not [r for r in _history(root) if r["action"] == "orphan"]
+
+    # Restoring the current identities.json brings the voice back.
+    document = json.loads(identities.read_text())
+    document["identities"]["v000000000002"] = json.loads(old_identities)["identities"][
+        "v000000000001"
+    ] | {"display_name": "Kazuma"}
+    identities.write_text(json.dumps(document))
+    state = _read(root)
+    assert state.orphans == {}
+    assert state.space_exemplars(name)["v000000000002"] == kazuma
+
+
+def test_a_missing_identities_json_is_refused_not_read_as_empty(tmp_path, caplog):
+    # Read as an empty library, every stored sample would be an orphan that
+    # the next enrollment deletes.
+    root = tmp_path / "voices"
+    ids = _Ids()
+    _enroll(root, [_entry(), _entry("Kazuma", _unit(1), label="SPEAKER_01")], ids=ids)
+    [name] = _read(root).spaces
+    (root / "identities.json").unlink()
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    refusal = r"identities\.json is missing, but spaces/ holds 2 voice sample"
+    with caplog.at_level(logging.WARNING, logger="voxweave"):
+        with pytest.raises(voicelibrary.VoiceLibraryError, match=refusal) as excinfo:
+            _enroll(
+                root,
+                [_entry("Megumin", _unit(2), label="SPEAKER_02")],
+                source=_source(2, episode="ep02"),
+                ids=ids,
+            )
+        assert "nothing was deleted" in str(excinfo.value)
+        # Also when the change targets another space, and for every reader.
+        with pytest.raises(voicelibrary.VoiceLibraryError, match=refusal):
+            _enroll(root, [_entry()], provenance=_decoupled("anime-va-ecapa-gn"))
+        for spaces in (None, [name], []):
+            with pytest.raises(voicelibrary.VoiceLibraryError, match=refusal):
+                _read(root, spaces=spaces)
+    assert "unknown identities" not in caplog.text
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
 
 
 def test_identities_json_lists_every_space_file(tmp_path):
@@ -1033,6 +1144,77 @@ def test_import_is_idempotent_and_keeps_ids(tmp_path):
     assert second.exemplars_present == 2
     assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
     assert [row["action"] for row in _history(root)].count("import") == 1
+
+
+def test_an_import_that_conflicts_with_the_library_is_reported_not_replaced(tmp_path):
+    root = tmp_path / "voices"
+    store, identity_id = _dated_legacy_store(["2025-01-01T00:00:00Z"])
+    [legacy] = store["identities"][identity_id]["exemplars"]
+    # The library already holds another capture of that episode in that scope.
+    ids = _Ids()
+    ids.exemplar = 200
+    _enroll(
+        root,
+        [_entry(identity_id=identity_id)],
+        scope="Legacy",
+        source=_source(7, episode="legacy0"),
+        ids=ids,
+    )
+    before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    change, summary = _import(root, store, scope="Legacy")
+    assert change.empty
+    assert summary.refused == (
+        f"{identity_id}/{legacy['id']}: conflicts with a voice sample already in "
+        "the library (episode 'legacy0', scope 'Legacy'); not imported",
+    )
+    assert {p: p.read_bytes() for p in root.rglob("*") if p.is_file()} == before
+
+
+def test_the_import_hint_skips_samples_the_import_would_refuse(tmp_path):
+    root = tmp_path / "voices"
+    store, identity_id = _dated_legacy_store(["2025-01-01T00:00:00Z"])
+    ids = _Ids()
+    ids.exemplar = 200
+    _enroll(
+        root,
+        [_entry(identity_id=identity_id)],
+        scope="Legacy",
+        source=_source(7, episode="legacy0"),
+        ids=ids,
+    )
+    name, _ = voicelibrary.space_identity(store["provenance"])
+    state = _read(root, spaces=[name])
+    pools = voicelibrary.matching_pools(state, name, "Legacy")
+    _pools, unimported = voicelibrary.add_legacy_store(
+        pools, store, state=state, space_name=name, in_scope=True
+    )
+    # `voices import` reports the conflict and adds nothing, so serve must not
+    # keep advising it.
+    assert not unimported
+    change, summary = _import(root, store, scope="Legacy")
+    assert change.empty and summary.refused
+
+
+def test_the_import_hint_uses_the_scopes_the_import_defaults_to(tmp_path):
+    root = tmp_path / "voices"
+    folder = tmp_path / "Show A"
+    folder.mkdir()
+    store_path = folder / "voxweave.voices.json"
+    store = _legacy_store(store_path)
+    name, _ = voicelibrary.space_identity(store["provenance"])
+    state = _read(root, spaces=[name])
+    pools = voicelibrary.matching_pools(state, name, "Show A")
+    _pools, unimported = voicelibrary.add_legacy_store(
+        pools, store, state=state, space_name=name, in_scope=True, store_path=store_path
+    )
+    assert unimported
+    _import(root, store, scope="Show A")
+    state = _read(root, spaces=[name])
+    _pools, unimported = voicelibrary.add_legacy_store(
+        pools, store, state=state, space_name=name, in_scope=True, store_path=store_path
+    )
+    assert not unimported
 
 
 def _dated_legacy_store(identity_count_dates, *, first_number=100):

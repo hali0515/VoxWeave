@@ -43,8 +43,8 @@ def test_internal_pipeline_exposes_no_retired_selector_parameters():
 
 @pytest.mark.parametrize(
     "command",
-    [cmd_transcribe, cli.commands["split"]],
-    ids=["transcribe", "split"],
+    [cmd_transcribe, cli.commands["render"]],
+    ids=["transcribe", "render"],
 )
 def test_public_commands_expose_no_semantic_mode(command):
     names = _option_names(command)
@@ -56,13 +56,13 @@ def test_public_commands_expose_no_semantic_mode(command):
 def test_public_help_contains_no_semantic_mode():
     runner = CliRunner()
     root_help = runner.invoke(cli, ["--help"])
-    split_help = runner.invoke(cli, ["split", "--help"])
+    render_help = runner.invoke(cli, ["render", "--help"])
     assert root_help.exit_code == 0
-    assert split_help.exit_code == 0
+    assert render_help.exit_code == 0
     assert "semantic-split" not in root_help.output
     assert "semantic-model" not in root_help.output
-    assert "semantic-split" not in split_help.output
-    assert "semantic-model" not in split_help.output
+    assert "semantic-split" not in render_help.output
+    assert "semantic-model" not in render_help.output
 
 
 def test_public_config_exposes_no_semantic_mode():

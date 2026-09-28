@@ -1,40 +1,5 @@
 # tests/test_breakpoints.py
-from voxweave.core.breakpoints import legal_break_index, phrase_atoms
-from voxweave.core.smart_split import _fit_split_clause
-
-
-def test_slides_off_article():
-    # must not break after "the" (article|noun); target=2 lands after "the" -> slides to a legal point
-    toks = ["I", "saw", "the", "red", "car", "today"]
-    # target index = break between toks[:i] | toks[i:]; i=3 would leave left side ending with "the" -> illegal
-    assert legal_break_index(toks, "en", 3) != 3
-
-
-def test_keeps_legal_midpoint():
-    toks = ["I", "left", "but", "she", "stayed", "home"]
-    # i=3: left side "...left but" -- "but" is a conjunction at the end, also an illegal left token -> should avoid
-    i = legal_break_index(toks, "en", 3)
-    assert toks[i - 1].lower() not in {"the", "a", "an", "but", "and"}
-
-
-def test_non_en_returns_target_unchanged():
-    assert legal_break_index(["a", "b", "c"], "ja", 1) == 1
-
-
-def test_target_clamped_in_range():
-    toks = ["one", "two"]
-    i = legal_break_index(toks, "en", 5)
-    assert 1 <= i <= len(toks)
-
-
-def test_fit_split_avoids_article_break():
-    # 6 tokens, no terminal/conjunction -> falls through to even-split; old mid=3 left
-    # "I gave the" ending with "the" (forbidden); the new guard slides away from it.
-    # max_line_length=12 forces overflow beyond 1 line to trigger the fallback.
-    clause = "I gave the enormous shiny present"
-    parts = _fit_split_clause(clause, max_line_length=12, max_lines=1, lang="en")
-    for p in parts[:-1]:
-        assert p.split()[-1].strip(".,").lower() not in {"the", "a", "an", "to", "of"}
+from voxweave.core.breakpoints import phrase_atoms
 
 
 def test_phrase_atoms_en_is_words():

@@ -25,7 +25,6 @@ from .schema import Cue
 
 TWO_FRAME_S = 2.0 / 24.0  # ~0.083s Netflix min inter-cue gap
 CHAIN_MAX_GAP_S = 0.5  # gaps below this are "dead zone" -> chain to 2 frames
-VISIBLE_GAP_MIN_S = 1.0  # gaps >= this stay a visible pause (BBC); not enforced in code (CHAIN_MAX_GAP_S=0.5 never reaches them)
 GLUE_MAX_GAP_S = 0.3  # lone-word flicker cue glues onto its nearer neighbor when that gap is below this
 LINGER_CAP_S = 1.0  # CPS-driven extension never lingers more than this past speech end
 DEGENERATE_CUE_S = (
@@ -311,15 +310,22 @@ def _cleanup_cues(
 ) -> list[Cue]:
     """Timing-only pass — never merges content across a real pause.
 
-    - Extends short cues into the following gap (no overlap) up to min_cue_s.
+    - Extends short cues into the following gap up to min_cue_s. This and the
+      two extensions below stop 2 frames (TWO_FRAME_S) before the next cue's
+      start.
     - Reading-speed linger (cps>0): a cue displayed for less than reading_chars/cps
       extends into the gap, at most LINGER_CAP_S past speech end (display end for
       untimed cues, which have no speech anchor).
     - Tail pad (lag_out_s>0): every cue end gets a flat pad so text does not vanish
       the instant speech stops; absorbed by chaining in dense dialogue.
     - Chains sub-0.5s inter-cue gaps down to 2 frames.
-    - Visible gaps (>=1s) are left untouched.
+    - Gaps of CHAIN_MAX_GAP_S or more are never chained, but they are not left
+      untouched: the extensions above grow into them, up to the same 2-frame
+      floor before the next start.
     - max_cue_s prevents any extension from re-inflating past the segmentation cap.
+      The one exception, a held/sung word still sounding past the cap, may keep
+      its cue up to the next cue's start itself: speech wins over the 2-frame
+      floor there.
 
     Idempotent for cues carrying timed ``word_data``: every extension target is an
     absolute end derived from the cue's start or its speech end, never from the
@@ -353,7 +359,11 @@ def _cleanup_cues(
             if nxt_start is None:
                 c["end"] = want
             elif nxt_start - c["end"] > TWO_FRAME_S:
-                c["end"] = min(want, nxt_start)
+                # stop at the 2-frame floor, not at next.start: chaining only
+                # closes gaps wider than the floor, so an extension that ran
+                # to next.start (or into the band just short of it) would
+                # leave a zero or sub-2-frame gap nothing downstream reopens.
+                c["end"] = min(want, nxt_start - TWO_FRAME_S)
             # else: the inter-cue gap is already at/under the 2-frame floor —
             # leave it untouched. Without the guard a second lag-out pass would
             # extend over a chained 2-frame gap and collapse it to zero, which

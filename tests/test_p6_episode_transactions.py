@@ -7,6 +7,9 @@ import json
 import pytest
 
 from voxweave import artifacts, episode_transaction, pipeline, sdh, songdet
+from voxweave import llm_commands
+from voxweave import paths
+from voxweave import vocals
 
 
 def _vtt(text: str = "hello", *, settings: str = "") -> str:
@@ -38,7 +41,7 @@ def test_align_expected_generation_rejects_before_media_or_backend(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("generation mismatch reached media/backend work")
 
-    monkeypatch.setattr(pipeline, "_find_sibling_media", forbidden)
+    monkeypatch.setattr(paths, "find_sibling_media", forbidden)
     with pytest.raises(InputStaleError) as caught:
         pipeline.align(vtt, _expected_vtt_sha256="0" * 64)
     assert caught.value.failure.detail_code == "vtt-generation"
@@ -59,9 +62,9 @@ def test_correct_apply_stale_generation_mutates_nothing(tmp_path, monkeypatch):
         vtt.write_text(concurrent, encoding="utf-8")
         return [{"i": 0, "orig": "hello", "fixed": "hallo", "reason": "typo"}]
 
-    monkeypatch.setattr(pipeline.asrfix_mod, "correct_cues", concurrent_fix)
+    monkeypatch.setattr(llm_commands.asrfix_mod, "correct_cues", concurrent_fix)
     with pytest.raises(InputStaleError) as caught:
-        pipeline.correct(vtt, apply=True)
+        llm_commands.correct(vtt, apply=True)
     assert caught.value.failure.detail_code == "correct-generation"
     assert vtt.read_text(encoding="utf-8") == concurrent
     assert evidence.read_text(encoding="utf-8") == '{"kept":true}\n'
@@ -80,14 +83,14 @@ def test_correct_all_rejected_canonical_rewrite_deletes_stale_evidence(
     cached_evidence = artifacts.claim_paths(media).align_evidence(vtt)
     cached_evidence.write_text("cached stale", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {"i": 0, "orig": "wrong", "fixed": "ignored", "reason": "bad quote"}
         ],
     )
 
-    result = pipeline.correct(vtt, apply=True, align_after=True)
+    result = llm_commands.correct(vtt, apply=True, align_after=True)
 
     assert result["applied"] == []
     assert result["aligned"] is False
@@ -112,10 +115,10 @@ def test_correct_byte_identical_rewrite_retains_evidence(tmp_path, monkeypatch):
     evidence = tmp_path / "episode.align-evidence.json"
     evidence.write_text("still-current", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod, "correct_cues", lambda _payload, **_kwargs: []
+        llm_commands.asrfix_mod, "correct_cues", lambda _payload, **_kwargs: []
     )
 
-    result = pipeline.correct(vtt, apply=True, align_after=True)
+    result = llm_commands.correct(vtt, apply=True, align_after=True)
 
     assert vtt.read_text(encoding="utf-8") == original
     assert evidence.read_text(encoding="utf-8") == "still-current"
@@ -137,7 +140,7 @@ def test_correct_retires_cached_evidence_created_at_commit_seam(tmp_path, monkey
         return real_commit(**kwargs)
 
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "typo"}
@@ -149,7 +152,7 @@ def test_correct_retires_cached_evidence_created_at_commit_seam(tmp_path, monkey
         create_evidence_then_commit,
     )
 
-    pipeline.correct(vtt, apply=True)
+    llm_commands.correct(vtt, apply=True)
 
     assert not cached.exists()
 
@@ -160,7 +163,7 @@ def test_correct_real_fix_hands_exact_committed_hash_to_align(tmp_path, monkeypa
     evidence = tmp_path / "episode.align-evidence.json"
     evidence.write_text("stale", encoding="utf-8")
     monkeypatch.setattr(
-        pipeline.asrfix_mod,
+        llm_commands.asrfix_mod,
         "correct_cues",
         lambda _payload, **_kwargs: [
             {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "typo"}
@@ -174,7 +177,7 @@ def test_correct_real_fix_hands_exact_committed_hash_to_align(tmp_path, monkeypa
         return path
 
     monkeypatch.setattr(pipeline, "align", fake_align)
-    result = pipeline.correct(vtt, apply=True, align_after=True)
+    result = llm_commands.correct(vtt, apply=True, align_after=True)
 
     committed = vtt.read_bytes()
     assert seen["path"] == vtt
@@ -193,6 +196,7 @@ def test_process_injected_words_is_media_free_with_absent_nominal_path(
 
     monkeypatch.setattr(pipeline, "transcribe", forbidden)
     monkeypatch.setattr(pipeline, "decode_to_wav", forbidden)
+    monkeypatch.setattr(vocals, "decode_to_wav", forbidden)
     monkeypatch.setattr(pipeline, "media_fingerprint", forbidden)
     monkeypatch.setattr(songdet, "release_model", forbidden)
 
@@ -374,6 +378,7 @@ def test_sdh_generation_change_retains_existing_auxiliary(
         lambda *_args, **_kwargs: ("en", _units(), None, [], [], None),
     )
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(songdet, "release_model", lambda: released.append("panns"))
 
     def concurrent_event_detection(*_args, **_kwargs):
@@ -781,6 +786,8 @@ def test_process_output_snapshot_precedes_voiceprint_media_snapshot(
             raise AssertionError("media snapshot ran before output snapshot")
 
     monkeypatch.setattr(pipeline, "MediaSnapshot", ForbiddenSnapshot)
+    # process() preflights diarization; the gated default model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
 
     with pytest.raises(IsADirectoryError) as caught:
         pipeline.process(media, diarize=True, voiceprints=True)
@@ -823,6 +830,8 @@ def test_process_voiceprint_candidate_uses_the_same_context_bound_transaction(
         "transcribe",
         lambda *_args, **_kwargs: ("en", _units(), None, [], turns, capture),
     )
+    # process() preflights diarization; the gated default model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     real_commit = episode_transaction.commit_primary_outputs
     seen: dict[str, object] = {}
 
@@ -863,6 +872,75 @@ def test_successful_segmentation_retires_stale_align_evidence(command, tmp_path)
         pipeline.split(json_path)
     assert not evidence.exists()
     assert not cached_evidence.exists()
+
+
+def test_split_reports_a_legacy_render_failure_with_its_cause(tmp_path, monkeypatch):
+    from voxweave import candidate_encoder, segmentation_candidates
+
+    json_path = tmp_path / "episode.json"
+    json_path.write_text(
+        json.dumps({"language": "en", "word_segments": _units()}), encoding="utf-8"
+    )
+
+    def fail_render(*_args, **_kwargs):
+        raise OSError("render target vanished")
+
+    monkeypatch.setattr(
+        segmentation_candidates, "project_segmentation_delivery", fail_render
+    )
+    with pytest.raises(
+        candidate_encoder.SelectedCandidateError, match="render target vanished"
+    ):
+        pipeline.split(json_path)
+    assert not (tmp_path / "episode.vtt").exists()
+
+
+@pytest.mark.parametrize("command", ["process", "split"])
+def test_segmentation_forgets_its_context_once_retired(command, tmp_path, monkeypatch):
+    from voxweave import (
+        align_context,
+        candidate_encoder,
+        segmentation_adapter,
+        segmentation_candidates,
+        segmentation_orchestration,
+    )
+    from voxweave.align_context import ContextAuthorityError, role_vector
+
+    registries = (
+        align_context._ISSUED,
+        candidate_encoder._SETS,
+        candidate_encoder._ENCODED,
+        candidate_encoder._VERIFIED,
+        segmentation_adapter._LEGACY,
+        segmentation_adapter._ADAPTER,
+        segmentation_candidates._ENCODED,
+        segmentation_candidates._VERIFIED,
+    )
+    issued = []
+    issue = segmentation_orchestration.issue_segmentation_context
+
+    def capture_issue(*args, **kwargs):
+        context = issue(*args, **kwargs)
+        issued.append(context)
+        return context
+
+    monkeypatch.setattr(
+        segmentation_orchestration, "issue_segmentation_context", capture_issue
+    )
+    json_path = tmp_path / "episode.json"
+    json_path.write_text(
+        json.dumps({"language": "en", "word_segments": _units()}), encoding="utf-8"
+    )
+    baseline = [len(registry) for registry in registries]
+    if command == "process":
+        pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
+    else:
+        pipeline.split(json_path)
+    (context,) = issued
+    assert [len(registry) for registry in registries] == baseline
+    with pytest.raises(ContextAuthorityError) as caught:
+        role_vector(context)
+    assert caught.value.detail_code == "context-unissued"
 
 
 def test_align_legacy_evidence_writeback_retires_cached_copy(tmp_path, monkeypatch):

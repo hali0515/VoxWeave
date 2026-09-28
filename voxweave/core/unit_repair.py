@@ -21,6 +21,7 @@ from typing import Any
 from voxweave.core.breakpoints import phrase_atoms
 from voxweave.core.langsets import LANGUAGES_WITHOUT_SPACES
 from voxweave.core.layout import _token_char_count
+from voxweave.core.smart_split import _unit_text
 
 #: A word-internal gap wider than this is never phrasing — no-space languages
 #: place phrase boundaries between words, and the aligner assigns voiced frames
@@ -72,7 +73,7 @@ def repair_stranded_tails(
     if lang not in LANGUAGES_WITHOUT_SPACES or len(units) < 2 or not speech_spans:
         return list(units)
 
-    text = "".join(str(u.get("text", u.get("word", ""))) for u in units)
+    text = "".join(_unit_text(u) for u in units)
     starts: set[int] = set()
     cursor = 0
     for phrase in phrase_atoms(text, lang):
@@ -83,7 +84,7 @@ def repair_stranded_tails(
     cursor = 0
     for u in units:
         positions.append(cursor)
-        cursor += _token_char_count(str(u.get("text", u.get("word", ""))))
+        cursor += _token_char_count(_unit_text(u))
     sorted_starts = sorted(starts)
 
     def phrase_index(char_pos: int) -> int:

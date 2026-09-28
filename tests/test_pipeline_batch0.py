@@ -12,9 +12,11 @@ from pathlib import Path
 import pytest
 
 from voxweave import backend, chunking, diarize, pipeline, songdet
+from voxweave import segmentation
 from voxweave.config import gap_thresholds
 from voxweave.core.smart_split import smart_split_segments
 from voxweave.diarize import apply_speaker_format
+from voxweave import vocals
 
 FRAME_S = 1.0 / 24.0
 TWO_FRAME_S = 2 * FRAME_S
@@ -71,7 +73,7 @@ def test_speaker_format_cleanup_undoes_shot_snapping():
     lag-out pad, landing inside the cut's adjustment zone.
     """
     th = gap_thresholds("en")
-    seg = pipeline._units_to_seg(UNITS, "en")
+    seg = segmentation._units_to_seg(UNITS, "en")
     cues = smart_split_segments([seg], lang="en", thresholds=th, shot_changes=SHOTS)
     assert not _zone_violations(cues, SHOTS, th["shot_snap_s"])
 
@@ -186,6 +188,7 @@ def _stub_transcribe_models(monkeypatch, tmp_path):
     wav = tmp_path / "audio.wav"
     wav.write_bytes(b"x")
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *a, **kw: wav)
+    monkeypatch.setattr(vocals, "decode_to_wav", lambda *a, **kw: wav)
     monkeypatch.setattr(
         pipeline, "vad_speech_segments", lambda *a, **kw: [{"start": 0.0, "end": 2.0}]
     )

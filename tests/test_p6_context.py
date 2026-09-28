@@ -53,26 +53,28 @@ def test_roles_are_single_use_scoped_and_terminal_exactly_once(tmp_path):
         ContextAuthorityError,
         consume_context_role,
         retire_live_context_roles,
-        role_events,
         role_vector,
     )
 
     context = _issue(tmp_path)
-    consume_context_role(context, "acquisition", consumer="FreshAlignmentIssuer")
+    consumed = consume_context_role(
+        context, "acquisition", consumer="FreshAlignmentIssuer"
+    )
     with pytest.raises(ContextAuthorityError) as reused:
         consume_context_role(context, "acquisition", consumer="FreshAlignmentIssuer")
     assert reused.value.detail_code == "context-consumed"
-    retire_live_context_roles(context)
+    retired = retire_live_context_roles(context)
     assert role_vector(context) == ("C", "R", "R", "R", "R")
-    assert [(event.role, event.terminal) for event in role_events(context)] == [
-        ("acquisition", "consumed"),
-        ("adapter", "retired"),
-        ("encoder", "retired"),
-        ("evidence-bind", "retired"),
-        ("commit", "retired"),
+    assert [
+        (event.role, event.terminal, event.ordinal) for event in (consumed, *retired)
+    ] == [
+        ("acquisition", "consumed", 0),
+        ("adapter", "retired", 1),
+        ("encoder", "retired", 2),
+        ("evidence-bind", "retired", 3),
+        ("commit", "retired", 4),
     ]
-    retire_live_context_roles(context)
-    assert len(role_events(context)) == 5
+    assert retire_live_context_roles(context) == ()
 
 
 def test_wrong_consumer_and_wrong_role_are_rejected_without_consumption(tmp_path):

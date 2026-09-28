@@ -348,23 +348,6 @@ def test_changed_segmentation_context_registry_family_is_rejected(tmp_path):
     assert error.value.detail_code == "context-binding"
 
 
-def test_changed_legacy_provider_ledger_is_rejected_before_adapter_consumption(
-    tmp_path,
-):
-    from voxweave.align_context import role_vector
-    from voxweave.segmentation_adapter import run_locked_segmentation_adapter
-
-    context, issued = _issued(tmp_path)
-    object.__setattr__(issued, "provider_ledger", _frozen_object({"forged": True}))
-    with pytest.raises(ValueError):
-        run_locked_segmentation_adapter(
-            context,
-            issued,
-            shadow_enabled=False,
-        )
-    assert role_vector(context) == ("L", "L", "L")
-
-
 def test_changed_adapter_binding_is_rejected_before_encoder_consumption(tmp_path):
     from voxweave.align_context import role_vector
     from voxweave.segmentation_candidates import encode_segmentation_candidates

@@ -554,6 +554,74 @@ def test_unknown_rule_and_out_of_range_targets_are_rejected():
         assert any(needle in problem for problem in problems)
 
 
+def _retargeted_chain_document():
+    """A chain leg whose honest answer, written to the WRONG boundary, still passes
+    every value check.
+
+    ``B.start`` sits just under four frames after ``A.end``, so chaining moves
+    ``A.end`` up to ``B.start - 2f``. The forged leg keeps the rule, the cue and
+    the arithmetic but writes that value to ``B.start`` instead: its ``from`` is
+    what ``B.start`` held, its read is true, the rule recomputes to its ``to``,
+    and the resulting stream -- ``B`` pulled two frames early, ``A`` untouched --
+    leaves a gap of just under two frames, which neither chaining nor the ladder
+    moves, so it is a genuine fixed point of the sweep as well.
+    """
+    prof = profile()
+    b_start = 1.0 + 4 * F - 1e-9
+    cues = [cue(0.0, 1.0), cue(b_start, 3.0)]
+    return prof, cues, b_start
+
+
+def test_a_leg_that_moves_the_wrong_boundary_is_rejected():
+    prof, cues, b_start = _retargeted_chain_document()
+    honest = run(cues, prof)
+    assert verify(honest, cues, prof) == ()
+
+    leg = honest.trace.legs[0]
+    assert (leg.rule_id, leg.target) == ("chain", fin.BoundaryRef(0, "end"))
+    forged_leg = dataclasses.replace(
+        leg, target=fin.BoundaryRef(1, "start"), from_value=b_start
+    )
+    forged_delivery = ((0.0, 1.0), (leg.to_value, 3.0))
+    seed = fin.phase1_stream(cues, profile=prof)
+    # every value check holds for the forged leg: the only lie is WHERE it wrote
+    assert (
+        tv.sweep(forged_delivery, seed, profile=prof, evidence=fin.FinalizeEvidence())
+        == forged_delivery
+    )
+    problems = tv.replay_trace(
+        dataclasses.replace(honest.trace, legs=(forged_leg,)),
+        seed,
+        profile=prof,
+        evidence=fin.FinalizeEvidence(),
+        policy=fin.FinalizePolicy(),
+        delivered=forged_delivery,
+    )
+    assert any(
+        "moves the end of cue 0, not the start of cue 1" in problem
+        for problem in problems
+    ), problems
+
+
+def test_a_leg_in_the_wrong_slot_is_rejected():
+    prof, cues, _b_start = _retargeted_chain_document()
+    honest = run(cues, prof)
+    forged_leg = dataclasses.replace(honest.trace.legs[0], slot=5)
+    problems = tv.replay_trace(
+        dataclasses.replace(honest.trace, legs=(forged_leg,)),
+        fin.phase1_stream(cues, profile=prof),
+        profile=prof,
+        evidence=fin.FinalizeEvidence(),
+        policy=fin.FinalizePolicy(),
+        delivered=tuple((c["start"], c["end"]) for c in honest.cues),
+    )
+    assert any("runs in slot 2, not slot 5" in problem for problem in problems)
+
+
+def test_every_rule_id_has_a_declared_write_site():
+    assert set(tv._RULE_WRITES) == set(fin.RULE_IDS)
+
+
 def test_backwards_sweep_numbering_is_rejected():
     """One ordered trajectory, not a bag of legs: sweep numbers may not go back."""
     prof, cues, shots = _r6_document()
@@ -629,6 +697,31 @@ def test_adopting_a_non_minimal_member_is_rejected():
         delivered=highest,
     )
     assert any("numeric minimum" in problem for problem in problems)
+
+
+@pytest.mark.parametrize(
+    "members",
+    [((),), (((0.0, 1.0), (1.0, 2.0)),), (((0.0,),),)],
+    ids=["empty-member", "extra-cue", "half-pair"],
+)
+def test_malformed_cycle_members_are_findings_not_crashes(members):
+    """A member that is not one (start, end) pair per cue cannot be swept."""
+    prof, cues, shots, result = _cycle_run()
+    cycle = result.trace.cycle
+    assert cycle is not None
+    trace = dataclasses.replace(
+        result.trace, cycle=dataclasses.replace(cycle, members=members)
+    )
+    seed = fin.phase1_stream(cues, profile=prof)
+    problems = tv.replay_trace(
+        trace,
+        seed,
+        profile=prof,
+        evidence=fin.FinalizeEvidence(shots=shots),
+        policy=fin.FinalizePolicy(),
+        delivered=tuple((c["start"], c["end"]) for c in result.cues),
+    )
+    assert any("member 0 is not one (start, end) pair" in p for p in problems)
 
 
 # ======================================================== E. the stability check

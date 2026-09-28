@@ -17,6 +17,7 @@ from voxweave import (
     pipeline,
     songdet,
 )
+from voxweave import vocals as vocals_mod
 from voxweave.mediasnapshot import SnapshotUnavailable
 from voxweave.voicebase import (
     load_voiceprints,
@@ -55,6 +56,9 @@ PROVENANCE = {
 @pytest.fixture(autouse=True)
 def _private_snapshot_root(tmp_path, monkeypatch):
     monkeypatch.setenv("VOXWEAVE_CACHE_ROOT", str(tmp_path / "cache-root"))
+    # process() preflights diarization before any audio work: the gated default
+    # model needs a token even though pyannote itself is faked here.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
 
 
 def _capture(turns):
@@ -175,6 +179,7 @@ def test_capture_raw_decoder_reads_stable_snapshot_through_truncate_aba(
         return wav
 
     monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
         pipeline,
         "vad_speech_segments",
@@ -527,6 +532,7 @@ def test_smoothing_active_capture_publishes_valid_four_part_conjunction(
     wav = _stub_transcribe_tail(tmp_path, monkeypatch)
     sf.write(wav, np.zeros(16000, dtype=np.float32), 16000)
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
     # diarize_turns resolves the HF token before reaching the stubbed pipeline;
     # provide one so the test does not depend on ambient credentials.
     monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
@@ -569,16 +575,23 @@ def test_capture_cache_hit_validates_pair_before_decode(tmp_path, monkeypatch):
         separator=SEPARATOR,
     )
     wav = _stub_transcribe_tail(tmp_path, monkeypatch)
-    decoded: list[Path] = []
+    decoded: list[Path | str] = []
+    real_validate = vocals_mod.validate_cache_pair
+
+    def recording_validate(*args, **kwargs):
+        decoded.append("validated")
+        return real_validate(*args, **kwargs)
 
     def fake_decode(source, **_kwargs):
         decoded.append(Path(source))
         return wav
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
+    monkeypatch.setattr(vocals_mod, "validate_cache_pair", recording_validate)
     monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
-        pipeline,
+        vocals_mod,
         "_separate_to_16k_32k",
         lambda *_args, **_kwargs: pytest.fail("bound cache should be a hit"),
     )
@@ -592,7 +605,10 @@ def test_capture_cache_hit_validates_pair_before_decode(tmp_path, monkeypatch):
     )
 
     assert result[0] == "en"
-    assert decoded == [cache.resolve()]
+    # The pair is validated before any decode; the only decodes are the cached
+    # vocals (ASR input) and, after ASR, the source media itself for the
+    # original-audio VAD timing reference (no full-band stem on a cache hit).
+    assert decoded == ["validated", cache.resolve(), media]
     assert Path(f"{cache.resolve()}.lock").exists()
 
 
@@ -625,13 +641,14 @@ def test_capture_cache_autocast_change_reseparates_and_rebinds(tmp_path, monkeyp
         return fullband, vocals, wav, voc32, dict(mixed_precision)
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(mixed_precision))
-    monkeypatch.setattr(pipeline, "_separate_to_16k_32k", fake_separate)
+    monkeypatch.setattr(vocals_mod, "_separate_to_16k_32k", fake_separate)
     monkeypatch.setattr(
-        pipeline,
+        vocals_mod,
         "_encode_flac",
         lambda _source, destination: Path(destination).write_bytes(b"bf16 flac"),
     )
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
 
     pipeline.transcribe(
         media,
@@ -687,9 +704,10 @@ def test_capture_cache_mismatch_reseparates_and_rebinds(tmp_path, monkeypatch):
         return diarize.DiarizationResult(turns=[], centroids=None, provenance={})
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
-    monkeypatch.setattr(pipeline, "_separate_to_16k_32k", fake_separate)
-    monkeypatch.setattr(pipeline, "_encode_flac", fake_encode)
+    monkeypatch.setattr(vocals_mod, "_separate_to_16k_32k", fake_separate)
+    monkeypatch.setattr(vocals_mod, "_encode_flac", fake_encode)
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(diarize, "diarize_turns", fake_diarize)
     monkeypatch.setattr(diarize, "release", lambda: None)
 
@@ -780,6 +798,7 @@ def _run_smoothing_capture(tmp_path, monkeypatch, *, lane):
     wav = _stub_transcribe_tail(tmp_path / lane, monkeypatch)
     sf.write(wav, np.zeros(3 * 16000, dtype=np.float32), 16000)
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     monkeypatch.setattr(
         diarize, "_get_pipeline", lambda _token, _model: _SmoothingPipeline()
@@ -854,6 +873,7 @@ def _stub_decoupled_transcribe(tmp_path, monkeypatch, *, language="English"):
         lambda *_args, **_kwargs: [(language, "hello", [dict(UNIT)])],
     )
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
     seen: dict[str, object] = {}
 
     def fake_diarize(wav_path, **kwargs):

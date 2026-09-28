@@ -1,4 +1,4 @@
-"""Break-point helpers: EN forbidden-break guard and BudouX/jieba phrase atoms (ja/zh)."""
+"""Break-point helpers: EN forbidden line-end tokens and BudouX/jieba phrase atoms (ja/zh)."""
 
 from __future__ import annotations
 
@@ -83,31 +83,6 @@ _FORBIDDEN_LEFT = {
     "has",
     "had",
 }
-
-
-def legal_break_index(tokens: list[str], lang: str, target: int) -> int:
-    """Return a break index near ``target`` whose left side does not end on a forbidden token.
-
-    Searches outward from target; falls back to target if none found.
-    No-op for non-English (CJK handled by BudouX phrase atoms).
-    """
-    n = len(tokens)
-    target = max(1, min(target, n))
-    if lang != "en" or n <= 1:
-        return target
-
-    def ok(i: int) -> bool:
-        return (
-            1 <= i < n and tokens[i - 1].strip(".,!?;:").lower() not in _FORBIDDEN_LEFT
-        )
-
-    if ok(target):
-        return target
-    for d in range(1, n):
-        for cand in (target - d, target + d):
-            if ok(cand):
-                return cand
-    return target
 
 
 # _NO_SPACE is the shared LANGUAGES_WITHOUT_SPACES (imported above), including

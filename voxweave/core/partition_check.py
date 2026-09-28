@@ -14,10 +14,10 @@ Two contracts here carry weight beyond P4:
   display *start* is pushed past the first word that was actually spoken.
 * **attribution is typed.** Every violation records where the partition came
   from (``origin``) and which post-transform stage produced the cue stream
-  (``stage``). Only unwaived ``v2`` violations at the ``raw``/``core`` stages may
-  fail a shadow run: v1's own damage and the legacy display overlay's damage are
-  evidence for the next phase, not a reason to reject an otherwise legal v2
-  partition.
+  (``stage``). Only unwaived ``v2`` violations at the ``raw``, ``core`` and
+  ``finalizer`` stages (:data:`EXIT_DRIVING_STAGES`) may fail a shadow run:
+  v1's own damage and the legacy display overlay's damage are evidence for the
+  next phase, not a reason to reject an otherwise legal v2 partition.
 
 Waivers are declared exemptions, never silent ones: each records the span and
 cap it exempts, so a reader can re-derive the exemption instead of trusting its
@@ -55,8 +55,10 @@ Stage = Literal["raw", "core", "legacy-overlay", "finalizer"]
 ORIGINS: tuple[Origin, ...] = ("v1", "v2")
 STAGES: tuple[Stage, ...] = ("raw", "core", "legacy-overlay", "finalizer")
 
-#: Closed vocabulary of hard-contract failures, sorted so artifact bytes are
-#: stable and a reader can diff two runs' violation sets directly.
+#: Closed vocabulary of hard-contract failures. Nothing here reads it: the
+#: tests pin every kind this module emits against it, so a new kind has to join
+#: the tuple explicitly. Artifact order comes from the check order, not from
+#: this tuple.
 VIOLATION_KINDS: tuple[str, ...] = (
     "duration-cap",
     "forged-report",
@@ -174,7 +176,7 @@ class Violation:
 
     @property
     def exit_driving(self) -> bool:
-        """Only unwaived v2 damage at the raw/core stages may fail the run."""
+        """Only unwaived v2 damage at an ``EXIT_DRIVING_STAGES`` stage may fail the run."""
         return (
             not self.waived
             and self.origin == "v2"
@@ -337,7 +339,6 @@ def check_partition(
     stage: Stage,
     waivers: Mapping[int, Waiver] | None = None,
     origins: Mapping[int, Origin] | None = None,
-    expect_no_overlap: bool = True,
     reports: Sequence[ReportTag] = (),
 ) -> PartitionCheckResult:
     """Run every hard predicate over one locked partition and its cue stream.
@@ -482,7 +483,7 @@ def check_partition(
                             f"start {start} precedes the previous cue's "
                             f"start {p_start}",
                         )
-                    if expect_no_overlap and start < p_end - EPS:
+                    if start < p_end - EPS:
                         report(
                             "overlap",
                             index,

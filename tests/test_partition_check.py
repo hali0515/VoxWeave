@@ -279,22 +279,6 @@ def test_an_off_whitelist_waiver_is_recorded_but_waives_nothing():
     assert result.waivers == (bogus,)
 
 
-def test_overlap_can_be_switched_off_for_a_lane_that_expects_it():
-    partition, cues, us = clean_case()
-    cues[1]["start"] = 0.85
-    cues[1]["speech_start"] = 0.85
-    result = check_partition(
-        partition,
-        cues,
-        units=us,
-        profile=profile(),
-        origin="v2",
-        stage="legacy-overlay",
-        expect_no_overlap=False,
-    )
-    assert "overlap" not in kinds(result)
-
-
 # ---------------------------------------------------------------- speech anchors
 
 

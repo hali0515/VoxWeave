@@ -65,6 +65,10 @@ def audition(tmp_path, monkeypatch):
     return media, seen
 
 
+# What serve passes create_speaker_audition when no library option is given.
+NO_LIBRARY_OPTIONS = {"voices": None, "show": None, "no_match": False}
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -80,7 +84,7 @@ def test_serve_canonical_and_bare_forms(speaker_group, audition, args):
         speaker_group, [str(media) if arg == "EPISODE" else arg for arg in args]
     )
     assert result.exit_code == 0, result.output
-    assert seen["create"] == [(media, {})]
+    assert seen["create"] == [(media, NO_LIBRARY_OPTIONS)]
     assert seen["serve"][0]["open_browser"] is False
     assert seen["serve"][0]["host"] == "127.0.0.1"
     assert seen["serve"][0]["ngrok"] is False
@@ -120,7 +124,7 @@ def test_serve_resolves_episode_reference(speaker_group, audition, suffix):
         speaker_group, ["serve", str(media.with_suffix(suffix))]
     )
     assert result.exit_code == 0, result.output
-    assert seen["create"] == [(media, {})]
+    assert seen["create"] == [(media, NO_LIBRARY_OPTIONS)]
 
 
 def test_manual_and_legacy_no_match_warn_once(speaker_group, audition):

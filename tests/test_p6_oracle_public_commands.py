@@ -46,7 +46,7 @@ def _load_oracle_runner() -> Any:
     return module
 
 
-def _pinned_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def _pinned_environment(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
     for name in tuple(os.environ):
         if name.startswith("LC_"):
             monkeypatch.delenv(name, raising=False)
@@ -54,13 +54,20 @@ def _pinned_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LC_ALL", "C.UTF-8")
     monkeypatch.delenv("TZ", raising=False)
     monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+    # The recorded environment leaves VOXWEAVE_CONFIG unset, so the default
+    # ~/.config/voxweave.conf applies: point HOME at a scratch directory so the
+    # in-process projections never read (or create) the developer's config.
     monkeypatch.delenv("VOXWEAVE_CONFIG", raising=False)
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
 
 
 @pytest.fixture(scope="module")
-def public_authority_run() -> dict[str, Any]:
+def public_authority_run(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, Any]:
     monkeypatch = pytest.MonkeyPatch()
-    _pinned_environment(monkeypatch)
+    _pinned_environment(monkeypatch, tmp_path_factory.mktemp("home"))
     try:
         oracle = _load_oracle_runner()
         manifest = oracle._load_checked_manifest(ORACLE_MANIFEST)
@@ -143,8 +150,9 @@ def test_public_command_artifact_matches_the_standalone_projector_authority(
 
 def test_public_command_environment_rejects_ambient_feature_flags(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ):
-    _pinned_environment(monkeypatch)
+    _pinned_environment(monkeypatch, tmp_path / "home")
     monkeypatch.setenv("VOXWEAVE_VAD_EMISSION_MASK", "1")
     oracle = _load_oracle_runner()
     manifest = oracle._load_checked_manifest(ORACLE_MANIFEST)
@@ -167,8 +175,9 @@ def test_public_command_environment_rejects_ambient_feature_flags(
 
 def test_align_public_cases_expose_production_owned_runtime_phase_traces(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ):
-    _pinned_environment(monkeypatch)
+    _pinned_environment(monkeypatch, tmp_path / "home")
     oracle = _load_oracle_runner()
     manifest = oracle._load_checked_manifest(ORACLE_MANIFEST)
     align_cases = [
@@ -198,8 +207,9 @@ def test_align_public_cases_expose_production_owned_runtime_phase_traces(
 def test_mms_scenario_validator_rejects_incomplete_or_reordered_live_trace(
     mutation: str,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ):
-    _pinned_environment(monkeypatch)
+    _pinned_environment(monkeypatch, tmp_path / "home")
     oracle = _load_oracle_runner()
     manifest = oracle._load_checked_manifest(ORACLE_MANIFEST)
     scenario = next(
@@ -250,8 +260,9 @@ def test_mms_scenario_validator_rejects_incomplete_or_reordered_live_trace(
 def test_uncontained_ao15_validator_rejects_all_late_work(
     forbidden_phase: str,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ):
-    _pinned_environment(monkeypatch)
+    _pinned_environment(monkeypatch, tmp_path / "home")
     oracle = _load_oracle_runner()
     manifest = oracle._load_checked_manifest(ORACLE_MANIFEST)
     scenario = next(
@@ -299,8 +310,9 @@ def test_uncontained_ao15_validator_rejects_all_late_work(
 def test_live_ao_order_mutation_forces_gate_exit_one_without_changing_declarations(
     command: str,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ):
-    _pinned_environment(monkeypatch)
+    _pinned_environment(monkeypatch, tmp_path / "home")
     oracle = _load_oracle_runner()
     declaration = REPO_ROOT / "voxweave" / "align_orchestration.py"
     before = hashlib.sha256(declaration.read_bytes()).hexdigest()

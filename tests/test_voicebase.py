@@ -1,7 +1,6 @@
 """Strict phase-2 JSON, vector, binding, fingerprint, and HTML primitives."""
 
 import hashlib
-import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -269,9 +268,10 @@ def test_four_part_voiceprint_conjunction_accepts_only_complete_match():
         (sidecar, sibling, "b" * 64),
     ]
     for bad_sidecar, bad_sibling, consumer in mutations:
-        assert not voicebase.voiceprint_conjunction_valid(
-            bad_sidecar, bad_sibling, consumer
-        )
+        with pytest.raises(voicebase.Phase2DataError):
+            voicebase.validate_voiceprint_conjunction(
+                bad_sidecar, bad_sibling, consumer
+            )
 
 
 def test_conjunction_requires_sidecar_labels_to_be_in_strict_turns():
@@ -280,17 +280,11 @@ def test_conjunction_requires_sidecar_labels_to_be_in_strict_turns():
         voicebase.validate_voiceprint_conjunction(sidecar, _sibling(), "a" * 64)
 
 
-def test_html_helpers_neutralize_malicious_values_in_all_contexts():
+def test_html_helpers_neutralize_malicious_values():
     malicious = '"><script>alert("x")</script>\u2028\u2029&\''
     text = voicebase.html_text(malicious)
     attribute = voicebase.html_attribute(malicious)
-    script = voicebase.script_json({"name": malicious})
 
     assert "<script>" not in text
     assert "<script>" not in attribute
     assert "&quot;" in text and "&#x27;" in text
-    assert "</script>" not in script.lower()
-    assert "<\\/script>" in script
-    assert "\u2028" not in script and "\u2029" not in script
-    assert "\\u2028" in script and "\\u2029" in script
-    assert json.loads(script.replace("<\\/", "</"))["name"] == malicious

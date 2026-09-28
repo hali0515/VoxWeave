@@ -9,13 +9,13 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from voxweave import pipeline, vocalscache
+from voxweave import pipeline, vocals, vocalscache
 
 
 def _durations(mapping):
     """Patch _probe_duration to look paths up by name in mapping (None = unprobeable)."""
     return patch(
-        "voxweave.pipeline._probe_duration",
+        "voxweave.vocals._probe_duration",
         side_effect=lambda p: mapping.get(p.name),
     )
 
@@ -32,25 +32,25 @@ def _paths(tmp_path):
 def test_fresh_when_durations_match(tmp_path):
     media, cache = _paths(tmp_path)
     with _durations({media.name: 1420.0, cache.name: 1420.2}):
-        assert pipeline._vocals_cache_fresh(cache, media)
+        assert vocals._vocals_cache_fresh(cache, media)
 
 
 def test_stale_when_durations_diverge(tmp_path):
     media, cache = _paths(tmp_path)
     with _durations({media.name: 1360.0, cache.name: 1420.0}):
-        assert not pipeline._vocals_cache_fresh(cache, media)
+        assert not vocals._vocals_cache_fresh(cache, media)
 
 
 def test_stale_when_cache_unreadable(tmp_path):
     media, cache = _paths(tmp_path)
     with _durations({media.name: 1420.0, cache.name: None}):
-        assert not pipeline._vocals_cache_fresh(cache, media)
+        assert not vocals._vocals_cache_fresh(cache, media)
 
 
 def test_fresh_when_media_unprobeable(tmp_path):
     media, cache = _paths(tmp_path)
     with _durations({media.name: None, cache.name: 1420.0}):
-        assert pipeline._vocals_cache_fresh(cache, media)
+        assert vocals._vocals_cache_fresh(cache, media)
 
 
 def test_prepare_align_reuses_fresh_cache(tmp_path):
@@ -59,8 +59,8 @@ def test_prepare_align_reuses_fresh_cache(tmp_path):
     tmp: list = []
     with (
         _durations({media.name: 100.0, cache.name: 100.0}),
-        patch("voxweave.pipeline.decode_to_wav", return_value=wav) as dec,
-        patch("voxweave.pipeline._separate_to_16k_32k") as sep,
+        patch("voxweave.vocals.decode_to_wav", return_value=wav) as dec,
+        patch("voxweave.vocals._separate_to_16k_32k") as sep,
     ):
         got = pipeline._prepare_16k_for_align(
             media, separate=True, normalize=False, reporter=pipeline.Reporter(), tmp=tmp
@@ -78,7 +78,7 @@ def test_first_run_16k_decode_matches_a_cache_hit(tmp_path, normalize, monkeypat
     media, cache = _paths(tmp_path)
     with (
         _durations({media.name: 100.0, cache.name: 100.0}),
-        patch("voxweave.pipeline.decode_to_wav", return_value=tmp_path / "o") as dec,
+        patch("voxweave.vocals.decode_to_wav", return_value=tmp_path / "o") as dec,
     ):
         pipeline._prepare_16k_for_align(
             media,
@@ -97,11 +97,11 @@ def test_first_run_16k_decode_matches_a_cache_hit(tmp_path, normalize, monkeypat
         decoded.append((Path(source), kwargs))
         return out
 
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
         pipeline.backend, "separate_vocals", lambda *_a, **_k: tmp_path / "v.wav"
     )
-    _full, _vocals, wav, voc32 = pipeline._separate_to_16k_32k(
+    _full, _vocals, wav, voc32 = vocals._separate_to_16k_32k(
         media, reporter=pipeline.Reporter(), normalize=normalize
     )
     first_source, first_kwargs = decoded[-1]
@@ -139,8 +139,8 @@ def test_transcribe_rerun_decodes_the_cache_like_its_first_run(
     def stop(*_args, **_kwargs):
         raise _StopAfterAudio
 
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
-    monkeypatch.setattr(pipeline, "_encode_flac", fake_encode)
+    monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(vocals, "_encode_flac", fake_encode)
     monkeypatch.setattr(pipeline, "vad_speech_segments", stop)
     monkeypatch.setattr(
         pipeline.backend, "separate_vocals", lambda *_a, **_k: tmp_path / "v.wav"
@@ -152,7 +152,7 @@ def test_transcribe_rerun_decodes_the_cache_like_its_first_run(
     assert encoded == [first_source]  # the cache stores what the 16k came from
 
     decoded.clear()
-    monkeypatch.setattr(pipeline, "_vocals_cache_fresh", lambda *_a: True)
+    monkeypatch.setattr(vocals, "_vocals_cache_fresh", lambda *_a: True)
     with pytest.raises(_StopAfterAudio):
         pipeline.transcribe(media, normalize=normalize, cache_vocals=cache)
     assert decoded == [(cache, first_kwargs)]
@@ -174,16 +174,16 @@ def test_real_cache_round_trip_gives_the_first_run_samples(tmp_path, normalize):
     stereo = np.stack([voice, 0.8 * voice], axis=1) + 0.01 * rng.normal(
         size=(t.size, 2)
     )
-    vocals = tmp_path / "vocals.flac"  # the separator writes 16-bit FLAC
-    sf.write(vocals, stereo.astype(np.float32), rate, subtype="PCM_16")
+    stem = tmp_path / "vocals.flac"  # the separator writes 16-bit FLAC
+    sf.write(stem, stereo.astype(np.float32), rate, subtype="PCM_16")
 
-    voc32 = pipeline.decode_to_wav(vocals, sample_rate=pipeline.SONGDET_SR)
+    voc32 = pipeline.decode_to_wav(stem, sample_rate=pipeline.SONGDET_SR)
     stored = tmp_path / "cache" / "vocals.32k.flac"
     first = hit = None
     try:
-        pipeline._encode_flac(voc32, stored)
-        first = pipeline._vocals_to_16k(voc32, normalize=normalize)
-        hit = pipeline._vocals_to_16k(stored, normalize=normalize)
+        vocals._encode_flac(voc32, stored)
+        first = vocals._vocals_to_16k(voc32, normalize=normalize)
+        hit = vocals._vocals_to_16k(stored, normalize=normalize)
         first_samples, first_rate = sf.read(first, dtype="int16")
         hit_samples, hit_rate = sf.read(hit, dtype="int16")
     finally:
@@ -201,8 +201,8 @@ def test_prepare_align_reseparates_and_overwrites_stale_cache(tmp_path):
     tmp: list = []
     with (
         _durations({media.name: 90.0, cache.name: 100.0}),
-        patch("voxweave.pipeline._separate_to_16k_32k", return_value=parts) as sep,
-        patch("voxweave.pipeline._encode_flac") as enc,
+        patch("voxweave.vocals._separate_to_16k_32k", return_value=parts) as sep,
+        patch("voxweave.vocals._encode_flac") as enc,
     ):
         got = pipeline._prepare_16k_for_align(
             media, separate=True, normalize=False, reporter=pipeline.Reporter(), tmp=tmp
@@ -221,8 +221,8 @@ def test_prepare_align_skips_stale_legacy_cache(tmp_path):
     parts = tuple(tmp_path / n for n in ("full.wav", "voc.flac", "16k.wav", "32k.wav"))
     with (
         _durations({media.name: 90.0, legacy.name: 100.0}),
-        patch("voxweave.pipeline._separate_to_16k_32k", return_value=parts) as sep,
-        patch("voxweave.pipeline._encode_flac"),
+        patch("voxweave.vocals._separate_to_16k_32k", return_value=parts) as sep,
+        patch("voxweave.vocals._encode_flac"),
     ):
         got = pipeline._prepare_16k_for_align(
             media, separate=True, normalize=False, reporter=pipeline.Reporter(), tmp=[]
@@ -246,8 +246,8 @@ def test_fresh_vocals_miss_writes_into_the_adjacent_cache_claim(tmp_path):
         destination.write_bytes(b"flac")
 
     with (
-        patch("voxweave.pipeline._separate_to_16k_32k", return_value=parts),
-        patch("voxweave.pipeline._encode_flac", side_effect=encode),
+        patch("voxweave.vocals._separate_to_16k_32k", return_value=parts),
+        patch("voxweave.vocals._encode_flac", side_effect=encode),
     ):
         assert (
             pipeline._prepare_16k_for_align(

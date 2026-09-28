@@ -31,6 +31,7 @@ different claims:
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
@@ -222,9 +223,9 @@ def pause_evidence(
     to a confirmed pause.
 
     One honest scoping note about that third value. The segmentation pipeline
-    cannot currently produce it: ``pipeline._copied_spans`` -- the only writer of
+    cannot currently produce it: ``overlay.copied_spans`` -- the only writer of
     ``SegDocument.vad_speech`` on that path -- collapses an empty span list to
-    ``None``, mirroring ``_spans_in``'s persisted-sibling contract that "no spans
+    ``None``, mirroring ``spans_in``'s persisted-sibling contract that "no spans
     recorded" and "empty array" mean the same thing. So the empty-list branch is
     reachable only from a direct caller (a test, or a future capture path that
     distinguishes them). It is implemented rather than removed because the
@@ -237,10 +238,17 @@ def pause_evidence(
     the classifier's 50 ms epsilon is the slack a *boolean* needs, and applying
     it to a fraction would quantize a continuous measurement for no reason.
     "True" means the covered *union*: overlapping spans (which a hand-edited or
-    foreign sibling JSON can carry, since ``_spans_in`` neither sorts nor merges)
+    foreign sibling JSON can carry, since ``overlay.spans_in`` neither sorts nor merges)
     would otherwise have their shared time counted twice and could push the
     fraction past 1.0, under-reporting the effective silence and making the cut
     look more expensive than the evidence says.
+
+    A gap with no length still gets its state from VAD rather than defaulting to
+    ``silence``. Where the units overlap, the fraction is taken over the shared
+    stretch; where they touch, it is 1.0 when a span covers that instant (a span
+    covers its start but not its end, the ``[low, high)`` rule above) and 0.0
+    otherwise. The effective silence is zero either way, so only the label and
+    the fraction move, never the price.
     """
     if (
         prev_end is None
@@ -269,8 +277,16 @@ def pause_evidence(
             effective_ms=gap_ms,
             ramp_ms=offline_ramp_ms(profile),
         )
-    overlapped = _covered_length(low, high, speech_spans) if gap_seconds > 0 else 0.0
-    fraction = 0.0 if gap_seconds <= 0 else min(1.0, overlapped / gap_seconds)
+    if gap_seconds > 0:
+        fraction = min(1.0, _covered_length(low, high, speech_spans) / gap_seconds)
+    elif gap_seconds < 0:
+        # The units overlap: the fraction is taken over the shared stretch.
+        fraction = min(1.0, _covered_length(high, low, speech_spans) / -gap_seconds)
+    else:
+        # The units touch: classify the instant, on the ``[start, end)`` rule.
+        fraction = (
+            1.0 if any(start <= low < end for start, end in speech_spans) else 0.0
+        )
     return PauseEvidence(
         gap_ms_raw=gap_ms,
         vad_state="speech-overlap" if fraction > 0 else "silence",
@@ -314,10 +330,19 @@ def ramp_integral_mean(
 
 
 def pause_cut_cost(evidence: PauseEvidence) -> float:
-    """Price one boundary's pause evidence."""
+    """Price one boundary's pause evidence.
+
+    The uncertainty band is the one the evidence records, and the amplitude is
+    read at call time rather than frozen into ``ramp_integral_mean``'s defaults.
+    """
     if evidence.effective_ms is None or evidence.ramp_ms is None:
         return PAUSE_MISSING_BOUNDS_COST
-    return ramp_integral_mean(evidence.effective_ms, evidence.ramp_ms)
+    return ramp_integral_mean(
+        evidence.effective_ms,
+        evidence.ramp_ms,
+        amplitude=W_PAUSE,
+        uncertainty_ms=evidence.uncertainty_ms,
+    )
 
 
 # --------------------------------------------------------------- breakdowns
@@ -371,18 +396,23 @@ def sum_breakdowns(parts: Iterable[CostBreakdown]) -> CostBreakdown:
     (``vad_state``) has no sum and is dropped rather than being turned into a
     misleading aggregate. It survives on the per-cut breakdowns, which is where
     a reader should look for it anyway.
+
+    A feature sums over the parts that carry it. Edge and cut breakdowns record
+    disjoint feature sets, so a key missing from a part is simply not in that
+    part's schema; requiring it in every part would empty every aggregate of a
+    path. A carried ``None`` is different -- an unknown value -- and drops the
+    key, since a sum that skipped it would not be the total it claims to be.
     """
-    items = list(parts)
     feature_values: dict[str, list[Any]] = {}
     term_totals: dict[str, float] = {}
-    for part in items:
+    for part in parts:
         for key, value in part.features.items():
             feature_values.setdefault(key, []).append(value)
         for key, value in part.weighted_terms.items():
             term_totals[key] = term_totals.get(key, 0.0) + value
     features: dict[str, bool | float | str | None] = {}
     for key, values in feature_values.items():
-        if len(values) == len(items) and all(_numeric(value) for value in values):
+        if all(_numeric(value) for value in values):
             features[key] = float(sum(values))
     return make_breakdown(features, term_totals)
 
@@ -411,6 +441,11 @@ class CostContext:
     speaker_evidence: Any = None
     sing_spans: Sequence[tuple[float, float]] | None = None
     speaker_weight: float = 0.0
+
+    @functools.cached_property
+    def sorted_sentence_nodes(self) -> tuple[int, ...]:
+        """``sentence_nodes`` in ascending order, for bisecting per edge."""
+        return tuple(sorted(self.sentence_nodes))
 
     def next_start_after(self, document_node: int) -> float | None:
         """The first known start at or after a document atom-stream node.
@@ -510,6 +545,7 @@ LAYOUT_SOURCES: tuple[str, ...] = (
     "greedy-packer",
     "renderer-single-line",
     "renderer-two-line",
+    "preview-final-text",
 )
 
 

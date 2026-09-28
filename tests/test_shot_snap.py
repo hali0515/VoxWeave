@@ -12,7 +12,6 @@ import json
 import logging
 import shutil
 import subprocess
-import time
 
 import pytest
 
@@ -262,26 +261,49 @@ def _install_missing_ffmpeg(monkeypatch):
     monkeypatch.setattr(shotdet.subprocess, "Popen", popen)
 
 
+def _detect_shot_changes(media, threshold=None, timeout_s=3600):
+    """Blocking use of the job: start the pass and collect it at once."""
+    return shotdet.ShotDetectionJob().start(media, threshold, timeout_s).result()
+
+
 def test_detect_parses_showinfo(monkeypatch, tmp_path):
     _install_popen(monkeypatch, rc=0, stderr=SHOWINFO)
-    cuts = shotdet.detect_shot_changes(tmp_path / "v.mkv")
+    cuts = _detect_shot_changes(tmp_path / "v.mkv")
     assert cuts == [12.345, 23.4]
 
 
 def test_detect_none_on_no_video(monkeypatch, tmp_path):
     _install_popen(monkeypatch, rc=1)
-    assert shotdet.detect_shot_changes(tmp_path / "a.wav") is None
+    assert _detect_shot_changes(tmp_path / "a.wav") is None
 
 
 def test_detect_none_on_missing_ffmpeg(monkeypatch, tmp_path):
     _install_missing_ffmpeg(monkeypatch)
-    assert shotdet.detect_shot_changes(tmp_path / "v.mkv") is None
+    assert _detect_shot_changes(tmp_path / "v.mkv") is None
 
 
 def test_detect_none_on_timeout(monkeypatch, tmp_path):
     launches = _install_popen(monkeypatch, hang=True)
-    assert shotdet.detect_shot_changes(tmp_path / "v.mkv", timeout_s=1) is None
+    assert _detect_shot_changes(tmp_path / "v.mkv", timeout_s=1) is None
     assert launches[0][2].calls == ["kill"]
+
+
+@pytest.mark.parametrize("raw", ["abc", "0", "-0.2", "1.5", "nan"])
+def test_scene_threshold_env_warns_and_falls_back(monkeypatch, caplog, raw):
+    # unparsable or outside (0, 1] (scene scores lie in [0, 1]) -> default, loudly
+    monkeypatch.setenv("VOXWEAVE_SHOT_SCENE", raw)
+    with caplog.at_level(logging.WARNING, logger="voxweave.shotdet"):
+        assert shotdet._scene_threshold() == shotdet.SCENE_THRESHOLD
+    assert "VOXWEAVE_SHOT_SCENE" in caplog.text
+
+
+def test_scene_threshold_env_in_range_is_used(monkeypatch):
+    monkeypatch.setenv("VOXWEAVE_SHOT_SCENE", " 0.45 ")
+    assert shotdet._scene_threshold() == 0.45
+    monkeypatch.setenv("VOXWEAVE_SHOT_SCENE", "1")
+    assert shotdet._scene_threshold() == 1.0
+    monkeypatch.setenv("VOXWEAVE_SHOT_SCENE", "")
+    assert shotdet._scene_threshold() == shotdet.SCENE_THRESHOLD
 
 
 def test_job_launch_follows_ffmpeg_contract(monkeypatch, tmp_path):
@@ -289,7 +311,7 @@ def test_job_launch_follows_ffmpeg_contract(monkeypatch, tmp_path):
     shotdet.ShotDetectionJob().start(tmp_path / "v.mkv", threshold=0.42)
     (cmd, kwargs, _proc), *rest = launches
     assert not rest
-    # Byte-identical to the argv the blocking detect_shot_changes built before
+    # Byte-identical to the argv the original blocking detector built before
     # the job existed; anything else changes what ffmpeg detects.
     assert cmd == [
         "ffmpeg",
@@ -320,7 +342,7 @@ def test_job_launch_follows_ffmpeg_contract(monkeypatch, tmp_path):
 
 def test_job_result_matches_detect_and_is_idempotent(monkeypatch, tmp_path):
     launches = _install_popen(monkeypatch, rc=0, stderr=SHOWINFO)
-    expected = shotdet.detect_shot_changes(tmp_path / "v.mkv")
+    expected = _detect_shot_changes(tmp_path / "v.mkv")
     job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
     first = job.result()
     assert first == expected == [12.345, 23.4]
@@ -363,28 +385,32 @@ def test_job_keeps_cuts_around_undecodable_stderr_bytes(monkeypatch, tmp_path):
     )
     job = shotdet.ShotDetectionJob().start(tmp_path / "v.mkv")
     assert job.result() == [1.5, 3.5]
-    assert shotdet.detect_shot_changes(tmp_path / "v.mkv") == [1.5, 3.5]
+    assert _detect_shot_changes(tmp_path / "v.mkv") == [1.5, 3.5]
+
+
+def test_job_reaps_a_fast_failing_child_before_collection(monkeypatch, tmp_path):
+    # Audio-only media makes ffmpeg exit at once; the drain thread reaps it on
+    # EOF so it does not linger as a zombie for the whole transcription. The
+    # fake child records its exit status only when polled or waited on, and
+    # nothing but the drain thread touches it before ``result``.
+    launches = _install_popen(monkeypatch, rc=3)
+    job = shotdet.ShotDetectionJob().start(tmp_path / "a.wav")
+    job._join_drain()
+    proc = launches[0][2]
+    assert proc.returncode == 3
+    assert proc.wait_timeouts == []
+    assert job.result() is None
 
 
 @pytest.mark.skipif(shutil.which("sh") is None, reason="needs a POSIX shell")
-def test_job_reaps_a_fast_failing_child_before_collection(monkeypatch, tmp_path):
-    # Audio-only media makes ffmpeg exit at once; the drain thread reaps it on
-    # EOF so it does not linger as a zombie for the whole transcription.
+def test_job_settles_none_for_a_real_fast_failing_child(monkeypatch, tmp_path):
     monkeypatch.setattr(
         shotdet, "_ffmpeg_command", lambda _media, _th: ["sh", "-c", "exit 3"]
     )
     job = shotdet.ShotDetectionJob().start(tmp_path / "a.wav")
-    job._join_drain()
-    assert job._proc is not None
-    # The drain thread polls once when the pipe hits EOF; the exit status can
-    # land a few milliseconds after the child closes stderr, so the reap is
-    # best-effort and is asserted under a short deadline, not on that one poll.
-    deadline = time.monotonic() + 5.0
-    while job._proc.returncode is None and time.monotonic() < deadline:
-        job._proc.poll()
-        time.sleep(0.01)
-    assert job._proc.returncode == 3
     assert job.result() is None
+    assert job._proc is not None
+    assert job._proc.returncode == 3
 
 
 def test_job_drain_failure_settles_none_not_partial_cuts(monkeypatch, tmp_path, caplog):

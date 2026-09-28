@@ -243,7 +243,7 @@ def _optional_json_float(value: float | None) -> FrozenJSON:
 
 
 def _relative_unit_value(unit: StrictCapturedUnit) -> FrozenArray:
-    """The displayed §5.3 fields, in their displayed order."""
+    """Every relative-unit field, in the fixed order its digest encoding binds."""
     return FrozenArray(
         (
             freeze_json(unit.unit_id),
@@ -457,7 +457,7 @@ def qwen_sample_geometry(
     sample_rate: int,
     sample_count: int,
 ) -> QwenSampleGeometry:
-    """Reproduce HEAD's Qwen slice arithmetic and retain both time origins."""
+    """Mirror ``chunking.slice_wav``'s sample arithmetic; retain both time origins."""
     if type(nominal_start) is not float or type(nominal_end) is not float:
         raise SampleGeometryError(
             "sample-geometry", "Qwen nominal bounds must be exact floats"
@@ -519,7 +519,11 @@ class AcquisitionAdmissionLedger:
 
 class FreshSealBroken(RuntimeError):
     def __init__(self, failure: CanonicalFailure):
-        super().__init__(f"{failure.kind}/{failure.phase}/{failure.detail_code}")
+        super().__init__(
+            f"{failure.kind}/{failure.phase}/{failure.detail_code}: an internal"
+            " alignment record changed after it was sealed. This is a VoxWeave bug,"
+            " not a problem with your files; please report it with this message"
+        )
         self.failure = failure
 
 
@@ -703,6 +707,8 @@ class _FreshRecord:
     verified: VerifiedFreshAlignment | None = None
     transfer_terminal: Literal["live", "consumed", "retired"] = "live"
     seals: _FreshSeals | None = None
+    # Per seal detail code, the exact objects its digest last matched.
+    verified_seal_inputs: dict[str, tuple[object, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -790,18 +796,6 @@ _FRESH_LOCK = threading.RLock()
 _ISSUER_TOKEN = object()
 
 
-def _is_sha256(value: object) -> bool:
-    return (
-        type(value) is str
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
-
-
-def _default_digest(label: str, value: str) -> str:
-    return hashlib.sha256(f"{label}\0{value}".encode()).hexdigest()
-
-
 def _stable_fact_digest(value: object) -> str:
     encoded = json.dumps(
         value,
@@ -861,24 +855,39 @@ def _physical_projection(
     return tuple(tuple(getattr(call, name) for name in names) for call in calls)
 
 
-def _context_seal_digest(record: _FreshRecord) -> str:
+# Each seal is split into an inputs projection and a digest over exactly those
+# inputs.  The projection returns the sealed objects themselves (record fields,
+# issued-receipt fields and the context's scalar attributes), so the digest can
+# read nothing the projection does not name and the verifier can memoize on
+# the identity of that tuple (see ``_verify_fresh_seals``).
+def _context_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
     stable = _align_context_stable_fields(record.context)
     context = record.context
-    return _stable_digest(
-        (
-            context.context_content_digest,
-            context.context_binding_digest,
-            context.engine_family,
-            context.effective_iso,
-            context.route_kind,
-            context._issuance_nonce,
-            record.issued.context_content_digest,
-            stable,
-        )
+    return (
+        context.context_content_digest,
+        context.context_binding_digest,
+        context.engine_family,
+        context.effective_iso,
+        context.route_kind,
+        context._issuance_nonce,
+        record.issued.context_content_digest,
+        stable,
     )
 
 
-def _raw_seal_digest(record: _FreshRecord) -> str:
+def _context_seal_digest(*facts: object) -> str:
+    return _stable_digest(facts)
+
+
+def _capture_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
+    return (record.captures, record.physical_calls, record.issued.physical_calls)
+
+
+def _raw_seal_digest(
+    record_captures: tuple[StrictCaptureResult, ...],
+    physical_calls: tuple[PhysicalCallReceipt, ...],
+    issued_physical_calls: tuple[PhysicalCallReceipt, ...],
+) -> str:
     captures = tuple(
         (
             capture.call_index,
@@ -890,7 +899,7 @@ def _raw_seal_digest(record: _FreshRecord) -> str:
             if capture.units is None
             else tuple((unit.unit_id, unit.raw) for unit in capture.units),
         )
-        for capture in record.captures
+        for capture in record_captures
     )
     names = (
         "call_index",
@@ -902,13 +911,17 @@ def _raw_seal_digest(record: _FreshRecord) -> str:
     return _stable_digest(
         (
             captures,
-            _physical_projection(record.physical_calls, names),
-            _physical_projection(record.issued.physical_calls, names),
+            _physical_projection(physical_calls, names),
+            _physical_projection(issued_physical_calls, names),
         )
     )
 
 
-def _relative_seal_digest(record: _FreshRecord) -> str:
+def _relative_seal_digest(
+    record_captures: tuple[StrictCaptureResult, ...],
+    physical_calls: tuple[PhysicalCallReceipt, ...],
+    issued_physical_calls: tuple[PhysicalCallReceipt, ...],
+) -> str:
     captures = tuple(
         (
             capture.call_index,
@@ -931,32 +944,66 @@ def _relative_seal_digest(record: _FreshRecord) -> str:
                 for unit in capture.units
             ),
         )
-        for capture in record.captures
+        for capture in record_captures
     )
     names = ("call_index", "normalized_relative_digest")
     return _stable_digest(
         (
             captures,
-            _physical_projection(record.physical_calls, names),
-            _physical_projection(record.issued.physical_calls, names),
+            _physical_projection(physical_calls, names),
+            _physical_projection(issued_physical_calls, names),
         )
     )
 
 
-def _legacy_slice_seal_digest(record: _FreshRecord) -> str:
+def _legacy_slice_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
+    return (
+        record.legacy_receipts,
+        record.legacy_block_units,
+        record.legacy_relative_block_units,
+        record.physical_calls,
+        record.issued.physical_calls,
+    )
+
+
+def _legacy_slice_seal_digest(
+    legacy_receipts: tuple[LegacyCallDistributionReceipt, ...],
+    legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...],
+    legacy_relative_block_units: tuple[tuple[Mapping[str, Any], ...], ...],
+    physical_calls: tuple[PhysicalCallReceipt, ...],
+    issued_physical_calls: tuple[PhysicalCallReceipt, ...],
+) -> str:
     names = ("call_index", "legacy_slice_digest", "legacy_absolute_digest")
     return _stable_digest(
         (
-            record.legacy_receipts,
-            record.legacy_block_units,
-            record.legacy_relative_block_units,
-            _physical_projection(record.physical_calls, names),
-            _physical_projection(record.issued.physical_calls, names),
+            legacy_receipts,
+            legacy_block_units,
+            legacy_relative_block_units,
+            _physical_projection(physical_calls, names),
+            _physical_projection(issued_physical_calls, names),
         )
     )
 
 
-def _authority_seal_digest(record: _FreshRecord) -> str:
+def _authority_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
+    return (
+        record.transforms,
+        record.physical_calls,
+        record.issued.physical_calls,
+        record.backend_model_config_facts,
+        record.route_input_facts,
+        record.reference_calls,
+    )
+
+
+def _authority_seal_digest(
+    record_transforms: tuple[AuthorityTransformResult, ...],
+    physical_calls: tuple[PhysicalCallReceipt, ...],
+    issued_physical_calls: tuple[PhysicalCallReceipt, ...],
+    backend_model_config_facts: FrozenJSON,
+    route_input_facts: FrozenJSON,
+    reference_calls: tuple[ReferencePhysicalCallFacts, ...],
+) -> str:
     transforms = tuple(
         (
             transform.call_index,
@@ -983,7 +1030,7 @@ def _authority_seal_digest(record: _FreshRecord) -> str:
                 for unit in transform.units
             ),
         )
-        for transform in record.transforms
+        for transform in record_transforms
     )
     names = (
         "call_index",
@@ -1003,10 +1050,10 @@ def _authority_seal_digest(record: _FreshRecord) -> str:
     return _stable_digest(
         (
             transforms,
-            _physical_projection(record.physical_calls, names),
-            _physical_projection(record.issued.physical_calls, names),
-            record.backend_model_config_facts,
-            record.route_input_facts,
+            _physical_projection(physical_calls, names),
+            _physical_projection(issued_physical_calls, names),
+            backend_model_config_facts,
+            route_input_facts,
             tuple(
                 (
                     call.call_index,
@@ -1023,35 +1070,74 @@ def _authority_seal_digest(record: _FreshRecord) -> str:
                     call.authority_origin_seconds,
                     call.geometry_failure,
                 )
-                for call in record.reference_calls
+                for call in reference_calls
             ),
         )
     )
 
 
-def _distribution_seal_digest(record: _FreshRecord) -> str:
-    return _stable_digest((record.distribution, record.issued.distribution))
+def _distribution_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
+    return (record.distribution, record.issued.distribution)
 
 
-def _phase1_seal_digest(record: _FreshRecord) -> str:
-    return _stable_digest(
-        (
-            record.seed,
-            record.issued.seed_status,
-            record.issued.seed_reasons,
-        )
-    )
+def _distribution_seal_digest(
+    distribution: AuthorityDistributionReceipt,
+    issued_distribution: AuthorityDistributionReceipt,
+) -> str:
+    return _stable_digest((distribution, issued_distribution))
 
 
-def _fresh_seals(record: _FreshRecord) -> _FreshSeals:
-    return _FreshSeals(
-        _context_seal_digest(record),
-        _raw_seal_digest(record),
-        _relative_seal_digest(record),
-        _legacy_slice_seal_digest(record),
-        _authority_seal_digest(record),
-        _distribution_seal_digest(record),
-        _phase1_seal_digest(record),
+def _phase1_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
+    return (record.seed, record.issued.seed_status, record.issued.seed_reasons)
+
+
+def _phase1_seal_digest(
+    seed: object, seed_status: str, seed_reasons: tuple[str, ...]
+) -> str:
+    return _stable_digest((seed, seed_status, seed_reasons))
+
+
+# (detail code, ``_FreshSeals`` field, inputs projection, digest over the
+# projected inputs), in verification order.
+_SEALS: tuple[
+    tuple[str, str, Callable[[_FreshRecord], tuple[object, ...]], Callable[..., str]],
+    ...,
+] = (
+    ("context-seal", "context", _context_seal_inputs, _context_seal_digest),
+    ("raw-seal", "raw", _capture_seal_inputs, _raw_seal_digest),
+    ("relative-seal", "relative", _capture_seal_inputs, _relative_seal_digest),
+    (
+        "legacy-slice-seal",
+        "legacy_slice",
+        _legacy_slice_seal_inputs,
+        _legacy_slice_seal_digest,
+    ),
+    ("authority-seal", "authority", _authority_seal_inputs, _authority_seal_digest),
+    (
+        "distribution-seal",
+        "distribution",
+        _distribution_seal_inputs,
+        _distribution_seal_digest,
+    ),
+    ("phase1-seal", "phase1", _phase1_seal_inputs, _phase1_seal_digest),
+)
+
+
+def _seal_fresh_record(record: _FreshRecord) -> None:
+    """Digest every component seal once and remember the objects it covered."""
+    digests: dict[str, str] = {}
+    covered: dict[str, tuple[object, ...]] = {}
+    for detail_code, name, inputs_of, digest_of in _SEALS:
+        inputs = inputs_of(record)
+        digests[name] = digest_of(*inputs)
+        covered[detail_code] = inputs
+    record.seals = _FreshSeals(**digests)
+    record.verified_seal_inputs = covered
+
+
+def _same_objects(left: tuple[object, ...], right: tuple[object, ...]) -> bool:
+    return len(left) == len(right) and all(
+        member is other for member, other in zip(left, right)
     )
 
 
@@ -1077,25 +1163,40 @@ def _raise_component_seal(detail_code: str) -> NoReturn:
 
 
 def _verify_fresh_seals(record: _FreshRecord) -> None:
+    """Re-digest every component seal whose covered objects were swapped.
+
+    A seal whose inputs projection still returns the very objects that were
+    last digested is not recomputed: re-digesting them on every
+    ``_fresh_record`` access cost seven full digests per access, the phase-1
+    seed alone seconds on a long full-pass episode.  Reassigning a record
+    field (a ``dataclasses.replace`` swap included) or an attribute of the
+    context or the issued receipt changes that identity, so the seal is
+    digested again and must still match.
+
+    Not caught: in-place mutation inside an already verified object, such as
+    item assignment in the plain unit mappings of the legacy block units or
+    the reference call nodes, or an ``object.__setattr__`` bypass on a nested
+    frozen dataclass.  Every record field is a private deep copy taken at
+    seal time and every thaw hands out deep copies, so nothing outside this
+    module holds a reference into those objects, and the issued receipt's
+    fields are frozen dataclasses and tuples.  Code that reaches into
+    ``_FRESH`` can rewrite ``seals`` as easily, so the seals never covered it.
+    """
     expected = record.seals
     if expected is None:
         _raise_component_seal("context-seal")
-    checks = (
-        ("context-seal", expected.context, _context_seal_digest),
-        ("raw-seal", expected.raw, _raw_seal_digest),
-        ("relative-seal", expected.relative, _relative_seal_digest),
-        ("legacy-slice-seal", expected.legacy_slice, _legacy_slice_seal_digest),
-        ("authority-seal", expected.authority, _authority_seal_digest),
-        ("distribution-seal", expected.distribution, _distribution_seal_digest),
-        ("phase1-seal", expected.phase1, _phase1_seal_digest),
-    )
-    for detail_code, sealed, projector in checks:
+    for detail_code, name, inputs_of, digest_of in _SEALS:
         try:
-            current = projector(record)
+            inputs = inputs_of(record)
+            covered = record.verified_seal_inputs.get(detail_code)
+            if covered is not None and _same_objects(covered, inputs):
+                continue
+            current = digest_of(*inputs)
         except Exception:
             _raise_component_seal(detail_code)
-        if current != sealed:
+        if current != getattr(expected, name):
             _raise_component_seal(detail_code)
+        record.verified_seal_inputs[detail_code] = inputs
 
 
 def _invalid_capture(
@@ -1134,7 +1235,6 @@ class FreshAlignmentIssuer:
         backend_model_config_facts: object | None,
         route_input_facts: object | None,
         ledger: AcquisitionAdmissionLedger | None,
-        verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None,
     ) -> None:
         if token is not _ISSUER_TOKEN:
             raise TypeError("FreshAlignmentIssuer is private")
@@ -1195,7 +1295,6 @@ class FreshAlignmentIssuer:
             },
         )
         self.ledger = ledger or AcquisitionAdmissionLedger()
-        self.verifier_cut_mutator = verifier_cut_mutator
         self.observed: list[_ObservedPhysicalCall] = []
         self.raw_cursor = 0
         self.sealed = False
@@ -1212,8 +1311,6 @@ class FreshAlignmentIssuer:
         sample_rate: int | None = None,
         sample_count: int | None = None,
         nominal_end_seconds: float | None = None,
-        backend_model_config_digest: str | None = None,
-        route_input_digest: str | None = None,
     ) -> None:
         """AO-07 callback: retain identity/length only; recurse only at sealing."""
         if self.sealed:
@@ -1345,16 +1442,9 @@ class FreshAlignmentIssuer:
                     "sample-geometry", None, "physical-origin-mismatch"
                 )
 
-        model_digest = backend_model_config_digest or self.backend_model_config_digest
-        input_digest = route_input_digest or self.route_input_digest
-        if not _is_sha256(model_digest) or not _is_sha256(input_digest):
-            geometry_failure = StrictFailureLocator(
-                "sample-geometry", None, "sample-geometry"
-            )
-            model_digest = self.backend_model_config_digest
-            input_digest = self.route_input_digest
-        assert isinstance(model_digest, str)
-        assert isinstance(input_digest, str)
+        # Every call shares the issuer's validated source-fact digests.
+        model_digest = self.backend_model_config_digest
+        input_digest = self.route_input_digest
         with align_runtime_activity("AO-07", "raw-id-and-call-observation"):
             self.observed.append(
                 _ObservedPhysicalCall(
@@ -1443,7 +1533,6 @@ def begin_fresh_alignment(
     backend_model_config_facts: object | None = None,
     route_input_facts: object | None = None,
     ledger: AcquisitionAdmissionLedger | None = None,
-    _verifier_cut_mutator: Callable[[tuple[int, ...]], tuple[int, ...]] | None = None,
 ) -> FreshAlignmentSession:
     """Issue an opaque session; the private backend seam owns its observations."""
     issuer = FreshAlignmentIssuer(
@@ -1460,7 +1549,6 @@ def begin_fresh_alignment(
         backend_model_config_facts=backend_model_config_facts,
         route_input_facts=route_input_facts,
         ledger=ledger,
-        verifier_cut_mutator=_verifier_cut_mutator,
     )
     session = object.__new__(FreshAlignmentSession)
     binding = secrets.token_hex(32)
@@ -1647,8 +1735,17 @@ def _assemble_call_capture(
     legacy_slice_digest = _stable_digest(legacy.receipt)
     try:
         legacy_absolute_digest = _stable_digest(legacy.block_units)
-    except Exception:
-        legacy_absolute_digest = None
+    except Exception as exc:
+        # A retained unit outside the JSON domain (e.g. a non-float time) cannot be
+        # sealed; every later consumer would reject a missing digest, so fail here
+        # with the unit's own error instead.
+        _attach_canonical_failure(
+            exc,
+            kind="legacy-time-transform-failed",
+            phase="legacy-time-transform",
+            detail_code="retained-unit-operand",
+        )
+        raise
     physical = PhysicalCallReceipt(
         call_index=call.call_index,
         source_block_indices=call.source_block_indices,
@@ -1834,7 +1931,6 @@ def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment
             route_claims=claims,
             iso=issuer.language,
             _limits=profile,
-            _verifier_cut_mutator=issuer.verifier_cut_mutator,
         )
     if distribution.work.status == "seal-mismatch":
         terminal = distribution.work.terminal_call_index
@@ -1896,7 +1992,7 @@ def seal_fresh_alignment(session: FreshAlignmentSession) -> IssuedFreshAlignment
         copy.deepcopy(issuer.route_input_facts),
     )
     record.public_snapshot = _issued_public_snapshot(issued)
-    record.seals = _fresh_seals(record)
+    _seal_fresh_record(record)
     with _FRESH_LOCK:
         _FRESH[id(issued)] = record
     issuer._dispose()
@@ -1921,6 +2017,25 @@ def _fresh_record(
         ):
             raise ValueError("fresh alignment is unissued, changed, or cross-context")
         return record
+
+
+def _release_fresh_alignments(context: IssuedAlignContext) -> None:
+    """Forget the sessions, sealed acquisitions and transfers issued for ``context``.
+
+    Their records hold deep copies of every captured unit; see
+    :func:`voxweave.align_orchestration.release_align_selection`.
+    """
+    with _FRESH_LOCK:
+        for key in [key for key, row in _FRESH.items() if row.context is context]:
+            del _FRESH[key]
+        for key in [
+            key for key, row in _VERIFIED_FRESH.items() if row.context is context
+        ]:
+            del _VERIFIED_FRESH[key]
+        for key in [
+            key for key, row in _FRESH_SESSIONS.items() if row.issuer.context is context
+        ]:
+            del _FRESH_SESSIONS[key]
 
 
 def _bind_fresh_adapter_payload(
@@ -2194,27 +2309,6 @@ def _fresh_reference_core_inputs(
         copy.deepcopy(payload.v2_policy_status),
         copy.deepcopy(profile_status),
         copy.deepcopy(evidence_status),
-    )
-
-
-def _fresh_evidence_inputs(
-    context: IssuedAlignContext,
-    acquisition: IssuedFreshAlignment,
-) -> tuple[
-    tuple[AuthorityBlock, ...],
-    tuple[StrictCaptureResult, ...],
-    tuple[AuthorityTransformResult, ...],
-    tuple[LegacyCallDistributionReceipt, ...],
-    tuple[tuple[Mapping[str, Any], ...], ...],
-]:
-    """Return a separate thaw of facts needed by the AO-21 evidence binder."""
-    record = _fresh_record(context, acquisition)
-    return (
-        copy.deepcopy(record.blocks),
-        copy.deepcopy(record.captures),
-        copy.deepcopy(record.transforms),
-        copy.deepcopy(record.legacy_receipts),
-        copy.deepcopy(record.legacy_block_units),
     )
 
 

@@ -5,8 +5,11 @@
 pixels via a styled ASS + libass filter and re-encodes the video (constant
 quality capped at the source bitrate, hardware encoder when available: NVENC on
 NVIDIA, VideoToolbox on macOS, libx264/libx265/libsvt-av1 software fallback).
-Both drop nothing from the source except, for burn, the now-redundant subtitle
-tracks.
+pack into mkv keeps every source stream; pack into mp4/webm keeps video, audio
+and text subtitle tracks (image subtitles cannot be stored there and are
+dropped, as is cover art in webm). burn keeps the one real video stream and the
+audio, dropping every subtitle track (now burnt in), data/attachment streams
+and cover art. The container follows the ``-o`` extension when it names one.
 
 Command construction is kept separate from probing/execution so the ffmpeg
 argv builders stay unit-testable without media files or a GPU.
@@ -14,16 +17,23 @@ argv builders stay unit-testable without media files or a GPU.
 
 from __future__ import annotations
 
+import codecs
 import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Collection, Sequence
 from pathlib import Path
 
 from voxweave import fsio, lang
+from voxweave.paths import (
+    detect_subtitle_language as detect_subtitle_language,
+)
+from voxweave.paths import find_subtitle_media, require_output_name, swap_ext
 from voxweave.progress import Reporter
 
 logger = logging.getLogger(__name__)
@@ -31,13 +41,41 @@ logger = logging.getLogger(__name__)
 # Containers pack/burn can write, mapped to the text subtitle codec each stores.
 SUB_CODEC = {"mkv": "srt", "mp4": "mov_text", "webm": "webvtt"}
 
+# ffmpeg muxer for each container, forced with -f when the output file name
+# does not already select it.
+_MUXER = {"mkv": "matroska", "mp4": "mp4", "webm": "webm"}
+
 # Video/audio codecs each non-mkv container can stream-copy (mkv holds anything).
-# pack stream-copies A/V, so an unlisted codec cannot be remuxed as-is.
+# pack stream-copies A/V, so an unlisted codec cannot be remuxed as-is. The mp4
+# audio set is every audio codec ffmpeg 9's mp4 muxer accepts without
+# `-strict experimental` (avformat_query_codec); truehd needs that flag, so it
+# is refused here and packs into mkv.
 _PACK_VIDEO_ALLOW = {
     "mp4": {"h264", "hevc", "av1", "vp9", "mpeg4"},
     "webm": {"vp8", "vp9", "av1"},
 }
 _PACK_AUDIO_ALLOW = {
+    "mp4": {
+        "aac",
+        "ac3",
+        "eac3",
+        "mp3",
+        "mp2",
+        "alac",
+        "flac",
+        "opus",
+        "dts",
+        "vorbis",
+        "mp4als",
+        "mpegh_3d_audio",
+        "qcelp",
+        "evrc",
+        *(
+            f"pcm_{kind}{order}"
+            for kind in ("s16", "s24", "s32", "f32", "f64")
+            for order in ("le", "be")
+        ),
+    },
     "webm": {"opus", "vorbis"},
 }
 
@@ -45,6 +83,10 @@ _PACK_AUDIO_ALLOW = {
 # subs like hdmv_pgs/dvd_subtitle cannot and are dropped when the target
 # container will not store them as-is).
 _TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+
+# Text subtitle codecs Matroska cannot store: pack into mkv converts them to
+# srt instead of stream-copying (3GPP timed text / tx3g probes as mov_text).
+_MKV_CONVERT_SUB_CODECS = {"mov_text", "tx3g"}
 
 # Audio codecs safe to stream-copy into mp4; anything else is re-encoded to AAC.
 # The mov/mp4 muxer stores flac/opus/dts natively, so those copy rather than
@@ -86,11 +128,37 @@ def _run_ffmpeg(cmd: list[str], *, capture: bool) -> None:
             stdin=subprocess.DEVNULL,
             capture_output=capture,
             text=capture,
+            # a non-UTF-8 file name in ffmpeg's output must not fail the run
+            errors="replace" if capture else None,
         )
     except FileNotFoundError as e:
         raise _missing_binary_error(cmd[0]) from e
     if proc.returncode != 0:
         raise _ffmpeg_failure(cmd[0], proc.returncode, proc.stderr if capture else "")
+    if capture:
+        _log_ffmpeg_warnings(cmd[0], proc.stderr)
+
+
+# Distinct stderr lines passed on after a successful run; libass repeats its
+# missing-glyph warning for every glyph.
+_FFMPEG_WARNING_LINES = 10
+
+# Lines ffmpeg prints for any ordinary source, not about this run: the mov
+# demuxer's note on an mp4 cover-art stream (plain decoding prints it too).
+_BENIGN_FFMPEG_LINE = re.compile(r"\bstream \d+, timescale not set$")
+
+
+def _log_ffmpeg_warnings(binary: str, stderr: str | None) -> None:
+    """Pass on what a successful run printed at -loglevel warning (ffmpeg's
+    own warnings and libass's, e.g. a font lacking the subtitle's glyphs)."""
+    lines = list(dict.fromkeys(line.strip() for line in (stderr or "").splitlines()))
+    lines = [line for line in lines if line and not _BENIGN_FFMPEG_LINE.search(line)]
+    if not lines:
+        return
+    shown = lines[:_FFMPEG_WARNING_LINES]
+    if len(lines) > len(shown):
+        shown.append(f"... and {len(lines) - len(shown)} more")
+    logger.warning("%s reported:\n%s", binary, "\n".join(shown))
 
 
 def _ffmpeg_failure(binary: str, returncode: int, stderr: str | None) -> RuntimeError:
@@ -116,7 +184,9 @@ def _run_ffmpeg_progress(
     frames = completed = 0
     out_time = "00:00:00"
     # A file drains diagnostics independently of stdout and avoids a full stderr pipe.
-    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errors:
+    with tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8", errors="replace"
+    ) as errors:
         try:
             proc = subprocess.Popen(
                 command,
@@ -154,9 +224,10 @@ def _run_ffmpeg_progress(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
+        errors.seek(0)
         if returncode != 0:
-            errors.seek(0)
             raise _ffmpeg_failure(command[0], returncode, errors.read())
+        _log_ffmpeg_warnings(command[0], errors.read())
 
 
 def probe_streams(media: Path) -> list[dict]:
@@ -183,19 +254,6 @@ def probe_streams(media: Path) -> list[dict]:
     return json.loads(proc.stdout).get("streams", [])
 
 
-def detect_subtitle_language(sub: Path) -> str | None:
-    """ISO code from a language-tagged subtitle filename ("X.zh.vtt" -> "zh"), else None."""
-    from voxweave.subformats import SUBTITLE_EXTS
-
-    p = Path(sub)
-    stem = p.name
-    if p.suffix.lower() in SUBTITLE_EXTS:
-        stem = stem[: -len(p.suffix)]
-    if "." not in stem:
-        return None
-    return lang.to_iso_or(stem.rsplit(".", 1)[1], None)
-
-
 def track_title(iso: str | None) -> str:
     """Subtitle track title: "VoxWeave Chinese" when the language is known, else "VoxWeave"."""
     return f"VoxWeave {lang.display_name(iso)}" if iso else "VoxWeave"
@@ -204,18 +262,15 @@ def track_title(iso: str | None) -> str:
 def resolve_media(vtt: Path, media: Path | None) -> Path:
     """Return the explicit media path, or find the sibling media next to the VTT.
 
-    Translated VTTs carry a language tag ("X.zh.vtt") while the media is named
-    "X.<ext>", so the lookup also retries with the language token stripped.
-    Sibling lookup itself is pipeline's, the one shared implementation.
+    Translated/derived subtitles carry suffix tags ("X.zh.vtt", "X.sdh.vtt",
+    "X.asrfix.vtt") while the media is named "X.<ext>", so the lookup peels
+    those tags. The lookup itself is :func:`voxweave.paths.find_subtitle_media`,
+    the one shared implementation.
     """
-    from voxweave.pipeline import _find_sibling_media, swap_ext
-
     if media is not None:
         return Path(media)
     vtt = Path(vtt)
-    found = _find_sibling_media(vtt)
-    if found is None and detect_subtitle_language(vtt) is not None:
-        found = _find_sibling_media(swap_ext(vtt, ""))  # drop ".zh" tag and retry
+    found = find_subtitle_media(vtt)
     if found is None:
         raise FileNotFoundError(
             f"no sibling media found for {vtt.name}; pass --media explicitly"
@@ -223,41 +278,118 @@ def resolve_media(vtt: Path, media: Path | None) -> Path:
     return found
 
 
-def _timed_subtitle_check(sub: Path) -> None:
-    """Raise early (with the standard hint) when the subtitle file parses to no
-    timestamped cues (e.g. a plain-text VTT edit draft)."""
-    from voxweave.export import _timed_rows
+def _timed_subtitle_check(sub: Path) -> list[dict]:
+    """Load the subtitle file's cue blocks, raising early (with the standard
+    hint) unless every cue is timed: a plain-text VTT edit draft has nothing to
+    show, and a partly timed file would lose its untimed cues. Shared by pack
+    and burn; export runs the same check."""
+    from voxweave.export import require_timed_blocks
     from voxweave.subformats import load_subtitle_blocks
 
-    _timed_rows(load_subtitle_blocks(Path(sub)))
+    blocks = load_subtitle_blocks(Path(sub))
+    require_timed_blocks(blocks, Path(sub).name)
+    return blocks
 
 
-def default_output(media: Path, container: str, tag: str) -> Path:
-    """Sibling output path "<stem>.<container>"; "<stem>.<tag>.<container>" when
-    that would overwrite the source."""
-    from voxweave.pipeline import swap_ext
+def _utf8_subtitle(sub: Path, temp_dirs: list[Path]) -> Path:
+    """Return ``sub`` when its bytes are UTF-8 (BOM or not), else a UTF-8 copy.
 
-    out = swap_ext(media, f".{container}")
-    if out.resolve() == Path(media).resolve():
-        out = swap_ext(media, f".{tag}.{container}")
-    return out
+    The loader accepts GBK/Big5/cp1252/UTF-16 subtitles, but ffmpeg's subtitle
+    demuxers and libass read them as UTF-8 and drop or mangle the cues. The
+    copy keeps the file name (extension and language tag) inside a fresh temp
+    directory, which is appended to ``temp_dirs`` for the caller to remove.
+    """
+    from voxweave.subformats import decode_subtitle_bytes
+
+    sub = Path(sub)
+    data = sub.read_bytes()
+    try:
+        data.removeprefix(codecs.BOM_UTF8).decode("utf-8")
+        return sub
+    except UnicodeDecodeError:
+        pass
+    text = decode_subtitle_bytes(data, sub.name)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="voxweave-sub-"))
+    temp_dirs.append(tmp_dir)
+    copy = tmp_dir / sub.name
+    copy.write_text(text, encoding="utf-8")
+    return copy
+
+
+def default_output(
+    media: Path,
+    container: str,
+    tag: str,
+    languages: Sequence[str | None] = (),
+) -> Path:
+    """Sibling output path "<stem>.<lang>...<tag>.<container>", e.g.
+    "ep.zh.ja.pack.mkv" or "ep.zh.burn.mp4".
+
+    ``languages`` are the subtitle languages (argument order, de-duplicated;
+    unknown ones are left out), so a pack/burn for one language never
+    overwrites another's; rerunning the same command replaces its own output.
+    The tag is always there, so the name never equals the source's and the
+    subtitle-to-media lookup ("ep.zh.vtt" tries "ep.zh.<ext>", then
+    "ep.<ext>") never picks up a product.
+    """
+    codes = [code for code in dict.fromkeys(languages) if code]
+    return swap_ext(media, "." + ".".join([*codes, tag, container]))
 
 
 def _check_output_clear_of_source(out: Path, media: Path) -> Path:
     """Reject an output path that resolves to the source media: ffmpeg reading
-    and writing the same file truncates the source. Only reachable via an
-    explicit ``-o`` (default_output already sidesteps the collision)."""
+    and writing the same file truncates the source. Reachable via an explicit
+    ``-o`` (or a default name that is a link to the source). An output name too
+    long for its filesystem is refused here too, before ffmpeg runs."""
     if Path(out).resolve() == Path(media).resolve():
         raise ValueError(
             f"output {Path(out).name} is the source media; pick a different -o/--output"
         )
-    return Path(out)
+    return require_output_name(Path(out))
 
 
 def _default_container(media: Path) -> str:
     """Keep the source container when pack can write it, else fall back to mkv."""
     ext = Path(media).suffix.lower().lstrip(".")
     return ext if ext in SUB_CODEC else "mkv"
+
+
+def _output_container(
+    output: Path | None,
+    container: str | None,
+    fallback: str,
+    allowed: Collection[str],
+) -> str:
+    """The container to write.
+
+    An ``-o`` extension naming a container decides (ffmpeg would pick that
+    muxer from it anyway), overriding a different ``--container`` with a
+    warning. Otherwise ``--container``, else ``fallback``; for any other
+    extension the muxer is forced with ``-f`` (see ``_muxer_args``).
+    """
+    name = Path(output).name if output is not None else ""
+    named = Path(name).suffix.lower().lstrip(".")
+    if named in _MUXER:
+        if named not in allowed:
+            raise ValueError(
+                f"cannot write {named} ({name}); choose from {', '.join(allowed)}"
+            )
+        if container is not None and container != named:
+            logger.warning(
+                "writing %s as the output name %s says, not --container %s",
+                named,
+                name,
+                container,
+            )
+        return named
+    return container or fallback
+
+
+def _muxer_args(out: Path, container: str) -> list[str]:
+    """``-f <muxer>`` unless the output extension already selects it."""
+    if Path(out).suffix.lower().lstrip(".") == container:
+        return []
+    return ["-f", _MUXER[container]]
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +404,18 @@ def _packed_sub_codec(sub: Path, container: str) -> str:
     return SUB_CODEC[container]
 
 
-def _check_pack_compat(container: str, streams: list[dict]) -> None:
+def _check_pack_compat(
+    container: str, streams: list[dict], *, output_named: bool = False
+) -> None:
     """Reject stream-copying source codecs the target container cannot hold.
 
     Raised before any ffmpeg run so the caller gets a clear message (and the
-    mkv escape hatch) instead of a cryptic muxer failure. mkv holds everything.
+    mkv escape hatch) instead of a cryptic muxer failure. mkv holds every
+    video/audio codec (text subtitles it cannot hold are converted to srt).
+    ``output_named`` means the ``-o`` extension chose the container, so the
+    hint names that instead of ``--container`` (which it overrides).
     """
+    hint = "an -o name ending in .mkv" if output_named else "--container mkv"
     checks = (
         ("video", _PACK_VIDEO_ALLOW.get(container)),
         ("audio", _PACK_AUDIO_ALLOW.get(container)),
@@ -294,7 +432,7 @@ def _check_pack_compat(container: str, streams: list[dict]) -> None:
             if name and name not in allow:
                 raise ValueError(
                     f"{container} cannot store {name} {kind}; "
-                    f"pack into mkv instead (--container mkv)"
+                    f"pack into mkv instead ({hint})"
                 )
 
 
@@ -310,38 +448,61 @@ def build_pack_cmd(
     (VTT/SRT/ASS) appended as a subtitle track (everything stream-copied, new
     subs transcoded to the container's text codec; ASS into mkv is kept as-is).
 
-    mkv targets carry every source stream (including attachments/fonts); mp4 and
-    webm targets keep video+audio and only those existing subtitle tracks that
-    are text-based (image subs cannot become mov_text/webvtt and are dropped).
+    mkv targets carry every source stream (including attachments/fonts; text
+    subtitles Matroska cannot store, like mov_text, are converted to srt); mp4
+    and webm targets keep video+audio and only those existing subtitle tracks
+    that are text-based (image subs cannot become mov_text/webvtt and are
+    dropped; webm also drops cover art). Only the first packed track is left
+    flagged default. Every output stream gets exactly one codec option, so
+    ffmpeg's warnings (logged after a successful run) are real ones.
     """
     sub_codec = SUB_CODEC[container]
     subs = [s for s in source_streams if s.get("codec_type") == "subtitle"]
-    cmd: list[str] = ["ffmpeg", "-nostdin", "-hide_banner", "-y", "-i", str(media)]
+    cmd: list[str] = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning"]
+    cmd += ["-y", "-i", str(media)]
     for vtt in vtts:
         cmd += ["-i", str(vtt)]
 
+    # source subtitle streams in output order (output s:0, s:1, ...)
+    kept: list[dict] = []
     if container == "mkv":
         cmd += ["-map", "0"]
-        kept_subs = len(subs)
+        kept = subs
     else:
         cmd += ["-map", "0:v", "-map", "0:a?"]
-        kept_subs = 0
+        if container == "webm":
+            for s in source_streams:
+                index = _stream_index(s)
+                if (
+                    s.get("codec_type") == "video"
+                    and (s.get("disposition") or {}).get("attached_pic") == 1
+                    and index is not None
+                ):
+                    logger.warning("dropping cover art (webm cannot store it)")
+                    cmd += ["-map", f"-0:{index}"]
         for s in subs:
             if s.get("codec_name") in _TEXT_SUB_CODECS:
                 cmd += ["-map", f"0:{s['index']}"]
-                kept_subs += 1
+                kept.append(s)
             else:
                 logger.warning(
                     "dropping %s subtitle track (not representable in %s)",
                     s.get("codec_name"),
                     container,
                 )
+    kept_subs = len(kept)
     for i in range(len(vtts)):
         cmd += ["-map", f"{i + 1}:0"]
 
-    cmd += ["-c", "copy"]
+    cmd += ["-c:v", "copy", "-c:a", "copy"]
     if container == "mkv":
-        # existing subs stream-copy; only the appended files are transcoded
+        # data and attachment (font) streams ride along; existing subs
+        # stream-copy unless Matroska cannot store their codec; the appended
+        # files are transcoded
+        cmd += ["-c:d", "copy", "-c:t", "copy"]
+        for i, s in enumerate(kept):
+            convert = s.get("codec_name") in _MKV_CONVERT_SUB_CODECS
+            cmd += [f"-c:s:{i}", "srt" if convert else "copy"]
         for i, vtt in enumerate(vtts):
             cmd += [f"-c:s:{kept_subs + i}", _packed_sub_codec(vtt, container)]
     else:
@@ -366,9 +527,14 @@ def build_pack_cmd(
         if iso:
             cmd += [f"-metadata:s:{spec}", f"language={lang.to_iso3(iso)}"]
         cmd += [f"-metadata:s:{spec}", f"title={track_title(iso)}"]
-    # the first packed track is what the user just produced — make players pick it
+    # the first packed track is what the user just produced — make players pick
+    # it, and only it: a kept source track still flagged default can win.
+    # "-default" drops just that flag (forced/hearing_impaired stay).
+    for i, s in enumerate(kept):
+        if (s.get("disposition") or {}).get("default") == 1:
+            cmd += [f"-disposition:s:{i}", "-default"]
     cmd += [f"-disposition:s:{kept_subs}", "default"]
-    cmd += [str(out)]
+    cmd += [*_muxer_args(out, container), str(out)]
     return cmd
 
 
@@ -393,20 +559,36 @@ def pack(
         require_subtitle(v)
         _timed_subtitle_check(v)
     src = resolve_media(vtts[0], media)
-    cont = container or _default_container(src)
+    cont = _output_container(output, container, _default_container(src), SUB_CODEC)
     if cont not in SUB_CODEC:
         raise ValueError(
             f"unsupported container {cont!r} (choose from {', '.join(SUB_CODEC)})"
         )
     out = _check_output_clear_of_source(
-        output or default_output(src, cont, "pack"), src
+        output
+        or default_output(
+            src, cont, "pack", [detect_subtitle_language(v) for v in vtts]
+        ),
+        src,
     )
     streams = probe_streams(src)
-    _check_pack_compat(cont, streams)  # raise before any ffmpeg run
+    output_named = output is not None and Path(output).suffix.lower() in {
+        f".{name}" for name in _MUXER
+    }
+    # raise before any ffmpeg run
+    _check_pack_compat(cont, streams, output_named=output_named)
     rep.step("pack subtitles")
-    with fsio.atomic_path(out) as tmp_out:
-        cmd = build_pack_cmd(src, vtts, tmp_out, container=cont, source_streams=streams)
-        _run_ffmpeg(cmd, capture=True)
+    temp_dirs: list[Path] = []
+    try:
+        inputs = [_utf8_subtitle(v, temp_dirs) for v in vtts]
+        with fsio.atomic_path(out) as tmp_out:
+            cmd = build_pack_cmd(
+                src, inputs, tmp_out, container=cont, source_streams=streams
+            )
+            _run_ffmpeg(cmd, capture=True)
+    finally:
+        for d in temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
     return out
 
 
@@ -631,6 +813,12 @@ def src_video_bitrate(
     return rate if rate > 0 else None
 
 
+def _stream_index(stream: dict) -> int | None:
+    """ffprobe's absolute stream index, or None when missing/malformed."""
+    index = stream.get("index")
+    return index if isinstance(index, int) and not isinstance(index, bool) else None
+
+
 def _burn_pix_fmt(encoder: str, src_depth: int) -> str:
     """Output pixel format: match the source bit depth, clamped to what the
     encoder can produce.
@@ -655,9 +843,18 @@ def _burn_pix_fmt(encoder: str, src_depth: int) -> str:
 
 
 def _filter_escape(path: str) -> str:
-    """Escape a filename for use inside an ffmpeg filtergraph option value."""
-    out = path.replace("\\", "/")
-    for ch in ("\\", "'", ":", ",", ";", "[", "]"):
+    """Escape a filename for use as a filter option value inside ``-vf``.
+
+    ffmpeg unescapes ``-vf`` twice: the filtergraph parser first (special
+    ``\\ ' [ ] , ;``), then the filter's option parser (special ``\\ ' :``,
+    plus ``=`` so a path is never read as ``key=value``). Escape the inner
+    level first, then the outer one. Windows separators become ``/``
+    (backslash is a legal filename character everywhere else).
+    """
+    out = path.replace("\\", "/") if sys.platform == "win32" else path
+    for ch in ("\\", "'", ":", "="):  # option-value level
+        out = out.replace(ch, "\\" + ch)
+    for ch in ("\\", "'", "[", "]", ",", ";"):  # filtergraph level
         out = out.replace(ch, "\\" + ch)
     return out
 
@@ -673,6 +870,7 @@ def build_burn_cmd(
     src_depth: int,
     audio_codecs: list[str],
     max_rate: int | None = None,
+    video_index: int | None = None,
 ) -> list[str]:
     """Build the ffmpeg argv that burns the styled ASS into the video.
 
@@ -697,7 +895,9 @@ def build_burn_cmd(
         cmd += ["-hwaccel", "videotoolbox"]
     cmd += ["-i", str(media)]
     cmd += ["-vf", f"ass={_filter_escape(str(ass_path))},format={pix}"]
-    cmd += ["-map", "0:v:0", "-map", "0:a?"]
+    # map the exact stream that was sized/measured (skips leading cover art)
+    video_map = f"0:{video_index}" if video_index is not None else "0:v:0"
+    cmd += ["-map", video_map, "-map", "0:a?"]
     cmd += ["-c:v", encoder, *_encoder_args(encoder, quality, max_rate)]
     if container == "mp4" and encoder.split("_")[0] in ("hevc", "libx265"):
         cmd += ["-tag:v", "hvc1"]
@@ -706,7 +906,7 @@ def build_burn_cmd(
         cmd += ["-c:a", "aac", "-b:a", "192k"]
     else:
         cmd += ["-c:a", "copy"]
-    cmd += [str(out)]
+    cmd += [*_muxer_args(out, container), str(out)]
     return cmd
 
 
@@ -717,7 +917,7 @@ def burn(
     codec: str = "hevc",
     encoder: str | None = None,
     quality: int | None = None,
-    container: str = "mp4",
+    container: str | None = None,
     font: str = "Arial",
     font_size: int | None = None,
     output: Path | None = None,
@@ -730,9 +930,10 @@ def burn(
     defaults at any resolution; ASS/SSA inputs go to libass as-is, keeping
     their own styling (--font/--font-size are ignored). With ``bitrate_cap``
     the video bitrate is capped at the source's, so the output is no larger
-    than the source."""
+    than the source. The container is mp4 unless ``container`` or an mkv
+    ``output`` name says otherwise."""
     from voxweave.export import _timed_rows, ass_header, render_ass
-    from voxweave.subformats import load_subtitle_blocks, require_subtitle
+    from voxweave.subformats import require_subtitle
 
     rep = reporter or Reporter()
     native_ass = Path(vtt).suffix.lower() in (".ass", ".ssa")
@@ -742,21 +943,22 @@ def burn(
     steps.append("encode video")
     rep.plan(steps)
     rep.step("check inputs")
+    container = _output_container(output, container, "mp4", ("mp4", "mkv"))
     if container not in ("mp4", "mkv"):
         raise ValueError(f"unsupported container {container!r} (choose mp4 or mkv)")
     require_subtitle(vtt)
     src = resolve_media(vtt, media)
+    out = _check_output_clear_of_source(
+        output
+        or default_output(src, container, "burn", [detect_subtitle_language(vtt)]),
+        src,
+    )
     timed_blocks = None
     if native_ass:
         rows = None
     else:
-        blocks = load_subtitle_blocks(Path(vtt))
-        rows = _timed_rows(blocks)
-        timed_blocks = [
-            block
-            for block in blocks
-            if block.get("start") is not None and block.get("end") is not None
-        ]
+        timed_blocks = _timed_subtitle_check(Path(vtt))  # every cue is timed
+        rows = _timed_rows(timed_blocks, name=Path(vtt).name)
 
     streams = probe_streams(src)
     videos = [s for s in streams if s.get("codec_type") == "video"]
@@ -792,17 +994,15 @@ def burn(
     rep.step("select encoder")
     enc = pick_encoder(codec, force=encoder)
     q = quality if quality is not None else _DEFAULT_QUALITY.get(enc, 23)
-    out = _check_output_clear_of_source(
-        output or default_output(src, container, "burn"), src
-    )
 
     tmp_ass: Path | None = None
+    temp_dirs: list[Path] = []
     if native_ass:
         if font != "Arial" or font_size is not None:
             logger.warning(
                 "ASS input keeps its own styling; --font/--font-size ignored"
             )
-        ass_path = Path(vtt)
+        ass_path = _utf8_subtitle(Path(vtt), temp_dirs)
     else:
         rep.step("prepare subtitles")
         header = ass_header(width=width, height=height, font=font, font_size=font_size)
@@ -828,6 +1028,7 @@ def burn(
                 src_depth=depth,
                 audio_codecs=audio_codecs,
                 max_rate=max_rate,
+                video_index=_stream_index(video),
             )
             cap_note = f", capped at {max_rate // 1000} kb/s" if max_rate else ""
             logger.info(
@@ -846,4 +1047,6 @@ def burn(
     finally:
         if tmp_ass is not None:
             tmp_ass.unlink(missing_ok=True)
+        for d in temp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
     return out

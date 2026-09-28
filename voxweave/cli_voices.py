@@ -12,10 +12,11 @@ import rich_click as click
 from rich.console import Console
 from rich.table import Table
 
-_DIR_HELP = (
-    "Voice library directory (default: VOXWEAVE_VOICES_DIR, conf [voices].dir, "
-    "or ~/.local/share/voxweave/voices)."
+VOICES_DIR_DEFAULT = (
+    "default: VOXWEAVE_VOICES_DIR, conf [voices].dir, "
+    "$XDG_DATA_HOME/voxweave/voices, else ~/.local/share/voxweave/voices"
 )
+_DIR_HELP = f"Voice library directory ({VOICES_DIR_DEFAULT})."
 
 
 class VoicesDirPath(click.Path):

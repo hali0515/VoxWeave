@@ -289,6 +289,8 @@ def test_process_commit_and_purge_serialize_as_one_episode_set(tmp_path, monkeyp
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
     monkeypatch.setattr(episode_transaction, "_replace_stage", blocking_replace)
+    # process() preflights diarization; the gated default model needs a token.
+    monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     with ThreadPoolExecutor(max_workers=2) as pool:
         processing = pool.submit(
             pipeline.process,

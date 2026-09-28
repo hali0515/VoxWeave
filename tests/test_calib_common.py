@@ -185,6 +185,25 @@ def test_unparsable_json_is_calibration_error(tmp_path: Path) -> None:
         cc.read_json(path)
 
 
+def test_non_utf8_json_is_calibration_error_naming_the_file(tmp_path: Path) -> None:
+    path = tmp_path / "latin1.json"
+    path.write_bytes(b'{"k": "\xff"}')
+    with pytest.raises(cc.CalibrationError) as excinfo:
+        cc.read_json(path)
+    assert str(path) in excinfo.value.message
+
+
+def test_schema_errors_notice_only_when_errors_dropped() -> None:
+    schema = {"type": "object", "properties": {k: {"type": "string"} for k in "abc"}}
+    doc = {"a": 1, "b": 2, "c": 3}
+    exact = cc.schema_errors(doc, schema, limit=3)
+    assert len(exact) == 3
+    assert not any("suppressed" in e for e in exact)
+    capped = cc.schema_errors(doc, schema, limit=2)
+    assert len(capped) == 3
+    assert capped[-1] == "... (1 further errors suppressed)"
+
+
 def test_read_json_or_exit2_uses_exit_code_2(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as excinfo:
         cc.read_json_or_exit2(tmp_path / "missing.json")
@@ -515,7 +534,7 @@ def test_ratio_rejects_impossible_counts() -> None:
 def test_micro_aggregation_is_not_a_mean_of_rates() -> None:
     # Short case 1/2 (50%) and long case 1/98 (~1%): the micro rate is 2/100,
     # the (wrong) macro average would be ~25.5%.
-    total = cc.merge_ratios([cc.Ratio(1, 2), cc.Ratio(1, 98)])
+    total = cc.Ratio(1, 2) + cc.Ratio(1, 98)
     assert total == cc.Ratio(2, 100)
     assert total.value == pytest.approx(0.02)
 
@@ -533,20 +552,11 @@ def test_micro_aggregator_pools_ratios_and_samples() -> None:
     assert agg.ratio("zh", "forbidden_end_rate") == cc.Ratio(1, 40)
     assert agg.ratio("en", "forbidden_end_rate") == cc.Ratio(0, 0)
     assert sorted(agg.samples("all", "cps")) == [9.0, 12.0, 18.0]
-    assert agg.groups() == ["all", "ja", "zh"]
-    assert agg.metrics("zh") == ["cps", "forbidden_end_rate"]
 
 
 # --------------------------------------------------------------------------- #
 # Exit-code contract
 # --------------------------------------------------------------------------- #
-
-
-def test_exit_code_contract() -> None:
-    assert cc.exit_code(valid=True, gates_passed=True) == 0
-    assert cc.exit_code(valid=True, gates_passed=False) == 1
-    assert cc.exit_code(valid=False, gates_passed=True) == 2
-    assert cc.exit_code(valid=False, gates_passed=False) == 2
 
 
 def test_die_helpers_use_the_shared_codes(capsys: pytest.CaptureFixture[str]) -> None:
@@ -571,6 +581,24 @@ def test_run_cli_maps_calibration_error_to_2() -> None:
     with pytest.raises(SystemExit) as ok:
         cc.run_cli(lambda: cc.EXIT_OK)
     assert ok.value.code == 0
+
+
+def test_run_cli_maps_an_unexpected_exception_to_2_not_1(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Malformed-but-parseable input that a check missed must not exit 1, which
+    # reads as "a quality gate regressed".
+    def crash() -> int:
+        raise KeyError("lanes")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cc.run_cli(crash)
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "Traceback" in err
+    assert "internal error: KeyError: 'lanes'" in err
+    assert "not a quality regression" in err
 
 
 def test_calib_common_does_not_pull_the_inference_stack() -> None:

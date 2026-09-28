@@ -48,7 +48,6 @@ import json
 import logging
 import os
 import re
-import secrets
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -93,7 +92,11 @@ from voxweave.voicestore import (
     EnrollmentRefusal,
     ExemplarKey,
     canonical_store_path,
+    event_time,
     load_voice_store,
+    mint_unique_id,
+    new_exemplar_id,
+    new_identity_id,
     normalize_episode,
     normalize_speaker_key,
     plan_indexed_enrollment,
@@ -130,7 +133,6 @@ HISTORY_ACTIONS = frozenset(
         "rename",
         "forget",
         "import",
-        "split",
         "orphan",
         "rescope",
     }
@@ -625,9 +627,12 @@ class LibraryState:
     compare-and-swap baseline of a later :func:`commit`.
 
     ``orphans`` counts, per space, the exemplars of identities that do not
-    exist, which were dropped from ``spaces`` on read (the next commit
-    deletes them from disk); ``missing_spaces`` names spaces that
-    ``identities.json`` lists but that could not be found.
+    exist, which were dropped from ``spaces`` on read; ``orphan_exemplars``
+    holds them. The next commit deletes only those of forgotten (tombstoned)
+    ids and carries the rest through unchanged: an ``identities.json``
+    rolled back to an older copy must not cost the newer voices their
+    samples. ``missing_spaces`` names spaces that ``identities.json`` lists
+    but that could not be found.
     """
 
     paths: LibraryPaths
@@ -637,6 +642,7 @@ class LibraryState:
     all_spaces: bool = False
     orphans: dict[str, dict[str, int]] = field(default_factory=dict)
     missing_spaces: tuple[str, ...] = ()
+    orphan_exemplars: dict[str, dict[str, list[object]]] = field(default_factory=dict)
 
     @property
     def identity_map(self) -> dict[str, dict[str, object]]:
@@ -645,6 +651,24 @@ class LibraryState:
     @property
     def forgotten(self) -> frozenset[str]:
         return frozenset(forgotten_ids(self.identities))
+
+    def kept_orphans(self, name: str) -> dict[str, list[object]]:
+        """Orphan exemplars of ``name`` a writer keeps: ids not forgotten."""
+        tombstones = self.forgotten
+        return {
+            identity_id: items
+            for identity_id, items in self.orphan_exemplars.get(name, {}).items()
+            if identity_id not in tombstones
+        }
+
+    def orphan_ids(self, name: str) -> tuple[set[str], set[str]]:
+        """Identity and exemplar ids held by the orphans of space ``name``."""
+        held = self.orphan_exemplars.get(name, {})
+        return set(held), {
+            cast(str, cast(Mapping[str, object], item)["id"])
+            for items in held.values()
+            for item in items
+        }
 
     def space_exemplars(self, name: str) -> dict[str, list[dict[str, object]]]:
         space = self.spaces.get(name)
@@ -708,28 +732,90 @@ def validate_relations(state: LibraryState) -> None:
 
 def _drop_orphans(
     identities: Mapping[str, object], spaces: Mapping[str, dict[str, object]]
-) -> dict[str, dict[str, int]]:
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, list[object]]]]:
     """Remove, in place, the exemplars of identities that do not exist.
 
-    They can only be left by an interrupted or unlocked writer (or a manual
-    edit); refusing to read the library over them would also block the
-    ``forget`` that removes them, so readers skip them and writers delete them.
+    Returns their per-space counts and the removed exemplars. They are left
+    by a forget racing a writer on a mount without working locks, by a
+    manual edit, or by an ``identities.json`` rolled back to an older copy
+    (a partial backup restore, a sync conflict). Refusing to read the
+    library over them would also block the ``forget`` that removes them, so
+    readers skip them. Writers delete only those of forgotten (tombstoned)
+    ids; the others are kept until ``identities.json`` is restored (see
+    :func:`commit`). A missing ``identities.json`` is refused by
+    :func:`read_state` instead (see :func:`_refuse_missing_identities`).
     """
     known = cast(Mapping[str, object], identities["identities"])
+    tombstones = set(forgotten_ids(identities))
     dropped: dict[str, dict[str, int]] = {}
+    removed: dict[str, dict[str, list[object]]] = {}
     for name, document in spaces.items():
         exemplars = cast(dict[str, list[object]], document["exemplars"])
         for identity_id in sorted(set(exemplars) - set(known)):
-            dropped.setdefault(name, {})[identity_id] = len(exemplars.pop(identity_id))
+            items = exemplars.pop(identity_id)
+            dropped.setdefault(name, {})[identity_id] = len(items)
+            removed.setdefault(name, {})[identity_id] = items
         if name in dropped:
-            log.warning(
-                "voice library space %s holds voice samples of %d unknown "
-                "identities (left by an interrupted or unlocked writer); they are "
-                "ignored, and the next change to the library deletes them",
-                name,
-                len(dropped[name]),
+            kept = {i: n for i, n in dropped[name].items() if i not in tombstones}
+            if kept:
+                log.warning(
+                    "voice library space %s holds %d voice sample(s) of %d "
+                    "identities that %s does not list (it may have been "
+                    "restored from an older copy, or edited by hand); they are "
+                    "ignored but kept. Restore %s to use them again; to delete "
+                    "them, restore it and run `voxweave voices forget` on those "
+                    "ids, or remove them from %s/%s.json by hand",
+                    name,
+                    sum(kept.values()),
+                    len(kept),
+                    IDENTITIES_NAME,
+                    IDENTITIES_NAME,
+                    SPACES_DIRNAME,
+                    name,
+                )
+            if len(kept) < len(dropped[name]):
+                log.warning(
+                    "voice library space %s holds %d voice sample(s) of "
+                    "forgotten identities; they are ignored, and the next "
+                    "command that changes the library deletes them",
+                    name,
+                    sum(n for i, n in dropped[name].items() if i in tombstones),
+                )
+    return dropped, removed
+
+
+def _refuse_missing_identities(
+    paths: LibraryPaths,
+    loaded: Mapping[str, dict[str, object]],
+    unread: Iterable[str],
+) -> None:
+    """Refuse a library whose ``identities.json`` is gone but whose samples are not.
+
+    Read as an empty library, every voice sample would be an orphan, and the
+    next enrollment or import would delete them all. ``loaded`` holds the
+    spaces already read; the space files named in ``unread`` are read here.
+    """
+    samples = 0
+    for name in sorted({*loaded, *unread}):
+        document = loaded.get(name)
+        if document is None:
+            raw = _read_bounded(paths.space(name), SPACE_MAX_BYTES)
+            if raw is None:
+                continue
+            document = _decode(
+                raw, source=f"{SPACES_DIRNAME}/{name}.json", max_bytes=SPACE_MAX_BYTES
             )
-    return dropped
+            validate_space(document, name=name)
+        exemplars = cast(Mapping[str, Sequence[object]], document["exemplars"])
+        samples += sum(len(items) for items in exemplars.values())
+    if samples:
+        raise VoiceLibraryError(
+            f"voice library {paths.root}: {IDENTITIES_NAME} is missing, but "
+            f"{SPACES_DIRNAME}/ holds {samples} voice sample(s); without it they "
+            f"belong to no one and the next change would delete them. Restore "
+            f"{IDENTITIES_NAME} (from a backup, or wherever it was moved) to use "
+            "the library; nothing was deleted"
+        )
 
 
 def read_state(
@@ -743,7 +829,8 @@ def read_state(
     Every space means every space ``identities.json`` lists, every space file
     found in the directory, and ``include`` (spaces a writer may create).
     Call it while holding :func:`library_lock`. A missing library reads as an
-    empty one.
+    empty one; a missing ``identities.json`` beside space files that still
+    hold voice samples is refused.
     """
     paths = LibraryPaths(Path(root))
     observed: dict[Path, bytes | None] = {}
@@ -775,13 +862,17 @@ def read_state(
         )
         validate_space(document, name=name)
         loaded[name] = document
+    if raw is None:
+        _refuse_missing_identities(
+            paths, loaded, () if spaces is None else list_space_names(paths)
+        )
     if missing:
         log.warning(
             "voice library %s lists space file(s) that cannot be found: %s",
             paths.root,
             ", ".join(missing),
         )
-    orphans = _drop_orphans(identities, loaded)
+    orphans, orphan_exemplars = _drop_orphans(identities, loaded)
     state = LibraryState(
         paths,
         identities,
@@ -790,6 +881,7 @@ def read_state(
         spaces is None,
         orphans=orphans,
         missing_spaces=tuple(missing),
+        orphan_exemplars=orphan_exemplars,
     )
     validate_relations(state)
     return state
@@ -811,11 +903,14 @@ def _chmod_best_effort(path: Path, mode: int) -> None:
 def _ensure_private_dir(path: Path, *, parents: bool = False) -> None:
     """Create ``path``; only a directory created here gets 0o700.
 
-    A pre-existing directory keeps its mode, so a NAS share prepared for
-    several users or machines is never narrowed behind the owner's back.
-    Missing parents are created only with ``parents`` (the built-in
-    location); otherwise they are refused, since a missing parent of a
-    configured library usually is a network share that is not mounted.
+    A library belongs to one account: every file in it (the lock included) is
+    created 0o600, and libraries shared between user accounts are not
+    supported (several machines can share one through the same account). A
+    pre-existing directory keeps the mode its owner gave it; the files inside
+    are private either way. Missing parents are created only with
+    ``parents`` (the built-in location); otherwise they are refused, since a
+    missing parent of a configured library usually is a network share that is
+    not mounted.
     """
     if path.is_dir():
         return
@@ -930,7 +1025,7 @@ def _write_cas(path: Path, payload: str, *, expected: bytes | None) -> None:
                 "(is locking enabled on this mount?); re-run the command"
             )
 
-    fsio.atomic_write_text(path, payload, before_replace=still_expected)
+    fsio.atomic_write_text(path, payload, before_replace=still_expected, private=True)
 
 
 # fsio.atomic_path names its temp files ``.<stem>.<random>.part<suffix>``.
@@ -1027,7 +1122,7 @@ def _rewrite_history_redacted(
             kept.append(line)
     kept.extend(canonical_json_bytes(row) for row in rows)
     payload = b"".join(line + b"\n" for line in kept)
-    with fsio.atomic_path(paths.history) as temporary:
+    with fsio.atomic_path(paths.history, private=True) as temporary:
         with open(temporary, "wb") as handle:
             handle.write(payload)
             handle.flush()
@@ -1048,9 +1143,14 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
     paths = state.paths
     healed_spaces: dict[str, dict[str, object]] = {}
     healed_history: list[dict[str, object]] = []
-    for name, dropped in sorted(state.orphans.items()):
-        # Delete what read_state skipped: vectors of identities that do not
-        # exist (a space the change rewrites anyway was read without them).
+    tombstones = state.forgotten
+    for name, all_dropped in sorted(state.orphans.items()):
+        # Delete the orphans of forgotten ids (a space the change rewrites
+        # anyway was read without them). Those of other ids are carried
+        # through below: identities.json may be an older copy.
+        dropped = {i: n for i, n in all_dropped.items() if i in tombstones}
+        if not dropped:
+            continue
         healed_history.append(
             history_row(
                 "orphan",
@@ -1079,6 +1179,28 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
         validate_space(document, name=name)
         merged_spaces[name] = document
     validate_relations(LibraryState(paths, identities, merged_spaces, state.observed))
+    carried: dict[str, dict[str, object]] = {}
+    for name, document in change.spaces.items():
+        kept = state.kept_orphans(name)
+        if not kept:
+            continue
+        written = copy.deepcopy(document)
+        exemplars = cast(dict[str, list[object]], written["exemplars"])
+        clash = sorted(set(kept) & set(exemplars))
+        if clash:
+            raise VoiceLibraryError(
+                f"{SPACES_DIRNAME}/{name}.json holds "
+                f"{sum(len(items) for items in kept.values())} voice sample(s) "
+                f"of identities {IDENTITIES_NAME} does not list, and this "
+                f"change would add samples under the same id ({', '.join(clash)}). "
+                f"Restore {IDENTITIES_NAME} (it may be an older copy); nothing "
+                "was changed"
+            )
+        exemplars.update(copy.deepcopy(kept))
+        validate_space(written, name=name)
+        carried[name] = written
+    if carried:
+        change = dataclasses.replace(change, spaces={**change.spaces, **carried})
 
     writes: list[tuple[Path, str]] = []
     if change.identities is not None:
@@ -1129,33 +1251,6 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
 # --------------------------------------------------------------------------
 # Transitions (pure: they never touch the filesystem)
 # --------------------------------------------------------------------------
-
-
-def _default_identity_id() -> str:
-    return f"v{secrets.token_hex(6)}"
-
-
-def _default_exemplar_id() -> str:
-    return f"x{secrets.token_hex(4)}"
-
-
-def _mint(
-    factory: Callable[[], str],
-    used: set[str],
-    validator: Callable[[object], str],
-    kind: str,
-) -> str:
-    for _attempt in range(1024):
-        candidate = validator(factory())
-        if candidate not in used:
-            return candidate
-    raise EnrollmentRefusal(f"could not mint a unique {kind} id")
-
-
-def _event_time(at: str | datetime | None) -> str:
-    if isinstance(at, str):
-        return require_utc_timestamp(at, "event timestamp")
-    return utc_timestamp(at)
 
 
 def scoped_episode(scope: str, episode: str) -> str:
@@ -1434,8 +1529,8 @@ def enroll_entries(
     entries: Sequence[EnrollEntry],
     replace_episode: bool = False,
     at: str | datetime | None = None,
-    identity_id_factory: Callable[[], str] = _default_identity_id,
-    exemplar_id_factory: Callable[[], str] = _default_exemplar_id,
+    identity_id_factory: Callable[[], str] = new_identity_id,
+    exemplar_id_factory: Callable[[], str] = new_exemplar_id,
 ) -> tuple[LibraryChange, tuple[EnrollOutcome, ...]]:
     """Enroll one episode's named speakers into the space of ``provenance``.
 
@@ -1447,7 +1542,7 @@ def enroll_entries(
     """
     if type(replace_episode) is not bool:
         raise EnrollmentRefusal("replace_episode must be a boolean")
-    event_at = _event_time(at)
+    event_at = event_time(at, "event timestamp")
     scope = normalize_scope(scope)
     episode = normalize_episode(source.episode)
     capture = require_capture_id(source.capture_id)
@@ -1469,7 +1564,8 @@ def enroll_entries(
     identities_document = copy.deepcopy(state.identities)
     identities = cast(dict[str, dict[str, object]], identities_document["identities"])
     exemplars_by_identity = cast(dict[str, list[dict[str, object]]], space["exemplars"])
-    used_exemplars = _used_exemplar_ids(space)
+    orphan_identities, orphan_exemplars = state.orphan_ids(space_name)
+    used_exemplars = _used_exemplar_ids(space) | orphan_exemplars
     history: list[dict[str, object]] = []
     outcomes: list[EnrollOutcome] = []
     targets: set[str] = set()
@@ -1481,8 +1577,11 @@ def enroll_entries(
         normalize_speaker_key(name)
         vector = list(validate_vector(entry.vector, dim=dim, field="incoming vector"))
         if entry.identity_id is None:
-            identity_id = _mint(
-                identity_id_factory, set(identities), require_identity_id, "identity"
+            identity_id = mint_unique_id(
+                identity_id_factory,
+                set(identities) | orphan_identities,
+                require_identity_id,
+                "identity",
             )
         else:
             identity_id = require_identity_id(entry.identity_id)
@@ -1571,7 +1670,7 @@ def enroll_entries(
             )
             continue
 
-        exemplar_id = _mint(
+        exemplar_id = mint_unique_id(
             exemplar_id_factory, used_exemplars, require_exemplar_id, "exemplar"
         )
         used_exemplars.add(exemplar_id)
@@ -1676,7 +1775,7 @@ def rename_identity(
     identity = cast(dict[str, dict[str, object]], document["identities"])[identity_id]
     if identity["display_name"] == name:
         return LibraryChange()
-    event_at = _event_time(at)
+    event_at = event_time(at, "event timestamp")
     identity["display_name"] = name
     identity["updated"] = event_at
     document["revision"] = cast(int, document["revision"]) + 1
@@ -1714,7 +1813,7 @@ def forget_identity(
             'deleted on purpose, remove its name from the "spaces" list in '
             "identities.json"
         )
-    event_at = _event_time(at)
+    event_at = event_time(at, "event timestamp")
     identities = copy.deepcopy(state.identities)
     del cast(dict[str, object], identities["identities"])[identity_id]
     identities["forgotten"] = [*forgotten_ids(identities), identity_id][-MAX_FORGOTTEN:]
@@ -1839,7 +1938,7 @@ def import_store(
     source_label: str,
     also_scopes: Sequence[str] = (),
     at: str | datetime | None = None,
-    exemplar_id_factory: Callable[[], str] = _default_exemplar_id,
+    exemplar_id_factory: Callable[[], str] = new_exemplar_id,
 ) -> tuple[LibraryChange, ImportSummary]:
     """Merge a pre-library per-show store into the library, idempotently.
 
@@ -1861,13 +1960,13 @@ def import_store(
         dict.fromkeys([scope, *(normalize_scope(extra) for extra in also_scopes)])
     )
     scopes_added = 0
-    event_at = _event_time(at)
+    event_at = event_time(at, "event timestamp")
     provenance = cast(Mapping[str, object], store["provenance"])
     space_name, space = _space_for(state, provenance)
     identities_document = copy.deepcopy(state.identities)
     identities = cast(dict[str, dict[str, object]], identities_document["identities"])
     exemplars_by_identity = cast(dict[str, list[dict[str, object]]], space["exemplars"])
-    used_exemplars = _used_exemplar_ids(space)
+    used_exemplars = _used_exemplar_ids(space) | state.orphan_ids(space_name)[1]
     history: list[dict[str, object]] = []
     refused: list[str] = []
     created_count = added_count = present_count = superseded_count = 0
@@ -1905,13 +2004,15 @@ def import_store(
                 superseded_count += 1
                 continue
             try:
+                # replace_episode only tells a replacement apart: an import
+                # never replaces a library sample, it reports the conflict.
                 plan = plan_indexed_enrollment(
                     keys,
                     capture_id=cast(str, legacy_exemplar["capture_id"]),
                     media_fingerprint=cast(str, legacy_exemplar["media_fingerprint"]),
                     episode=scoped_episode(scope, episode),
                     vector=vector,
-                    replace_episode=False,
+                    replace_episode=True,
                 )
             except EnrollmentRefusal as exc:
                 refused.append(f"{identity_id}/{legacy_exemplar['id']}: {exc}")
@@ -1919,11 +2020,18 @@ def import_store(
             if plan.outcome == "noop":
                 present_count += 1
                 continue
+            if plan.outcome == "replace":
+                refused.append(
+                    f"{identity_id}/{legacy_exemplar['id']}: conflicts with a voice "
+                    f"sample already in the library (episode {episode!r}, scope "
+                    f"{scope!r}); not imported"
+                )
+                continue
             legacy_id = cast(str, legacy_exemplar["id"])
             exemplar_id = (
                 legacy_id
                 if legacy_id not in used_exemplars
-                else _mint(
+                else mint_unique_id(
                     exemplar_id_factory, used_exemplars, require_exemplar_id, "exemplar"
                 )
             )
@@ -2164,43 +2272,31 @@ def add_legacy_store(
     state: LibraryState,
     space_name: str,
     in_scope: bool,
+    store_path: Path | None = None,
 ) -> tuple[MatchPools, bool]:
     """Add a read-only pre-library store's identities to ``pools``.
 
     Identities the library already holds are skipped (the library copy wins),
     and so are identities forgotten in this library. Returns the new pools
-    and whether the store holds anything the library lacks: an identity it
-    does not have, or a capture that is not in this space yet and that an
-    import would keep (the cue to suggest ``voxweave voices import``); a
-    capture older than every sample of an identity at the cap is
-    superseded, not missing.
+    and whether ``voxweave voices import`` of the store would add anything
+    (the cue to suggest it): an identity or a voice sample the library lacks
+    and the import keeps. That is a dry run of :func:`import_store` under the
+    scopes the import defaults to for ``store_path`` (the store's show without
+    it), so samples the import refuses (they conflict with the library) or
+    supersedes (older than every sample of an identity at the cap) do not
+    count, and the hint cannot outlive a successful import.
     """
     validated = validate_voice_store(store)
     show = normalize_scope(validated.show)
-    library_exemplars = state.space_exemplars(space_name)
     target = dict(pools.in_scope if in_scope else pools.other_scopes)
     scopes = dict(pools.scopes)
-    unimported = False
     tombstones = state.forgotten
     for identity_id, raw in validated.identities.items():
         if identity_id in tombstones:
             continue  # forgotten in this library: never offered again
         identity = cast(Mapping[str, object], raw)
         exemplars = cast(list[Mapping[str, object]], identity["exemplars"])
-        if identity_id in state.identity_map:
-            keys = _exemplar_keys(library_exemplars.get(identity_id, []))
-            present = {key.capture_id for key in keys}
-            if any(
-                item["capture_id"] not in present
-                and not _older_than_retained(
-                    keys, cast(str, item["added"]), cast(str, item["id"])
-                )
-                for item in exemplars
-            ):
-                unimported = True
-            continue
-        unimported = True
-        if not exemplars:
+        if identity_id in state.identity_map or not exemplars:
             continue
         target[identity_id] = {
             "display_name": identity["display_name"],
@@ -2210,6 +2306,24 @@ def add_legacy_store(
             ],
         }
         scopes[identity_id] = (show,)
+    import_scopes = (
+        (show,)
+        if store_path is None
+        else default_import_scopes(store_path, validated.show)
+    )
+    try:
+        _change, summary = import_store(
+            state,
+            store,
+            scope=import_scopes[0],
+            also_scopes=import_scopes[1:],
+            source_label="(dry run)",
+        )
+    except Phase2DataError:
+        # The import would stop on the same error: nothing to suggest.
+        unimported = False
+    else:
+        unimported = bool(summary.identities_created or summary.exemplars_added)
     if in_scope:
         return MatchPools(target, dict(pools.other_scopes), scopes), unimported
     return MatchPools(dict(pools.in_scope), target, scopes), unimported

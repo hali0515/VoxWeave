@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 import pytest
+from voxweave import paths
+from voxweave import vocals
 
 
 class _PhysicalCallReached(RuntimeError):
@@ -606,7 +608,6 @@ def test_sibling_media_shadowing_uses_closed_extension_precedence(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from voxweave import pipeline
 
     reference = tmp_path / "episode.part.vtt"
     reference.write_bytes(b"WEBVTT\n")
@@ -615,7 +616,7 @@ def test_sibling_media_shadowing_uses_closed_extension_precedence(
     wav.write_bytes(b"wav")
     mkv.write_bytes(b"mkv")
     with caplog.at_level("WARNING", logger="voxweave"):
-        selected = pipeline._find_sibling_media(reference)
+        selected = paths.find_sibling_media(reference)
     assert selected == mkv
     assert any(
         "multiple sibling media files" in record.message for record in caplog.records
@@ -1371,6 +1372,7 @@ def test_sdh_success_and_empty_detection_commit_selected_sidecar(
 
     media, wav = _sdh_inputs(tmp_path)
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(sdh, "detect_events", lambda *_args, **_kwargs: events)
     monkeypatch.setattr(sdh, "fit_events_to_gaps", lambda found, _cues: found)
     monkeypatch.setattr(sdh, "render_sdh_vtt", lambda _cues, found: repr(found))
@@ -1390,6 +1392,7 @@ def test_sdh_missing_dependency_and_detector_exception_retain_preexisting_sideca
     sidecar = tmp_path / "episode.sdh.vtt"
     sidecar.write_bytes(b"existing")
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(
         sdh,
         "detect_events",
@@ -1423,6 +1426,7 @@ def test_sdh_atomic_replace_failure_retains_preexisting_sidecar_and_no_stage(
     sidecar = tmp_path / "episode.sdh.vtt"
     sidecar.write_bytes(b"existing")
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(vocals, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(sdh, "detect_events", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(sdh, "fit_events_to_gaps", lambda found, _cues: found)
     monkeypatch.setattr(sdh, "render_sdh_vtt", lambda _cues, _events: "candidate")

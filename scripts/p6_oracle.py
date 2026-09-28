@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import traceback
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -165,6 +166,18 @@ EXPECTED_RUNTIME_SCENARIOS = {
         "expect_failure": True,
     },
 }
+#: First-started AO phase sequence each runtime scenario must show, beside its
+#: law in EXPECTED_RUNTIME_SCENARIOS; a scenario missing here fails as "has no
+#: validator" rather than crashing the run.
+EXPECTED_SCENARIO_STARTED_PHASES = {
+    "mms-legacy-happy": AO_PHASES[:14] + ("AO-16",) + AO_PHASES[17:],
+    "qwen-all-skip-legacy": AO_PHASES[:10] + ("AO-24",),
+    "qwen-all-skip-boundary": AO_PHASES[:10] + ("AO-24",),
+    "ao15-uncontained-boundary": AO_PHASES[:15] + ("AO-24",),
+    "paired-ao15-ao16-boundary": AO_PHASES[:15] + ("AO-24",),
+    "ao15-isolated-then-ao16-legacy": AO_PHASES[:16] + AO_PHASES[17:],
+    "paired-ao15-ao16-legacy": AO_PHASES[:16] + ("AO-24",),
+}
 REFERENCE_COMMITS = {
     "historical": "6e6033fa3930b263133f02c1332ae4d79a490f8b",
     "post_p11": "b6d3b76dd518f943d922dc31cde227745892933d",
@@ -261,14 +274,11 @@ def _sha256_bytes(value: bytes) -> str:
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
+    """The execution record's own file digest (one definition for every pin)."""
     try:
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                digest.update(chunk)
-    except OSError as exc:
-        _invalid(f"cannot read {path}: {exc}")
-    return digest.hexdigest()
+        return oracle_environment.sha256_file(path)
+    except oracle_environment.ExecutionEnvironmentError as exc:
+        _invalid(str(exc))
 
 
 def _read_json(path: Path) -> Any:
@@ -319,10 +329,7 @@ def _schema_validate(manifest: object) -> Mapping[str, Any]:
 
 
 def _canonical_digest(value: object) -> str:
-    encoded = json.dumps(
-        value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
-    return _sha256_bytes(encoded)
+    return cc.canonical_digest(value)
 
 
 def _frozen_json_bytes(value: object) -> bytes:
@@ -531,6 +538,15 @@ def _validate_reference_commits(references: Mapping[str, Any]) -> None:
             _invalid(f"reference commit {name} is unavailable: {commit}")
 
 
+def _environment_mismatch(
+    what: str, *, recorded: object, observed: object, remedy: str
+) -> NoReturn:
+    _invalid(
+        f"{what} does not match the recorded oracle environment: recorded "
+        f"{recorded!r}, observed {observed!r}; {remedy}"
+    )
+
+
 def _validate_execution(execution: Mapping[str, Any]) -> None:
     expected_interpreter = (
         f"{platform.python_implementation()} "
@@ -538,34 +554,82 @@ def _validate_execution(execution: Mapping[str, Any]) -> None:
     )
     expected_platform = f"{platform.system()} {platform.machine()}"
     if execution["interpreter"] != expected_interpreter:
-        _invalid("interpreter does not match the recorded oracle environment")
+        _environment_mismatch(
+            "interpreter",
+            recorded=execution["interpreter"],
+            observed=expected_interpreter,
+            remedy=(
+                "run the oracle with the recorded interpreter (e.g. rebuild the"
+                " project environment with `uv sync --python <version>` plus the"
+                " extras `make quality-p6-oracle` uses)"
+            ),
+        )
     if execution["platform"] != expected_platform:
-        _invalid("platform does not match the recorded oracle environment")
+        _environment_mismatch(
+            "platform",
+            recorded=execution["platform"],
+            observed=expected_platform,
+            remedy="the oracle only compares on the recorded platform",
+        )
     lock_path = REPO_ROOT / "uv.lock"
     lock_digest = _sha256_file(lock_path)
     if lock_digest != execution["dependency_lock_sha256"]:
-        _invalid("dependency lock digest differs from the oracle environment")
+        _environment_mismatch(
+            "uv.lock digest",
+            recorded=execution["dependency_lock_sha256"],
+            observed=lock_digest,
+            remedy=(
+                "after a reviewed lock or release change, refresh the execution"
+                " record with scripts/p6_oracle_release_refresh.py"
+            ),
+        )
     try:
         project_version = oracle_environment.project_package_version(REPO_ROOT)
         locked_version = oracle_environment.locked_package_version(REPO_ROOT)
         installed_version = oracle_environment.installed_package_version()
     except oracle_environment.ExecutionEnvironmentError as exc:
         _invalid(str(exc))
-    if execution["package_version"] != project_version:
-        _invalid("project package version differs from the oracle environment")
-    if execution["package_version"] != locked_version:
-        _invalid("locked package version differs from the oracle environment")
-    if execution["package_version"] != installed_version:
-        _invalid("installed package version differs from the oracle environment")
+    for source, observed in (
+        ("pyproject.toml", project_version),
+        ("uv.lock", locked_version),
+        ("installed voxweave", installed_version),
+    ):
+        if execution["package_version"] != observed:
+            _environment_mismatch(
+                f"package version ({source})",
+                recorded=execution["package_version"],
+                observed=observed,
+                remedy=(
+                    "re-sync the environment (an editable install keeps stale"
+                    " metadata until `uv sync`), or refresh the execution record"
+                    " for a release with scripts/p6_oracle_release_refresh.py"
+                ),
+            )
     locale = os.environ.get("LC_ALL") or os.environ.get("LANG") or "unset"
     timezone = os.environ.get("TZ") or "unset"
     hash_seed = os.environ.get("PYTHONHASHSEED") or "unset"
+    run_through_make = "run it through `make quality-p6-oracle`, which pins it"
     if execution["locale"] != locale:
-        _invalid("locale does not match the recorded oracle environment")
+        _environment_mismatch(
+            "locale (LC_ALL, else LANG)",
+            recorded=execution["locale"],
+            observed=locale,
+            remedy=run_through_make,
+        )
     if execution["timezone"] != timezone:
-        _invalid("timezone does not match the recorded oracle environment")
+        _environment_mismatch(
+            "timezone (TZ)",
+            recorded=execution["timezone"],
+            observed=timezone,
+            remedy=run_through_make,
+        )
     if execution["hash_seed"] != hash_seed:
-        _invalid("hash seed does not match the recorded oracle environment")
+        _environment_mismatch(
+            "hash seed (PYTHONHASHSEED)",
+            recorded=execution["hash_seed"],
+            observed=hash_seed,
+            remedy=run_through_make,
+        )
     environment_digest = oracle_environment.container_digest(
         dependency_lock_sha256=lock_digest,
         hash_seed=hash_seed,
@@ -577,7 +641,10 @@ def _validate_execution(execution: Mapping[str, Any]) -> None:
     )
     if execution["container_digest"] != environment_digest:
         _invalid(
-            "detached container/toolchain digest differs from the oracle environment"
+            "detached container/toolchain digest differs from the oracle environment:"
+            f" recorded {execution['container_digest']!r}, observed"
+            f" {environment_digest!r} (every other execution field matched, so"
+            " the toolchain id changed or the recorded digest was edited)"
         )
 
 
@@ -591,8 +658,13 @@ def _validate_registry_digests(digests: Mapping[str, Any]) -> None:
 
 def _validate_environment(environment: Mapping[str, Any], *, case_id: str) -> None:
     for name, expected in environment.items():
-        if os.environ.get(name) != expected:
-            _invalid(f"case {case_id} environment differs for {name}")
+        observed = os.environ.get(name)
+        if observed != expected:
+            _invalid(
+                f"case {case_id} environment differs for {name}: recorded"
+                f" {expected!r} (None = unset), observed {observed!r}; run it"
+                " through `make quality-p6-oracle`, which pins it"
+            )
 
 
 def _require_exact_keys(
@@ -1020,19 +1092,24 @@ def _closed_sequence(value: object, *, label: str) -> Sequence[Any]:
     return value
 
 
+def _case_input_path(
+    case: Mapping[str, Any], oracle_root: Path, *, basename: str
+) -> Path:
+    """The case's one input file named ``basename``; zero or several is invalid."""
+    matches = [
+        _resolve_under(oracle_root, fact["path"], label=f"{case['id']}.input")
+        for fact in case["input_files"]
+        if Path(fact["path"]).name == basename
+    ]
+    if len(matches) != 1:
+        _invalid(f"case {case['id']} does not have one input named {basename}")
+    return matches[0]
+
+
 def _load_delivery(
     case: Mapping[str, Any], oracle_root: Path, *, basename: str
 ) -> Mapping[str, Any]:
-    path = next(
-        (
-            _resolve_under(oracle_root, fact["path"], label=f"{case['id']}.input")
-            for fact in case["input_files"]
-            if Path(fact["path"]).name == basename
-        ),
-        None,
-    )
-    if path is None:
-        _invalid(f"case {case['id']} does not have one input named {basename}")
+    path = _case_input_path(case, oracle_root, basename=basename)
     value = _read_json(path)
     if not isinstance(value, Mapping):
         _invalid(f"detached delivery {basename} is not an object")
@@ -1699,17 +1776,11 @@ def _project_selected_segmentation(
 
 
 def _case_input(case: Mapping[str, Any], oracle_root: Path, *, basename: str) -> bytes:
-    matches = [
-        _resolve_under(oracle_root, fact["path"], label=f"{case['id']}.input")
-        for fact in case["input_files"]
-        if Path(fact["path"]).name == basename
-    ]
-    if len(matches) != 1:
-        _invalid(f"case {case['id']} does not have one input named {basename}")
+    path = _case_input_path(case, oracle_root, basename=basename)
     try:
-        return matches[0].read_bytes()
+        return path.read_bytes()
     except OSError as exc:
-        _invalid(f"cannot read detached projector input {matches[0]}: {exc}")
+        _invalid(f"cannot read detached projector input {path}: {exc}")
 
 
 def _project_case(
@@ -1791,8 +1862,9 @@ def _apply_runtime_mutation(source_root: Path, name: str | None) -> None:
         source = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         _invalid(f"cannot read copied pipeline for mutation: {exc}")
-    seal = "        acquisition = seal_fresh_alignment(fresh_session)\n"
-    anchor = '        with align_runtime_activity("AO-10", "group-block-spans"):\n'
+    # Indented as in align()'s body, which sits inside two try blocks.
+    seal = "            acquisition = seal_fresh_alignment(fresh_session)\n"
+    anchor = '            with align_runtime_activity("AO-10", "group-block-spans"):\n'
     if source.count(seal) != 1 or source.count(anchor) != 1:
         _invalid("copied pipeline does not expose the reviewed AO-10/AO-11 seam")
     source = source.replace(seal, "", 1).replace(anchor, seal + anchor, 1)
@@ -1851,13 +1923,12 @@ def _copy_distribution_metadata(source_root: Path, *, package_version: str) -> N
 def _public_artifact_path(
     artifact: str,
     *,
-    cache_root: Path,
     episode_root: Path,
     route_evidence_path: Path,
 ) -> Path:
-    # cache_root is retained in the signature for isolation checks; since the
-    # media-adjacent cache relocation no public artifact lives under it.
-    _ = cache_root
+    # Every public artifact lives beside the episode (the machine cache is
+    # media-adjacent under episode_root/cache), never under the worker's
+    # VOXWEAVE_CACHE_ROOT.
     paths = {
         "vtt": episode_root / "episode.vtt",
         "main-json": episode_root / "episode.json",
@@ -1883,7 +1954,96 @@ def _public_worker_environment(
             environment[name] = value
     environment["PYTHONPATH"] = str(source_root)
     environment["VOXWEAVE_CACHE_ROOT"] = str(cache_root)
+    # The recorded environment leaves VOXWEAVE_CONFIG unset, so the CLI would read
+    # (and on a first run create) ~/.config/voxweave.conf; with no HOME, Python
+    # resolves ~ from the password database, i.e. the developer's real home.
+    home = cache_root.parent / "home"
+    home.mkdir(exist_ok=True)
+    environment["HOME"] = str(home)
     return environment
+
+
+class _WorkerLayout:
+    """File layout of one isolated public-worker run under ``root``."""
+
+    __slots__ = (
+        "cache",
+        "episode",
+        "outcome",
+        "request",
+        "root",
+        "route_evidence",
+        "source",
+        "trace",
+        "verification",
+        "worker",
+    )
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.source = root / "source"
+        self.cache = root / "cache"
+        self.episode = root / "episode"
+        self.worker = self.source / "p6_oracle_public.py"
+        self.request = root / "request.json"
+        self.trace = root / "trace.json"
+        self.verification = root / "evidence-verification.json"
+        self.outcome = root / "outcome.json"
+        self.route_evidence = root / "route-evidence.json"
+
+
+def _run_public_worker(
+    layout: _WorkerLayout,
+    *,
+    recorded_environment: Mapping[str, str | None],
+    label: str,
+) -> None:
+    """Run the copied worker on ``layout``'s request; a failed run is invalid."""
+    environment = _public_worker_environment(
+        recorded_environment, cache_root=layout.cache, source_root=layout.source
+    )
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(layout.worker),
+                "--request",
+                str(layout.request),
+                "--episode-root",
+                str(layout.episode),
+                "--trace-out",
+                str(layout.trace),
+                "--evidence-verification-out",
+                str(layout.verification),
+                "--outcome-out",
+                str(layout.outcome),
+                "--route-evidence-out",
+                str(layout.route_evidence),
+            ],
+            cwd=layout.root,
+            check=False,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _invalid(f"{label} could not execute: {exc}")
+    if completed.returncode != 0:
+        excerpt = completed.stdout[-4000:].strip()
+        _invalid(f"{label} exited {completed.returncode}: {excerpt}")
+
+
+def _scenario_environment(manifest: Mapping[str, Any]) -> Mapping[str, str | None]:
+    """The one recorded environment every case shares, for the AO scenarios."""
+    environments = [case["environment"] for case in manifest["cases"]]
+    if not environments or any(env != environments[0] for env in environments):
+        _invalid(
+            "G-ALIGN-AO runtime scenarios need one environment shared by every case"
+        )
+    return environments[0]
 
 
 def _execute_public_case(
@@ -1907,27 +2067,18 @@ def _execute_public_case(
 
     historical = case["reference_set"] == "6e6033f"
     with tempfile.TemporaryDirectory(prefix=f"p6-oracle-{case['id']}-") as raw_root:
-        isolated_root = Path(raw_root)
-        source_root = isolated_root / "source"
-        cache_root = isolated_root / "cache"
-        episode_root = isolated_root / "episode"
-        worker_path = source_root / "p6_oracle_public.py"
-        request_path = isolated_root / "request.json"
-        trace_path = isolated_root / "trace.json"
-        verification_path = isolated_root / "evidence-verification.json"
-        outcome_path = isolated_root / "outcome.json"
-        route_evidence_path = isolated_root / "route-evidence.json"
+        layout = _WorkerLayout(Path(raw_root))
         try:
-            _copy_public_source(source_root, historical=historical)
+            _copy_public_source(layout.source, historical=historical)
             _copy_distribution_metadata(
-                source_root,
+                layout.source,
                 package_version=package_version,
             )
-            shutil.copy2(SCRIPTS_DIR / "p6_oracle_public.py", worker_path)
+            shutil.copy2(SCRIPTS_DIR / "p6_oracle_public.py", layout.worker)
         except OSError as exc:
             _invalid(f"cannot construct isolated public-command source: {exc}")
         if not historical:
-            _apply_runtime_mutation(source_root, _RUNTIME_MUTATION.get())
+            _apply_runtime_mutation(layout.source, _RUNTIME_MUTATION.get())
         request = {
             "arguments": list(case["arguments"]),
             "case_id": case["id"],
@@ -1939,58 +2090,26 @@ def _execute_public_case(
             "shadow_requested": case["id"] == "selected-v2-segmentation",
         }
         try:
-            cc.write_json(request_path, request)
+            cc.write_json(layout.request, request)
         except OSError as exc:
             _invalid(f"cannot write isolated public-command request: {exc}")
-        environment = _public_worker_environment(
-            case["environment"], cache_root=cache_root, source_root=source_root
+        _run_public_worker(
+            layout,
+            recorded_environment=case["environment"],
+            label=f"public command {case['id']}",
         )
-        try:
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(worker_path),
-                    "--request",
-                    str(request_path),
-                    "--episode-root",
-                    str(episode_root),
-                    "--trace-out",
-                    str(trace_path),
-                    "--evidence-verification-out",
-                    str(verification_path),
-                    "--outcome-out",
-                    str(outcome_path),
-                    "--route-evidence-out",
-                    str(route_evidence_path),
-                ],
-                cwd=isolated_root,
-                check=False,
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=120,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            _invalid(f"public command {case['id']} could not execute: {exc}")
-        if completed.returncode != 0:
-            excerpt = completed.stdout[-4000:].strip()
-            _invalid(
-                f"public command {case['id']} exited {completed.returncode}: {excerpt}"
-            )
 
-        runtime_trace = _read_json(trace_path)
+        runtime_trace = _read_json(layout.trace)
         if runtime_trace is not None and not isinstance(runtime_trace, Mapping):
             _invalid(f"public command {case['id']} emitted a nonobject runtime trace")
-        evidence_verification = _read_json(verification_path)
+        evidence_verification = _read_json(layout.verification)
         if evidence_verification is not None and not isinstance(
             evidence_verification, Mapping
         ):
             _invalid(
                 f"public command {case['id']} emitted invalid evidence verification"
             )
-        outcome = _read_json(outcome_path)
+        outcome = _read_json(layout.outcome)
         if outcome != {"exception_class": None, "success": True}:
             _invalid(
                 f"public command {case['id']} did not report successful completion"
@@ -2000,9 +2119,8 @@ def _execute_public_case(
             artifact = output["artifact"]
             path = _public_artifact_path(
                 artifact,
-                cache_root=cache_root,
-                episode_root=episode_root,
-                route_evidence_path=route_evidence_path,
+                episode_root=layout.episode,
+                route_evidence_path=layout.route_evidence,
             )
             try:
                 artifacts[artifact] = path.read_bytes()
@@ -2012,16 +2130,16 @@ def _execute_public_case(
                 )
         return PublicCaseResult(
             artifacts=artifacts,
-            cache_root=cache_root,
+            cache_root=layout.cache,
             case_id=case["id"],
             command=case["command"],
-            episode_root=episode_root,
+            episode_root=layout.episode,
             evidence_verification=cast(
                 Mapping[str, Any] | None,
                 evidence_verification,
             ),
             runtime_trace=cast(Mapping[str, Any] | None, runtime_trace),
-            source_root=source_root,
+            source_root=layout.source,
         )
 
 
@@ -2042,26 +2160,17 @@ def _execute_runtime_scenario(
     if not isinstance(fixture, Mapping):
         _invalid(f"G-ALIGN-AO scenario fixture is not an object: {scenario_id}")
     with tempfile.TemporaryDirectory(prefix=f"p6-oracle-{scenario_id}-") as raw_root:
-        isolated_root = Path(raw_root)
-        source_root = isolated_root / "source"
-        cache_root = isolated_root / "cache"
-        episode_root = isolated_root / "episode"
-        worker_path = source_root / "p6_oracle_public.py"
-        request_path = isolated_root / "request.json"
-        trace_path = isolated_root / "trace.json"
-        verification_path = isolated_root / "evidence-verification.json"
-        outcome_path = isolated_root / "outcome.json"
-        route_evidence_path = isolated_root / "route-evidence.json"
+        layout = _WorkerLayout(Path(raw_root))
         try:
-            shutil.copytree(REPO_ROOT / "voxweave", source_root / "voxweave")
+            shutil.copytree(REPO_ROOT / "voxweave", layout.source / "voxweave")
             _copy_distribution_metadata(
-                source_root,
+                layout.source,
                 package_version=manifest["execution"]["package_version"],
             )
-            shutil.copy2(SCRIPTS_DIR / "p6_oracle_public.py", worker_path)
+            shutil.copy2(SCRIPTS_DIR / "p6_oracle_public.py", layout.worker)
         except OSError as exc:
             _invalid(f"cannot construct G-ALIGN-AO scenario source: {exc}")
-        _apply_runtime_mutation(source_root, _RUNTIME_MUTATION.get())
+        _apply_runtime_mutation(layout.source, _RUNTIME_MUTATION.get())
         request = {
             "arguments": ["align", "episode.vtt", "--media", "episode.wav"],
             "case_id": scenario_id,
@@ -2074,52 +2183,17 @@ def _execute_runtime_scenario(
             "shadow_requested": scenario["shadow_requested"],
         }
         try:
-            cc.write_json(request_path, request)
+            cc.write_json(layout.request, request)
         except OSError as exc:
             _invalid(f"cannot write G-ALIGN-AO scenario request: {exc}")
-        environment = _public_worker_environment(
-            manifest["cases"][0]["environment"],
-            cache_root=cache_root,
-            source_root=source_root,
+        _run_public_worker(
+            layout,
+            recorded_environment=_scenario_environment(manifest),
+            label=f"G-ALIGN-AO scenario {scenario_id}",
         )
-        try:
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    str(worker_path),
-                    "--request",
-                    str(request_path),
-                    "--episode-root",
-                    str(episode_root),
-                    "--trace-out",
-                    str(trace_path),
-                    "--evidence-verification-out",
-                    str(verification_path),
-                    "--outcome-out",
-                    str(outcome_path),
-                    "--route-evidence-out",
-                    str(route_evidence_path),
-                ],
-                cwd=isolated_root,
-                check=False,
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=120,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            _invalid(f"G-ALIGN-AO scenario {scenario_id} could not execute: {exc}")
-        if completed.returncode != 0:
-            excerpt = completed.stdout[-4000:].strip()
-            _invalid(
-                f"G-ALIGN-AO scenario {scenario_id} exited "
-                f"{completed.returncode}: {excerpt}"
-            )
-        trace = _read_json(trace_path)
-        outcome = _read_json(outcome_path)
-        verification = _read_json(verification_path)
+        trace = _read_json(layout.trace)
+        outcome = _read_json(layout.outcome)
+        verification = _read_json(layout.verification)
         if not isinstance(trace, Mapping) or not isinstance(outcome, Mapping):
             _invalid(f"G-ALIGN-AO scenario {scenario_id} emitted invalid records")
         if verification is not None and not isinstance(verification, Mapping):
@@ -2269,15 +2343,9 @@ def _runtime_scenario_failures(
         failures.append(f"{prefix}: lifecycle is incomplete")
 
     first_started_phases = tuple(dict.fromkeys(phase for phase, _activity in starts))
-    expected_started_phases = {
-        "mms-legacy-happy": AO_PHASES[:14] + ("AO-16",) + AO_PHASES[17:],
-        "qwen-all-skip-legacy": AO_PHASES[:10] + ("AO-24",),
-        "qwen-all-skip-boundary": AO_PHASES[:10] + ("AO-24",),
-        "ao15-uncontained-boundary": AO_PHASES[:15] + ("AO-24",),
-        "paired-ao15-ao16-boundary": AO_PHASES[:15] + ("AO-24",),
-        "ao15-isolated-then-ao16-legacy": (AO_PHASES[:16] + AO_PHASES[17:]),
-        "paired-ao15-ao16-legacy": AO_PHASES[:16] + ("AO-24",),
-    }[scenario_id]
+    expected_started_phases = EXPECTED_SCENARIO_STARTED_PHASES.get(scenario_id)
+    if expected_started_phases is None:
+        return sorted(set(failures + [f"{prefix}: scenario has no validator"]))
     if first_started_phases != expected_started_phases:
         failures.append(f"{prefix}: first live phase sequence differs")
 
@@ -2352,7 +2420,7 @@ def _runtime_scenario_failures(
         reject_phases(
             "AO-17", "AO-18", "AO-19", "AO-20", "AO-21", "AO-22", "AO-23", "AO-25"
         )
-    else:  # pragma: no cover - closed at manifest validation
+    else:  # pragma: no cover - EXPECTED_SCENARIO_STARTED_PHASES is checked above
         failures.append(f"{prefix}: scenario has no validator")
     return sorted(set(failures))
 
@@ -2622,6 +2690,12 @@ def _check_test_evidence(manifest: Mapping[str, Any]) -> list[str]:
     return failures
 
 
+#: pytest exits that say nothing about the evidence itself: 3 internal error,
+#: 5 no tests collected. Failing tests (1), collection errors (2) and missing
+#: nodes (4, also reported by _check_test_evidence) stay gate failures.
+_PYTEST_TOOLING_EXITS = frozenset({3, 5})
+
+
 def _execute_test_evidence(manifest: Mapping[str, Any]) -> list[str]:
     """Run every declared vector/injection node, deduplicated, as one real gate."""
 
@@ -2638,10 +2712,15 @@ def _execute_test_evidence(manifest: Mapping[str, Any]) -> list[str]:
             timeout=300,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return [f"declared executable evidence could not run: {exc}"]
+        _invalid(f"declared executable evidence could not run: {exc}")
+    tail = "\n".join(result.stdout.splitlines()[-20:])
+    if result.returncode in _PYTEST_TOOLING_EXITS:
+        _invalid(
+            "pytest could not judge the declared executable evidence "
+            f"(exit {result.returncode}):\n{tail}"
+        )
     if result.returncode == 0:
         return []
-    tail = "\n".join(result.stdout.splitlines()[-20:])
     return [
         "declared executable evidence failed with "
         f"pytest exit {result.returncode}:\n{tail}"
@@ -2883,16 +2962,42 @@ def _check_literal_source_terminals() -> list[str]:
 
 
 def _imports(path: Path) -> set[str]:
+    """Every module ``path`` may import, as absolute dotted names.
+
+    ``from P import X`` reports ``P`` and ``P.X`` (``X`` may be a submodule, as in
+    ``from voxweave import pipeline``); relative imports resolve against the
+    package the file lives in under ``REPO_ROOT``.
+    """
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, SyntaxError) as exc:
         _invalid(f"cannot parse dependency-gate source {path}: {exc}")
+    try:
+        package = path.relative_to(REPO_ROOT).with_suffix("").parts[:-1]
+    except ValueError:
+        _invalid(f"dependency-gate source is outside the repository: {path}")
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                if node.level - 1 >= len(package):
+                    _invalid(
+                        f"relative import beyond the top package in {path}"
+                        f" at line {node.lineno}"
+                    )
+                base = package[: len(package) - (node.level - 1)]
+                tail = node.module.split(".") if node.module else []
+                module = ".".join((*base, *tail))
+            elif node.module:
+                module = node.module
+            else:
+                continue
+            imported.add(module)
+            imported.update(
+                f"{module}.{alias.name}" for alias in node.names if alias.name != "*"
+            )
     return imported
 
 
@@ -2905,6 +3010,9 @@ def _check_dependencies() -> list[str]:
             "voxweave.segmentation_projector",
             "voxweave.candidate_encoder",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
         "voxweave/core/align_compare.py": {
             "voxweave.align_evidence_core",
@@ -2912,6 +3020,9 @@ def _check_dependencies() -> list[str]:
             "voxweave.segmentation_projector",
             "voxweave.candidate_encoder",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
         "voxweave/reference_projector.py": {
             "voxweave.align_projector",
@@ -2919,15 +3030,24 @@ def _check_dependencies() -> list[str]:
             "voxweave.candidate_encoder",
             "voxweave.episode_transaction",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
         "voxweave/episode_transaction.py": {
             "voxweave.backend",
             "voxweave.candidate_encoder",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
         "voxweave/align_dp_safety.py": {
             "voxweave.backend",
             "voxweave.pipeline",
+            "voxweave.segmentation",
+            "voxweave.vocals",
+            "voxweave.llm_commands",
         },
     }
     failures: list[str] = []
@@ -2971,19 +3091,10 @@ def _public_runtime_gate(
 def _source_gates(
     manifest: Mapping[str, Any],
     *,
-    manifest_path: Path | None = None,
+    manifest_path: Path,
 ) -> list[str]:
     failures = _check_ao_source()
-    failures.extend(
-        _public_runtime_gate(
-            manifest,
-            manifest_path=(
-                REPO_ROOT / "calibration" / "p6-oracle" / "manifest.json"
-                if manifest_path is None
-                else manifest_path
-            ),
-        )
-    )
+    failures.extend(_public_runtime_gate(manifest, manifest_path=manifest_path))
     failures.extend(_check_test_evidence(manifest))
     failures.extend(_execute_test_evidence(manifest))
     failures.extend(_check_injection_registry(manifest))
@@ -3020,16 +3131,44 @@ def _source_gates(
     return sorted(set(failures))
 
 
+_COMMAND_HELP = {
+    "validate": "check the manifest, its schema, the pinned environment and inputs",
+    "compare": (
+        "validate, then compare every case's independent projection with the"
+        " public command's output bytes"
+    ),
+    "source-gates": (
+        "validate, then run the source, runtime-order, dependency and declared"
+        " test-evidence gates"
+    ),
+}
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate", "compare", "source-gates"):
-        command = subparsers.add_parser(name)
-        command.add_argument("--manifest", type=Path, required=True)
+    for name, help_text in _COMMAND_HELP.items():
+        command = subparsers.add_parser(name, help=help_text, description=help_text)
+        command.add_argument(
+            "--manifest", type=Path, required=True, help="the oracle manifest JSON"
+        )
         if name != "validate":
-            command.add_argument("--check", action="store_true", required=True)
+            command.add_argument(
+                "--check",
+                action="store_true",
+                help=(
+                    "accepted for symmetry with the other quality rulers; the"
+                    " oracle only ever checks and never rewrites its corpus"
+                ),
+            )
         if name == "compare":
-            command.add_argument("--json-out", type=Path)
+            command.add_argument(
+                "--json-out",
+                type=Path,
+                help="also write the comparison report here (outside the corpus)",
+            )
     return parser
 
 
@@ -3056,6 +3195,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             failures = _source_gates(manifest, manifest_path=manifest_path)
     except OracleInvalid as exc:
         print(f"invalid: {exc}", file=sys.stderr)
+        return EXIT_INVALID
+    except Exception as exc:
+        # An unexpected crash is a tooling failure with no standing to judge the
+        # comparison: exit 2, never the "mismatch" code, traceback kept.
+        traceback.print_exc(file=sys.stderr)
+        print(
+            f"invalid: internal oracle error: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return EXIT_INVALID
     if failures:
         for failure in failures:

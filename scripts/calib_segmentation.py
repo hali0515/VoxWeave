@@ -10,7 +10,7 @@ How it works::
       -> calibration/segmentation/cases/*.json   one captured word_segments
          stream + the production replay inputs (vad_speech, shot_changes,
          sing_spans, speaker_turns) + the config that produced it
-      -> voxweave.pipeline.segment_document   the *production* entry point
+      -> voxweave.segmentation.segment_document   the *production* entry point
       -> four metrics, micro-aggregated per language
       -> one-sided comparison against calibration/segmentation/baseline.json
 
@@ -18,7 +18,7 @@ Every case replays through the same function ``process`` and ``split`` call, so
 this harness cannot drift away from what ships. No media, no model, no network:
 a case is JSON, and a replay is arithmetic plus the segmenters.
 
-The four gated metrics (design doc 4.5):
+The four gated metrics:
 
 ``len_break_mid_phrase_rate``
     Of the internal cue boundaries that acoustic silence did *not* force, how
@@ -52,12 +52,14 @@ Subcommands::
     validate-corpus   schema + coverage + size + digest, no replay
     evaluate          replay, measure, compare to baseline, write the report
     record-baseline   promote a report to the tracked baseline (never run by CI)
-    shadow            P5: measure the full finalizer lane/row matrix beside v1
+    shadow            measure the unshipped shadow lane/row matrix beside v1
     compare-video-dir legacy: run the same metrics over private media siblings
 
-The last stdout line is always a machine summary::
+A run that measures (exit 0 or 1) ends stdout with a machine summary::
 
     QUALITY segmentation status=pass cases=20 failures=0 warnings=0 report=...
+
+An invalid run (exit 2) reports on stderr and may print no summary line.
 """
 
 from __future__ import annotations
@@ -78,6 +80,13 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from voxweave.core.shadow_lanes import (
+    LANE_CORE as SHADOW_LANE_CORE,
+    LANE_DISPLAY as SHADOW_LANE_LEGACY_DISPLAY,
+    LANE_FINALIZER as SHADOW_LANE_FINALIZER,
+    LANE_LEGACY as SHADOW_LANE_DELIVERY,
+)
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = _SCRIPTS_DIR.parent
@@ -311,11 +320,6 @@ def metric_definition_block() -> dict[str, Any]:
             "ja_tail_lens": forbidden_end_ja_lens(),
         },
     }
-
-
-def metric_definition_digest() -> str:
-    """Digest of :func:`metric_definition_block` for baseline compatibility."""
-    return cc.canonical_digest(metric_definition_block())
 
 
 def repo_commit() -> str | None:
@@ -679,7 +683,7 @@ def replay(case: Case) -> Any:
     re-run. Whatever the case does not carry stays empty -- a replay may never
     invent an input the capture did not record.
     """
-    from voxweave.pipeline import segment_document
+    from voxweave.segmentation import segment_document
 
     doc = case.doc
     turns = [
@@ -865,9 +869,13 @@ class UnitLocator:
     (this was the silent-exclusion mechanism behind up to 10% unmapped
     boundaries on len-break-heavy zh cases). Lookup prefers the first candidate
     at or after a monotonic cursor, which disambiguates the repeated keys that
-    zero-duration units produce. An entry the splitter fabricated (the logged
-    proportional-timing desync path) still resolves to nothing, and its boundary
-    is excluded and counted -- never guessed at.
+    zero-duration units produce. A cue's *last* entry needs one more step: a
+    zero-duration word and the punctuation ``reinject_punct`` hangs on it share
+    one key, so the cue's n-th entry with that key is the n-th candidate from
+    the cue's first unit, not the first one (taking the first hid the
+    punctuation and misclassified the boundary). An entry the splitter
+    fabricated (the logged proportional-timing desync path) still resolves to
+    nothing, and its boundary is excluded and counted -- never guessed at.
     """
 
     def __init__(self, units: Sequence[Mapping[str, Any]]) -> None:
@@ -889,12 +897,15 @@ class UnitLocator:
         )
 
     @staticmethod
-    def _pick(candidates: list[int] | None, cursor: int) -> int | None:
+    def _pick(
+        candidates: list[int] | None, cursor: int, occurrence: int = 1
+    ) -> int | None:
+        """The ``occurrence``-th candidate at or after ``cursor`` (clamped)."""
         if not candidates:
             return None
-        for i in candidates:
+        for pos, i in enumerate(candidates):
             if i >= cursor:
-                return i
+                return candidates[min(pos + occurrence - 1, len(candidates) - 1)]
         return candidates[-1]
 
     def locate_first(self, entry: Mapping[str, Any], cursor: int) -> int | None:
@@ -905,13 +916,25 @@ class UnitLocator:
             return found
         return self._pick(self._by_start.get(key[0]), cursor)
 
-    def locate_last(self, entry: Mapping[str, Any], cursor: int) -> int | None:
-        """Index of the unit this entry *ends* on (edge fallback for atoms)."""
+    def locate_last(
+        self, entry: Mapping[str, Any], cursor: int, occurrence: int = 1
+    ) -> int | None:
+        """Index of the unit this entry *ends* on (edge fallback for atoms).
+
+        ``occurrence`` is how many entries of the cue, this one included, carry
+        this entry's exact key; with ``cursor`` at the cue's first unit it picks
+        the matching repeat of a same-timestamp run instead of its first unit.
+        """
         key = self._key(entry)
-        found = self._pick(self._index.get(key), cursor)
+        found = self._pick(self._index.get(key), cursor, occurrence)
         if found is not None:
             return found
         return self._pick(self._by_end.get(key[1]), cursor)
+
+    def occurrence(self, entries: Sequence[Mapping[str, Any]]) -> int:
+        """How many of ``entries`` share the last entry's exact key."""
+        key = self._key(entries[-1])
+        return sum(1 for entry in entries if self._key(entry) == key)
 
 
 @dataclass(frozen=True)
@@ -949,7 +972,9 @@ def map_boundaries(
             continue
         first = locator.locate_first(word_data[0], cursor)
         last = locator.locate_last(
-            word_data[-1], first if first is not None else cursor
+            word_data[-1],
+            first if first is not None else cursor,
+            locator.occurrence(word_data),
         )
         firsts.append(first)
         lasts.append(last)
@@ -996,9 +1021,11 @@ _STRANDED_WARN_S = 5.0
 #: vowel is fine, a unit stretched across silence is an alignment overhang.
 _LONG_UNIT_S = 1.0
 
-#: Wall/run sizes at or above this are worth a warning line; mirrors
-#: ``voxweave.realign.ZERO_DURATION_MAX_RUN`` (the repair pass gives up past
-#: this run length, so anything this long survived into the shipped units).
+#: Wall/run sizes at or above this are worth a warning line. The value borrows
+#: the scale of ``voxweave.realign.ZERO_DURATION_MAX_RUN`` but is not that
+#: limit: the repair pass still relocates runs of exactly that length and
+#: counts punctuation units in its runs, while these counters see lexical units
+#: only, so a warning does not by itself mean the repair gave up on the run.
 _ZERO_SHAPE_WARN = 8
 
 
@@ -1875,8 +1902,9 @@ def gate_exit_code(results: Sequence[Mapping[str, Any]]) -> int:
 def load_baseline(path: str | Path, corpus: Corpus) -> dict[str, Any]:
     """Load a baseline and refuse to compare against one that does not fit.
 
-    A digest, metric-definition or segmenter-version mismatch is exit 2 and
-    demands a reviewed ``record-baseline``. Silently comparing today's corpus to
+    A corpus-digest or metric-definition mismatch is exit 2 and demands a
+    reviewed ``record-baseline``. Segmenter/python version drift is checked
+    separately by :func:`environment_drift` in ``evaluate``. Silently comparing today's corpus to
     yesterday's numbers is how a gate stops meaning anything.
     """
     baseline = cc.load_validated_json(path, BASELINE_SCHEMA, label=str(path))
@@ -1914,7 +1942,17 @@ def load_baseline(path: str | Path, corpus: Corpus) -> dict[str, Any]:
     if problems:
         raise cc.CalibrationError(
             f"{path} does not describe this corpus",
-            [*problems, "re-record deliberately: make quality-record-segmentation"],
+            [
+                *problems,
+                "re-record deliberately: `make quality-segmentation` refuses to run"
+                " against this baseline, so first write a fresh report without it:"
+                " `uv run --extra <cuda|mps> python scripts/calib_segmentation.py"
+                f" evaluate --corpus {corpus.path}"
+                " --json-out build/calibration/segmentation-report.json`"
+                " (no --baseline, no --check), review it, then run"
+                " `make quality-record-segmentation` (it keeps the gate levels of"
+                " the baseline it replaces)",
+            ],
         )
     return baseline
 
@@ -1937,8 +1975,15 @@ def environment_drift(baseline: Mapping[str, Any]) -> list[str]:
     return drift
 
 
-def baseline_from_report(report: Mapping[str, Any]) -> dict[str, Any]:
-    """Project a report onto the tracked baseline shape (groups + gate rules)."""
+def baseline_from_report(
+    report: Mapping[str, Any],
+    gates: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Project a report onto the tracked baseline shape (groups + gate rules).
+
+    ``gates`` replaces the report's own gate table; ``record-baseline`` passes
+    the table :func:`carry_gate_levels` built.
+    """
     return {
         "schema_version": SCHEMA_VERSION,
         "metric_definition_version": METRIC_DEFINITION_VERSION,
@@ -1948,8 +1993,64 @@ def baseline_from_report(report: Mapping[str, Any]) -> dict[str, Any]:
         "generated_from_commit": report["generated_from_commit"],
         "environment": report["environment"],
         "groups": report["groups"],
-        "gates": report["gates"],
+        "gates": report["gates"] if gates is None else gates,
     }
+
+
+def carry_gate_levels(
+    report_gates: Mapping[str, Mapping[str, Any]],
+    levels: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """The report's gate rules, each at the ``mode`` the ``levels`` table set.
+
+    A gate's level is tracked policy, raised to ``blocking`` by a reviewed edit
+    of the baseline (design 4.6), while its thresholds belong to the metric
+    definition in this code. A report's table is DEFAULT_GATES -- every gate at
+    the ``warning`` landing level -- whenever it was evaluated without a
+    baseline, which after a corpus or metric-definition change is the only way
+    to get one; so re-recording keeps each level and takes only the thresholds
+    from the report. Returns the table and one note per field that differs
+    from ``levels``, for the reviewer.
+    """
+    gates: dict[str, dict[str, Any]] = {}
+    notes: list[str] = []
+    for metric in METRICS:
+        rule = dict(report_gates[metric])
+        kept = levels[metric]
+        if rule.get("mode") != kept["mode"]:
+            notes.append(
+                f"{metric}: mode {kept['mode']} kept (the report has {rule.get('mode')})"
+            )
+        rule["mode"] = kept["mode"]
+        for key in sorted(set(rule) | set(kept)):
+            if key != "mode" and rule.get(key) != kept.get(key):
+                notes.append(
+                    f"{metric}: {key} {kept.get(key)!r} -> {rule.get(key)!r}"
+                    " (from the report)"
+                )
+        gates[metric] = rule
+    return gates, notes
+
+
+def load_gate_levels(path: str | Path) -> dict[str, Any]:
+    """The gate table of an existing baseline, validated on its own.
+
+    Only the table is read: the baseline being replaced is expected to be stale
+    in every other respect (digests, groups, even an older schema).
+    """
+    doc = cc.read_json(path)
+    gates: Any = doc.get("gates") if isinstance(doc, dict) else None
+    errors = cc.schema_errors(gates, gates_schema())
+    if errors:
+        raise cc.CalibrationError(
+            f"cannot read the gate levels of {path}",
+            [
+                *(f"gates/{e}" for e in errors),
+                "fix its gate table, name another baseline with --gates-from, or"
+                " pass --gates-from-report to take the report's levels",
+            ],
+        )
+    return gates
 
 
 # --------------------------------------------------------------------------- #
@@ -2101,9 +2202,20 @@ def private_corpus_path() -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _warn_private_missing() -> None:
+    """Say why ``--private`` produced no private block (stderr only)."""
+    root = os.environ.get("VOXWEAVE_CALIB_ROOT", "").strip()
+    if not root:
+        reason = "VOXWEAVE_CALIB_ROOT is not set"
+    else:
+        reason = f"{Path(root) / 'segmentation' / 'corpus.json'} does not exist"
+    print(f"warning: --private ignored: {reason}", file=sys.stderr)
+
+
 def evaluate_private() -> dict[str, Any] | None:
     path = private_corpus_path()
     if path is None:
+        _warn_private_missing()
         return None
     corpus = load_corpus(path, strict_size=False)
     measurements = run_cases(corpus.cases)
@@ -2175,20 +2287,48 @@ def print_summary(report: Mapping[str, Any]) -> None:
         print()
         print("  gates")
         for result in results:
-            marker = {
-                "pass": "ok  ",
-                "fail": "FAIL",
-                "insufficient_samples": "n<min",
-                "disabled": "off ",
-            }.get(str(result["status"]), "?   ")
-            reasons = "; ".join(result["reasons"])
-            print(
-                f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
-                f" {result['mode']:<8} {_gate_value_cell(result)}"
-                + (f"  {reasons}" if reasons else "")
-            )
+            _print_gate_row(result)
     for warning in report.get("warnings") or ():
         print(f"  warning: {warning}")
+
+
+def _structurally_zero(result: Mapping[str, Any]) -> bool:
+    """A mid-phrase gate on a spaced language: one unit is one word, so it cannot fail."""
+    group = str(result["group"])
+    return (
+        result["metric"] == "len_break_mid_phrase_rate"
+        and group in cc.CALIBRATION_LANGUAGES
+        and not _has_multichar_phrases(group)
+    )
+
+
+def _print_gate_row(result: Mapping[str, Any]) -> None:
+    marker = {
+        "pass": "ok  ",
+        "fail": "FAIL",
+        "insufficient_samples": "n<min",
+        "disabled": "off ",
+    }.get(str(result["status"]), "?   ")
+    reasons = list(result["reasons"])
+    if _structurally_zero(result):
+        reasons.append("structurally 0: word-level phrases, this gate cannot fail")
+    note = "; ".join(reasons)
+    print(
+        f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
+        f" {result['mode']:<8} {_gate_value_cell(result)}"
+        + (f"  {note}" if note else "")
+    )
+
+
+#: Heading per shadow gate family; ``{lane}`` is the gated lane.
+_SHADOW_GATE_FAMILY_TITLES = {
+    "N1-finalizer-v2-vs-tracked-baseline": (
+        "non-inferiority gates ({lane}, v2 vs the tracked v1 baseline)"
+    ),
+    "N3a-finalizer-vs-legacy-display": (
+        "finalizer vs legacy display gates (same committed v1 input)"
+    ),
+}
 
 
 def machine_summary(
@@ -2318,7 +2458,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     warned = sum(
         1 for r in gate_results if r["mode"] == "warning" and r["status"] != "pass"
     )
-    code = gate_exit_code(gate_results) if args.check else cc.EXIT_OK
+    verdict = gate_exit_code(gate_results)
+    code = verdict if args.check else cc.EXIT_OK
     if code == cc.EXIT_INVALID:
         print(
             machine_summary("invalid", len(measurements), failures, warned, destination)
@@ -2331,7 +2472,18 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 if r["mode"] == "blocking" and r["status"] == "insufficient_samples"
             ],
         )
-    status = "fail" if code == cc.EXIT_GATE_FAILED else "pass"
+    # The status reflects the gates even without --check (as ``shadow`` does);
+    # only the exit code is left unenforced.
+    status = {
+        cc.EXIT_OK: "pass",
+        cc.EXIT_GATE_FAILED: "fail",
+        cc.EXIT_INVALID: "invalid",
+    }[verdict]
+    if not args.check and verdict != cc.EXIT_OK:
+        print(
+            f"note: status={status} not enforced (--check not given); exiting 0",
+            file=sys.stderr,
+        )
     print(machine_summary(status, len(measurements), failures, warned, destination))
     return code
 
@@ -2342,6 +2494,11 @@ def cmd_record_baseline(args: argparse.Namespace) -> int:
     Refuses a partial report, a stale digest or a metric-definition mismatch, so
     a regression cannot be laundered into a new baseline by rerunning the
     harness until the numbers look acceptable.
+
+    Gate levels are kept from the baseline being replaced (``--output``, or
+    ``--gates-from``), never copied from the report: see
+    :func:`carry_gate_levels`. With no such baseline the run refuses unless
+    ``--gates-from-report`` says the report's levels are the intended ones.
     """
     corpus = load_corpus(args.corpus)
     report = cc.read_json(args.report)
@@ -2374,15 +2531,45 @@ def cmd_record_baseline(args: argparse.Namespace) -> int:
         problems.append(
             "report has no generated_from_commit (run inside a git checkout)"
         )
+    problems.extend(
+        f"report gates/{e}"
+        for e in cc.schema_errors(report.get("gates"), gates_schema())
+    )
     if problems:
         raise cc.CalibrationError(f"refusing to record {args.output}", problems)
 
-    baseline = baseline_from_report(report)
+    notes: list[str] = []
+    if args.gates_from_report:
+        gates = {metric: dict(report["gates"][metric]) for metric in METRICS}
+        levels_from = f"{args.report} (--gates-from-report)"
+    else:
+        source = Path(args.gates_from or args.output)
+        if not source.is_file():
+            raise cc.CalibrationError(
+                f"refusing to record {args.output}: no baseline at {source} to keep"
+                " the gate levels of",
+                [
+                    "a report evaluated without a baseline carries the all-warning"
+                    " DEFAULT_GATES, so copying its table would silently demote"
+                    " every blocking gate",
+                    "name the tracked baseline with --gates-from (e.g. when --output"
+                    " is a new path)",
+                    "or pass --gates-from-report for a first recording, or to reset"
+                    " the levels to the report's on purpose",
+                ],
+            )
+        gates, notes = carry_gate_levels(report["gates"], load_gate_levels(source))
+        levels_from = str(source)
+
+    baseline = baseline_from_report(report, gates)
     cc.validate_or_exit2(baseline, BASELINE_SCHEMA, label=str(args.output))
     path = cc.write_json(args.output, baseline)
     print(f"recorded {path}")
     print(f"  corpus_digest : {baseline['corpus_digest']}")
     print(f"  commit        : {baseline['generated_from_commit']}")
+    print(f"  gate levels   : {levels_from}")
+    for note in notes:
+        print(f"  note: {note}")
     for metric in METRICS:
         gate = baseline["gates"][metric]
         print(f"  gate {metric:<26} mode={gate['mode']}")
@@ -2397,7 +2584,7 @@ def _sibling_json(media: Path) -> Path:
     """Sibling ``.json``, replacing only the trailing extension.
 
     Never ``Path.with_suffix``: a name with an interior dot would be truncated at
-    the first one (same contract as ``pipeline.swap_ext``).
+    the first one (same contract as ``paths.swap_ext``).
     """
     return media.with_name(media.name[: -len(media.suffix)] + ".json")
 
@@ -2470,7 +2657,7 @@ def cmd_compare_video_dir(args: argparse.Namespace) -> int:
     """Legacy: run the corpus metrics over a directory of private media siblings.
 
     This is the knob-validation path referenced from ``gap_split.adaptive_clause_ms``
-    and ``pipeline._maybe_adaptive_thresholds``: run it twice, once with
+    and ``segmentation._maybe_adaptive_thresholds``: run it twice, once with
     ``VOXWEAVE_GAP_ADAPTIVE=1``, and compare the four numbers. It reads sibling
     JSON only -- no subtitle track is extracted and no ASS is parsed here; a
     commercial release track is the *alignment* ruler's ground truth, not this
@@ -2564,12 +2751,8 @@ SHADOW_REPORT_KIND = "segmentation-shadow-report"
 #: quality run that may follow in the same process.
 SHADOW_ENV = "VOXWEAVE_SEG_V2_SHADOW"
 
-#: P5's lane/row matrix, named by ``voxweave.core.shadow_v2.SHADOW_LANE_*``
-#: (re-exported by ``pipeline``).
-SHADOW_LANE_CORE = "core_partition_pre_overlay"
-SHADOW_LANE_DELIVERY = "delivery_v1_legacy"
-SHADOW_LANE_FINALIZER = "delivery_finalizer"
-SHADOW_LANE_LEGACY_DISPLAY = "legacy_display"
+#: P5's lane/row matrix; the SHADOW_LANE_* names are imported from
+#: ``voxweave.core.shadow_lanes``, which defines them once.
 SHADOW_LANES = (
     SHADOW_LANE_CORE,
     SHADOW_LANE_DELIVERY,
@@ -2654,10 +2837,10 @@ PERTURB_SAMPLE_RATE = 0.10
 PERTURB_JITTER_DRAWS = 3
 
 #: One-at-a-time weight ablation: term name -> the ``boundary_cost`` constants
-#: that make it up. ``pause_cut`` is absent on purpose -- its amplitude reaches
-#: the ramp through a *keyword default* bound at definition time, so rebinding
-#: ``W_PAUSE`` would not change a single score. It is ablated by zeroing the term
-#: function instead, which is what "this term contributes nothing" means anyway.
+#: that make it up. ``pause_cut`` is absent on purpose: it is ablated by zeroing
+#: the term function, which is what "this term contributes nothing" means.
+#: ``pause_cut_cost`` reads ``W_PAUSE`` at call time, so rebinding it would scale
+#: the ramp, but not ``PAUSE_MISSING_BOUNDS_COST``, which no amplitude reaches.
 ABLATION_WEIGHTS: dict[str, tuple[str, ...]] = {
     "balance": ("W_BALANCE",),
     "cue_base": ("CUE_BASE",),
@@ -2733,19 +2916,33 @@ def shadow_artifact_of(case: Case, result: Any) -> dict[str, Any]:
             f"{case.relpath}: the replay returned no shadow artifact",
             [
                 f"the hook is gated on {SHADOW_ENV}=1 and this run pinned it on",
-                "the installed voxweave predates the P5 hook, or the flag was"
+                "the installed voxweave predates the shadow hook, or the flag was"
                 " consumed by a different process",
             ],
         )
+    error = artifact.get("error") or {}
+    if isinstance(error, Mapping) and error.get("reason") == "invalid-profile":
+        # The hook wraps AD3-2's refusal in an incomplete envelope; the refused
+        # knobs ride on its diagnostic ({key, reason, value}, value may be
+        # "nan"/"inf").
+        diagnostic = artifact.get("diagnostic") or {}
+        raise cc.CalibrationError(
+            f"{case.relpath}: the shadow optimizer refuses a display-profile knob"
+            " that has no defined meaning",
+            [
+                f"{v.get('key')}={v.get('value')}: {v.get('reason')}"
+                for v in diagnostic.get("invalid_profile") or ()
+            ],
+        )
     if "error" in artifact:
-        error = artifact["error"]
         raise cc.CalibrationError(
             f"{case.relpath}: the shadow lane failed on this document",
             [f"{error.get('type')}: {error.get('detail')}"],
         )
     if "invalid_profile" in artifact:
         raise cc.CalibrationError(
-            f"{case.relpath}: the display profile is not interpretable (AD3-2)",
+            f"{case.relpath}: the shadow optimizer refuses a display-profile knob"
+            " that has no defined meaning",
             [
                 f"{v.get('key')}={v.get('value')}: {v.get('reason')}"
                 for v in artifact["invalid_profile"]
@@ -3478,6 +3675,16 @@ def finalizer_vs_legacy_gates(
     return results
 
 
+#: N3b's absolute floor for the ja speaker counterfactual: expressed turn-change
+#: cuts per raw in-speech turn change. 21 of 136 is a fixed target of the P5
+#: shadow specification, which is not part of this repository. When the corpus
+#: cannot reach it (``possible_rate`` below), the gate reports ``stopped``, which
+#: ``p5-authorized-deferrals.txt`` adjudicates.
+N3B_EXPRESSED_RATE_TARGET = 21.0 / 136.0
+#: N3b's floor for the share of expressible ja turn changes the row expressed.
+N3B_EXPRESSIBLE_HIT_TARGET = 0.5
+
+
 def speaker_gate_block(shadow_cases: Sequence[ShadowCase]) -> dict[str, Any]:
     """N3b's four ja gates plus non-blocking zh/en diagnostics."""
 
@@ -3533,7 +3740,7 @@ def speaker_gate_block(shadow_cases: Sequence[ShadowCase]) -> dict[str, Any]:
         language: aggregate_language(language) for language in cc.CALIBRATION_LANGUAGES
     }
     ja = diagnostics["ja"]
-    target = 21.0 / 136.0
+    target = N3B_EXPRESSED_RATE_TARGET
     possible_rate = (
         0.0
         if ja["raw_in_speech_turn_changes"] == 0
@@ -3586,10 +3793,10 @@ def speaker_gate_block(shadow_cases: Sequence[ShadowCase]) -> dict[str, Any]:
             "status": (
                 "pass"
                 if ja["expressible_hit_rate"] is not None
-                and ja["expressible_hit_rate"] >= 0.5
+                and ja["expressible_hit_rate"] >= N3B_EXPRESSIBLE_HIT_TARGET
                 else "fail"
             ),
-            "target": 0.5,
+            "target": N3B_EXPRESSIBLE_HIT_TARGET,
             "value": ja["expressible_hit_rate"],
         },
     ]
@@ -3857,10 +4064,11 @@ _COARSE_BREAKERS = frozenset("。！？、，,.!?；;：:")
 def load_coarse_manifest(path: str | Path = DEFAULT_COARSE_CORPUS) -> dict[str, Any]:
     """Load W2's shadow-only derivation registry under a closed local schema."""
     source = Path(path)
-    try:
-        payload = cc.read_json(source)
-    except OSError as exc:
-        raise cc.CalibrationError(f"coarse corpus not found: {source}") from exc
+    # cc.read_json already turns OSError into CalibrationError, so check
+    # existence first to keep the specific message reachable.
+    if not source.is_file():
+        raise cc.CalibrationError(f"coarse corpus not found: {source}")
+    payload = cc.read_json(source)
     if not isinstance(payload, dict) or set(payload) != {
         "schema_version",
         "description",
@@ -4467,7 +4675,7 @@ def run_coarse_gates(
         )
         frozen_projection_gap = (
             isinstance(raw_error, Mapping)
-            and raw_error.get("detail") == "v1 source partition could not be projected"
+            and raw_error.get("reason") == "v1-unprojected"
             and isinstance(unavailable_comparison, Mapping)
             and unavailable_comparison.get("status") == "refined-counterfactual"
             and isinstance(diagnostic, Mapping)
@@ -4475,8 +4683,7 @@ def run_coarse_gates(
         )
         frozen_optimizer_gap = (
             isinstance(raw_error, Mapping)
-            and raw_error.get("detail")
-            == "optimizer selection authority unavailable for one or more rows"
+            and raw_error.get("reason") == "optimizer-selection-unavailable"
             and isinstance(unavailable_comparison, Mapping)
             and unavailable_comparison.get("status") == "unmaterialized"
             and unavailable_comparison.get("reason")
@@ -4496,11 +4703,10 @@ def run_coarse_gates(
         )
         final_row = artifact["lanes"][SHADOW_LANE_FINALIZER]["rows"].get("v2") or {}
         errors = _coarse_start_errors(source, final_row.get("cues") or ())
-        ordered = sorted(errors)
-        p90 = (
-            None if not ordered else ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
-        )
-        maximum = max(ordered, default=None)
+        # The one pinned percentile definition (type 7), like every other
+        # calibration percentile.
+        p90 = cc.percentile(errors, 90.0)
+        maximum = max(errors, default=None)
         adopted = sum(bool(item["adopted_v1"]) for item in artifact["intervals"])
         raw_validator = artifact["validator"].get("raw") or {}
         finalizer_validator = artifact["validator"].get("finalizer") or {}
@@ -5979,22 +6185,17 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
                     f"  {_ratio_cell(row['forbidden_end_rate']):<20}"
                 )
     results = report["gate_results"]
-    if results:
+    families: dict[str, list[Mapping[str, Any]]] = {}
+    for result in results:
+        families.setdefault(str(result.get("family")), []).append(result)
+    for family, rows in families.items():
+        title = _SHADOW_GATE_FAMILY_TITLES.get(family, family).format(
+            lane=report["gated_lane"]
+        )
         print()
-        print(f"  non-inferiority gates ({report['gated_lane']}, v2 vs v1 baseline)")
-        for result in results:
-            marker = {
-                "pass": "ok  ",
-                "fail": "FAIL",
-                "insufficient_samples": "n<min",
-                "disabled": "off ",
-            }.get(str(result["status"]), "?   ")
-            reasons = "; ".join(result["reasons"])
-            print(
-                f"    [{marker}] {result['group']:<3} {result['metric']:<26}"
-                f" {result['mode']:<8} {_gate_value_cell(result)}"
-                + (f"  {reasons}" if reasons else "")
-            )
+        print(f"  {title}")
+        for result in rows:
+            _print_gate_row(result)
     coverage = report["coverage"]
     print()
     print(
@@ -6018,7 +6219,7 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
     failures = coverage["failures"]
     if failures:
         print()
-        print("  C13 coverage failures")
+        print("  coverage failures")
         for line in failures[:OFFENDER_LIMIT]:
             print(f"    {line}")
     perturbation = report.get("perturbation")
@@ -6037,9 +6238,10 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
             p2 = classes["P2-shot"]
             p3 = classes["P3-speaker-cliffs"]
             print(
-                f"  P1/P2/P3    unit={p1['attempted']}/{p1['failures']}"
-                f" shot={p2['effective']}/{p2['attempted']}"
-                f" speaker={len(p3['probes'])}/{len(p3['failures'])}"
+                f"  P1 unit     attempted={p1['attempted']} failures={p1['failures']}"
+                f"  P2 shot effective={p2['effective']}/{p2['attempted']}"
+                f"  P3 speaker probes={len(p3['probes'])}"
+                f" failures={len(p3['failures'])}"
             )
     coarse = report.get("coarse_gates")
     if coarse:
@@ -6071,6 +6273,12 @@ def print_shadow_summary(report: Mapping[str, Any]) -> None:
 
 def cmd_shadow(args: argparse.Namespace) -> int:
     command_started = time.perf_counter()
+    ignored = _perturbation_options_without_perturb(args)
+    if ignored:
+        raise cc.CalibrationError(
+            f"{', '.join(ignored)} only apply with --perturb",
+            ["add --perturb, or drop the perturbation options"],
+        )
     corpus = load_corpus(args.corpus)
     cases = list(corpus.cases)
     partial = False
@@ -6355,14 +6563,27 @@ def cmd_shadow(args: argparse.Namespace) -> int:
             near_cliff_only=bool(args.perturb_near_cliff_only),
         )
         if not perturbation["exhaustive"]:
+            truncated = [
+                str(block["case"])
+                for block in perturbation["single_gap"]
+                if int(block["coverage"]["planned_probes"])
+                > sum(block["coverage"]["selected_by_magnitude"].values())
+            ]
+            cause = (
+                "--perturb-max-probes truncated the near-cliff set of "
+                + ", ".join(truncated)
+                if truncated
+                else "a perturbed case had no gap to probe"
+            )
             warnings.append(
-                "--perturb-max-probes truncated the near-cliff set: this run is not"
-                " exhaustive coverage and must not be reported as such"
+                f"{cause}: this run is not exhaustive coverage and must not be"
+                " reported as such"
             )
         if perturbation["near_cliff_only"]:
             warnings.append(
                 "--perturb-near-cliff-only skipped the seeded 10% sample of"
-                " non-near-cliff gaps: a bounded AD-2 slice, not full coverage"
+                " non-near-cliff gaps: a bounded perturbation slice, not full"
+                " coverage"
             )
         warnings.extend(perturbation["classes"]["P3-speaker-cliffs"]["warnings"])
     perturbation_wall_s = time.perf_counter() - perturbation_started
@@ -6466,6 +6687,29 @@ def cmd_shadow(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def _non_negative_int(raw: str) -> int:
+    """argparse type: an integer >= 0 (a negative slice bound would drop probes)."""
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {raw!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {value}")
+    return value
+
+
+def _perturbation_options_without_perturb(args: argparse.Namespace) -> list[str]:
+    """``--perturb-*`` options that were given although ``--perturb`` was not."""
+    given = {
+        "--perturb-case": bool(args.perturb_case),
+        "--perturb-mode": bool(args.perturb_mode),
+        "--perturb-magnitude": bool(args.perturb_magnitude),
+        "--perturb-near-cliff-only": bool(args.perturb_near_cliff_only),
+        "--perturb-max-probes": bool(args.perturb_max_probes),
+    }
+    return [] if args.perturb else [flag for flag, used in given.items() if used]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="calib_segmentation.py",
@@ -6487,7 +6731,10 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument(
         "--baseline",
         default=None,
-        help="tracked baseline to compare against; omitted = absolute gates only",
+        help=(
+            "tracked baseline to compare against; omitted = the default gates are"
+            " reported in warning mode only, so no gate is enforced"
+        ),
     )
     evaluate.add_argument("--json-out", default=None, help="where to write the report")
     evaluate.add_argument(
@@ -6519,11 +6766,33 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--corpus", default=str(DEFAULT_CORPUS))
     record.add_argument("--report", required=True)
     record.add_argument("--output", default=str(DEFAULT_BASELINE))
+    levels = record.add_mutually_exclusive_group()
+    levels.add_argument(
+        "--gates-from",
+        default=None,
+        help=(
+            "baseline whose gate levels (mode per metric) the new baseline keeps;"
+            " default: the existing --output baseline. Thresholds always come"
+            " from the report"
+        ),
+    )
+    levels.add_argument(
+        "--gates-from-report",
+        action="store_true",
+        help=(
+            "take the gate levels from the report instead (all warning unless it"
+            " was evaluated against a baseline): a first recording, or a"
+            " deliberate reset"
+        ),
+    )
     record.set_defaults(func=cmd_record_baseline)
 
     shadow = sub.add_parser(
         "shadow",
-        help="P5: measure the complete shadow lane/row matrix (separate from `quality`)",
+        help=(
+            "measure the unshipped shadow lane/row matrix beside v1 (separate from"
+            " `quality`)"
+        ),
     )
     shadow.add_argument("--corpus", default=str(DEFAULT_CORPUS))
     shadow.add_argument(
@@ -6541,7 +6810,10 @@ def build_parser() -> argparse.ArgumentParser:
     shadow.add_argument(
         "--check",
         action="store_true",
-        help="apply the exits: 1 on a C13/gate/perturbation failure, 2 on invalid",
+        help=(
+            "apply the exits: 1 on a coverage, gate or perturbation failure,"
+            " 2 on an invalid run"
+        ),
     )
     shadow.add_argument(
         "--allow-environment-drift",
@@ -6558,7 +6830,10 @@ def build_parser() -> argparse.ArgumentParser:
     shadow.add_argument(
         "--perturb",
         action="store_true",
-        help="also run the AD-2 perturbation probes (expensive; see --perturb-case)",
+        help=(
+            "also run the boundary-stability perturbation probes (expensive; see"
+            " --perturb-case). The other --perturb-* options require it"
+        ),
     )
     shadow.add_argument(
         "--perturb-case",
@@ -6584,13 +6859,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--perturb-near-cliff-only",
         action="store_true",
         help="probe only near-cliff gaps (skip the seeded 10%% sample): a bounded"
-        " AD-2 slice cheap enough for the frozen Makefile target",
+        " slice cheap enough for the routine make target",
     )
     shadow.add_argument(
         "--perturb-max-probes",
-        type=int,
+        type=_non_negative_int,
         default=0,
-        help="0 = exhaustive near-cliff coverage; any cap marks the run non-exhaustive",
+        help=(
+            "cap on single-gap probes per perturbed case (0 = no cap); a cap that"
+            " cuts any case's plan short marks the run non-exhaustive"
+        ),
     )
     shadow.set_defaults(func=cmd_shadow)
 

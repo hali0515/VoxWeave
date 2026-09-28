@@ -820,7 +820,11 @@ _COARSE_BREAKERS = frozenset("。！？、，,.!?；;：:")
 def _sentence_merged_document(
     fixture: dict[str, object],
 ) -> tuple[dict[str, object], SegDocument]:
-    """Reproduce ``probe_prop_error.py`` with a language-correct text join."""
+    """Merge the tracked case into sentence-sized coarse units.
+
+    A unit ends at sentence or clause punctuation, or after ``max_block_units``
+    fine units; each coarse surface is joined the way the language joins text.
+    """
     relative = Path(str(fixture["source_case"]))
     cases_root = COARSE_CORPUS.parent.resolve()
     source_path = (COARSE_CORPUS.parent / relative).resolve()
@@ -897,8 +901,8 @@ def _cue_start_errors(cues: list[dict[str, object]], truth: list[float]) -> list
     errors: list[float] = []
     for cue in cues:
         # The first cue is fixed to the document's first source time and is not
-        # an interior boundary.  ``probe_prop_error.py`` excludes it for the
-        # same reason; the fixture measures only choices refinement can move.
+        # an interior boundary; the fixture measures only choices refinement
+        # can move.
         if 0 < offset < len(truth):
             errors.append(abs(float(cue["start"]) - truth[offset]))
         offset += len("".join(normalize_text(str(cue["text"])).split()))

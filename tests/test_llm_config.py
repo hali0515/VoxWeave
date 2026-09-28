@@ -9,7 +9,8 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
-from voxweave import asrfix, config, pipeline, translate
+from voxweave import asrfix, config, translate
+from voxweave import llm_commands
 from voxweave.cli import cli
 
 
@@ -203,7 +204,7 @@ def test_resolve_model_passthrough_never_probes():
 def test_translate_cues_resolves_auto_before_calling(monkeypatch):
     seen = {}
 
-    def fake_call(client, model, messages, on_entry=None):
+    def fake_call(client, model, messages, on_entry=None, **_kwargs):
         seen["model"] = model
         return '{"translations": [{"i": 0, "t": "早上好"}]}'
 
@@ -221,7 +222,7 @@ def test_translate_cues_resolves_auto_before_calling(monkeypatch):
 def test_correct_cues_resolves_auto_before_calling(monkeypatch):
     seen = {}
 
-    def fake_call(client, model, messages, on_entry=None):
+    def fake_call(client, model, messages, on_entry=None, **_kwargs):
         seen["model"] = model
         return '{"fixes": []}'
 
@@ -267,7 +268,7 @@ def test_cli_translate_uses_conf_llm_without_openai_key(conf_at, tmp_path):
     )
     captured = {}
     with patch.object(
-        pipeline,
+        llm_commands,
         "translate",
         lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
     ):
@@ -285,7 +286,7 @@ def test_cli_correct_uses_conf_llm_without_openai_key(conf_at, tmp_path):
     )
     captured = {}
     with patch.object(
-        pipeline,
+        llm_commands,
         "correct",
         lambda path, **kw: (
             captured.update(kw)
@@ -310,7 +311,7 @@ def test_cli_translate_passes_windowing_and_partial_options(conf_at, tmp_path):
     conf_at.write_text('[llm]\napi_key_env = ""\n', encoding="utf-8")
     captured = {}
     with patch.object(
-        pipeline,
+        llm_commands,
         "translate",
         lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
     ):
@@ -332,7 +333,7 @@ def test_cli_translate_passes_windowing_and_partial_options(conf_at, tmp_path):
     assert captured["allow_partial"] is True
     captured.clear()
     with patch.object(
-        pipeline,
+        llm_commands,
         "translate",
         lambda path, **kw: captured.update(kw) or (tmp_path / "ep.zh.vtt"),
     ):
@@ -397,6 +398,5 @@ def test_module_constants_never_read_the_user_conf(conf_at):
     # model = "auto" leaked into every library call and test. The module-level
     # names stay built-in; env / conf resolve at call time in the CLI and pipeline.
     conf_at.write_text('[llm]\nmodel = "auto"\n', encoding="utf-8")
-    assert translate.TRANSLATE_MODEL == config.DEFAULT_LLM_MODEL
     assert asrfix.FIX_MODEL == config.DEFAULT_LLM_MODEL
     assert config.resolve_llm_model(None, task_envvar="VOXWEAVE_FIX_MODEL") == "auto"

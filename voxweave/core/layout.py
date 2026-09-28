@@ -10,7 +10,10 @@ cue dicts — those live in ``timing`` (cue-stream polish) and ``smart_split``
 from __future__ import annotations
 
 import re
+import unicodedata
+from functools import lru_cache
 
+from .breakpoints import phrase_atoms
 from .kinsoku import line_end_penalty
 from .langsets import LANGUAGES_WITHOUT_SPACES
 
@@ -243,9 +246,31 @@ def strip_punct_for_subtitles(text: str) -> str:
     return cleaned
 
 
+# Alphabetic scripts whose letters render at Latin (half-width) width. Matched on
+# the Unicode character name, so fullwidth forms ("FULLWIDTH LATIN ...") stay wide.
+_NARROW_SCRIPT_PREFIXES = ("LATIN", "CYRILLIC", "GREEK")
+
+
+@lru_cache(maxsize=4096)
+def _non_ascii_width(c: str) -> int:
+    """Half-width cells for one non-ASCII, non-space character."""
+    if unicodedata.combining(c):
+        return 0
+    if unicodedata.name(c, "").startswith(_NARROW_SCRIPT_PREFIXES):
+        return 1
+    return 2
+
+
 def _vis_width(s: str) -> int:
-    """Visual width: CJK/full-width glyphs count 2; ASCII/space counts 1."""
-    return sum(1 if (c.isascii() or c.isspace()) else 2 for c in s)
+    """Visual width in half-width cells, summed per character.
+
+    ASCII and whitespace count 1. Letters of the narrow alphabetic scripts
+    (Unicode name starting with LATIN, CYRILLIC or GREEK, e.g. ``é``, ``ж``,
+    ``λ``) count 1 and combining marks count 0, so a Russian or accented-French
+    line gets the same budget as English. Every other non-ASCII character --
+    CJK/full-width glyphs, fullwidth Latin, symbols, other scripts -- counts 2.
+    """
+    return sum(1 if (c.isascii() or c.isspace()) else _non_ascii_width(c) for c in s)
 
 
 def _wrap_units(text: str, lang: str) -> list[tuple[str, str]]:
@@ -335,6 +360,38 @@ _ORPHAN_WEIGHT = 30
 _ORPHAN_MAX_VIS = 10
 
 
+def _break_words(units: list[tuple[str, str]], lang: str) -> list[tuple[bool, str]]:
+    """Per break index ``i`` (between ``units[i-1]`` and ``units[i]``): whether it
+    falls on a word boundary, and the word it leaves at the end of the line.
+
+    Spaced languages: every unit is a whole word. No-space languages: units are
+    single glyphs or ASCII runs, so words come from the segmentation the engine
+    scores line ends on (``breakpoints.phrase_atoms``: jieba for zh, BudouX for
+    ja/yue), and the trailing word is the enclosing word up to the break. That is
+    what ``line_end_penalty`` is built for: its zh tables are whole-word (目的 is
+    not the particle 的) and its ja table holds multi-kana particles (まで/より).
+    Index 0 is a placeholder; a break there is never a candidate.
+    """
+    n = len(units)
+    if not _no_spaces(lang):
+        return [(True, "")] + [(True, units[i - 1][0]) for i in range(1, n)]
+    word_starts: set[int] = set()
+    offset = 0
+    for word in phrase_atoms(_join_line(units), lang):
+        word_starts.add(offset)
+        offset += _token_char_count(word)
+    out: list[tuple[bool, str]] = [(True, "")]
+    word_start = 0
+    offset = _token_char_count(units[0][0]) if units else 0
+    for i in range(1, n):
+        at_word = offset in word_starts
+        out.append((at_word, _join_line(units[word_start:i])))
+        if at_word:
+            word_start = i
+        offset += _token_char_count(units[i][0])
+    return out
+
+
 def _two_line_break(
     units: list[tuple[str, str]], lang: str, max_line_length: int
 ) -> tuple[int, int, int] | None:
@@ -343,8 +400,10 @@ def _two_line_break(
     Scores every break where both lines fit the hard visual budget
     (``max_line_length``, in half-width cells): line-length imbalance + sticky
     line-end penalty (the same line_end_penalty signal the segmentation engine
-    uses) + orphan penalty for a lone short word stranded on either line. Ties
-    prefer bottom-heavy (pyramid) shape. ``None`` when no two-line split fits.
+    uses, on the trailing *word* -- see ``_break_words``) + orphan penalty for a
+    lone short word stranded on either line. Breaks on a word boundary always
+    beat breaks inside a segmented CJK word. Ties prefer bottom-heavy (pyramid)
+    shape. ``None`` when no two-line split fits.
 
     Line widths come from prefix sums rather than from re-joining a slice per
     candidate, which makes the scan linear in the unit count instead of
@@ -360,8 +419,9 @@ def _two_line_break(
     for index, (atom, gap) in enumerate(units):
         atom_prefix[index + 1] = atom_prefix[index] + _vis_width(atom)
         gap_prefix[index + 1] = gap_prefix[index] + _vis_width(gap)
+    words = _break_words(units, lang)
     best: tuple[int, int, int] | None = None
-    best_score: float | None = None
+    best_key: tuple[int, float] | None = None
     for i in range(1, n):
         # ``_join_line`` drops the *last* unit's trailing gap, so a slice's width
         # is its atoms plus every gap strictly inside it.
@@ -371,16 +431,20 @@ def _two_line_break(
         bot_w = (atom_prefix[n] - atom_prefix[i]) + (gap_prefix[n - 1] - gap_prefix[i])
         if bot_w > max_line_length:
             continue
+        at_word, trailing = words[i]
         score: float = abs(top_w - bot_w)
-        score += _STICKY_END_WEIGHT * line_end_penalty(units[i - 1][0], lang)
+        score += _STICKY_END_WEIGHT * line_end_penalty(trailing, lang)
         if i == 1 and top_w <= _ORPHAN_MAX_VIS:
             score += _ORPHAN_WEIGHT
         if i == n - 1 and bot_w <= _ORPHAN_MAX_VIS:
             score += _ORPHAN_WEIGHT
         if top_w > bot_w:
             score += 1  # tie-break: bottom-heavy reads better
-        if best_score is None or score < best_score:
-            best, best_score = (i, top_w, bot_w), score
+        # a break inside a segmented word is only a fallback for when no word
+        # boundary fits the budget
+        key = (0 if at_word else 1, score)
+        if best_key is None or key < best_key:
+            best, best_key = (i, top_w, bot_w), key
     return best
 
 

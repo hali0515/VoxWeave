@@ -5,11 +5,9 @@ pyannote stays the segmenter (who speaks when, overlap); this module decides
 nobody can attribute confidently (background voices, noise, very short
 fragments). It is a pure algorithm: the caller injects ``embed`` (spans in
 seconds -> ``[N, D]`` L2-normalised rows), so everything here runs without
-torch or a GPU and is deterministic. numpy is the only import-time
-dependency; the non-default ``spectral`` and ``refine`` methods import scipy
-when they run. ``voxweave.diarize`` calls :func:`cluster_turns` on the raw
-pyannote turns, before its smoothing pass, when
-``[diarize].clustering = "voiceprint"``.
+torch or a GPU and is deterministic. numpy is its only dependency.
+``voxweave.diarize`` calls :func:`cluster_turns` on the raw pyannote turns,
+before its smoothing pass, when ``[diarize].clustering = "voiceprint"``.
 
 Pipeline (``cluster_turns``):
 
@@ -20,28 +18,23 @@ Pipeline (``cluster_turns``):
    ``anchor_seconds``. A turn's embedding is the duration-weighted unit mean of
    its pieces' embeddings; a turn without a usable piece is embedded over its
    whole span (never an anchor).
-3. **Anchor clustering**, one of three methods:
-
-   * ``ahc``: average-linkage cosine AHC cut at ``cut_distance``, with a
-     cannot-link constraint (two anchors overlapping in time by more than
-     ``cannot_link_overlap`` of the shorter one never end up in one cluster);
-   * ``spectral``: 3D-Speaker style spectral clustering (p-pruned cosine
-     affinity, unnormalised Laplacian, eigengap speaker count, k-means);
-   * ``refine``: start from pyannote's labels, split labels whose anchors
-     form two well separated groups, merge labels whose anchors are close.
+3. **Anchor clustering**: average-linkage cosine AHC cut at ``cut_distance``,
+   with a cannot-link constraint (two anchors overlapping in time by more than
+   ``cannot_link_overlap`` of the shorter one never end up in one cluster).
+   More than :data:`MAX_ANCHORS` anchors raise :class:`ClusteringError` (the
+   AHC's time grows with the cube, its memory with the square, of the count).
 
    Clusters holding fewer than ``dissolve_seconds`` of anchor speech are
    dissolved: their anchors are assigned like any other turn. ``min_speakers``
-   / ``max_speakers`` are hard bounds on the number of surviving clusters:
-   ``ahc`` walks from its cut towards the bound it misses (more merges for
+   / ``max_speakers`` are hard bounds on the number of surviving clusters: the
+   AHC walks from its cut towards the bound it misses (more merges for
    ``max_speakers``, fewer for ``min_speakers``) and takes the first level that
    satisfies them; when the walk finds none (cannot-link keeping more than
    ``max_speakers`` anchor groups apart, too little anchor speech for
    ``min_speakers`` clusters), :class:`ClusteringError` is raised rather than
-   returning a count outside the bounds. Every method is held to the bounds
-   the same way. A ``min_speakers`` above the cut's count is met by dividing
-   the voices the cut found, because a person with less than
-   ``dissolve_seconds`` of anchor speech never holds a cluster: that costs
+   returning a count outside the bounds. A ``min_speakers`` above the cut's
+   count is met by dividing the voices the cut found, because a person with
+   less than ``dissolve_seconds`` of anchor speech never holds a cluster: that costs
    accuracy against the unbounded result, but less than pyannote's own
    clustering under the same bound (the true speaker count, on the 33
    VoxConverse and JVS-conv dev+test recordings where the cut finds fewer;
@@ -89,10 +82,14 @@ Turn = tuple[float, float, str]
 Span = tuple[float, float]
 # spans in seconds -> [N, D] L2-normalised rows, one per span, in span order.
 EmbedFn = Callable[[Sequence[Span]], np.ndarray]
-Embed = EmbedFn
 
 RECIPE = "voiceprint-v1"
-METHODS = ("ahc", "spectral", "refine")
+# The anchor clustering method, as the audit records it.
+METHOD = "ahc"
+# Cap on the anchor count: the AHC takes O(n^3) time and O(n^2) memory. 5,000
+# anchors (hours of dense dialogue) took 42 s and 0.5 GB on a desktop CPU;
+# beyond that the caller keeps pyannote's clustering.
+MAX_ANCHORS = 5_000
 LABEL_FORMAT = "SPEAKER_{:02d}"
 # Audit key present (with the reason) when pyannote's labels were passed through.
 PASSTHROUGH = "passthrough"
@@ -118,21 +115,12 @@ class ClusteringParams:
     AgglomerativeClustering; all other thresholds are cosine similarities.
     """
 
-    method: str = "ahc"
     anchor_seconds: float = 1.0
     min_piece_seconds: float = 0.3
     min_embed_seconds: float = 0.05
-    # ahc
+    # anchor clustering
     cut_distance: float = 0.45
     cannot_link_overlap: float = 0.5
-    # spectral
-    spectral_pval: float = 0.012
-    spectral_merge_similarity: float = 0.0
-    spectral_max_speakers: int = 20
-    # refine
-    merge_similarity: float = 0.55
-    split_similarity: float = 0.3
-    # all methods
     dissolve_seconds: float = 6.0
     # assignment
     local_seconds: float = 30.0
@@ -147,10 +135,6 @@ class ClusteringParams:
     overlap_exclusion: bool = True
 
     def __post_init__(self) -> None:
-        if self.method not in METHODS:
-            raise ClusteringError(
-                f"method must be one of {METHODS}, got {self.method!r}"
-            )
         nonnegative = (
             "anchor_seconds",
             "min_piece_seconds",
@@ -166,14 +150,7 @@ class ClusteringParams:
                 raise ClusteringError(
                     f"{name} must be a finite number >= 0, got {value!r}"
                 )
-        for name in (
-            "tau",
-            "tau_global",
-            "tau_floor",
-            "merge_similarity",
-            "split_similarity",
-            "spectral_merge_similarity",
-        ):
+        for name in ("tau", "tau_global", "tau_floor"):
             value = float(getattr(self, name))
             if not math.isfinite(value) or not -1.0 <= value <= 1.0:
                 raise ClusteringError(f"{name} must lie in [-1, 1], got {value!r}")
@@ -183,12 +160,8 @@ class ClusteringParams:
             )
         if not 0.0 < self.cannot_link_overlap <= 1.0:
             raise ClusteringError("cannot_link_overlap must lie in (0, 1]")
-        if not 0.0 < self.spectral_pval <= 1.0:
-            raise ClusteringError("spectral_pval must lie in (0, 1]")
-        if self.local_turns < 0 or self.spectral_max_speakers < 1:
-            raise ClusteringError(
-                "local_turns must be >= 0 and spectral_max_speakers >= 1"
-            )
+        if self.local_turns < 0:
+            raise ClusteringError("local_turns must be >= 0")
 
 
 @dataclass
@@ -273,6 +246,11 @@ def assign_turns(
     anchor_idx = [
         i for i in range(n) if has_vec[i] and usable[i] >= params.anchor_seconds
     ]
+    if len(anchor_idx) > MAX_ANCHORS:
+        raise ClusteringError(
+            f"{len(anchor_idx)} anchor turns exceed the {MAX_ANCHORS} this recipe "
+            "clusters (its cost grows with the cube of the anchor count)"
+        )
     anchor_idx_arr = np.array(anchor_idx, dtype=np.int64)
     anchor_vecs = (
         vectors[anchor_idx_arr] if anchor_idx else np.zeros((0, vectors.shape[1]))
@@ -280,15 +258,7 @@ def assign_turns(
     anchor_secs = usable[anchor_idx_arr] if anchor_idx else np.zeros(0)
     cannot = _cannot_link(ordered, anchor_idx, params.cannot_link_overlap)
 
-    if params.method == "ahc":
-        raw = _ahc_clusters(anchor_vecs, anchor_secs, cannot, params, lo, hi)
-    elif params.method == "spectral":
-        raw = _spectral_clusters(anchor_vecs, anchor_secs, params, lo, hi)
-    else:
-        original = [ordered[i][2] for i in anchor_idx]
-        raw = _refine_clusters(
-            anchor_vecs, anchor_secs, original, cannot, params, lo, hi
-        )
+    raw = _ahc_clusters(anchor_vecs, anchor_secs, cannot, params, lo, hi)
     n_before = int(len(set(raw.tolist()))) if raw.size else 0
     clusters = _dissolve(raw, anchor_secs, params.dissolve_seconds)
     survivors = sorted({int(c) for c in clusters.tolist() if c >= 0})
@@ -298,12 +268,8 @@ def assign_turns(
     if not survivors:
         # Nothing to anchor a voiceprint on: keep pyannote's labels untouched.
         return _passthrough(ordered, params, n_spans, len(anchor_idx), lo, hi)
-    if len(survivors) < lo or (hi is not None and len(survivors) > hi):
-        # Every surviving cluster keeps its anchors, so this is the output count.
-        raise ClusteringError(
-            f"{params.method} clustering left {len(survivors)} speaker(s), outside "
-            f"the speaker bounds {_bounds_text(lo, hi)}"
-        )
+    # _ahc_clusters met the speaker bounds with these very survivors, and every
+    # surviving cluster keeps its anchors, so they are the output count.
 
     remap = {c: k for k, c in enumerate(survivors)}
     cluster_of_anchor = np.array(
@@ -522,18 +488,6 @@ def _embedding_plan(
     return plan
 
 
-def embedding_spans(
-    turns: Sequence[Turn], params: ClusteringParams | None = None
-) -> list[Span]:
-    """Exactly the spans ``cluster_turns`` passes to ``embed`` (first-seen order)."""
-    params = params or ClusteringParams()
-    ordered = _valid_sorted(turns)
-    plan = _embedding_plan(
-        ordered, overlap_trimmed_pieces(ordered, params.min_piece_seconds), params
-    )
-    return list(dict.fromkeys(span for spans in plan for span in spans))
-
-
 def _turn_vectors(
     turns: Sequence[Turn],
     pieces: Sequence[Sequence[Span]],
@@ -590,10 +544,6 @@ def _speaker_bounds(
     if hi is not None and hi < lo:
         raise ClusteringError(f"max_speakers ({hi}) < min_speakers ({lo})")
     return lo, hi
-
-
-def _bounds_text(lo: int, hi: int | None) -> str:
-    return f"[{lo}, {hi}]" if hi is not None else f"[{lo}, unbounded]"
 
 
 def _dissolve(clusters: np.ndarray, seconds: np.ndarray, minimum: float) -> np.ndarray:
@@ -768,212 +718,6 @@ def _ahc_clusters(
     )
 
 
-def _kmeans(
-    points: np.ndarray, k: int, restarts: int = 10, iterations: int = 100
-) -> np.ndarray:
-    """Deterministic k-means++ / Lloyd with fixed seeds; best inertia wins."""
-    best_labels = np.zeros(points.shape[0], dtype=np.int64)
-    best_inertia = np.inf
-    for seed in range(restarts):
-        rng = np.random.default_rng(seed)
-        centers = [points[int(rng.integers(points.shape[0]))]]
-        for _ in range(1, k):
-            d2 = np.min(
-                ((points[:, None, :] - np.array(centers)[None]) ** 2).sum(-1), axis=1
-            )
-            total = float(d2.sum())
-            if total <= 0.0:
-                centers.append(points[int(rng.integers(points.shape[0]))])
-            else:
-                centers.append(points[int(rng.choice(points.shape[0], p=d2 / total))])
-        c = np.array(centers)
-        labels = np.zeros(points.shape[0], dtype=np.int64)
-        for _ in range(iterations):
-            dist = ((points[:, None, :] - c[None]) ** 2).sum(-1)
-            new = np.argmin(dist, axis=1)
-            if np.array_equal(new, labels) and _ > 0:
-                break
-            labels = new
-            for j in range(k):
-                members = points[labels == j]
-                if len(members):
-                    c[j] = members.mean(axis=0)
-        inertia = float(((points - c[labels]) ** 2).sum())
-        if inertia < best_inertia - 1e-12:
-            best_inertia, best_labels = inertia, labels
-    return best_labels
-
-
-def _spectral_labels(x: np.ndarray, pval: float, k_lo: int, k_hi: int) -> np.ndarray:
-    import scipy.linalg
-
-    n = x.shape[0]
-    if n < 3:
-        return np.zeros(n, dtype=np.int64)
-    sim = x @ x.T
-    keep = pval if n * pval >= 6 else 6.0 / n
-    n_drop = int((1 - keep) * n)
-    pruned = sim.copy()
-    if n_drop > 0:
-        order = np.argsort(pruned, axis=1, kind="stable")[:, :n_drop]
-        np.put_along_axis(pruned, order, 0.0, axis=1)
-    sym = 0.5 * (pruned + pruned.T)
-    np.fill_diagonal(sym, 0.0)
-    laplacian = np.diag(np.abs(sym).sum(axis=1)) - sym
-    eigvals, eigvecs = scipy.linalg.eigh(laplacian)
-    window = eigvals[k_lo - 1 : k_hi + 1]
-    k = k_lo if len(window) < 2 else int(np.argmax(np.diff(window))) + k_lo
-    k = max(1, min(k, n))
-    if k == 1:
-        return np.zeros(n, dtype=np.int64)
-    return _relabel(_kmeans(eigvecs[:, :k], k).tolist())
-
-
-def _merge_close(labels: np.ndarray, x: np.ndarray, threshold: float) -> np.ndarray:
-    labels = labels.copy()
-    while True:
-        ids = np.unique(labels)
-        if len(ids) < 2:
-            break
-        centers = _unit_rows(np.stack([x[labels == c].mean(axis=0) for c in ids]))
-        sim = centers @ centers.T
-        np.fill_diagonal(sim, -np.inf)
-        a, b = divmod(int(np.argmax(sim)), len(ids))
-        if sim[a, b] <= threshold:
-            break
-        labels[labels == ids[b]] = ids[a]
-    return _relabel(labels.tolist())
-
-
-def _spectral_clusters(
-    x: np.ndarray,
-    seconds: np.ndarray,
-    params: ClusteringParams,
-    lo: int,
-    hi: int | None,
-) -> np.ndarray:
-    n = x.shape[0]
-    if n == 0:
-        return np.zeros(0, dtype=np.int64)
-    k_hi = min(hi if hi is not None else params.spectral_max_speakers, max(1, n - 1))
-    labels = _spectral_labels(x, params.spectral_pval, min(lo, k_hi), k_hi)
-    if params.spectral_merge_similarity > 0.0:
-        labels = _merge_close(labels, x, params.spectral_merge_similarity)
-    return labels
-
-
-def _refine_clusters(
-    x: np.ndarray,
-    seconds: np.ndarray,
-    original: Sequence[str],
-    cannot: set[tuple[int, int]],
-    params: ClusteringParams,
-    lo: int,
-    hi: int | None,
-) -> np.ndarray:
-    """Split, then merge, pyannote's labels on anchor evidence."""
-    from scipy.cluster.hierarchy import fcluster, linkage
-
-    n = x.shape[0]
-    if n == 0:
-        return np.zeros(0, dtype=np.int64)
-    groups: list[list[int]] = []
-    by_label: dict[str, list[int]] = {}
-    for pos, label in enumerate(original):
-        by_label.setdefault(label, []).append(pos)
-    pending = [
-        by_label[label] for label in sorted(by_label, key=lambda lb: by_label[lb][0])
-    ]
-
-    def two_way(members: list[int]) -> tuple[list[int], list[int], float] | None:
-        if len(members) < 2:
-            return None
-        sub = x[members]
-        if len(members) == 2:
-            sides = np.array([1, 2])
-        else:
-            tree = linkage(sub, method="average", metric="cosine")
-            sides = fcluster(tree, 2, criterion="maxclust")
-        left = [m for m, s in zip(members, sides) if s == sides[0]]
-        right = [m for m, s in zip(members, sides) if s != sides[0]]
-        if not left or not right:
-            return None
-        cross = float((x[left] @ x[right].T).mean())
-        return left, right, cross
-
-    while pending:
-        members = pending.pop(0)
-        split = two_way(members)
-        if split is not None:
-            left, right, cross = split
-            if (
-                cross < params.split_similarity
-                and seconds[left].sum() >= params.dissolve_seconds
-                and seconds[right].sum() >= params.dissolve_seconds
-            ):
-                pending[:0] = [left, right]
-                continue
-        groups.append(members)
-
-    def group_sim(a: list[int], b: list[int]) -> float:
-        return float((x[a] @ x[b].T).mean())
-
-    def blocked(a: list[int], b: list[int]) -> bool:
-        sa = set(a)
-        return any((p in sa and q in b) or (q in sa and p in b) for p, q in cannot)
-
-    def merge_best(threshold: float | None, only: Callable[[int], bool]) -> bool:
-        best: tuple[float, int, int] | None = None
-        for i in range(len(groups)):
-            if not only(i):
-                continue
-            for j in range(i + 1, len(groups)):
-                if not only(j):
-                    continue
-                s = group_sim(groups[i], groups[j])
-                if (threshold is None or s >= threshold) and (
-                    best is None or s > best[0]
-                ):
-                    if not blocked(groups[i], groups[j]):
-                        best = (s, i, j)
-        if best is None:
-            return False
-        _s, i, j = best
-        groups[i] = sorted(groups[i] + groups[j])
-        del groups[j]
-        return True
-
-    while merge_best(params.merge_similarity, lambda _i: True):
-        pass
-
-    def labels_now() -> np.ndarray:
-        out = np.zeros(n, dtype=np.int64)
-        for g, members in enumerate(groups):
-            out[members] = g
-        return out
-
-    def alive(i: int) -> bool:
-        return float(seconds[groups[i]].sum()) >= params.dissolve_seconds
-
-    while (
-        hi is not None
-        and _surviving(labels_now(), seconds, params.dissolve_seconds) > hi
-    ):
-        if not merge_best(None, alive):
-            break
-    while _surviving(labels_now(), seconds, params.dissolve_seconds) < lo:
-        options = []
-        for g, members in enumerate(groups):
-            split = two_way(members)
-            if split is not None:
-                options.append((split[2], g, split[0], split[1]))
-        if not options:
-            break
-        _cross, g, left, right = min(options, key=lambda o: (o[0], o[1]))
-        groups[g : g + 1] = [left, right]
-    return _relabel(labels_now().tolist())
-
-
 # --------------------------------------------------------------------------
 # Assignment and output
 # --------------------------------------------------------------------------
@@ -1096,7 +840,7 @@ def _audit(
     n_out = len(per_label)
     return {
         "recipe": RECIPE,
-        "method": params.method,
+        "method": METHOD,
         "params": asdict(params),
         "speaker_bounds": {
             "min": lo,
@@ -1125,10 +869,10 @@ __all__ = [
     "ClusteringError",
     "ClusteringParams",
     "ClusteringResult",
-    "Embed",
     "EmbedFn",
     "LABEL_FORMAT",
-    "METHODS",
+    "MAX_ANCHORS",
+    "METHOD",
     "PASSTHROUGH",
     "RECIPE",
     "ROUTES",
@@ -1143,7 +887,6 @@ __all__ = [
     "assign_turns",
     "average_linkage_history",
     "cluster_turns",
-    "embedding_spans",
     "overlap_trimmed_pieces",
     "union_same_label",
 ]

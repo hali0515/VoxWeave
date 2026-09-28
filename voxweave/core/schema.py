@@ -3,8 +3,8 @@
 These are the de facto contracts of the sibling-file pipeline (see the JSON
 ``word_segments`` produced by transcribe/align); TypedDicts make them explicit
 so a typo'd key is a type error instead of a silently-absent value.
-``Unit``/``Atom`` are ``total=False`` (ghost units lack spans, legacy
-word_data has no ``word``); ``Cue`` keys are required invariants.
+``Unit`` is ``total=False`` (ghost units lack spans, legacy word_data has no
+``word``); ``Cue`` keys are required invariants.
 """
 
 from __future__ import annotations
@@ -33,27 +33,6 @@ class Unit(TypedDict, total=False):
     word: str
     start: float | None
     end: float | None
-
-
-class Atom(TypedDict, total=False):
-    """A non-breakable packing unit inside one cue (see ``_build_atoms``).
-
-    Spaced langs: one word. No-space langs: one CJK char or Latin run.
-    ``end_pen`` is the precomputed line-end break penalty attached by
-    ``_attach_end_penalties`` (0 = clean break point).
-    ``forced_boundary`` exposes spaces inside an overlong embedded Latin run.
-    ``_unit_start``/``_unit_end`` are the atom's half-open footprint in the
-    ``word_data`` it was built from — the only granularity-safe way to slice that
-    stream back (``diarize.format_speaker_cues``, ``_repair_bound_particle_cues``).
-    """
-
-    text: str
-    start: float | None
-    end: float | None
-    end_pen: int
-    forced_boundary: bool
-    _unit_start: int
-    _unit_end: int
 
 
 class Cue(TypedDict):

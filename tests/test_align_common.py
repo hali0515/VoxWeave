@@ -14,7 +14,15 @@ def _fake_pass(recorder):
     return pass_fn
 
 
-def test_dp_chunked_pass_crops_to_envelope_when_opted_in():
+def _chunked_pass(wav, sr, norm, bounds, pass_fn, label, *, crop_to_envelope=False):
+    """Prepare and run the full-pass calls the way the CTC/MMS aligners do."""
+    calls = align_common._prepare_dp_calls(
+        wav, sr, norm, bounds, label, crop_to_envelope=crop_to_envelope
+    )
+    return align_common._execute_dp_calls(calls, pass_fn)
+
+
+def test_full_pass_crops_to_envelope_when_opted_in():
     # With crop_to_envelope=True (transcribe path: bounds are fresh VAD chunk windows), the
     # single global pass is cropped to [first_bound-pad, last_bound+pad] so a leading/trailing
     # skipped song (present in wav, absent from text) can't host stretched tokens.
@@ -24,7 +32,7 @@ def test_dp_chunked_pass_crops_to_envelope_when_opted_in():
     )  # 60s -> 3000 frames, well under budget
     bounds = [(30.0, 50.0)]  # 0-30 (skipped song) and 50-60 are untranscribed
     rec: dict = {}
-    out = align_common._dp_chunked_pass(
+    out = _chunked_pass(
         wav, sr, ["hello"], bounds, _fake_pass(rec), "TEST", crop_to_envelope=True
     )
 
@@ -37,7 +45,7 @@ def test_dp_chunked_pass_crops_to_envelope_when_opted_in():
     assert out[0][0]["start"] == lo  # local t=0 shifted back to absolute lo
 
 
-def test_dp_chunked_pass_default_does_not_crop():
+def test_full_pass_default_does_not_crop():
     # Routing-free invariant: WITHOUT the opt-in the full wav is passed even when bounds sit
     # far from the edges. The align subcommand's bounds are input-VTT timestamps — exactly
     # what may be wrong — so cropping to them would confine words to a possibly-shifted
@@ -45,21 +53,19 @@ def test_dp_chunked_pass_default_does_not_crop():
     sr = 16000
     wav = np.zeros(int(60.0 * sr), dtype="float32")
     rec: dict = {}
-    out = align_common._dp_chunked_pass(
-        wav, sr, ["hello"], [(30.0, 50.0)], _fake_pass(rec), "TEST"
-    )
+    out = _chunked_pass(wav, sr, ["hello"], [(30.0, 50.0)], _fake_pass(rec), "TEST")
 
     assert rec["len"] == wav.shape[-1]
     assert rec["offset"] == 0.0
     assert out[0][0]["start"] == 0.0
 
 
-def test_dp_chunked_pass_no_crop_when_envelope_is_full():
+def test_full_pass_no_crop_when_envelope_is_full():
     # Bounds already span the whole wav -> pad clamps to [0, total] -> no crop, offset 0.
     sr = 16000
     wav = np.zeros(int(40.0 * sr), dtype="float32")
     rec: dict = {}
-    out = align_common._dp_chunked_pass(
+    out = _chunked_pass(
         wav, sr, ["x"], [(0.0, 40.0)], _fake_pass(rec), "TEST", crop_to_envelope=True
     )
 
@@ -68,14 +74,12 @@ def test_dp_chunked_pass_no_crop_when_envelope_is_full():
     assert out[0][0]["start"] == 0.0
 
 
-def test_dp_chunked_pass_no_bounds_runs_full_pass():
+def test_full_pass_no_bounds_runs_full_pass():
     # No usable bounds -> fall back to a single full-wav pass at offset 0 (no crop).
     sr = 16000
     wav = np.zeros(int(20.0 * sr), dtype="float32")
     rec: dict = {}
-    align_common._dp_chunked_pass(
-        wav, sr, ["x"], None, _fake_pass(rec), "TEST", crop_to_envelope=True
-    )
+    _chunked_pass(wav, sr, ["x"], None, _fake_pass(rec), "TEST", crop_to_envelope=True)
 
     assert rec["len"] == wav.shape[-1]
     assert rec["offset"] == 0.0

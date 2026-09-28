@@ -15,8 +15,9 @@ This module adds the record and changes no behaviour:
   document must not pay for fugashi, and a Japanese one must not pay for jieba.
 * :func:`note_degraded` / :func:`degradation_capture` -- which fallbacks actually
   fired during one segmentation, aggregated by ``(slot, reason)``, plus a
-  once-per-process ``log.warning`` on the ``voxweave`` logger. Never
-  ``warnings.warn``: ``ui.install_logging``'s filters swallow those.
+  once-per-process ``log.warning`` on the ``voxweave`` logger (``log.debug`` for
+  a fallback that is permanent by design, e.g. pysbd having no ``pt`` model).
+  Never ``warnings.warn``: ``ui.install_logging``'s filters swallow those.
 
 Instrumentation built on this is observation only -- an instrumented call must
 return exactly what it returned before. Nothing heavy is imported at module
@@ -29,7 +30,7 @@ CPython starts a new :class:`threading.Thread` with a fresh empty context, so a
 capture established on one thread is invisible to worker threads it spawns --
 a degradation raised off-thread is dropped from the manifest even though its
 once-per-process warning still reaches the log. Nothing in the segmentation path
-is threaded today (``pipeline.segment_document`` runs the whole engine inline),
+is threaded today (``segmentation.segment_document`` runs the whole engine inline),
 so no event is currently lost; anything that later moves provider work onto a
 pool has to carry the context across itself (``contextvars.copy_context()``) or
 the manifest will under-report.
@@ -59,6 +60,11 @@ _LEDGER: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.Conte
 #: complete record, the log line only has to say it once.
 _WARNED: set[tuple[str, str]] = set()
 
+#: ``(slot, reason)`` pairs of *expected* fallbacks already logged at DEBUG. Kept
+#: apart from ``_WARNED`` so a designed fallback can never consume the warning a
+#: genuine failure reported under the same pair is still owed.
+_NOTED: set[tuple[str, str]] = set()
+
 #: Set inside a capture that must not consume the once-per-process warning.
 #: A measurement lane re-runs the same providers over the same document, so
 #: without this it can WIN the latch and swallow the one line the shipping run
@@ -75,13 +81,18 @@ _QUIET: contextvars.ContextVar[bool] = contextvars.ContextVar(
 _POSSEG_DECODE_MODE = "HMM=False"
 
 
-def note_degraded(slot: str, reason: str) -> None:
+def note_degraded(slot: str, reason: str, *, expected: bool = False) -> None:
     """Record that ``slot`` fell back to a lesser provider, once per event.
 
     A no-op beyond one ``ContextVar`` read when no capture is active, so call
     sites can sit on the hot path. Repeats of the same ``(slot, reason)`` inside
     one capture increment ``count`` instead of appending, which keeps per-cue
     events (tokenizer disagreements) from swamping the manifest.
+
+    ``expected=True`` marks a fallback that is permanent by design (the language
+    has no model in that provider), not a broken install: it is recorded in the
+    ledger exactly the same, but logged once at DEBUG instead of WARNING so every
+    run in that language does not warn.
     """
     ledger = _LEDGER.get()
     if ledger is not None:
@@ -92,9 +103,11 @@ def note_degraded(slot: str, reason: str) -> None:
         else:
             ledger.append({"slot": slot, "reason": reason, "count": 1})
     key = (slot, reason)
-    if key not in _WARNED and not _QUIET.get():
-        _WARNED.add(key)
-        log.warning("segmentation %s provider degraded: %s", slot, reason)
+    latch = _NOTED if expected else _WARNED
+    if key not in latch and not _QUIET.get():
+        latch.add(key)
+        level = logging.DEBUG if expected else logging.WARNING
+        log.log(level, "segmentation %s provider degraded: %s", slot, reason)
 
 
 @contextmanager
@@ -163,8 +176,8 @@ def _atoms_slot(iso: str) -> dict[str, Any]:
 
     Spaced languages split on whitespace -- the designed provider, not a
     degradation. zh prefers jieba (BudouX's zh model is too weak), then BudouX,
-    then per-char; the other no-space languages have only BudouX, and yue has
-    neither, so it always lands on per-char.
+    then per-char; ja has only BudouX (per-char when it is absent); yue, th, lo
+    and my have no atom provider at all and always land on per-char.
     """
     if iso not in LANGUAGES_WITHOUT_SPACES:
         return {"provider": "whitespace", "version": None}

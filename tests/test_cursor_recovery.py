@@ -60,7 +60,7 @@ def test_ghost_run_beyond_window_resyncs_forward(caplog):
     # remaining window must find it and every cue must pair exactly.
     stream = S1.split() + GHOSTS + S2.split() + S3.split() + S4.split()
     with caplog.at_level(logging.WARNING):
-        cues = split_at_sentence_end(TEXT, _units(stream), "en", 42, 2)
+        cues = split_at_sentence_end(TEXT, _units(stream), "en")
     assert [c["text"].strip() for c in cues] == [S1, S2, S3, S4]
     _assert_paired(cues, "en")
     assert cues[1]["start"] == pytest.approx(stream.index("xa") * STEP)
@@ -81,7 +81,7 @@ def test_unanchorable_sentence_does_not_desync_followers(caplog):
     stream = S1.split() + s2[:5] + GHOSTS + s2[5:] + S3.split() + S4.split()
     word_data = _units(stream)
     with caplog.at_level(logging.WARNING):
-        cues = split_at_sentence_end(TEXT, word_data, "en", 42, 2)
+        cues = split_at_sentence_end(TEXT, word_data, "en")
     assert [c["text"].strip() for c in cues] == [S1, S2, S3, S4]
 
     # Downstream sentences are paired again and carry their own units' timing.
@@ -114,9 +114,7 @@ def test_no_space_ghost_run_beyond_window_resyncs():
     # Same failure on the char-level CJK cursor: a 10-unit ghost run pushes every
     # later sentence past the local rescan window.
     stream = list(JA_S1) + JA_GHOSTS + list(JA_S2) + list(JA_S3)
-    cues = split_at_sentence_end(
-        JA_TEXT, _units(stream, CJK_STEP, CJK_DUR), "ja", 18, 1
-    )
+    cues = split_at_sentence_end(JA_TEXT, _units(stream, CJK_STEP, CJK_DUR), "ja")
     assert [c["text"].strip() for c in cues] == [JA_S1, JA_S2, JA_S3]
     _assert_paired(cues, "ja")
     assert cues[1]["start"] == pytest.approx(stream.index("明") * CJK_STEP)
@@ -126,7 +124,7 @@ def test_no_space_ghost_run_beyond_window_resyncs():
 def test_clean_stream_needs_no_recovery(caplog):
     # Control: recovery must not fire on a well-formed stream.
     with caplog.at_level(logging.WARNING):
-        cues = split_at_sentence_end(TEXT, _units(TEXT.split()), "en", 42, 2)
+        cues = split_at_sentence_end(TEXT, _units(TEXT.split()), "en")
     assert [c["text"].strip() for c in cues] == [S1, S2, S3, S4]
     _assert_paired(cues, "en")
     assert cues[0]["start"] == pytest.approx(0.0)
@@ -139,7 +137,7 @@ def test_proportional_fill_does_not_mint_speech_anchors():
     # while located neighbours keep anchors equal to their real unit spans.
     s2 = S2.split()
     stream = S1.split() + s2[:5] + GHOSTS + s2[5:] + S3.split() + S4.split()
-    cues = split_at_sentence_end(TEXT, _units(stream), "en", 42, 2)
+    cues = split_at_sentence_end(TEXT, _units(stream), "en")
     assert [c["text"].strip() for c in cues] == [S1, S2, S3, S4]
 
     fabricated = cues[1]

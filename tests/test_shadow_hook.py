@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from voxweave import pipeline
+from voxweave.core import overlay
 from voxweave.config import gap_thresholds
 from voxweave.core import boundary_lattice, boundary_v2, shadow_v2
 from voxweave.core import providers
@@ -123,10 +124,10 @@ def _segment(case: dict, **kwargs) -> pipeline.SegmentationResult:
     return pipeline.segment_document(
         language=case["language"],
         word_segments=case["word_segments"],
-        vad_speech=pipeline._spans_in(case.get("vad_speech")),
+        vad_speech=overlay.spans_in(case.get("vad_speech")),
         shot_changes=[float(t) for t in case.get("shot_changes") or []] or None,
-        sing_spans=pipeline._spans_in(case.get("sing_spans")),
-        speaker_turns=pipeline._turns_in(case.get("speaker_turns")),
+        sing_spans=overlay.spans_in(case.get("sing_spans")),
+        speaker_turns=overlay.turns_in(case.get("speaker_turns")),
         **kwargs,
     )
 
@@ -179,7 +180,7 @@ def test_flag_off_returns_no_shadow(shadow_off):
 def test_only_the_exact_string_one_turns_the_shadow_on(
     monkeypatch: pytest.MonkeyPatch, value: str
 ):
-    """``--no-<flag>`` writes the literal ``"0"``, which is a truthy string."""
+    """Only ``"1"`` enables it: ``"0"`` or ``"false"`` are truthy strings, not "on"."""
     monkeypatch.setenv(FLAG, value)
     assert _segment(_case_plain()).shadow is None
 
@@ -227,7 +228,11 @@ def test_off_path_imports_no_v2_module(tmp_path: Path):
         encoding="utf-8",
     )
     proc = subprocess.run(
-        [sys.executable, str(script)], capture_output=True, text=True, check=True
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=300,
     )
     report = json.loads(proc.stdout.splitlines()[-1])
     assert report["shadow"] is None
@@ -252,7 +257,6 @@ def test_flag_on_leaves_the_returned_stream_identical(
         assert _canonical(on.cues) == _canonical(off.cues), name
         assert _canonical(on.units) == _canonical(off.units), name
         assert _canonical(on.manifest) == _canonical(off.manifest), name
-        assert on.thresholds_used == off.thresholds_used, name
         assert on.language == off.language, name
         # The only diagnostics delta is the boolean the hook itself records.
         assert {k: v for k, v in on.diagnostics.items() if k != "shadow_v2"} == {
@@ -277,10 +281,10 @@ def test_inputs_are_not_mutated_with_the_shadow_on(shadow_on):
     for name, build in CASES.items():
         case = build()
         units = case["word_segments"]
-        vad = pipeline._spans_in(case.get("vad_speech"))
+        vad = overlay.spans_in(case.get("vad_speech"))
         shots = [float(t) for t in case.get("shot_changes") or []] or None
-        sings = pipeline._spans_in(case.get("sing_spans"))
-        turns = pipeline._turns_in(case.get("speaker_turns"))
+        sings = overlay.spans_in(case.get("sing_spans"))
+        turns = overlay.turns_in(case.get("speaker_turns"))
         before = copy.deepcopy((units, vad, shots, sings, turns))
 
         pipeline.segment_document(
@@ -336,7 +340,7 @@ def test_artifact_carries_both_lanes_with_stage_attribution(shadow_on):
 
     lanes = artifact["lanes"]
     core = lanes[pipeline.SHADOW_LANE_CORE]
-    delivery = lanes[pipeline.SHADOW_LANE_DELIVERY]
+    delivery = lanes[pipeline.SHADOW_LANE_DELIVERY_LEGACY]
     assert core["stage"] == "core"
     assert delivery["stage"] == "legacy-overlay"
     for lane, stage in ((core, "core"), (delivery, "legacy-overlay")):
@@ -467,7 +471,7 @@ def test_post_overlay_lane_runs_the_diarize_formatter(shadow_on):
     # make the formatter a visible no-op. The v1 proxy is the stable tripwire
     # that proves this legacy overlay lane still invokes its old treatment.
     core = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v1"]
-    delivery = artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY]["v1"]
+    delivery = artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY_LEGACY]["v1"]
     assert delivery["cue_count"] >= core["cue_count"]
     # The formatter either split at the speaker turn or dashed a shared cue;
     # either way the delivery stream is not simply the core stream renamed.
@@ -480,7 +484,7 @@ def test_legacy_lyric_overlay_and_v2_evidence_lyric_are_both_visible(shadow_on):
     artifact = _segment(_case_lyrics()).shadow
     assert artifact is not None
     core_v1 = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v1"]["cues"]
-    delivery_v1 = artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY]["v1"]["cues"]
+    delivery_v1 = artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY_LEGACY]["v1"]["cues"]
     core_v2 = artifact["lanes"][pipeline.SHADOW_LANE_CORE]["v2"]["cues"]
     assert not any(row["lyric"] for row in core_v1)
     assert any(row["lyric"] for row in delivery_v1)
@@ -740,7 +744,8 @@ def test_an_unprojectable_v1_stream_is_measured_without_a_v1_reference(
     # The legacy proxy independently reconciles its post-overlay surfaces, but
     # that cannot retroactively manufacture the missing optimizer reference.
     assert (
-        artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY]["v1"]["validator"] is not None
+        artifact["lanes"][pipeline.SHADOW_LANE_DELIVERY_LEGACY]["v1"]["validator"]
+        is not None
     )
 
 

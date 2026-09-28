@@ -3,8 +3,9 @@
 
 For every media file given, the diarized ``speaker_turns`` of its sibling
 ``<stem>.json`` are cut into centroid-v1 segments (overlap-trimmed turns of at
-least ``voiceembed.MIN_TURN_SECONDS``), each model embeds them, and two score
-populations are collected:
+least ``voiceembed.MIN_TURN_SECONDS``, or the shorter fallback pieces when a
+speaker has none that long -- the production rule, with a larger per-speaker
+cap), each model embeds them, and two score populations are collected:
 
 * **target**: cosine between the duration-weighted centroid of a speaker's
   even-numbered segments and that of its odd-numbered segments (same episode,
@@ -24,7 +25,9 @@ non-target pairs to mean anything -- calibrate on several episodes.
 
 Audio: the separated-vocals cache ``voxweave transcribe`` left next to the
 media is used when present (the same signal captured voiceprints are computed
-on); otherwise the original mix is decoded, with a warning.
+on); otherwise the original mix is decoded, with a warning. Each episode is
+decoded once to a temporary 16 kHz WAV and loaded one episode at a time, so
+memory does not grow with the number of episodes.
 
 Models (``--models``, comma separated; default
 ``redimnet2,anime-va,pyannote-community-1``):
@@ -51,14 +54,19 @@ Usage::
     python scripts/calibrate_voiceprints.py ep01.mkv ep02.mkv \\
         --models redimnet2,anime-va,pyannote-community-1 --out voiceprints-calib.json
 
-Exit codes: 0 = report written, 2 = invalid input.
+Exit codes: 0 = report written, 2 = invalid input or a decode / model /
+report-write failure (reported on stderr, no traceback). A model that fails
+does not discard the others: the report is still written with their results
+and the failed model's ``error``, and the run exits 2.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import math
+import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -78,6 +86,10 @@ from voxweave import voiceembed  # noqa: E402
 PYANNOTE_COMMUNITY_1 = "pyannote-community-1"
 PYANNOTE_EMBEDDING = "pyannote-embedding"
 PYANNOTE_BASELINES = (PYANNOTE_COMMUNITY_1, PYANNOTE_EMBEDDING)
+# The dedicated voiceembed checkpoints, by the short names the report uses.
+DEDICATED_MODELS = ("redimnet2", "anime-va")
+# Every --models entry this script accepts (and the only ones it lists).
+MODEL_CHOICES = (*DEDICATED_MODELS, *PYANNOTE_BASELINES)
 DEFAULT_MODELS = ("redimnet2", "anime-va", PYANNOTE_COMMUNITY_1)
 # Segments per speaker fed to the target split (longest first, then back to
 # time order); more than the capture cap so odd/even halves stay meaningful.
@@ -96,13 +108,27 @@ Span = tuple[float, float]
 def calibration_segments(
     turns: Sequence[Turn], label: str, *, max_segments: int
 ) -> list[Span]:
-    """Overlap-trimmed segments of ``label`` that reach MIN_TURN_SECONDS."""
-    others = [(start, end) for start, end, other in turns if other != label]
+    """``voiceembed.centroid_segments`` for ``label``, keeping ``max_segments``.
+
+    The same centroid-v1 rule production applies -- overlap-trimmed pieces of
+    at least MIN_TURN_SECONDS, or of at least FALLBACK_SEGMENT_SECONDS when a
+    speaker has none that long -- with only the cap changed, so the odd/even
+    target split has enough segments per half.
+    """
+    others = [
+        (float(start), float(end))
+        for start, end, other in turns
+        if other != label and end > start
+    ]
     pieces: list[Span] = []
     for start, end, owner in turns:
         if owner == label and end > start:
             pieces.extend(voiceembed._subtract(float(start), float(end), others))
     qualifying = [p for p in pieces if p[1] - p[0] >= voiceembed.MIN_TURN_SECONDS]
+    if not qualifying:
+        qualifying = [
+            p for p in pieces if p[1] - p[0] >= voiceembed.FALLBACK_SEGMENT_SECONDS
+        ]
     ranked = sorted(qualifying, key=lambda p: (-(p[1] - p[0]), p[0], p[1]))
     return sorted(ranked[:max_segments])
 
@@ -284,15 +310,15 @@ def _pyannote_embedder(name: str) -> Embedder:
 
         inference, minimum = load()
         rows = []
-        for start, end in spans:
-            first = max(0, math.floor(start * voiceembed.SAMPLE_RATE))
-            last = min(len(waveform), math.ceil(end * voiceembed.SAMPLE_RATE))
+        for index, (start, end) in enumerate(spans):
+            # Same span -> samples rule (and out-of-audio refusal) as voiceembed.
+            first, last = voiceembed._span_samples(
+                waveform, float(start), float(end), index=index
+            )
             windows = voiceembed.window_bounds(first, last)
             vectors = []
             for low, high in windows:
-                segment = waveform[low:high]
-                if len(segment) < minimum:
-                    segment = np.resize(segment, minimum)
+                segment = voiceembed.repeat_to_length(waveform[low:high], minimum)
                 tensor = torch.from_numpy(np.ascontiguousarray(segment)).reshape(
                     1, 1, -1
                 )
@@ -319,6 +345,11 @@ def _pyannote_embedder(name: str) -> Embedder:
 
 
 def build_embedder(name: str) -> Embedder:
+    if name not in MODEL_CHOICES:
+        raise ValueError(
+            f"--models has unknown voiceprint model {name!r}; "
+            f"choose from {', '.join(MODEL_CHOICES)}"
+        )
     if name in PYANNOTE_BASELINES:
         return _pyannote_embedder(name)
     return _voiceembed_embedder(name)
@@ -338,10 +369,11 @@ class Episode:
 
 
 def load_episode(media: Path, *, use_vocals_cache: bool) -> Episode:
-    from voxweave import artifacts, pipeline
+    from voxweave import artifacts, vocals
+    from voxweave.paths import swap_ext
     from voxweave.voicebase import strict_turn_projection
 
-    sibling = pipeline.swap_ext(media, ".json")
+    sibling = swap_ext(media, ".json")
     try:
         document = json.loads(sibling.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -351,71 +383,120 @@ def load_episode(media: Path, *, use_vocals_cache: bool) -> Episode:
         raise ValueError(f"{media}: {sibling.name} has no speaker_turns (--diarize)")
     source, separated = media, False
     if use_vocals_cache:
-        legacy = media.parent / pipeline.CACHE_DIRNAME / f"{media.stem}.vocals.32k.flac"
+        legacy = media.parent / vocals.CACHE_DIRNAME / f"{media.stem}.vocals.32k.flac"
         managed = artifacts.inspect_paths(media)
         for candidate in (legacy, managed.vocals_cache if managed else None):
-            if candidate is not None and candidate.is_file():
+            # A cache that no longer matches the media duration (replaced
+            # source, truncated FLAC) is skipped; the mix is scored instead.
+            if (
+                candidate is not None
+                and candidate.is_file()
+                and vocals._vocals_cache_fresh(candidate, media)
+            ):
                 source, separated = candidate, True
                 break
     return Episode(media=media, turns=turns, audio_source=source, separated=separated)
 
 
-def decode_episode(episode: Episode, *, normalize: bool) -> np.ndarray:
-    from voxweave import pipeline
+def decode_episode(episode: Episode, *, normalize: bool) -> Path:
+    """Decode ``episode``'s audio to a temporary 16 kHz WAV the caller deletes."""
+    from voxweave import vocals
     from voxweave.chunking import decode_to_wav
 
-    wav = decode_to_wav(
+    return decode_to_wav(
         episode.audio_source,
         sample_rate=voiceembed.SAMPLE_RATE,
         mono=True,
-        audio_filter=pipeline.ASR_LOUDNORM if normalize else None,
+        audio_filter=vocals.ASR_LOUDNORM if normalize else None,
     )
+
+
+def load_waveform(wav: Path) -> np.ndarray:
+    return voiceembed.read_mono_16k(wav)
+
+
+# What an embedder or its audio can raise on bad input, missing weights or a
+# broken checkpoint; anything else is a bug and keeps its traceback.
+_MODEL_FAILURES = (RuntimeError, OSError, ValueError, ImportError)
+
+
+def _calibrate_model(
+    episodes: Sequence[Episode],
+    waveforms: Sequence[Callable[[], np.ndarray]],
+    embedder: Embedder,
+    *,
+    max_segments: int,
+) -> dict[str, object]:
+    """Score one model over every episode; failures carry model/episode context."""
+    targets: list[float] = []
+    non_targets: list[float] = []
+    per_episode = []
     try:
-        return voiceembed.read_mono_16k(wav)
+        for episode, load in zip(episodes, waveforms, strict=True):
+            try:
+                waveform = load()
+            except _MODEL_FAILURES as exc:
+                raise RuntimeError(
+                    f"{embedder.name}: cannot load the decoded audio of "
+                    f"{episode.media.name}: {exc}"
+                ) from exc
+            embedded: dict[str, tuple[Sequence[Span], np.ndarray]] = {}
+            for label in sorted({label for _s, _e, label in episode.turns}):
+                spans = calibration_segments(
+                    episode.turns, label, max_segments=max_segments
+                )
+                if spans:
+                    try:
+                        vectors = embedder.embed(waveform, spans)
+                    except _MODEL_FAILURES as exc:
+                        raise RuntimeError(
+                            f"{embedder.name} on {episode.media.name}, "
+                            f"speaker {label}: {exc}"
+                        ) from exc
+                    embedded[label] = (spans, vectors)
+            del waveform  # one episode's audio in memory at a time
+            episode_targets, episode_non_targets = episode_scores(embedded)
+            targets.extend(float(row["score"]) for row in episode_targets)
+            non_targets.extend(float(row["score"]) for row in episode_non_targets)
+            per_episode.append(
+                {
+                    "media": str(episode.media),
+                    "target": episode_targets,
+                    "non_target": episode_non_targets,
+                }
+            )
     finally:
-        wav.unlink(missing_ok=True)
+        embedder.release()
+    return {
+        "identity": embedder.identity,
+        "target": _stats(targets),
+        "non_target": _stats(non_targets),
+        **error_rates(targets, non_targets),
+        "episodes": per_episode,
+    }
 
 
 def calibrate(
     episodes: Sequence[Episode],
-    waveforms: Sequence[np.ndarray],
+    waveforms: Sequence[Callable[[], np.ndarray]],
     embedders: Sequence[Embedder],
     *,
     max_segments: int,
 ) -> dict[str, object]:
+    """Score every model; ``waveforms[i]`` loads ``episodes[i]``'s 16 kHz audio.
+
+    A model that fails is recorded with its ``error`` instead of its scores, and
+    the remaining models still run, so one broken checkpoint does not discard
+    the others' results.
+    """
     models: dict[str, object] = {}
     for embedder in embedders:
-        targets: list[float] = []
-        non_targets: list[float] = []
-        per_episode = []
         try:
-            for episode, waveform in zip(episodes, waveforms, strict=True):
-                embedded: dict[str, tuple[Sequence[Span], np.ndarray]] = {}
-                for label in sorted({label for _s, _e, label in episode.turns}):
-                    spans = calibration_segments(
-                        episode.turns, label, max_segments=max_segments
-                    )
-                    if spans:
-                        embedded[label] = (spans, embedder.embed(waveform, spans))
-                episode_targets, episode_non_targets = episode_scores(embedded)
-                targets.extend(float(row["score"]) for row in episode_targets)
-                non_targets.extend(float(row["score"]) for row in episode_non_targets)
-                per_episode.append(
-                    {
-                        "media": str(episode.media),
-                        "target": episode_targets,
-                        "non_target": episode_non_targets,
-                    }
-                )
-        finally:
-            embedder.release()
-        models[embedder.name] = {
-            "identity": embedder.identity,
-            "target": _stats(targets),
-            "non_target": _stats(non_targets),
-            **error_rates(targets, non_targets),
-            "episodes": per_episode,
-        }
+            models[embedder.name] = _calibrate_model(
+                episodes, waveforms, embedder, max_segments=max_segments
+            )
+        except RuntimeError as exc:
+            models[embedder.name] = {"identity": embedder.identity, "error": str(exc)}
     return models
 
 
@@ -423,6 +504,8 @@ def _format_row(name: str, result: Mapping[str, Any]) -> str:
     def number(value: object) -> str:
         return "-" if value is None else f"{float(value):.3f}"
 
+    if "error" in result:
+        return f"{name:<20} FAILED: {result['error']}"
     target, non_target = result["target"], result["non_target"]
     return (
         f"{name:<20} target n={target['count']:<4} mean={number(target['mean'])} "
@@ -434,14 +517,38 @@ def _format_row(name: str, result: Mapping[str, Any]) -> str:
     )
 
 
+def _out_problem(out: Path) -> str | None:
+    """Why ``--out`` cannot be written, checked before any model runs; else None."""
+    parent = out.parent
+    if out.is_dir():
+        return "is a directory"
+    if not parent.is_dir():
+        return f"directory {parent} does not exist"
+    if not os.access(parent, os.W_OK | os.X_OK):
+        return f"directory {parent} is not writable"
+    if out.exists() and not os.access(out, os.W_OK):
+        return "is not writable"
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n", 1)[0] if __doc__ else None
     )
     parser.add_argument("media", nargs="+", type=Path)
-    parser.add_argument("--models", default=",".join(DEFAULT_MODELS))
     parser.add_argument(
-        "--out", type=Path, default=Path("voiceprints-calibration.json")
+        "--models",
+        default=",".join(DEFAULT_MODELS),
+        help=(
+            f"comma-separated models to calibrate, from {', '.join(MODEL_CHOICES)} "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("voiceprints-calibration.json"),
+        help="JSON report path; its directory must exist (default: %(default)s)",
     )
     parser.add_argument(
         "--normalize",
@@ -453,9 +560,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="always decode the original mix instead of the separated vocals",
     )
-    parser.add_argument("--max-segments", type=int, default=DEFAULT_MAX_SEGMENTS)
+    parser.add_argument(
+        "--max-segments",
+        type=int,
+        default=DEFAULT_MAX_SEGMENTS,
+        help=(
+            "longest segments per speaker fed to the odd/even target split; "
+            "at least 2 (default: %(default)s)"
+        ),
+    )
     args = parser.parse_args(argv)
 
+    if args.max_segments < 2:
+        print(
+            f"error: --max-segments must be at least 2 (got {args.max_segments}): "
+            "a speaker needs two segments for a target score",
+            file=sys.stderr,
+        )
+        return 2
+    out_problem = _out_problem(args.out)
+    if out_problem is not None:
+        print(f"error: --out {args.out}: {out_problem}", file=sys.stderr)
+        return 2
     names = [name.strip() for name in args.models.split(",") if name.strip()]
     try:
         embedders = [build_embedder(name) for name in names]
@@ -463,7 +589,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             load_episode(Path(media), use_vocals_cache=not args.no_vocals_cache)
             for media in args.media
         ]
-    except ValueError as exc:
+    except (ValueError, RuntimeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if not embedders:
@@ -476,10 +602,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "scoring the original mix",
                 file=sys.stderr,
             )
-    waveforms = [
-        decode_episode(episode, normalize=args.normalize) for episode in episodes
-    ]
-    models = calibrate(episodes, waveforms, embedders, max_segments=args.max_segments)
+    wavs: list[Path] = []
+    try:
+        for episode in episodes:
+            wavs.append(decode_episode(episode, normalize=args.normalize))
+        models = calibrate(
+            episodes,
+            [functools.partial(load_waveform, wav) for wav in wavs],
+            embedders,
+            max_segments=args.max_segments,
+        )
+    except (RuntimeError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        for wav in wavs:
+            wav.unlink(missing_ok=True)
     report = {
         "version": 1,
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -497,11 +635,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         ],
         "models": models,
     }
-    args.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    try:
+        args.out.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"error: cannot write {args.out}: {exc}", file=sys.stderr)
+        return 2
     for name, result in models.items():
         print(_format_row(name, result))
     print(f"report: {args.out}")
-    return 0
+    failed = [
+        str(result["error"])
+        for result in models.values()
+        if isinstance(result, Mapping) and "error" in result
+    ]
+    for message in failed:
+        print(f"error: {message}", file=sys.stderr)
+    return 2 if failed else 0
 
 
 if __name__ == "__main__":

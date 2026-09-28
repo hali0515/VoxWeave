@@ -14,7 +14,8 @@ a replay that:
 * **reconstructs the phase-1 state itself** from each cue's immutable seed
   record instead of reading the state the producer published (a disagreement is
   a reported failure, not an assumption);
-* checks every leg's ``from`` and **every neighbour it claims to have read**
+* checks that every leg writes the boundary its rule acts on, in that rule's
+  slot, and checks its ``from`` and **every neighbour it claims to have read**
   against the validator's own evolving state -- the review-6 hole;
 * applies the rule with this module's arithmetic and requires equality;
 * requires the replayed final state to equal the delivered stream bit-exactly,
@@ -124,7 +125,9 @@ def guarded_end(want: float, seed_end: float, next_start: float | None) -> float
     inter-cue gap is already at or under the two-frame floor -- and one way to
     grow, clamped at the neighbour's start. The guard is measured against the
     SEED end, never the current one, so a sweep cannot stack this sweep's desire
-    on the last sweep's grant.
+    on the last sweep's grant. v1 cleanup stops two frames short of the
+    neighbour instead; slot 6's ladder trims to the same delivered end (see
+    ``finalizer._guarded_end`` for which copies must move together).
     """
     if want <= seed_end:
         return seed_end
@@ -408,6 +411,22 @@ def sweep(
 
 # ------------------------------------------------------------------- the replay
 
+#: Where each rule writes, stated here rather than read off the producer: the
+#: sweep slot it runs in, and the boundary it moves relative to the cue the sweep
+#: is visiting (the ladder trims the PREVIOUS cue's end). Recomputing a rule only
+#: proves the value; without this a leg could carry the right value to the wrong
+#: boundary.
+_RULE_WRITES: dict[str, tuple[int, int, str]] = {
+    "duration-desire": (1, 0, "end"),
+    "chain": (2, 0, "end"),
+    "cap": (3, 0, "end"),
+    "shot-in": (4, 0, "start"),
+    "shot-out": (5, 0, "end"),
+    "ladder-1": (6, -1, "end"),
+    "ladder-2": (6, -1, "end"),
+    "ladder-3": (6, -1, "end"),
+}
+
 
 def _recompute(
     rule_id: str,
@@ -506,6 +525,26 @@ def _check_cycle(
         return ["cycle adoption without cycle evidence"]
     if not cycle.members:
         return ["cycle evidence declares no members"]
+    # Shape first: a member that is not one (start, end) pair per cue cannot be
+    # swept at all, and the sweep would fail on it with an IndexError instead of
+    # a finding.
+    malformed = [
+        position
+        for position, member in enumerate((*cycle.members, cycle.adopted))
+        if len(member) != len(cues) or any(len(pair) != 2 for pair in member)
+    ]
+    if malformed:
+        for position in malformed:
+            label = (
+                "adopted state"
+                if position == len(cycle.members)
+                else f"member {position}"
+            )
+            problems.append(
+                f"cycle {label} is not one (start, end) pair per cue of the "
+                f"{len(cues)}-cue stream"
+            )
+        return problems
     if replayed not in cycle.members:
         problems.append("the replayed state is not a member of the declared cycle")
     for position, member in enumerate(cycle.members):
@@ -535,11 +574,13 @@ def replay_trace(
 ) -> tuple[str, ...]:
     """Verify one document-global trace (spec section 10.2). Empty tuple == pass.
 
-    Every leg is checked three ways before it is allowed to advance the state:
-    the ``from`` value must be what this replay holds, every neighbour the leg
-    says it read must be what this replay holds -- the review-6 forged-snapshot
-    hole -- and the rule recomputed here must give the leg's ``to``. The final
-    state must then equal ``delivered`` bit-exactly.
+    Every leg is checked four ways before it is allowed to advance the state:
+    it must name the slot its rule runs in and the boundary that rule writes
+    (``_RULE_WRITES``) -- a recomputed value alone does not say WHERE it
+    belongs -- the ``from`` value must be what this replay holds, every
+    neighbour the leg says it read must be what this replay holds -- the
+    review-6 forged-snapshot hole -- and the rule recomputed here must give the
+    leg's ``to``. The final state must then equal ``delivered`` bit-exactly.
 
     A fixed-point terminal is additionally required to BE a fixed point of this
     module's sweep. Leg-by-leg replay alone cannot see a rule the producer
@@ -581,6 +622,20 @@ def replay_trace(
                 "so the trace is not one ordered trajectory"
             )
         last_sweep = leg.sweep
+
+        slot, offset, side = _RULE_WRITES[leg.rule_id]
+        if leg.slot != slot:
+            problems.append(
+                f"leg {position}: rule {leg.rule_id!r} runs in slot {slot}, "
+                f"not slot {leg.slot}"
+            )
+        written = leg.cue_index + offset
+        if (leg.target.cue_index, leg.target.side) != (written, side):
+            problems.append(
+                f"leg {position}: rule {leg.rule_id!r} at cue {leg.cue_index} "
+                f"moves the {side} of cue {written}, not the {leg.target.side} "
+                f"of cue {leg.target.cue_index}"
+            )
 
         held = (
             starts[leg.target.cue_index]
@@ -646,7 +701,7 @@ def replay_trace(
 
     if replayed != delivered:
         problems.append(f"replayed state {replayed} is not the delivered {delivered}")
-    if trace.terminal == "fixed-point":
+    if trace.terminal == "fixed-point" and len(delivered) == len(seed):
         stepped = sweep(delivered, seed, profile=profile, evidence=evidence)
         if stepped != delivered:
             problems.append(

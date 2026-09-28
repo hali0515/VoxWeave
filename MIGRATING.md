@@ -6,8 +6,11 @@ heads-up appear here.
 ## 0.18.0 (unreleased)
 
 Most of this release concerns `--voiceprints` (cross-episode voice matching and **Split
-this speaker**). One fix changes the audio a first run transcribes and diarizes, so a
-first run's subtitles can differ slightly from 0.17.0.
+this speaker**). Several fixes change output: a first run transcribes and diarizes the
+same audio as a re-run, and subtitle layout changed for Latin/Cyrillic/Greek text, CJK
+line wraps and cue gaps, so subtitles can differ slightly from 0.17.0. `speakers serve`
+now opens only through the access link it prints, and deliverables are written with
+your umask instead of `0600`.
 
 ### First runs transcribe and diarize the same audio as re-runs
 
@@ -18,10 +21,66 @@ through the same 32 kHz mono vocals, so both runs feed ASR and diarization ident
 samples. Without `--normalize` (the default) the old gap was only a resampling difference.
 With `--normalize` it was larger: loudness normalization measured the two inputs about
 2.5 dB apart and moved 10-14% of diarization frames, so a re-run could change the speaker
-turns. Expect small differences against a 0.17.0 first run; re-runs from an existing cache
-are unchanged. One difference remains: a first run finds the speech timing reference (gap
-splitting, snapping words to speech) on the original mix, while a re-run from the cache
-uses the separated vocals, so cue timing can still differ slightly between the two.
+turns. Expect small differences against a 0.17.0 first run. Re-runs from an existing cache
+feed ASR and diarization the same samples as before, and now also find the speech timing
+reference (gap splitting, snapping words to speech) on the original mix, as a first run
+does. They used the separated vocals for it, so re-running an episode (for example to add
+`--diarize`) could move cue timing; expect small timing differences against a 0.17.0 re-run.
+
+### ASR models that cannot load stop the run at once
+
+A model that cannot be loaded (a missing package, an unknown `--asr-model` id, no network for
+the first download) used to be retried on every chunk, and the run failed only after the whole
+ASR pass with "ASR failed on all N chunks". It now stops immediately with the original error.
+Under `--hybrid` this covers both engines: a whisper or Qwen engine that cannot load fails the
+run instead of producing a single-engine transcript. If an engine loads but then fails on every
+chunk, `--hybrid` keeps the other engine's transcript and says so in a warning.
+
+### TF32 is limited to vocal separation
+
+On CUDA, vocal separation runs its matrix multiplies in TF32 (`VOXWEAVE_TF32=0` turns this
+off). The setting used to stay on for the rest of the process, so on a run that separated
+vocals, later fp32 stages (song detection, `--sdh` scoring, the English wav2vec2 aligner) also
+ran in TF32, while a re-run from the vocals cache ran them in full fp32. It is now restored
+when separation finishes: a first run and a cached re-run compute the same numbers, and a first
+run's song spans and English word timings can differ very slightly from 0.17.0.
+
+### Model directory
+
+- With `VOXWEAVE_CACHE_ROOT` set, an explicitly placed separator checkpoint
+  (`vocals_mel_band_roformer.ckpt` + `.yaml`) is looked for under that root, like every other
+  model, unless `VOXWEAVE_MODEL_DIR` says otherwise.
+- Importing voxweave no longer moves a pre-rename `~/.cache/qsub` directory into place.
+
+### Subtitle layout changes
+
+`voxweave <media>` and `render` lay out some cues differently from 0.17.0; run `render` on an
+existing episode's JSON to re-lay it out with the new rules.
+
+- Latin, Cyrillic and Greek letters count as one column and combining marks as none. Every
+  non-ASCII character used to count as two, so Russian and accented Latin lines were packed
+  and wrapped at about half the configured width.
+- Two-line CJK cues prefer to wrap at a jieba/BudouX word boundary over a break inside a
+  word, and と/まで/より are kept whole.
+- Extending a cue (minimum duration, linger, tail pad) stops two frames before the next cue
+  instead of running up to it.
+- A word without timing is shown over its own stretch instead of its whole parent span, and
+  a cue left shorter than the minimum duration borrows spare display time from its neighbours.
+
+### `--diarize` refuses a run that cannot succeed before the audio work
+
+`voxweave MEDIA --diarize` now checks the Hugging Face token for a gated diarization model
+(the default community-1 and 3.1 are both gated) and the `--min-speakers`/`--max-speakers`
+bounds before vocal separation and ASR. Previously it only failed after them. Accept the model
+card and run `hf auth login` (or set `VOXWEAVE_HF_TOKEN` / `HF_TOKEN` / `hf_token` in the
+config) before the run.
+
+### `--debug` bundle
+
+Each `--debug` run now replaces the previous `cache/<stem>/debug/` bundle instead of mixing its
+chunk files with the old ones, and `chunks/*.raw.txt` is no longer written (it repeated
+`*.text.txt`). Library callers: `pipeline.transcribe()` no longer takes `debug_stem`, and
+`debug.FileDebugSink` takes the bundle directory as its only argument.
 
 ### Opt-in voiceprint speaker clustering
 
@@ -47,7 +106,7 @@ keyed by pyannote's labels.
 
 Saved speaker names are keyed by speaker id (`SPEAKER_00`, ...), and switching
 `--speaker-clustering` (like switching `--diarize-model`) renumbers the speakers of an episode
-you already named. `process` now warns when a named id's turns changed; review the names with
+you already named. A transcription run now warns when a named id's turns changed; review the names with
 `voxweave speakers <media>` before running `voxweave speakers enroll`, or a voice can be
 stored in the voice library under someone else's name.
 
@@ -64,7 +123,7 @@ speaker-embedding model chosen per language (`--voiceprint-model` /
 - `pyannote`: the previous behavior.
 
 A `--voiceprints` run fetches the checkpoint it may need (51 MB for `redimnet2`, 83 MB
-for `anime-va`; with `auto` and no `--lang`, both) into `~/.cache/voxweave/audio/` and
+for `anime-va`; with `auto` and no `--language`, both) into `~/.cache/voxweave/audio/` and
 verifies its SHA-256 before any audio work. If that fails (no network, a stalled
 download), the run warns and continues without voiceprints; the subtitles are written as
 usual. For an offline host:
@@ -98,8 +157,9 @@ or set it once in `~/.config/voxweave.conf`:
 model = "pyannote"
 ```
 
-Alternatively start a new store with the new embedder: re-run the reviewed episodes with
-`--diarize --voiceprints` and `speakers enroll` them into a new `--voices` file.
+Alternatively re-run the reviewed episodes with `--diarize --voiceprints` and
+`voxweave speakers enroll EPISODE`; the voice library keeps the new embedder's voices in their
+own embedding space.
 
 In exchange, a store built by `redimnet2` or `anime-va` no longer depends on the
 diarization pipeline: switching `--diarize-model` keeps it matching. The default
@@ -110,6 +170,15 @@ your own diarized episodes.
 
 **Split this speaker** embeds turns with whichever embedder the episode's voiceprints
 were captured with, so legacy episodes keep splitting as before.
+
+### `speakers serve` opens through its access link
+
+The audition page, `/serve-info`, saves and splits now require a session cookie that the
+printed link (`http://127.0.0.1:PORT/?k=...`) sets; a bookmark or a hand-typed
+`http://127.0.0.1:PORT/` gets 403. Open the link the command prints (it is also what the
+browser is opened with); with `--host 0.0.0.0` replace `0.0.0.0` in it with the machine's IP;
+with `--ngrok` append the printed `/?k=...` to the tunnel URL. The key changes on every start,
+so restart links do not carry over.
 
 ### Enrolled voices go to a global voice library
 
@@ -147,6 +216,12 @@ What stays the same, and what to do:
 - Enrolling a name does not merge it with a same-named person of another scope unless you
   used that person's suggestion on the review page; use `voxweave voices list`,
   `show`, `rename` and `forget` to curate the result.
+- A library belongs to one user account. Machines that share it on a NAS must reach it as
+  the same user (the same uid on NFS); sharing one library between accounts is not supported.
+- A library whose `identities.json` is missing is refused with a message saying what to
+  restore, and voice samples whose identity is missing from a rolled-back `identities.json`
+  are kept on disk until it is restored. Only samples of an identity removed with
+  `voxweave voices forget` are deleted.
 
 ### `burn` output is no larger than the source
 
@@ -158,6 +233,174 @@ changes where it used to exceed the source rate. Pass `--no-bitrate-cap` for the
 behaviour, for example when burning an AV1 or VP9 source to h264, which needs more bits than
 the source for the same picture. When the source rate cannot be read, `burn` warns and
 encodes without a cap.
+
+### `pack` and `burn` name their output after the subtitle language
+
+Without `-o`, the output used to be `<media stem>.<container>` (`.pack`/`.burn` was added
+only when that name was the source itself), so packing or burning a second language into
+the same media silently replaced the first result. The default name now always carries the
+command and the subtitle languages taken from the subtitle file names:
+
+- `burn episode.zh.vtt` writes `episode.zh.burn.mp4` (was `episode.mp4`);
+  `burn episode.vtt` writes `episode.burn.mp4`.
+- `pack episode.zh.vtt episode.ja.vtt` writes `episode.zh.ja.pack.mkv` (languages in
+  argument order, each once); with no language in any file name it is `episode.pack.mkv`.
+
+Running the same command again still replaces its own previous output. Scripts that pick up
+the old name should pass `-o` or use the new one.
+
+### `pack` and `burn` take the container from `-o`
+
+An `-o` path ending in `.mkv`, `.mp4` or `.webm` now decides the container, and the ffmpeg
+command is built for it (for example mov_text subtitles for `-o out.mp4` from an mkv source).
+Before, the container came from the source or `--container` while ffmpeg picked its muxer from
+the file name. A `--container` that contradicts such an `-o` is overridden with a warning. Any
+other extension (`.m4v`, `.mov`) keeps `--container` and forces its muxer. `burn -o x.webm` is
+refused (burn writes mp4 or mkv). `pack` into mp4 now refuses up front audio the mp4 muxer
+cannot store (`pcm_u8`, `wmav2`, `truehd`, ...; pack into mkv instead), and `pack` into webm
+drops cover art. Warnings ffmpeg or libass print during a successful `pack`/`burn` (for example
+a font without glyphs for the subtitle text) are now shown instead of discarded. A hidden
+`.<name>.<random>.part.<ext>` file that a killed `pack` or `burn` left next to the media is now
+deleted by the next voxweave write in that directory once nothing has written it for 5
+minutes. Before, it stayed until you deleted it.
+
+### Output files honour your umask
+
+Subtitles (VTT/SRT/ASS), the sibling `.json`, the `.sdh.vtt`/`.asrfix.vtt` sidecars and
+`pack`/`burn` outputs used to be written with mode `0600` whatever your umask. They are now
+created like any other file (`0644` under the usual umask `022`), and rewriting an existing
+file keeps its current mode. Files written by earlier versions therefore keep `0600` when
+rewritten; if other accounts or services need to read them, `chmod 644` them once (for
+example `chmod 644 *.vtt *.srt *.json`). Private data stays private: the voice library and
+its locks, speaker mappings, voiceprints, align evidence, translation progress, the
+correction audit and the vocals cache are written `0600`, and everything under
+`cache/<stem>/` (including `--debug` dumps) lives in a `0700` directory.
+
+### `pack` into mkv keeps mov_text subtitles and a single default track
+
+Packing into mkv (the default for `.mov` sources) failed when the source carried mov_text
+(3GPP timed text) subtitles, which Matroska cannot store; those tracks are now converted to
+SRT. The first packed track was flagged default, but a source subtitle track flagged default
+kept its flag, so players could still pick the old track; that flag is now cleared (other
+flags such as forced stay).
+
+### Subtitle conversion refuses partly timed files and keeps `{\an8}`
+
+- `export`, `burn` and `pack` refuse a subtitle file in which only some cues have
+  timestamps, as `translate` does for SRT/ASS, instead of silently leaving the untimed cues
+  out. The error names the first untimed cues; run `voxweave align` on a VTT, or add the
+  missing timing lines to an SRT.
+- The SRT position tag `{\an8}` (and the SSA form `{\a6}`) no longer shows up as literal
+  `(\an8)` text in ASS export or burned video: it is kept as an ASS override, stays in SRT
+  output and is dropped from VTT output.
+- ASS vector drawings (`{\p1}m 0 0 l ...`) are no longer read as dialogue; an event that only
+  draws a shape produces no cue.
+
+### `align` on long media accepts nested cues
+
+Above the single-pass alignment budget (about 30 min, `ctc_max_dp_frames`), English and
+Japanese alignment is split at silences between cues. Overlapping or nested cue times (such
+as a short cue stretched across its successor) used to refuse the whole file; they are now
+planned on their combined extent. If a split would still cut a cue off from its own audio
+(for example one cue whose start was mistyped far too early), `align` refuses and names the
+overlapping cues and their times; fix those cue times and run it again. VTTs whose cue times
+never overlap are planned exactly as before, and plans that fit the budget before still do.
+
+### Library API: smart_split parameters
+
+`voxweave.core.smart_split.smart_split_segments` and `split_long_cues_with_word_timings` no
+longer accept `min_duration` or `desired_wps`; neither argument had any effect. Their optional
+arguments are now keyword-only: everything after `max_lines` in `smart_split_segments`
+(`split_at_comma`, `comma_split_min_len`, `speech_spans`, `thresholds`, `shot_changes`), and
+`speech_spans`/`thresholds` in `split_long_cues_with_word_timings`. Passing a removed argument,
+by keyword or positionally, including through `pipeline.split(..., **kwargs)`, raises
+`TypeError`: drop it, and pass the remaining optional arguments by keyword.
+
+`thresholds` is now required by both functions. Their length-break-only mode
+(`thresholds=None`: no gap or duration breaks and none of the cue-stream timing passes) is
+retired; omitting `thresholds` or passing `None` raises `TypeError` instead of falling back to
+it. Pass `config.gap_thresholds(lang)` (what `pipeline` uses), a mapping, or a
+`SplitThresholds` (`SplitThresholds()` for the defaults). Subtitles VoxWeave writes do not
+change: the pipeline always passed thresholds. The pieces only that mode used are gone:
+`split_sentence_heuristically`, `voxweave.core.conjunctions`,
+`voxweave.core.breakpoints.legal_break_index` and `SplitContext.do_new` (construct
+`SplitContext` without it). `split_at_sentence_end` no longer takes `max_line_length`,
+`max_lines` or `defer_length_split`, and its `split_at_comma`/`comma_split_min_len` are
+keyword-only: call it as `split_at_sentence_end(text, words, lang)`, since it never splits
+for length; `split_long_cues_with_word_timings` does. A segment with text but no word
+timings is no longer split at conjunctions: its sentences and comma clauses are wrapped to
+the line budget with proportional timing.
+
+### Library API: `pipeline` split into smaller modules
+
+`voxweave.pipeline` keeps `transcribe`, `process`, `split` and `align`. The helpers it also
+held moved to their own modules, and its other public names (`swap_ext`, `require_vtt`,
+`MEDIA_EXTS`, `segment_document`, `SegmentationResult`, `cache_vocals_path`, the
+`speakers_*_path` and `voiceprints_path` helpers, `lyric_display_text`, ...) stay importable
+from `pipeline`. Three things changed:
+
+- `pipeline.translate` and `pipeline.correct` are now `voxweave.llm_commands.translate` and
+  `voxweave.llm_commands.correct`, with the same signatures. `correct --apply` calls
+  `pipeline.align`, so `pipeline` cannot import them back.
+- `SHADOW_LANE_DELIVERY` is gone from `pipeline` and `voxweave.core.shadow_v2`; use
+  `SHADOW_LANE_DELIVERY_LEGACY`, which has the same value.
+- `SegmentationResult` no longer has `thresholds_used`: read the thresholds a run used from
+  `result.manifest["profile"]` (the nine gap/duration keys, as the engine ran them). The
+  field was positional, so construct a `SegmentationResult` by keyword.
+
+Code that imported or patched private `pipeline` helpers finds them here:
+`voxweave.paths` (`swap_ext`, `find_sibling_media`, `find_subtitle_media`),
+`voxweave.sidecars` (`artifact_owner` and the speaker and voiceprint sidecar paths),
+`voxweave.vocals` (the vocals cache and `acquire_16k`, the one 16 kHz input flow shared by
+`transcribe` and `align`), `voxweave.segmentation` (`segment_document`) and
+`voxweave.core.overlay` (`spans_in`, `turns_in`, lyric marking and the shot re-snap).
+`voxweave.mux.detect_subtitle_language` and `voxweave.subformats.SUBTITLE_EXTS` still import
+from their old modules.
+
+A name re-exported from `pipeline` is a second binding: patching it on `pipeline` does not reach
+the module that reads it. Patch the defining module instead, for example
+`voxweave.vocals.decode_to_wav` or `voxweave.vocals.CACHE_DUR_TOL_SEC` for the 16 kHz input
+flow. Modules `pipeline` only held as imports (`translate_mod`, `asrfix_mod`, `subprocess`,
+`validate_cache_pair`, ...) are no longer reachable through it.
+
+### Smaller changes
+
+- `--language` accepts ISO codes such as `ja` with the Qwen engine; before, every chunk failed
+  after the whole separation and ASR pass. An unsupported value fails before any model loads.
+- `correct --apply` re-aligns with the `[defaults]` `separate`/`normalize`/`vad_mask` settings,
+  like `align`.
+- A `translate` or `correct` request times out after 300 s (`VOXWEAVE_LLM_TIMEOUT_S`) and the
+  OpenAI SDK no longer retries underneath VoxWeave's own retries; before, one attempt could
+  wait 600 s three times. Raise the timeout for a slow self-hosted endpoint.
+- A malformed `VOXWEAVE_*` number or config value warns once and falls back to its default,
+  instead of crashing every command at import or being ignored silently.
+- `--vad-mask` only ever applied to wav2vec2 CTC alignment (English by default); with
+  Japanese MMS alignment it now warns that it has no effect.
+- `align` no longer drops plain-text draft lines that begin with "Note", "Style" or "Region".
+- Aligning Thai, Lao or Burmese with a configured CTC or MMS aligner (`[align] th = "mms"`)
+  no longer aborts.
+- `--hybrid` keeps the decimal point in numbers (`14.2`, not `142`) and no longer doubles
+  punctuation Whisper already has.
+- Voiceprint clustering keeps pyannote's speakers for recordings with more than 5000 anchor
+  turns instead of running for a very long time.
+- `--help` no longer writes `~/.config/voxweave.conf`.
+- `burn` works with subtitle paths that contain `:` or quotes (`Star Wars: A New Hope.ass`).
+- `pack` and `burn` accept GBK/Big5 subtitles that the other commands read, instead of
+  losing CJK cues or failing, and find the media for `X.sdh.vtt` / `X.asrfix.vtt` as `align`
+  does.
+- After an episode is re-diarized, the audition page's Save and Split work again: a saved
+  mapping entry for a speaker id that no longer exists is ignored (and reported) instead of
+  failing the page.
+- Media with very long file names work: a cache name that would exceed the filesystem's
+  file-name limit (such as the episode lock, for a stem of about 243 bytes or more) is
+  shortened to `<stem, cut to fit>--<sha1(stem)[:8]><suffix>`, while names that fit are
+  unchanged. A deliverable beside the media whose name cannot fit (`<stem>.json`,
+  `<stem>.sdh.vtt`, a translation, a `pack`/`burn` output) is never shortened: the command now
+  stops before any work and names the file, instead of failing at the final write.
+- After **Split this speaker** is applied, the audition page offers **Undo this split**, which
+  restores the files the split rewrote from its one-level snapshot. It is refused, with the
+  reason on the page, when one of those files or the media changed since the split. Restart
+  `voxweave speakers serve` afterwards, as after the split itself.
 
 ## 0.17.0
 

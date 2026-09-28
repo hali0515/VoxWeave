@@ -47,7 +47,8 @@ passed, ``1`` valid but a gate failed, ``2`` manifest / schema / reference /
 coverage / tooling invalid.
 
 ``record-baseline`` is a deliberate human action: it refuses a report whose
-manifest digest differs and it is never wired into CI or a default make target.
+manifest digest differs or that was narrowed with ``--source`` / ``--item``, and
+it is never wired into CI or a default make target.
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = _SCRIPTS_DIR.parent
@@ -112,7 +113,7 @@ TEXT_NORM_VERSION = 1
 WORD_KINDS = ("mfa_words", "manual_words")
 CUE_KINDS = ("commercial_cues", "manual_cues")
 
-#: Thresholds each lane reports (design 3.7). Cue lanes are a display ruler, so
+#: Hit-rate thresholds each lane kind reports. Cue lanes are a display ruler, so
 #: 25 ms buckets would be noise; word lanes are an acoustic ruler, so a 1 s
 #: bucket would be uninformative.
 CUE_THRESHOLDS = (0.25, 1.0)
@@ -159,8 +160,12 @@ ANCHOR_N: dict[str, int] = {"en": 3}
 ANCHOR_N_DEFAULT = 6
 
 #: Bounded DP. Small windows run the full grid; large ones are restricted to a
-#: diagonal band, and the terminal cell is retried unbanded if the band cut it
-#: off, so a pathological window degrades in speed but never in correctness.
+#: diagonal band around the window's own diagonal. The band is a speed/quality
+#: trade: the result is still a valid monotonic pairing (the terminal lies on
+#: the diagonal and skips can always walk the band to it), but it is optimal
+#: only among paths inside the band, so a window whose best pairing strays
+#: further than the band can pair worse than the full grid would. Unique n-gram
+#: anchors keep most windows under the full-grid limit.
 DP_FULL_CELL_LIMIT = 4096
 DP_BAND_MIN = 64
 DP_BAND_SLACK = 32
@@ -172,7 +177,8 @@ LEVENSHTEIN_CELL_LIMIT = 250_000
 
 #: Language detection needs enough lexical characters to mean anything.
 MIN_DETECT_CHARS = 16
-#: Japanese script-ratio floor from design 3.4 rule 6.
+#: A Japanese-lane reference track must be at least this share kana/Han, so a
+#: mistagged English translation track is refused rather than paired.
 JA_SCRIPT_RATIO_MIN = 0.5
 #: Two candidate tracks this close in text coverage are not distinguishable.
 TRACK_COVERAGE_AMBIGUITY = 0.02
@@ -392,7 +398,7 @@ def detect_text_language(text: str) -> str | None:
 
 
 def japanese_script_ratio(text: str) -> float:
-    """Fraction of lexical codepoints that are kana or Han (design 3.4 rule 6)."""
+    """Fraction of lexical codepoints that are kana or Han."""
     counts = script_counts(text)
     total = sum(counts.values())
     if not total:
@@ -421,14 +427,29 @@ class Segment:
         return lexical_len(self.norm)
 
 
+class SegmentList(list[Segment]):
+    """Segments plus the number of input rows left out for having no start/end.
+
+    Pairing needs a time on both ends of a group to score it, so an untimed row
+    cannot take part; counting it keeps that loss visible in the report rather
+    than letting it quietly shrink the coverage denominator.
+    """
+
+    untimed: int = 0
+
+
 def make_segments(
     rows: Sequence[Mapping[str, Any]],
     *,
     language: str,
     prefix: str,
-) -> list[Segment]:
-    """Build segments from ``{text|word, start, end}`` rows, normalizing text once."""
-    out: list[Segment] = []
+) -> SegmentList:
+    """Build segments from ``{text|word, start, end}`` rows, normalizing text once.
+
+    Rows with a null ``start`` or ``end`` are left out and counted in
+    ``SegmentList.untimed``.
+    """
+    out = SegmentList()
     for i, row in enumerate(rows):
         text = row.get("text")
         if text is None:
@@ -438,6 +459,7 @@ def make_segments(
         start = row.get("start")
         end = row.get("end")
         if start is None or end is None:
+            out.untimed += 1
             continue
         try:
             s, e = float(start), float(end)
@@ -687,7 +709,7 @@ def _dp_window(
     min_similarity: float,
     banded: bool,
 ) -> list[MatchGroup] | None:
-    """Monotonic DP over one window; ``None`` when the band cut off the terminal.
+    """Monotonic DP over one window; ``None`` if the terminal was never reached.
 
     Cells are finalized in increasing ``i + j`` order (every transition advances
     at least one index), and among equal ``i + j`` the smaller reference index is
@@ -826,20 +848,7 @@ def pair_monotonic(
             min_similarity=min_pair_similarity,
             banded=banded,
         )
-        if window is None:  # pragma: no cover - band never reached the terminal
-            window = _dp_window(
-                h_side,
-                r_side,
-                h_lo=h_lo,
-                h_hi=h_hi,
-                r_lo=r_lo,
-                r_hi=r_hi,
-                max_h=max_h,
-                max_r=max_r,
-                min_similarity=min_pair_similarity,
-                banded=False,
-            )
-        if window is None:  # pragma: no cover - defensive
+        if window is None:  # pragma: no cover - the terminal is always in band
             raise cc.CalibrationError("matcher failed to reach the window terminal")
         groups.extend(window)
 
@@ -928,7 +937,7 @@ class BoundaryError:
     shape: str = "1:1"
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize one pair for manual spot-checking (design 3.6)."""
+        """Serialize one pair so a human can spot-check it against the media."""
         return {
             "hyp_ids": list(self.hyp_ids),
             "ref_ids": list(self.ref_ids),
@@ -1045,14 +1054,18 @@ class ReferenceSpec:
 
 @dataclass(frozen=True)
 class ItemSpec:
+    """One manifest item.
+
+    Its ``media`` is only the default for its references; ``tags`` and the extra
+    ``hypothesis`` paths are annotations the ruler does not read.
+    """
+
     id: str
     language: str
-    media: Path | None
     hypothesis_path: Path
     references: tuple[ReferenceSpec, ...]
     include_ranges: tuple[tuple[float, float], ...]
     exclude_ranges: tuple[tuple[float, float], ...]
-    tags: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1224,11 +1237,6 @@ def load_manifest(path: str | Path) -> Manifest:
             ItemSpec(
                 id=item_id,
                 language=language,
-                media=(
-                    resolve_manifest_path(media, base=base, root_env=root_env)
-                    if media
-                    else None
-                ),
                 hypothesis_path=resolve_manifest_path(
                     raw_item["hypothesis"]["path"], base=base, root_env=root_env
                 ),
@@ -1241,7 +1249,6 @@ def load_manifest(path: str | Path) -> Manifest:
                     raw_item.get("exclude_ranges"),
                     label=f"item {item_id} exclude_ranges",
                 ),
-                tags=tuple(raw_item.get("tags") or ()),
             )
         )
 
@@ -1278,12 +1285,20 @@ def _subtitle_blocks(path: Path) -> list[dict[str, Any]]:
         raise cc.CalibrationError(f"cannot parse {path}: {exc}") from None
 
 
-def load_hypothesis_segments(path: Path, *, language: str, level: str) -> list[Segment]:
+#: JSON arrays a hypothesis may hold, per lane level, in lookup order. ``segments``
+#: is where voxweave's own sibling ``<stem>.json`` keeps its cues.
+HYPOTHESIS_JSON_KEYS: dict[str, tuple[str, ...]] = {
+    "word": ("word_segments", "words"),
+    "cue": ("cues", "segments", "blocks"),
+}
+
+
+def load_hypothesis_segments(path: Path, *, language: str, level: str) -> SegmentList:
     """Load the voxweave output under test: a subtitle file or a sibling JSON.
 
-    Cue lanes read the rendered subtitle (or a ``cues`` array); word lanes read
-    the sibling JSON's ``word_segments``, because a subtitle carries no word
-    units at all.
+    Cue lanes read the rendered subtitle (or a ``cues`` / ``segments`` array,
+    so voxweave's sibling JSON works too); word lanes read the sibling JSON's
+    ``word_segments``, because a subtitle carries no word units at all.
     """
     p = Path(path)
     if not p.exists():
@@ -1294,30 +1309,46 @@ def load_hypothesis_segments(path: Path, *, language: str, level: str) -> list[S
                 f"hypothesis {p.name} is a subtitle file, which has no word units; "
                 "a word lane needs the sibling JSON with word_segments"
             )
-        return make_segments(_subtitle_blocks(p), language=language, prefix="hyp")
+        return _timed_hypothesis(
+            p, make_segments(_subtitle_blocks(p), language=language, prefix="hyp")
+        )
     if p.suffix.lower() != ".json":
         raise cc.CalibrationError(
             f"hypothesis {p.name}: expected one of {', '.join(SUBTITLE_EXTS)} or .json"
         )
     doc = cc.read_json(p)
+    keys = HYPOTHESIS_JSON_KEYS[level]
     if isinstance(doc, list):
         rows: Any = doc
     elif isinstance(doc, Mapping):
-        key = "word_segments" if level == "word" else "cues"
-        rows = doc.get(key)
-        if rows is None and level == "word":
-            rows = doc.get("words")
-        if rows is None and level == "cue":
-            rows = doc.get("blocks")
+        rows = next((doc[key] for key in keys if doc.get(key) is not None), None)
         if rows is None:
+            hint = (
+                "point hypothesis.path at the sibling JSON, which has word_segments"
+                if level == "word"
+                else "point hypothesis.path at the rendered subtitle (.vtt/.srt/.ass)"
+                " or at voxweave's sibling JSON"
+            )
             raise cc.CalibrationError(
-                f"hypothesis {p.name}: no {key!r} array for a {level} lane"
+                f"hypothesis {p.name}: no {' / '.join(map(repr, keys))} array for a"
+                f" {level} lane; {hint}"
             )
     else:
         raise cc.CalibrationError(f"hypothesis {p.name}: unexpected JSON top level")
     if not isinstance(rows, list) or not rows:
         raise cc.CalibrationError(f"hypothesis {p.name}: empty segment list")
-    return make_segments(rows, language=language, prefix="hyp")
+    return _timed_hypothesis(p, make_segments(rows, language=language, prefix="hyp"))
+
+
+def _timed_hypothesis(path: Path, segments: SegmentList) -> SegmentList:
+    """Refuse a hypothesis with no timed row at all (e.g. an untimed draft VTT)."""
+    if segments.untimed and not segments:
+        raise cc.CalibrationError(
+            f"hypothesis {path.name}: none of its {segments.untimed} rows has a"
+            " start/end time, so there is nothing to measure",
+            ["an untimed draft must be aligned first (voxweave align)"],
+        )
+    return segments
 
 
 def load_reference_document(path: Path) -> dict[str, Any]:
@@ -1331,7 +1362,7 @@ def load_reference_document(path: Path) -> dict[str, Any]:
 
 def reference_segments(
     doc: Mapping[str, Any], *, language: str
-) -> tuple[list[Segment], int]:
+) -> tuple[SegmentList, int]:
     """Apply ``offset_s``, check the read-only invariants, drop excluded segments.
 
     Returns the usable segments plus the number that were explicitly excluded --
@@ -1593,6 +1624,59 @@ class TrackSelection:
     candidates: tuple[TrackCandidate, ...]
 
 
+_ScoredTrack = tuple[float, SubtitleStream, list[dict[str, Any]], str | None]
+
+
+def _screen_tracks(
+    media: Path,
+    streams: Sequence[SubtitleStream],
+    *,
+    language: str,
+    hypothesis_norm: str,
+    expected_codec: str | None,
+    extract: Callable[[Path, int, Path, str], Path],
+) -> tuple[list[TrackCandidate], list[_ScoredTrack]]:
+    """Every stream's verdict, plus the survivors ranked best first.
+
+    The one screening both ``select_subtitle_track`` and ``inspect-tracks`` use,
+    so the listing can never promise a track selection would refuse.
+    """
+    candidates: list[TrackCandidate] = []
+    scored: list[_ScoredTrack] = []
+    for stream in streams:
+        reason = _static_rejection(stream, language, expected_codec)
+        if reason is not None:
+            candidates.append(TrackCandidate(stream, reason))
+            continue
+        blocks = _read_track(media, stream, extract)
+        text = " ".join(str(b.get("text", "")) for b in blocks)
+        detected = detect_text_language(text)
+        if detected is not None and not cc.languages_match(detected, language):
+            candidates.append(
+                TrackCandidate(stream, f"detected_language({detected})", None, detected)
+            )
+            continue
+        if language == "ja" and japanese_script_ratio(text) < JA_SCRIPT_RATIO_MIN:
+            candidates.append(
+                TrackCandidate(
+                    stream, "japanese_script_ratio_below_floor", None, detected
+                )
+            )
+            continue
+        coverage = text_coverage(
+            hypothesis_norm, normalize_text(text, language), language
+        )
+        candidates.append(TrackCandidate(stream, None, coverage, detected))
+        scored.append((coverage, stream, blocks, detected))
+    scored.sort(key=lambda row: (-row[0], row[1].index))
+    return candidates, scored
+
+
+def _is_ambiguous(scored: Sequence[_ScoredTrack]) -> bool:
+    """Two best-ranked tracks too close in text coverage to tell apart."""
+    return len(scored) > 1 and (scored[0][0] - scored[1][0]) < TRACK_COVERAGE_AMBIGUITY
+
+
 def select_subtitle_track(
     media: Path,
     *,
@@ -1605,7 +1689,7 @@ def select_subtitle_track(
 ) -> TrackSelection:
     """Pick the same-language dialogue track, by tags first and text second.
 
-    Order of business (design 3.4): an explicit manifest index wins but is still
+    Order of business: an explicit manifest index wins but is still
     validated; language tags are canonicalized and never guessed; bitmap, forced
     and signs/songs tracks are dropped; the survivors are parsed and ranked by
     text coverage against the hypothesis; two candidates within 2 points of each
@@ -1651,41 +1735,20 @@ def select_subtitle_track(
             candidates=(TrackCandidate(stream, None, None, detected),),
         )
 
-    candidates: list[TrackCandidate] = []
-    scored: list[tuple[float, SubtitleStream, list[dict[str, Any]], str | None]] = []
-    for stream in streams:
-        reason = _static_rejection(stream, language, expected_codec)
-        if reason is not None:
-            candidates.append(TrackCandidate(stream, reason))
-            continue
-        blocks = _read_track(media, stream, do_extract)
-        text = " ".join(str(b.get("text", "")) for b in blocks)
-        detected = detect_text_language(text)
-        if detected is not None and not cc.languages_match(detected, language):
-            candidates.append(
-                TrackCandidate(stream, f"detected_language({detected})", None, detected)
-            )
-            continue
-        if language == "ja" and japanese_script_ratio(text) < JA_SCRIPT_RATIO_MIN:
-            candidates.append(
-                TrackCandidate(
-                    stream, "japanese_script_ratio_below_floor", None, detected
-                )
-            )
-            continue
-        coverage = text_coverage(
-            hypothesis_norm, normalize_text(text, language), language
-        )
-        candidates.append(TrackCandidate(stream, None, coverage, detected))
-        scored.append((coverage, stream, blocks, detected))
-
+    candidates, scored = _screen_tracks(
+        media,
+        streams,
+        language=language,
+        hypothesis_norm=hypothesis_norm,
+        expected_codec=expected_codec,
+        extract=do_extract,
+    )
     if not scored:
         raise cc.CalibrationError(
             f"{Path(media).name}: no same-language subtitle track survived selection",
             [f"stream {c.stream.index}: {c.rejected}" for c in candidates],
         )
-    scored.sort(key=lambda row: (-row[0], row[1].index))
-    if len(scored) > 1 and (scored[0][0] - scored[1][0]) < TRACK_COVERAGE_AMBIGUITY:
+    if _is_ambiguous(scored):
         raise TrackSelectionAmbiguous(
             f"{Path(media).name}: subtitle track selection is ambiguous "
             f"({scored[0][0]:.3f} vs {scored[1][0]:.3f}); pin stream_index in the manifest",
@@ -1753,7 +1816,6 @@ class ItemOutcome:
     status: str
     coverage: dict[str, Any]
     errors: list[BoundaryError] = field(default_factory=list)
-    excluded_reference_segments: int = 0
     reference_uncertainty_s: float | None = None
     notes: list[str] = field(default_factory=list)
     failure: dict[str, Any] | None = None
@@ -1860,6 +1922,16 @@ def evaluate_reference(
         )
         coverage = coverage_of(result)
         coverage["excluded_reference_segments"] = excluded
+        coverage["untimed_rows"] = {
+            "hypothesis": hyp_all.untimed,
+            "reference": segments.untimed,
+        }
+        untimed_notes = [
+            f"{count} {side} rows without start/end were left out of pairing and"
+            " coverage"
+            for side, count in coverage["untimed_rows"].items()
+            if count
+        ]
         coverage["thresholds"] = {
             "min_hyp_coverage": float(defaults["min_hyp_coverage"]),
             "min_ref_coverage": float(defaults["min_ref_coverage"]),
@@ -1884,9 +1956,8 @@ def evaluate_reference(
                 quality=ref.quality,
                 status="insufficient_samples",
                 coverage=coverage,
-                excluded_reference_segments=excluded,
                 reference_uncertainty_s=uncertainty,
-                notes=["no lexical content left after normalization"],
+                notes=["no lexical content left after normalization", *untimed_notes],
                 track=track_info,
             )
         if hyp_cov < float(defaults["min_hyp_coverage"]):
@@ -1923,7 +1994,7 @@ def evaluate_reference(
             ),
         )
 
-    notes: list[str] = []
+    notes: list[str] = list(untimed_notes)
     primary = sum(1 for e in errors if level != "word" or e.ref_count == 1)
     floor = MIN_WORD_SAMPLES if level == "word" else MIN_CUE_GROUPS
     if primary < floor:
@@ -1937,7 +2008,6 @@ def evaluate_reference(
         status="ok",
         coverage=coverage,
         errors=errors,
-        excluded_reference_segments=excluded,
         reference_uncertainty_s=uncertainty,
         notes=notes,
         track=track_info,
@@ -2058,6 +2128,7 @@ def _merge_coverage(outcomes: Sequence[ItemOutcome]) -> dict[str, Any]:
         "ref_unmatched_chars": 0,
     }
     empty = {"hypothesis": 0, "reference": 0}
+    untimed = {"hypothesis": 0, "reference": 0}
     shapes = {"1:1": 0, "1:N": 0, "N:1": 0, "N:M": 0}
     groups = 0
     excluded = 0
@@ -2072,6 +2143,7 @@ def _merge_coverage(outcomes: Sequence[ItemOutcome]) -> dict[str, Any]:
             unmatched[key] += int(cov.get(key, 0))
         for side in empty:
             empty[side] += int(cov["empty_after_normalization"][side])
+            untimed[side] += int((cov.get("untimed_rows") or {}).get(side, 0))
         for shape in shapes:
             shapes[shape] += int(cov["match_shapes"][shape])
         groups += int(cov.get("groups", 0))
@@ -2081,6 +2153,7 @@ def _merge_coverage(outcomes: Sequence[ItemOutcome]) -> dict[str, Any]:
     }
     merged.update(unmatched)
     merged["empty_after_normalization"] = empty
+    merged["untimed_rows"] = untimed
     merged["match_shapes"] = shapes
     merged["groups"] = groups
     merged["excluded_reference_segments"] = excluded
@@ -2155,7 +2228,7 @@ def build_lanes(
 def _pair_details(
     errors: Sequence[BoundaryError], *, pairs: str, limit: int
 ) -> dict[str, Any]:
-    """Per-group detail for manual spot-checking (design 3.6).
+    """Per-group detail a human can spot-check against the media.
 
     ``worst`` (the default) keeps the largest boundary errors, which is what a
     human actually opens the report for; the selection is named, and
@@ -2184,7 +2257,11 @@ def _pair_details(
 def _item_detail(
     outcome: ItemOutcome, level: str, *, pairs: str, pairs_limit: int
 ) -> dict[str, Any]:
-    """Per-item stratification kept inside the lane (design 3.1)."""
+    """Per-item stratification inside the lane.
+
+    Each item keeps its ``reference_id`` and its own metrics, so the pooled lane
+    numbers stay traceable to the item that moved them.
+    """
     metrics: dict[str, Any] = {}
     if outcome.status != "invalid":
         metrics, _ = lane_metrics(
@@ -2227,6 +2304,8 @@ def build_report(
     failures: Sequence[Mapping[str, Any]] = (),
     pairs: str = "worst",
     pairs_limit: int = 25,
+    source_filter: Sequence[str] = (),
+    item_filter: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Assemble the report document and validate it against its tracked schema."""
     bootstrap = int(manifest.defaults["bootstrap_samples"])
@@ -2258,6 +2337,12 @@ def build_report(
                 "skip_cost": SKIP_COST,
                 "merge_similarity_step": MERGE_SIMILARITY_STEP,
                 "max_group": {k: list(v) for k, v in MAX_GROUP.items()},
+                # The digest names the whole manifest, so a --source / --item run
+                # must say it covered less: see report_filters().
+                "filters": {
+                    "source": sorted(source_filter),
+                    "item": sorted(item_filter),
+                },
             }
         },
         "failures": all_failures,
@@ -2314,12 +2399,32 @@ def evaluate(
         failures=failures,
         pairs=pairs,
         pairs_limit=pairs_limit,
+        source_filter=source_filter,
+        item_filter=item_filter,
     )
 
 
 # --------------------------------------------------------------------------- #
 # Baseline and one-way gates
 # --------------------------------------------------------------------------- #
+
+
+def report_filters(report: Mapping[str, Any]) -> dict[str, Any]:
+    """The non-empty ``--source`` / ``--item`` filters a report was computed with.
+
+    A filtered report still carries the whole manifest's digest, so without this
+    it could be recorded as a baseline that silently leaves every other lane (or
+    item) ungated. Anything unreadable counts as a filter: refusing is safe,
+    guessing "unfiltered" is not.
+    """
+    health = report.get("health")
+    config = health.get("config") if isinstance(health, Mapping) else None
+    filters = config.get("filters") if isinstance(config, Mapping) else None
+    if filters is None:
+        return {}
+    if not isinstance(filters, Mapping):
+        return {"filters": filters}
+    return {str(key): value for key, value in filters.items() if value}
 
 
 def baseline_document(
@@ -2366,6 +2471,83 @@ def baseline_document(
     }
 
 
+def _got(value: Any) -> str:
+    return "missing" if value is None else repr(value)[:60]
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def baseline_shape_errors(baseline: Any) -> list[str]:
+    """Where ``baseline`` departs from the shape :func:`baseline_document` writes.
+
+    A hand-edited or truncated baseline is invalid input (exit 2); letting it
+    surface as a bare ``KeyError`` would exit 1 and read as a quality regression.
+    """
+    if not isinstance(baseline, Mapping):
+        return [f"<root>: expected an object, got {type(baseline).__name__}"]
+    errors: list[str] = []
+    for key in ("schema_version", "text_norm_version"):
+        value = baseline.get(key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            errors.append(f"{key}: expected an integer, got {_got(value)}")
+    tolerances = baseline.get("tolerances")
+    if tolerances is not None and not isinstance(tolerances, Mapping):
+        errors.append(f"tolerances: expected an object, got {_got(tolerances)}")
+    elif tolerances:
+        errors.extend(
+            f"tolerances/{key}: expected a finite number, got {_got(value)}"
+            for key, value in tolerances.items()
+            if not _is_finite_number(value)
+        )
+    lanes = baseline.get("lanes")
+    if not isinstance(lanes, list):
+        return [*errors, f"lanes: expected an array, got {_got(lanes)}"]
+    for index, lane in enumerate(lanes):
+        where = f"lanes/{index}"
+        if not isinstance(lane, Mapping):
+            errors.append(f"{where}: expected an object, got {_got(lane)}")
+            continue
+        for key in ("source_kind", "language"):
+            if not isinstance(lane.get(key), str):
+                errors.append(
+                    f"{where}/{key}: expected a string, got {_got(lane.get(key))}"
+                )
+        coverage = lane.get("coverage")
+        if coverage is not None and not isinstance(coverage, Mapping):
+            errors.append(f"{where}/coverage: expected an object, got {_got(coverage)}")
+        elif coverage:
+            for side in ("hyp_chars", "ref_chars"):
+                value = coverage.get(side)
+                if value is not None and not _is_finite_number(value):
+                    errors.append(
+                        f"{where}/coverage/{side}: expected a number, got {_got(value)}"
+                    )
+        metrics = lane.get("metrics")
+        if not isinstance(metrics, Mapping):
+            errors.append(f"{where}/metrics: expected an object, got {_got(metrics)}")
+            continue
+        for name, block in metrics.items():
+            if not isinstance(block, Mapping):
+                errors.append(
+                    f"{where}/metrics/{name}: expected an object, got {_got(block)}"
+                )
+                continue
+            for metric_field in (*GATED_ERROR_FIELDS, *GATED_RATE_FIELDS):
+                value = block.get(metric_field)
+                if value is not None and not _is_finite_number(value):
+                    errors.append(
+                        f"{where}/metrics/{name}/{metric_field}: expected a number,"
+                        f" got {_got(value)}"
+                    )
+    return errors
+
+
 def _allowed_ceiling(base: float, tol: Mapping[str, float]) -> float:
     return base + max(float(tol["absolute_s"]), abs(base) * float(tol["relative"]))
 
@@ -2385,6 +2567,9 @@ def apply_gates(
     disappeared, a metric whose samples vanished) is *invalid*, not a
     regression -- a run with different inputs has no standing to judge quality.
     """
+    shape_errors = baseline_shape_errors(baseline)
+    if shape_errors:
+        raise cc.CalibrationError("baseline is malformed", shape_errors)
     if int(baseline.get("schema_version", 0)) != BASELINE_SCHEMA_VERSION:
         raise cc.CalibrationError(
             f"baseline schema_version {baseline.get('schema_version')!r} != "
@@ -2598,37 +2783,37 @@ def cmd_inspect_tracks(args: argparse.Namespace) -> int:
         )
         hypothesis_norm = joiner_for(language).join(s.norm for s in hyp)
 
-    rows: list[dict[str, Any]] = []
-    for stream in streams:
-        reason = _static_rejection(stream, language, None)
-        candidate = TrackCandidate(stream, reason)
-        if reason is None and hypothesis_norm:
-            blocks = _read_track(
-                media,
-                stream,
-                lambda m, i, d, c: extract_subtitle_track(m, i, d, codec=c),
-            )
-            text = " ".join(str(b.get("text", "")) for b in blocks)
-            detected = detect_text_language(text)
-            if detected is not None and not cc.languages_match(detected, language):
-                candidate = TrackCandidate(
-                    stream, f"detected_language({detected})", None, detected
-                )
-            else:
-                candidate = TrackCandidate(
-                    stream,
-                    None,
-                    text_coverage(
-                        hypothesis_norm, normalize_text(text, language), language
-                    ),
-                    detected,
-                )
-        rows.append(candidate.to_dict())
+    selected: int | None = None
+    ambiguous = False
+    if hypothesis_norm:
+        candidates, scored = _screen_tracks(
+            media,
+            streams,
+            language=language,
+            hypothesis_norm=hypothesis_norm,
+            expected_codec=None,
+            extract=lambda m, i, d, c: extract_subtitle_track(m, i, d, codec=c),
+        )
+        ambiguous = _is_ambiguous(scored)
+        if scored and not ambiguous:
+            selected = scored[0][1].index
+    else:
+        # Without a hypothesis there is nothing to rank against, so no track is
+        # read: only the tag/disposition screening applies.
+        candidates = [
+            TrackCandidate(stream, _static_rejection(stream, language, None))
+            for stream in streams
+        ]
+    rows = [candidate.to_dict() for candidate in candidates]
+    for row in rows:
+        row["selected"] = row["index"] == selected
 
     if args.json:
         print(
             json.dumps(
-                {"media": str(media), "streams": rows}, ensure_ascii=False, indent=2
+                {"media": str(media), "streams": rows, "ambiguous": ambiguous},
+                ensure_ascii=False,
+                indent=2,
             )
         )
     else:
@@ -2638,11 +2823,19 @@ def cmd_inspect_tracks(args: argparse.Namespace) -> int:
                 if row["coverage"] is not None
                 else "candidate"
             )
+            if row["selected"]:
+                verdict += ", selected"
             print(
                 f"0:{row['index']}  {row['codec']:<18} "
                 f"lang={row['language']!s:<5} "
                 f"forced={int(row['forced'])} default={int(row['default'])} "
                 f"title={row['title']!r} -> {verdict}"
+            )
+        if ambiguous:
+            print(
+                "ambiguous: the two best tracks are within "
+                f"{TRACK_COVERAGE_AMBIGUITY:.2f} text coverage; pin stream_index"
+                " in the manifest"
             )
     return cc.EXIT_OK
 
@@ -2669,14 +2862,40 @@ def cmd_report(args: argparse.Namespace) -> int:
     return cc.EXIT_OK
 
 
+def _die_filtered(filters: Mapping[str, Any], what: str) -> NoReturn:
+    cc.die_invalid(
+        f"refusing to {what} a report filtered with --source/--item",
+        [
+            *(f"{key}: {value}" for key, value in sorted(filters.items())),
+            "a baseline gates the whole manifest; a filtered run would leave the "
+            "other lanes and items ungated -- re-run without --source/--item",
+        ],
+    )
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Compare a report against a recorded baseline with one-way gates."""
     manifest = _load_manifest_or_die(args.manifest)
+    requested = {"source": args.source, "item": args.item}
+    if any(requested.values()):
+        _die_filtered({k: v for k, v in requested.items() if v}, "gate")
     if args.report:
         report = cc.read_json_or_exit2(args.report)
         errors = cc.schema_errors(report, "alignment-report")
         if errors:
             cc.die_invalid(f"{args.report} failed schema validation", errors)
+        filters = report_filters(report)
+        if filters:
+            _die_filtered(filters, "gate")
+        if report["manifest_digest"] != manifest.digest:
+            cc.die_invalid(
+                f"{args.report} was computed from a different manifest than"
+                f" {args.manifest}; re-run the report against this manifest",
+                [
+                    f"report:   {report['manifest_digest']}",
+                    f"manifest: {manifest.digest}",
+                ],
+            )
     else:
         report = evaluate(
             manifest,
@@ -2692,7 +2911,10 @@ def cmd_check(args: argparse.Namespace) -> int:
         cc.die_invalid("the run is invalid; it cannot judge quality")
 
     baseline = cc.read_json_or_exit2(args.baseline)
-    failures = apply_gates(report, baseline)
+    try:
+        failures = apply_gates(report, baseline)
+    except cc.CalibrationError as exc:
+        cc.die_invalid(f"{args.baseline}: {exc.message}", exc.details)
     if args.json_out:
         cc.write_json(args.json_out, report)
     print_report(report)
@@ -2713,6 +2935,9 @@ def cmd_record_baseline(args: argparse.Namespace) -> int:
         cc.die_invalid(f"{args.report} failed schema validation", errors)
     if report["status"] == "invalid":
         cc.die_invalid("refusing to record a baseline from an invalid report")
+    filters = report_filters(report)
+    if filters:
+        _die_filtered(filters, "record a baseline from")
     if report["manifest_digest"] != manifest.digest:
         cc.die_invalid(
             "report manifest_digest does not match the manifest; re-run the report "
@@ -2773,7 +2998,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_shared(check)
     check.add_argument("--baseline", required=True)
     check.add_argument(
-        "--report", help="reuse an existing report instead of recomputing"
+        "--report",
+        help=(
+            "reuse an existing report of this --manifest instead of recomputing"
+            " (--pairs and --pairs-limit then have no effect)"
+        ),
     )
     check.set_defaults(func=cmd_check)
 

@@ -67,16 +67,16 @@
       "properties": {
         "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]+$"},
         "language": {"enum": ["en", "ja", "zh"]},
-        "media": {"type": ["string", "null"]},
+        "media": {"type": ["string", "null"], "description": "Default media for references that name none."},
         "hypothesis": {
           "type": "object",
           "additionalProperties": false,
           "required": ["path"],
           "properties": {
             "path": {"type": "string", "minLength": 1},
-            "pre_position_units": {"type": ["string", "null"]},
-            "post_position_units": {"type": ["string", "null"]},
-            "alignment_health": {"type": ["string", "null"]}
+            "pre_position_units": {"type": ["string", "null"], "description": "Annotation only: accepted, not read by calib_alignment.py."},
+            "post_position_units": {"type": ["string", "null"], "description": "Annotation only: accepted, not read by calib_alignment.py."},
+            "alignment_health": {"type": ["string", "null"], "description": "Annotation only: accepted, not read by calib_alignment.py."}
           }
         },
         "references": {
@@ -86,7 +86,7 @@
         },
         "include_ranges": {"type": "array", "items": {"$ref": "#/$defs/range"}},
         "exclude_ranges": {"type": "array", "items": {"$ref": "#/$defs/range"}},
-        "tags": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+        "tags": {"type": "array", "items": {"type": "string"}, "uniqueItems": true, "description": "Free-form labels for people; the ruler does not read them."}
       }
     }
   }

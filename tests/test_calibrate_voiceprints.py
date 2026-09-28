@@ -30,6 +30,7 @@ def _load_script(name: str) -> Any:
 
 
 calib = _load_script("calibrate_voiceprints")
+voiceembed = calib.voiceembed
 
 
 def test_error_rates_for_perfectly_separated_scores():
@@ -115,7 +116,7 @@ def test_calibrate_reports_every_model_and_releases_it():
         name="fake", embed=embed, release=lambda: released.append(True)
     )
 
-    models = calib.calibrate(episodes, [waveform], [embedder], max_segments=40)
+    models = calib.calibrate(episodes, [lambda: waveform], [embedder], max_segments=40)
 
     result = models["fake"]
     assert result["target"]["count"] == 2
@@ -124,6 +125,82 @@ def test_calibrate_reports_every_model_and_releases_it():
     assert result["non_target"]["mean"] == pytest.approx(0.0)
     assert result["eer"] == pytest.approx(0.0)
     assert released == [True]
+
+
+def _stub_decode(monkeypatch, tmp_path, *, decoded=None):
+    """Decode to a real temp file (so cleanup is observable), load zeros."""
+
+    def decode(episode, **_kw):
+        wav = tmp_path / f"{episode.media.stem}.decoded.wav"
+        wav.write_bytes(b"RIFF")
+        if decoded is not None:
+            decoded.append(wav)
+        return wav
+
+    monkeypatch.setattr(calib, "decode_episode", decode)
+    monkeypatch.setattr(calib, "load_waveform", lambda _wav: np.zeros(96_000))
+
+
+def test_calibration_segments_follow_the_production_rule_at_its_cap():
+    turns = [
+        (0.0, 3.0, "A"),
+        (2.5, 6.0, "B"),
+        (6.0, 9.0, "A"),
+        (9.0, 9.5, "A"),
+        # C never talks for MIN_TURN_SECONDS: production falls back to short pieces.
+        (10.0, 10.8, "C"),
+        (11.0, 11.3, "C"),
+        (12.0, 13.2, "C"),
+    ]
+    cap = voiceembed.MAX_SEGMENTS_PER_SPEAKER
+
+    for label in ("A", "B", "C"):
+        assert calib.calibration_segments(
+            turns, label, max_segments=cap
+        ) == voiceembed.centroid_segments(turns, label)
+    assert calib.calibration_segments(turns, "C", max_segments=cap) == [
+        (10.0, 10.8),
+        (12.0, 13.2),
+    ]
+
+
+def test_a_failing_model_keeps_the_other_models_results(tmp_path, monkeypatch, capsys):
+    media = tmp_path / "ep.mkv"
+    episode = calib.Episode(
+        media=media,
+        turns=[(0.0, 2.0, "A"), (2.0, 4.0, "B"), (4.0, 6.0, "A")],
+        audio_source=media,
+        separated=True,
+    )
+
+    def build(name):
+        def embed(_waveform, spans):
+            if name == "anime-va":
+                raise OSError("checkpoint is truncated")
+            return np.ones((len(spans), 2))
+
+        return calib.Embedder(name=name, embed=embed, release=lambda: None)
+
+    decoded = []
+    monkeypatch.setattr(calib, "build_embedder", build)
+    monkeypatch.setattr(calib, "load_episode", lambda _media, **_kw: episode)
+    _stub_decode(monkeypatch, tmp_path, decoded=decoded)
+    out = tmp_path / "r.json"
+
+    code = calib.main([str(media), "--models", "anime-va,redimnet2", "--out", str(out)])
+
+    assert code == 2
+    models = json.loads(out.read_text(encoding="utf-8"))["models"]
+    assert (
+        "anime-va on ep.mkv, speaker A: checkpoint is truncated"
+        in (models["anime-va"]["error"])
+    )
+    assert models["redimnet2"]["target"]["count"] == 1
+    captured = capsys.readouterr()
+    assert "error: anime-va on ep.mkv" in captured.err
+    assert "anime-va             FAILED" in captured.out
+    # The decoded audio is a temp file, removed once every model has run.
+    assert decoded and not any(path.exists() for path in decoded)
 
 
 def test_main_writes_the_json_report(tmp_path, monkeypatch, capsys):
@@ -144,9 +221,7 @@ def test_main_writes_the_json_report(tmp_path, monkeypatch, capsys):
         ),
     )
     monkeypatch.setattr(calib, "load_episode", lambda _media, **_kw: episode)
-    monkeypatch.setattr(
-        calib, "decode_episode", lambda _episode, **_kw: np.zeros(96_000)
-    )
+    _stub_decode(monkeypatch, tmp_path)
     out = tmp_path / "report.json"
 
     code = calib.main([str(media), "--models", "redimnet2", "--out", str(out)])
@@ -165,6 +240,186 @@ def test_unknown_model_is_an_input_error(tmp_path, capsys):
 
     assert code == 2
     assert "unknown voiceprint model" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name", ["auto", "pyannote", "ecapa", "RedimNet2"])
+def test_model_error_lists_exactly_the_accepted_models(tmp_path, capsys, name):
+    code = calib.main(
+        [str(tmp_path / "ep.mkv"), "--models", name, "--out", str(tmp_path / "r.json")]
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert err.count("error:") == 1
+    listed = err.rsplit("choose from ", 1)[1].strip()
+    assert listed.split(", ") == [
+        "redimnet2",
+        "anime-va",
+        "pyannote-community-1",
+        "pyannote-embedding",
+    ]
+
+
+def test_help_documents_models_out_and_max_segments(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        calib.main(["--help"])
+
+    assert excinfo.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "pyannote-embedding" in text
+    assert "(default: redimnet2,anime-va,pyannote-community-1)" in text
+    assert "(default: voiceprints-calibration.json)" in text
+    assert "(default: 40)" in text
+
+
+def _refuse_loading(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise AssertionError("must fail before any episode or model is loaded")
+
+    monkeypatch.setattr(calib, "load_episode", boom)
+    monkeypatch.setattr(calib, "build_embedder", boom)
+
+
+@pytest.mark.parametrize("value", ["1", "0", "-3"])
+def test_max_segments_below_two_is_an_input_error(tmp_path, monkeypatch, capsys, value):
+    _refuse_loading(monkeypatch)
+
+    code = calib.main(
+        [
+            str(tmp_path / "ep.mkv"),
+            f"--max-segments={value}",
+            "--out",
+            str(tmp_path / "r.json"),
+        ]
+    )
+
+    assert code == 2
+    assert "--max-segments must be at least 2" in capsys.readouterr().err
+
+
+def test_unwritable_out_is_refused_before_any_work(tmp_path, monkeypatch, capsys):
+    _refuse_loading(monkeypatch)
+
+    missing = calib.main(
+        [str(tmp_path / "ep.mkv"), "--out", str(tmp_path / "nope" / "r.json")]
+    )
+    directory = calib.main([str(tmp_path / "ep.mkv"), "--out", str(tmp_path)])
+
+    assert (missing, directory) == (2, 2)
+    err = capsys.readouterr().err
+    assert "does not exist" in err
+    assert "is a directory" in err
+
+
+def _stub_run(monkeypatch, tmp_path, *, embed=None, decode=None):
+    media = tmp_path / "ep.mkv"
+    episode = calib.Episode(
+        media=media,
+        turns=[(0.0, 2.0, "A"), (2.0, 4.0, "B"), (4.0, 6.0, "A")],
+        audio_source=media,
+        separated=True,
+    )
+    monkeypatch.setattr(
+        calib,
+        "build_embedder",
+        lambda name: calib.Embedder(
+            name=name,
+            embed=embed or (lambda _w, spans: np.ones((len(spans), 2))),
+            release=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(calib, "load_episode", lambda _media, **_kw: episode)
+    _stub_decode(monkeypatch, tmp_path)
+    if decode is not None:
+        monkeypatch.setattr(calib, "decode_episode", decode)
+    return media
+
+
+def test_decode_failure_is_exit_2_without_a_traceback(tmp_path, monkeypatch, capsys):
+    def decode(_episode, **_kw):
+        raise RuntimeError("ffmpeg failed to decode ep.mkv: moov atom not found")
+
+    media = _stub_run(monkeypatch, tmp_path, decode=decode)
+    out = tmp_path / "r.json"
+
+    code = calib.main([str(media), "--models", "redimnet2", "--out", str(out)])
+
+    assert code == 2
+    assert "error: ffmpeg failed to decode ep.mkv" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_embedder_failure_names_model_episode_and_speaker(
+    tmp_path, monkeypatch, capsys
+):
+    def embed(_waveform, _spans):
+        raise voiceembed.VoiceEmbeddingError("segment 0 falls outside the audio")
+
+    media = _stub_run(monkeypatch, tmp_path, embed=embed)
+
+    code = calib.main(
+        [str(media), "--models", "anime-va", "--out", str(tmp_path / "r.json")]
+    )
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "anime-va on ep.mkv, speaker A: segment 0 falls outside the audio" in err
+
+
+def test_report_write_failure_is_exit_2(tmp_path, monkeypatch, capsys):
+    media = _stub_run(monkeypatch, tmp_path)
+    out = tmp_path / "r.json"
+
+    def refuse(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "write_text", refuse)
+
+    code = calib.main([str(media), "--models", "redimnet2", "--out", str(out)])
+
+    assert code == 2
+    assert f"error: cannot write {out}" in capsys.readouterr().err
+
+
+def _episode_files(tmp_path):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"")
+    (tmp_path / "ep.json").write_text(
+        json.dumps({"speaker_turns": [[0.0, 2.0, "A"], [2.0, 4.0, "B"]]}),
+        encoding="utf-8",
+    )
+    cache = tmp_path / "cache" / "ep.vocals.32k.flac"
+    cache.parent.mkdir()
+    cache.write_bytes(b"flac")
+    return media, cache
+
+
+def test_fresh_vocals_cache_is_scored(tmp_path, monkeypatch):
+    from voxweave import vocals
+
+    media, cache = _episode_files(tmp_path)
+    checked = []
+    monkeypatch.setattr(
+        vocals,
+        "_vocals_cache_fresh",
+        lambda candidate, source: checked.append((candidate, source)) or True,
+    )
+
+    episode = calib.load_episode(media, use_vocals_cache=True)
+
+    assert (episode.audio_source, episode.separated) == (cache, True)
+    assert checked == [(cache, media)]
+
+
+def test_stale_vocals_cache_falls_back_to_the_mix(tmp_path, monkeypatch):
+    from voxweave import vocals
+
+    media, _cache = _episode_files(tmp_path)
+    monkeypatch.setattr(vocals, "_vocals_cache_fresh", lambda _c, _m: False)
+
+    episode = calib.load_episode(media, use_vocals_cache=True)
+
+    assert (episode.audio_source, episode.separated) == (media, False)
 
 
 def test_the_default_pyannote_baseline_is_community_1():
@@ -229,6 +484,25 @@ def test_pyannote_baselines_load_their_own_checkpoint(monkeypatch, name, source)
         "checkpoint_sha256": "a" * 64,
         "pyannote_version": "4.0.7",
     }
+    embedder.release()
+
+
+def test_pyannote_span_outside_the_audio_is_refused(monkeypatch):
+    from voxweave import turnembed
+
+    inference = _FakePyannoteInference()
+    monkeypatch.setattr(
+        turnembed,
+        "_load_inference",
+        lambda _identity=None, *, source=None: (
+            inference,
+            turnembed.EmbeddingIdentity("m@rev", "a" * 64, "4.0.7"),
+        ),
+    )
+    embedder = calib.build_embedder("pyannote-community-1")
+
+    with pytest.raises(voiceembed.VoiceEmbeddingError, match="segment 1 falls outside"):
+        embedder.embed(np.ones(3 * 16000, dtype=np.float32), [(0.0, 2.5), (4.0, 6.0)])
     embedder.release()
 
 

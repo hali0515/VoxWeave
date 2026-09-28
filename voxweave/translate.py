@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from voxweave import config, fsio
-from voxweave.realign import render_cues
+from voxweave.core.overlay import wrap_lyric
 from voxweave.speakers import voice_text_for_block
 
 log = logging.getLogger("voxweave")
@@ -25,27 +25,28 @@ _sleep = time.sleep
 # blips, short enough that a hard failure surfaces within seconds.
 _RETRY_DELAYS = (2.0, 8.0)
 
-# Built-in only: env / conf [llm] are resolved at call time (config.resolve_llm_model)
-# by the CLI and pipeline, never at import (a test or library import must not read the user conf).
-TRANSLATE_MODEL = config.DEFAULT_LLM_MODEL
 # Cue cap of the SEQUENTIAL planner (concurrency == 1). Set high (800) so a typical
 # episode (300-500 cues) fits in one call: with one window there are no seams, hence no
 # cross-window disambiguation errors or inconsistent proper-noun rendering, and only very
 # long compilations (>800 cues) fall back to sequential windows. Concurrency > 1 gives
 # that up on purpose -- it caps windows at WINDOW_CUES instead and relies on ``glossary``
 # and ``context`` for consistency (see :func:`translate_cues`).
-BATCH_THRESHOLD = int(os.environ.get("VOXWEAVE_TRANSLATE_BATCH", "800"))
+BATCH_THRESHOLD = config._env_int("VOXWEAVE_TRANSLATE_BATCH", 800)
 # Tail cues from the previous window carried into the next for stylistic continuity.
-CONTEXT_TAIL = int(os.environ.get("VOXWEAVE_TRANSLATE_CONTEXT_TAIL", "3"))
+CONTEXT_TAIL = config._env_int("VOXWEAVE_TRANSLATE_CONTEXT_TAIL", 3)
 # Second windowing gate: total cue characters per window. The cue-count cap alone
 # lets a dense compilation (800 long cues) build a prompt past the model's context
 # window; CJK text runs ~1 token/char and the response echoes the input size, so
 # 60k chars keeps request+response comfortably inside current context limits.
-WINDOW_CHARS = int(os.environ.get("VOXWEAVE_TRANSLATE_WINDOW_CHARS", "60000"))
+WINDOW_CHARS = config._env_int("VOXWEAVE_TRANSLATE_WINDOW_CHARS", 60000)
 # Concurrent-mode window size (cues per request when translate_cues runs with
 # concurrency > 1). Built-in only: env / conf [llm].window_cues resolve at call time
 # in the pipeline (config.resolve_llm_window_cues), never at import.
 WINDOW_CUES = config.DEFAULT_TRANSLATE_WINDOW_CUES
+# Per-request timeout (seconds) for the OpenAI client. The SDK's own retries are
+# disabled (our _RETRY_DELAYS loop already retries), so a hung endpoint fails after
+# at most three timeouts instead of the SDK's 600 s x 3 under each of ours.
+LLM_TIMEOUT_S = config._env_float("VOXWEAVE_LLM_TIMEOUT_S", 300.0)
 # Characters of the response kept in an IncompleteResponse message for diagnosis.
 _INCOMPLETE_TAIL_CHARS = 120
 # Cue indices listed in a "missing cues" log line before eliding.
@@ -86,12 +87,12 @@ class PartialTranslationError(RuntimeError):
     def __init__(self, missing: list[int], total: int) -> None:
         self.missing = list(missing)
         self.total = total
-        shown = ", ".join(str(i) for i in self.missing[:8])
+        shown = ", ".join(str(i + 1) for i in self.missing[:8])
         if len(self.missing) > 8:
             shown += ", ..."
         super().__init__(
             f"{len(self.missing)} of {total} cues untranslated after retry (cue "
-            f"indices {shown}); translation progress is kept -- rerun the same "
+            f"numbers {shown}); translation progress is kept -- rerun the same "
             "command to resume, or allow partial output (--allow-partial) to fill "
             "them with source text"
         )
@@ -333,7 +334,7 @@ def translated_rows(
                 strip_punct_for_subtitles(trans.get(i, "").strip() or b["text"]),
                 to_iso,
             )
-            rendered = f"♪ {t} ♪" if b.get("lyric") else t
+            rendered = wrap_lyric(t, b.get("lyric"))
         if voice_tags:
             return voice_text_for_block(
                 rendered, _speaker_block_for_rendered(b, rendered)
@@ -341,14 +342,6 @@ def translated_rows(
         return rendered
 
     return [(b.get("start"), b.get("end"), _text(i, b)) for i, b in enumerate(blocks)]
-
-
-def render_translated_vtt(
-    blocks: list[dict], trans: dict[int, str], to_iso: str | None = None
-) -> str:
-    """Translated blocks -> VTT (see :func:`translated_rows`); blocks without
-    timestamps produce plain-text cues."""
-    return render_cues(translated_rows(blocks, trans, to_iso))
 
 
 def format_glossary(glossary: dict[str, str] | str | None) -> str:
@@ -458,7 +451,8 @@ def _make_client(base_url: str | None, api_key: str | None):
         from openai import OpenAI
     except ModuleNotFoundError as e:
         raise RuntimeError(
-            "translate requires openai (not installed); install with: pip install 'voxweave[translate]' or make install"
+            "translate requires openai (not installed); reinstall voxweave "
+            "(openai is a core dependency)"
         ) from e
     base_url = config.resolve_llm_base_url(base_url)
     key_env = config.resolve_llm_api_key_env(None)
@@ -469,8 +463,10 @@ def _make_client(base_url: str | None, api_key: str | None):
             'variable ([llm].api_key_env = "" declares a keyless endpoint)'
         )
     if base_url:
-        return OpenAI(api_key=key, base_url=base_url)
-    return OpenAI(api_key=key)
+        return OpenAI(
+            api_key=key, base_url=base_url, max_retries=0, timeout=LLM_TIMEOUT_S
+        )
+    return OpenAI(api_key=key, max_retries=0, timeout=LLM_TIMEOUT_S)
 
 
 def resolve_model(client, model: str) -> str:
@@ -495,21 +491,18 @@ def resolve_model(client, model: str) -> str:
     )
 
 
-# Marker for "this response object does not expose finish_reason at all" (fakes,
-# minimal shims). Only a response that exposes the field can be judged incomplete;
-# the real SDK always exposes it (``None`` until the finish chunk arrives).
-_NO_FINISH_FIELD = object()
-
-
 def _check_complete(finish_reason: object, text: str) -> None:
     """Raise :class:`IncompleteResponse` unless the response finished with ``"stop"``.
 
-    ``None`` means the stream ended without a finish chunk (the server dropped the
-    request mid-answer); ``"length"`` / ``"abort"`` / anything else means the text
-    is cut short -- a truncated JSON object never parses, so treating the window as
-    "no result" and retrying beats silently accepting a partial buffer.
+    ``None`` means no finish reason was reported: a stream that ended without its
+    finish chunk (the server dropped the request mid-answer), or a response that
+    left the field out (the SDK exposes a missing field as ``None``, and so does
+    :func:`_call` for a client object without the attribute). ``"length"`` /
+    ``"abort"`` / anything else means the text is cut short -- a truncated JSON
+    object never parses, so treating the window as "no result" and retrying beats
+    silently accepting a partial buffer.
     """
-    if finish_reason is _NO_FINISH_FIELD or finish_reason == "stop":
+    if finish_reason == "stop":
         return
     raise IncompleteResponse(
         finish_reason if isinstance(finish_reason, str) else None, text
@@ -537,7 +530,7 @@ def _call(
     prose) -- the fallback for servers whose structured-output path aborts requests.
 
     Both paths check the final ``finish_reason`` and raise :class:`IncompleteResponse`
-    unless it is ``"stop"``; a response that never exposes the field is trusted.
+    unless it is ``"stop"`` (see :func:`_check_complete`).
     """
     request_options: dict = (
         {"reasoning_effort": reasoning_effort}
@@ -554,12 +547,12 @@ def _call(
         )
         choice = resp.choices[0]
         text = choice.message.content or ""
-        _check_complete(getattr(choice, "finish_reason", _NO_FINISH_FIELD), text)
+        _check_complete(getattr(choice, "finish_reason", None), text)
         return text
 
     buf: list[str] = []
     seen = 0
-    finish_reason: object = _NO_FINISH_FIELD
+    finish_reason: object = None
     stream = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -571,13 +564,10 @@ def _call(
             if not getattr(chunk, "choices", None):
                 continue  # trailing usage-only chunks have no choices
             choice = chunk.choices[0]
-            reason = getattr(choice, "finish_reason", _NO_FINISH_FIELD)
-            if reason is not _NO_FINISH_FIELD and (
-                reason is not None or finish_reason is _NO_FINISH_FIELD
-            ):
-                # A non-None reason is final; None only records that the field exists
-                # so an early-terminated stream is caught, without erasing a "stop"
-                # already seen (servers may trail an empty-delta chunk).
+            reason = getattr(choice, "finish_reason", None)
+            if reason is not None:
+                # A reported reason is final: a later None (servers may trail an
+                # empty-delta chunk) must not erase a "stop" already seen.
                 finish_reason = reason
             piece = getattr(getattr(choice, "delta", None), "content", None)
             if not piece:
@@ -643,25 +633,15 @@ def _with_retry(fn: Callable[[], _T], *, label: str = "translate call") -> _T:
     raise AssertionError("unreachable")
 
 
-def _call_options(reasoning_effort: str | None, json_mode: bool) -> dict:
-    """Keyword arguments forwarded to :func:`_call`, omitting defaults so a
-    minimal ``_call`` replacement (tests) keeps working."""
-    options: dict = {}
-    if reasoning_effort is not None:
-        options["reasoning_effort"] = reasoning_effort
-    if not json_mode:
-        options["json_mode"] = False
-    return options
-
-
 def _block_index(unit_index: int) -> int:
     """Translation-unit index -> its cue (block) index; dash halves share one cue."""
     return unit_index % _DASH_UNIT_BASE
 
 
 def _window_label(position: int, win: list[dict]) -> str:
-    first = _block_index(win[0]["i"])
-    last = _block_index(win[-1]["i"])
+    """Log label naming the window's cues by 1-based cue number, as players show them."""
+    first = _block_index(win[0]["i"]) + 1
+    last = _block_index(win[-1]["i"]) + 1
     return f"window {position + 1} (cues {first}-{last})"
 
 
@@ -693,7 +673,7 @@ def _parse_window(raw: str, win_ids: list[int], *, label: str) -> dict[int, str]
             label,
             len(missing),
             len(win_ids),
-            _short_indices([_block_index(i) for i in missing]),
+            _short_indices([_block_index(i) + 1 for i in missing]),
         )
     return parsed
 
@@ -753,7 +733,8 @@ def _request_window(
             model,
             messages,
             on_entry=on_entry,
-            **_call_options(reasoning_effort, json_mode),
+            reasoning_effort=reasoning_effort,
+            json_mode=json_mode,
         )
         return _parse_window(raw, win_ids, label=label)
 
@@ -806,7 +787,9 @@ def save_progress(path: Path, sig: str | None, trans: dict[int, str]) -> None:
     """Persist completed translations (atomic) so an interrupted multi-window
     run can resume instead of re-translating from zero."""
     doc = {"sig": sig, "translations": {str(i): t for i, t in trans.items()}}
-    fsio.atomic_write_text(Path(path), json.dumps(doc, ensure_ascii=False))
+    fsio.atomic_write_text(
+        Path(path), json.dumps(doc, ensure_ascii=False), private=True
+    )
 
 
 def load_progress(path: Path, sig: str | None) -> dict[int, str]:
@@ -876,10 +859,12 @@ def _expand_to_units(payload: list[dict]) -> list[dict]:
 
 
 def _collapse_units(payload: list[dict], unit_trans: dict[int, str]) -> dict[int, str]:
-    """Per-unit translations -> per-block translations (external cue count). A dash
-    cue recombines its two halves as ``X\\n-less`` joined by ``\\n`` only when BOTH
-    are present -- a partial cue is left absent so the pipeline retries the whole
-    cue instead of emitting a blank speaker line. Ordinary cues pass through."""
+    """Per-unit translations -> per-block translations (external cue count).
+
+    A dash cue's two halves are each cleaned (leading dash stripped, flattened to
+    one line) and rejoined as ``first\\nsecond`` only when BOTH are present -- a
+    partial cue is left absent so the pipeline retries the whole cue instead of
+    emitting a blank speaker line. Ordinary cues pass through."""
     out: dict[int, str] = {}
     for c in payload:
         k = c["i"]
@@ -1008,7 +993,8 @@ def translate_cues(
                 result.update(request(position, win, msgs, on_entry))
                 if progress_path is not None:
                     save_progress(progress_path, progress_sig, result)
-            tail = [(c["t"], result.get(c["i"], "")) for c in win[-context_tail:]]
+            recent = win[-context_tail:] if context_tail > 0 else []  # win[-0:] is all
+            tail = [(c["t"], result.get(c["i"], "")) for c in recent]
         return _collapse_units(payload, result)
 
     # Concurrent lane: one lock serialises result merging, progress saves and

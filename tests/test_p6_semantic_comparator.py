@@ -220,3 +220,22 @@ def test_semantic_oracle_replays_leg_arithmetic_instead_of_trusting_delivery():
     assert outcome.triggered is True
     assert outcome.passed is False
     assert "ALD-4" in comparison.violations
+
+
+def test_semantic_oracle_reports_a_block_count_mismatch_instead_of_raising():
+    """Regression: more authority blocks than phase-1 cues left no display
+    seeds, and the lyric expectation's strict zip raised ``ValueError`` on the
+    very shape violation the comparison exists to report."""
+    from voxweave.core.align_compare import compare_semantic_deltas
+
+    facts = _semantic_facts()
+    block = facts["authority_blocks"][0]
+    facts["authority_blocks"] = (block, block)
+
+    comparison = compare_semantic_deltas(**facts)
+    outcomes = {outcome.delta_id: outcome for outcome in comparison.outcomes}
+
+    for delta_id in ("ALD-1", "ALD-2", "ALD-3", "ALD-5"):
+        assert outcomes[delta_id].triggered is True
+        assert outcomes[delta_id].passed is False
+        assert delta_id in comparison.violations

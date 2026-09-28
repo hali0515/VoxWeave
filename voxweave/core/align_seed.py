@@ -1,8 +1,13 @@
 """Pure absolute-authority seed and footprint construction for P6 align.
 
-The result is acquisition evidence while RAT-1 remains pending.  This module
-does not mint a TimelineFinalizer root, call a P5 factory, or launder the fresh
-receipt through either existing authority kind.
+RAT-1 is approved (``p6_ratifications``): ``align_acquisition`` builds the
+seed here from the fresh aligner units and their authority distribution and
+carries it in the issued fresh receipt, and
+``finalizer.phase1_from_fresh_alignment`` consumes the verified seed to mint the
+``fresh-alignment`` W1 root.  That minting lives in the finalizer, not here:
+this module still mints no TimelineFinalizer root, calls no P5 factory, and
+never launders the fresh receipt through the ``v1-capture`` or
+``optimizer-selection`` authority kinds.
 """
 
 from __future__ import annotations

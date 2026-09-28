@@ -13,11 +13,20 @@ from typing import Any, Literal
 
 from voxweave.align_delta_registry import (
     ALIGN_DELTA_IDS,
+    ALIGN_DELTA_REGISTRY,
     ALIGN_DELTA_REGISTRY_SHA256,
 )
 from voxweave.align_evidence import encode_align_evidence
 from voxweave.align_failures import CanonicalFailure, OUTCOME_DETAILS
 
+
+# Deltas the semantic comparator can activate, in registry order: every
+# lazy-semantic entry (the mandatory EvidenceCore delta is checked elsewhere).
+_LAZY_SEMANTIC_DELTAS = tuple(
+    delta
+    for delta in ALIGN_DELTA_IDS
+    if ALIGN_DELTA_REGISTRY[delta].phase == "lazy-semantic"
+)
 
 _RICH_KEYS = (
     "schema_version",
@@ -353,7 +362,7 @@ def _validate_rich_artifact(value: Mapping[str, Any]) -> None:
         violations = comparison["violations"]
         if (
             not isinstance(active, list)
-            or active != [delta for delta in ALIGN_DELTA_IDS[:-1] if delta in active]
+            or active != [delta for delta in _LAZY_SEMANTIC_DELTAS if delta in active]
             or len(set(active)) != len(active)
             or not isinstance(primitive_fields, list)
             or primitive_fields
@@ -361,7 +370,7 @@ def _validate_rich_artifact(value: Mapping[str, Any]) -> None:
             or len(set(primitive_fields)) != len(primitive_fields)
             or not isinstance(violations, list)
             or violations
-            != [delta for delta in ALIGN_DELTA_IDS[:-1] if delta in violations]
+            != [delta for delta in _LAZY_SEMANTIC_DELTAS if delta in violations]
             or len(set(violations)) != len(violations)
             or any(delta not in active for delta in violations)
         ):

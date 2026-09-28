@@ -71,7 +71,6 @@ class SegmentationProjectionInputs:
 class IssuedLegacySegmentation:
     context_content_digest: str
     delivery: SegmentationDelivery
-    provider_ledger: FrozenJSON
     manifest_digest: str
     _binding: str = field(repr=False, compare=False)
 
@@ -97,7 +96,6 @@ class _LegacyRecord:
     issued: IssuedLegacySegmentation
     delivery: SegmentationDelivery
     delivery_snapshot: SegmentationDelivery
-    provider_ledger_snapshot: FrozenJSON
     projection_inputs: SegmentationProjectionInputs
     projection_snapshot: SegmentationProjectionInputs
     document: SegDocument
@@ -192,16 +190,6 @@ def segmentation_delivery_digest(delivery: SegmentationDelivery) -> str:
     return frozen_json_digest(freeze_json(_delivery_value(delivery)))
 
 
-def _validate_ranges(delivery: SegmentationDelivery, unit_count: int) -> None:
-    ranges = tuple(cue.unit_range for cue in delivery.cues)
-    if not ranges or ranges[0][0] != 0 or ranges[-1][1] != unit_count:
-        raise ValueError("segmentation delivery does not cover its unit stream")
-    if any(low < 0 or high <= low or high > unit_count for low, high in ranges) or any(
-        left[1] != right[0] for left, right in zip(ranges, ranges[1:])
-    ):
-        raise ValueError("segmentation delivery ranges are not a contiguous tiling")
-
-
 def _validate_delivery(
     context: IssuedSegmentationContext,
     delivery: SegmentationDelivery,
@@ -237,11 +225,10 @@ def _validate_delivery(
             or value.get("text", value.get("word", "")) != unit.surface
         ):
             raise ValueError("segmentation top-level surface stream changed")
-    # The historical delivery may contain proportional coarse-unit cues whose
-    # word-data footprint cannot name a source-unit partition. Only a v2
-    # delivery claims the increasing contiguous unit-range authority.
-    if delivery.engine_family == "boundary-v2":
-        _validate_ranges(delivery, len(document.units))
+    # No unit-range tiling is checked here: the historical delivery may contain
+    # proportional coarse-unit cues whose word-data footprint cannot name a
+    # source-unit partition. The v2 delivery's ranges come from the optimizer
+    # partition, which ``check_partition`` validates when it is built.
 
 
 def issue_legacy_segmentation(
@@ -255,16 +242,9 @@ def issue_legacy_segmentation(
     _validate_delivery(context, delivery, projection_inputs, document)
     sealed_document = copy.deepcopy(document)
     sealed_document.manifest = copy.deepcopy(_manifest_value(delivery))
-    provider_ledger = freeze_json(
-        {
-            "providers": sealed_document.manifest.get("providers", {}),
-            "degraded": sealed_document.manifest.get("degraded", []),
-        }
-    )
     issued = object.__new__(IssuedLegacySegmentation)
     object.__setattr__(issued, "context_content_digest", context.context_content_digest)
     object.__setattr__(issued, "delivery", delivery)
-    object.__setattr__(issued, "provider_ledger", provider_ledger)
     object.__setattr__(issued, "manifest_digest", frozen_json_digest(delivery.manifest))
     object.__setattr__(issued, "_binding", secrets.token_hex(32))
     with _LOCK:
@@ -273,7 +253,6 @@ def issue_legacy_segmentation(
             issued,
             delivery,
             copy.deepcopy(delivery),
-            copy.deepcopy(provider_ledger),
             projection_inputs,
             copy.deepcopy(projection_inputs),
             sealed_document,
@@ -296,7 +275,6 @@ def _legacy_record(
             or record.issued is not issued
             or issued.delivery is not record.delivery
             or issued.delivery != record.delivery_snapshot
-            or issued.provider_ledger != record.provider_ledger_snapshot
             or issued.context_content_digest != record.context_content_digest
             or issued.context_content_digest != context.context_content_digest
             or issued.manifest_digest != record.manifest_digest
@@ -498,7 +476,13 @@ def run_locked_segmentation_adapter(
     *,
     shadow_enabled: bool,
 ) -> SegmentationAdapterResult:
-    """Consume one adapter role and produce immutable legacy/v2 delivery status."""
+    """Consume one adapter role and produce immutable legacy/v2 delivery status.
+
+    The v2 delivery is built when the shadow switch asks for it or when the
+    registry selects the boundary family for this context. In the second case
+    v2 is the selected output, so its failure is raised with its canonical cause
+    instead of being recorded as a shadow status.
+    """
     if type(shadow_enabled) is not bool:
         raise TypeError("segmentation adapter switch must be an exact bool")
     record = _legacy_record(context, issued)
@@ -507,23 +491,26 @@ def run_locked_segmentation_adapter(
         "adapter",
         consumer="run_locked_segmentation_adapter",
     )
+    selected = context.engine_family == "boundary-v2"
     boundary: SegmentationDelivery | None = None
-    if not shadow_enabled:
+    if not (shadow_enabled or selected):
         status = V2Status("not-requested", None)
     else:
         try:
             boundary = _build_boundary_delivery(record)
         except SegmentationProductionError as exc:
+            if selected:
+                raise
             status = V2Status("invalid", exc.failure)
-        except Exception:
-            status = V2Status(
-                "invalid",
-                CanonicalFailure(
-                    "shadow-internal-error",
-                    "segmentation-adapter",
-                    "w1-stage",
-                ),
+        except Exception as exc:
+            failure = CanonicalFailure(
+                "shadow-internal-error",
+                "segmentation-adapter",
+                "w1-stage",
             )
+            if selected:
+                raise SegmentationProductionError(failure) from exc
+            status = V2Status("invalid", failure)
         else:
             status = V2Status("valid", None)
     result = object.__new__(SegmentationAdapterResult)
@@ -532,12 +519,17 @@ def run_locked_segmentation_adapter(
     object.__setattr__(result, "v2", boundary)
     object.__setattr__(result, "v2_status", status)
     object.__setattr__(result, "_binding", secrets.token_hex(32))
+    # The legacy delivery already has a private deep copy, taken at issuance and
+    # verified equal just above; seeding the memo reuses it instead of copying
+    # the whole delivery a second time. The snapshot is still compared field by
+    # field against a copy no caller can reach.
+    snapshot = copy.deepcopy(result, {id(result.legacy): record.delivery_snapshot})
     with _LOCK:
         _ADAPTER[id(result)] = _AdapterRecord(
             context,
             issued,
             result,
-            copy.deepcopy(result),
+            snapshot,
             record.projection_inputs,
             result.legacy,
             result.v2,
@@ -567,6 +559,22 @@ def _adapter_record(
         return record
 
 
+def release_context_records(context: IssuedSegmentationContext) -> None:
+    """Forget every issuance record bound to ``context``.
+
+    Called once the context's roles are retired. The records hold the whole
+    document and both deliveries, and nothing may consult them after
+    retirement, so keeping them would pin every run's data for the life of the
+    process.
+    """
+    with _LOCK:
+        for registry in (_LEGACY, _ADAPTER):
+            for key in [
+                key for key, record in registry.items() if record.context is context
+            ]:
+                del registry[key]
+
+
 __all__ = [
     "IssuedLegacySegmentation",
     "SegmentationAdapterResult",
@@ -576,6 +584,7 @@ __all__ = [
     "SegmentationProductionError",
     "SegmentationProjectionInputs",
     "issue_legacy_segmentation",
+    "release_context_records",
     "run_locked_segmentation_adapter",
     "segmentation_delivery_digest",
 ]

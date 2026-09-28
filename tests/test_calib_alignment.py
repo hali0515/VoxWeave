@@ -823,6 +823,79 @@ def test_ambiguous_tracks_require_an_explicit_index(tmp_path: Path) -> None:
         )
 
 
+# Mostly Latin with a little kana/Han: undetectable, and under the ja script floor.
+ROMAJI_TRACK = [("灯台守は嵐の前 tōdaimori arashi", 1.0 + i, 1.5 + i) for i in range(6)]
+
+
+def _inspect_json(
+    media: Path, monkeypatch: Any, capsys: Any, streams: list[Any], extract: Any
+) -> dict[str, Any]:
+    monkeypatch.setattr(ca, "probe_subtitle_streams", lambda _m: streams)
+    monkeypatch.setattr(
+        ca,
+        "extract_subtitle_track",
+        lambda m, i, d, codec="": extract(m, i, d, codec),
+    )
+    code = ca.main(
+        [
+            "inspect-tracks",
+            str(media),
+            "--lang",
+            "ja",
+            "--hypothesis",
+            str(FIXTURES / "synthetic-ja.hypothesis.json"),
+            "--json",
+        ]
+    )
+    assert code == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_inspect_tracks_applies_the_same_screening_as_selection(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"")
+    streams = [
+        ca.SubtitleStream(4, "subrip", "ja", "jpn", "Japanese", False, False, False),
+        ca.SubtitleStream(8, "subrip", "ja", "jpn", "Romaji", False, False, False),
+    ]
+
+    def extract(_media: Path, index: int, dest: Path, _codec: str) -> Path:
+        dest.write_text(
+            _srt(JA_TRACK if index == 4 else ROMAJI_TRACK), encoding="utf-8"
+        )
+        return dest
+
+    payload = _inspect_json(media, monkeypatch, capsys, streams, extract)
+
+    rows = {row["index"]: row for row in payload["streams"]}
+    assert rows[8]["rejected"] == "japanese_script_ratio_below_floor"
+    assert rows[4]["rejected"] is None and rows[4]["selected"] is True
+    assert rows[8]["selected"] is False
+    assert payload["ambiguous"] is False
+
+
+def test_inspect_tracks_reports_ambiguity_instead_of_a_choice(
+    tmp_path: Path, monkeypatch: Any, capsys: Any
+) -> None:
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"")
+    streams = [
+        ca.SubtitleStream(4, "subrip", "ja", "jpn", "Japanese", False, False, False),
+        ca.SubtitleStream(7, "subrip", "ja", "jpn", "Japanese 2", False, False, False),
+    ]
+
+    def extract(_media: Path, _index: int, dest: Path, _codec: str) -> Path:
+        dest.write_text(_srt(JA_TRACK), encoding="utf-8")
+        return dest
+
+    payload = _inspect_json(media, monkeypatch, capsys, streams, extract)
+
+    assert payload["ambiguous"] is True
+    assert not any(row["selected"] for row in payload["streams"])
+
+
 # --------------------------------------------------------------------------- #
 # Manifest loading
 # --------------------------------------------------------------------------- #
@@ -1104,3 +1177,178 @@ def test_source_and_item_filters_narrow_the_run(gated_corpus: Path) -> None:
     empty = ca.evaluate(ca.load_manifest(gated_corpus), item_filter=("nothing",))
     assert empty["status"] == "invalid"
     assert empty["failures"][0]["code"] == "no_references_selected"
+
+
+def test_filtered_report_cannot_become_a_baseline(
+    gated_corpus: Path, tmp_path: Path
+) -> None:
+    """A --source/--item run keeps the whole manifest's digest; it must say so."""
+    report_path = tmp_path / "report.json"
+    assert (
+        ca.main(
+            [
+                "report",
+                "--manifest",
+                str(gated_corpus),
+                "--source",
+                "mfa_words",
+                "--json-out",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert ca.report_filters(report) == {"source": ["mfa_words"]}
+    with pytest.raises(SystemExit) as exc:
+        ca.main(
+            [
+                "record-baseline",
+                "--manifest",
+                str(gated_corpus),
+                "--report",
+                str(report_path),
+                "--output",
+                str(tmp_path / "baseline.json"),
+            ]
+        )
+    assert exc.value.code == cc.EXIT_INVALID
+    assert not (tmp_path / "baseline.json").exists()
+
+    full = ca.evaluate(ca.load_manifest(gated_corpus))
+    assert ca.report_filters(full) == {}
+    baseline_path = tmp_path / "full-baseline.json"
+    baseline_path.write_text(json.dumps(ca.baseline_document(full)), encoding="utf-8")
+    for extra in (["--report", str(report_path)], ["--item", "en-split"]):
+        with pytest.raises(SystemExit) as exc:
+            ca.main(
+                [
+                    "check",
+                    "--manifest",
+                    str(gated_corpus),
+                    "--baseline",
+                    str(baseline_path),
+                    *extra,
+                ]
+            )
+        assert exc.value.code == cc.EXIT_INVALID
+
+
+def test_check_refuses_a_report_of_another_manifest(
+    gated_corpus: Path, tmp_path: Path, capsys: Any
+) -> None:
+    # The baseline was recorded from the same report, so the gates alone would
+    # compare equal digests and pass while --manifest names different inputs.
+    report = ca.evaluate(ca.load_manifest(gated_corpus))
+    report_path = tmp_path / "report.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(ca.baseline_document(report)), encoding="utf-8")
+    (tmp_path / "other").mkdir()
+    other = write_manifest(
+        tmp_path / "other",
+        [
+            fixture_item(
+                "en-split",
+                "en",
+                "synthetic-1to2.hypothesis.json",
+                "synthetic-1to2.reference.json",
+                "manual_cues",
+            )
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        ca.main(
+            [
+                "check",
+                "--manifest",
+                str(other),
+                "--baseline",
+                str(baseline_path),
+                "--report",
+                str(report_path),
+            ]
+        )
+
+    assert exc.value.code == cc.EXIT_INVALID
+    assert "computed from a different manifest" in capsys.readouterr().err
+
+
+def test_untimed_rows_are_counted_not_silently_dropped() -> None:
+    rows = [
+        {"text": "one", "start": 0.0, "end": 1.0},
+        {"text": "two", "start": None, "end": None},
+        {"text": "three", "start": 2.0},
+    ]
+
+    segments = ca.make_segments(rows, language="en", prefix="hyp")
+
+    assert [s.text for s in segments] == ["one"]
+    assert segments.untimed == 2
+
+
+def test_cue_lane_reads_voxweaves_sibling_json_segments(tmp_path: Path) -> None:
+    sibling = tmp_path / "episode.json"
+    sibling.write_text(
+        json.dumps(
+            {
+                "language": "en",
+                "segments": [{"text": "Hello there", "start": 0.5, "end": 1.5}],
+                "word_segments": [{"word": "Hello", "start": 0.5, "end": 0.9}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cues = ca.load_hypothesis_segments(sibling, language="en", level="cue")
+    words = ca.load_hypothesis_segments(sibling, language="en", level="word")
+
+    assert [c.text for c in cues] == ["Hello there"]
+    assert [w.text for w in words] == ["Hello"]
+
+
+def test_cue_lane_without_a_cue_array_points_at_the_subtitle(tmp_path: Path) -> None:
+    path = tmp_path / "episode.json"
+    path.write_text(json.dumps({"word_segments": []}), encoding="utf-8")
+
+    with pytest.raises(cc.CalibrationError, match="rendered subtitle"):
+        ca.load_hypothesis_segments(path, language="en", level="cue")
+
+
+def test_an_all_untimed_hypothesis_is_invalid(tmp_path: Path) -> None:
+    path = tmp_path / "draft.json"
+    path.write_text(
+        json.dumps({"cues": [{"text": "Hello there", "start": None, "end": None}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(cc.CalibrationError, match="none of its 1 rows"):
+        ca.load_hypothesis_segments(path, language="en", level="cue")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda b: b.pop("lanes"),
+        lambda b: b["lanes"][0].pop("metrics"),
+        lambda b: b["lanes"][0].pop("source_kind"),
+        lambda b: b.update(schema_version="one"),
+        lambda b: b.update(tolerances={"relative": "loose"}),
+        lambda b: next(iter(b["lanes"][0]["metrics"].values())).update(mae="x"),
+    ],
+    ids=["no-lanes", "no-metrics", "no-source-kind", "version", "tolerance", "mae"],
+)
+def test_malformed_baseline_is_invalid_not_a_regression(
+    gated_corpus: Path, tmp_path: Path, capsys: Any, mutate: Any
+) -> None:
+    baseline = ca.baseline_document(ca.evaluate(ca.load_manifest(gated_corpus)))
+    mutate(baseline)
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        ca.main(
+            ["check", "--manifest", str(gated_corpus), "--baseline", str(baseline_path)]
+        )
+    assert exc.value.code == cc.EXIT_INVALID
+    assert str(baseline_path) in capsys.readouterr().err
