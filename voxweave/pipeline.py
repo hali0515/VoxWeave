@@ -1904,17 +1904,42 @@ def _check_layout_overrides(iso: str, overrides: Mapping[str, Any]) -> None:
         )
 
 
+class VttEditsKeptError(RuntimeError):
+    """``split(keep_vtt_edits=True)`` found cues the JSON would not reproduce."""
+
+
+def _cue_content(vtt_path: Path, raw: bytes) -> list[tuple[Any, Any, str, bool]] | None:
+    """Cue times, text and lyric flag of a VTT, without speaker names (None = unreadable)."""
+    from voxweave.subformats import load_subtitle_blocks_bytes
+
+    try:
+        blocks = load_subtitle_blocks_bytes(vtt_path, raw)
+    except (RuntimeError, ValueError, UnicodeError):
+        return None
+    return [
+        (block.get("start"), block.get("end"), block["text"], bool(block.get("lyric")))
+        for block in blocks
+    ]
+
+
 def split(
     json_path: Path,
     timestamps: bool = True,
     *,
     reporter: Reporter | None = None,
+    keep_vtt_edits: bool = False,
     **smart_split_kwargs,
 ) -> Path:
     """Re-run smart_split from persisted word_segments.
 
     Reuses ``vad_speech`` from the sibling JSON for gap splitting; falls back to gap-only
     mode if absent. ``timestamps`` behaves as in :func:`process`.
+
+    ``keep_vtt_edits`` writes only when the existing VTT is missing or differs from
+    the new one in speaker names alone; otherwise it raises :class:`VttEditsKeptError`
+    and writes nothing. A VTT changed after that check is not overwritten either. Use
+    it when the caller did not ask to replace the VTT (render after a speakers Save):
+    the VTT may hold hand edits the JSON does not have yet.
     """
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
@@ -1993,6 +2018,15 @@ def split(
     if segmented.document is None or segmented.manifest is None:
         raise RuntimeError("segmentation result lacks its production authority")
     expected_json = episode_transaction.FileGeneration(True, input_bytes)
+    vtt_path = swap_ext(json_path, ".vtt")
+    expected_vtt: episode_transaction.FileGeneration | None = None
+    if keep_vtt_edits:
+        try:
+            expected_vtt = episode_transaction.FileGeneration(
+                True, vtt_path.read_bytes()
+            )
+        except FileNotFoundError:
+            expected_vtt = episode_transaction.FileGeneration(False, None)
     lexical_snapshot = decode_sibling_json_snapshot(json_path.name, input_bytes)
     selection = segmentation_orchestration.build_segmentation_selection(
         command="split",
@@ -2011,7 +2045,7 @@ def split(
         timestamps=timestamps,
         speaker_names=mapping_generation.names,
         expected_json=expected_json,
-        expected_vtt=None,
+        expected_vtt=expected_vtt,
         source_mode=None,
         mapping_generation=mapping_generation,
         mapping_path=mapping_path,
@@ -2042,13 +2076,24 @@ def split(
     )
     rep.step("write outputs")
     try:
+        if expected_vtt is not None and expected_vtt.bytes_value is not None:
+            old = _cue_content(vtt_path, expected_vtt.bytes_value)
+            if old is None or old != _cue_content(
+                vtt_path, selection.verified.vtt_bytes
+            ):
+                raise VttEditsKeptError(
+                    f"{vtt_path.name} was not overwritten: its cue text or timing"
+                    f" differs from what {json_path.name} produces (hand edits, align"
+                    " output, or other render options); run"
+                    f" 'voxweave render {json_path}' to replace it anyway"
+                )
         episode_transaction.commit_primary_outputs(
             command="split",
             episode_path=owner,
             json_path=json_path,
-            vtt_path=swap_ext(json_path, ".vtt"),
+            vtt_path=vtt_path,
             expected_json=expected_json,
-            expected_vtt=None,
+            expected_vtt=expected_vtt,
             main_json_bytes=selection.verified.main_json_bytes,
             vtt_bytes=selection.verified.vtt_bytes,
             cleanup_paths=tuple(cleanup),

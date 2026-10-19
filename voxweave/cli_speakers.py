@@ -23,6 +23,33 @@ class SpeakersGroup(DefaultGroup):
     media_extensions = (*MEDIA_EXTS, ".vtt", ".json")
 
 
+def _render_after_save(json_path: Path) -> Callable[[], str]:
+    """The re-render ``speakers serve`` runs after each Save; returns the VTT's name.
+
+    It keeps the VTT's own timestamps choice (a plain-text draft stays one) and
+    never overwrites cue text or timing the JSON would not reproduce.
+    """
+
+    def render() -> str:
+        from voxweave import config, pipeline
+        from voxweave.subformats import load_subtitle_blocks
+
+        vtt_path = swap_ext(json_path, ".vtt")
+        timestamps = config.conf_default_flag("timestamps", True)
+        if vtt_path.exists():
+            try:
+                blocks = load_subtitle_blocks(vtt_path)
+            except (RuntimeError, ValueError, UnicodeError):
+                blocks = []  # unreadable: split refuses to overwrite it anyway
+            if blocks:
+                timestamps = all(block.get("start") is not None for block in blocks)
+        return pipeline.split(
+            json_path, timestamps=timestamps, keep_vtt_edits=True
+        ).name
+
+    return render
+
+
 def _episode_owner(episode: Path, *, require_media: bool = False) -> Path:
     owner = sidecars.artifact_owner(episode)
     if require_media and owner.suffix.lower() not in MEDIA_EXTS:
@@ -294,6 +321,15 @@ def build_speakers_group(
         default=True,
         help="Open the audition in a browser.",
     )
+    @click.option(
+        "--render/--no-render",
+        default=True,
+        help=(
+            "Re-render the episode's VTT after each Save so it shows the new names"
+            " (default: on). A VTT with cue text or timing the JSON would not"
+            " reproduce, such as hand edits, is left unchanged."
+        ),
+    )
     @click.option("--enroll", is_flag=True, hidden=True)
     @click.option("--purge-voiceprints", is_flag=True, hidden=True)
     @click.option("--episode", hidden=True)
@@ -311,6 +347,7 @@ def build_speakers_group(
         ngrok: bool,
         port: int,
         open_browser: bool,
+        render: bool,
         enroll: bool,
         purge_voiceprints: bool,
         episode: str | None,
@@ -394,6 +431,9 @@ def build_speakers_group(
                 port=port,
                 open_browser=open_browser,
                 report=report,
+                render=(
+                    _render_after_save(audition.sibling_json_path) if render else None
+                ),
             ),
             reporter=False,
         )

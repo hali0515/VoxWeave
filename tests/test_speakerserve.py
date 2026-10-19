@@ -21,7 +21,9 @@ def _generation(path: Path) -> tuple[int, int, int, int]:
 
 
 @contextmanager
-def _running_server(tmp_path: Path, *, host: str = "127.0.0.1", ngrok: bool = False):
+def _running_server(
+    tmp_path: Path, *, host: str = "127.0.0.1", ngrok: bool = False, render=None
+):
     mapping = tmp_path / "episode.speakers.json"
     mapping.write_text(
         json.dumps(
@@ -43,6 +45,7 @@ def _running_server(tmp_path: Path, *, host: str = "127.0.0.1", ngrok: bool = Fa
         ngrok=ngrok,
         port=0,
         report=logs.append,
+        render=render,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -158,6 +161,48 @@ def test_save_writes_exact_bytes_in_skeleton_order_and_can_overwrite(tmp_path):
             f"Saved {mapping}",
             f"Next: voxweave render {tmp_path / 'episode.json'}",
         ]
+
+
+def test_save_renders_the_subtitles_after_writing_the_mapping(tmp_path):
+    seen: list[dict] = []
+
+    def render() -> str:
+        # runs after the new mapping is on disk
+        seen.append(json.loads((tmp_path / "episode.speakers.json").read_text()))
+        return "episode.vtt"
+
+    with _running_server(tmp_path, render=render) as (server, _mapping, logs):
+        token = _serve_info(server)["token"]
+        status, _headers, body = _save(
+            server, token, {"version": 1, "speakers": {"SPEAKER_00": "Ren"}}
+        )
+    assert status == 200
+    assert json.loads(body) == {"saved": True, "rendered": "episode.vtt"}
+    assert seen == [{"version": 1, "speakers": {"SPEAKER_00": "Ren"}}]
+    assert logs[-1] == "Rendered episode.vtt"
+    assert not any(line.startswith("Next:") for line in logs)
+
+
+def test_a_failed_render_keeps_the_save_and_says_why(tmp_path):
+    def render() -> str:
+        raise RuntimeError("episode.vtt was not overwritten: hand edits")
+
+    with _running_server(tmp_path, render=render) as (server, mapping, logs):
+        token = _serve_info(server)["token"]
+        status, _headers, body = _save(
+            server, token, {"version": 1, "speakers": {"SPEAKER_00": "Ren"}}
+        )
+    assert status == 200
+    assert json.loads(body) == {
+        "saved": True,
+        "render_error": "episode.vtt was not overwritten: hand edits",
+    }
+    assert json.loads(mapping.read_text(encoding="utf-8"))["speakers"] == {
+        "SPEAKER_00": "Ren"
+    }
+    assert (
+        logs[-1] == "Subtitles not updated: episode.vtt was not overwritten: hand edits"
+    )
 
 
 @pytest.mark.parametrize("token", [None, "wrong-token"])
