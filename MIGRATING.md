@@ -3,7 +3,7 @@
 What changed per release, newest first. Only releases that need an action or a
 heads-up appear here.
 
-## 0.18.0 (unreleased)
+## 0.18.0
 
 Most of this release concerns `--voiceprints` (cross-episode voice matching and **Split
 this speaker**). Several fixes change output: a first run transcribes and diarizes the
