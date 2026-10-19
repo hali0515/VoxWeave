@@ -1845,9 +1845,9 @@ def test_concurrent_seed_tail_reaches_only_the_first_window():
 def test_concurrency_one_never_touches_the_thread_pool(monkeypatch):
     # The sequential lane is today's planner: whole-episode batch, translated tail.
     def boom(*a, **k):
-        raise AssertionError("ThreadPoolExecutor used in sequential mode")
+        raise AssertionError("worker threads used in sequential mode")
 
-    monkeypatch.setattr(translate, "ThreadPoolExecutor", boom)
+    monkeypatch.setattr(translate, "_run_windows_concurrently", boom)
     client = FakeClient([_json_ok(range(3))])
     out = translate.translate_cues(
         _payload(3), to="zh", model="m", client=client, concurrency=1, window_cues=1
@@ -1884,3 +1884,72 @@ def test_translate_cues_rejects_invalid_concurrency_and_window():
         translate.translate_cues(
             _payload(1), to="zh", model="m", client=client, window_cues=0
         )
+
+
+def test_stream_counts_entries_split_across_chunks():
+    pieces = [
+        '{"translations":[{"',
+        'i":0,"t":"a"},{"i"',
+        ':1,"t":"b"},{',
+        '"i":2,"t":"c"}]}',
+    ]
+    seen: list[int] = []
+    text = translate._call(FakeStreamClient(pieces), "m", _MSGS, on_entry=seen.append)
+    assert text == "".join(pieces)
+    assert sum(seen) == 3
+
+
+class _AttemptsStreamClient:
+    """Streams one queued ``(pieces, finish_reason)`` attempt per request."""
+
+    def __init__(self, attempts):
+        self._attempts = list(attempts)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, *, model, messages, stream=False, **kw):
+        pieces, finish = self._attempts.pop(0)
+        return FinishStreamClient(pieces, finish)._chunks()
+
+
+def test_a_retried_window_advances_the_bar_once_per_cue(fast_retry):
+    partial = '{"translations":[{"i":0,"t":"tx 0"},{"i":1,"t":"tx 1"}'
+    client = _AttemptsStreamClient(
+        [([partial], "length"), ([_json_ok(range(3))], "stop")]
+    )
+    rep = _RecordingReporter()
+    out = translate.translate_cues(
+        _payload(3), to="zh", model="m", client=client, reporter=rep
+    )
+    assert out == {i: f"tx {i}" for i in range(3)}
+    assert rep.total == 3 and rep.advances == 3
+
+
+def test_ctrl_c_returns_without_waiting_for_windows_in_flight():
+    import _thread
+    import time
+
+    release = threading.Event()
+    calls: list[int] = []
+
+    def run(position):
+        calls.append(position)
+        release.wait(30)  # a window still streaming or retrying
+
+    timer = threading.Timer(0.3, _thread.interrupt_main)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            translate._run_windows_concurrently(run, [0, 1, 2], workers=2)
+        assert time.monotonic() - started < 5
+        workers = [
+            t for t in threading.enumerate() if t.name.startswith("voxweave-translate")
+        ]
+        assert workers and all(t.daemon for t in workers)
+    finally:
+        timer.cancel()
+        release.set()
+    for t in threading.enumerate():
+        if t.name.startswith("voxweave-translate"):
+            t.join(5)
+    assert sorted(calls) == [0, 1]  # the queued window never started

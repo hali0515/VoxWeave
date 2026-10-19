@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
 from pathlib import Path
 from typing import TypeVar
 
@@ -551,7 +551,7 @@ def _call(
         return text
 
     buf: list[str] = []
-    seen = 0
+    carry = ""
     finish_reason: object = None
     stream = client.chat.completions.create(
         model=model,
@@ -573,10 +573,13 @@ def _call(
             if not piece:
                 continue
             buf.append(piece)
-            n = "".join(buf).count('"i"')
-            if n > seen:
-                on_entry(n - seen)
-                seen = n
+            # Count only what arrived, plus the 2 characters a '"i"' split across
+            # chunks can start in; rescanning the whole buffer is quadratic.
+            window = carry + piece
+            n = window.count('"i"')
+            carry = window[-2:]
+            if n:
+                on_entry(n)
     finally:
         close = getattr(stream, "close", None)
         if close is not None:
@@ -725,14 +728,30 @@ def _request_window(
     A window that still comes back incomplete is logged and returned empty: its
     cues stay untranslated for the sequential retry stage, and the caller decides
     whether partial output is acceptable.
+
+    ``on_entry`` advances at most once per cue of the window: every attempt
+    streams the window from its first entry again, so only entries past the
+    furthest earlier attempt count.
     """
+    counted = 0
 
     def attempt(json_mode: bool) -> dict[int, str]:
+        streamed = 0
+        report = on_entry
+
+        def advance(n: int) -> None:
+            nonlocal counted, streamed
+            streamed += n
+            reach = min(streamed, len(win_ids))
+            if report is not None and reach > counted:
+                report(reach - counted)
+                counted = reach
+
         raw = _call(
             client,
             model,
             messages,
-            on_entry=on_entry,
+            on_entry=None if report is None else advance,
             reasoning_effort=reasoning_effort,
             json_mode=json_mode,
         )
@@ -1048,36 +1067,67 @@ def translate_cues(
             if progress_path is not None:
                 save_progress(progress_path, progress_sig, result)
 
-    hard_error: BaseException | None = None
-    with ThreadPoolExecutor(max_workers=min(concurrency, len(pending))) as pool:
-        futures = [pool.submit(run, position) for position in pending]
-        try:
-            for future in as_completed(futures):
-                # A worker's BaseException (KeyboardInterrupt included) lands in the
-                # future rather than propagating, so read it instead of calling
-                # result(): the first failure ends the run.
-                exc = future.exception()
-                if exc is not None:
-                    hard_error = exc
-                    break
-        finally:
-            # Drop the windows that never started -- for a failure, for a
-            # KeyboardInterrupt in this thread, and harmlessly when every window
-            # already finished. Never keep consuming as_completed afterwards:
-            # cancel_futures cancels a queued future WITHOUT notifying the
-            # as_completed waiter (only set_running_or_notify_cancel does that),
-            # so the iterator would block forever waiting for them. The pool's
-            # exit then joins the in-flight windows, whose progress is persisted.
-            pool.shutdown(wait=False, cancel_futures=True)
-    if hard_error is not None:
-        # Later failures are dropped by the break above; report them so a systemic
-        # outage is not misread as one bad window.
-        for future in futures:
-            if future.cancelled():
-                continue
-            other = future.exception()
-            if other is not None and other is not hard_error:
-                log.warning("another translate window failed: %s", other)
-        raise hard_error
+    _run_windows_concurrently(run, pending, workers=min(concurrency, len(pending)))
     result = dict(sorted(result.items()))
     return _collapse_units(payload, result)
+
+
+def _run_windows_concurrently(
+    run: Callable[[int], None], positions: list[int], *, workers: int
+) -> None:
+    """Run ``run(position)`` for every position on ``workers`` daemon threads.
+
+    The first failure stops new windows from starting; the windows already in
+    flight finish (their progress is persisted) and then that failure is raised,
+    with any later ones logged so a systemic outage is not misread as one bad
+    window. A KeyboardInterrupt in the calling thread returns at once: the
+    threads are daemons, so in-flight windows (each may retry for minutes) do
+    not hold up the exit, as ThreadPoolExecutor workers would, since the
+    interpreter joins those at shutdown.
+    """
+    todo: queue.SimpleQueue[int] = queue.SimpleQueue()
+    for position in positions:
+        todo.put(position)
+    done: queue.SimpleQueue[BaseException | None] = queue.SimpleQueue()
+    stop = threading.Event()
+
+    def worker() -> None:
+        while not stop.is_set():
+            try:
+                position = todo.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                run(position)
+            except BaseException as exc:  # noqa: BLE001 - handed to the caller
+                done.put(exc)
+            else:
+                done.put(None)
+
+    threads = [
+        threading.Thread(target=worker, name=f"voxweave-translate-{k}", daemon=True)
+        for k in range(workers)
+    ]
+    for thread in threads:
+        thread.start()
+    failures: list[BaseException] = []
+    try:
+        while True:
+            try:
+                outcome = done.get(timeout=0.1)
+            except queue.Empty:
+                if any(thread.is_alive() for thread in threads):
+                    continue
+                if done.empty():
+                    break
+                continue
+            if outcome is not None:
+                failures.append(outcome)
+                stop.set()  # windows already running still finish and save
+    except BaseException:
+        stop.set()
+        raise
+    if failures:
+        for other in failures[1:]:
+            log.warning("another translate window failed: %s", other)
+        raise failures[0]
