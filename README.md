@@ -375,7 +375,11 @@ section of `~/.config/voxweave.conf` — an explicit CLI flag always wins for th
 After a diarized transcription, `voxweave speakers serve <media>` prepares an audition page in
 memory, serves it on `127.0.0.1` by default, and opens it in your browser. The page embeds up to three
 clean, non-overlapping speech clips per diarizer id. Listen, enter names, then select **Save**
-to write them directly to the episode's speaker mapping. The server runs until Ctrl+C; use
+to write them directly to the episode's speaker mapping. Each Save then re-renders the
+episode's VTT from `<stem>.json` so it shows the new names (`--no-render` turns this off).
+The VTT is replaced only when it differs from that render in speaker names alone: if it holds
+cue text or timing the JSON does not, such as hand edits not yet aligned, it is left unchanged
+and the page says why. The server runs until Ctrl+C; use
 `--no-open` to print the access link without opening a browser, or `--port N` to choose its HTTP
 port. No audition HTML is written to disk. `voxweave speakers <media>` is the supported
 shorthand for `serve`; `--manual` disables voice matching for that session.
@@ -403,8 +407,7 @@ Only tunnels forwarding to this local port are accepted, including HTTPS access 
 ```bash
 voxweave episode.mkv --diarize
 voxweave speakers serve episode.mkv
-# Save names in the browser, stop the server with Ctrl+C, then render them
-voxweave render episode.json
+# Save names in the browser; each Save re-renders episode.vtt with them
 ```
 
 If pyannote merged two people under one diarizer id, select **Split this speaker** on that
@@ -664,7 +667,10 @@ voxweave correct episode.vtt --glossary names.json --apply   # rewrite in place 
 `voxweave translate <subtitle>` — **after align**, translate each cue with whole-episode
 context, preserving cue count, into `<stem>.<target>.<ext>` (the original is left unchanged).
 Accepts `.vtt`/`.srt`/`.ass`/`.ssa`; the output mirrors the input format
-(`episode.srt` → `episode.zh.srt`).
+(`episode.srt` → `episode.zh.srt`). An ASS/SSA input keeps its script: only the text of each
+translated event changes, behind the override tags that open it, so styles, positions
+(`{\an8}`, `\pos`), Comment lines and drawings stay as they were. Position tags never reach
+the model; an SRT cue's `{\an8}` is put back on its translation.
 
 ```bash
 voxweave translate episode.vtt --target zh
@@ -693,7 +699,7 @@ source cues as context. This trades some cross-window stylistic continuity for
 throughput and resilience on a self-hosted server -- `--glossary` and `--context`
 are the consistency tools there. `--concurrency 1` sends one whole-episode request
 (sequential windows with translated-tail continuity only past 800 cues), the best
-choice for a hosted API.
+choice for a hosted API and the default when no `base_url` is set.
 
 Every response is checked for completeness: an answer that does not finish with
 `stop` (length cap, a server aborting its structured-output grammar) is retried,
@@ -726,7 +732,7 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 | `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env, `[llm].model` in the config, or `gpt-6-luna`; `auto` = the endpoint's only served model). |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](#configuration)). |
 | `--reasoning-effort`           | Model-specific effort. `VOXWEAVE_TRANSLATE_REASONING_EFFORT` > `[llm].reasoning_effort` > endpoint default; `default` explicitly omits the field. |
-| `--concurrency N`              | Windows in flight at once (`VOXWEAVE_TRANSLATE_CONCURRENCY` > `[llm].concurrency` > 8). `1` = one whole-episode request with translated-tail continuity. |
+| `--concurrency N`              | Windows in flight at once (`VOXWEAVE_TRANSLATE_CONCURRENCY` > `[llm].concurrency` > 8 with a base URL, 1 for api.openai.com). `1` = one whole-episode request with translated-tail continuity. |
 | `--window N`                   | Cues per window when `--concurrency` > 1 (`VOXWEAVE_TRANSLATE_WINDOW_CUES` > `[llm].window_cues` > 100). |
 | `--allow-partial`              | Write the output even when cues stay untranslated after the retry (they keep their source text). Default: fail and keep the progress file for a resumed rerun. |
 
@@ -738,9 +744,9 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 SRT/ASS/VTT out (written next to the input; the VTT + JSON pair stays the source of truth
 for voxweave-produced subtitles). ASS output carries a Default style; lyric cues (`♪ ... ♪`)
 render italic. Named VTT cues become `NAME: text` in SRT and use the ASS Dialogue `Name`
-field. The SRT position tag `{\an8}` (raise to the top) stays in SRT output, becomes a real
-override in ASS and is dropped from VTT. Foreign SRT/ASS files can be exported to VTT to
-enter the editing workflow. Every cue needs timestamps: a plain-text edit draft, or a file in
+field. The position tag `{\an8}` (raise to the top; an ASS input's `\anN`/`\aN` override too)
+stays in SRT output, becomes a real override in ASS and is dropped from VTT. Foreign SRT/ASS
+files can be exported to VTT to enter the editing workflow. Every cue needs timestamps: a plain-text edit draft, or a file in
 which only some cues are timed, is refused with the untimed cues named (run `align` on a VTT
 first; an SRT needs its missing timing lines).
 
@@ -815,8 +821,9 @@ capped CRF on x264/x265/SVT-AV1, a one-second data rate limit on VideoToolbox), 
 constant quality alone can inflate a low-bitrate source: a 3440x1440 screen recording at
 374 kb/s H.264 came out of NVENC `-cq 23` at 873 kb/s HEVC. Under the cap the output is no
 larger than the source; content that needs fewer bits still gets fewer. The rate comes from
-the stream (`bit_rate`, or matroska's `BPS` tag), else from the file size over the duration
-minus the known audio rates; when neither can be read the cap is skipped with a warning.
+the stream (`bit_rate`, or matroska's `BPS` tag), else from the video stream's packet sizes
+(one demux-only ffprobe pass), else from the file size over the duration minus attachments and
+the other streams' known rates; when none can be read the cap is skipped with a warning.
 Turn it off with `--no-bitrate-cap` when the target codec is less efficient than the
 source's (an AV1 or VP9 source burnt to h264 needs more bits for the same picture). Output bit
 depth follows the source dynamically (8-bit stays 8-bit, 10-bit stays 10-bit; 12-bit is kept
@@ -886,7 +893,7 @@ Set `VOXWEAVE_CONFIG` to read (and create) the config file somewhere else.
 - `VOXWEAVE_TRANSLATE_REASONING_EFFORT` (default `[llm].reasoning_effort`, else the endpoint default;
   same as `translate --reasoning-effort`; `default` leaves the request field unset)
 - `VOXWEAVE_TRANSLATE_CONCURRENCY` / `VOXWEAVE_TRANSLATE_WINDOW_CUES` (default `[llm].concurrency` /
-  `[llm].window_cues`, else 8 / 100; same as `translate --concurrency` / `--window`)
+  `[llm].window_cues`, else 8 (1 for api.openai.com) / 100; same as `translate --concurrency` / `--window`)
 - `VOXWEAVE_LLM_TIMEOUT_S` (default 300) — seconds one `translate` / `correct` request may take
   before it is retried; raise it for a slow self-hosted endpoint
 - `VOXWEAVE_DEVICE` (default: auto-detect `cuda:0` → `mps` → `cpu`)

@@ -532,11 +532,14 @@ def test_collapsed_names_do_not_bake_into_srt_round_trip(tmp_path, monkeypatch):
     )
 
     llm_commands.correct(vtt, apply=True)
-    assert "<v " not in vtt.read_text(encoding="utf-8")
+    # the cue keeps its two lines; only the unchanged line keeps its name
+    corrected = vtt.read_text(encoding="utf-8")
+    assert "\nHello there my friend\n<v Ren>Hi</v>\n" in corrected
+    assert "<v Aoi>" not in corrected
     export_subtitles(vtt, ("srt",))
     srt = tmp_path / "episode.srt"
     assert "Aoi / Ren" not in srt.read_text(encoding="utf-8")
-    assert load_subtitle_blocks(srt)[0]["text"] == "Hello there my friend Hi"
+    assert load_subtitle_blocks(srt)[0]["text"] == "Hello there my friend\nHi"
 
 
 def test_correct_audit_records_reflowed_text_written_to_vtt(tmp_path, monkeypatch):
@@ -874,6 +877,91 @@ def test_split_named_render_keeps_sibling_json_clean(tmp_path):
     assert "<v Aoi>" in vtt and "<v Ren>" in vtt
     assert "Aoi" not in sibling and "Ren" not in sibling
     assert "speaker_ids" not in sibling
+
+
+def _named_episode(tmp_path, names):
+    json_path = tmp_path / "episode.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "language": "en",
+                "segments": [],
+                "word_segments": [
+                    {"text": "Hello", "start": 0.0, "end": 0.5},
+                    {"text": "there", "start": 0.55, "end": 1.0},
+                    {"text": "Go", "start": 1.1, "end": 1.5},
+                    {"text": "away", "start": 1.55, "end": 2.0},
+                ],
+                "vad_speech": [[0.0, 2.0]],
+                "speaker_turns": [
+                    [0.0, 1.05, "SPEAKER_00"],
+                    [1.05, 2.1, "SPEAKER_01"],
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_names(tmp_path, names)
+    return json_path
+
+
+def _write_names(tmp_path, names):
+    (tmp_path / "episode.speakers.json").write_text(
+        json.dumps({"version": 1, "speakers": names}), encoding="utf-8"
+    )
+
+
+def test_split_keeping_vtt_edits_updates_names_on_an_unedited_vtt(tmp_path):
+    json_path = _named_episode(tmp_path, {"SPEAKER_00": "Aoi", "SPEAKER_01": "Ren"})
+    vtt_path = pipeline.split(json_path)
+    _write_names(tmp_path, {"SPEAKER_00": "Aster", "SPEAKER_01": "Ren"})
+
+    pipeline.split(json_path, keep_vtt_edits=True)
+
+    vtt = vtt_path.read_text(encoding="utf-8")
+    assert "<v Aster>" in vtt and "<v Aoi>" not in vtt
+
+
+def test_split_keeping_vtt_edits_refuses_a_hand_edited_vtt(tmp_path):
+    json_path = _named_episode(tmp_path, {"SPEAKER_00": "Aoi", "SPEAKER_01": "Ren"})
+    vtt_path = pipeline.split(json_path)
+    edited = vtt_path.read_text(encoding="utf-8").replace("Hello", "Hullo")
+    vtt_path.write_text(edited, encoding="utf-8")
+    json_before = json_path.read_bytes()
+    _write_names(tmp_path, {"SPEAKER_00": "Aster", "SPEAKER_01": "Ren"})
+
+    with pytest.raises(pipeline.VttEditsKeptError, match="was not overwritten"):
+        pipeline.split(json_path, keep_vtt_edits=True)
+
+    assert vtt_path.read_text(encoding="utf-8") == edited
+    assert json_path.read_bytes() == json_before
+
+
+def test_split_keeping_vtt_edits_writes_a_missing_vtt(tmp_path):
+    json_path = _named_episode(tmp_path, {"SPEAKER_00": "Aoi", "SPEAKER_01": "Ren"})
+
+    vtt_path = pipeline.split(json_path, keep_vtt_edits=True)
+
+    assert "<v Aoi>" in vtt_path.read_text(encoding="utf-8")
+
+
+def test_split_keeping_vtt_edits_refuses_a_vtt_changed_after_the_check(
+    tmp_path, monkeypatch
+):
+    from voxweave import episode_transaction
+
+    json_path = _named_episode(tmp_path, {"SPEAKER_00": "Aoi", "SPEAKER_01": "Ren"})
+    vtt_path = pipeline.split(json_path)
+    commit = episode_transaction.commit_primary_outputs
+
+    def edit_then_commit(**kwargs):
+        vtt_path.write_text("WEBVTT\n\nedited meanwhile\n", encoding="utf-8")
+        return commit(**kwargs)
+
+    monkeypatch.setattr(episode_transaction, "commit_primary_outputs", edit_then_commit)
+    with pytest.raises(Exception, match="vtt-generation|changed"):
+        pipeline.split(json_path, keep_vtt_edits=True)
+    assert vtt_path.read_text(encoding="utf-8") == "WEBVTT\n\nedited meanwhile\n"
 
 
 VOICE_CAPTURE = "c" + "1" * 32

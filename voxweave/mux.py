@@ -792,25 +792,80 @@ def src_video_bitrate(
     """Bitrate of the source's video stream in bit/s (None when it cannot be told).
 
     Uses the stream's own rate when the container reports one. Otherwise (webm
-    and most matroska remuxes) it is the file size over the video duration minus
-    the audio streams whose rate is known, which overestimates the video share
-    by the rate of any audio stream that reports none.
+    and ffmpeg-muxed matroska, where the other streams usually report no rate
+    either) it sums the video stream's packet sizes over its duration, one
+    demux-only pass over the file. Only when that fails is it the file size over
+    the duration minus the other streams' known rates and attachment bytes, which
+    overestimates the video share by any stream that reports no rate.
     """
     rate = _stream_bitrate(video_stream)
     if rate:
         return rate
     duration = _stream_duration(video_stream)
+    if not duration:
+        return None
+    index = _stream_index(video_stream)
+    packets = _packet_bytes(media, index) if index is not None else None
+    if packets:
+        return int(packets * 8 / duration)
     try:
         size = media.stat().st_size
     except OSError:
         return None
-    if not duration or size <= 0:
+    if size <= 0:
         return None
-    audio = sum(
-        _stream_bitrate(s) or 0 for s in streams if s.get("codec_type") == "audio"
+    others = [s for s in streams if s is not video_stream]
+    attached = sum(
+        s["extradata_size"]
+        for s in others
+        if s.get("codec_type") == "attachment"
+        and isinstance(s.get("extradata_size"), int)
     )
-    rate = int(size * 8 / duration) - audio
+    known = sum(
+        _stream_bitrate(s) or 0
+        for s in others
+        if s.get("codec_type") in ("audio", "subtitle", "data")
+    )
+    rate = int((size - attached) * 8 / duration) - known
     return rate if rate > 0 else None
+
+
+def _packet_bytes(media: Path, index: int) -> int | None:
+    """Total size of one stream's packets, read by ffprobe without decoding; None
+    when ffprobe fails or reports nothing."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        str(index),
+        "-show_entries",
+        "packet=size",
+        "-of",
+        "csv=p=0",
+        str(media),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+        )
+    except OSError:
+        return None
+    total = 0
+    assert proc.stdout is not None
+    with proc.stdout:
+        for line in proc.stdout:
+            field = line.split(",", 1)[0].strip()
+            if field.isdecimal():
+                total += int(field)
+    if proc.wait() != 0:
+        return None
+    return total or None
 
 
 def _stream_index(stream: dict) -> int | None:

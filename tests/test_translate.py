@@ -467,8 +467,79 @@ def test_pipeline_translate_ass_mirrors_format(tmp_path, monkeypatch):
     out = llm_commands.translate(ass, to="zh")
     assert out == tmp_path / "ep.zh.ass"
     txt = out.read_text(encoding="utf-8")
-    assert "[V4+ Styles]" in txt  # rendered as a full ASS script
-    assert "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好" in txt
+    # the source script with the event text replaced, nothing added
+    assert txt == (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好\n"
+    )
+
+
+_FANSUB_ASS = (
+    "[Script Info]\n"
+    "ScriptType: v4.00+\n"
+    "PlayResX: 1920\n"
+    "PlayResY: 1080\n"
+    "\n"
+    "[V4+ Styles]\n"
+    "Format: Name, Fontname, Fontsize, Alignment\n"
+    "Style: Default,Arial,60,2\n"
+    "Style: Sign,Arial,48,8\n"
+    "\n"
+    "[Events]\n"
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    "Comment: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,translator note\n"
+    "Dialogue: 0,0:00:03.00,0:00:04.00,Default,Aoi,0,0,0,,Bottom line\n"
+    "Dialogue: 1,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\an8}Top line\n"
+    "Dialogue: 0,0:00:01.50,0:00:03.00,Sign,,0,0,0,,{\\pos(100,200)\\fad(200,0)}STORE SIGN\n"
+    "Dialogue: 0,0:00:00.00,0:00:05.00,Sign,,0,0,0,,{\\p1}m 0 0 l 100 0 100 100{\\p0}\n"
+)
+
+
+def test_translate_ass_keeps_styles_positions_comments_and_drawings(
+    tmp_path, monkeypatch
+):
+    ass = tmp_path / "fansub.ass"
+    ass.write_text(_FANSUB_ASS, encoding="utf-8")
+    seen: list[list[str]] = []
+
+    def fake_translate(payload, **_kw):
+        seen.append([entry["t"] for entry in payload])
+        return {entry["i"]: f"zh {entry['t']}" for entry in payload}
+
+    monkeypatch.setattr(llm_commands.translate_mod, "translate_cues", fake_translate)
+    out = llm_commands.translate(ass, to="zh")
+
+    # cues in time order, position tags kept away from the model
+    assert seen == [["Top line", "STORE SIGN", "Bottom line"]]
+    expected = (
+        _FANSUB_ASS.replace(",,Bottom line", ",,zh Bottom line")
+        .replace("{\\an8}Top line", "{\\an8}zh Top line")
+        .replace("\\fad(200,0)}STORE SIGN", "\\fad(200,0)}zh STORE SIGN")
+    )
+    assert out.read_text(encoding="utf-8") == expected
+
+
+def test_translate_srt_puts_the_position_tag_back(tmp_path, monkeypatch):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n{\\an8}Top line\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nBottom line\n",
+        encoding="utf-8",
+    )
+    seen: list[list[str]] = []
+
+    def fake_translate(payload, **_kw):
+        seen.append([entry["t"] for entry in payload])
+        return {entry["i"]: f"zh {entry['t']}" for entry in payload}
+
+    monkeypatch.setattr(llm_commands.translate_mod, "translate_cues", fake_translate)
+    out = llm_commands.translate(srt, to="zh")
+
+    assert seen == [["Top line", "Bottom line"]]
+    txt = out.read_text(encoding="utf-8")
+    assert "{\\an8}zh Top line" in txt
+    assert "\nzh Bottom line\n" in txt
 
 
 def test_pipeline_translate_fills_missing_with_retry_then_original(
@@ -1845,9 +1916,9 @@ def test_concurrent_seed_tail_reaches_only_the_first_window():
 def test_concurrency_one_never_touches_the_thread_pool(monkeypatch):
     # The sequential lane is today's planner: whole-episode batch, translated tail.
     def boom(*a, **k):
-        raise AssertionError("ThreadPoolExecutor used in sequential mode")
+        raise AssertionError("worker threads used in sequential mode")
 
-    monkeypatch.setattr(translate, "ThreadPoolExecutor", boom)
+    monkeypatch.setattr(translate, "_run_windows_concurrently", boom)
     client = FakeClient([_json_ok(range(3))])
     out = translate.translate_cues(
         _payload(3), to="zh", model="m", client=client, concurrency=1, window_cues=1
@@ -1884,3 +1955,72 @@ def test_translate_cues_rejects_invalid_concurrency_and_window():
         translate.translate_cues(
             _payload(1), to="zh", model="m", client=client, window_cues=0
         )
+
+
+def test_stream_counts_entries_split_across_chunks():
+    pieces = [
+        '{"translations":[{"',
+        'i":0,"t":"a"},{"i"',
+        ':1,"t":"b"},{',
+        '"i":2,"t":"c"}]}',
+    ]
+    seen: list[int] = []
+    text = translate._call(FakeStreamClient(pieces), "m", _MSGS, on_entry=seen.append)
+    assert text == "".join(pieces)
+    assert sum(seen) == 3
+
+
+class _AttemptsStreamClient:
+    """Streams one queued ``(pieces, finish_reason)`` attempt per request."""
+
+    def __init__(self, attempts):
+        self._attempts = list(attempts)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, *, model, messages, stream=False, **kw):
+        pieces, finish = self._attempts.pop(0)
+        return FinishStreamClient(pieces, finish)._chunks()
+
+
+def test_a_retried_window_advances_the_bar_once_per_cue(fast_retry):
+    partial = '{"translations":[{"i":0,"t":"tx 0"},{"i":1,"t":"tx 1"}'
+    client = _AttemptsStreamClient(
+        [([partial], "length"), ([_json_ok(range(3))], "stop")]
+    )
+    rep = _RecordingReporter()
+    out = translate.translate_cues(
+        _payload(3), to="zh", model="m", client=client, reporter=rep
+    )
+    assert out == {i: f"tx {i}" for i in range(3)}
+    assert rep.total == 3 and rep.advances == 3
+
+
+def test_ctrl_c_returns_without_waiting_for_windows_in_flight():
+    import _thread
+    import time
+
+    release = threading.Event()
+    calls: list[int] = []
+
+    def run(position):
+        calls.append(position)
+        release.wait(30)  # a window still streaming or retrying
+
+    timer = threading.Timer(0.3, _thread.interrupt_main)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            translate._run_windows_concurrently(run, [0, 1, 2], workers=2)
+        assert time.monotonic() - started < 5
+        workers = [
+            t for t in threading.enumerate() if t.name.startswith("voxweave-translate")
+        ]
+        assert workers and all(t.daemon for t in workers)
+    finally:
+        timer.cancel()
+        release.set()
+    for t in threading.enumerate():
+        if t.name.startswith("voxweave-translate"):
+            t.join(5)
+    assert sorted(calls) == [0, 1]  # the queued window never started

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from voxweave import artifacts, pipeline
+from voxweave import artifacts, pipeline, vocals
 
 
 def _stub_public_shadow_align(tmp_path, monkeypatch):
@@ -36,9 +36,14 @@ def _stub_public_shadow_align(tmp_path, monkeypatch):
     )
     vtt_path = tmp_path / "episode.vtt"
     vtt_path.write_text("WEBVTT\n\n你好\n", encoding="utf-8")
-    monkeypatch.setattr(
-        pipeline, "_prepare_16k_for_align", lambda *_args, **_kwargs: media
-    )
+
+    def fake_prepare(*_args, hit_only: bool = False, **_kwargs):
+        if hit_only:
+            # no vocals cache here: a bound align reads a media snapshot
+            raise vocals.VocalsCacheMiss("stub has no cache")
+        return media
+
+    monkeypatch.setattr(pipeline, "_prepare_16k_for_align", fake_prepare)
 
     def fake_slice(
         _wav,

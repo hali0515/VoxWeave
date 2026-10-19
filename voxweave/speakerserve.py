@@ -165,6 +165,7 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         report: Callable[[str], None],
         host: str = HOST,
         ngrok: bool = False,
+        render: Callable[[], str] | None = None,
     ) -> None:
         if host not in (HOST, "0.0.0.0"):
             raise ValueError("host must be 127.0.0.1 or 0.0.0.0")
@@ -184,6 +185,9 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         self.session_cookie = secrets.token_urlsafe(32)
         self.token = secrets.token_urlsafe(32)
         self.report = report
+        # Re-renders the episode's subtitles after a Save and returns the VTT's
+        # name; None leaves rendering to the user (speakers serve --no-render).
+        self.render = render
         self.action_lock = threading.Lock()
         self.split_proposal: _SplitProposal | None = None
         self.session_terminal = False
@@ -522,10 +526,21 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
         self.server.pristine_mapping_generation = None
         self.server.pristine_mapping_path = None
         self.server.report(f"Saved {mapping_path}")
-        self.server.report(
-            f"Next: voxweave render {shlex.quote(str(self.server.sibling_path))}"
-        )
-        self._json_reply(HTTPStatus.OK, {"saved": True})
+        reply: dict[str, object] = {"saved": True}
+        if self.server.render is None:
+            self.server.report(
+                f"Next: voxweave render {shlex.quote(str(self.server.sibling_path))}"
+            )
+        else:
+            try:
+                reply["rendered"] = self.server.render()
+            except Exception as exc:  # noqa: BLE001 - the save stands; say why render did not
+                message = str(exc) or type(exc).__name__
+                self.server.report(f"Subtitles not updated: {message}")
+                reply["render_error"] = message
+            else:
+                self.server.report(f"Rendered {reply['rendered']}")
+        self._json_reply(HTTPStatus.OK, reply)
 
     def _handle_split(self, payload: object) -> None:
         if self.server.session_terminal:
@@ -1625,6 +1640,7 @@ def make_server(
     ngrok: bool = False,
     port: int = 0,
     report: Callable[[str], None] = print,
+    render: Callable[[], str] | None = None,
 ) -> SpeakerHTTPServer:
     """Bind and return one audition server."""
     return SpeakerHTTPServer(
@@ -1638,6 +1654,7 @@ def make_server(
         ngrok=ngrok,
         port=port,
         report=report,
+        render=render,
     )
 
 
@@ -1669,11 +1686,13 @@ def serve(
     port: int = 0,
     open_browser: bool = True,
     report: Callable[[str], None] = print,
+    render: Callable[[], str] | None = None,
 ) -> str:
     """Serve an audition until interrupted and return its access link.
 
     The link (the listening URL plus ``?k=`` and the access key) is the only
     way in; it is printed first and is what the browser is opened with.
+    ``render`` runs after every successful Save (see :class:`SpeakerHTTPServer`).
     """
     server = make_server(
         page=page,
@@ -1686,6 +1705,7 @@ def serve(
         ngrok=ngrok,
         port=port,
         report=report,
+        render=render,
     )
     url = server.access_url
     report(url)

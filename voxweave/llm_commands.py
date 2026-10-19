@@ -27,13 +27,15 @@ from voxweave import (
 )
 from voxweave import asrfix as asrfix_mod
 from voxweave import translate as translate_mod
-from voxweave.export import render_ass, render_srt
+from voxweave.export import _ass_text, _split_position, render_ass, render_srt
 from voxweave.lang import to_iso_or
 from voxweave.paths import require_output_name, swap_ext
 from voxweave.progress import NestedReporter, Reporter
 from voxweave.subformats import (
+    decode_subtitle_bytes,
     load_subtitle_blocks,
     load_subtitle_blocks_bytes,
+    replace_ass_event_texts,
     require_subtitle,
 )
 
@@ -66,7 +68,11 @@ def translate(
     <stem>.<to>.<ext> (source untouched).
 
     Accepts VTT/SRT/ASS/SSA; the output mirrors the input format (SSA is written
-    back as ASS). Output cue count always equals input cue count.
+    back as ASS). Output cue count always equals input cue count. An ASS/SSA
+    input keeps its script: only each translated event's text changes, after the
+    override tags that open it (position, style, effects), so styles, Comment
+    lines and drawings stay. Position tags (``{\\an8}``) never reach the model and
+    are put back on the translated cue.
 
     ``concurrency`` / ``window_cues`` (None = env > conf ``[llm]`` > built-in 8 /
     100) run bounded windows in parallel; ``concurrency=1`` is the single
@@ -84,14 +90,25 @@ def translate(
     )
     base_url = config.resolve_llm_base_url(base_url)
     reasoning_effort = config.resolve_llm_reasoning_effort(reasoning_effort)
-    concurrency = config.resolve_llm_concurrency(concurrency)
+    concurrency = config.resolve_llm_concurrency(concurrency, base_url=base_url)
     window_cues = config.resolve_llm_window_cues(window_cues)
     ext = ".ass" if vtt_path.suffix.lower() == ".ssa" else vtt_path.suffix.lower()
     out_path = require_output_name(swap_ext(vtt_path, f".{to}{ext}"))
     rep = reporter or Reporter()
     rep.plan(("read subtitles", "translate cues", "write translation"))
     rep.step("read subtitles")
-    blocks = _load_cues(vtt_path)
+    source_bytes = vtt_path.read_bytes()
+    is_ass = vtt_path.suffix.lower() in (".ass", ".ssa")
+    blocks = load_subtitle_blocks_bytes(vtt_path, source_bytes, ass_events=is_ass)
+    ass_script = decode_subtitle_bytes(source_bytes, vtt_path.name) if is_ass else None
+    # Position tags are markup, not dialogue: translate the text without them
+    # and put them back on the output cue.
+    positions: list[str | None] = []
+    for index, block in enumerate(blocks):
+        position, bare = _split_position(block["text"])
+        positions.append(position)
+        if position:
+            blocks[index] = {**block, "text": bare}
     if any(b.get("start") is None for b in blocks):
         if ext != ".vtt":
             raise ValueError(
@@ -190,7 +207,13 @@ def translate(
     )
     if ext == ".vtt":
         content = realign.render_cues(rows)
+    elif ass_script is not None:
+        content = _write_back_ass(ass_script, blocks, rows)
     else:
+        rows = [
+            (start, end, f"{{\\{position}}}{text}" if position else text)
+            for (start, end, text), position in zip(rows, positions)
+        ]
         timed = [
             (float(s), float(e), t)
             for s, e, t in rows
@@ -244,6 +267,21 @@ def translate(
             )
     log.info("wrote %s (%d cues → %s)", out_path.name, len(blocks), to)
     return out_path
+
+
+def _write_back_ass(
+    script: str,
+    blocks: Sequence[Mapping[str, Any]],
+    rows: Sequence[tuple[float | None, float | None, str]],
+) -> str:
+    """The source ASS/SSA script with each cue's event text replaced by its
+    translation, behind the override blocks that opened the original text."""
+    texts: dict[int, str] = {}
+    for block, (_start, _end, text) in zip(blocks, rows):
+        line, prefix = block["ass_event"]
+        # the prefix keeps the original position tag; a second one is noise
+        texts[line] = prefix + _ass_text(_split_position(text)[1])
+    return replace_ass_event_texts(script, texts)
 
 
 def _warn_correction_not_realigned(vtt_path: Path, applied: Sequence[Mapping]) -> None:

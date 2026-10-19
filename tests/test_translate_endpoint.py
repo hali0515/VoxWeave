@@ -499,8 +499,9 @@ def test_interrupted_sdk_stream_retries_with_effort_and_closes_responses(
     assert _body(requests[1])["stream"] is True
     assert len(sleeps) == 1
     assert len(streams) == 2 and all(stream.closed for stream in streams)
-    # Each attempt sees one content entry; reasoning never advances the reporter.
-    assert advances == [1, 1]
+    # Both attempts stream the one entry; the retry does not count it again, and
+    # reasoning never advances the reporter.
+    assert advances == [1]
 
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["blocking", "streaming"])

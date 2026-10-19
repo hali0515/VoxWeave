@@ -103,13 +103,96 @@ def test_apply_fixes_rejects_noop():
 
 
 def test_apply_fixes_norm_tolerates_wrapped_newline():
-    # multi-line cue (wrapped with \n); model quotes orig space-joined -> normalizes to a match, fix applied normally
+    # multi-line cue (wrapped with \n); model quotes orig space-joined -> normalizes
+    # to a match, fix applied, and the cue keeps its line break
     blocks = [{"text": "U S\nMarshall", "start": 0.0, "end": 1.0}]
     fixes = [
         {"i": 0, "orig": "U S Marshall", "fixed": "U S Marshal", "reason": "title"}
     ]
     new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
-    assert new[0] == "U S Marshal" and len(applied) == 1 and not rejected
+    assert new[0] == "U S\nMarshal" and len(applied) == 1 and not rejected
+
+
+def test_apply_fixes_keeps_line_breaks_of_a_wrapped_cue():
+    blocks = _blocks(["the first lien here\nand the second line"])
+    fixes = [
+        {
+            "i": 0,
+            "orig": "the first lien here and the second line",
+            "fixed": "the first line here and the second line",
+            "reason": "typo",
+        }
+    ]
+    new, _applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == ["the first line here\nand the second line"] and not rejected
+
+
+def test_apply_fixes_keeps_the_break_of_a_no_space_cue():
+    # the payload joins the two lines with a space the model may keep or drop
+    blocks = _blocks(["如金仍是\n主力部队"])
+    for fixed in ("如今仍是 主力部队", "如今仍是主力部队"):
+        fixes = [{"i": 0, "orig": "如金仍是 主力部队", "fixed": fixed, "reason": ""}]
+        new, _applied, rejected = asrfix.apply_fixes(blocks, fixes)
+        assert new == ["如今仍是\n主力部队"] and not rejected
+
+
+def test_apply_fixes_break_inside_the_rewritten_span_moves_to_a_space():
+    blocks = _blocks(["we need teh\ncar keys now"])
+    fixes = [
+        {
+            "i": 0,
+            "orig": "we need teh car keys now",
+            "fixed": "we need the car keys now",
+            "reason": "typo",
+        }
+    ]
+    new, _applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == ["we need the\ncar keys now"] and not rejected
+
+
+def test_apply_fixes_model_newlines_never_split_the_cue():
+    # a blank line inside "fixed" used to become a cue break on the next parse
+    blocks = _blocks(["one long line with a typo hear"])
+    fixes = [
+        {
+            "i": 0,
+            "orig": "one long line with a typo hear",
+            "fixed": "one long line\n\nwith a typo here",
+            "reason": "typo",
+        }
+    ]
+    new, _applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == ["one long line with a typo here"] and not rejected
+
+
+def test_apply_fixes_keeps_an_unnamed_dash_cue_on_two_lines():
+    # plain --diarize output: dash layout without voice tags
+    blocks = _blocks(["-Did you see teh car?\n-Yes I did."])
+    fixes = [
+        {
+            "i": 0,
+            "orig": "-Did you see teh car? -Yes I did.",
+            "fixed": "-Did you see the car? -Yes I did.",
+            "reason": "typo",
+        }
+    ]
+    new, _applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == ["-Did you see the car?\n-Yes I did."] and not rejected
+
+
+def test_apply_fixes_rejects_a_fix_that_drops_the_speaker_dash():
+    blocks = _blocks(["-Did you see teh car?\n-Yes I did."])
+    fixes = [
+        {
+            "i": 0,
+            "orig": "-Did you see teh car? -Yes I did.",
+            "fixed": "Did you see the car? Yes I did.",
+            "reason": "typo",
+        }
+    ]
+    new, applied, rejected = asrfix.apply_fixes(blocks, fixes)
+    assert new == [blocks[0]["text"]] and not applied
+    assert rejected[0]["_why"] == "speaker dash lost"
 
 
 def test_apply_fixes_rejects_empty_replacement():

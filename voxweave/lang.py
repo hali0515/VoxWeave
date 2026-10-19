@@ -96,6 +96,25 @@ def to_iso(raw: str) -> str:
     raise ValueError(f"unsupported language {raw!r}")
 
 
+def require_aligner_language(raw: str) -> str:
+    """ISO code of an explicitly requested alignment language.
+
+    Unlike :func:`to_iso_or`, an unknown value is an error naming the supported
+    set: a forced ``--language jp`` must not quietly align Japanese text with the
+    English model.
+    """
+    try:
+        return to_iso(raw)
+    except ValueError:
+        supported = ", ".join(
+            f"{iso} ({name.capitalize()})" for iso, name in sorted(_ISO_TO_NAME.items())
+        )
+        raise ValueError(
+            f"unsupported language {raw!r}: alignment takes an ISO code or English "
+            f"name from {supported}"
+        ) from None
+
+
 def to_aligner_name(raw: str) -> str:
     """Normalize full name or ISO code to the Qwen full name (all lowercase); used by aligner/align."""
     key = _canon(raw)

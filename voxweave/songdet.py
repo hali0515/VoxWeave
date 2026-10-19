@@ -286,19 +286,6 @@ def song_flags(
     )
 
 
-def sing_flags(
-    probs: np.ndarray,
-    *,
-    sing_min: float = SING_MIN,
-) -> np.ndarray:
-    """(n, 527) → boolean: True = singing/rap/chant dominant (excludes pure instrumental).
-
-    Only spans that pass this test trigger voiced-block expansion (to catch rap verses
-    PANNs misclassifies as Speech). Pure-instrumental BGM (music dominant, sing~0) does
-    NOT trigger expansion, preventing adjacent dialogue from being absorbed."""
-    return sing_flags_from_scores(*reduce_scores(probs), sing_min=sing_min)
-
-
 def speech_flags_from_scores(
     speech: np.ndarray,
     sing: np.ndarray,
@@ -315,22 +302,6 @@ def speech_flags_from_scores(
     match, so they are still absorbed: a rap verse between sung windows stays inside the
     excised song."""
     return (speech > speech_min) & (sing < sing_max) & (music < music_max)
-
-
-def speech_flags(
-    probs: np.ndarray,
-    *,
-    speech_min: float = SPEECH_CLEAN_MIN,
-    sing_max: float = SING_QUIET_MAX,
-    music_max: float = MUSIC_QUIET_MAX,
-) -> np.ndarray:
-    """Per-window (n, 527) → boolean: True = clean dialogue. Pure function. See speech_flags_from_scores."""
-    return speech_flags_from_scores(
-        *reduce_scores(probs),
-        speech_min=speech_min,
-        sing_max=sing_max,
-        music_max=music_max,
-    )
 
 
 def merge_spans(
@@ -480,12 +451,12 @@ def expand_spans_to_voiced_blocks(
     anchoring on it pulls the whole block (rap included) into the song span.
 
     ``expandable`` (default None = all spans may expand) restricts which spans trigger
-    whole-block absorption — typically singing spans from :func:`sing_flags`. Pure-instrumental
+    whole-block absorption — typically singing spans from :func:`sing_flags_from_scores`. Pure-instrumental
     BGM spans are excluded here; without this, a BGM cue followed immediately by speech
     (gap < block_gap) would absorb the speech and drop its subtitles.
 
     ``protect`` (default None = no trimming) lists clean-dialogue spans (see
-    :func:`speech_flags`): before absorbing a block, dialogue segments at the leading/trailing
+    :func:`speech_flags_from_scores`): before absorbing a block, dialogue segments at the leading/trailing
     edges are trimmed inward until a non-dialogue segment is hit. Interior segments are NOT
     trimmed and are still absorbed, so a rap verse between sung windows stays inside the
     excised song even when it scores as clean dialogue.

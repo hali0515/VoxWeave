@@ -225,6 +225,21 @@ def test_export_srt_position_tag_to_ass_and_vtt(tmp_path):
     assert "an8" not in vtt and "Sign on the wall" in vtt
 
 
+def test_export_ass_position_override_to_srt_and_vtt(tmp_path):
+    ass = tmp_path / "ep.ass"
+    ass.write_text(
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\an8\\fad(200,0)}Top line\n",
+        encoding="utf-8",
+    )
+    export_subtitles(ass, ("srt", "vtt"))
+    srt = (tmp_path / "ep.srt").read_text(encoding="utf-8")
+    assert "\n{\\an8}Top line\n" in srt
+    vtt = (tmp_path / "ep.vtt").read_text(encoding="utf-8")
+    assert "an8" not in vtt and "\nTop line\n" in vtt
+
+
 def test_export_rejects_partly_timed_vtt(tmp_path):
     vtt = tmp_path / "ep.vtt"
     vtt.write_text(

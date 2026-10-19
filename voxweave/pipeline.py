@@ -58,6 +58,8 @@ from voxweave.debug import DebugSink, FileDebugSink
 from voxweave.lang import (
     is_supported,
     reconcile_detected_language,
+    require_aligner_language,
+    to_asr_iso,
     to_iso_or,
     transcript_content_weight,
 )
@@ -105,6 +107,7 @@ from voxweave.vocals import (
     CACHE_DIRNAME as CACHE_DIRNAME,
     CACHE_DUR_TOL_SEC as CACHE_DUR_TOL_SEC,
     SONGDET_SR,
+    VocalsCacheMiss,
     acquire_16k,
     cache_vocals_path,
 )
@@ -658,6 +661,9 @@ def transcribe(
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
+    if lang_override and lang_override.strip():
+        # transcribe_chunks checks again, but only after separation and VAD.
+        to_asr_iso(lang_override)
     if diarize:
         # Fail on a bad env/conf value now, not after separation and ASR.
         speaker_clustering = config.resolve_diarize_clustering(speaker_clustering)
@@ -701,6 +707,7 @@ def transcribe(
             fingerprint=(source_fingerprint or "") if voiceprints else None,
             purpose="capture",
             on_separated=dump_separation,
+            want_voc32=skip_songs or keep_lyrics,
         )
         wav = acquired.wav
         fullband = acquired.fullband
@@ -1372,6 +1379,9 @@ def process(
     picks how its turns are grouped into speakers.
     """
     media_path = Path(media_path)
+    if lang_override and lang_override.strip():
+        # A --language typo fails here, not after separation and VAD.
+        to_asr_iso(lang_override)
     # The deliverables keep their names beside the media: refuse one that cannot
     # exist before any audio work, not at the final write.
     writes_sdh = sdh and word_segments is None
@@ -1878,17 +1888,58 @@ def _write_sdh_sidecar(
     return path
 
 
+def _check_layout_overrides(iso: str, overrides: Mapping[str, Any]) -> None:
+    """Reject line limits the layout cannot honour before they replace the VTT."""
+    from voxweave.core.layout import min_max_line_length
+
+    max_lines = overrides.get("max_lines")
+    if max_lines is not None and max_lines < 1:
+        raise ValueError(f"max_lines must be at least 1, got {max_lines}")
+    max_line_length = overrides.get("max_line_length")
+    floor = min_max_line_length(iso)
+    if max_line_length is not None and max_line_length < floor:
+        raise ValueError(
+            f"max_line_length {max_line_length} is below the minimum of {floor} for"
+            f" {iso!r}: shorter lines split ordinary words apart"
+        )
+
+
+class VttEditsKeptError(RuntimeError):
+    """``split(keep_vtt_edits=True)`` found cues the JSON would not reproduce."""
+
+
+def _cue_content(vtt_path: Path, raw: bytes) -> list[tuple[Any, Any, str, bool]] | None:
+    """Cue times, text and lyric flag of a VTT, without speaker names (None = unreadable)."""
+    from voxweave.subformats import load_subtitle_blocks_bytes
+
+    try:
+        blocks = load_subtitle_blocks_bytes(vtt_path, raw)
+    except (RuntimeError, ValueError, UnicodeError):
+        return None
+    return [
+        (block.get("start"), block.get("end"), block["text"], bool(block.get("lyric")))
+        for block in blocks
+    ]
+
+
 def split(
     json_path: Path,
     timestamps: bool = True,
     *,
     reporter: Reporter | None = None,
+    keep_vtt_edits: bool = False,
     **smart_split_kwargs,
 ) -> Path:
     """Re-run smart_split from persisted word_segments.
 
     Reuses ``vad_speech`` from the sibling JSON for gap splitting; falls back to gap-only
     mode if absent. ``timestamps`` behaves as in :func:`process`.
+
+    ``keep_vtt_edits`` writes only when the existing VTT is missing or differs from
+    the new one in speaker names alone; otherwise it raises :class:`VttEditsKeptError`
+    and writes nothing. A VTT changed after that check is not overwritten either. Use
+    it when the caller did not ask to replace the VTT (render after a speakers Save):
+    the VTT may hold hand edits the JSON does not have yet.
     """
     # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
     # WEBVTT bytes to json.loads.
@@ -1934,6 +1985,7 @@ def split(
     log.debug("replaying %s (%s)", json_path.name, resolve_segmentation_manifest(data))
     units = data["word_segments"]
     iso, units = _reconcile_word_segment_language(data.get("language", "en"), units)
+    _check_layout_overrides(iso, smart_split_kwargs)
     speech_spans = spans_in(data.get("vad_speech"))
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = spans_in(data.get("sing_spans"))
@@ -1966,6 +2018,15 @@ def split(
     if segmented.document is None or segmented.manifest is None:
         raise RuntimeError("segmentation result lacks its production authority")
     expected_json = episode_transaction.FileGeneration(True, input_bytes)
+    vtt_path = swap_ext(json_path, ".vtt")
+    expected_vtt: episode_transaction.FileGeneration | None = None
+    if keep_vtt_edits:
+        try:
+            expected_vtt = episode_transaction.FileGeneration(
+                True, vtt_path.read_bytes()
+            )
+        except FileNotFoundError:
+            expected_vtt = episode_transaction.FileGeneration(False, None)
     lexical_snapshot = decode_sibling_json_snapshot(json_path.name, input_bytes)
     selection = segmentation_orchestration.build_segmentation_selection(
         command="split",
@@ -1984,7 +2045,7 @@ def split(
         timestamps=timestamps,
         speaker_names=mapping_generation.names,
         expected_json=expected_json,
-        expected_vtt=None,
+        expected_vtt=expected_vtt,
         source_mode=None,
         mapping_generation=mapping_generation,
         mapping_path=mapping_path,
@@ -2015,13 +2076,24 @@ def split(
     )
     rep.step("write outputs")
     try:
+        if expected_vtt is not None and expected_vtt.bytes_value is not None:
+            old = _cue_content(vtt_path, expected_vtt.bytes_value)
+            if old is None or old != _cue_content(
+                vtt_path, selection.verified.vtt_bytes
+            ):
+                raise VttEditsKeptError(
+                    f"{vtt_path.name} was not overwritten: its cue text or timing"
+                    f" differs from what {json_path.name} produces (hand edits, align"
+                    " output, or other render options); run"
+                    f" 'voxweave render {json_path}' to replace it anyway"
+                )
         episode_transaction.commit_primary_outputs(
             command="split",
             episode_path=owner,
             json_path=json_path,
-            vtt_path=swap_ext(json_path, ".vtt"),
+            vtt_path=vtt_path,
             expected_json=expected_json,
-            expected_vtt=None,
+            expected_vtt=expected_vtt,
             main_json_bytes=selection.verified.main_json_bytes,
             vtt_bytes=selection.verified.vtt_bytes,
             cleanup_paths=tuple(cleanup),
@@ -2045,6 +2117,7 @@ def _prepare_16k_for_align(
     tmp: list[Path],
     cache_media: Path | None = None,
     source_fingerprint: str | None = None,
+    hit_only: bool = False,
 ) -> Path:
     """Prepare 16k vocals for align; append temp paths to tmp. Return the 16k wav path.
 
@@ -2052,6 +2125,8 @@ def _prepare_16k_for_align(
     the persistent cache namespace and defaults to the same path. When
     ``source_fingerprint`` is present, only a fully validated v1 companion can
     establish a hit; legacy duration-only caches remain unbound-only behavior.
+    ``hit_only`` raises :class:`voxweave.vocals.VocalsCacheMiss` rather than
+    reading ``media`` when the cache cannot serve the request.
     """
     media = Path(media)
     cache_owner = Path(cache_media) if cache_media is not None else media
@@ -2073,6 +2148,8 @@ def _prepare_16k_for_align(
         separator=separator_identity,
         legacy_16k=True,
         purpose="align source",
+        want_voc32=False,
+        hit_only=hit_only,
     ).wav
 
 
@@ -2401,6 +2478,17 @@ def _media_not_found_error(vtt_path: Path) -> FileNotFoundError:
     return exc
 
 
+@dataclass(frozen=True)
+class _CachedMediaIdentity:
+    """Selected-media identity for align when a bound vocals cache serves the audio.
+
+    Stands where a :class:`MediaSnapshot` would: the media bytes are never read,
+    so only the fingerprint the cache companion was validated against is needed.
+    """
+
+    fingerprint: str
+
+
 def align(
     vtt_path: Path,
     *,
@@ -2494,8 +2582,12 @@ def align(
     log.debug("re-timing %s (%s)", vtt_path.name, resolve_segmentation_manifest(data))
     word_segments = data.get("word_segments", [])
 
-    lang_name = lang_override or data.get("language") or "english"
-    iso = to_iso_or(lang_name, "en")
+    if lang_override:
+        iso = require_aligner_language(lang_override)
+    else:
+        # A detected language outside the aligner's set falls back to English;
+        # only an explicit override has to name a supported one.
+        iso = to_iso_or(data.get("language") or "english", "en")
 
     from voxweave.align_snapshot import decode_align_snapshot
 
@@ -2631,7 +2723,7 @@ def align(
     tmp: list[Path] = []
     tmp_chunks: list[Path] = []
     snapshots = ExitStack()
-    selected_snapshot = None
+    selected_snapshot: MediaSnapshot | _CachedMediaIdentity | None = None
     align_context = None
     completed_selection = None
     observation_input: Mapping[str, Any] | None = None
@@ -2641,32 +2733,57 @@ def align(
     acquisition_media = media
     production_failure: BaseException | None = None
     try:
-        if voiceprint_pair is not None:
-            try:
-                selected_snapshot = snapshots.enter_context(MediaSnapshot(media))
-            except SnapshotUnavailable as exc:
-                log.warning(
-                    "voiceprint binding will be omitted during align: "
-                    "selected media snapshot unavailable: %s",
-                    exc,
-                )
-            else:
-                acquisition_media = selected_snapshot.path
         try:
             rep.step("prepare audio")
+            cached_wav: Path | None = None
+            if voiceprint_pair is not None and separate:
+                # A bound vocals-cache hit decodes the cache and never reads the
+                # media, so it needs no private copy of the whole file: the cache
+                # companion binds the vocals to this fingerprint, and the commit
+                # rechecks the media against it.
+                try:
+                    cached_wav = _prepare_16k_for_align(
+                        media,
+                        separate=separate,
+                        normalize=normalize,
+                        reporter=rep,
+                        tmp=tmp,
+                        cache_media=media,
+                        source_fingerprint=media_input_fingerprint,
+                        hit_only=True,
+                    )
+                except VocalsCacheMiss:
+                    pass
+                else:
+                    selected_snapshot = _CachedMediaIdentity(media_input_fingerprint)
+            if voiceprint_pair is not None and cached_wav is None:
+                try:
+                    selected_snapshot = snapshots.enter_context(MediaSnapshot(media))
+                except SnapshotUnavailable as exc:
+                    log.warning(
+                        "voiceprint binding will be omitted during align: "
+                        "selected media snapshot unavailable: %s",
+                        exc,
+                    )
+                else:
+                    acquisition_media = selected_snapshot.path
             with align_runtime_activity("AO-04", "prepared-audio-and-cache"):
-                wav = _prepare_16k_for_align(
-                    acquisition_media,
-                    separate=separate,
-                    normalize=normalize,
-                    reporter=rep,
-                    tmp=tmp,
-                    cache_media=media,
-                    source_fingerprint=(
-                        selected_snapshot.fingerprint
-                        if selected_snapshot is not None
-                        else None
-                    ),
+                wav = (
+                    cached_wav
+                    if cached_wav is not None
+                    else _prepare_16k_for_align(
+                        acquisition_media,
+                        separate=separate,
+                        normalize=normalize,
+                        reporter=rep,
+                        tmp=tmp,
+                        cache_media=media,
+                        source_fingerprint=(
+                            selected_snapshot.fingerprint
+                            if selected_snapshot is not None
+                            else None
+                        ),
+                    )
                 )
             from voxweave import align_orchestration
 

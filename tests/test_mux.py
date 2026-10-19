@@ -545,6 +545,52 @@ def test_src_video_bitrate_falls_back_to_size_over_duration(tmp_path):
     assert mux.src_video_bitrate(tagged, [tagged], media) == 500_000
 
 
+def test_src_video_bitrate_measures_packets_when_no_stream_reports_a_rate(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"x" * 1_000_000)  # fonts and FLAC would inflate a size estimate
+    seen = []
+
+    def packets(path, index):
+        seen.append((path, index))
+        return 62_500  # 500 kbit of video packets
+
+    monkeypatch.setattr(mux, "_packet_bytes", packets)
+    video = {"index": 0, "codec_type": "video", "duration": "1.0"}
+    audio = {"index": 1, "codec_type": "audio"}  # FLAC: no rate reported
+    assert mux.src_video_bitrate(video, [video, audio], media) == 500_000
+    assert seen == [(media, 0)]
+
+
+def test_src_video_bitrate_estimate_leaves_out_attachments(tmp_path, monkeypatch):
+    monkeypatch.setattr(mux, "_packet_bytes", lambda _m, _i: None)
+    media = tmp_path / "ep.mkv"
+    media.write_bytes(b"x" * 125_000)
+    video = {"index": 0, "codec_type": "video", "duration": "2.0"}
+    font = {"index": 2, "codec_type": "attachment", "extradata_size": 25_000}
+    subs = {"index": 3, "codec_type": "subtitle", "tags": {"BPS": "10000"}}
+    # (125000 - 25000) bytes over 2 s = 400 kb/s, minus the subtitle's 10 kb/s
+    assert mux.src_video_bitrate(video, [video, font, subs], media) == 390_000
+
+
+def test_packet_bytes_sums_ffprobe_packet_sizes(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeProc:
+        def __init__(self, cmd, **_kwargs):
+            calls.append(cmd)
+            self.stdout = io.StringIO("100\n200,\nN/A\n")
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(mux.subprocess, "Popen", FakeProc)
+    assert mux._packet_bytes(tmp_path / "ep.mkv", 4) == 300
+    assert has_seq(calls[0], "-select_streams", "4")
+    assert has_seq(calls[0], "-show_entries", "packet=size")
+
+
 def test_src_video_bitrate_unknown(tmp_path):
     media = tmp_path / "ep.mkv"
     media.write_bytes(b"x" * 1000)

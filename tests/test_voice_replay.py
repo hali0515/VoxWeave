@@ -94,6 +94,9 @@ def _stub_align(
     chunk.write_bytes(b"chunk")
 
     def fake_prepare(source, **kwargs):
+        if kwargs.get("hit_only"):
+            # no vocals cache here: align falls back to the media snapshot
+            raise vocals.VocalsCacheMiss("stub has no cache")
         if inspect_prepare is not None:
             inspect_prepare(Path(source), kwargs)
         return prepared
@@ -376,6 +379,57 @@ def test_bound_align_snapshot_failure_continues_unbound_and_cleans(
     replayed = json.loads(json_path.read_text(encoding="utf-8"))
     assert "voiceprint_capture" not in replayed
     assert not artifact.exists()
+
+
+def test_bound_align_cache_hit_keeps_the_pair_without_copying_the_media(
+    tmp_path, monkeypatch
+):
+    media, vtt_path, json_path, _vtt, _json = _write_align_input(tmp_path)
+    fingerprint = media_fingerprint(media)
+    json_path.write_text(json.dumps(_sibling(pair_media=fingerprint)), encoding="utf-8")
+    _stub_align(tmp_path, monkeypatch)
+    prepared = tmp_path / "prepared.wav"
+    calls: list[tuple[Path, dict]] = []
+
+    def cache_hit(source, **kwargs):
+        calls.append((Path(source), kwargs))
+        return prepared
+
+    class NoSnapshot:
+        def __init__(self, _source):
+            raise AssertionError("a vocals cache hit must not copy the media")
+
+    monkeypatch.setattr(pipeline, "_prepare_16k_for_align", cache_hit)
+    monkeypatch.setattr(pipeline, "MediaSnapshot", NoSnapshot)
+
+    pipeline.align(vtt_path)
+
+    replayed = json.loads(json_path.read_text(encoding="utf-8"))
+    assert replayed["voiceprint_capture"] == CAPTURE
+    assert replayed["voiceprint_media"] == fingerprint
+    [(source, kwargs)] = calls
+    assert source == media
+    assert kwargs["hit_only"] is True
+    assert kwargs["source_fingerprint"] == fingerprint
+
+
+def test_bound_align_cache_miss_still_reads_a_media_snapshot(tmp_path, monkeypatch):
+    media, vtt_path, json_path, _vtt, _json = _write_align_input(tmp_path)
+    fingerprint = media_fingerprint(media)
+    json_path.write_text(json.dumps(_sibling(pair_media=fingerprint)), encoding="utf-8")
+    sources: list[Path] = []
+
+    def inspect_prepare(source: Path, kwargs: dict) -> None:
+        sources.append(source)
+        assert kwargs["source_fingerprint"] == fingerprint
+
+    _stub_align(tmp_path, monkeypatch, inspect_prepare=inspect_prepare)
+
+    pipeline.align(vtt_path)
+
+    assert len(sources) == 1 and sources[0] != media  # the private copy
+    replayed = json.loads(json_path.read_text(encoding="utf-8"))
+    assert replayed["voiceprint_media"] == fingerprint
 
 
 @pytest.mark.parametrize("changed_input", ["json", "vtt"])

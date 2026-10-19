@@ -70,6 +70,24 @@ def test_process_refuses_a_gated_diarization_without_token_before_audio_work(
     assert not (tmp_path / "episode.json").exists()
 
 
+def test_transcribe_refuses_an_unknown_language_before_audio_work(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        vocals,
+        "decode_to_wav",
+        lambda *_a, **_k: pytest.fail("must fail before decoding"),
+    )
+    media = tmp_path / "episode.mkv"
+    media.write_bytes(b"media")
+
+    with pytest.raises(ValueError, match="unsupported language 'jp'"):
+        pipeline.transcribe(media, lang_override="jp", separate=False)
+    _refuse_transcribe(monkeypatch)
+    with pytest.raises(ValueError, match="unsupported language 'jp'"):
+        pipeline.process(media, lang_override="jp", shot_snap=False)
+
+
 def test_process_refuses_impossible_speaker_bounds_before_audio_work(
     tmp_path, monkeypatch
 ):

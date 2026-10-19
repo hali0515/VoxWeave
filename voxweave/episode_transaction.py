@@ -636,19 +636,20 @@ def _check_primary_generations(
             else "sibling-generation"
         )
         raise _stale(command, detail, problem)
-    if command != "split":
-        problem = (
-            "changed"
-            if expected_vtt is None
-            else _generation_problem(vtt_path, expected_vtt)
+    # split owns the VTT outright unless it checked the VTT first (render after
+    # a speakers Save, which must not overwrite a hand edit made meanwhile).
+    if command == "split" and expected_vtt is None:
+        return
+    problem = (
+        "changed"
+        if expected_vtt is None
+        else _generation_problem(vtt_path, expected_vtt)
+    )
+    if problem is not None:
+        detail = (
+            "process-output-generation" if command == "process" else "vtt-generation"
         )
-        if problem is not None:
-            detail = (
-                "process-output-generation"
-                if command == "process"
-                else "vtt-generation"
-            )
-            raise _stale(command, detail, problem)
+        raise _stale(command, detail, problem)
 
 
 def _unreadable_media(path: Path, exc: OSError) -> str:

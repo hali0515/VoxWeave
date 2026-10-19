@@ -1295,6 +1295,8 @@ input {{ font: inherit; padding: .6rem .75rem; border: 1px solid #8888; border-r
 .clips {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .75rem; margin-top: 1rem; }}
 figure {{ margin: 0; }} figcaption {{ font-size: .8rem; color: #777; }} audio {{ width: 100%; }}
 .empty {{ color: #777; font-style: italic; }}
+.save-note:empty {{ display: none; }}
+.save-note {{ margin: .5rem 0 0; color: #777; }}
 .output {{ position: sticky; bottom: 0; background: Canvas; border: 1px solid #8886; border-radius: .75rem; padding: 1rem; box-shadow: 0 0 2rem #0003; }}
 .output-head, .output-actions {{ display: flex; justify-content: space-between; align-items: center; gap: 1rem; }}
 button {{ font: inherit; padding: .45rem .8rem; cursor: pointer; }}
@@ -1307,17 +1309,28 @@ pre {{ overflow-x: auto; margin-bottom: 0; user-select: all; }}{matching_css}
 {"".join(cards)}
 <section class="output">
 <div class="output-head"><strong>Speaker mapping JSON</strong><span class="output-actions"><button id="save" type="button" hidden>Save</button><button id="copy" type="button">Copy JSON</button></span></div>
+<p id="save-note" class="save-note" aria-live="polite"></p>
 <pre id="json" aria-live="polite"></pre>
 </section>
 <script>
 const fields = [...document.querySelectorAll('[data-speaker]')];
 const output = document.querySelector('#json');
 const save = document.querySelector('#save');
+const saveNote = document.querySelector('#save-note');
 let sessionToken = '';
+// Set once the saved names load; empty while Save is unavailable.
+let saveLabel = '';
+// The mapping as this page last saved it: the button says Saved only while the
+// names still match it, so an edit after a save never looks saved.
+let savedJSON = null;
 function update() {{
   const speakers = {{}};
   for (const field of fields) speakers[field.dataset.speaker] = field.value;
   output.textContent = JSON.stringify({{version: 1, speakers}}, null, 2);
+  if (!saveLabel) return;
+  const saved = output.textContent === savedJSON;
+  save.textContent = saved ? 'Saved' : saveLabel;
+  if (!saved) saveNote.textContent = '';
 }}
 for (const field of fields) field.addEventListener('input', update);
 {matching_script}{split_script}document.querySelector('#copy').addEventListener('click', async (event) => {{
@@ -1338,8 +1351,8 @@ fetch('serve-info', {{cache: 'no-store'}}).then(async (response) => {{
       field.value = info.speakers[field.dataset.speaker];
     }}
   }}
+  saveLabel = `Save to ${{info.mapping_name}}`;
   update();
-  save.textContent = `Save to ${{info.mapping_name}}`;
   save.hidden = false;
   splitReady = true;
   for (const button of splitButtons) button.hidden = false;
@@ -1351,18 +1364,27 @@ fetch('serve-info', {{cache: 'no-store'}}).then(async (response) => {{
 }});
 save.addEventListener('click', async () => {{
   save.disabled = true;
+  const body = output.textContent;
   try {{
     const response = await fetch('save', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json', 'X-VoxWeave-Token': sessionToken}},
-      body: output.textContent,
+      body,
     }});
     if (!response.ok) {{
       let payload = {{}};
       try {{ payload = await response.json(); }} catch (_) {{}}
       throw new Error(splitErrorMessage(payload, ''));
     }}
-    save.textContent = 'Saved';
+    let result = {{}};
+    try {{ result = await response.json(); }} catch (_) {{}}
+    savedJSON = body;
+    update();
+    if (typeof result.rendered === 'string') {{
+      saveNote.textContent = `Subtitles updated: ${{result.rendered}}`;
+    }} else if (typeof result.render_error === 'string') {{
+      saveNote.textContent = `Subtitles not updated: ${{result.render_error}}`;
+    }}
   }} catch (error) {{
     save.textContent = error instanceof Error && error.message ? `Save failed: ${{error.message}}` : 'Save failed';
   }}

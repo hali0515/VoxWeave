@@ -115,10 +115,24 @@ def test_llm_wrong_types_fall_back(conf_at, caplog):
 
 
 def test_concurrency_and_window_defaults(conf_at):
-    assert config.resolve_llm_concurrency(None) == config.DEFAULT_TRANSLATE_CONCURRENCY
+    url = "http://127.0.0.1:8000/v1"
+    assert (
+        config.resolve_llm_concurrency(None, base_url=url)
+        == config.DEFAULT_TRANSLATE_CONCURRENCY
+    )
     assert config.resolve_llm_window_cues(None) == config.DEFAULT_TRANSLATE_WINDOW_CUES
     assert config.DEFAULT_TRANSLATE_CONCURRENCY == 8
     assert config.DEFAULT_TRANSLATE_WINDOW_CUES == 100
+
+
+def test_hosted_openai_defaults_to_one_whole_episode_request(conf_at, monkeypatch):
+    # no base_url anywhere = api.openai.com: parallel windows only add 429s there
+    assert config.resolve_llm_concurrency(None) == 1
+    assert config.resolve_llm_concurrency(None, base_url=None) == 1
+    # an explicit choice still wins over the hosted default
+    monkeypatch.setenv("VOXWEAVE_TRANSLATE_CONCURRENCY", "4")
+    assert config.resolve_llm_concurrency(None) == 4
+    assert config.resolve_llm_concurrency(3) == 3
 
 
 def test_concurrency_and_window_precedence(conf_at, monkeypatch):
@@ -149,7 +163,8 @@ def test_invalid_env_concurrency_warns_and_falls_through(
     caplog.clear()
     with caplog.at_level("WARNING", logger="voxweave"):
         assert (
-            config.resolve_llm_concurrency(None) == config.DEFAULT_TRANSLATE_CONCURRENCY
+            config.resolve_llm_concurrency(None, base_url="http://x/v1")
+            == config.DEFAULT_TRANSLATE_CONCURRENCY
         )
         assert (
             config.resolve_llm_window_cues(None) == config.DEFAULT_TRANSLATE_WINDOW_CUES
@@ -160,7 +175,10 @@ def test_invalid_env_concurrency_warns_and_falls_through(
 
 def test_invalid_cli_concurrency_warns_and_falls_through(conf_at, caplog):
     with caplog.at_level("WARNING", logger="voxweave"):
-        assert config.resolve_llm_concurrency(0) == config.DEFAULT_TRANSLATE_CONCURRENCY
+        assert (
+            config.resolve_llm_concurrency(0, base_url="http://x/v1")
+            == config.DEFAULT_TRANSLATE_CONCURRENCY
+        )
     assert "--concurrency must be an integer >= 1" in caplog.text
 
 

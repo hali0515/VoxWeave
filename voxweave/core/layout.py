@@ -32,6 +32,20 @@ DEFAULT_MAX_LINES = 2
 SINGLE_LINE_LANGS = {"zh", "yue", "ja"}
 
 
+# Smallest line budget a caller may request. Below it the wrapper cuts ordinary
+# words apart: Latin words into letter runs (plus an empty trailing cue at <=4),
+# CJK words between glyphs (天|気 at 4).
+MIN_MAX_LINE_LENGTH = 12
+MIN_MAX_LINE_LENGTH_CJK = 6
+
+
+def min_max_line_length(lang: str) -> int:
+    """Smallest ``max_line_length`` that keeps ordinary words whole in ``lang``."""
+    return (
+        MIN_MAX_LINE_LENGTH_CJK if lang in WIDE_GLYPH_LANGUAGES else MIN_MAX_LINE_LENGTH
+    )
+
+
 def default_max_lines(lang: str) -> int:
     """zh/yue/ja: 1 line per cue (long utterances split more). Others: 2."""
     return 1 if lang in SINGLE_LINE_LANGS else DEFAULT_MAX_LINES

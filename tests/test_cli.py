@@ -535,3 +535,35 @@ def test_debug_summary_reads_the_claim_without_creating_one(tmp_path):
         r = CliRunner().invoke(cli, ["--debug", str(media)])
     assert r.exit_code == 0, r.output
     assert panel.call_args.kwargs["debug_dir"] == debug_dir
+
+
+@pytest.mark.parametrize(
+    "args", [["--max-lines", "0"], ["--max-line-length", "0"], ["--max-lines", "-1"]]
+)
+def test_render_rejects_non_positive_line_limits(tmp_path, args):
+    j = tmp_path / "a.json"
+    j.write_text("{}", encoding="utf-8")
+    with patch("voxweave.pipeline.split") as m:
+        r = CliRunner().invoke(cli, ["render", str(j), *args])
+    assert r.exit_code == 2, r.output
+    assert not m.called
+
+
+def test_transcribe_rejects_an_unknown_language_before_any_work(tmp_path):
+    media, _out = _media(tmp_path)
+    with patch("voxweave.pipeline.process") as m:
+        r = CliRunner().invoke(cli, ["--language", "jp", str(media)])
+    assert r.exit_code == 2, r.output
+    assert "unsupported language" in r.output
+    assert not m.called
+
+
+def test_align_rejects_a_language_the_aligner_cannot_take(tmp_path):
+    vtt = tmp_path / "a.vtt"
+    vtt.write_text("WEBVTT\n", encoding="utf-8")
+    with patch("voxweave.pipeline.align") as m:
+        for value in ("jp", "vi"):
+            r = CliRunner().invoke(cli, ["align", str(vtt), "--language", value])
+            assert r.exit_code == 2, r.output
+            assert "unsupported language" in r.output
+    assert not m.called

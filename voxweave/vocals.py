@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -282,15 +284,32 @@ def _separate_to_16k_32k(
         raise
 
 
+def _private_copy(source: Path) -> Path:
+    """Copy ``source`` to a new temp file of the same suffix (caller deletes it)."""
+    fd, name = tempfile.mkstemp(prefix="voxweave_", suffix=source.suffix)
+    os.close(fd)
+    copy = Path(name)
+    try:
+        shutil.copyfile(source, copy)
+    except BaseException:
+        copy.unlink(missing_ok=True)
+        raise
+    return copy
+
+
+class VocalsCacheMiss(LookupError):
+    """``acquire_16k(hit_only=True)`` found no usable vocals cache."""
+
+
 @dataclass(frozen=True)
 class Acquired16k:
     """What :func:`acquire_16k` produced. Every temp file is already in ``tmp``."""
 
     #: The 16 kHz mono ASR/diarization input (a temp wav).
     wav: Path
-    #: 32 kHz mono vocals, the PANNs input: a fresh temp wav, or on a cache hit the
-    #: cache file itself (not a temp). ``None`` without separation or on a legacy
-    #: 16k cache hit.
+    #: 32 kHz mono vocals, the PANNs input: a fresh temp wav, or on a cache hit a
+    #: temp copy of the cache taken under its lock. ``None`` without separation or
+    #: on a legacy 16k cache hit.
     voc32: Path | None = None
     #: The full-band 44.1 kHz stereo decode (the original-mix VAD reference);
     #: only when separation ran.
@@ -313,6 +332,8 @@ def acquire_16k(
     legacy_16k: bool = False,
     purpose: str,
     on_separated: Callable[[Path, Path], None] | None = None,
+    want_voc32: bool = True,
+    hit_only: bool = False,
 ) -> Acquired16k:
     """Produce the 16 kHz input for ``media``, reusing or refreshing the vocals cache.
 
@@ -329,9 +350,14 @@ def acquire_16k(
     resolves the configured one, and only once a cache is there to validate),
     and a rewritten cache gets its companion. ``purpose`` names the bound
     consumer in the refusal log. ``on_separated(fullband, vocals)`` runs after a
-    fresh separation, before the cache write.
+    fresh separation, before the cache write. ``want_voc32=False`` skips the
+    copy a cache hit would otherwise make for song detection. ``hit_only``
+    raises :class:`VocalsCacheMiss` instead of reading ``media`` when the
+    cache cannot serve the request.
     """
     media = Path(media)
+    if hit_only and (not separate or cache is None):
+        raise VocalsCacheMiss("no vocals cache to read")
     if not separate:
         reporter.stage("decode 16k")
         wav = decode_to_wav(media, audio_filter=ASR_LOUDNORM if normalize else None)
@@ -383,7 +409,16 @@ def acquire_16k(
                     raise
                 tmp.append(wav)
                 # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
-                return Acquired16k(wav, voc32=cache_path, separator=bound_separator)
+                # PANNs reads after the lock is gone, so it gets a private copy taken
+                # under the lock: another run may replace the cache in between, and
+                # song spans must come from the same vocals as the ASR input.
+                voc32 = None
+                if want_voc32:
+                    voc32 = _private_copy(cache_path)
+                    tmp.append(voc32)
+                return Acquired16k(wav, voc32=voc32, separator=bound_separator)
+    if hit_only:
+        raise VocalsCacheMiss("the vocals cache cannot serve this media")
     if legacy_16k and not bound:
         legacy = cache_16k_path(reference)
         if any(
