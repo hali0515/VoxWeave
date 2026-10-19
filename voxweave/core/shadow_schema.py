@@ -2377,12 +2377,3 @@ def validate_shadow_v2_payload(
         errors.append("policy_deltas: differs from the live policy-2 declaration")
     _fallback_rechecks(artifact, final_rows, errors)
     return errors
-
-
-def assert_shadow_v2_payload(
-    artifact: Mapping[str, Any], *, require_version: bool = True
-) -> None:
-    """Raise one compact error when a payload cannot claim live schema 2."""
-    errors = validate_shadow_v2_payload(artifact, require_version=require_version)
-    if errors:
-        raise ValueError("invalid live shadow schema 2: " + "; ".join(errors))

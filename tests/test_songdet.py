@@ -16,10 +16,21 @@ from voxweave.songdet import (
     filter_short_spans,
     group_segments_by_spans,
     merge_spans,
-    sing_flags,
+    reduce_scores,
+    sing_flags_from_scores,
     song_flags,
-    speech_flags,
+    speech_flags_from_scores,
 )
+
+
+def sing_flags(probs, **kwargs):
+    """(n, 527) probabilities -> the singing flags production derives from scores."""
+    return sing_flags_from_scores(*reduce_scores(probs), **kwargs)
+
+
+def speech_flags(probs, **kwargs):
+    """(n, 527) probabilities -> the clean-dialogue flags production derives from scores."""
+    return speech_flags_from_scores(*reduce_scores(probs), **kwargs)
 
 
 # A complete labels csv: header + one row per class (display names may hold quoted commas).
