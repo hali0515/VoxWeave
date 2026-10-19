@@ -467,8 +467,79 @@ def test_pipeline_translate_ass_mirrors_format(tmp_path, monkeypatch):
     out = llm_commands.translate(ass, to="zh")
     assert out == tmp_path / "ep.zh.ass"
     txt = out.read_text(encoding="utf-8")
-    assert "[V4+ Styles]" in txt  # rendered as a full ASS script
-    assert "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好" in txt
+    # the source script with the event text replaced, nothing added
+    assert txt == (
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好\n"
+    )
+
+
+_FANSUB_ASS = (
+    "[Script Info]\n"
+    "ScriptType: v4.00+\n"
+    "PlayResX: 1920\n"
+    "PlayResY: 1080\n"
+    "\n"
+    "[V4+ Styles]\n"
+    "Format: Name, Fontname, Fontsize, Alignment\n"
+    "Style: Default,Arial,60,2\n"
+    "Style: Sign,Arial,48,8\n"
+    "\n"
+    "[Events]\n"
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    "Comment: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,translator note\n"
+    "Dialogue: 0,0:00:03.00,0:00:04.00,Default,Aoi,0,0,0,,Bottom line\n"
+    "Dialogue: 1,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\an8}Top line\n"
+    "Dialogue: 0,0:00:01.50,0:00:03.00,Sign,,0,0,0,,{\\pos(100,200)\\fad(200,0)}STORE SIGN\n"
+    "Dialogue: 0,0:00:00.00,0:00:05.00,Sign,,0,0,0,,{\\p1}m 0 0 l 100 0 100 100{\\p0}\n"
+)
+
+
+def test_translate_ass_keeps_styles_positions_comments_and_drawings(
+    tmp_path, monkeypatch
+):
+    ass = tmp_path / "fansub.ass"
+    ass.write_text(_FANSUB_ASS, encoding="utf-8")
+    seen: list[list[str]] = []
+
+    def fake_translate(payload, **_kw):
+        seen.append([entry["t"] for entry in payload])
+        return {entry["i"]: f"zh {entry['t']}" for entry in payload}
+
+    monkeypatch.setattr(llm_commands.translate_mod, "translate_cues", fake_translate)
+    out = llm_commands.translate(ass, to="zh")
+
+    # cues in time order, position tags kept away from the model
+    assert seen == [["Top line", "STORE SIGN", "Bottom line"]]
+    expected = (
+        _FANSUB_ASS.replace(",,Bottom line", ",,zh Bottom line")
+        .replace("{\\an8}Top line", "{\\an8}zh Top line")
+        .replace("\\fad(200,0)}STORE SIGN", "\\fad(200,0)}zh STORE SIGN")
+    )
+    assert out.read_text(encoding="utf-8") == expected
+
+
+def test_translate_srt_puts_the_position_tag_back(tmp_path, monkeypatch):
+    srt = tmp_path / "ep.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n{\\an8}Top line\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nBottom line\n",
+        encoding="utf-8",
+    )
+    seen: list[list[str]] = []
+
+    def fake_translate(payload, **_kw):
+        seen.append([entry["t"] for entry in payload])
+        return {entry["i"]: f"zh {entry['t']}" for entry in payload}
+
+    monkeypatch.setattr(llm_commands.translate_mod, "translate_cues", fake_translate)
+    out = llm_commands.translate(srt, to="zh")
+
+    assert seen == [["Top line", "Bottom line"]]
+    txt = out.read_text(encoding="utf-8")
+    assert "{\\an8}zh Top line" in txt
+    assert "\nzh Bottom line\n" in txt
 
 
 def test_pipeline_translate_fills_missing_with_retry_then_original(

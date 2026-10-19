@@ -11,6 +11,7 @@ from __future__ import annotations
 import codecs
 import logging
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 from voxweave import sidecars
@@ -41,6 +42,10 @@ _ASS_ITALIC_TAG_RE = re.compile(r"\\i([01])(?![0-9])")
 # \pN switches vector-drawing mode (N > 0 on, 0 off); \pos and \pbo never
 # match because a digit must follow the p directly.
 _ASS_DRAWING_TAG_RE = re.compile(r"\\p(\d+)")
+# Position overrides (\an1-9, legacy SSA \a1-11) inside an override block,
+# even packed with other tags ({\an8\fad(200,200)}); \alpha never matches.
+_ASS_POSITION_TAG_RE = re.compile(r"\\(an[1-9]|a(?:1[01]|[1235679]))(?![0-9])")
+_ASS_LEADING_OVERRIDES_RE = re.compile(r"(?:\{[^}]*\})+")
 _ITALIC_WRAP_RE = re.compile(r"<i>(.*)</i>\Z", re.DOTALL)
 _ITALIC_TOKEN_RE = re.compile(r"(<i>|</i>)")
 
@@ -125,20 +130,41 @@ def _lyric_block(cue: str, start: float | None, end: float | None) -> dict | Non
     return block
 
 
-def parse_ass_blocks(text: str) -> list[dict]:
+def _ass_position(raw: str) -> str | None:
+    """The first position override (``an8``, ``a6``) in an event's override
+    blocks, the one libass applies; None when there is none."""
+    for block in _ASS_OVERRIDE_RE.findall(raw):
+        tag = _ASS_POSITION_TAG_RE.search(block)
+        if tag:
+            return tag.group(1)
+    return None
+
+
+def ass_lines(text: str) -> list[str]:
+    """An ASS/SSA script split into lines, the numbering ``ass_event`` uses."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def parse_ass_blocks(text: str, *, events: bool = False) -> list[dict]:
     """Parse ASS/SSA ``[Events]`` Dialogue lines -> ordered cue blocks.
 
     Honors the section's Format line for field order (falling back to the
     standard v4.00+ layout), skips Comment lines, and sorts by start time
     (ASS events are not required to be chronological).  The Name/Actor field is
     authoring metadata in foreign scripts and is deliberately not promoted to a
-    display speaker.
+    display speaker. A position override (``{\\an8}``, also inside a packed
+    block) is kept as a leading ``{\\anN}`` tag in the cue text, the form SRT
+    cues carry it in.
+
+    ``events`` also records ``block["ass_event"] = (line, prefix)``: the event's
+    line number in :func:`ass_lines` and the override blocks that open its text,
+    so :func:`replace_ass_event_texts` can write new text back into the script.
     """
     blocks: list[dict] = []
     fields: list[str] | None = None
     in_events = False
     music_only = 0
-    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+    for number, raw in enumerate(ass_lines(text)):
         line = raw.strip()
         if line.startswith("["):
             in_events = line.lower() == "[events]"
@@ -168,12 +194,23 @@ def parse_ass_blocks(text: str) -> list[dict]:
         end = _parse_ts(row.get("end", ""))
         if start is None or end is None:
             continue
-        cue = _ass_plain_text(row.get("text", ""))
+        event_text = row.get("text", "")
+        cue = _ass_plain_text(event_text)
         block = _lyric_block(cue, start, end)
         if block is None:
             if cue:
                 music_only += 1
             continue
+        position = _ass_position(_drop_drawings(event_text))
+        if position:
+            block["text"] = f"{{\\{position}}}{block['text']}"
+        if events:
+            match = _ASS_LEADING_OVERRIDES_RE.match(event_text.lstrip())
+            prefix = match.group(0) if match else ""
+            toggles = _ASS_DRAWING_TAG_RE.findall(prefix)
+            if toggles and int(toggles[-1]) > 0:
+                prefix += "{\\p0}"  # new text must not be read as shape commands
+            block["ass_event"] = (number, prefix)
         blocks.append(block)
     if music_only:
         log.info(
@@ -181,6 +218,45 @@ def parse_ass_blocks(text: str) -> list[dict]:
         )
     blocks.sort(key=lambda b: (b["start"], b["end"]))
     return blocks
+
+
+def replace_ass_event_texts(text: str, texts: Mapping[int, str]) -> str:
+    """The script with the Text field of each Dialogue line numbered in
+    ``texts`` (see :func:`ass_lines`) replaced. Every other line, the header,
+    styles, Comment lines and drawings included, is kept as it was; line
+    endings become ``\\n``. Raises ValueError when a number is not a Dialogue
+    line of the ``[Events]`` section."""
+    lines = ass_lines(text)
+    fields: list[str] | None = None
+    in_events = False
+    done: set[int] = set()
+    for number, raw in enumerate(lines):
+        line = raw.strip()
+        if line.startswith("["):
+            in_events = line.lower() == "[events]"
+            fields = None
+            continue
+        if not in_events or not line:
+            continue
+        key, sep, val = line.partition(":")
+        if key.strip().lower() == "format":
+            fields = [f.strip().lower() for f in val.split(",")]
+            continue
+        if number not in texts or key.strip().lower() != "dialogue":
+            continue
+        names = fields or _ASS_DEFAULT_FIELDS
+        parts = val.split(",", len(names) - 1)
+        if len(parts) < len(names):
+            continue
+        parts[-1] = texts[number]
+        lines[number] = f"{key}{sep}{','.join(parts)}"
+        done.add(number)
+    missing = sorted(set(texts) - done)
+    if missing:
+        raise ValueError(
+            f"ASS line {missing[0] + 1} is not a Dialogue event; cannot replace its text"
+        )
+    return "\n".join(lines)
 
 
 def require_subtitle(path: Path, *, exts: tuple[str, ...] = SUBTITLE_EXTS) -> Path:
@@ -250,8 +326,13 @@ def sniff_format(text: str) -> str | None:
     return None
 
 
-def load_subtitle_blocks_bytes(path: Path, data: bytes) -> list[dict]:
-    """Parse exact staged subtitle bytes using ``path`` for format context."""
+def load_subtitle_blocks_bytes(
+    path: Path, data: bytes, *, ass_events: bool = False
+) -> list[dict]:
+    """Parse exact staged subtitle bytes using ``path`` for format context.
+
+    ``ass_events`` records each ASS/SSA cue's event slot (see :func:`parse_ass_blocks`).
+    """
     p = require_subtitle(path)
     text = decode_subtitle_bytes(data, p.name)
     is_ass = p.suffix.lower() in (".ass", ".ssa")
@@ -263,7 +344,7 @@ def load_subtitle_blocks_bytes(path: Path, data: bytes) -> list[dict]:
             f" {p.suffix.lower().lstrip('.')}; rename the file to its real format"
         )
     if is_ass:
-        blocks = parse_ass_blocks(text)
+        blocks = parse_ass_blocks(text, events=ass_events)
     elif p.suffix.lower() == ".srt":
         from voxweave.speakers import load_speaker_display_names
 

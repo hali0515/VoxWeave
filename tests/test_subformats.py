@@ -8,8 +8,10 @@ import pytest
 
 from voxweave import speakers
 from voxweave.subformats import (
+    ass_lines,
     load_subtitle_blocks,
     parse_ass_blocks,
+    replace_ass_event_texts,
     require_subtitle,
 )
 
@@ -523,3 +525,41 @@ def test_parse_ass_drawing_commands_dropped_around_text():
         "{\\fsp2\\p4}m 5 5 l 6 6\n"
     )
     assert [b["text"] for b in parse_ass_blocks(doc)] == ["Sign <i>text</i>"]
+
+
+def test_ass_position_override_becomes_a_leading_tag():
+    doc = (
+        ASS_EVENTS
+        + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\fad(9,9)\\an8}Top\\Nline\n"
+        + "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\\a6}Legacy top\n"
+        + "Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\\alpha&H80&}Faded\n"
+    )
+    assert [b["text"] for b in parse_ass_blocks(doc)] == [
+        "{\\an8}Top\nline",
+        "{\\a6}Legacy top",
+        "Faded",
+    ]
+
+
+def test_ass_events_record_their_line_and_opening_overrides():
+    doc = (
+        ASS_EVENTS
+        + "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,plain\n"
+        + "Dialogue: 0,0:00:01.00,0:00:02.00,Sign,,0,0,0,,{\\pos(1,2)}{\\b1}Sign\n"
+    )
+    blocks = parse_ass_blocks(doc, events=True)
+    assert [b["ass_event"] for b in blocks] == [(3, "{\\pos(1,2)}{\\b1}"), (2, "")]
+    assert ass_lines(doc)[3].endswith("Sign")
+    assert "ass_event" not in parse_ass_blocks(doc)[0]
+
+
+def test_replace_ass_event_texts_changes_only_the_text_field():
+    doc = (
+        ASS_EVENTS
+        + "Comment: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,note, with comma\n"
+        + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,Aoi,0,0,0,,old, text\n"
+    )
+    out = replace_ass_event_texts(doc, {3: "new, text"})
+    assert out == doc.replace("Aoi,0,0,0,,old, text", "Aoi,0,0,0,,new, text")
+    with pytest.raises(ValueError, match="not a Dialogue event"):
+        replace_ass_event_texts(doc, {2: "x"})
