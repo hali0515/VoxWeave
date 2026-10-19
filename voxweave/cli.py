@@ -776,7 +776,8 @@ def cmd_align(
     metavar="N",
     help=(
         "Translation windows in flight at once (default: VOXWEAVE_TRANSLATE_CONCURRENCY "
-        f"env, conf [llm].concurrency, or {config.DEFAULT_TRANSLATE_CONCURRENCY}). "
+        f"env, conf [llm].concurrency, or {config.DEFAULT_TRANSLATE_CONCURRENCY} with a "
+        f"base URL, {config.HOSTED_TRANSLATE_CONCURRENCY} for api.openai.com). "
         "1 = one whole-episode request with translated-tail continuity; >1 = bounded "
         "windows in parallel with source-text context (self-hosted servers)."
     ),

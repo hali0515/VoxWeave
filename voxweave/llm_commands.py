@@ -84,7 +84,7 @@ def translate(
     )
     base_url = config.resolve_llm_base_url(base_url)
     reasoning_effort = config.resolve_llm_reasoning_effort(reasoning_effort)
-    concurrency = config.resolve_llm_concurrency(concurrency)
+    concurrency = config.resolve_llm_concurrency(concurrency, base_url=base_url)
     window_cues = config.resolve_llm_window_cues(window_cues)
     ext = ".ass" if vtt_path.suffix.lower() == ".ssa" else vtt_path.suffix.lower()
     out_path = require_output_name(swap_ext(vtt_path, f".{to}{ext}"))

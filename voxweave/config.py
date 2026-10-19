@@ -36,6 +36,10 @@ LLM_MODEL_AUTO = "auto"
 # failure (one aborted stream loses everything). concurrency = 1 restores the
 # whole-episode single request (best cross-window continuity, the OpenAI path).
 DEFAULT_TRANSLATE_CONCURRENCY = 8
+# Built-in for the OpenAI default endpoint (no base_url): one whole-episode request.
+# Parallel windows there only add 429s (two short retries) and resend the prompt and
+# glossary per window.
+HOSTED_TRANSLATE_CONCURRENCY = 1
 DEFAULT_TRANSLATE_WINDOW_CUES = 100
 # community-1 is the default (better multi-speaker separation in practice);
 # the 3.1 pipeline stays selectable via the "3.1" alias and keeps its own
@@ -130,7 +134,8 @@ _TEMPLATE = """\
 #                 VOXWEAVE_TRANSLATE_REASONING_EFFORT). Values depend on the served model.
 #                 Unset or "default" leaves the endpoint's default unchanged.
 #   concurrency = translate windows in flight at once (= --concurrency /
-#                 VOXWEAVE_TRANSLATE_CONCURRENCY; default 8, min 1). 1 = one whole-episode
+#                 VOXWEAVE_TRANSLATE_CONCURRENCY; default 8 with base_url set, 1 for
+#                 api.openai.com; min 1). 1 = one whole-episode
 #                 request with translated-tail continuity (best consistency, OpenAI-style);
 #                 >1 = bounded windows translated in parallel with source-text context
 #                 (throughput on a self-hosted vLLM; use glossary/context for consistency).
@@ -558,17 +563,23 @@ def _resolve_llm_positive_int(
     return default
 
 
-def resolve_llm_concurrency(cli_value: object = None) -> int:
+def resolve_llm_concurrency(
+    cli_value: object = None, *, base_url: str | None = None
+) -> int:
     """Translate windows in flight at once. Precedence: CLI value >
-    ``VOXWEAVE_TRANSLATE_CONCURRENCY`` > conf ``[llm].concurrency`` >
-    :data:`DEFAULT_TRANSLATE_CONCURRENCY`; always >= 1 (1 = the sequential
-    whole-episode planner)."""
+    ``VOXWEAVE_TRANSLATE_CONCURRENCY`` > conf ``[llm].concurrency`` > built-in;
+    always >= 1 (1 = the sequential whole-episode planner). The built-in is
+    :data:`DEFAULT_TRANSLATE_CONCURRENCY` for a configured endpoint
+    (``base_url``, see :func:`resolve_llm_base_url`) and
+    :data:`HOSTED_TRANSLATE_CONCURRENCY` for the OpenAI default."""
     return _resolve_llm_positive_int(
         cli_value,
         envvar="VOXWEAVE_TRANSLATE_CONCURRENCY",
         key="concurrency",
         cli_flag="--concurrency",
-        default=DEFAULT_TRANSLATE_CONCURRENCY,
+        default=(
+            DEFAULT_TRANSLATE_CONCURRENCY if base_url else HOSTED_TRANSLATE_CONCURRENCY
+        ),
     )
 
 
