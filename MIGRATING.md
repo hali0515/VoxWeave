@@ -401,6 +401,45 @@ flow. Modules `pipeline` only held as imports (`translate_mod`, `asrfix_mod`, `s
   restores the files the split rewrote from its one-level snapshot. It is refused, with the
   reason on the page, when one of those files or the media changed since the split. Restart
   `voxweave speakers serve` afterwards, as after the split itself.
+- `translate` against api.openai.com (no `base_url` from `--base-url`, `OPENAI_BASE_URL` or
+  `[llm].base_url`) defaults to `--concurrency 1`, one whole-episode request; the default of
+  8 parallel windows now applies only when an endpoint is configured. An explicit
+  `--concurrency`, `VOXWEAVE_TRANSLATE_CONCURRENCY` or `[llm].concurrency` still wins.
+- `align --language` must name one of the 11 alignment languages. A typo such as `jp` used
+  to align the text with the English model; it now fails before any work and lists the
+  accepted values. A language detected by ASR outside that set still falls back to English.
+- `transcribe --language` rejects an unknown value before separation, song detection and VAD
+  run, not after them.
+- `render --max-lines` must be at least 1 and `--max-line-length` at least 12 (6 for
+  zh/yue/ja/ko). Smaller values used to split ordinary words into letters and replace the
+  VTT with that output.
+- `correct` keeps each cue's line breaks, and a two-speaker dash cue (`-A` / `-B`) stays on
+  two lines whether or not it carries speaker names. Before, every corrected cue was joined
+  onto one line, and a blank line in the model's answer split the cue in two. A fix that
+  removes a speaker dash is now rejected (`speaker dash lost` in the audit).
+- `speakers serve` re-renders the episode's VTT after every **Save**, so the new names show
+  without a separate `voxweave render`. It replaces the VTT only when the VTT differs from the
+  render in speaker names alone; a VTT with hand edits the JSON does not have is left as it is
+  and the page says why. `speakers serve --no-render` restores the old behaviour. The Save
+  button now reads **Saved** only while the names on the page match what was saved.
+- `translate` of an ASS/SSA file writes back into the source script: only each translated
+  event's text changes, behind its opening override tags, so styles, `\an8`/`\pos` positions,
+  Comment lines and drawings are kept. Before, the output was a new script with one Default
+  style, which put signs and top-line text at the bottom over the dialogue. Position tags
+  (`{\an8}`) are no longer sent to the model; an SRT cue's tag is put back on its translation.
+  ASS input to `export --format srt` now keeps an `\anN`/`\aN` position as `{\anN}`.
+- `burn` reads the source video bitrate from the video stream's packet sizes when the
+  container reports no rate (ffmpeg-muxed matroska, webm), instead of estimating it from the
+  file size, which counted embedded fonts and audio of unknown rate as video and set the cap
+  too high.
+- `align` of an episode with a voiceprint binding no longer copies the whole media file when
+  the bound vocals cache serves the audio; the private copy is made only when it has to
+  separate the audio again.
+- `translate --concurrency N` stops at once on Ctrl+C instead of waiting for every window in
+  flight to finish its retries, and a retried window no longer advances the progress bar a
+  second time.
+
+## 0.17.0
 
 ## 0.17.0
 
