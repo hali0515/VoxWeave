@@ -161,3 +161,15 @@ def test_asr_language_helpers_reject_unknown_with_the_supported_set():
         to_asr_iso("xx")
     with pytest.raises(ValueError, match="language is required"):
         to_asr_iso("  ")
+
+
+def test_require_aligner_language_rejects_a_typo_with_the_supported_set():
+    from voxweave.lang import require_aligner_language
+
+    assert require_aligner_language("Japanese") == "ja"
+    assert require_aligner_language("en-US") == "en"
+    with pytest.raises(ValueError, match=r"unsupported language 'jp'.*ja \(Japanese\)"):
+        require_aligner_language("jp")
+    # an ASR-only language cannot be aligned either
+    with pytest.raises(ValueError, match="unsupported language"):
+        require_aligner_language("vi")

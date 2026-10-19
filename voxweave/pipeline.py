@@ -58,6 +58,8 @@ from voxweave.debug import DebugSink, FileDebugSink
 from voxweave.lang import (
     is_supported,
     reconcile_detected_language,
+    require_aligner_language,
+    to_asr_iso,
     to_iso_or,
     transcript_content_weight,
 )
@@ -658,6 +660,9 @@ def transcribe(
     """
     media_path = Path(media_path)
     rep = reporter or Reporter()
+    if lang_override and lang_override.strip():
+        # transcribe_chunks checks again, but only after separation and VAD.
+        to_asr_iso(lang_override)
     if diarize:
         # Fail on a bad env/conf value now, not after separation and ASR.
         speaker_clustering = config.resolve_diarize_clustering(speaker_clustering)
@@ -1372,6 +1377,9 @@ def process(
     picks how its turns are grouped into speakers.
     """
     media_path = Path(media_path)
+    if lang_override and lang_override.strip():
+        # A --language typo fails here, not after separation and VAD.
+        to_asr_iso(lang_override)
     # The deliverables keep their names beside the media: refuse one that cannot
     # exist before any audio work, not at the final write.
     writes_sdh = sdh and word_segments is None
@@ -1878,6 +1886,22 @@ def _write_sdh_sidecar(
     return path
 
 
+def _check_layout_overrides(iso: str, overrides: Mapping[str, Any]) -> None:
+    """Reject line limits the layout cannot honour before they replace the VTT."""
+    from voxweave.core.layout import min_max_line_length
+
+    max_lines = overrides.get("max_lines")
+    if max_lines is not None and max_lines < 1:
+        raise ValueError(f"max_lines must be at least 1, got {max_lines}")
+    max_line_length = overrides.get("max_line_length")
+    floor = min_max_line_length(iso)
+    if max_line_length is not None and max_line_length < floor:
+        raise ValueError(
+            f"max_line_length {max_line_length} is below the minimum of {floor} for"
+            f" {iso!r}: shorter lines split ordinary words apart"
+        )
+
+
 def split(
     json_path: Path,
     timestamps: bool = True,
@@ -1934,6 +1958,7 @@ def split(
     log.debug("replaying %s (%s)", json_path.name, resolve_segmentation_manifest(data))
     units = data["word_segments"]
     iso, units = _reconcile_word_segment_language(data.get("language", "en"), units)
+    _check_layout_overrides(iso, smart_split_kwargs)
     speech_spans = spans_in(data.get("vad_speech"))
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = spans_in(data.get("sing_spans"))
@@ -2494,8 +2519,12 @@ def align(
     log.debug("re-timing %s (%s)", vtt_path.name, resolve_segmentation_manifest(data))
     word_segments = data.get("word_segments", [])
 
-    lang_name = lang_override or data.get("language") or "english"
-    iso = to_iso_or(lang_name, "en")
+    if lang_override:
+        iso = require_aligner_language(lang_override)
+    else:
+        # A detected language outside the aligner's set falls back to English;
+        # only an explicit override has to name a supported one.
+        iso = to_iso_or(data.get("language") or "english", "en")
 
     from voxweave.align_snapshot import decode_align_snapshot
 

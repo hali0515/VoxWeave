@@ -156,6 +156,25 @@ def test_manifest_profile_records_what_actually_ran(tmp_path):
     assert manifest["profile"]["max_lines"] == 2
 
 
+@pytest.mark.parametrize(
+    ("language", "kwargs"),
+    [
+        ("en", {"max_line_length": 11}),
+        ("ja", {"max_line_length": 5}),
+        ("en", {"max_lines": 0}),
+    ],
+)
+def test_split_refuses_line_limits_below_the_floor_before_writing(
+    tmp_path, language, kwargs
+):
+    path = _write_case(tmp_path, language=language)
+    vtt = path.with_suffix(".vtt")
+    vtt.write_text("WEBVTT\n\nkeep me\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="max_line"):
+        pipeline.split(path, **kwargs)
+    assert vtt.read_text(encoding="utf-8") == "WEBVTT\n\nkeep me\n"
+
+
 def test_manifest_profile_records_a_layout_override(tmp_path):
     path = _write_case(tmp_path)
     pipeline.split(path, max_line_length=12, max_lines=1)

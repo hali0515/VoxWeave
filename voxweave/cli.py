@@ -7,7 +7,7 @@ from pathlib import Path
 
 import rich_click as click
 
-from voxweave import artifacts, config, llm_commands, pipeline
+from voxweave import artifacts, config, lang, llm_commands, pipeline
 from voxweave.cli_compat import (
     HELP_REQUESTED,
     DefaultGroup,
@@ -77,6 +77,21 @@ def _flag_source(
             return False, f"environment {envvar}"
         raise ValueError(f"{envvar} must be one of: 1/0, true/false, yes/no, on/off")
     return config.conf_default_flag_source(key, builtin)
+
+
+def _language_option(check):
+    """Click callback that rejects a --language value ``check`` does not accept."""
+
+    def callback(ctx, param, value: str | None) -> str | None:
+        if value is None or not value.strip() or ctx.resilient_parsing:
+            return value
+        try:
+            check(value)
+        except ValueError as exc:
+            raise click.BadParameter(str(exc), ctx, param) from exc
+        return value
+
+    return callback
 
 
 def _apply_vad_mask(vad_mask: bool | None) -> None:
@@ -264,6 +279,7 @@ def cli(ctx, verbose: bool) -> None:
 @click.option(
     "--language",
     default=None,
+    callback=_language_option(lang.to_asr_iso),
     help="Force language (ISO code or full name); default: auto-detect.",
 )
 @renamed_option(
@@ -598,9 +614,17 @@ cli.add_command(build_voices_group(_run))
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
 )
 @click.option(
-    "--max-line-length", type=int, default=None, help="Maximum characters per line."
+    "--max-line-length",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Maximum characters per line (at least 12, or 6 for zh/yue/ja/ko).",
 )
-@click.option("--max-lines", type=int, default=None, help="Maximum lines per cue.")
+@click.option(
+    "--max-lines",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Maximum lines per cue.",
+)
 @click.option(
     "--timestamps/--no-timestamps",
     default=None,
@@ -653,6 +677,7 @@ cli.add_command(DeprecatedAlias("split", cmd_split))
 @click.option(
     "--language",
     default=None,
+    callback=_language_option(lang.require_aligner_language),
     help="Force language (ISO code or full name); default: read from JSON.",
 )
 @click.option(

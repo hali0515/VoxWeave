@@ -1094,7 +1094,9 @@ def test_prefetch_failure_turns_capture_off_but_keeps_the_subtitles(
         ("  ", None),
         ("ja", "ja"),
         ("Japanese", "ja"),
-        ("xx-unknown", "en"),
+        # an ASR language outside the aligner set (an unknown value now fails
+        # before any work, see test_audit2_cli_config)
+        ("vi", "en"),
     ],
 )
 def test_prefetch_follows_a_forced_language(
