@@ -107,6 +107,7 @@ from voxweave.vocals import (
     CACHE_DIRNAME as CACHE_DIRNAME,
     CACHE_DUR_TOL_SEC as CACHE_DUR_TOL_SEC,
     SONGDET_SR,
+    VocalsCacheMiss,
     acquire_16k,
     cache_vocals_path,
 )
@@ -706,6 +707,7 @@ def transcribe(
             fingerprint=(source_fingerprint or "") if voiceprints else None,
             purpose="capture",
             on_separated=dump_separation,
+            want_voc32=skip_songs or keep_lyrics,
         )
         wav = acquired.wav
         fullband = acquired.fullband
@@ -2070,6 +2072,7 @@ def _prepare_16k_for_align(
     tmp: list[Path],
     cache_media: Path | None = None,
     source_fingerprint: str | None = None,
+    hit_only: bool = False,
 ) -> Path:
     """Prepare 16k vocals for align; append temp paths to tmp. Return the 16k wav path.
 
@@ -2077,6 +2080,8 @@ def _prepare_16k_for_align(
     the persistent cache namespace and defaults to the same path. When
     ``source_fingerprint`` is present, only a fully validated v1 companion can
     establish a hit; legacy duration-only caches remain unbound-only behavior.
+    ``hit_only`` raises :class:`voxweave.vocals.VocalsCacheMiss` rather than
+    reading ``media`` when the cache cannot serve the request.
     """
     media = Path(media)
     cache_owner = Path(cache_media) if cache_media is not None else media
@@ -2098,6 +2103,8 @@ def _prepare_16k_for_align(
         separator=separator_identity,
         legacy_16k=True,
         purpose="align source",
+        want_voc32=False,
+        hit_only=hit_only,
     ).wav
 
 
@@ -2426,6 +2433,17 @@ def _media_not_found_error(vtt_path: Path) -> FileNotFoundError:
     return exc
 
 
+@dataclass(frozen=True)
+class _CachedMediaIdentity:
+    """Selected-media identity for align when a bound vocals cache serves the audio.
+
+    Stands where a :class:`MediaSnapshot` would: the media bytes are never read,
+    so only the fingerprint the cache companion was validated against is needed.
+    """
+
+    fingerprint: str
+
+
 def align(
     vtt_path: Path,
     *,
@@ -2660,7 +2678,7 @@ def align(
     tmp: list[Path] = []
     tmp_chunks: list[Path] = []
     snapshots = ExitStack()
-    selected_snapshot = None
+    selected_snapshot: MediaSnapshot | _CachedMediaIdentity | None = None
     align_context = None
     completed_selection = None
     observation_input: Mapping[str, Any] | None = None
@@ -2670,32 +2688,57 @@ def align(
     acquisition_media = media
     production_failure: BaseException | None = None
     try:
-        if voiceprint_pair is not None:
-            try:
-                selected_snapshot = snapshots.enter_context(MediaSnapshot(media))
-            except SnapshotUnavailable as exc:
-                log.warning(
-                    "voiceprint binding will be omitted during align: "
-                    "selected media snapshot unavailable: %s",
-                    exc,
-                )
-            else:
-                acquisition_media = selected_snapshot.path
         try:
             rep.step("prepare audio")
+            cached_wav: Path | None = None
+            if voiceprint_pair is not None and separate:
+                # A bound vocals-cache hit decodes the cache and never reads the
+                # media, so it needs no private copy of the whole file: the cache
+                # companion binds the vocals to this fingerprint, and the commit
+                # rechecks the media against it.
+                try:
+                    cached_wav = _prepare_16k_for_align(
+                        media,
+                        separate=separate,
+                        normalize=normalize,
+                        reporter=rep,
+                        tmp=tmp,
+                        cache_media=media,
+                        source_fingerprint=media_input_fingerprint,
+                        hit_only=True,
+                    )
+                except VocalsCacheMiss:
+                    pass
+                else:
+                    selected_snapshot = _CachedMediaIdentity(media_input_fingerprint)
+            if voiceprint_pair is not None and cached_wav is None:
+                try:
+                    selected_snapshot = snapshots.enter_context(MediaSnapshot(media))
+                except SnapshotUnavailable as exc:
+                    log.warning(
+                        "voiceprint binding will be omitted during align: "
+                        "selected media snapshot unavailable: %s",
+                        exc,
+                    )
+                else:
+                    acquisition_media = selected_snapshot.path
             with align_runtime_activity("AO-04", "prepared-audio-and-cache"):
-                wav = _prepare_16k_for_align(
-                    acquisition_media,
-                    separate=separate,
-                    normalize=normalize,
-                    reporter=rep,
-                    tmp=tmp,
-                    cache_media=media,
-                    source_fingerprint=(
-                        selected_snapshot.fingerprint
-                        if selected_snapshot is not None
-                        else None
-                    ),
+                wav = (
+                    cached_wav
+                    if cached_wav is not None
+                    else _prepare_16k_for_align(
+                        acquisition_media,
+                        separate=separate,
+                        normalize=normalize,
+                        reporter=rep,
+                        tmp=tmp,
+                        cache_media=media,
+                        source_fingerprint=(
+                            selected_snapshot.fingerprint
+                            if selected_snapshot is not None
+                            else None
+                        ),
+                    )
                 )
             from voxweave import align_orchestration
 

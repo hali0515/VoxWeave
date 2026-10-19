@@ -70,6 +70,80 @@ def test_prepare_align_reuses_fresh_cache(tmp_path):
     sep.assert_not_called()
 
 
+def test_cache_hit_hands_song_detection_a_copy_taken_under_the_lock(tmp_path):
+    # PANNs reads voc32 after acquire_16k returns and the cache lock is gone; a
+    # run that replaces the cache in between must not change what it reads.
+    media, cache = _paths(tmp_path)
+    tmp: list = []
+    with (
+        _durations({media.name: 100.0, cache.name: 100.0}),
+        patch("voxweave.vocals.decode_to_wav", return_value=tmp_path / "o.wav"),
+    ):
+        got = vocals.acquire_16k(
+            media,
+            separate=True,
+            normalize=False,
+            reporter=pipeline.Reporter(),
+            tmp=tmp,
+            cache=cache,
+            purpose="test",
+        )
+    assert got.voc32 is not None and got.voc32 != cache
+    assert got.voc32 in tmp
+    cache.write_bytes(b"replaced by another run")
+    assert got.voc32.read_bytes() == b"c"
+    got.voc32.unlink()
+
+
+def test_hit_only_serves_a_fresh_cache_and_refuses_a_stale_one(tmp_path):
+    media, cache = _paths(tmp_path)
+    kwargs = dict(
+        separate=True,
+        normalize=False,
+        reporter=pipeline.Reporter(),
+        cache=cache,
+        purpose="test",
+        hit_only=True,
+    )
+    with (
+        _durations({media.name: 100.0, cache.name: 100.0}),
+        patch("voxweave.vocals.decode_to_wav", return_value=tmp_path / "o.wav"),
+    ):
+        assert vocals.acquire_16k(media, tmp=[], **kwargs).wav == tmp_path / "o.wav"
+    with (
+        _durations({media.name: 100.0, cache.name: 50.0}),
+        patch("voxweave.vocals.decode_to_wav") as dec,
+        patch("voxweave.vocals._separate_to_16k_32k") as sep,
+    ):
+        with pytest.raises(vocals.VocalsCacheMiss):
+            vocals.acquire_16k(media, tmp=[], **kwargs)
+        with pytest.raises(vocals.VocalsCacheMiss):
+            vocals.acquire_16k(media, tmp=[], **{**kwargs, "separate": False})
+    dec.assert_not_called()
+    sep.assert_not_called()
+
+
+def test_cache_hit_skips_the_copy_when_song_detection_is_off(tmp_path):
+    media, cache = _paths(tmp_path)
+    tmp: list = []
+    with (
+        _durations({media.name: 100.0, cache.name: 100.0}),
+        patch("voxweave.vocals.decode_to_wav", return_value=tmp_path / "o.wav"),
+    ):
+        got = vocals.acquire_16k(
+            media,
+            separate=True,
+            normalize=False,
+            reporter=pipeline.Reporter(),
+            tmp=tmp,
+            cache=cache,
+            purpose="test",
+            want_voc32=False,
+        )
+    assert got.voc32 is None
+    assert tmp == [tmp_path / "o.wav"]
+
+
 @pytest.mark.parametrize("normalize", [True, False])
 def test_first_run_16k_decode_matches_a_cache_hit(tmp_path, normalize, monkeypatch):
     # A cache hit decodes vocals.32k.flac (the 32k mono vocals, losslessly) to 16k;
