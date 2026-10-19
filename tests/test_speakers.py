@@ -532,11 +532,14 @@ def test_collapsed_names_do_not_bake_into_srt_round_trip(tmp_path, monkeypatch):
     )
 
     llm_commands.correct(vtt, apply=True)
-    assert "<v " not in vtt.read_text(encoding="utf-8")
+    # the cue keeps its two lines; only the unchanged line keeps its name
+    corrected = vtt.read_text(encoding="utf-8")
+    assert "\nHello there my friend\n<v Ren>Hi</v>\n" in corrected
+    assert "<v Aoi>" not in corrected
     export_subtitles(vtt, ("srt",))
     srt = tmp_path / "episode.srt"
     assert "Aoi / Ren" not in srt.read_text(encoding="utf-8")
-    assert load_subtitle_blocks(srt)[0]["text"] == "Hello there my friend Hi"
+    assert load_subtitle_blocks(srt)[0]["text"] == "Hello there my friend\nHi"
 
 
 def test_correct_audit_records_reflowed_text_written_to_vtt(tmp_path, monkeypatch):

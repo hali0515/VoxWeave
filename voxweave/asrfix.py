@@ -23,6 +23,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import re
 
 from voxweave import config
 from voxweave.core.overlay import wrap_lyric
@@ -35,6 +36,7 @@ from voxweave.translate import (
     _make_client,
     build_payload,
     format_glossary,
+    is_dash_cue,
     request_with_json_fallback,
     resolve_model,
     restore_dash_layout,
@@ -166,6 +168,65 @@ def _norm(s: str) -> str:
     return " ".join(s.split())
 
 
+_WS_RUN_RE = re.compile(r"\s+")
+
+
+def _line_break_offsets(text: str) -> list[int]:
+    """Offsets in ``_norm(text)`` of the separators that were line breaks.
+
+    ``_norm`` turns each whitespace run between two words into one space, so the
+    k-th run maps to the space after the k-th word.
+    """
+    offsets: list[int] = []
+    pos = 0
+    for word, run in zip(text.split(), _WS_RUN_RE.findall(text.strip())):
+        pos += len(word)
+        if "\n" in run:
+            offsets.append(pos)
+        pos += 1
+    return offsets
+
+
+def _restore_line_breaks(actual: str, fixed_n: str) -> str:
+    """Put the line breaks of ``actual`` back into the flattened fix ``fixed_n``.
+
+    The model sees and returns cue text space-joined, so a fix would otherwise
+    collapse a wrapped cue onto one line. Fixes are minimal edits, so the two
+    flat strings align almost everywhere: each break is carried to the matching
+    offset in the fix. A break inside text the fix rewrote goes to the nearest
+    space in that rewrite, else to the matching character offset (no-space
+    scripts break between glyphs anyway).
+    """
+    actual_n = _norm(actual)
+    breaks = _line_break_offsets(actual)
+    if not breaks:
+        return fixed_n
+    out = list(fixed_n)
+    inserts: list[int] = []
+    matcher = difflib.SequenceMatcher(None, actual_n, fixed_n, autojunk=False)
+    opcodes = matcher.get_opcodes()
+    for k in breaks:
+        for tag, i1, i2, j1, j2 in opcodes:
+            if not i1 <= k < i2:
+                continue
+            if tag == "equal":
+                out[j1 + (k - i1)] = "\n"
+            elif tag == "delete":
+                inserts.append(j1)
+            else:  # replace
+                spaces = [j for j in range(j1, j2) if out[j] == " "]
+                guess = j1 + (k - i1) * (j2 - j1) // max(1, i2 - i1)
+                if spaces:
+                    out[min(spaces, key=lambda j: abs(j - guess))] = "\n"
+                else:
+                    inserts.append(min(guess, j2))
+            break
+    for j in sorted(inserts, reverse=True):
+        out.insert(j, "\n")
+    lines = "".join(out).split("\n")
+    return "\n".join(line.strip() for line in lines if line.strip())
+
+
 # Semantic gates on the fixed text. Growth budget: legit fixes substitute or
 # shrink; the only legal growth is a short garble replaced by a canonical term
 # (often cross-script, e.g. a 3-hanzi garble -> a Latin glossary entry), which
@@ -237,9 +298,14 @@ def apply_fixes(
         if why is not None:
             rejected.append({**f, "_why": why})
             continue
-        fixed = f["fixed"]
-        if isinstance(blocks[i].get("speakers"), list):
-            fixed = restore_dash_layout(actual, fixed)
+        # The model's line breaks are not trusted (a blank line would split the
+        # cue when the VTT is parsed again); the cue keeps its own layout.
+        fixed = _restore_line_breaks(actual, fixed_n)
+        if is_dash_cue(actual) and not is_dash_cue(fixed):
+            fixed = restore_dash_layout(actual, fixed_n)
+            if not is_dash_cue(fixed):
+                rejected.append({**f, "_why": "speaker dash lost"})
+                continue
         new_texts[i] = fixed
         changed.add(i)
         applied.append({**f, "orig": actual, "fixed": fixed})
