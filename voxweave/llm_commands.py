@@ -373,6 +373,100 @@ def _warn_correction_not_realigned(vtt_path: Path, applied: Sequence[Mapping]) -
     )
 
 
+# Write stage of correct: --apply commits the corrected VTT in place, otherwise the
+# review sidecar VTT and its audit json are written as a pair. Returns the output path
+# and the audit path (None for --apply).
+def _write_correction(
+    *,
+    apply: bool,
+    rendered: str,
+    owner: Path,
+    vtt_path: Path,
+    vtt_input_bytes: bytes,
+    applied: Sequence[Mapping],
+    rejected: Sequence[Mapping],
+    sidecar_path: Path | None,
+    rep: Reporter,
+) -> tuple[Path, Path | None]:
+    audit_path: Path | None = None
+    if apply:
+        # in-place edit: overwrite the original, no sidecar json (diff lives in the summary)
+        rep.stage("overwrite VTT in place")
+        rendered_bytes = rendered.encode("utf-8")
+        episode_transaction.commit_correction(
+            episode_path=owner,
+            vtt_path=vtt_path,
+            expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
+            rendered_vtt_bytes=rendered_bytes,
+            evidence_paths=artifacts.align_evidence_candidates(
+                owner,
+                vtt_path,
+            ),
+        )
+        out_path = vtt_path
+    else:
+        rep.stage("write sidecar VTT + audit json")
+        assert sidecar_path is not None
+        out_path = sidecar_path
+        audit_path = artifacts.asrfix_audit_path(owner, vtt_path)
+        fsio.atomic_write_text(out_path, rendered)
+        try:
+            fsio.atomic_write_text(
+                audit_path,
+                json.dumps(
+                    {"applied": applied, "rejected": rejected},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                private=True,
+            )
+        except Exception:
+            # Sidecar VTT + audit JSON are a pair; if the audit write fails, unlink
+            # the VTT so no orphaned half-pair is left behind (source stays untouched).
+            out_path.unlink(missing_ok=True)
+            raise
+    return out_path, audit_path
+
+
+# Realign stage of correct --apply --align: refresh the timing of the text that was
+# just committed. Returns True when pipeline.align ran to completion.
+def _realign_after_correction(
+    out_path: Path,
+    applied: Sequence[Mapping],
+    rendered: str,
+    *,
+    media_path: Path | None,
+    separate: bool,
+    normalize: bool,
+    lang_override: str | None,
+    rep: Reporter,
+) -> bool:
+    rep.step("check and refresh timing")
+    if not applied:
+        rep.stage("no text changes; alignment not needed")
+    if applied:
+        try:
+            pipeline.align(
+                out_path,
+                media_path=media_path,
+                separate=separate,
+                normalize=normalize,
+                lang_override=lang_override,
+                reporter=NestedReporter(rep),
+                _expected_vtt_sha256=hashlib.sha256(
+                    rendered.encode("utf-8")
+                ).hexdigest(),
+            )
+        except BaseException:
+            # The text is already committed: re-running correct finds nothing left to
+            # change, so keep the diff the summary would have shown and say how to
+            # finish the job.
+            _warn_correction_not_realigned(out_path, applied)
+            raise
+        return True
+    return False
+
+
 def correct(
     vtt_path: Path,
     *,
@@ -448,43 +542,17 @@ def correct(
     rendered = asrfix_mod.render_vtt(blocks, new_texts)
 
     rep.step("write correction")
-    audit_path: Path | None = None
-    if apply:
-        # in-place edit: overwrite the original, no sidecar json (diff lives in the summary)
-        rep.stage("overwrite VTT in place")
-        rendered_bytes = rendered.encode("utf-8")
-        episode_transaction.commit_correction(
-            episode_path=owner,
-            vtt_path=vtt_path,
-            expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
-            rendered_vtt_bytes=rendered_bytes,
-            evidence_paths=artifacts.align_evidence_candidates(
-                owner,
-                vtt_path,
-            ),
-        )
-        out_path = vtt_path
-    else:
-        rep.stage("write sidecar VTT + audit json")
-        assert sidecar_path is not None
-        out_path = sidecar_path
-        audit_path = artifacts.asrfix_audit_path(owner, vtt_path)
-        fsio.atomic_write_text(out_path, rendered)
-        try:
-            fsio.atomic_write_text(
-                audit_path,
-                json.dumps(
-                    {"applied": applied, "rejected": rejected},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                private=True,
-            )
-        except Exception:
-            # Sidecar VTT + audit JSON are a pair; if the audit write fails, unlink
-            # the VTT so no orphaned half-pair is left behind (source stays untouched).
-            out_path.unlink(missing_ok=True)
-            raise
+    out_path, audit_path = _write_correction(
+        apply=apply,
+        rendered=rendered,
+        owner=owner,
+        vtt_path=vtt_path,
+        vtt_input_bytes=vtt_input_bytes,
+        applied=applied,
+        rejected=rejected,
+        sidecar_path=sidecar_path,
+        rep=rep,
+    )
     log.info(
         "asrfix %s: %d applied / %d rejected → %s",
         vtt_path.name,
@@ -497,29 +565,16 @@ def correct(
     # if something actually changed; an empty diff leaves the VTT identical).
     aligned = False
     if apply and align_after:
-        rep.step("check and refresh timing")
-        if not applied:
-            rep.stage("no text changes; alignment not needed")
-    if apply and align_after and applied:
-        try:
-            pipeline.align(
-                out_path,
-                media_path=media_path,
-                separate=separate,
-                normalize=normalize,
-                lang_override=lang_override,
-                reporter=NestedReporter(rep),
-                _expected_vtt_sha256=hashlib.sha256(
-                    rendered.encode("utf-8")
-                ).hexdigest(),
-            )
-        except BaseException:
-            # The text is already committed: re-running correct finds nothing left to
-            # change, so keep the diff the summary would have shown and say how to
-            # finish the job.
-            _warn_correction_not_realigned(out_path, applied)
-            raise
-        aligned = True
+        aligned = _realign_after_correction(
+            out_path,
+            applied,
+            rendered,
+            media_path=media_path,
+            separate=separate,
+            normalize=normalize,
+            lang_override=lang_override,
+            rep=rep,
+        )
 
     return {
         "out": out_path,
