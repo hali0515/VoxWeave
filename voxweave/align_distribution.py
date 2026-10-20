@@ -1086,18 +1086,46 @@ def _job_receipt(
     )
 
 
-def _build_authority_distribution_impl(
+def _final_receipt(
     *,
-    blocks: tuple[AuthorityBlock, ...],
+    work: AuthorityJobWorkReceipt,
+    job_status: str,
     delivery_route: tuple[RouteExpectation, ...],
-    calls: tuple[AuthorityCallInput, ...],
-    skipped_blocks: tuple[AuthoritySkippedBlockInput, ...],
-    route_claims: tuple[RouteClaim, ...],
-    iso: str,
-    profile: AuthorityLimitProfile,
+    owners_by_source: dict[int, tuple[str, ...]],
+    all_raw_ids: tuple[str, ...],
 ) -> AuthorityDistributionReceipt:
-    """Run preflight, producer, and verifier under one sealed effective profile."""
-    effective_profile = validate_authority_limit_profile(profile)
+    # The job receipt after both lanes ran: valid owners, or the invalid leftovers.
+    reasons = project_authority_reasons(work)
+    owner_sources = tuple(item.source_index for item in delivery_route)
+    if job_status != "complete":
+        return AuthorityDistributionReceipt(
+            "invalid",
+            owner_sources,
+            None,
+            None,
+            reasons,
+            0,
+            all_raw_ids,
+            work,
+        )
+    owners = tuple(owners_by_source[source] for source in owner_sources)
+    return AuthorityDistributionReceipt(
+        "valid",
+        owner_sources,
+        owners,
+        tuple(len(owner) for owner in owners),
+        (),
+        len(all_raw_ids),
+        (),
+        work,
+    )
+
+
+def _check_authority_inputs(
+    blocks: tuple[AuthorityBlock, ...],
+    calls: tuple[AuthorityCallInput, ...],
+) -> dict[int, AuthorityBlock]:
+    # Structural checks on the caller's blocks and calls; returns the block index.
     blocks_by_source = {block.source_index: block for block in blocks}
     if len(blocks_by_source) != len(blocks):
         raise ValueError("authority blocks must have unique source indices")
@@ -1118,12 +1146,24 @@ def _build_authority_distribution_impl(
                 raise ValueError("capture-invalid call has impossible strict facts")
         elif call.unit_surfaces is None:
             raise ValueError("capture-valid call requires every captured surface")
-    mismatch = project_route_mismatch(
-        route_claims, delivery_route, calls, skipped_blocks
-    )
-    positions_by_owner = _claim_positions(route_claims)
-    skip_rows = _skip_receipts(skipped_blocks, positions_by_owner)
-    all_raw_ids = tuple(unit_id for call in calls for unit_id in call.raw_unit_ids)
+    return blocks_by_source
+
+
+def _preflight_invalid_receipt(
+    *,
+    mismatch: RouteMismatch | None,
+    route_claims: tuple[RouteClaim, ...],
+    delivery_route: tuple[RouteExpectation, ...],
+    calls: tuple[AuthorityCallInput, ...],
+    skipped_blocks: tuple[AuthoritySkippedBlockInput, ...],
+    effective_profile: AuthorityLimitProfile,
+    blocks_by_source: dict[int, AuthorityBlock],
+    positions_by_owner: _ClaimPositions,
+    skip_rows: tuple[AuthoritySkippedBlockReceipt, ...],
+    all_raw_ids: tuple[str, ...],
+) -> AuthorityDistributionReceipt | None:
+    # The zero-work receipt for a job whose preflight already failed, or None when
+    # the producer and verifier lanes should run.
     preflight_status: str | None = None
     terminal_call: int | None = None
     if mismatch is not None:
@@ -1165,6 +1205,42 @@ def _build_authority_distribution_impl(
             all_raw_ids,
             work,
         )
+    return None
+
+
+def _build_authority_distribution_impl(
+    *,
+    blocks: tuple[AuthorityBlock, ...],
+    delivery_route: tuple[RouteExpectation, ...],
+    calls: tuple[AuthorityCallInput, ...],
+    skipped_blocks: tuple[AuthoritySkippedBlockInput, ...],
+    route_claims: tuple[RouteClaim, ...],
+    iso: str,
+    profile: AuthorityLimitProfile,
+) -> AuthorityDistributionReceipt:
+    """Run preflight, producer, and verifier under one sealed effective profile."""
+    effective_profile = validate_authority_limit_profile(profile)
+    blocks_by_source = _check_authority_inputs(blocks, calls)
+    mismatch = project_route_mismatch(
+        route_claims, delivery_route, calls, skipped_blocks
+    )
+    positions_by_owner = _claim_positions(route_claims)
+    skip_rows = _skip_receipts(skipped_blocks, positions_by_owner)
+    all_raw_ids = tuple(unit_id for call in calls for unit_id in call.raw_unit_ids)
+    invalid_receipt = _preflight_invalid_receipt(
+        mismatch=mismatch,
+        route_claims=route_claims,
+        delivery_route=delivery_route,
+        calls=calls,
+        skipped_blocks=skipped_blocks,
+        effective_profile=effective_profile,
+        blocks_by_source=blocks_by_source,
+        positions_by_owner=positions_by_owner,
+        skip_rows=skip_rows,
+        all_raw_ids=all_raw_ids,
+    )
+    if invalid_receipt is not None:
+        return invalid_receipt
 
     budget = _BudgetLedger(effective_profile)
     rows: list[AuthorityCallWorkReceipt] = []
@@ -1293,29 +1369,12 @@ def _build_authority_distribution_impl(
         call_rows=tuple(rows),
         skip_rows=skip_rows,
     )
-    reasons = project_authority_reasons(work)
-    owner_sources = tuple(item.source_index for item in delivery_route)
-    if job_status != "complete":
-        return AuthorityDistributionReceipt(
-            "invalid",
-            owner_sources,
-            None,
-            None,
-            reasons,
-            0,
-            all_raw_ids,
-            work,
-        )
-    owners = tuple(owners_by_source[source] for source in owner_sources)
-    return AuthorityDistributionReceipt(
-        "valid",
-        owner_sources,
-        owners,
-        tuple(len(owner) for owner in owners),
-        (),
-        len(all_raw_ids),
-        (),
-        work,
+    return _final_receipt(
+        work=work,
+        job_status=job_status,
+        delivery_route=delivery_route,
+        owners_by_source=owners_by_source,
+        all_raw_ids=all_raw_ids,
     )
 
 
