@@ -49,15 +49,16 @@ def _sealed_acquisition(tmp_path):
 
 
 def _count_digests(monkeypatch):
-    from voxweave import align_acquisition
+    from voxweave import align_acquisition, align_fresh_seals
 
     calls: list[object] = []
-    original = align_acquisition._stable_digest
+    original = align_fresh_seals._stable_digest
 
     def counting(value):
         calls.append(value)
         return original(value)
 
+    monkeypatch.setattr(align_fresh_seals, "_stable_digest", counting)
     monkeypatch.setattr(align_acquisition, "_stable_digest", counting)
     return calls
 
