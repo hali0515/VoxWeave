@@ -183,6 +183,102 @@ def line_start_penalty(text: str, lang: str = "") -> int:
     return 0
 
 
+def _non_space_width(surface: str) -> int:
+    return sum(not char.isspace() for char in surface)
+
+
+def _zh_pos_tokens(
+    atoms: Sequence[str],
+) -> tuple[dict[int, tuple[str, str]], dict[int, tuple[str, str]]] | None:
+    """Tokenise ``atoms`` with jieba posseg into (previous, following) maps.
+
+    Both map a non-space char offset to the ``(word, flag)`` token that ends
+    (``previous``) or starts (``following``) there.  None when posseg is absent
+    or ``cut`` raises; each exit records its own degradation event.
+    """
+    from voxweave.core import breakpoints
+
+    pseg = breakpoints.quiet_import_jieba(posseg=True)
+    if pseg is None:
+        note_degraded("pos", "posseg-import-failed")
+        return None
+
+    text = "".join(atoms)
+    previous: dict[int, tuple[str, str]] = {}
+    following: dict[int, tuple[str, str]] = {}
+    cursor = 0
+    try:
+        for token in pseg.cut(text, HMM=False):
+            surface = str(token.word)
+            token_width = _non_space_width(surface)
+            if token_width < 1:
+                continue
+            start, end = cursor, cursor + token_width
+            following[start] = (surface, str(token.flag))
+            previous[end] = (surface, str(token.flag))
+            cursor = end
+    except Exception:  # noqa: BLE001 - optional POS hint must stay fail-safe
+        note_degraded("pos", "posseg-exception")
+        return None
+    return previous, following
+
+
+def _zh_pos_penalty(
+    left_word: str, left_pos: str, right_word: str, right_pos: str
+) -> int:
+    """Modifier/head damage score for a boundary between two jieba tokens."""
+    penalty = 0
+    if left_pos == "c":
+        penalty += 4
+    elif left_pos in {"m", "q", "r"}:
+        penalty += 4
+    elif left_pos == "p":
+        penalty += 5
+    elif left_pos in {"d", "f"}:
+        penalty += 3
+    elif left_pos in {"s", "t"} and right_pos[:1] in {"a", "v"}:
+        penalty += 3
+    if (
+        right_pos.startswith("u")
+        or right_pos == "y"
+        or right_word in _ZH_BIND_START_HIGH
+    ):
+        penalty += 4
+    left_noun = left_pos.startswith("n") or left_pos in {"eng", "vn"}
+    right_noun = right_pos.startswith("n") or right_pos in {"eng", "vn"}
+    if left_word == "的" and right_noun:
+        penalty += 6
+    elif left_word == "地" and right_pos.startswith("v"):
+        penalty += 6
+    elif left_word == "得" and right_pos[:1] in {"a", "d", "v"}:
+        penalty += 5
+    elif left_word in _ZH_ASPECT_PARTICLES and (
+        right_noun or right_pos[:1] in {"a", "b", "d", "m", "q", "v"}
+    ):
+        penalty += 6
+    if left_pos[:1] in {"a", "b"} and right_noun:
+        penalty += 4
+    if left_pos in {"f", "s", "t"} and right_noun:
+        penalty += 4
+    if left_pos == "t" and right_pos == "t":
+        penalty += 4
+    if left_noun and right_noun:
+        penalty += 3
+        if left_pos in {"eng", "vn"} or right_pos in {"eng", "vn"}:
+            penalty += 3
+    if left_pos == "eng" and right_pos in {"f", "s"}:
+        penalty += 5
+    if left_pos.startswith("v") and right_pos == "p":
+        penalty += 3
+    if left_pos.startswith("v") and right_pos.startswith("v"):
+        penalty += 3
+    elif left_pos.startswith("v") and (right_noun or right_pos in {"f", "r"}):
+        penalty += 4
+    if left_word.casefold() in _ZH_CATEGORY_WORDS and right_pos == "eng":
+        penalty += 3
+    return penalty
+
+
 def zh_pos_boundary_penalties(
     atoms: Sequence[str], candidate_indices: Sequence[int], lang: str
 ) -> dict[int, int]:
@@ -201,37 +297,14 @@ def zh_pos_boundary_penalties(
 
     if lang not in {"zh", "yue"}:
         return {}
-    from voxweave.core import breakpoints
-
-    pseg = breakpoints.quiet_import_jieba(posseg=True)
-    if pseg is None:
-        note_degraded("pos", "posseg-import-failed")
+    tokens = _zh_pos_tokens(atoms)
+    if tokens is None:
         return {}
-
-    def width(surface: str) -> int:
-        return sum(not char.isspace() for char in surface)
-
-    text = "".join(atoms)
-    previous: dict[int, tuple[str, str]] = {}
-    following: dict[int, tuple[str, str]] = {}
-    cursor = 0
-    try:
-        for token in pseg.cut(text, HMM=False):
-            surface = str(token.word)
-            token_width = width(surface)
-            if token_width < 1:
-                continue
-            start, end = cursor, cursor + token_width
-            following[start] = (surface, str(token.flag))
-            previous[end] = (surface, str(token.flag))
-            cursor = end
-    except Exception:  # noqa: BLE001 - optional POS hint must stay fail-safe
-        note_degraded("pos", "posseg-exception")
-        return {}
+    previous, following = tokens
 
     atom_offsets = [0]
     for atom in atoms:
-        atom_offsets.append(atom_offsets[-1] + width(atom))
+        atom_offsets.append(atom_offsets[-1] + _non_space_width(atom))
     penalties: dict[int, int] = {}
     for boundary in candidate_indices:
         if not 0 < boundary < len(atom_offsets):
@@ -248,56 +321,9 @@ def zh_pos_boundary_penalties(
             continue
         left_word, left_pos = left
         right_word, right_pos = right
-        penalty = 0
-        if left_pos == "c":
-            penalty += 4
-        elif left_pos in {"m", "q", "r"}:
-            penalty += 4
-        elif left_pos == "p":
-            penalty += 5
-        elif left_pos in {"d", "f"}:
-            penalty += 3
-        elif left_pos in {"s", "t"} and right_pos[:1] in {"a", "v"}:
-            penalty += 3
-        if (
-            right_pos.startswith("u")
-            or right_pos == "y"
-            or right_word in _ZH_BIND_START_HIGH
-        ):
-            penalty += 4
-        left_noun = left_pos.startswith("n") or left_pos in {"eng", "vn"}
-        right_noun = right_pos.startswith("n") or right_pos in {"eng", "vn"}
-        if left_word == "的" and right_noun:
-            penalty += 6
-        elif left_word == "地" and right_pos.startswith("v"):
-            penalty += 6
-        elif left_word == "得" and right_pos[:1] in {"a", "d", "v"}:
-            penalty += 5
-        elif left_word in _ZH_ASPECT_PARTICLES and (
-            right_noun or right_pos[:1] in {"a", "b", "d", "m", "q", "v"}
-        ):
-            penalty += 6
-        if left_pos[:1] in {"a", "b"} and right_noun:
-            penalty += 4
-        if left_pos in {"f", "s", "t"} and right_noun:
-            penalty += 4
-        if left_pos == "t" and right_pos == "t":
-            penalty += 4
-        if left_noun and right_noun:
-            penalty += 3
-            if left_pos in {"eng", "vn"} or right_pos in {"eng", "vn"}:
-                penalty += 3
-        if left_pos == "eng" and right_pos in {"f", "s"}:
-            penalty += 5
-        if left_pos.startswith("v") and right_pos == "p":
-            penalty += 3
-        if left_pos.startswith("v") and right_pos.startswith("v"):
-            penalty += 3
-        elif left_pos.startswith("v") and (right_noun or right_pos in {"f", "r"}):
-            penalty += 4
-        if left_word.casefold() in _ZH_CATEGORY_WORDS and right_pos == "eng":
-            penalty += 3
-        penalties[boundary] = penalty
+        penalties[boundary] = _zh_pos_penalty(
+            left_word, left_pos, right_word, right_pos
+        )
     return penalties
 
 
