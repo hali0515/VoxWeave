@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from voxweave import backend, chunking, runtime, songdet
+from voxweave import backend, chunking, runtime, separator, songdet
 
 SR = 16000
 
@@ -255,11 +255,11 @@ def _fake_separator_env(monkeypatch, tmp_path, *, device: str):
     separator_config = tmp_path / "separator.yaml"
     separator_config.write_text("model: {}\n", encoding="utf-8")
     monkeypatch.setattr(
-        backend,
+        separator,
         "_resolve_separator_files",
         lambda: (checkpoint, separator_config),
     )
-    monkeypatch.setattr(backend, "get_device", lambda: device)
+    monkeypatch.setattr(separator, "get_device", lambda: device)
     return precisions, checkpoint, torch_stub
 
 

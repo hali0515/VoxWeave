@@ -1,7 +1,7 @@
 """Process-level runtime infrastructure shared by the model backends.
 
 Device resolution, dtype policy, VRAM reclaim, dependency-error messages and
-HF download helpers. No model logic lives here — ``backend`` (separation/ASR),
+HF download helpers. No model logic lives here — ``separator``, ``backend`` (ASR),
 ``align_ctc`` and ``align_mms`` all build on this module, which keeps the
 import direction acyclic.
 """

@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from voxweave import align_common, align_ctc, align_mms, backend, runtime, vocalscache
+from voxweave import (
+    align_common,
+    align_ctc,
+    align_mms,
+    backend,
+    runtime,
+    separator,
+    vocalscache,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -446,13 +454,13 @@ def test_resolve_separator_uses_existing_files(monkeypatch, tmp_path):
     cf = tmp_path / "x.yaml"
     ck.write_bytes(b"w")
     cf.write_text("model: {}\n")
-    monkeypatch.setattr(backend, "SEPARATOR_CKPT", str(ck))
-    monkeypatch.setattr(backend, "SEPARATOR_CONFIG", str(cf))
+    monkeypatch.setattr(separator, "SEPARATOR_CKPT", str(ck))
+    monkeypatch.setattr(separator, "SEPARATOR_CONFIG", str(cf))
 
     def _boom(*a, **k):
         raise AssertionError("should not download")
 
-    monkeypatch.setattr(backend, "_hf_download", _boom)
+    monkeypatch.setattr(separator, "_hf_download", _boom)
     rck, rcf = backend._resolve_separator_files()
     assert rck == ck and rcf == cf
 
@@ -464,15 +472,15 @@ def test_resolve_separator_downloads_missing_ckpt(monkeypatch, tmp_path):
     cached = tmp_path / "hf" / "MelBandRoformer.ckpt"
     cached.parent.mkdir()
     cached.write_bytes(b"w")
-    monkeypatch.setattr(backend, "SEPARATOR_CKPT", "/nonexistent/x.ckpt")
-    monkeypatch.setattr(backend, "SEPARATOR_CONFIG", str(cf))
+    monkeypatch.setattr(separator, "SEPARATOR_CKPT", "/nonexistent/x.ckpt")
+    monkeypatch.setattr(separator, "SEPARATOR_CONFIG", str(cf))
     calls = []
 
     def _dl(repo, fn, cache_dir=None):
         calls.append((repo, fn, cache_dir))
         return str(cached)
 
-    monkeypatch.setattr(backend, "_hf_download", _dl)
+    monkeypatch.setattr(separator, "_hf_download", _dl)
     rck, rcf = backend._resolve_separator_files()
     assert rck == cached and rcf == cf
     # separator weights download into the voxweave audio cache subdir
@@ -489,8 +497,8 @@ def test_resolve_separator_falls_back_to_bundled_config(monkeypatch, tmp_path):
     # yaml missing -> fall back to the vendor-bundled config (must exist and be parseable)
     ck = tmp_path / "x.ckpt"
     ck.write_bytes(b"w")
-    monkeypatch.setattr(backend, "SEPARATOR_CKPT", str(ck))
-    monkeypatch.setattr(backend, "SEPARATOR_CONFIG", "/nonexistent/x.yaml")
+    monkeypatch.setattr(separator, "SEPARATOR_CKPT", str(ck))
+    monkeypatch.setattr(separator, "SEPARATOR_CONFIG", "/nonexistent/x.yaml")
     rck, rcf = backend._resolve_separator_files()
     assert rck == ck
     assert rcf == backend._BUNDLED_SEPARATOR_CONFIG
@@ -501,13 +509,13 @@ def test_resolve_separator_falls_back_to_bundled_config(monkeypatch, tmp_path):
 
 def test_resolve_separator_download_failure_raises_friendly(monkeypatch):
     # download fails -> friendly RuntimeError (mentions --no-separate / manual weight placement), not bare exception
-    monkeypatch.setattr(backend, "SEPARATOR_CKPT", "/nonexistent/x.ckpt")
-    monkeypatch.setattr(backend, "SEPARATOR_CONFIG", "/nonexistent/x.yaml")
+    monkeypatch.setattr(separator, "SEPARATOR_CKPT", "/nonexistent/x.ckpt")
+    monkeypatch.setattr(separator, "SEPARATOR_CONFIG", "/nonexistent/x.yaml")
 
     def _dl(repo, fn):
         raise OSError("no network")
 
-    monkeypatch.setattr(backend, "_hf_download", _dl)
+    monkeypatch.setattr(separator, "_hf_download", _dl)
     with pytest.raises(RuntimeError, match="--no-separate"):
         backend._resolve_separator_files()
 
@@ -727,7 +735,7 @@ def test_demix_wraps_only_the_model_forward(monkeypatch):
         helper_calls.append((dev, mode))
         return recorder
 
-    monkeypatch.setattr(backend, "_autocast_context", _fake_ctx)
+    monkeypatch.setattr(separator, "_autocast_context", _fake_ctx)
 
     class _Model(torch.nn.Module):
         def __init__(self):
@@ -805,12 +813,12 @@ def test_separator_identity_records_the_effective_autocast_mode(
     separator_config = tmp_path / "separator.yaml"
     separator_config.write_text("model: {}\n", encoding="utf-8")
     monkeypatch.setattr(
-        backend,
+        separator,
         "_resolve_separator_files",
         lambda: (checkpoint, separator_config),
     )
     monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: mode)
-    monkeypatch.setattr(backend, "get_device", lambda: device)
+    monkeypatch.setattr(separator, "get_device", lambda: device)
 
     identity = backend.separator_identity()
 
@@ -829,12 +837,12 @@ def test_probe_and_load_agree_on_the_fp32_path_off_cuda(monkeypatch, tmp_path, d
     separator_config = tmp_path / "separator.yaml"
     separator_config.write_text("model: {}\n", encoding="utf-8")
     monkeypatch.setattr(
-        backend,
+        separator,
         "_resolve_separator_files",
         lambda: (checkpoint, separator_config),
     )
     monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: "bf16")
-    monkeypatch.setattr(backend, "get_device", lambda: device)
+    monkeypatch.setattr(separator, "get_device", lambda: device)
 
     probe = backend.separator_identity()["autocast"]
     load_edge = backend._effective_autocast(
@@ -882,7 +890,7 @@ def test_separate_vocals_resolves_autocast_once_for_forward_and_identity(
         return reads[-1]
 
     monkeypatch.setattr(backend.config, "conf_separate_autocast", _drifting_resolver)
-    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    monkeypatch.setattr(separator, "_empty_cache", lambda: None)
     seen: dict[str, object] = {}
 
     def _fake_load(autocast=None):
@@ -893,8 +901,8 @@ def test_separate_vocals_resolves_autocast_once_for_forward_and_identity(
         seen["demix"] = autocast
         return torch.zeros_like(mix)
 
-    monkeypatch.setattr(backend, "_load_separator", _fake_load)
-    monkeypatch.setattr(backend, "_demix", _fake_demix)
+    monkeypatch.setattr(separator, "_load_separator", _fake_load)
+    monkeypatch.setattr(separator, "_demix", _fake_demix)
     source = tmp_path / "fullband.wav"
     sf.write(str(source), numpy.zeros((256, 2), dtype="float32"), 44100)
 
@@ -917,7 +925,7 @@ def test_separate_vocals_refuses_multichannel_audio_before_loading(
     sf = pytest.importorskip("soundfile")
     numpy = pytest.importorskip("numpy")
     monkeypatch.setattr(
-        backend,
+        separator,
         "_load_separator",
         lambda **_kwargs: pytest.fail("a 6-channel input must not load the model"),
     )

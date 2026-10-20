@@ -87,7 +87,7 @@ DEFAULT_ALIGN_MODELS = {"en": "facebook/wav2vec2-large-960h-lv60-self", "ja": "m
 # Model cache layout: every downloaded weight goes under VOXWEAVE_CACHE_ROOT
 # (~/.cache/voxweave), split by role (asr / align / audio). Each subdir is a
 # self-contained HF hub tree passed as cache_dir/download_root= to every model download.
-# A hand-placed separator checkpoint/config is looked up in backend.MODEL_DIR
+# A hand-placed separator checkpoint/config is looked up in separator.MODEL_DIR
 # (VOXWEAVE_MODEL_DIR, else this root); a downloaded one lands in AUDIO_CACHE.
 # Weights do NOT share with ~/.cache/huggingface/hub — a model already pulled by
 # `hf download` will re-download here on first run. This isolation is intentional:
@@ -861,7 +861,7 @@ def conf_batch(key: str) -> int:
 
 
 # Autocast for the MelBandRoformer separation forward. "off" is the byte-identical
-# reference path (fp32 with TF32 matmuls, see backend._separation_matmul_precision); bf16/fp16 trade
+# reference path (fp32 with TF32 matmuls, see separator._separation_matmul_precision); bf16/fp16 trade
 # tiny stem differences for throughput. The default stays off until an A/B decides it.
 SEP_AUTOCAST_MODES = ("off", "bf16", "fp16")
 SEP_AUTOCAST_DEFAULT = "off"
