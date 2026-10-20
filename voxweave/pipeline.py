@@ -1436,30 +1436,52 @@ def process(
             expected_media_fingerprint=expected_media,
             mode=source_mode,
         )
+
+        # Called by _process_from_source after the shot detection job starts;
+        # ``transcribe`` and ``cache_vocals_path`` are looked up when it runs.
+        def transcribe_source() -> tuple[
+            str,
+            list[dict],
+            list[tuple[float, float]],
+            list[tuple[float, float]],
+            list[tuple[float, float, str]],
+            VoiceprintCapture | None,
+        ]:
+            return transcribe(
+                source_path,
+                lang_override=lang_override,
+                separate=separate,
+                skip_songs=skip_songs,
+                keep_lyrics=keep_lyrics,
+                diarize=diarize,
+                diarize_model=diarize_model,
+                voiceprints=capture_enabled,
+                voiceprint_model=voiceprint_model,
+                speaker_clustering=speaker_clustering,
+                normalize=normalize,
+                reporter=rep,
+                debug=debug,
+                debug_root=debug_root,
+                cache_vocals=cache_vocals_path(media_path),
+                source_fingerprint=snapshot_fingerprint,
+                asr_model=asr_model,
+                context=context,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                # SDH reuses the successfully returned deferred PANNs owner.
+                release_panns=not sdh,
+            )
+
         return _process_from_source(
             media_path,
             source=source,
             lang_override=lang_override,
-            separate=separate,
             reporter=rep,
-            debug=debug,
-            debug_root=debug_root,
-            normalize=normalize,
-            skip_songs=skip_songs,
-            keep_lyrics=keep_lyrics,
             sdh=sdh,
-            diarize=diarize,
-            diarize_model=diarize_model,
-            voiceprints=capture_enabled,
-            voiceprint_model=voiceprint_model,
-            speaker_clustering=speaker_clustering,
             word_segments=word_segments,
-            asr_model=asr_model,
-            context=context,
             timestamps=timestamps,
             shot_snap=shot_snap,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
+            transcribe_source=transcribe_source,
         )
 
     if voiceprints and (not diarize or word_segments is not None):
@@ -1554,26 +1576,22 @@ def _process_from_source(
     *,
     source: _ProcessSource,
     lang_override: str | None = None,
-    separate: bool = True,
     reporter: Reporter | None = None,
-    debug: bool = False,
-    debug_root: Path | None = None,
-    normalize: bool = False,
-    skip_songs: bool = False,
-    keep_lyrics: bool = False,
     sdh: bool = False,
-    diarize: bool = False,
-    diarize_model: str | None = None,
-    voiceprints: bool = False,
-    voiceprint_model: str | None = None,
-    speaker_clustering: str | None = None,
     word_segments: tuple[str, list[dict]] | None = None,
-    asr_model: str | None = None,
-    context: str | None = None,
     timestamps: bool = True,
     shot_snap: bool = True,
-    min_speakers: int | None = None,
-    max_speakers: int | None = None,
+    transcribe_source: Callable[
+        [],
+        tuple[
+            str,
+            list[dict],
+            list[tuple[float, float]],
+            list[tuple[float, float]],
+            list[tuple[float, float, str]],
+            VoiceprintCapture | None,
+        ],
+    ],
 ) -> Path:
     """Execute one process run against the selected immutable/live source."""
     rep = reporter or Reporter()
@@ -1605,30 +1623,7 @@ def _process_from_source(
                 sing_spans,
                 speaker_turns,
                 _voiceprint_capture,
-            ) = transcribe(
-                source.path,
-                lang_override=lang_override,
-                separate=separate,
-                skip_songs=skip_songs,
-                keep_lyrics=keep_lyrics,
-                diarize=diarize,
-                diarize_model=diarize_model,
-                voiceprints=voiceprints,
-                voiceprint_model=voiceprint_model,
-                speaker_clustering=speaker_clustering,
-                normalize=normalize,
-                reporter=reporter,
-                debug=debug,
-                debug_root=debug_root,
-                cache_vocals=cache_vocals_path(media_path),
-                source_fingerprint=source.snapshot_fingerprint,
-                asr_model=asr_model,
-                context=context,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers,
-                # SDH reuses the successfully returned deferred PANNs owner.
-                release_panns=not sdh,
-            )
+            ) = transcribe_source()
             panns_handoff_owned = sdh
             sing_spans = sing_spans or None
             speaker_turns = speaker_turns or None
