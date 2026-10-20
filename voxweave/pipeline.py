@@ -2578,6 +2578,68 @@ def _stable_fact_digest(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# Per-cue (zh/yue Qwen) route planning: route every block to its audio window, then
+# crop each window. Every unusable route raises a canonical failure.
+def _plan_qwen_crops(
+    blocks: list[dict[str, Any]], word_segments: Any, json_path: Path
+) -> list[tuple[float, float] | None]:
+    has_ts = all(b["start"] is not None and b["end"] is not None for b in blocks)
+    if not has_ts and not word_segments:
+        untimed = sum(1 for b in blocks if b["start"] is None or b["end"] is None)
+        if untimed == len(blocks):
+            message = (
+                f"{json_path.name} has no word_segments and VTT has no timestamps; "
+                f"cannot route audio windows"
+            )
+        else:
+            message = (
+                f"{json_path.name} has no word_segments and {untimed} of "
+                f"{len(blocks)} VTT cues have no timestamps; cannot route audio "
+                f"windows (give every cue a timing line, or restore the sibling "
+                f"JSON's word_segments)"
+            )
+        exc = RuntimeError(message)
+        _attach_canonical_failure(
+            exc,
+            kind="qwen-route-invalid",
+            phase="route-plan",
+            detail_code="no-route-source",
+        )
+        raise exc
+    with align_runtime_activity("AO-03", "qwen-route-plan"):
+        try:
+            spans = realign.route_blocks(blocks, word_segments)
+            crops = realign.crop_blocks(spans)
+        except (IndexError, KeyError) as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="qwen-window-operation-failed",
+                phase="route-plan",
+                detail_code="route-bound-access",
+            )
+            raise
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="qwen-window-operation-failed",
+                phase="route-plan",
+                detail_code="route-bound-arithmetic",
+            )
+            raise
+    if all(c is None for c in crops):
+        exc = RuntimeError(
+            "routing failed: no alignable blocks (text completely mismatches word_segments?)"
+        )
+        _attach_canonical_failure(
+            exc,
+            kind="qwen-route-invalid",
+            phase="route-plan",
+            detail_code="all-crops-none",
+        )
+        raise exc
+    return crops
+
+
 def align(
     vtt_path: Path,
     *,
@@ -2735,60 +2797,7 @@ def align(
         tuple[float, float] | None
     ] = []  # set + looped only on the per-cue (zh·yue) path
     if not full_pass:
-        has_ts = all(b["start"] is not None and b["end"] is not None for b in blocks)
-        if not has_ts and not word_segments:
-            untimed = sum(1 for b in blocks if b["start"] is None or b["end"] is None)
-            if untimed == len(blocks):
-                message = (
-                    f"{json_path.name} has no word_segments and VTT has no timestamps; "
-                    f"cannot route audio windows"
-                )
-            else:
-                message = (
-                    f"{json_path.name} has no word_segments and {untimed} of "
-                    f"{len(blocks)} VTT cues have no timestamps; cannot route audio "
-                    f"windows (give every cue a timing line, or restore the sibling "
-                    f"JSON's word_segments)"
-                )
-            exc = RuntimeError(message)
-            _attach_canonical_failure(
-                exc,
-                kind="qwen-route-invalid",
-                phase="route-plan",
-                detail_code="no-route-source",
-            )
-            raise exc
-        with align_runtime_activity("AO-03", "qwen-route-plan"):
-            try:
-                spans = realign.route_blocks(blocks, word_segments)
-                crops = realign.crop_blocks(spans)
-            except (IndexError, KeyError) as exc:
-                _attach_canonical_failure(
-                    exc,
-                    kind="qwen-window-operation-failed",
-                    phase="route-plan",
-                    detail_code="route-bound-access",
-                )
-                raise
-            except (ArithmeticError, TypeError, ValueError) as exc:
-                _attach_canonical_failure(
-                    exc,
-                    kind="qwen-window-operation-failed",
-                    phase="route-plan",
-                    detail_code="route-bound-arithmetic",
-                )
-                raise
-        if all(c is None for c in crops):
-            exc = RuntimeError(
-                "routing failed: no alignable blocks (text completely mismatches word_segments?)"
-            )
-            _attach_canonical_failure(
-                exc,
-                kind="qwen-route-invalid",
-                phase="route-plan",
-                detail_code="all-crops-none",
-            )
-            raise exc
+        crops = _plan_qwen_crops(blocks, word_segments, json_path)
 
     tmp: list[Path] = []
     tmp_chunks: list[Path] = []
