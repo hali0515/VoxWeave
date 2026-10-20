@@ -157,37 +157,15 @@ def _print_list(data: dict[str, Any]) -> None:
     )
 
 
-def build_speakers_group(
-    run: Callable[..., Any], report: Callable[[str], None]
-) -> click.RichGroup:
-    """Build the speaker CLI using the application's error wrapper and service output."""
-
-    episode_type = click.Path(exists=False, dir_okay=False, path_type=Path)
-    voices_type = click.Path(exists=False, dir_okay=False, path_type=Path)
-    voices_dir_type = VoicesDirPath()
-
-    def library_kwargs(
-        voices: Path | None, voices_dir: Path | None
-    ) -> dict[str, Path | None]:
-        """Reject --voices with --voices-dir; pass --voices-dir only when given."""
-        if voices is not None and voices_dir is not None:
-            raise click.UsageError(
-                "use either --voices FILE (a per-show store) or --voices-dir DIR "
-                "(the voice library), not both"
-            )
-        return {} if voices_dir is None else {"voices_dir": voices_dir}
-
-    @click.group(
-        "speakers",
-        cls=SpeakersGroup,
-        short_help="Review speaker names and manage saved voices.",
-    )
-    def group() -> None:
-        """Review and name speakers, manage saved voices, or inspect an episode.
-
-        A bare EPISODE starts the audition service. Use Ctrl+C after saving.
-        """
-
+def _add_enroll_command(
+    group: click.Group,
+    run: Callable[..., Any],
+    library_kwargs: Callable[[Path | None, Path | None], dict[str, Path | None]],
+    episode_type: click.Path,
+    voices_type: click.Path,
+    voices_dir_type: VoicesDirPath,
+) -> click.Command:
+    # Registers `speakers enroll`; the parameters are the builder's shared closure values.
     @group.command("enroll", short_help="Save reviewed voices to the voice library.")
     @click.argument("episode_path", metavar="EPISODE", type=episode_type)
     @click.option(
@@ -249,6 +227,13 @@ def build_speakers_group(
         )
         click.echo(out)
 
+    return enroll_command
+
+
+def _add_purge_command(
+    group: click.Group, run: Callable[..., Any], episode_type: click.Path
+) -> click.Command:
+    # Registers `speakers purge`.
     @group.command("purge", short_help="Remove voice data; keep reviewed names.")
     @click.argument("episode_path", metavar="EPISODE", type=episode_type)
     def purge_command(episode_path: Path) -> None:
@@ -264,6 +249,22 @@ def build_speakers_group(
         for path in removed:
             click.echo(path)
 
+    return purge_command
+
+
+def _add_serve_command(
+    group: click.Group,
+    run: Callable[..., Any],
+    report: Callable[[str], None],
+    library_kwargs: Callable[[Path | None, Path | None], dict[str, Path | None]],
+    episode_type: click.Path,
+    voices_type: click.Path,
+    voices_dir_type: VoicesDirPath,
+    enroll_command: click.Command,
+    purge_command: click.Command,
+) -> click.Command:
+    # Registers `speakers serve`, the group's default command; the deprecated
+    # --enroll and --purge-voiceprints flags invoke the two commands passed in.
     @group.command("serve", short_help="Review speaker names in a local browser.")
     @click.argument("episode_path", metavar="EPISODE", type=episode_type)
     @click.option(
@@ -438,6 +439,13 @@ def build_speakers_group(
             reporter=False,
         )
 
+    return serve_command
+
+
+def _add_list_command(
+    group: click.Group, run: Callable[..., Any], episode_type: click.Path
+) -> click.Command:
+    # Registers `speakers list`.
     @group.command("list", short_help="Inspect saved speaker IDs, names, and turns.")
     @click.argument("episode_path", metavar="EPISODE", type=episode_type)
     @click.option(
@@ -450,6 +458,57 @@ def build_speakers_group(
             click.echo(json.dumps(data, ensure_ascii=False))
         else:
             _print_list(data)
+
+    return list_command
+
+
+def build_speakers_group(
+    run: Callable[..., Any], report: Callable[[str], None]
+) -> click.RichGroup:
+    """Build the speaker CLI using the application's error wrapper and service output."""
+
+    episode_type = click.Path(exists=False, dir_okay=False, path_type=Path)
+    voices_type = click.Path(exists=False, dir_okay=False, path_type=Path)
+    voices_dir_type = VoicesDirPath()
+
+    def library_kwargs(
+        voices: Path | None, voices_dir: Path | None
+    ) -> dict[str, Path | None]:
+        """Reject --voices with --voices-dir; pass --voices-dir only when given."""
+        if voices is not None and voices_dir is not None:
+            raise click.UsageError(
+                "use either --voices FILE (a per-show store) or --voices-dir DIR "
+                "(the voice library), not both"
+            )
+        return {} if voices_dir is None else {"voices_dir": voices_dir}
+
+    @click.group(
+        "speakers",
+        cls=SpeakersGroup,
+        short_help="Review speaker names and manage saved voices.",
+    )
+    def group() -> None:
+        """Review and name speakers, manage saved voices, or inspect an episode.
+
+        A bare EPISODE starts the audition service. Use Ctrl+C after saving.
+        """
+
+    enroll_command = _add_enroll_command(
+        group, run, library_kwargs, episode_type, voices_type, voices_dir_type
+    )
+    purge_command = _add_purge_command(group, run, episode_type)
+    serve_command = _add_serve_command(
+        group,
+        run,
+        report,
+        library_kwargs,
+        episode_type,
+        voices_type,
+        voices_dir_type,
+        enroll_command,
+        purge_command,
+    )
+    _add_list_command(group, run, episode_type)
 
     group.default_cmd = serve_command
     return group
