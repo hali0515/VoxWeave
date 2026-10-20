@@ -197,6 +197,8 @@ V2_ONLY_MODULES = (
     "voxweave.core.finalizer",
     "voxweave.core.finalizer_model",
     "voxweave.core.shadow_schema",
+    "voxweave.core.shadow_schema_fields",
+    "voxweave.core.shadow_schema_finalizer",
     "voxweave.core.speaker_evidence",
     "voxweave.core.subunit",
     "voxweave.core.partition_check",

@@ -165,6 +165,10 @@ def test_the_vad_state_enum_is_four_valued():
         "boundary_select",
         "boundary_interval",
         "partition_check",
+        "shadow_oracles",
+        "shadow_rows",
+        "shadow_schema_fields",
+        "shadow_schema_finalizer",
     ],
 )
 def test_no_module_reads_the_environment(module):

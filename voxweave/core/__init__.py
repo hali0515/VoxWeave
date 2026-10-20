@@ -62,6 +62,10 @@ imports ``voxweave.align_delta_registry``; ``finalizer`` lazily imports
   the TimelineFinalizer, its independent checks and sealed issuance.
 - ``shadow_v2`` / ``shadow_schema`` / ``shadow_lanes`` — the shadow lane, its
   artifact contract and the lane names both share.
+- ``shadow_oracles`` / ``shadow_rows`` — the lane's independent diff and preview
+  oracles, and the row builders for cues, streams and finalizer rows.
+- ``shadow_schema_fields`` / ``shadow_schema_finalizer`` — the schema's field
+  readers, and the finalizer row decode and replay.
 - ``align_seed`` / ``align_compare`` — P6 align seed construction and semantic
   comparison.
 """
