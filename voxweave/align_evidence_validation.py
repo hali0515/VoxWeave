@@ -60,13 +60,11 @@ from voxweave.align_snapshot import (
 )
 
 
-def _validate_work(
-    value: object,
-    route_plan: Mapping[str, Any],
-    physical_calls: Sequence[Mapping[str, Any]],
-    history: Mapping[str, Any],
-) -> dict[str, Any]:
-    work = _closed_mapping(value, _WORK_KEYS, "authority work")
+# Stage 1 of the authority work validation: the header fields, the route
+# mismatch record and the route claims.
+def _validate_work_header(
+    work: Mapping[str, Any],
+) -> tuple[Mapping[str, Any] | None, list[Any]]:
     if work["status"] not in _WORK_STATUSES:
         _invalid("authority work status is invalid")
     if work["route_status"] not in ("valid", "invalid"):
@@ -91,8 +89,16 @@ def _validate_work(
             _invalid("route claim owner kind is invalid")
         for name in _ROUTE_CLAIM_KEYS[1:]:
             _exact_int(claim[name], f"route claim {name}")
-    calls = _list(work["calls"], "authority work calls")
-    skips = _list(work["skipped_blocks"], "authority skipped blocks")
+    return mismatch, claims
+
+
+# Stage 2: the per-call rows. The raw node cursor and the lane counter sums
+# feed the checks after the skipped block rows, so they are returned.
+def _validate_work_calls(
+    calls: Sequence[Any],
+    physical_calls: Sequence[Mapping[str, Any]],
+    claims: Sequence[Any],
+) -> tuple[int, dict[str, int]]:
     if len(calls) != len(physical_calls):
         _invalid("work/physical call cardinality mismatch")
     raw_cursor = 0
@@ -160,6 +166,11 @@ def _validate_work(
             lane_totals[name] += allocator[name]
             if verifier is not None:
                 lane_totals[name] += verifier[name]
+    return raw_cursor, lane_totals
+
+
+# Stage 3: the skipped block rows.
+def _validate_work_skips(skips: Sequence[Any], claims: Sequence[Any]) -> None:
     for skip_index, member in enumerate(skips):
         row = _closed_mapping(member, _SKIP_KEYS, "authority skipped block")
         positions = _int_array(
@@ -183,6 +194,22 @@ def _validate_work(
             _invalid("skipped block shape is invalid")
         if any(_exact_int(row[name], f"skip {name}") for name in _COUNTER_KEYS):
             _invalid("skipped block carries work")
+
+
+# Stage 4: the route mismatch projection, the declared counts, the charged
+# call count, the limit profile, the totals, the terminal call index and the
+# denied charge.
+def _validate_work_totals(
+    work: Mapping[str, Any],
+    route_plan: Mapping[str, Any],
+    history: Mapping[str, Any],
+    claims: Sequence[Any],
+    calls: Sequence[Any],
+    skips: Sequence[Any],
+    mismatch: Mapping[str, Any] | None,
+    raw_cursor: int,
+    lane_totals: Mapping[str, int],
+) -> None:
     expected_mismatch = _project_route_mismatch(
         claims, route_plan["entries"], calls, skips
     )
@@ -233,6 +260,31 @@ def _validate_work(
             _invalid("not-run authority work carries charges")
         if any(row["verifier"] is not None for row in calls):
             _invalid("not-run authority work carries a verifier")
+
+
+def _validate_work(
+    value: object,
+    route_plan: Mapping[str, Any],
+    physical_calls: Sequence[Mapping[str, Any]],
+    history: Mapping[str, Any],
+) -> dict[str, Any]:
+    work = _closed_mapping(value, _WORK_KEYS, "authority work")
+    mismatch, claims = _validate_work_header(work)
+    calls = _list(work["calls"], "authority work calls")
+    skips = _list(work["skipped_blocks"], "authority skipped blocks")
+    raw_cursor, lane_totals = _validate_work_calls(calls, physical_calls, claims)
+    _validate_work_skips(skips, claims)
+    _validate_work_totals(
+        work,
+        route_plan,
+        history,
+        claims,
+        calls,
+        skips,
+        mismatch,
+        raw_cursor,
+        lane_totals,
+    )
     return work
 
 
