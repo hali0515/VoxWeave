@@ -383,6 +383,78 @@ class FreshAlignmentIssuer:
         """AO-07 callback: retain identity/length only; recurse only at sealing."""
         if self.sealed:
             raise RuntimeError("fresh acquisition issuer is already sealed")
+        raw_count = self._checked_raw_count(post_units, original_units)
+        sources = self._delivery_sources(source_indices)
+        call_index = len(self.observed)
+        raw_start = self.raw_cursor
+        raw_ids = tuple(
+            f"r{index}" for index in range(raw_start, raw_start + raw_count)
+        )
+        self.raw_cursor += raw_count
+
+        legacy_origin, rate, count, start, end, geometry_failure = (
+            self._resolve_sample_window(
+                legacy_origin_seconds,
+                audio_sample_start,
+                audio_sample_end,
+                sample_rate,
+                sample_count,
+            )
+        )
+        physical_origin = start / rate
+        if self.context.route_kind == "qwen-crop":
+            legacy_kind: Literal["identity", "sample-origin", "nominal-route"] = (
+                "nominal-route"
+            )
+            geometry_failure = self._nominal_route_failure(
+                geometry_failure,
+                legacy_origin,
+                nominal_end_seconds,
+                rate,
+                count,
+                start,
+                end,
+            )
+        elif start == 0 and legacy_origin == 0.0:
+            legacy_kind = "identity"
+        else:
+            legacy_kind = "sample-origin"
+            if physical_origin.hex() != legacy_origin.hex():
+                geometry_failure = StrictFailureLocator(
+                    "sample-geometry", None, "physical-origin-mismatch"
+                )
+
+        # Every call shares the issuer's validated source-fact digests.
+        model_digest = self.backend_model_config_digest
+        input_digest = self.route_input_digest
+        with align_runtime_activity("AO-07", "raw-id-and-call-observation"):
+            self.observed.append(
+                _ObservedPhysicalCall(
+                    call_index,
+                    sources,
+                    post_units,
+                    original_units,
+                    raw_ids,
+                    (raw_start, raw_start + raw_count),
+                    start,
+                    end,
+                    rate,
+                    count,
+                    physical_origin,
+                    legacy_origin,
+                    legacy_kind,
+                    physical_origin,
+                    model_digest,
+                    input_digest,
+                    geometry_failure,
+                )
+            )
+
+    # Stage 1 of the observation: both backend results must be sized.
+    @staticmethod
+    def _checked_raw_count(
+        post_units: Sequence[Any], original_units: Sequence[Any] | None
+    ) -> int:
         try:
             raw_count = len(post_units)
         except Exception as exc:
@@ -406,6 +478,10 @@ class FreshAlignmentIssuer:
                     detail_code="backend-call-shape",
                 )
                 raise classified from exc
+        return raw_count
+
+    # Stage 2: validate the delivery positions and map them to source indices.
+    def _delivery_sources(self, source_indices: Sequence[int]) -> tuple[int, ...]:
         source_positions = tuple(source_indices)
         if (
             not source_positions
@@ -419,13 +495,18 @@ class FreshAlignmentIssuer:
         sources = tuple(
             self.blocks[position].source_index for position in source_positions
         )
-        call_index = len(self.observed)
-        raw_start = self.raw_cursor
-        raw_ids = tuple(
-            f"r{index}" for index in range(raw_start, raw_start + raw_count)
-        )
-        self.raw_cursor += raw_count
+        return sources
 
+    # Stage 3: resolve origin, rate, count and the sample window. Each failed
+    # check overwrites the failure locator, so the last assignment wins.
+    def _resolve_sample_window(
+        self,
+        legacy_origin_seconds: float,
+        audio_sample_start: int | None,
+        audio_sample_end: int | None,
+        sample_rate: int | None,
+        sample_count: int | None,
+    ) -> tuple[float, int, int, int, int, StrictFailureLocator | None]:
         rate = self.sample_rate if sample_rate is None else sample_rate
         count = (
             self.prepared_audio_sample_count if sample_count is None else sample_count
@@ -475,66 +556,42 @@ class FreshAlignmentIssuer:
             )
             start = 0
             end = 0
-        physical_origin = start / rate
-        if self.context.route_kind == "qwen-crop":
-            legacy_kind: Literal["identity", "sample-origin", "nominal-route"] = (
-                "nominal-route"
+        return legacy_origin, rate, count, start, end, geometry_failure
+
+    # Stage 4 (Qwen crop route): compare the observed window with the nominal
+    # route geometry. Returns the incoming failure unless a check replaces it.
+    @staticmethod
+    def _nominal_route_failure(
+        geometry_failure: StrictFailureLocator | None,
+        legacy_origin: float,
+        nominal_end_seconds: float | None,
+        rate: int,
+        count: int,
+        start: int,
+        end: int,
+    ) -> StrictFailureLocator | None:
+        if nominal_end_seconds is None:
+            geometry_failure = StrictFailureLocator(
+                "sample-geometry", None, "sample-geometry"
             )
-            if nominal_end_seconds is None:
+        else:
+            try:
+                expected = qwen_sample_geometry(
+                    nominal_start=legacy_origin,
+                    nominal_end=nominal_end_seconds,
+                    sample_rate=rate,
+                    sample_count=count,
+                )
+            except SampleGeometryError:
                 geometry_failure = StrictFailureLocator(
                     "sample-geometry", None, "sample-geometry"
                 )
             else:
-                try:
-                    expected = qwen_sample_geometry(
-                        nominal_start=legacy_origin,
-                        nominal_end=nominal_end_seconds,
-                        sample_rate=rate,
-                        sample_count=count,
-                    )
-                except SampleGeometryError:
+                if expected.sample_start != start or expected.sample_end != end:
                     geometry_failure = StrictFailureLocator(
-                        "sample-geometry", None, "sample-geometry"
+                        "sample-geometry", None, "physical-origin-mismatch"
                     )
-                else:
-                    if expected.sample_start != start or expected.sample_end != end:
-                        geometry_failure = StrictFailureLocator(
-                            "sample-geometry", None, "physical-origin-mismatch"
-                        )
-        elif start == 0 and legacy_origin == 0.0:
-            legacy_kind = "identity"
-        else:
-            legacy_kind = "sample-origin"
-            if physical_origin.hex() != legacy_origin.hex():
-                geometry_failure = StrictFailureLocator(
-                    "sample-geometry", None, "physical-origin-mismatch"
-                )
-
-        # Every call shares the issuer's validated source-fact digests.
-        model_digest = self.backend_model_config_digest
-        input_digest = self.route_input_digest
-        with align_runtime_activity("AO-07", "raw-id-and-call-observation"):
-            self.observed.append(
-                _ObservedPhysicalCall(
-                    call_index,
-                    sources,
-                    post_units,
-                    original_units,
-                    raw_ids,
-                    (raw_start, raw_start + raw_count),
-                    start,
-                    end,
-                    rate,
-                    count,
-                    physical_origin,
-                    legacy_origin,
-                    legacy_kind,
-                    physical_origin,
-                    model_digest,
-                    input_digest,
-                    geometry_failure,
-                )
-            )
+        return geometry_failure
 
     def _invoke_backend_call(self, backend_call: Callable[[], Any]) -> Any:
         """Preserve a backend exception while attaching its closed classification."""
