@@ -259,6 +259,18 @@ class _ProcessPublication:
     auxiliary_landed: tuple[Path, ...] = ()
 
 
+@dataclass(frozen=True)
+class _ProcessSource:
+    """The sealed identity of one process run's source and sibling generations."""
+
+    path: Path
+    snapshot_fingerprint: str | None
+    expected_json: episode_transaction.FileGeneration
+    expected_vtt: episode_transaction.FileGeneration
+    expected_media_fingerprint: str | None
+    mode: episode_transaction.ProcessSourceMode
+
+
 def _attach_canonical_failure(
     exc: BaseException,
     *,
@@ -1414,14 +1426,19 @@ def process(
         assert expected_json is not None
         assert expected_vtt is not None
         assert source_mode is not None
-        return _process_from_source(
-            media_path,
-            source_path=source_path,
+        # Built at call time: expected_json, expected_vtt, expected_media and
+        # source_mode are assigned after this closure is defined.
+        source = _ProcessSource(
+            path=source_path,
             snapshot_fingerprint=snapshot_fingerprint,
             expected_json=expected_json,
             expected_vtt=expected_vtt,
             expected_media_fingerprint=expected_media,
-            source_mode=source_mode,
+            mode=source_mode,
+        )
+        return _process_from_source(
+            media_path,
+            source=source,
             lang_override=lang_override,
             separate=separate,
             reporter=rep,
@@ -1535,12 +1552,7 @@ def process(
 def _process_from_source(
     media_path: Path,
     *,
-    source_path: Path,
-    snapshot_fingerprint: str | None,
-    expected_json: episode_transaction.FileGeneration,
-    expected_vtt: episode_transaction.FileGeneration,
-    expected_media_fingerprint: str | None,
-    source_mode: episode_transaction.ProcessSourceMode,
+    source: _ProcessSource,
     lang_override: str | None = None,
     separate: bool = True,
     reporter: Reporter | None = None,
@@ -1585,7 +1597,7 @@ def _process_from_source(
 
                 # CPU-only ffmpeg pass: start it now so it overlaps the GPU stages
                 # and collect it at the "detect shot changes" step afterwards.
-                shot_job = shotdet.ShotDetectionJob().start(source_path)
+                shot_job = shotdet.ShotDetectionJob().start(source.path)
             (
                 iso,
                 units,
@@ -1594,7 +1606,7 @@ def _process_from_source(
                 speaker_turns,
                 _voiceprint_capture,
             ) = transcribe(
-                source_path,
+                source.path,
                 lang_override=lang_override,
                 separate=separate,
                 skip_songs=skip_songs,
@@ -1609,7 +1621,7 @@ def _process_from_source(
                 debug=debug,
                 debug_root=debug_root,
                 cache_vocals=cache_vocals_path(media_path),
-                source_fingerprint=snapshot_fingerprint,
+                source_fingerprint=source.snapshot_fingerprint,
                 asr_model=asr_model,
                 context=context,
                 min_speakers=min_speakers,
@@ -1639,11 +1651,7 @@ def _process_from_source(
             speaker_turns=speaker_turns,
             timestamps=timestamps,
             capture=_voiceprint_capture,
-            snapshot_fingerprint=snapshot_fingerprint,
-            expected_json=expected_json,
-            expected_vtt=expected_vtt,
-            expected_media_fingerprint=expected_media_fingerprint,
-            source_mode=source_mode,
+            source=source,
             sdh_enabled=sdh,
         )
     except BaseException as primary:
@@ -1686,11 +1694,7 @@ def _finish_process_from_units(
     speaker_turns: list[tuple[float, float, str]] | None,
     timestamps: bool,
     capture: VoiceprintCapture | None,
-    snapshot_fingerprint: str | None,
-    expected_json: episode_transaction.FileGeneration,
-    expected_vtt: episode_transaction.FileGeneration,
-    expected_media_fingerprint: str | None,
-    source_mode: episode_transaction.ProcessSourceMode,
+    source: _ProcessSource,
     sdh_enabled: bool,
 ) -> _ProcessPublication:
     """Finish segmentation and publication after source ownership is sealed."""
@@ -1717,22 +1721,22 @@ def _finish_process_from_units(
 
     voiceprint_pair: tuple[str, str] | None = None
     machine_artifact: episode_transaction.MachineArtifactPublication | None = None
-    if capture is not None and snapshot_fingerprint is not None:
+    if capture is not None and source.snapshot_fingerprint is not None:
         capture_id = mint_capture_id(
-            current=_voiceprint_capture_from_generation(expected_json)
+            current=_voiceprint_capture_from_generation(source.expected_json)
         )
         try:
             sidecar = _voiceprints_document(
                 media_path,
                 capture,
                 capture_id=capture_id,
-                source_fingerprint=snapshot_fingerprint,
+                source_fingerprint=source.snapshot_fingerprint,
             )
             sidecar_bytes = encode_json_bytes(sidecar, max_bytes=VOICEPRINTS_MAX_BYTES)
         except Phase2DataError as exc:
             log.warning("voiceprint capture dropped: %s", exc)
         else:
-            voiceprint_pair = (capture_id, snapshot_fingerprint)
+            voiceprint_pair = (capture_id, source.snapshot_fingerprint)
             machine_artifact = episode_transaction.MachineArtifactPublication(
                 voiceprints_path(media_path), sidecar_bytes
             )
@@ -1755,9 +1759,9 @@ def _finish_process_from_units(
         voiceprint_pair=voiceprint_pair,
         timestamps=timestamps,
         speaker_names=(),
-        expected_json=expected_json,
-        expected_vtt=expected_vtt,
-        source_mode=source_mode,
+        expected_json=source.expected_json,
+        expected_vtt=source.expected_vtt,
+        source_mode=source.mode,
         mapping_generation=None,
         mapping_path=None,
         shadow_enabled=shadow_enabled(),
@@ -1776,14 +1780,16 @@ def _finish_process_from_units(
             episode_path=media_path,
             json_path=swap_ext(media_path, ".json"),
             vtt_path=swap_ext(media_path, ".vtt"),
-            expected_json=expected_json,
-            expected_vtt=expected_vtt,
+            expected_json=source.expected_json,
+            expected_vtt=source.expected_vtt,
             main_json_bytes=selection.verified.main_json_bytes,
             vtt_bytes=selection.verified.vtt_bytes,
             cleanup_paths=tuple(cleanup),
             context=selection.context,
-            media_path=(media_path if expected_media_fingerprint is not None else None),
-            expected_media_fingerprint=expected_media_fingerprint,
+            media_path=(
+                media_path if source.expected_media_fingerprint is not None else None
+            ),
+            expected_media_fingerprint=source.expected_media_fingerprint,
             machine_artifact=machine_artifact,
         )
     finally:
@@ -1794,9 +1800,9 @@ def _finish_process_from_units(
     if machine_artifact is not None:
         log.info("wrote voice-biometric sidecar %s", machine_artifact.path.name)
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
-    _warn_stale_speaker_names(media_path, expected_json, speaker_turns)
+    _warn_stale_speaker_names(media_path, source.expected_json, speaker_turns)
     auxiliary_landed: tuple[Path, ...] = ()
-    if sdh_enabled and source_mode == "transcribed-media":
+    if sdh_enabled and source.mode == "transcribed-media":
         rep.step("create SDH sidecar")
         committed_json = episode_transaction.capture_file_generation(
             swap_ext(media_path, ".json")
@@ -1809,7 +1815,7 @@ def _finish_process_from_units(
                 rep,
                 expected_json_generation=committed_json,
                 expected_vtt_generation=committed_vtt,
-                expected_media_fingerprint=expected_media_fingerprint,
+                expected_media_fingerprint=source.expected_media_fingerprint,
             )
             if sidecar is not None:
                 auxiliary_landed = (sidecar,)
