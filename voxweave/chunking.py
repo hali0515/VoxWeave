@@ -69,6 +69,59 @@ def pack_speech_segments(segments: list[dict], max_sec: float) -> list[dict]:
     return chunks
 
 
+class _CueTimeline:
+    """Cue time bounds (``None`` = timestamp-less cue) plus the anchors derived from them."""
+
+    def __init__(
+        self, bounds: Sequence[tuple[float, float] | None], n: int, pad_sec: float
+    ) -> None:
+        self.bounds = bounds
+        self.n = n
+        self.pad_sec = pad_sec
+
+    def start(self, i: int) -> float | None:
+        b = self.bounds[i]
+        return b[0] if b is not None else None
+
+    def end(self, i: int) -> float | None:
+        b = self.bounds[i]
+        return b[1] if b is not None else None
+
+    def first_start(self, i: int) -> float | None:
+        for k in range(i, self.n):
+            if (s := self.start(k)) is not None:
+                return s
+        return None
+
+    def last_end(self, i: int) -> float | None:
+        for k in range(self.n - 1, i - 1, -1):
+            if (e := self.end(k)) is not None:
+                return e
+        return None
+
+    def gap(self, c: int) -> float | None:
+        e, s = self.end(c), self.start(c + 1)
+        return None if e is None or s is None else s - e
+
+    def split_time(self, c: int) -> float:
+        # midpoint of the gap after cue c; if next cue has no timestamp, pad past cue c's end
+        e, s = self.end(c), self.start(c + 1)
+        if e is None:  # cut cue has no end (pathological): fall back to next known end
+            e = next(
+                (self.end(k) for k in range(c, self.n) if self.end(k) is not None),
+                None,
+            )
+        if e is None:
+            return self.last_end(0) or 0.0
+        return e + self.pad_sec if s is None else (e + s) / 2.0
+
+    def crop_start(self, lo: int) -> float:
+        # left edge of the crop of the chunk starting at cue lo (what the budget measures from)
+        if lo > 0:
+            return self.split_time(lo - 1)
+        return max(0.0, (self.first_start(lo) or 0.0) - self.pad_sec)
+
+
 def plan_dp_chunks(
     bounds: Sequence[tuple[float, float] | None],
     *,
@@ -107,44 +160,7 @@ def plan_dp_chunks(
     if n == 0:
         return []
 
-    def _start(i: int) -> float | None:
-        b = bounds[i]
-        return b[0] if b is not None else None
-
-    def _end(i: int) -> float | None:
-        b = bounds[i]
-        return b[1] if b is not None else None
-
-    def _first_start(i: int) -> float | None:
-        for k in range(i, n):
-            if (s := _start(k)) is not None:
-                return s
-        return None
-
-    def _last_end(i: int) -> float | None:
-        for k in range(n - 1, i - 1, -1):
-            if (e := _end(k)) is not None:
-                return e
-        return None
-
-    def _gap(c: int) -> float | None:
-        e, s = _end(c), _start(c + 1)
-        return None if e is None or s is None else s - e
-
-    def _split_time(c: int) -> float:
-        # midpoint of the gap after cue c; if next cue has no timestamp, pad past cue c's end
-        e, s = _end(c), _start(c + 1)
-        if e is None:  # cut cue has no end (pathological): fall back to next known end
-            e = next((_end(k) for k in range(c, n) if _end(k) is not None), None)
-        if e is None:
-            return _last_end(0) or 0.0
-        return e + pad_sec if s is None else (e + s) / 2.0
-
-    def _crop_start(lo: int) -> float:
-        # left edge of the crop of the chunk starting at cue lo (what the budget measures from)
-        if lo > 0:
-            return _split_time(lo - 1)
-        return max(0.0, (_first_start(lo) or 0.0) - pad_sec)
+    tl = _CueTimeline(bounds, n, pad_sec)
 
     def _tail_end(last: float) -> float:
         # tightest right edge of a final chunk: pad_sec past its last cue, capped at audio_end
@@ -153,25 +169,25 @@ def plan_dp_chunks(
     cuts: list[int] = []  # split AFTER cue index c
     i = 0
     while True:
-        cstart = _first_start(i)
-        rem_end = _last_end(i)
+        cstart = tl.first_start(i)
+        rem_end = tl.last_end(i)
         if cstart is None or rem_end is None:
             break
-        crop_start = _crop_start(i)
+        crop_start = tl.crop_start(i)
         if _tail_end(rem_end) - crop_start <= max_sec:
             break  # remaining cues fit in one final chunk
         last_any: int | None = None
         last_gap: int | None = None
         for k in range(i, n - 1):
-            ek = _end(k)
+            ek = tl.end(k)
             if ek is None:
                 continue
             if ek - crop_start > max_sec:
                 break
-            if _split_time(k) - crop_start > max_sec:
+            if tl.split_time(k) - crop_start > max_sec:
                 continue  # the crop would run to the gap midpoint after cue k
             last_any = k
-            g = _gap(k)
+            g = tl.gap(k)
             if g is not None and g >= min_gap_sec:
                 last_gap = k
         chosen = last_gap if last_gap is not None else last_any
@@ -185,14 +201,16 @@ def plan_dp_chunks(
     edges = [0, *[c + 1 for c in cuts], n]
     chunks: list[dict] = []
     for lo, hi in zip(edges, edges[1:]):
-        start = _crop_start(lo)
+        start = tl.crop_start(lo)
         if hi < n:
-            end = _split_time(hi - 1)
+            end = tl.split_time(hi - 1)
         else:
             end = (
-                audio_end if audio_end is not None else (_last_end(lo) or 0.0) + pad_sec
+                audio_end
+                if audio_end is not None
+                else (tl.last_end(lo) or 0.0) + pad_sec
             )
-            last = _last_end(lo)
+            last = tl.last_end(lo)
             if last is not None and end - start > max_sec:
                 # trailing audio past the last cue would blow the budget: stop pad_sec after it
                 end = _tail_end(last)
