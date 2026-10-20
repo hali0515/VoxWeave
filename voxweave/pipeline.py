@@ -2493,6 +2493,91 @@ def resolve_align_route(mms: bool, ctc_model: str | None) -> AlignRoute:
     )
 
 
+# Builds the per-block dicts that every align route consumes, in delivery order.
+# input_snapshot is a voxweave.align_snapshot.AlignSnapshot (imported lazily by align).
+def _align_blocks_from_snapshot(
+    input_snapshot: Any, delivery_order: tuple[int, ...]
+) -> list[dict[str, Any]]:
+    bounds_by_source = {
+        bound.source_index: bound for bound in input_snapshot.route_bounds
+    }
+    blocks: list[dict[str, Any]] = []
+    for source_index in delivery_order:
+        content = input_snapshot.blocks[source_index]
+        bound = bounds_by_source[source_index]
+        blocks.append(
+            {
+                "text": content.text,
+                "alignment_text": content.alignment_text,
+                "start": bound.start,
+                "end": bound.end,
+                "lyric": content.lyric,
+                "speaker": content.speaker,
+                "speakers": (
+                    None if content.speakers is None else list(content.speakers)
+                ),
+                "source_index": content.source_index,
+            }
+        )
+    return blocks
+
+
+# Reads the prepared 16k wav geometry (sample rate, sample count); unavailable
+# geometry falls back to (16_000, 0) so the sealed facts mark it invalid.
+def _prepared_audio_geometry(wav: Path) -> tuple[int, int]:
+    try:
+        import soundfile as sf
+
+        prepared_info = sf.info(str(wav))
+        prepared_sample_rate = int(prepared_info.samplerate)
+        prepared_sample_count = int(prepared_info.frames)
+    except Exception:  # noqa: BLE001 - unavailable geometry is sealed as invalid
+        prepared_sample_rate = 16_000
+        prepared_sample_count = 0
+    return prepared_sample_rate, prepared_sample_count
+
+
+# Route facts whose stable digest becomes route_input_digest. Floats are hex
+# encoded so the digest does not depend on decimal formatting.
+def _align_route_facts(
+    route_kind: str,
+    iso: str,
+    blocks: list[dict[str, Any]],
+    crops: list[tuple[float, float] | None],
+) -> dict[str, Any]:
+    route_facts = {
+        "route": route_kind,
+        "language": iso,
+        "blocks": [
+            {
+                "source_index": block["source_index"],
+                "alignment_text": block["alignment_text"],
+                "start": (
+                    None if block["start"] is None else float(block["start"]).hex()
+                ),
+                "end": (None if block["end"] is None else float(block["end"]).hex()),
+            }
+            for block in blocks
+        ],
+        "crops": [
+            None if crop is None else [float(crop[0]).hex(), float(crop[1]).hex()]
+            for crop in crops
+        ],
+    }
+    return route_facts
+
+
+def _stable_fact_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def align(
     vtt_path: Path,
     *,
@@ -2645,27 +2730,7 @@ def align(
         if full_pass
         else input_snapshot.qwen_delivery_order
     )
-    bounds_by_source = {
-        bound.source_index: bound for bound in input_snapshot.route_bounds
-    }
-    blocks: list[dict[str, Any]] = []
-    for source_index in delivery_order:
-        content = input_snapshot.blocks[source_index]
-        bound = bounds_by_source[source_index]
-        blocks.append(
-            {
-                "text": content.text,
-                "alignment_text": content.alignment_text,
-                "start": bound.start,
-                "end": bound.end,
-                "lyric": content.lyric,
-                "speaker": content.speaker,
-                "speakers": (
-                    None if content.speakers is None else list(content.speakers)
-                ),
-                "source_index": content.source_index,
-            }
-        )
+    blocks = _align_blocks_from_snapshot(input_snapshot, delivery_order)
     crops: list[
         tuple[float, float] | None
     ] = []  # set + looped only on the per-cue (zh·yue) path
@@ -2864,15 +2929,7 @@ def align(
                 seal_fresh_alignment,
             )
 
-            try:
-                import soundfile as sf
-
-                prepared_info = sf.info(str(wav))
-                prepared_sample_rate = int(prepared_info.samplerate)
-                prepared_sample_count = int(prepared_info.frames)
-            except Exception:  # noqa: BLE001 - unavailable geometry is sealed as invalid
-                prepared_sample_rate = 16_000
-                prepared_sample_count = 0
+            prepared_sample_rate, prepared_sample_count = _prepared_audio_geometry(wav)
 
             model_facts = {
                 "route": route_kind,
@@ -2881,41 +2938,7 @@ def align(
                 "model": align_route.model_label(backend.ALIGNER_MODEL),
                 "sample_rate": prepared_sample_rate,
             }
-            route_facts = {
-                "route": route_kind,
-                "language": iso,
-                "blocks": [
-                    {
-                        "source_index": block["source_index"],
-                        "alignment_text": block["alignment_text"],
-                        "start": (
-                            None
-                            if block["start"] is None
-                            else float(block["start"]).hex()
-                        ),
-                        "end": (
-                            None if block["end"] is None else float(block["end"]).hex()
-                        ),
-                    }
-                    for block in blocks
-                ],
-                "crops": [
-                    None
-                    if crop is None
-                    else [float(crop[0]).hex(), float(crop[1]).hex()]
-                    for crop in crops
-                ],
-            }
-
-            def stable_fact_digest(value: object) -> str:
-                encoded = json.dumps(
-                    value,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                return hashlib.sha256(encoded).hexdigest()
+            route_facts = _align_route_facts(route_kind, iso, blocks, crops)
 
             with align_runtime_activity("AO-05", "acquisition-authorization"):
                 fresh_session = begin_fresh_alignment(
@@ -2931,8 +2954,8 @@ def align(
                     language=iso,
                     prepared_audio_sample_count=prepared_sample_count,
                     sample_rate=prepared_sample_rate,
-                    backend_model_config_digest=stable_fact_digest(model_facts),
-                    route_input_digest=stable_fact_digest(route_facts),
+                    backend_model_config_digest=_stable_fact_digest(model_facts),
+                    route_input_digest=_stable_fact_digest(route_facts),
                     backend_model_config_facts=model_facts,
                     route_input_facts=route_facts,
                 )
