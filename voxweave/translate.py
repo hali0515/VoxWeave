@@ -456,7 +456,9 @@ def _make_client(base_url: str | None, api_key: str | None):
         ) from e
     base_url = config.resolve_llm_base_url(base_url)
     key_env = config.resolve_llm_api_key_env(None)
-    key = api_key or ("EMPTY" if key_env == "" else os.environ.get(key_env))
+    key = api_key or (
+        config.KEYLESS_API_KEY if key_env == "" else os.environ.get(key_env)
+    )
     if not key:
         raise RuntimeError(
             f"{key_env} is not set; pass api_key= or set the {key_env} environment "

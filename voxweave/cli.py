@@ -148,9 +148,7 @@ def _llm_model_help(task: str, task_envvar: str) -> str:
     )
 
 
-# Sent as the bearer token when the endpoint is declared keyless (api_key_env = "").
-# The OpenAI client refuses an empty key; vLLM and friends ignore the value.
-_KEYLESS_API_KEY = "EMPTY"
+_KEYLESS_API_KEY = config.KEYLESS_API_KEY
 
 
 def _resolve_llm(

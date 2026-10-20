@@ -484,6 +484,11 @@ def resolve_llm_base_url(cli_value: str | None) -> str | None:
     )
 
 
+# Sent as the bearer token when the endpoint is declared keyless (api_key_env = "").
+# The OpenAI client refuses an empty key; vLLM and friends ignore the value.
+KEYLESS_API_KEY = "EMPTY"
+
+
 def resolve_llm_api_key_env(cli_value: str | None) -> str:
     """Name of the env var holding the LLM API key. Precedence: CLI value > conf
     ``[llm].api_key_env`` > :data:`DEFAULT_LLM_API_KEY_ENV`. An empty string
