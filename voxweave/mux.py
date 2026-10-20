@@ -432,7 +432,9 @@ def _muxer_args(out: Path, container: str) -> list[str]:
 def _packed_sub_codec(sub: Path, container: str) -> str:
     """Codec for an appended subtitle input: mkv stores ASS/SSA natively (keeps
     styling); everything else transcodes to the container's text codec."""
-    if container == "mkv" and Path(sub).suffix.lower() in (".ass", ".ssa"):
+    from voxweave.subformats import is_ass_path
+
+    if container == "mkv" and is_ass_path(sub):
         return "ass"
     return SUB_CODEC[container]
 
@@ -540,7 +542,9 @@ def build_pack_cmd(
             cmd += [f"-c:s:{kept_subs + i}", _packed_sub_codec(vtt, container)]
     else:
         cmd += ["-c:s", sub_codec]  # every kept text sub must be transcoded anyway
-        if any(Path(v).suffix.lower() in (".ass", ".ssa") for v in vtts):
+        from voxweave.subformats import is_ass_path
+
+        if any(is_ass_path(v) for v in vtts):
             logger.warning(
                 "ASS styling is lost when packing into %s (stored as %s)",
                 container,
@@ -1024,10 +1028,10 @@ def burn(
     than the source. The container is mp4 unless ``container`` or an mkv
     ``output`` name says otherwise."""
     from voxweave.export import _timed_rows, ass_header, render_ass
-    from voxweave.subformats import require_subtitle
+    from voxweave.subformats import is_ass_path, require_subtitle
 
     rep = reporter or Reporter()
-    native_ass = Path(vtt).suffix.lower() in (".ass", ".ssa")
+    native_ass = is_ass_path(vtt)
     steps = ["check inputs", "select encoder"]
     if not native_ass:
         steps.append("prepare subtitles")

@@ -326,6 +326,11 @@ def sniff_format(text: str) -> str | None:
     return None
 
 
+def is_ass_path(path: str | Path) -> bool:
+    """True when ``path`` has an ASS/SSA extension (case-insensitive)."""
+    return Path(path).suffix.lower() in (".ass", ".ssa")
+
+
 def load_subtitle_blocks_bytes(
     path: Path, data: bytes, *, ass_events: bool = False
 ) -> list[dict]:
@@ -335,7 +340,7 @@ def load_subtitle_blocks_bytes(
     """
     p = require_subtitle(path)
     text = decode_subtitle_bytes(data, p.name)
-    is_ass = p.suffix.lower() in (".ass", ".ssa")
+    is_ass = is_ass_path(p)
     sniffed = sniff_format(text)
     if sniffed is not None and (sniffed == "ass") != is_ass:
         actual = "ASS/SSA" if sniffed == "ass" else "WebVTT"
