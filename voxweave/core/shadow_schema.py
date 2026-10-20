@@ -2273,21 +2273,10 @@ def _residual_block(artifact: Mapping[str, Any], errors: list[str]) -> None:
         errors.append("policy_deltas: differs from the live policy-2 declaration")
 
 
-def validate_shadow_v2_payload(
-    artifact: Mapping[str, Any], *, require_version: bool = True
-) -> list[str]:
-    """Return every structural reason ``artifact`` cannot claim live schema 2."""
-    errors: list[str] = []
-    _closed(artifact, TOP_LEVEL_KEYS, "artifact", errors)
-    if require_version and artifact.get("schema_version") != LIVE_SHADOW_SCHEMA_VERSION:
-        errors.append(
-            f"schema_version: expected {LIVE_SHADOW_SCHEMA_VERSION}, got {artifact.get('schema_version')!r}"
-        )
-    if artifact.get("kind") != "segmentation-shadow":
-        errors.append("kind: expected 'segmentation-shadow'")
-
-    coverage = _mapping(artifact.get("coverage"), "coverage", errors)
-    totals = _mapping(artifact.get("totals"), "totals", errors)
+# Section 2a: the coverage block; returns the declared unit count.
+def _coverage_block(
+    coverage: Mapping[str, Any] | None, errors: list[str]
+) -> int | None:
     unit_count: int | None = None
     if coverage is not None:
         _closed(coverage, _COVERAGE_KEYS, "coverage", errors)
@@ -2319,6 +2308,16 @@ def validate_shadow_v2_payload(
             "coverage.fallback_unit_ranges",
             errors,
         )
+    return unit_count
+
+
+# Section 2b: the totals block against coverage and the raw serialized intervals.
+def _totals_block(
+    totals: Mapping[str, Any] | None,
+    coverage: Mapping[str, Any] | None,
+    artifact: Mapping[str, Any],
+    errors: list[str],
+) -> None:
     if totals is not None:
         _closed(totals, _TOTAL_KEYS, "totals", errors)
         for key in _TOTAL_KEYS - {"optimized_unit_ratio", "waivers"}:
@@ -2341,6 +2340,11 @@ def validate_shadow_v2_payload(
         ):
             errors.append("totals.interval_count: disagrees with serialized intervals")
 
+
+# Sections 3 and 4: source units against the declared count, and the display profile.
+def _units_and_profile(
+    artifact: Mapping[str, Any], unit_count: int | None, errors: list[str]
+) -> tuple[list[Any] | None, Any | None]:
     source_units = _source_units(artifact.get("units"), "units", errors)
     if (
         source_units is not None
@@ -2351,9 +2355,13 @@ def validate_shadow_v2_payload(
             f"units: expected coverage.unit_count {unit_count}, got {len(source_units)}"
         )
     profile_value = _display_profile(artifact.get("profile"), "profile", errors)
+    return source_units, profile_value
 
-    intervals = _list(artifact.get("intervals"), "intervals", errors)
-    validator = _mapping(artifact.get("validator"), "validator", errors)
+
+# Section 5b: the validator summary fields (the per-stage blocks come later).
+def _validator_summary_block(
+    validator: Mapping[str, Any] | None, errors: list[str]
+) -> None:
     if validator is not None:
         _closed(validator, _VALIDATOR_KEYS, "validator", errors)
         if not isinstance(validator.get("interval_document_agree"), bool):
@@ -2366,26 +2374,17 @@ def validate_shadow_v2_payload(
         if not isinstance(validator.get("raw_duplicate_v1_cues"), bool):
             errors.append("validator.raw_duplicate_v1_cues: expected boolean")
 
-    raw_row = _stream_row(
-        artifact.get("raw"),
-        unit_count=unit_count,
-        units=source_units,
-        profile=profile_value,
-        path="raw",
-        errors=errors,
-        validator_stage="raw",
-        validator_origins=frozenset({"v2"}),
-    )
-    lanes, final_rows = _lanes(
-        artifact.get("lanes"),
-        unit_count=unit_count,
-        units=source_units,
-        profile=profile_value,
-        errors=errors,
-    )
-    core_v2 = _lane_row(lanes, LANE_CORE, "v2")
-    legacy_v2 = _lane_row(lanes, LANE_LEGACY, "v2")
-    final_v2 = _lane_row(lanes, LANE_FINALIZER, "v2")
+
+# Section 7: validator stage blocks, then their agreement with the rows.
+def _validator_alias_block(
+    validator: Mapping[str, Any] | None,
+    raw_row: Mapping[str, Any] | None,
+    core_v2: Mapping[str, Any] | None,
+    legacy_v2: Mapping[str, Any] | None,
+    final_v2: Mapping[str, Any] | None,
+    unit_count: int | None,
+    errors: list[str],
+) -> None:
     if validator is not None:
         for key, stage, row in (
             ("raw", "raw", raw_row),
@@ -2410,6 +2409,12 @@ def validate_shadow_v2_payload(
         ):
             if row is not None and validator.get(key) != row.get("validator"):
                 errors.append(f"validator.{key}: disagrees with {row_path}.validator")
+
+
+# Section 8: the finalizer alias and the invalid finalizer row list.
+def _finalizer_alias_block(
+    artifact: Mapping[str, Any], final_rows: Mapping[str, Any] | None, errors: list[str]
+) -> None:
     if final_rows is not None:
         v2 = final_rows.get("v2")
         if isinstance(v2, Mapping):
@@ -2424,6 +2429,55 @@ def validate_shadow_v2_payload(
         ]
         if artifact.get("invalid_finalizer_rows") != invalid:
             errors.append("invalid_finalizer_rows: disagrees with materialized rows")
+
+
+def validate_shadow_v2_payload(
+    artifact: Mapping[str, Any], *, require_version: bool = True
+) -> list[str]:
+    """Return every structural reason ``artifact`` cannot claim live schema 2."""
+    errors: list[str] = []
+    _closed(artifact, TOP_LEVEL_KEYS, "artifact", errors)
+    if require_version and artifact.get("schema_version") != LIVE_SHADOW_SCHEMA_VERSION:
+        errors.append(
+            f"schema_version: expected {LIVE_SHADOW_SCHEMA_VERSION}, got {artifact.get('schema_version')!r}"
+        )
+    if artifact.get("kind") != "segmentation-shadow":
+        errors.append("kind: expected 'segmentation-shadow'")
+
+    coverage = _mapping(artifact.get("coverage"), "coverage", errors)
+    totals = _mapping(artifact.get("totals"), "totals", errors)
+    unit_count = _coverage_block(coverage, errors)
+    _totals_block(totals, coverage, artifact, errors)
+    source_units, profile_value = _units_and_profile(artifact, unit_count, errors)
+
+    intervals = _list(artifact.get("intervals"), "intervals", errors)
+    validator = _mapping(artifact.get("validator"), "validator", errors)
+    _validator_summary_block(validator, errors)
+
+    raw_row = _stream_row(
+        artifact.get("raw"),
+        unit_count=unit_count,
+        units=source_units,
+        profile=profile_value,
+        path="raw",
+        errors=errors,
+        validator_stage="raw",
+        validator_origins=frozenset({"v2"}),
+    )
+    lanes, final_rows = _lanes(
+        artifact.get("lanes"),
+        unit_count=unit_count,
+        units=source_units,
+        profile=profile_value,
+        errors=errors,
+    )
+    core_v2 = _lane_row(lanes, LANE_CORE, "v2")
+    legacy_v2 = _lane_row(lanes, LANE_LEGACY, "v2")
+    final_v2 = _lane_row(lanes, LANE_FINALIZER, "v2")
+    _validator_alias_block(
+        validator, raw_row, core_v2, legacy_v2, final_v2, unit_count, errors
+    )
+    _finalizer_alias_block(artifact, final_rows, errors)
 
     _authorities_block(artifact, final_rows, errors)
     _preview_fidelity_block(artifact, final_rows, errors)
