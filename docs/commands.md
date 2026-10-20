@@ -36,7 +36,7 @@ only the transcribe path writes it.
 
 `voxweave transcribe <media>` (or `voxweave <media>`) — separation → song-skip → VAD chunking → ASR + forced alignment →
 smart_split → writes `<stem>.vtt` (editable) + `<stem>.json` (word-level timestamp source of
-truth). Models load in-process (see `voxweave.backend`); the separator is released from VRAM
+truth). Models load in-process (see `voxweave.separator` and `voxweave.backend`); the separator is released from VRAM
 before ASR+alignment load, so peak usage is ≈ max(sep, asr) rather than their sum.
 
 ```bash

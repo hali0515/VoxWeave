@@ -46,6 +46,7 @@ from voxweave.align_snapshot import (
     frozen_json_digest,
     thaw_json,
 )
+from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS
 from voxweave.core.segdoc import SourceUnit
 from voxweave.core.subunit import speech_span_units
 from voxweave.engine_registry import engine_family_for
@@ -1121,10 +1122,8 @@ def _r_capture(call: ReferencePhysicalCallFacts) -> StrictCaptureResult:
 
 def _r_legacy_count(text: str, language: str) -> int:
     # The legacy slicer counts characters only for the aligners' no-space set.
-    from voxweave.realign import NO_SPACE_LANGS
-
     stripped = (text or "").strip()
-    if language in NO_SPACE_LANGS:
+    if language in ALIGNER_NO_SPACE_LANGS:
         return sum(1 for character in stripped if character.isalnum())
     return len(stripped.split())
 

@@ -22,6 +22,7 @@ from voxweave.align_dp_safety import (
     validate_over_budget_plans,
     validate_widened_plans,
 )
+from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS
 
 log = logging.getLogger("voxweave")
 
@@ -188,9 +189,7 @@ def _distribute_units(flat: list[dict], texts: list[str], iso: str) -> list[list
     No-space langs: alnum character count per block (one unit per char, punctuation skipped).
     Spaced langs: word count (len(split())). Consistent with whisperx reformat_vtt. Pure logic.
     """
-    from voxweave.realign import NO_SPACE_LANGS
-
-    nospace = iso in NO_SPACE_LANGS
+    nospace = iso in ALIGNER_NO_SPACE_LANGS
     out: list[list[dict]] = []
     cur = 0
     for t in texts:

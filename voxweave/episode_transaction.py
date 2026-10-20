@@ -33,6 +33,12 @@ from voxweave.align_context import (
 )
 from voxweave.align_failures import CanonicalFailure, SecondaryFailure
 from voxweave.align_runtime import align_runtime_activity
+from voxweave.sidecars import (
+    align_evidence_candidates,
+    speaker_suggest_candidates,
+    speakers_html_path,
+    voiceprints_candidates,
+)
 from voxweave.voicebase import media_fingerprint
 from voxweave.voiceepisode import episode_lock
 
@@ -114,6 +120,39 @@ class ArtifactCleanup:
     path: Path
     detail_code: Literal[
         "voiceprints-unlink", "suggest-unlink", "html-unlink", "evidence-unlink"
+    ]
+
+
+def speaker_artifact_cleanups(
+    owner: Path, html_owner: Path, *, voiceprints: bool = True
+) -> list[ArtifactCleanup]:
+    """Return the speaker sidecar unlinks in publication order.
+
+    Voiceprints (when ``voiceprints``), suggest files for ``owner``, then the
+    speakers HTML next to ``html_owner``.
+    """
+    cleanup: list[ArtifactCleanup] = []
+    if voiceprints:
+        cleanup.extend(
+            ArtifactCleanup(path, "voiceprints-unlink")
+            for path in voiceprints_candidates(owner)
+        )
+    cleanup.extend(
+        ArtifactCleanup(path, "suggest-unlink")
+        for path in speaker_suggest_candidates(owner)
+    )
+    cleanup.append(ArtifactCleanup(speakers_html_path(html_owner), "html-unlink"))
+    return cleanup
+
+
+def evidence_cleanups(
+    subtitle: Path, *, media: Path, keep: Path | None = None
+) -> list[ArtifactCleanup]:
+    """Return the align-evidence unlinks for ``subtitle``, skipping ``keep``."""
+    return [
+        ArtifactCleanup(path, "evidence-unlink")
+        for path in align_evidence_candidates(subtitle, media=media)
+        if path != keep
     ]
 
 
@@ -1019,9 +1058,11 @@ __all__ = [
     "commit_auxiliary_sdh",
     "commit_correction",
     "commit_primary_outputs",
+    "evidence_cleanups",
     "release_split_speaker_mapping_generation",
     "require_media_generation",
     "same_file_generation",
     "same_speaker_mapping_generation",
     "observe_speaker_mapping_generation",
+    "speaker_artifact_cleanups",
 ]

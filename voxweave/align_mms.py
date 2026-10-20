@@ -30,6 +30,7 @@ from voxweave.align_common import (
     _strip_trailing_punct,
     mute_spans_in_wav,
 )
+from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS
 from voxweave.runtime import _empty_cache, _hf_download, _require, get_device
 
 log = logging.getLogger("voxweave")
@@ -126,7 +127,6 @@ def _mms_emit_units(wav, text: str, iso: str) -> list[dict]:
     )
 
     from voxweave.lang import to_iso3
-    from voxweave.realign import NO_SPACE_LANGS
 
     text = (text or "").strip()
     if not any(c.isalnum() for c in text):
@@ -143,7 +143,7 @@ def _mms_emit_units(wav, text: str, iso: str) -> list[dict]:
     spans = get_spans(toks_starred, segments, blank)
     word_ts = postprocess_results(text_starred, spans, stride, scores)
 
-    nospace = iso in NO_SPACE_LANGS
+    nospace = iso in ALIGNER_NO_SPACE_LANGS
     units: list[dict] = []
     for w in word_ts:
         t = (w.get("text") or "").strip()

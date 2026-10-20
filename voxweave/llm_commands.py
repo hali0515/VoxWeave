@@ -33,6 +33,7 @@ from voxweave.paths import require_output_name, swap_ext
 from voxweave.progress import NestedReporter, Reporter
 from voxweave.subformats import (
     decode_subtitle_bytes,
+    is_ass_path,
     load_subtitle_blocks,
     load_subtitle_blocks_bytes,
     replace_ass_event_texts,
@@ -98,7 +99,7 @@ def translate(
     rep.plan(("read subtitles", "translate cues", "write translation"))
     rep.step("read subtitles")
     source_bytes = vtt_path.read_bytes()
-    is_ass = vtt_path.suffix.lower() in (".ass", ".ssa")
+    is_ass = is_ass_path(vtt_path)
     blocks = load_subtitle_blocks_bytes(vtt_path, source_bytes, ass_events=is_ass)
     ass_script = decode_subtitle_bytes(source_bytes, vtt_path.name) if is_ass else None
     # Position tags are markup, not dialogue: translate the text without them

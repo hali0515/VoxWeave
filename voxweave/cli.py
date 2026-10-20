@@ -17,6 +17,7 @@ from voxweave.cli_compat import (
 )
 from voxweave.cli_speakers import build_speakers_group
 from voxweave.cli_voices import build_voices_group
+from voxweave.export import EXPORT_RENDERERS
 from voxweave.progress import Reporter
 from voxweave.ui import (
     RichReporter,
@@ -148,9 +149,7 @@ def _llm_model_help(task: str, task_envvar: str) -> str:
     )
 
 
-# Sent as the bearer token when the endpoint is declared keyless (api_key_env = "").
-# The OpenAI client refuses an empty key; vLLM and friends ignore the value.
-_KEYLESS_API_KEY = "EMPTY"
+_KEYLESS_API_KEY = config.KEYLESS_API_KEY
 
 
 def _resolve_llm(
@@ -856,7 +855,7 @@ def cmd_translate(
     "formats",
     legacy="--to",
     multiple=True,
-    type=click.Choice(["srt", "ass", "vtt"]),
+    type=click.Choice(list(EXPORT_RENDERERS)),
     default=("srt",),
     help="Output format(s); repeat for several (e.g. -f srt -f ass). Default: srt.",
 )

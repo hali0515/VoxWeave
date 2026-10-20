@@ -21,7 +21,7 @@ import json
 
 import pytest
 
-from voxweave import diarize, pipeline
+from voxweave import diarize, pipeline, speaker_format
 from voxweave.core.smart_split import (
     _chunk_to_cue,
     _repair_bound_particle_cues,
@@ -591,7 +591,9 @@ def test_diarize_split_piece_without_timed_atoms_gets_none_not_display_bounds(
             ],
         ),
     ]
-    monkeypatch.setattr(diarize, "_speaker_runs", lambda atoms, turns, lang: runs)
+    monkeypatch.setattr(
+        speaker_format, "_speaker_runs", lambda atoms, turns, lang: runs
+    )
     out = diarize.format_speaker_cues([cue], [(0.0, 9.0, "A")], "en")
 
     assert [c["text"] for c in out] == ["One", "two", "three"]

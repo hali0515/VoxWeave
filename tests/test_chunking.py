@@ -375,6 +375,107 @@ def test_decode_to_wav_error_keeps_only_the_stderr_tail(tmp_path, monkeypatch):
     assert "line 31" not in msg
 
 
+def _patch_decode_failure(monkeypatch, tmp_path, probe):
+    """ffmpeg fails; ``probe(cmd)`` answers the follow-up ffprobe call."""
+
+    def fake_mkstemp(suffix="", prefix="", dir=None):
+        path = tmp_path / f"{prefix}fake{suffix}"
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+        return fd, str(path)
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "ffprobe":
+            return probe(cmd)
+        raise subprocess.CalledProcessError(
+            1, cmd, stderr=b"Output file does not contain any stream"
+        )
+
+    monkeypatch.setattr(chunking.tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(chunking.subprocess, "run", fake_run)
+
+
+def test_decode_to_wav_names_a_video_only_file(tmp_path, monkeypatch):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"x")
+    _patch_decode_failure(
+        monkeypatch,
+        tmp_path,
+        lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+
+    with pytest.raises(
+        chunking.NoAudioStreamError, match="clip.mp4 has no audio stream"
+    ):
+        chunking.decode_to_wav(media)
+    assert [p for p in tmp_path.iterdir() if p.suffix == ".wav"] == []
+
+
+def test_decode_to_wav_keeps_the_ffmpeg_error_when_audio_exists(tmp_path, monkeypatch):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"x")
+    _patch_decode_failure(
+        monkeypatch,
+        tmp_path,
+        lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout="1\n", stderr=""),
+    )
+
+    with pytest.raises(RuntimeError, match="ffmpeg failed to decode clip.mp4") as ei:
+        chunking.decode_to_wav(media)
+    assert not isinstance(ei.value, chunking.NoAudioStreamError)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError(2, "No such file or directory", "ffprobe"),
+        subprocess.CalledProcessError(1, ["ffprobe"], stderr="moov atom not found"),
+        subprocess.TimeoutExpired(["ffprobe"], 30),
+    ],
+)
+def test_decode_to_wav_keeps_the_ffmpeg_error_when_the_probe_fails(
+    tmp_path, monkeypatch, failure
+):
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"x")
+
+    def probe(cmd):
+        raise failure
+
+    _patch_decode_failure(monkeypatch, tmp_path, probe)
+
+    with pytest.raises(RuntimeError, match="ffmpeg failed to decode clip.mp4") as ei:
+        chunking.decode_to_wav(media)
+    assert not isinstance(ei.value, chunking.NoAudioStreamError)
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="needs ffmpeg and ffprobe",
+)
+def test_decode_to_wav_real_video_only_file_reports_no_audio(tmp_path):
+    media = tmp_path / "silent.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=64x64:d=1",
+            "-an",
+            str(media),
+        ],
+        check=True,
+    )
+
+    with pytest.raises(
+        chunking.NoAudioStreamError, match="silent.mp4 has no audio stream"
+    ):
+        chunking.decode_to_wav(media)
+
+
 def test_vad_rejects_wrong_sample_rate_with_value_error(tmp_path, monkeypatch):
     import soundfile as sf
 

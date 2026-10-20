@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import soundfile as sf
 
-from voxweave import backend, config, diarize, voicematch
+from voxweave import backend, config, diarize, separator, voicematch
 
 
 EMBEDDING_REPO = "pyannote/wespeaker-voxceleb-resnet34-LM"
@@ -475,7 +475,7 @@ def test_separator_identity_uses_hf_blob_or_explicit_local_digest(
     separator_config = tmp_path / "separator.yaml"
     separator_config.write_bytes(b"model: {}\n")
     monkeypatch.setattr(
-        backend,
+        separator,
         "_resolve_separator_files",
         lambda: (snapshot_path, separator_config),
     )
@@ -485,7 +485,7 @@ def test_separator_identity_uses_hf_blob_or_explicit_local_digest(
     local_checkpoint = tmp_path / "separator.ckpt"
     local_checkpoint.write_bytes(local_payload)
     monkeypatch.setattr(
-        backend,
+        separator,
         "_resolve_separator_files",
         lambda: (local_checkpoint, separator_config),
     )
@@ -499,7 +499,7 @@ def test_separator_identity_uses_hf_blob_or_explicit_local_digest(
     mismatched_blob.parent.mkdir(exist_ok=True)
     mismatched_blob.write_bytes(mismatched_payload)
     monkeypatch.setattr(
-        backend,
+        separator,
         "_resolve_separator_files",
         lambda: (mismatched_blob, separator_config),
     )

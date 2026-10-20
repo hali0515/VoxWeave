@@ -3,13 +3,13 @@
 import numpy as np
 import pytest
 
-from voxweave import backend, runtime
+from voxweave import backend, runtime, separator
 
 
 @pytest.fixture
 def _missing_separator(monkeypatch):
-    monkeypatch.setattr(backend, "SEPARATOR_CKPT", "/nonexistent/x.ckpt")
-    monkeypatch.setattr(backend, "SEPARATOR_CONFIG", "/nonexistent/x.yaml")
+    monkeypatch.setattr(separator, "SEPARATOR_CKPT", "/nonexistent/x.ckpt")
+    monkeypatch.setattr(separator, "SEPARATOR_CONFIG", "/nonexistent/x.yaml")
 
 
 def test_separator_download_failure_through_hf_download_keeps_the_hint(
@@ -23,7 +23,7 @@ def test_separator_download_failure_through_hf_download_keeps_the_hint(
         except OSError as e:
             raise runtime._hf_error(repo, e) from e
 
-    monkeypatch.setattr(backend, "_hf_download", _dl)
+    monkeypatch.setattr(separator, "_hf_download", _dl)
     with pytest.raises(RuntimeError) as failure:
         backend._resolve_separator_files()
     msg = str(failure.value)
@@ -44,7 +44,7 @@ def test_separator_missing_dependency_error_is_reraised_as_is(
         except ModuleNotFoundError as e:
             raise missing from e
 
-    monkeypatch.setattr(backend, "_hf_download", _dl)
+    monkeypatch.setattr(separator, "_hf_download", _dl)
     with pytest.raises(RuntimeError) as failure:
         backend._resolve_separator_files()
     assert failure.value is missing
@@ -70,13 +70,13 @@ def test_separate_vocals_removes_temp_flac_when_the_write_fails(monkeypatch, tmp
         sf, "read", lambda *a, **k: (np.zeros((64, 2), dtype=np.float32), 44100)
     )
     monkeypatch.setattr(sf, "write", failing_write)
-    monkeypatch.setattr(backend.tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(separator.tempfile, "mkstemp", fake_mkstemp)
     monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: "off")
     monkeypatch.setattr(
-        backend, "_load_separator", lambda autocast=None: (object(), {}, {})
+        separator, "_load_separator", lambda autocast=None: (object(), {}, {})
     )
-    monkeypatch.setattr(backend, "_demix", lambda *a, **k: torch.zeros(2, 64))
-    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    monkeypatch.setattr(separator, "_demix", lambda *a, **k: torch.zeros(2, 64))
+    monkeypatch.setattr(separator, "_empty_cache", lambda: None)
 
     with pytest.raises(OSError, match="No space left"):
         backend.separate_vocals(tmp_path / "in.wav")
@@ -134,12 +134,12 @@ def test_separate_vocals_scopes_tf32_to_the_forward(monkeypatch, tmp_path):
         sf, "read", lambda *a, **k: (np.zeros((64, 2), dtype=np.float32), 44100)
     )
     monkeypatch.setattr(backend.config, "conf_separate_autocast", lambda: "off")
-    monkeypatch.setattr(backend, "get_device", lambda: "cuda:0")
+    monkeypatch.setattr(separator, "get_device", lambda: "cuda:0")
     monkeypatch.setattr(
-        backend, "_load_separator", lambda autocast=None: (object(), {}, {})
+        separator, "_load_separator", lambda autocast=None: (object(), {}, {})
     )
-    monkeypatch.setattr(backend, "_demix", fake_demix)
-    monkeypatch.setattr(backend, "_empty_cache", lambda: None)
+    monkeypatch.setattr(separator, "_demix", fake_demix)
+    monkeypatch.setattr(separator, "_empty_cache", lambda: None)
 
     before = torch.get_float32_matmul_precision()
     try:

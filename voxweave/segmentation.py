@@ -32,7 +32,7 @@ from voxweave.core.segdoc import (
     SegDocument,
     build_seg_document,
 )
-from voxweave.core.shadow_v2 import SEG_V2_SHADOW_ENV
+from voxweave.core.shadow_v2 import shadow_enabled
 
 log = logging.getLogger("voxweave")
 
@@ -186,7 +186,7 @@ def _maybe_shadow_v2(
     Nothing in the lane may fail the run: ``run_shadow`` records an unexpected
     error as a typed ``error`` block and the shipped cues are returned untouched.
     """
-    if os.environ.get(SEG_V2_SHADOW_ENV, "").strip() != "1":
+    if not shadow_enabled():
         return None
     from voxweave.core.shadow_v2 import run_shadow
 

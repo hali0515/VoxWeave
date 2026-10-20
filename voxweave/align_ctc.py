@@ -32,6 +32,7 @@ from voxweave.align_common import (
     interp_missing,
     mute_spans_in_wav,
 )
+from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS
 from voxweave.runtime import _empty_cache, get_device
 
 log = logging.getLogger("voxweave")
@@ -433,8 +434,6 @@ def align_blocks_full_ctc(
     chunks planned and checked) before the model is loaded, so unsafe long-media hints
     are refused without model work; ``_preparation_invoker`` only wraps that step.
     """
-    from voxweave.realign import NO_SPACE_LANGS
-
     if (_legacy_distribution_invoker is None) != (_legacy_shift_invoker is None):
         raise ValueError("legacy projection phase invokers must be supplied together")
 
@@ -477,7 +476,7 @@ def align_blocks_full_ctc(
         if _backend_invoker is None
         else _backend_invoker(load_fixed_rate_aligner)
     )
-    nospace = iso in NO_SPACE_LANGS
+    nospace = iso in ALIGNER_NO_SPACE_LANGS
 
     source_cursor = 0
 
@@ -582,13 +581,11 @@ def align_text_ctc(wav_path: Path, text: str, iso: str, model_name: str) -> list
     bounds the encoder's O(T^2) self-attention on long chunks.
     Exceptions propagate; align_text catches and falls back to Qwen.
     """
-    from voxweave.realign import NO_SPACE_LANGS
-
     text = (text or "").strip()
     if not text:
         return []
     al = _get_ctc_aligner(iso, model_name)
-    nospace = iso in NO_SPACE_LANGS
+    nospace = iso in ALIGNER_NO_SPACE_LANGS
     wav = _load_mono(wav_path, al.sr)
     units = _ctc_full_pass(al, wav, [text], nospace, iso)[0]
     _empty_cache()

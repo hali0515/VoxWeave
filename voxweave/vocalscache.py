@@ -73,7 +73,7 @@ class SeparatorIdentity:
     ``autocast`` is the ``[separate].autocast`` mode that actually wrapped the
     roformer forward, which is the *effective* mode rather than the configured
     one: autocast is CUDA-only, so a CPU/MPS host records ``"off"`` whatever it
-    is configured with (``backend._effective_autocast``, the single rule the
+    is configured with (``separator._effective_autocast``, the single rule the
     identity, the cache probe and the forward all resolve through). It belongs
     to the identity because it changes the stems, not just the speed: bf16
     measures 52 dB SNR against the fp32 reference and 2.3% downstream ASR CER,

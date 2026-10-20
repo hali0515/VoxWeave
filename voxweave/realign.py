@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
 
+from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS
 from voxweave.core.overlay import wrap_lyric
 from voxweave.speakers import (
     strip_srt_speaker_prefixes,
@@ -30,8 +31,7 @@ from voxweave.speakers import (
 
 log = logging.getLogger("voxweave")
 
-# Korean uses spaces, so excluded.
-NO_SPACE_LANGS = {"zh", "ja", "yue"}
+NO_SPACE_LANGS = ALIGNER_NO_SPACE_LANGS
 # Gaps wider than this between adjacent word_segments are song holes; windows and interpolation must not cross them.
 GAP_SEC = 2.0
 # Crop window padding. WhisperX uses pad=0; adding pad causes boundary tokens to drift into the

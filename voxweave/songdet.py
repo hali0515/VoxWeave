@@ -436,6 +436,55 @@ def _overlaps(seg: dict, spans: list[tuple[float, float]]) -> bool:
     return any(max(seg["start"], a) < min(seg["end"], b) for a, b in spans)
 
 
+def voiced_blocks(segments: list[dict], block_gap: float) -> list[list[dict]]:
+    """Group consecutive VAD segments whose gap is at most ``block_gap`` into voiced blocks."""
+    blocks: list[list[dict]] = [[segments[0]]]
+    for s in segments[1:]:
+        if s["start"] - blocks[-1][-1]["end"] <= block_gap:
+            blocks[-1].append(s)
+        else:
+            blocks.append([s])
+    return blocks
+
+
+def song_cores(
+    spans: list[tuple[float, float]],
+    expandable: list[tuple[float, float]],
+    merge_sec: float,
+) -> list[tuple[float, float]]:
+    """Member spans of the ``spans`` clusters that overlap an ``expandable`` span.
+
+    Spans are clustered single-linkage (each joins when it starts within ``merge_sec`` of the
+    cluster's end so far). Only the MEMBER spans are kept, NOT the cluster hull: a hull would
+    also cover the gaps BETWEEN members, and clean dialogue sitting in such a gap (e.g. a line
+    between the OP and a title-card sting 12s later) must stay trimmable. A short sung
+    intro/outro near a long OP/ED core is part of the song and must stop the edge trim; an
+    isolated sting embedded in dialogue (no long core within ``merge_sec``) is NOT a core, so
+    the trim passes through it — the dialogue on the far side is freed and the sting is
+    re-covered by plan_song_skip's short_sing excision."""
+    if not expandable:
+        return []
+
+    def _touches_exp(cluster: list[tuple[float, float]]) -> bool:
+        return any(max(a, ea) < min(b, eb) for a, b in cluster for ea, eb in expandable)
+
+    cores: list[tuple[float, float]] = []
+    cluster: list[tuple[float, float]] = []
+    cluster_end = 0.0
+    for a, b in sorted(spans):
+        if cluster and a - cluster_end <= merge_sec:
+            cluster.append((a, b))
+            cluster_end = max(cluster_end, b)
+        else:
+            if cluster and _touches_exp(cluster):
+                cores.extend(cluster)
+            cluster = [(a, b)]
+            cluster_end = b
+    if cluster and _touches_exp(cluster):
+        cores.extend(cluster)
+    return cores
+
+
 def expand_spans_to_voiced_blocks(
     segments: list[dict],
     spans: list[tuple[float, float]],
@@ -476,40 +525,8 @@ def expand_spans_to_voiced_blocks(
     exp = spans if expandable is None else expandable
     prot = protect or []
 
-    blocks: list[list[dict]] = [[segments[0]]]
-    for s in segments[1:]:
-        if s["start"] - blocks[-1][-1]["end"] <= block_gap:
-            blocks[-1].append(s)
-        else:
-            blocks.append([s])
-
-    # Song "cores": song spans clustered within SONG_CORE_MERGE_SEC, keeping the MEMBER spans of
-    # clusters that reach a long expandable span — NOT the cluster hull. A hull would also cover
-    # the gaps BETWEEN member spans, and clean dialogue sitting in such a gap (e.g. a line between
-    # the OP and a title-card sting 12s later) must stay trimmable. A short sung intro/outro near
-    # a long OP/ED core is part of the song and must stop the edge trim; an isolated sting
-    # embedded in dialogue (no long core within SONG_CORE_MERGE_SEC) is NOT a core, so the trim
-    # passes through it — the dialogue on the far side is freed and the sting is re-covered by
-    # plan_song_skip's short_sing excision.
-    cores: list[tuple[float, float]] = []
-    if exp:
-
-        def _touches_exp(cluster: list[tuple[float, float]]) -> bool:
-            return any(max(a, ea) < min(b, eb) for a, b in cluster for ea, eb in exp)
-
-        cluster: list[tuple[float, float]] = []
-        cluster_end = 0.0
-        for a, b in sorted(spans):
-            if cluster and a - cluster_end <= SONG_CORE_MERGE_SEC:
-                cluster.append((a, b))
-                cluster_end = max(cluster_end, b)
-            else:
-                if cluster and _touches_exp(cluster):
-                    cores.extend(cluster)
-                cluster = [(a, b)]
-                cluster_end = b
-        if cluster and _touches_exp(cluster):
-            cores.extend(cluster)
+    blocks = voiced_blocks(segments, block_gap)
+    cores = song_cores(spans, exp, SONG_CORE_MERGE_SEC)
 
     def _clean_speech(seg: dict) -> bool:
         # Never trim a segment on a song core (expandable OP/ED + its contiguous short spans),

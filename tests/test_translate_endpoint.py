@@ -9,7 +9,7 @@ import openai
 import pytest
 from click.testing import CliRunner
 
-from voxweave import translate
+from voxweave import llm_client, translate
 from voxweave.cli import cli
 from voxweave.progress import Reporter
 
@@ -70,8 +70,8 @@ def endpoint(tmp_path, monkeypatch):
 
         monkeypatch.setattr(openai, "OpenAI", make_client)
 
-    monkeypatch.setattr(translate, "_sleep", sleeps.append)
-    monkeypatch.setattr(translate, "_RETRY_DELAYS", (0.0,))
+    monkeypatch.setattr(llm_client, "_sleep", sleeps.append)
+    monkeypatch.setattr(llm_client, "_RETRY_DELAYS", (0.0,))
     yield conf, install, requests, sleeps
     for client in clients:
         client.close()

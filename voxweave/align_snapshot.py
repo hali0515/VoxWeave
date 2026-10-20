@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS
+
 
 class FrozenJSONDomainError(TypeError):
     """A selected value cannot be represented in the closed JSON sum type."""
@@ -703,9 +705,7 @@ def decode_align_snapshot(
         ):
             raise ValueError("predecoded sibling snapshot does not match exact J0")
         sibling = sibling_snapshot
-    from voxweave.realign import NO_SPACE_LANGS
-
-    separator = "" if effective_iso in NO_SPACE_LANGS else " "
+    separator = "" if effective_iso in ALIGNER_NO_SPACE_LANGS else " "
     contents: list[AlignBlockContent] = []
     block_values: list[FrozenJSON] = []
     bounds: list[RouteBound] = []

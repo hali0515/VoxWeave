@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from voxweave import artifacts, translate
-from voxweave import llm_commands
+from voxweave import llm_client, llm_commands
 from voxweave.progress import Reporter
 from voxweave.realign import render_cues
 
@@ -872,7 +872,7 @@ def _resp(indices):
 
 def test_translate_cues_retries_transient_failures(monkeypatch):
     sleeps = []
-    monkeypatch.setattr(translate, "_sleep", sleeps.append)
+    monkeypatch.setattr(llm_client, "_sleep", sleeps.append)
     client = FlakyClient([_resp(range(2))], fail_times=2)
     out = translate.translate_cues(_payload(2), to="zh", model="m", client=client)
     assert out == {0: "tx 0", 1: "tx 1"}
@@ -880,15 +880,21 @@ def test_translate_cues_retries_transient_failures(monkeypatch):
     assert len(sleeps) == 2  # backoff between attempts
 
 
+def test_retry_knobs_live_only_in_llm_client():
+    # a stale alias on translate would let a leftover patch succeed with no effect
+    assert not hasattr(translate, "_sleep")
+    assert not hasattr(translate, "_RETRY_DELAYS")
+
+
 def test_translate_cues_raises_after_retries_exhausted(monkeypatch):
-    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
+    monkeypatch.setattr(llm_client, "_sleep", lambda _s: None)
     client = FlakyClient([], fail_times=99)
     with pytest.raises(ConnectionError):
         translate.translate_cues(_payload(2), to="zh", model="m", client=client)
 
 
 def test_window_failure_persists_completed_windows(tmp_path, monkeypatch):
-    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
+    monkeypatch.setattr(llm_client, "_sleep", lambda _s: None)
     # window 1 (cues 1-2) succeeds; window 2 (cues 3-4) fails every attempt
     client = FlakyClient([_resp(range(2))], fail_times=0)
     orig = client._create
@@ -1416,8 +1422,8 @@ class FinishStreamClient:
 
 @pytest.fixture
 def fast_retry(monkeypatch):
-    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
-    monkeypatch.setattr(translate, "_RETRY_DELAYS", (0.0,))  # two attempts
+    monkeypatch.setattr(llm_client, "_sleep", lambda _s: None)
+    monkeypatch.setattr(llm_client, "_RETRY_DELAYS", (0.0,))  # two attempts
 
 
 _MSGS = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
