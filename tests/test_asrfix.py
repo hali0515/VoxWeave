@@ -430,10 +430,10 @@ class FinishClient:
 @pytest.fixture
 def single_attempt(monkeypatch):
     """One json_object attempt per cue set (no backoff waits in the suite)."""
-    from voxweave import translate
+    from voxweave import llm_client
 
-    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
-    monkeypatch.setattr(translate, "_RETRY_DELAYS", ())
+    monkeypatch.setattr(llm_client, "_sleep", lambda _s: None)
+    monkeypatch.setattr(llm_client, "_RETRY_DELAYS", ())
 
 
 _FIX_0 = '{"fixes":[{"i":0,"orig":"a","fixed":"A","reason":"x"}]}'
@@ -446,9 +446,9 @@ def _fix_payload(n):
 def test_correct_cues_retries_transient_incomplete_then_succeeds(monkeypatch, caplog):
     # a server-side abort mid-stream (vLLM structured-output FSM) is transient:
     # the same json_object request is retried instead of failing the whole run.
-    from voxweave import translate
+    from voxweave import llm_client
 
-    monkeypatch.setattr(translate, "_sleep", lambda _s: None)
+    monkeypatch.setattr(llm_client, "_sleep", lambda _s: None)
     client = FinishClient([('{"fixes":[{"i":0,', None), (_FIX_0, "stop")])
     with caplog.at_level("WARNING", logger="voxweave"):
         fixes = asrfix.correct_cues([{"i": 0, "t": "a"}], model="m", client=client)
@@ -585,11 +585,11 @@ def test_correct_cues_non_size_failure_raises_without_splitting(single_attempt):
 def test_correct_cues_length_skips_the_retry_ladder(monkeypatch, caplog):
     # with the real retry schedule, a length cut-off is still not re-requested (json
     # retries + plain chat would all hit the same output cap): it splits at once
-    from voxweave import translate
+    from voxweave import llm_client
 
     sleeps: list[float] = []
-    monkeypatch.setattr(translate, "_sleep", sleeps.append)
-    assert translate._RETRY_DELAYS  # the default schedule does retry other failures
+    monkeypatch.setattr(llm_client, "_sleep", sleeps.append)
+    assert llm_client._RETRY_DELAYS  # the default schedule does retry other failures
     client = FinishClient(
         [
             ("", "length"),

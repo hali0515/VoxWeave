@@ -27,18 +27,20 @@ import re
 
 from voxweave import config
 from voxweave.core.overlay import wrap_lyric
-from voxweave.realign import render_cues
-from voxweave.speakers import voice_text_for_block
-from voxweave.translate import (
+from voxweave.llm_client import (
     IncompleteResponse,
     _call,
     _loads_salvage,
     _make_client,
+    request_with_json_fallback,
+    resolve_model,
+)
+from voxweave.realign import render_cues
+from voxweave.speakers import voice_text_for_block
+from voxweave.translate import (
     build_payload,
     format_glossary,
     is_dash_cue,
-    request_with_json_fallback,
-    resolve_model,
     restore_dash_layout,
 )
 
