@@ -1523,11 +1523,15 @@ def process(
             )
         else:
             with snapshots:
-                return run_with_source(
-                    snapshot.path,
-                    snapshot.fingerprint,
-                    True,
-                )
+                try:
+                    return run_with_source(
+                        snapshot.path,
+                        snapshot.fingerprint,
+                        True,
+                    )
+                except chunking.NoAudioStreamError as exc:
+                    # The decode saw the private snapshot copy; name the user's file.
+                    raise chunking.NoAudioStreamError(media_path.name) from exc
     return run_with_source(media_path, None, False)
 
 

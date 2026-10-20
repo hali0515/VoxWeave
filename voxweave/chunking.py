@@ -276,6 +276,8 @@ def decode_to_wav(
                 f"raise VOXWEAVE_FFMPEG_TIMEOUT for very long media: {_stderr_tail(e.stderr)}"
             ) from e
         if isinstance(e, subprocess.CalledProcessError):
+            if _has_no_audio_stream(media_path):
+                raise NoAudioStreamError(media_path.name) from e
             raise RuntimeError(
                 f"ffmpeg failed to decode {media_path.name}: {_stderr_tail(e.stderr)}"
             ) from e
@@ -285,6 +287,47 @@ def decode_to_wav(
             ) from e
         raise
     return out
+
+
+class NoAudioStreamError(RuntimeError):
+    """The media has no audio stream, so ffmpeg has nothing to decode."""
+
+    def __init__(self, media_name: str) -> None:
+        super().__init__(
+            f"{media_name} has no audio stream; "
+            "voxweave needs an audio track to transcribe"
+        )
+
+
+def _has_no_audio_stream(media_path: Path) -> bool:
+    """True only when ffprobe succeeds and lists zero audio streams.
+
+    Called after a failed decode to tell a video-only file from a real decode
+    error. Any probe failure answers False, so the original ffmpeg error is kept.
+    """
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+                str(media_path),
+            ],
+            check=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return not probe.stdout.strip()
 
 
 def _stderr_tail(err: bytes | str | None) -> str:
