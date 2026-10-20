@@ -43,6 +43,7 @@ from voxweave.core.shadow_lanes import (
 )
 
 if TYPE_CHECKING:  # the v2 modules are import-free unless the flag is on
+    from voxweave.core.authority import AuthorityKind, AuthorityLedger
     from voxweave.core.boundary_v2 import DocumentSolution
     from voxweave.core.finalizer import FinalizerPreview
     from voxweave.core.partition_check import Origin, Stage
@@ -1083,6 +1084,83 @@ def _incomplete(
     }
 
 
+def _shadow_owned_footprints(
+    document: SegDocument, unit_count: int, partition: Sequence[int] | None
+) -> list[str]:
+    # The authority and layout modules load here, not at import: the flag-off
+    # path must stay free of the v2-only modules.
+    from voxweave.core.layout import _join
+    from voxweave.core.partition_check import owned_unit_ids
+
+    if partition is None:
+        return []
+    return [
+        _join(
+            [unit.surface for unit in document.units[low:high]],
+            document.language,
+        )
+        for low, high in owned_unit_ids(partition, unit_count)
+    ]
+
+
+def _shadow_publish_validators(
+    artifact: dict[str, Any],
+    core_v2: dict[str, Any],
+    delivery_v2: dict[str, Any],
+    overlapping: bool,
+    finalizer: dict[str, Any] | None,
+) -> None:
+    artifact["validator"]["core"] = core_v2["validator"]
+    artifact["validator"]["legacy_overlay"] = delivery_v2["validator"]
+    artifact["validator"]["raw_duplicate_v1_cues"] = overlapping
+    artifact["validator"]["finalizer"] = finalizer
+
+
+def _shadow_lanes(
+    core_v1: dict[str, Any],
+    core_v2: dict[str, Any],
+    delivery_v1: dict[str, Any],
+    delivery_v2: dict[str, Any],
+    finalizer_rows: dict[str, Any],
+    comparator_row: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        SHADOW_LANE_CORE: _shadow_lane_block(
+            SHADOW_LANE_CORE, "core", core_v1, core_v2
+        ),
+        SHADOW_LANE_DELIVERY_LEGACY: _shadow_lane_block(
+            SHADOW_LANE_DELIVERY_LEGACY,
+            "legacy-overlay",
+            delivery_v1,
+            delivery_v2,
+        ),
+        SHADOW_LANE_FINALIZER: {
+            "lane": SHADOW_LANE_FINALIZER,
+            "rows": finalizer_rows,
+            "stage": "finalizer",
+        },
+        SHADOW_LANE_LEGACY_DISPLAY: {
+            "lane": SHADOW_LANE_LEGACY_DISPLAY,
+            "rows": {"v1": comparator_row},
+            "stage": "legacy-display",
+        },
+    }
+
+
+def _shadow_authorities(
+    ledger: AuthorityLedger, expected: dict[str, AuthorityKind]
+) -> dict[str, Any]:
+    # Loaded here for the same flag-off reason as in _shadow_owned_footprints.
+    from voxweave.core.authority import check_roots, lineage_tuples
+
+    return {
+        "events": [event.to_dict() for event in ledger.events],
+        "expected": expected,
+        "lineage": [list(record) for record in lineage_tuples(ledger)],
+        "violations": list(check_roots(ledger, expected=expected)),
+    }
+
+
 def _shadow_v2_artifact(
     document: SegDocument, v1_cues: Sequence[Cue], thresholds: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1093,13 +1171,7 @@ def _shadow_v2_artifact(
     :class:`ShadowAdmissionError` when the assembled artifact fails the
     contract.
     """
-    from voxweave.core.authority import (
-        AuthorityKind,
-        AuthorityLedger,
-        check_roots,
-        digest_payload,
-        lineage_tuples,
-    )
+    from voxweave.core.authority import AuthorityLedger, digest_payload
     from voxweave.core.boundary_v2 import (
         V1Partition,
         _document_partition,
@@ -1118,7 +1190,6 @@ def _shadow_v2_artifact(
         phase1_from_v1_capture,
         register_optimizer_selection,
     )
-    from voxweave.core.layout import _join
     from voxweave.core.partition_check import owned_unit_ids
     from voxweave.core.speaker_evidence import (
         W_SPEAKER_INTERIOR,
@@ -1225,17 +1296,6 @@ def _shadow_v2_artifact(
         validator=copy.deepcopy(artifact["validator"]["raw"]),
     )
     artifact["raw"] = raw_v2
-
-    def owned_footprints(partition: Sequence[int] | None) -> list[str]:
-        if partition is None:
-            return []
-        return [
-            _join(
-                [unit.surface for unit in shadow_document.units[low:high]],
-                shadow_document.language,
-            )
-            for low, high in owned_unit_ids(partition, unit_count)
-        ]
 
     core_cues = _shadow_core_cues(solution, shadow_document, thresholds)
     core_projection, core_projection_mode = _shadow_surface_partition(
@@ -1383,45 +1443,6 @@ def _shadow_v2_artifact(
         )
         return v1_row, comparator_row, classification
 
-    def publish_validators(finalizer: dict[str, Any] | None) -> None:
-        artifact["validator"]["core"] = core_v2["validator"]
-        artifact["validator"]["legacy_overlay"] = delivery_v2["validator"]
-        artifact["validator"]["raw_duplicate_v1_cues"] = overlapping
-        artifact["validator"]["finalizer"] = finalizer
-
-    def lanes(
-        finalizer_rows: dict[str, Any], comparator_row: dict[str, Any]
-    ) -> dict[str, Any]:
-        return {
-            SHADOW_LANE_CORE: _shadow_lane_block(
-                SHADOW_LANE_CORE, "core", core_v1, core_v2
-            ),
-            SHADOW_LANE_DELIVERY_LEGACY: _shadow_lane_block(
-                SHADOW_LANE_DELIVERY_LEGACY,
-                "legacy-overlay",
-                delivery_v1,
-                delivery_v2,
-            ),
-            SHADOW_LANE_FINALIZER: {
-                "lane": SHADOW_LANE_FINALIZER,
-                "rows": finalizer_rows,
-                "stage": "finalizer",
-            },
-            SHADOW_LANE_LEGACY_DISPLAY: {
-                "lane": SHADOW_LANE_LEGACY_DISPLAY,
-                "rows": {"v1": comparator_row},
-                "stage": "legacy-display",
-            },
-        }
-
-    def authorities(expected: dict[str, AuthorityKind]) -> dict[str, Any]:
-        return {
-            "events": [event.to_dict() for event in ledger.events],
-            "expected": expected,
-            "lineage": [list(record) for record in lineage_tuples(ledger)],
-            "violations": list(check_roots(ledger, expected=expected)),
-        }
-
     if any(unavailable.values()):
         # The frozen optimizer factory correctly refuses an adopted-v1 interval:
         # it has no optimizer selection to seal. Preserve the useful core/legacy
@@ -1452,12 +1473,16 @@ def _shadow_v2_artifact(
             "unit_count": unit_count,
             "v1_unprojected": v1_partition is None,
         }
-        publish_validators(None)
+        _shadow_publish_validators(artifact, core_v2, delivery_v2, overlapping, None)
         unmaterialized = {
             "materialized": False,
             "reason": "adopted-v1-has-no-optimizer-authority",
         }
-        artifact["lanes"] = lanes(
+        artifact["lanes"] = _shadow_lanes(
+            core_v1,
+            core_v2,
+            delivery_v1,
+            delivery_v2,
             {
                 "v1": v1_row,
                 "v2": dict(unmaterialized),
@@ -1465,13 +1490,13 @@ def _shadow_v2_artifact(
             },
             comparator_row,
         )
-        artifact["authorities"] = authorities(
-            {f"{SHADOW_LANE_FINALIZER}/v1": "v1-capture"}
+        artifact["authorities"] = _shadow_authorities(
+            ledger, {f"{SHADOW_LANE_FINALIZER}/v1": "v1-capture"}
         )
         artifact["diff_classification"] = diff_classification
         artifact["canonical_fallback_rechecks"] = _shadow_fallback_rechecks(
             v1_stream,
-            owned_footprints(v1_partition),
+            _shadow_owned_footprints(shadow_document, unit_count, v1_partition),
             row_id="v1",
         )
         artifact["finalizer"] = None
@@ -1511,17 +1536,17 @@ def _shadow_v2_artifact(
     canonical_fallback_rechecks = [
         *_shadow_fallback_rechecks(
             v1_stream,
-            owned_footprints(v1_partition),
+            _shadow_owned_footprints(shadow_document, unit_count, v1_partition),
             row_id="v1",
         ),
         *_shadow_fallback_rechecks(
             on_stream,
-            owned_footprints(raw_partition),
+            _shadow_owned_footprints(shadow_document, unit_count, raw_partition),
             row_id="v2",
         ),
         *_shadow_fallback_rechecks(
             off_stream,
-            owned_footprints(off_partition),
+            _shadow_owned_footprints(shadow_document, unit_count, off_partition),
             row_id="v2-speaker-off",
         ),
     ]
@@ -1740,7 +1765,9 @@ def _shadow_v2_artifact(
         canonical_fallback_rechecks.extend(
             _shadow_fallback_rechecks(
                 refiner_stream,
-                owned_footprints(refiner_partition),
+                _shadow_owned_footprints(
+                    shadow_document, unit_count, refiner_partition
+                ),
                 row_id="refiner-off",
             )
         )
@@ -1758,10 +1785,14 @@ def _shadow_v2_artifact(
         "unit_count": totals["unit_count"],
         "v1_unprojected": v1_partition is None,
     }
-    publish_validators(on_row["validator"])
+    _shadow_publish_validators(
+        artifact, core_v2, delivery_v2, overlapping, on_row["validator"]
+    )
     artifact["finalizer"] = on_row["finalizer"]
-    artifact["lanes"] = lanes(rows, comparator_row)
-    artifact["authorities"] = authorities(expected)
+    artifact["lanes"] = _shadow_lanes(
+        core_v1, core_v2, delivery_v1, delivery_v2, rows, comparator_row
+    )
+    artifact["authorities"] = _shadow_authorities(ledger, expected)
     artifact["diff_classification"] = diff_classification
     artifact["canonical_fallback_rechecks"] = canonical_fallback_rechecks
     artifact["preview_fidelity"] = preview.to_dict()
