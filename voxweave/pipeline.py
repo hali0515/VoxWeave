@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from voxweave import (
     artifacts,
@@ -2459,6 +2459,39 @@ class _CachedMediaIdentity:
     fingerprint: str
 
 
+@dataclass(frozen=True)
+class AlignRoute:
+    """Aligner route chosen for a language: the one place the route strings live.
+
+    ``kind`` feeds persisted digests and evidence, so its values are fixed.
+    """
+
+    kind: Literal["mms-full", "ctc-full", "qwen-crop"]
+    full_pass: bool
+    ctc_model: str | None
+
+    def backend_label(self, use_mlx: Callable[[], bool]) -> str:
+        # ``use_mlx`` is only consulted on the qwen route.
+        if self.kind == "mms-full":
+            return "mms"
+        if self.ctc_model:
+            return "ctc"
+        return "mlx-qwen" if use_mlx() else "qwen-asr"
+
+    def model_label(self, qwen_model: str) -> str:
+        if self.kind == "mms-full":
+            return "mms"
+        return self.ctc_model if self.ctc_model else qwen_model
+
+
+def resolve_align_route(mms: bool, ctc_model: str | None) -> AlignRoute:
+    return AlignRoute(
+        kind="mms-full" if mms else "ctc-full" if ctc_model else "qwen-crop",
+        full_pass=mms or bool(ctc_model),
+        ctc_model=ctc_model,
+    )
+
+
 def align(
     vtt_path: Path,
     *,
@@ -2603,8 +2636,9 @@ def align(
     with align_runtime_activity("AO-03", "route-family-plan"):
         mms = backend.uses_mms(iso)
         ctc_model = None if mms else align_model_for(iso)
-        full_pass = mms or bool(ctc_model)
-        route_kind = "mms-full" if mms else "ctc-full" if ctc_model else "qwen-crop"
+        align_route = resolve_align_route(mms, ctc_model)
+        full_pass = align_route.full_pass
+        route_kind = align_route.kind
     delivery_order = (
         tuple(range(len(input_snapshot.blocks)))
         if full_pass
@@ -2842,18 +2876,8 @@ def align(
             model_facts = {
                 "route": route_kind,
                 "language": iso,
-                "backend": (
-                    "mms"
-                    if mms
-                    else "ctc"
-                    if ctc_model
-                    else "mlx-qwen"
-                    if backend._use_mlx()
-                    else "qwen-asr"
-                ),
-                "model": (
-                    "mms" if mms else ctc_model if ctc_model else backend.ALIGNER_MODEL
-                ),
+                "backend": align_route.backend_label(lambda: backend._use_mlx()),
+                "model": align_route.model_label(backend.ALIGNER_MODEL),
                 "sample_rate": prepared_sample_rate,
             }
             route_facts = {
