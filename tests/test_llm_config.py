@@ -389,8 +389,11 @@ def test_cli_llm_help_names_the_live_default():
 def test_readme_no_longer_documents_the_retired_model():
     from pathlib import Path
 
-    readme = Path(__file__).resolve().parents[1] / "README.md"
-    text = readme.read_text(encoding="utf-8")
+    root = Path(__file__).resolve().parents[1]
+    text = "\n".join(
+        page.read_text(encoding="utf-8")
+        for page in [root / "README.md", *sorted((root / "docs").glob("*.md"))]
+    )
     assert "gpt-5.3-chat-latest" not in text
     assert "[llm]" in text
 
@@ -398,8 +401,10 @@ def test_readme_no_longer_documents_the_retired_model():
 def test_readme_documents_the_windowing_options():
     from pathlib import Path
 
-    text = (Path(__file__).resolve().parents[1] / "README.md").read_text(
-        encoding="utf-8"
+    root = Path(__file__).resolve().parents[1]
+    text = "\n".join(
+        page.read_text(encoding="utf-8")
+        for page in [root / "README.md", *sorted((root / "docs").glob("*.md"))]
     )
     for token in (
         "--concurrency",

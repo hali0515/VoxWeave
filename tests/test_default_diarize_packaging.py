@@ -125,8 +125,16 @@ def test_make_install_has_no_diarize_extra_detection(tmp_path: Path) -> None:
     assert '".[cuda,diarize]"' in compatibility.stdout
 
 
+def _readme_and_docs() -> str:
+    """README plus docs/*.md: the reference material lives under docs/."""
+    parts = [(REPO_ROOT / "README.md").read_text(encoding="utf-8")]
+    for page in sorted((REPO_ROOT / "docs").glob("*.md")):
+        parts.append(page.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
 def test_readme_describes_default_install_and_opt_in_runtime() -> None:
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    readme = _readme_and_docs()
     lowered = readme.lower()
 
     assert "voxweave[diarize]" not in lowered
@@ -165,7 +173,7 @@ def test_diarize_model_help_names_community1_as_default_not_31() -> None:
 
 
 def test_readme_diarize_docs_name_community1_as_default_everywhere() -> None:
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    readme = _readme_and_docs()
 
     stale_31_default_phrases = [
         "3.1 (default)",
@@ -187,7 +195,7 @@ def test_readme_diarize_docs_name_community1_as_default_everywhere() -> None:
 def test_readme_speaker_clustering_default_matches_the_constant() -> None:
     from voxweave import config
 
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    readme = _readme_and_docs()
     default = config.DEFAULT_DIARIZE_CLUSTERING
     other = next(
         choice for choice in config.DIARIZE_CLUSTERING_CHOICES if choice != default
