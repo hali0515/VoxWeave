@@ -45,7 +45,13 @@ from voxweave.core.shadow_lanes import (
 if TYPE_CHECKING:  # the v2 modules are import-free unless the flag is on
     from voxweave.core.authority import AuthorityKind, AuthorityLedger
     from voxweave.core.boundary_v2 import DocumentSolution
-    from voxweave.core.finalizer import FinalizerPreview
+    from voxweave.core.finalizer import (
+        FinalizeEvidence,
+        FinalizePolicy,
+        FinalizerPreview,
+        Phase1CueStream,
+        V1ReferenceCapture,
+    )
     from voxweave.core.partition_check import Origin, Stage
     from voxweave.core.timing_preview import CueCandidate, CuePreview
 
@@ -1161,6 +1167,65 @@ def _shadow_authorities(
     }
 
 
+def _shadow_v1_rows(
+    *,
+    v1_stream: Phase1CueStream,
+    capture: V1ReferenceCapture,
+    v1_partition: Sequence[int] | None,
+    v1_projection: str,
+    document: SegDocument,
+    evidence: FinalizeEvidence,
+    policy: FinalizePolicy,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """The v1 finalizer row, its legacy-display comparator, and N11 on both.
+
+    The comparator is the exact captured input with only the legacy
+    display-span lyric classification applied (set and clear): no speaker
+    overlay, no resnap.
+    """
+    # Loaded here, not at import: the flag-off path must stay free of the
+    # v2-only modules.
+    from voxweave.core.finalizer import finalize
+
+    v1_finalized = finalize(
+        v1_stream,
+        profile=document.profile,
+        evidence=evidence,
+        policy=policy,
+    )
+    v1_row, _v1_final_cues = _shadow_finalizer_row(
+        v1_finalized,
+        v1_stream,
+        v1_partition,
+        document=document,
+        origin="v1",
+        evidence=evidence,
+        policy=policy,
+        projection=v1_projection,
+    )
+    comparator_cues = [copy.deepcopy(cue) for cue in capture.cues]
+    for cue in comparator_cues:
+        cue.pop("lyric", None)
+    mark_lyric_cues(comparator_cues, copied_spans(document.sing_spans))
+    comparator_row = _shadow_stream_block(
+        comparator_cues,
+        v1_partition,
+        v1_projection,
+        document=document,
+        origin="v1",
+        stage="core",
+    )
+    _shadow_stamp_comparator_deltas(v1_row, comparator_row)
+    classification = _shadow_diff_classification(
+        v1_row,
+        comparator_row,
+        stream=v1_stream,
+        seed_cues=capture.cues,
+        sing_spans=tuple(document.sing_spans or ()),
+    )
+    return v1_row, comparator_row, classification
+
+
 def _shadow_admit(artifact: dict[str, Any]) -> dict[str, Any]:
     # The optimizer artifact remains schema 1 until this exact completed
     # payload passes the one shared live/harness contract.  Validation ignores
@@ -1417,57 +1482,20 @@ def _shadow_v2_artifact(
         evaluation_id=evaluation_id,
     )
 
-    def v1_rows() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-        """The v1 finalizer row, its legacy-display comparator, and N11 on both.
-
-        The comparator is the exact captured input with only the legacy
-        display-span lyric classification applied (set and clear): no speaker
-        overlay, no resnap.
-        """
-        v1_finalized = finalize(
-            v1_stream,
-            profile=shadow_document.profile,
-            evidence=finalizer_evidence,
-            policy=finalizer_policy,
-        )
-        v1_row, _v1_final_cues = _shadow_finalizer_row(
-            v1_finalized,
-            v1_stream,
-            v1_partition,
-            document=shadow_document,
-            origin="v1",
-            evidence=finalizer_evidence,
-            policy=finalizer_policy,
-            projection=v1_projection,
-        )
-        comparator_cues = [copy.deepcopy(cue) for cue in capture.cues]
-        for cue in comparator_cues:
-            cue.pop("lyric", None)
-        mark_lyric_cues(comparator_cues, copied_spans(shadow_document.sing_spans))
-        comparator_row = _shadow_stream_block(
-            comparator_cues,
-            v1_partition,
-            v1_projection,
-            document=shadow_document,
-            origin="v1",
-            stage="core",
-        )
-        _shadow_stamp_comparator_deltas(v1_row, comparator_row)
-        classification = _shadow_diff_classification(
-            v1_row,
-            comparator_row,
-            stream=v1_stream,
-            seed_cues=capture.cues,
-            sing_spans=tuple(shadow_document.sing_spans or ()),
-        )
-        return v1_row, comparator_row, classification
-
     if any(unavailable.values()):
         # The frozen optimizer factory correctly refuses an adopted-v1 interval:
         # it has no optimizer selection to seal. Preserve the useful core/legacy
         # diagnostics and state the unmaterialized rows instead of letting that
         # typed precondition collapse the whole fail-open artifact to ``error``.
-        v1_row, comparator_row, diff_classification = v1_rows()
+        v1_row, comparator_row, diff_classification = _shadow_v1_rows(
+            v1_stream=v1_stream,
+            capture=capture,
+            v1_partition=v1_partition,
+            v1_projection=v1_projection,
+            document=shadow_document,
+            evidence=finalizer_evidence,
+            policy=finalizer_policy,
+        )
         actual_fallbacks = sum(not item.optimized for item in solution.solutions)
         optimized_units = sum(
             item.interval.unit_end - item.interval.unit_start
@@ -1569,7 +1597,15 @@ def _shadow_v2_artifact(
             row_id="v2-speaker-off",
         ),
     ]
-    v1_row, comparator_row, diff_classification = v1_rows()
+    v1_row, comparator_row, diff_classification = _shadow_v1_rows(
+        v1_stream=v1_stream,
+        capture=capture,
+        v1_partition=v1_partition,
+        v1_projection=v1_projection,
+        document=shadow_document,
+        evidence=finalizer_evidence,
+        policy=finalizer_policy,
+    )
     on_finalized = finalize(
         on_stream,
         profile=shadow_document.profile,
