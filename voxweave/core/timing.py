@@ -105,6 +105,38 @@ def combine_speech(
     return (min(starts) if starts else None, max(ends) if ends else None)
 
 
+def _join_text(a_text: str, b_text: str, lang: str) -> str:
+    """Join two cue texts: strip the inner edges, add a space unless ``lang`` has none."""
+    sep = "" if _no_spaces(lang) else " "
+    return (a_text.rstrip() + sep + b_text.lstrip()).strip()
+
+
+def merge_cues(
+    a: Mapping[str, Any],
+    b: Mapping[str, Any],
+    lang: str,
+    *,
+    text: str | None = None,
+) -> dict[str, Any]:
+    """The fields every cue fold computes identically; ``a`` precedes ``b``.
+
+    Returns ``text`` (``text`` when given, else :func:`_join_text` of the two cue
+    texts), ``word_data`` (``a``'s entries then ``b``'s, as a fresh list) and the
+    raw ``speech_start``/``speech_end`` anchors via :func:`combine_speech` (min/max
+    of the raw anchors, never back-filled from display times). It does NOT touch
+    ``start``/``end``: each fold site owns its own bound rule (None handling and
+    which side is kept) and applies it itself. Neither input is mutated; callers
+    apply the result with ``target.update(...)``.
+    """
+    speech_start, speech_end = combine_speech(a, b)
+    return {
+        "text": _join_text(a["text"], b["text"], lang) if text is None else text,
+        "word_data": list(a.get("word_data") or []) + list(b.get("word_data") or []),
+        "speech_start": speech_start,
+        "speech_end": speech_end,
+    }
+
+
 def _merge_micro_cues(
     cues: list[Cue],
     lang: str,
@@ -138,13 +170,12 @@ def _merge_micro_cues(
     """
     if max_gap_s <= 0 or len(cues) < 2:
         return cues
-    sep = "" if _no_spaces(lang) else " "
     out = [cast(Cue, dict(cues[0]))]
     escaped = [False]  # cue was force-merged over budget -> needs a re-wrap
     for nxt in cues[1:]:
         cur = out[-1]
         gap = _gap_between(cur, nxt)
-        merged_text = (cur["text"].rstrip() + sep + nxt["text"].lstrip()).strip()
+        merged_text = _join_text(cur["text"], nxt["text"], lang)
         cur_start, cur_end = cur.get("start"), cur.get("end")
         nxt_start, nxt_end = nxt.get("start"), nxt.get("end")
         contiguous = gap is not None and gap < max_gap_s
@@ -171,14 +202,10 @@ def _merge_micro_cues(
         )
         degenerate = contiguous and (both_below_floor or run_below_min)
         if fits or degenerate:
-            cur["text"] = merged_text
             cur["end"] = nxt["end"] if cur_end is None else max(cur_end, nxt["end"])
-            cur["word_data"] = list(cur.get("word_data") or []) + list(
-                nxt.get("word_data") or []
-            )
             # A content fold owns both sides' speech, so the anchor is recomputed
             # from the folded material (never from the display bounds above).
-            cur["speech_start"], cur["speech_end"] = combine_speech(cur, nxt)
+            cur.update(cast(Cue, merge_cues(cur, nxt, lang, text=merged_text)))
             if degenerate and not fits:
                 escaped[-1] = True
             continue
@@ -222,7 +249,6 @@ def _glue_short_cues(
     """
     if max_gap_s <= 0 or len(cues) < 2:
         return cues
-    sep = "" if _no_spaces(lang) else " "
     work = [cast(Cue, dict(c)) for c in cues]
     out: list[Cue] = []
     i, n = 0, len(work)
@@ -232,15 +258,9 @@ def _glue_short_cues(
         if _is_short_fragment(c["text"], lang):
             gap_back = _gap_between(out[-1], c) if out else None
             gap_fwd = _gap_between(c, nxt) if nxt is not None else None
-            back_text = (
-                (out[-1]["text"].rstrip() + sep + c["text"].lstrip()).strip()
-                if out
-                else ""
-            )
+            back_text = _join_text(out[-1]["text"], c["text"], lang) if out else ""
             fwd_text = (
-                (c["text"].rstrip() + sep + nxt["text"].lstrip()).strip()
-                if nxt is not None
-                else ""
+                _join_text(c["text"], nxt["text"], lang) if nxt is not None else ""
             )
             back_start = out[-1].get("start") if out else None
             back_end = c.get("end")
@@ -267,32 +287,24 @@ def _glue_short_cues(
                 not back_ok or (gap_fwd is not None and gap_fwd < gap_back)  # type: ignore[operator]
             )
             if go_fwd and nxt is not None:  # prepend fragment into next, reprocess it
-                nxt["text"] = fwd_text
                 if c.get("start") is not None:
                     nxt["start"] = (
                         c["start"]
                         if nxt.get("start") is None
                         else min(nxt["start"], c["start"])
                     )
-                nxt["word_data"] = list(c.get("word_data") or []) + list(
-                    nxt.get("word_data") or []
-                )
-                nxt["speech_start"], nxt["speech_end"] = combine_speech(c, nxt)
+                nxt.update(cast(Cue, merge_cues(c, nxt, lang, text=fwd_text)))
                 i += 1
                 continue
             if back_ok:
                 prev = out[-1]
-                prev["text"] = back_text
                 if c.get("end") is not None:
                     prev["end"] = (
                         c["end"]
                         if prev.get("end") is None
                         else max(prev["end"], c["end"])
                     )
-                prev["word_data"] = list(prev.get("word_data") or []) + list(
-                    c.get("word_data") or []
-                )
-                prev["speech_start"], prev["speech_end"] = combine_speech(prev, c)
+                prev.update(cast(Cue, merge_cues(prev, c, lang, text=back_text)))
                 i += 1
                 continue
         out.append(c)
