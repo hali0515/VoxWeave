@@ -27,12 +27,21 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from voxweave import artifacts, fsio, sidecars, turnembed, vocals, voiceembed
 from voxweave.core.overlay import spans_in
 from voxweave.ngrok import NgrokOrigins
+from voxweave.speakerserve_mapping import (
+    MAX_NAME_CHARS as MAX_NAME_CHARS,
+    _check_names as _check_names,
+    _file_generation as _file_generation,
+    _mapping_entries as _mapping_entries,
+    _mapping_speakers as _mapping_speakers,
+    _strict_json_loads as _strict_json_loads,
+    _validated_mapping as _validated_mapping,
+    _validated_speakers as _validated_speakers,
+)
 from voxweave.voicebase import (
     MAX_PROVENANCE_STRING_BYTES,
     VOICEPRINTS_MAX_BYTES,
@@ -56,7 +65,6 @@ from voxweave.vocalscache import SeparatorIdentity, validate_separator_identity
 
 HOST = "127.0.0.1"
 MAX_BODY_BYTES = 10_000_000
-MAX_NAME_CHARS = 500
 MAX_UNDO_BYTES = 64 * 1024 * 1024
 _POST_ROUTES = frozenset({"/save", "/split", "/split-confirm", "/split-undo"})
 _INVALID_BODY = object()
@@ -1525,107 +1533,6 @@ def _undo_split(server: SpeakerHTTPServer) -> None:
     server.session_terminal = True
     server.report("Restored the previous speaker split generation")
     server.report("Restart `voxweave speakers serve` to re-audition")
-
-
-def _strict_json_loads(raw: bytes) -> Any:
-    def reject_duplicate(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate key: {key}")
-            result[key] = value
-        return result
-
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"non-finite JSON number: {value}")
-
-    return json.loads(
-        raw.decode("utf-8"),
-        object_pairs_hook=reject_duplicate,
-        parse_constant=reject_constant,
-    )
-
-
-def _mapping_speakers(value: object) -> dict[str, Any]:
-    """The version-1 envelope every mapping reader of this server shares.
-
-    Returns the ``speakers`` object unchecked; extra top-level keys are allowed
-    (only the POST payload is held to exactly ``{version, speakers}``, see
-    :func:`_validated_mapping`).
-    """
-    if not isinstance(value, dict):
-        raise ValueError("mapping must be an object")
-    if type(value.get("version")) is not int or value.get("version") != 1:
-        raise ValueError("mapping version must be 1")
-    speakers = value.get("speakers")
-    if not isinstance(speakers, dict):
-        raise ValueError("speakers must be an object")
-    return speakers
-
-
-def _check_names(speakers: Mapping[str, object]) -> None:
-    if any(
-        not isinstance(name, str) or len(name) > MAX_NAME_CHARS
-        for name in speakers.values()
-    ):
-        raise ValueError("mapping contains invalid speaker entries")
-
-
-def _validated_speakers(
-    value: object,
-    speaker_ids: Sequence[str],
-    *,
-    stale: list[str] | None = None,
-) -> dict[str, str]:
-    """The mapping's names, all of them for ids in ``speaker_ids``.
-
-    Used for the ``/save`` payload and the ``/serve-info`` read. When ``stale``
-    is given, entries for ids outside ``speaker_ids`` (left behind by a
-    re-diarization) are dropped and collected there instead of rejected, as
-    :func:`voxweave.speakers.load_speaker_mapping_bytes` does.
-    """
-    speakers = _mapping_speakers(value)
-    known = set(speaker_ids)
-    if stale is not None:
-        stale.extend(key for key in speakers if key not in known)
-        speakers = {key: name for key, name in speakers.items() if key in known}
-    if any(key not in known for key in speakers):
-        raise ValueError("mapping contains invalid speaker entries")
-    _check_names(speakers)
-    return speakers
-
-
-def _validated_mapping(
-    value: object,
-    speaker_ids: Sequence[str],
-) -> dict[str, str]:
-    if not isinstance(value, dict) or set(value) != {"version", "speakers"}:
-        raise ValueError("mapping must contain only version and speakers")
-    return _validated_speakers(value, speaker_ids)
-
-
-def _file_generation(path: Path) -> tuple[int, int, int, int]:
-    metadata = Path(path).stat()
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-    )
-
-
-def _mapping_entries(
-    path: Path, speaker_ids: Sequence[str]
-) -> tuple[dict[str, str], list[str], tuple[int, int, int, int]]:
-    """Read the on-disk mapping, dropping (and returning) ids no longer known."""
-    before = _file_generation(path)
-    value = _strict_json_loads(Path(path).read_bytes())
-    after = _file_generation(path)
-    if before != after:
-        raise ValueError("mapping changed while reading")
-    stale: list[str] = []
-    speakers = _validated_speakers(value, speaker_ids, stale=stale)
-    return speakers, stale, after
 
 
 def make_server(
