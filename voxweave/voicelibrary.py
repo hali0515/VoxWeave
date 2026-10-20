@@ -1129,18 +1129,9 @@ def _rewrite_history_redacted(
             os.fsync(handle.fileno())
 
 
-def commit(state: LibraryState, change: LibraryChange) -> None:
-    """Write ``change`` under the exclusive lock ``state`` was read with.
-
-    Each changed file is replaced only if its bytes still equal the ones
-    ``state`` observed; history is appended after every data file is in
-    place. Every document is validated and encoded before the first file is
-    replaced, so a refusal (a size limit included) changes nothing. The
-    first write into an empty library logs a biometrics notice.
-    """
-    if change.empty:
-        return
-    paths = state.paths
+def _heal_orphans(state: LibraryState, change: LibraryChange) -> LibraryChange:
+    # Phase 1 of commit: returns ``change`` itself, or a copy that also
+    # deletes the orphans of forgotten ids; the heal history rows go first.
     healed_spaces: dict[str, dict[str, object]] = {}
     healed_history: list[dict[str, object]] = []
     tombstones = state.forgotten
@@ -1170,6 +1161,11 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
             spaces={**change.spaces, **healed_spaces},
             history=(*healed_history, *change.history),
         )
+    return change
+
+
+def _validate_change(state: LibraryState, change: LibraryChange) -> None:
+    # Phase 2 of commit: validates the healed change before orphans are carried.
     for row in change.history:
         _reject_vectors(row)
     identities = change.identities or state.identities
@@ -1178,7 +1174,14 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
     for name, document in change.spaces.items():
         validate_space(document, name=name)
         merged_spaces[name] = document
-    validate_relations(LibraryState(paths, identities, merged_spaces, state.observed))
+    validate_relations(
+        LibraryState(state.paths, identities, merged_spaces, state.observed)
+    )
+
+
+def _carry_kept_orphans(state: LibraryState, change: LibraryChange) -> LibraryChange:
+    # Phase 3 of commit: rewritten spaces keep the orphans of ids that
+    # identities.json does not list (it may be an older copy).
     carried: dict[str, dict[str, object]] = {}
     for name, document in change.spaces.items():
         kept = state.kept_orphans(name)
@@ -1201,7 +1204,15 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
         carried[name] = written
     if carried:
         change = dataclasses.replace(change, spaces={**change.spaces, **carried})
+    return change
 
+
+def _encode_writes(
+    state: LibraryState, change: LibraryChange
+) -> tuple[list[tuple[Path, str]], list[tuple[Path, str]]]:
+    # Phase 4 of commit: encodes every document (size limits raise here) and
+    # returns (writes in order, space writes) before any file is replaced.
+    paths = state.paths
     writes: list[tuple[Path, str]] = []
     if change.identities is not None:
         writes.append(
@@ -1223,6 +1234,25 @@ def commit(state: LibraryState, change: LibraryChange) -> None:
     for path, _payload in writes:
         if path not in state.observed:
             raise VoiceLibraryError(f"{path} was not read before being written")
+    return writes, space_writes
+
+
+def commit(state: LibraryState, change: LibraryChange) -> None:
+    """Write ``change`` under the exclusive lock ``state`` was read with.
+
+    Each changed file is replaced only if its bytes still equal the ones
+    ``state`` observed; history is appended after every data file is in
+    place. Every document is validated and encoded before the first file is
+    replaced, so a refusal (a size limit included) changes nothing. The
+    first write into an empty library logs a biometrics notice.
+    """
+    if change.empty:
+        return
+    paths = state.paths
+    change = _heal_orphans(state, change)
+    _validate_change(state, change)
+    change = _carry_kept_orphans(state, change)
+    writes, space_writes = _encode_writes(state, change)
 
     first_write = (
         state.observed.get(paths.identities) is None and not paths.history.exists()
