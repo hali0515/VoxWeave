@@ -154,7 +154,18 @@ def test_the_vad_state_enum_is_four_valued():
 
 
 @pytest.mark.parametrize(
-    "module", ["boundary_cost", "boundary_lattice", "boundary_v2", "partition_check"]
+    "module",
+    [
+        "boundary_atoms",
+        "boundary_cost",
+        "boundary_lattice",
+        "boundary_nodes",
+        "boundary_packing",
+        "boundary_v2",
+        "boundary_select",
+        "boundary_interval",
+        "partition_check",
+    ],
 )
 def test_no_module_reads_the_environment(module):
     """C7: all constants are module level; the shadow must be reproducible from

@@ -47,8 +47,14 @@ imports ``voxweave.align_delta_registry``; ``finalizer`` lazily imports
 ``voxweave.align_acquisition``; ``shadow_v2`` lazily imports
 ``voxweave.diarize``.
 
-- ``boundary_lattice`` / ``boundary_cost`` / ``boundary_v2`` — the hard-legal
-  lattice, the cost model and the exact whole-interval solver.
+- ``boundary_lattice`` / ``boundary_atoms`` / ``boundary_nodes`` /
+  ``boundary_packing`` / ``boundary_cost`` / ``boundary_v2`` — the hard-legal
+  lattice, its data model, its node sets, its packing measure, the cost model
+  and the exact whole-interval solver.
+- ``boundary_select`` — path choice over one interval's cost table: the
+  forward DP, path scoring and the margin policy.
+- ``boundary_interval`` — one interval's committed answer: select a path or
+  adopt v1's cues, then materialize the cues.
 - ``subunit`` / ``speaker_evidence`` / ``timing_preview`` / ``canonical_text``
   / ``policy_delta`` — solver inputs: sub-unit refinement, speaker evidence,
   display-duration preview, delivered text, the policy delta registry.
