@@ -936,6 +936,39 @@ def _attach_end_penalties(
             a["end_pen"] = 0
 
 
+# Pause-grade ladder shared by the break scorers: a gap shorter than each bound
+# (ms) costs the matching damage, so a clearly audible pause is the cheapest cut.
+PAUSE_LADDER_MS = (40, 120, 220)
+PAUSE_LADDER_DAMAGE = (3, 2, 1)
+# Micro-fragment penalties: a side no wider than the bound (cells) costs the
+# matching damage.
+MICRO_FRAGMENT_WIDTHS = (1, 2)
+MICRO_FRAGMENT_DAMAGE = (8, 4)
+
+
+def pause_damage(left_end: object, right_start: object) -> int:
+    """Pause-ladder damage for the gap between two atoms (0 if untimed)."""
+    if isinstance(left_end, (int, float)) and isinstance(right_start, (int, float)):
+        pause_ms = max(0.0, (float(right_start) - float(left_end)) * 1000)
+        if pause_ms < PAUSE_LADDER_MS[0]:
+            return PAUSE_LADDER_DAMAGE[0]
+        if pause_ms < PAUSE_LADDER_MS[1]:
+            return PAUSE_LADDER_DAMAGE[1]
+        if pause_ms < PAUSE_LADDER_MS[2]:
+            return PAUSE_LADDER_DAMAGE[2]
+    return 0
+
+
+def micro_fragment_damage(left_width: int, right_width: int) -> int:
+    """Penalty for a cut that leaves a very narrow side."""
+    small = min(left_width, right_width)
+    if small <= MICRO_FRAGMENT_WIDTHS[0]:
+        return MICRO_FRAGMENT_DAMAGE[0]
+    if small <= MICRO_FRAGMENT_WIDTHS[1]:
+        return MICRO_FRAGMENT_DAMAGE[1]
+    return 0
+
+
 def _best_len_break_pos(
     cur: list[dict],
     cur_bnd: list[bool],
@@ -982,28 +1015,11 @@ def _best_len_break_pos(
         hard_damage = 3 * (_atom_end_pen(cur[k - 1]) + _atom_start_pen(right))
         gap_damage = 0
         if enhanced:
-            left_end = cur[k - 1].get("end")
-            right_start = right.get("start")
-            if isinstance(left_end, (int, float)) and isinstance(
-                right_start, (int, float)
-            ):
-                pause_ms = max(0.0, (float(right_start) - float(left_end)) * 1000)
-                if pause_ms < 40:
-                    gap_damage = 3
-                elif pause_ms < 120:
-                    gap_damage = 2
-                elif pause_ms < 220:
-                    gap_damage = 1
+            gap_damage = pause_damage(cur[k - 1].get("end"), right.get("start"))
         right_known = cur[k:] + ([next_atom] if next_atom is not None else [])
         left_width = _vis_width(_join([atom["text"] for atom in cur[:k]], lang))
         right_width = _vis_width(_join([atom["text"] for atom in right_known], lang))
-        micro_damage = (
-            8
-            if min(left_width, right_width) <= 1
-            else 4
-            if min(left_width, right_width) <= 2
-            else 0
-        )
+        micro_damage = micro_fragment_damage(left_width, right_width)
         soft_damage = _atom_boundary_pen(right) + gap_damage + micro_damage
         imbalance = abs(left_width - right_width)
         return hard_damage, soft_damage, imbalance, -k
@@ -1622,21 +1638,12 @@ def _repair_bound_particle_cues(
             hard = 3 * (_atom_end_pen(atoms[k - 1]) + _atom_start_pen(edge_right))
             prev_end = atoms[k - 1].get("end")
             next_start = edge_right.get("start")
-            pause = 0
-            if isinstance(prev_end, (int, float)) and isinstance(
-                next_start, (int, float)
-            ):
-                pause_ms = max(0.0, (float(next_start) - float(prev_end)) * 1000)
-                if pause_ms < 40:
-                    pause = 3
-                elif pause_ms < 120:
-                    pause = 2
-                elif pause_ms < 220:
-                    pause = 1
+            pause = pause_damage(prev_end, next_start)
             left_surface = _join([atom["text"] for atom in atoms[:k]], lang)
             right_surface = _join([atom["text"] for atom in atoms[k:]], lang)
-            small = min(_vis_width(left_surface), _vis_width(right_surface))
-            micro = 8 if small <= 1 else 4 if small <= 2 else 0
+            micro = micro_fragment_damage(
+                _vis_width(left_surface), _vis_width(right_surface)
+            )
             soft = _atom_boundary_pen(edge_right) + pause + micro
             return (
                 worsens_tail,
