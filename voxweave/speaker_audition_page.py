@@ -50,104 +50,22 @@ def _tiered_suggestions(match: SpeakerMatch | None, scope: str) -> str:
     return "".join(rows)
 
 
-def _render_audition_html(
-    title: str,
-    mapping_name: str,
-    snippets: Mapping[str, Sequence[tuple[Span, str]]],
-    matches: Mapping[str, SpeakerMatch] | None = None,
-    *,
-    scope: str | None = None,
-) -> str:
-    """Build the self-contained in-memory audition page.
-
-    ``scope`` marks a voice-library match: suggestions are then split into the
-    episode's own scope and the other scopes, each labelled.
-    """
-    cards: list[str] = []
-    for speaker_id, clips in snippets.items():
-        audio = []
-        for (start, end), data_uri in clips:
-            audio.append(
-                "<figure><figcaption>"
-                f"{start:.1f}s- {end:.1f}s"
-                f'</figcaption><audio controls preload="none" src="{data_uri}"></audio></figure>'
-            )
-        if not audio:
-            audio.append(
-                '<p class="empty">No clean 2-6 second snippet was available.</p>'
-            )
-        sid = html.escape(speaker_id, quote=True)
-        split_controls = (
-            '<div class="speaker-actions">'
-            '<button type="button" class="split-speaker" '
-            f'data-split="{sid}" hidden>Split this speaker</button></div>'
-            '<div class="split-proposal" role="status" '
-            'aria-live="polite"></div>'
-        )
-        if matches is None:
-            cards.append(
-                '<section class="speaker">'
-                f'<div class="speaker-head"><code>{html.escape(speaker_id)}</code>'
-                f'<input type="text" data-speaker="{sid}" aria-label="Name for {sid}" '
-                'placeholder="Enter display name" autocomplete="off"></div>'
-                f'{split_controls}<div class="clips">{"".join(audio)}</div></section>'
-            )
-            continue
-
-        match = matches.get(speaker_id)
-        candidates = match.candidates if match is not None else ()
-        prefill = (
-            candidates[0].display_name
-            if match is not None and match.decision == "prefill" and candidates
-            else ""
-        )
-        if scope is not None:
-            suggestion_rows = _tiered_suggestions(match, scope)
-        else:
-            suggestion_buttons = "".join(
-                _suggestion_button(candidate, show_scopes=False)
-                for candidate in candidates
-            )
-            if not suggestion_buttons:
-                suggestion_buttons = (
-                    '<span class="no-suggestion">No stored match.</span>'
-                )
-            suggestion_rows = f'<div class="suggestions">{suggestion_buttons}</div>'
-        machine_mark = (
-            '<span class="machine-mark">machine-suggested; review before saving</span>'
-            if prefill
-            else ""
-        )
-        cards.append(
-            '<section class="speaker">'
-            f'<div class="speaker-head"><code>{html.escape(speaker_id)}</code>'
-            f'<input type="text" data-speaker="{sid}" aria-label="Name for {sid}" '
-            f'value="{html_attribute(prefill)}" placeholder="Enter display name" '
-            f'autocomplete="off">{machine_mark}</div>'
-            f"{suggestion_rows}"
-            f'{split_controls}<div class="clips">{"".join(audio)}</div></section>'
-        )
-
-    safe_title = html.escape(title)
-    safe_mapping = html.escape(mapping_name)
-    matching_css = (
-        "\n.suggestions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }"
-        "\n.machine-mark, .no-suggestion, .tier { color: #777; font-size: .8rem; }"
-        "\n.tier { align-self: center; }"
-        if matches is not None
-        else ""
-    )
-    matching_script = (
-        "for (const button of document.querySelectorAll('.use-suggestion')) {"
-        "\n  button.addEventListener('click', () => {"
-        "\n    const field = button.closest('.speaker').querySelector('[data-speaker]');"
-        "\n    field.value = button.dataset.use; field.dispatchEvent(new Event('input'));"
-        "\n  });"
-        "\n}\n"
-        if matches is not None
-        else ""
-    )
-    split_script = """const splitButtons = [...document.querySelectorAll('.split-speaker')];
+# The page pieces that depend only on whether suggestions are shown, kept at
+# module level so the page function holds just the template.
+_MATCHING_CSS = (
+    "\n.suggestions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }"
+    "\n.machine-mark, .no-suggestion, .tier { color: #777; font-size: .8rem; }"
+    "\n.tier { align-self: center; }"
+)
+_MATCHING_SCRIPT = (
+    "for (const button of document.querySelectorAll('.use-suggestion')) {"
+    "\n  button.addEventListener('click', () => {"
+    "\n    const field = button.closest('.speaker').querySelector('[data-speaker]');"
+    "\n    field.value = button.dataset.use; field.dispatchEvent(new Event('input'));"
+    "\n  });"
+    "\n}\n"
+)
+_SPLIT_SCRIPT = """const splitButtons = [...document.querySelectorAll('.split-speaker')];
 let splitReady = false;
 let splitApplied = false;
 
@@ -348,6 +266,101 @@ for (const button of splitButtons) {
   });
 }
 """
+
+
+# One section per speaker; the loop body is moved here unchanged.
+def _audition_cards(
+    snippets: Mapping[str, Sequence[tuple[Span, str]]],
+    matches: Mapping[str, SpeakerMatch] | None,
+    scope: str | None,
+) -> list[str]:
+    cards: list[str] = []
+    for speaker_id, clips in snippets.items():
+        audio = []
+        for (start, end), data_uri in clips:
+            audio.append(
+                "<figure><figcaption>"
+                f"{start:.1f}s- {end:.1f}s"
+                f'</figcaption><audio controls preload="none" src="{data_uri}"></audio></figure>'
+            )
+        if not audio:
+            audio.append(
+                '<p class="empty">No clean 2-6 second snippet was available.</p>'
+            )
+        sid = html.escape(speaker_id, quote=True)
+        split_controls = (
+            '<div class="speaker-actions">'
+            '<button type="button" class="split-speaker" '
+            f'data-split="{sid}" hidden>Split this speaker</button></div>'
+            '<div class="split-proposal" role="status" '
+            'aria-live="polite"></div>'
+        )
+        if matches is None:
+            cards.append(
+                '<section class="speaker">'
+                f'<div class="speaker-head"><code>{html.escape(speaker_id)}</code>'
+                f'<input type="text" data-speaker="{sid}" aria-label="Name for {sid}" '
+                'placeholder="Enter display name" autocomplete="off"></div>'
+                f'{split_controls}<div class="clips">{"".join(audio)}</div></section>'
+            )
+            continue
+
+        match = matches.get(speaker_id)
+        candidates = match.candidates if match is not None else ()
+        prefill = (
+            candidates[0].display_name
+            if match is not None and match.decision == "prefill" and candidates
+            else ""
+        )
+        if scope is not None:
+            suggestion_rows = _tiered_suggestions(match, scope)
+        else:
+            suggestion_buttons = "".join(
+                _suggestion_button(candidate, show_scopes=False)
+                for candidate in candidates
+            )
+            if not suggestion_buttons:
+                suggestion_buttons = (
+                    '<span class="no-suggestion">No stored match.</span>'
+                )
+            suggestion_rows = f'<div class="suggestions">{suggestion_buttons}</div>'
+        machine_mark = (
+            '<span class="machine-mark">machine-suggested; review before saving</span>'
+            if prefill
+            else ""
+        )
+        cards.append(
+            '<section class="speaker">'
+            f'<div class="speaker-head"><code>{html.escape(speaker_id)}</code>'
+            f'<input type="text" data-speaker="{sid}" aria-label="Name for {sid}" '
+            f'value="{html_attribute(prefill)}" placeholder="Enter display name" '
+            f'autocomplete="off">{machine_mark}</div>'
+            f"{suggestion_rows}"
+            f'{split_controls}<div class="clips">{"".join(audio)}</div></section>'
+        )
+    return cards
+
+
+def _render_audition_html(
+    title: str,
+    mapping_name: str,
+    snippets: Mapping[str, Sequence[tuple[Span, str]]],
+    matches: Mapping[str, SpeakerMatch] | None = None,
+    *,
+    scope: str | None = None,
+) -> str:
+    """Build the self-contained in-memory audition page.
+
+    ``scope`` marks a voice-library match: suggestions are then split into the
+    episode's own scope and the other scopes, each labelled.
+    """
+    cards = _audition_cards(snippets, matches, scope)
+
+    safe_title = html.escape(title)
+    safe_mapping = html.escape(mapping_name)
+    matching_css = _MATCHING_CSS if matches is not None else ""
+    matching_script = _MATCHING_SCRIPT if matches is not None else ""
+    split_script = _SPLIT_SCRIPT
     return f"""<!doctype html>
 <html lang="en">
 <head>
