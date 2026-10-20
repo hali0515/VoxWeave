@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, overload
+from typing import Any, BinaryIO, Literal, NamedTuple, overload
 
 from voxweave import config
 from voxweave.align_ctc import align_blocks_full_ctc, align_text_ctc, release_ctc
@@ -90,22 +90,32 @@ _WHISPER_ALIASES = {"whisper": "large-v3-turbo", "turbo": "large-v3-turbo"}
 _FUSION_ALIASES = {"fusion", "fuse", "hybrid", "hybrid+"}
 
 
-def _select_engine(name: str | None) -> tuple[str, str]:
+EngineKind = Literal["qwen", "whisper", "fusion"]
+
+
+class EngineSpec(NamedTuple):
+    """A selected ASR engine: its kind and the resolved model id."""
+
+    kind: EngineKind
+    model_id: str
+
+
+def _select_engine(name: str | None) -> EngineSpec:
     """--asr-model value -> (engine, resolved model id).
 
     Empty -> ('qwen', ASR_MODEL). Fusion aliases -> ('fusion', ''). Whisper size/distil- prefix -> ('whisper', size).
     Otherwise -> ('qwen', repo id).
     """
     if not name or not name.strip():
-        return "qwen", ASR_MODEL
+        return EngineSpec("qwen", ASR_MODEL)
     key = name.strip().lower()
     if key in _FUSION_ALIASES:
-        return "fusion", ""
+        return EngineSpec("fusion", "")
     if key in _WHISPER_ALIASES:
-        return "whisper", _WHISPER_ALIASES[key]
+        return EngineSpec("whisper", _WHISPER_ALIASES[key])
     if key in _WHISPER_MODELS or key.startswith("distil-"):
-        return "whisper", key
-    return "qwen", resolve_asr_model(name)
+        return EngineSpec("whisper", key)
+    return EngineSpec("qwen", resolve_asr_model(name))
 
 
 # Where an explicitly placed separator ckpt + companion yaml are looked for: VOXWEAVE_MODEL_DIR,
