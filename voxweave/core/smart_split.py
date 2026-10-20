@@ -15,9 +15,20 @@ necessarily in the output: ``_repair_bound_particle_cues``
 adjacent cues across it. Each of those folds gates on a sub-pause gap, so none
 crosses a real pause.
 
-This module owns the segmentation *engine*: clause/sentence splitting and the
-atom packing loop. Pure text helpers and display wrapping live in ``layout``;
-cue-stream timing polish (glue/merge/cleanup/shot-snap) lives in ``timing``.
+This module is the public facade and the orchestrator of the segmentation
+*engine*: it keeps ``smart_split_segments``, ``split_long_cues_with_word_timings``
+and ``_split_without_timings``. The engine code itself lives in sibling modules
+and is re-exported here, so every ``smart_split.<name>`` import still resolves:
+
+- ``split_types``: ``SplitThresholds`` and ``SplitContext``.
+- ``split_atoms``: unit surface text, display-character ranges and atoms.
+- ``split_sentences``: stage 1 (sentences, comma clauses, clause location).
+- ``split_scoring``: break-point quality and length-break choice.
+- ``split_packing``: stage 2 packing, hard wrap and untimed spread.
+- ``split_repair``: the zh/yue/ja bound-particle repair.
+
+Pure text helpers and display wrapping live in ``layout``; cue-stream timing
+polish (glue/merge/cleanup/shot-snap) lives in ``timing``.
 """
 
 from __future__ import annotations
