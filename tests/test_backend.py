@@ -1892,6 +1892,118 @@ def test_transcribe_chunks_sum_strategy_keeps_singletons_resident(
     assert out[0] == ("Japanese", "はい", [{"text": "はい", "start": 0.0, "end": 1.0}])
 
 
+def test_transcribe_chunks_fusion_sum_strategy_keeps_both_asr_models_resident(
+    monkeypatch, tmp_path
+):
+    # fusion + sum: same three-pass structure as peak (whisper ASR, Qwen ASR, align),
+    # but neither ASR singleton is released between passes. 3N ticks like peak.
+    seq: list[str] = []
+
+    def _asr(engine, w, lang, mid, ctx):
+        seq.append(f"asr:{engine}:{w.name}")
+        return ("ja", f"{engine}-{w.name}", "ja")
+
+    def _align(w, text, alang):
+        seq.append(f"align:{text}")
+        return [{"text": "x", "start": 0.0, "end": 0.2}]
+
+    def _fuse(wr, qr, lang):
+        seq.append(f"fuse:{wr[1]}|{qr[1]}")
+        return ("ja", "fused", [])
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(backend, "align_text", _align)
+    monkeypatch.setattr(backend, "_fuse_chunk", _fuse)
+    monkeypatch.setattr(backend, "_release_whisper", lambda: seq.append("REL_W"))
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: seq.append("REL_Q"))
+    monkeypatch.setattr(backend, "_empty_cache", lambda: seq.append("EMPTY"))
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    out = backend.transcribe_chunks(
+        wavs,
+        None,
+        asr_model="fusion",
+        on_done=lambda i: seq.append(f"TICK:{i}"),
+        strategy="sum",
+    )
+    # Three passes, no REL_W / REL_Q anywhere; 3N ticks like peak. Each chunk of the
+    # alignment pass ends with the cache clear and then its tick.
+    assert seq == [
+        "asr:whisper:c0.wav",
+        "TICK:0",
+        "asr:whisper:c1.wav",
+        "TICK:1",
+        "asr:qwen:c0.wav",
+        "TICK:2",
+        "asr:qwen:c1.wav",
+        "TICK:3",
+        "align:whisper-c0.wav",
+        "align:qwen-c0.wav",
+        "fuse:whisper-c0.wav|qwen-c0.wav",
+        "EMPTY",
+        "TICK:4",
+        "align:whisper-c1.wav",
+        "align:qwen-c1.wav",
+        "fuse:whisper-c1.wav|qwen-c1.wav",
+        "EMPTY",
+        "TICK:5",
+    ]
+    assert out == [("ja", "fused", [])] * 2
+
+
+def test_transcribe_chunks_whisper_sum_strategy_keeps_whisper_resident(
+    monkeypatch, tmp_path
+):
+    # whisper engine + sum: two-pass structure, whisper is NOT released between the
+    # ASR pass and the alignment pass (and qwen is never touched). 2N ticks like peak.
+    seq: list[str] = []
+
+    def _asr(engine, w, lang, mid, ctx):
+        seq.append(f"asr:{engine}:{w.name}")
+        return ("ja", "" if w.name == "c1.wav" else "はい", "ja")
+
+    def _align(w, text, alang):
+        seq.append(f"align:{w.name}")
+        return [{"text": "はい", "start": 0.0, "end": 1.0}]
+
+    monkeypatch.setattr(backend, "_asr_only", _asr)
+    monkeypatch.setattr(backend, "align_text", _align)
+    monkeypatch.setattr(backend, "_release_whisper", lambda: seq.append("REL_W"))
+    monkeypatch.setattr(backend, "_release_qwen_asr", lambda: seq.append("REL_Q"))
+    monkeypatch.setattr(backend, "_empty_cache", lambda: seq.append("EMPTY"))
+    wavs = [tmp_path / "c0.wav", tmp_path / "c1.wav", tmp_path / "c2.wav"]
+    for w in wavs:
+        w.write_bytes(b"x")
+    out = backend.transcribe_chunks(
+        wavs,
+        None,
+        asr_model="large-v3-turbo",
+        on_done=lambda i: seq.append(f"TICK:{i}"),
+        strategy="sum",
+    )
+    # The empty-text c1 is not aligned but still clears the cache and ticks; no REL_W /
+    # REL_Q; 2N ticks like peak.
+    assert seq == [
+        "asr:whisper:c0.wav",
+        "TICK:0",
+        "asr:whisper:c1.wav",
+        "TICK:1",
+        "asr:whisper:c2.wav",
+        "TICK:2",
+        "align:c0.wav",
+        "EMPTY",
+        "TICK:3",
+        "EMPTY",
+        "TICK:4",
+        "align:c2.wav",
+        "EMPTY",
+        "TICK:5",
+    ]
+    assert [t for _, t, _ in out] == ["はい", "", "はい"]
+    assert out[1][2] == []
+
+
 # --- full-file alignment pass (full_wav + bounds) ----------------------------------------------- #
 def test_transcribe_chunks_full_pass_for_ctc_lang(monkeypatch, tmp_path):
     # CTC-configured file language + full_wav/bounds -> ONE align_blocks_full_ctc call
