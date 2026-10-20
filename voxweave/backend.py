@@ -21,7 +21,7 @@ from voxweave.align_mms import (
     release_mms,
     uses_mms as uses_mms,  # re-export (pipeline-facing)
 )
-from voxweave.core.langsets import LANGUAGES_WITHOUT_SPACES
+from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS, LANGUAGES_WITHOUT_SPACES
 from voxweave.runtime import (
     _MISSING_WHISPER,
     _empty_cache,
@@ -877,7 +877,7 @@ def _fuse_chunk(
     if not text_w.strip():
         return q_res
     from voxweave.lang import to_iso_or
-    from voxweave.realign import NO_SPACE_LANGS, fuse_punct_into_text, reinject_punct
+    from voxweave.realign import fuse_punct_into_text, reinject_punct
 
     det_q, text_q, units_q = q_res
     # Punctuation transfer is an enhancement, never a reason to destroy a good
@@ -899,7 +899,7 @@ def _fuse_chunk(
     # Spaced langs: strip whisper's sparse punctuation and use Qwen's (word-level transplant is stable).
     # No-space langs: keep whisper's own punctuation (char-level time transplant drifts; see fuse_punct_into_text).
     fused = fuse_punct_into_text(
-        text_w, qwen_punct, strip_existing=iso not in NO_SPACE_LANGS
+        text_w, qwen_punct, strip_existing=iso not in ALIGNER_NO_SPACE_LANGS
     )
     return det_w or det_q, fused, units_w
 

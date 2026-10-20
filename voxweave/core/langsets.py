@@ -9,3 +9,8 @@ from __future__ import annotations
 # joiner, so th/lo/my are no-space here but space-joined there. Both treat Cantonese (yue) like
 # Chinese.
 LANGUAGES_WITHOUT_SPACES = {"zh", "yue", "ja", "th", "lo", "my"}
+
+# The aligners' no-space set (re-exported as realign.NO_SPACE_LANGS). It is deliberately narrower
+# than LANGUAGES_WITHOUT_SPACES (which also has th/lo/my); do not unify the two without checking
+# the aligner output. Korean uses spaces, so it is excluded.
+ALIGNER_NO_SPACE_LANGS = {"zh", "ja", "yue"}

@@ -27,7 +27,7 @@ from voxweave.align_snapshot import (
     FrozenString,
     frozen_json_digest,
 )
-from voxweave.core.langsets import LANGUAGES_WITHOUT_SPACES
+from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS, LANGUAGES_WITHOUT_SPACES
 from voxweave.core.partition_check import normalize_text
 from voxweave.timestamps import shift_units
 
@@ -1444,10 +1444,8 @@ def _legacy_count(text: str, iso: str) -> int:
     sliced by words there, and counting characters here would disagree with the
     delivered units.
     """
-    from voxweave.realign import NO_SPACE_LANGS
-
     stripped = (text or "").strip()
-    if iso in NO_SPACE_LANGS:
+    if iso in ALIGNER_NO_SPACE_LANGS:
         return sum(1 for character in stripped if character.isalnum())
     return len(stripped.split())
 
