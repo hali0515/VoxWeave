@@ -1161,6 +1161,25 @@ def _shadow_authorities(
     }
 
 
+def _shadow_admit(artifact: dict[str, Any]) -> dict[str, Any]:
+    # The optimizer artifact remains schema 1 until this exact completed
+    # payload passes the one shared live/harness contract.  Validation ignores
+    # only the version field for this pre-admission pass; every other top-level
+    # key, lane/row, evidence block, and cross-block cardinality is live.
+    from voxweave.core.shadow_schema import (
+        LIVE_SHADOW_SCHEMA_VERSION,
+        validate_shadow_v2_payload,
+    )
+
+    if artifact.get("schema_version") != 1:
+        raise ValueError("live shadow admission requires a schema-1 optimizer payload")
+    errors = validate_shadow_v2_payload(artifact, require_version=False)
+    if errors:
+        raise ShadowAdmissionError(artifact, errors)
+    artifact["schema_version"] = LIVE_SHADOW_SCHEMA_VERSION
+    return artifact
+
+
 def _shadow_v2_artifact(
     document: SegDocument, v1_cues: Sequence[Cue], thresholds: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1815,22 +1834,7 @@ def _shadow_v2_artifact(
             reason="refiner-off-unavailable",
             detail="refiner-off optimizer selection authority unavailable",
         )
-    # The optimizer artifact remains schema 1 until this exact completed
-    # payload passes the one shared live/harness contract.  Validation ignores
-    # only the version field for this pre-admission pass; every other top-level
-    # key, lane/row, evidence block, and cross-block cardinality is live.
-    from voxweave.core.shadow_schema import (
-        LIVE_SHADOW_SCHEMA_VERSION,
-        validate_shadow_v2_payload,
-    )
-
-    if artifact.get("schema_version") != 1:
-        raise ValueError("live shadow admission requires a schema-1 optimizer payload")
-    errors = validate_shadow_v2_payload(artifact, require_version=False)
-    if errors:
-        raise ShadowAdmissionError(artifact, errors)
-    artifact["schema_version"] = LIVE_SHADOW_SCHEMA_VERSION
-    return artifact
+    return _shadow_admit(artifact)
 
 
 def run_shadow(
