@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from voxweave import fsio, lang
@@ -107,6 +108,38 @@ _DEFAULT_QUALITY = {
     "libx265": 23,
     "libsvtav1": 30,
 }
+
+
+@dataclass(frozen=True)
+class EncoderProfile:
+    """What the argv builders need to know about an ffmpeg encoder name.
+
+    Each flag keeps the exact name test the builders used before this class
+    existed, so a forced ``--encoder`` with an unusual name is classified the
+    same way in every builder.
+    """
+
+    nvenc: bool
+    videotoolbox: bool
+    svtav1: bool
+    h264: bool
+    x265: bool
+    hvc1: bool  # an mp4 holding it needs the hvc1 brand for Apple players
+
+    @property
+    def hardware(self) -> bool:
+        return self.nvenc or self.videotoolbox
+
+
+def encoder_profile(encoder: str) -> EncoderProfile:
+    return EncoderProfile(
+        nvenc=encoder.endswith("_nvenc"),
+        videotoolbox=encoder.endswith("_videotoolbox"),
+        svtav1=encoder == "libsvtav1",
+        h264="264" in encoder,  # h264_nvenc / h264_videotoolbox / libx264
+        x265=encoder == "libx265",
+        hvc1=encoder.split("_")[0] in ("hevc", "libx265"),
+    )
 
 
 def _missing_binary_error(binary: str) -> RuntimeError:
@@ -692,7 +725,8 @@ def _encoder_args(encoder: str, quality: int, max_rate: int | None = None) -> li
     # the VBV buffer turns the ceiling into a running average rather than a
     # per-frame limit; two seconds is the usual size
     vbv = ["-bufsize", str(2 * max_rate)] if max_rate else []
-    if encoder.endswith("_nvenc"):
+    profile = encoder_profile(encoder)
+    if profile.nvenc:
         # NVENC's CQ mode honours only the max bitrate and discards -bufsize
         return [
             "-preset",
@@ -715,10 +749,10 @@ def _encoder_args(encoder: str, quality: int, max_rate: int | None = None) -> li
             "32",
             *cap,
         ]
-    if encoder.endswith("_videotoolbox"):
+    if profile.videotoolbox:
         # VideoToolbox turns -maxrate into a one-second data rate limit
         return ["-q:v", str(quality), *cap]
-    if encoder == "libsvtav1":
+    if profile.svtav1:
         return ["-preset", "6", "-crf", str(quality), *cap, *vbv]  # capped CRF
     # libx264 / libx265
     return ["-preset", "slow", "-crf", str(quality), *cap, *vbv]
@@ -883,10 +917,11 @@ def _burn_pix_fmt(encoder: str, src_depth: int) -> str:
     so 12-bit sources clamp to 10 there; libx265 keeps 12-bit. Chroma is always
     4:2:0 for playback compatibility.
     """
-    hw = encoder.endswith(("_nvenc", "_videotoolbox"))
-    if "264" in encoder:  # h264_nvenc / h264_videotoolbox / libx264
+    profile = encoder_profile(encoder)
+    hw = profile.hardware
+    if profile.h264:
         depth = 8
-    elif encoder == "libx265":
+    elif profile.x265:
         depth = max(d for d in (8, 10, 12) if d <= max(src_depth, 8))
     else:  # hevc/av1 nvenc, hevc_videotoolbox, libsvtav1
         depth = max(d for d in (8, 10) if d <= max(src_depth, 8))
@@ -944,9 +979,10 @@ def build_burn_cmd(
         "-stats",
         "-y",
     ]
-    if encoder.endswith("_nvenc"):
+    profile = encoder_profile(encoder)
+    if profile.nvenc:
         cmd += ["-hwaccel", "cuda"]  # decode assist; frames return to sysmem for libass
-    elif encoder.endswith("_videotoolbox"):
+    elif profile.videotoolbox:
         cmd += ["-hwaccel", "videotoolbox"]
     cmd += ["-i", str(media)]
     cmd += ["-vf", f"ass={_filter_escape(str(ass_path))},format={pix}"]
@@ -954,7 +990,7 @@ def build_burn_cmd(
     video_map = f"0:{video_index}" if video_index is not None else "0:v:0"
     cmd += ["-map", video_map, "-map", "0:a?"]
     cmd += ["-c:v", encoder, *_encoder_args(encoder, quality, max_rate)]
-    if container == "mp4" and encoder.split("_")[0] in ("hevc", "libx265"):
+    if container == "mp4" and profile.hvc1:
         cmd += ["-tag:v", "hvc1"]
     if container == "mp4" and any(c not in _MP4_SAFE_AUDIO for c in audio_codecs):
         logger.warning("audio re-encoded to AAC (source codec not mp4-compatible)")
