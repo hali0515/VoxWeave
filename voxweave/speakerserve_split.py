@@ -625,6 +625,47 @@ def _restore_files(files: Iterable[tuple[Path, bytes, bool]]) -> None:
         _write_bytes(path, raw, private=private)
 
 
+# Pure check of a confirmed proposal against the re-read episode; no I/O, so it
+# can run inside the episode lock before any write.
+def _split_group_centroids(
+    proposal: _SplitProposal,
+    turns,
+    validated,
+) -> tuple[dict[int, str], dict[str, list[float] | None]]:
+    assignments = dict(proposal.assignment)
+    vectors = dict(proposal.embeddings)
+    if set(assignments) != set(vectors):
+        raise SplitConflict("split proposal embeddings are incomplete")
+    for index in assignments:
+        if index >= len(turns) or turns[index][2] != proposal.speaker_id:
+            raise SplitConflict("split proposal no longer addresses the same turns")
+    group_a = [vectors[index] for index, group in assignments.items() if group == "A"]
+    group_b = [vectors[index] for index, group in assignments.items() if group == "B"]
+    if any(len(vector) != validated.embedding_dim for vector in (*group_a, *group_b)):
+        raise SplitConflict("split proposal embedding dimension changed")
+    if proposal.recipe_centroids is None:
+        # Legacy lane: the mean of the whole-turn pyannote embeddings.
+        group_centroids: dict[str, list[float] | None] = {
+            "A": turnembed.normalized_centroid(group_a),
+            "B": turnembed.normalized_centroid(group_b),
+        }
+    else:
+        # Decoupled lane: the centroid-v1 voiceprints the proposal computed
+        # with the capture's embedder, so the split sidecar matches what a
+        # fresh capture of the relabelled turns would write.
+        recipe = dict(proposal.recipe_centroids)
+        group_centroids = {
+            group: (list(recipe[group]) if group in recipe else None)
+            for group in ("A", "B")
+        }
+        if any(
+            vector is not None and len(vector) != validated.embedding_dim
+            for vector in group_centroids.values()
+        ):
+            raise SplitConflict("split proposal embedding dimension changed")
+    return assignments, group_centroids
+
+
 def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
     with episode_lock(server.media_path):
         sibling_bytes = server.sibling_path.read_bytes()
@@ -669,43 +710,9 @@ def _confirm_split(server: SpeakerHTTPServer, proposal: _SplitProposal) -> str:
         }
         new_id = _next_speaker_id(used_ids)
 
-        assignments = dict(proposal.assignment)
-        vectors = dict(proposal.embeddings)
-        if set(assignments) != set(vectors):
-            raise SplitConflict("split proposal embeddings are incomplete")
-        for index in assignments:
-            if index >= len(turns) or turns[index][2] != proposal.speaker_id:
-                raise SplitConflict("split proposal no longer addresses the same turns")
-        group_a = [
-            vectors[index] for index, group in assignments.items() if group == "A"
-        ]
-        group_b = [
-            vectors[index] for index, group in assignments.items() if group == "B"
-        ]
-        if any(
-            len(vector) != validated.embedding_dim for vector in (*group_a, *group_b)
-        ):
-            raise SplitConflict("split proposal embedding dimension changed")
-        if proposal.recipe_centroids is None:
-            # Legacy lane: the mean of the whole-turn pyannote embeddings.
-            group_centroids: dict[str, list[float] | None] = {
-                "A": turnembed.normalized_centroid(group_a),
-                "B": turnembed.normalized_centroid(group_b),
-            }
-        else:
-            # Decoupled lane: the centroid-v1 voiceprints the proposal computed
-            # with the capture's embedder, so the split sidecar matches what a
-            # fresh capture of the relabelled turns would write.
-            recipe = dict(proposal.recipe_centroids)
-            group_centroids = {
-                group: (list(recipe[group]) if group in recipe else None)
-                for group in ("A", "B")
-            }
-            if any(
-                vector is not None and len(vector) != validated.embedding_dim
-                for vector in group_centroids.values()
-            ):
-                raise SplitConflict("split proposal embedding dimension changed")
+        assignments, group_centroids = _split_group_centroids(
+            proposal, turns, validated
+        )
 
         updated_sibling = copy.deepcopy(sibling)
         raw_turns = updated_sibling.get("speaker_turns")
