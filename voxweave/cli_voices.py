@@ -91,24 +91,7 @@ def _print_identity(detail: Mapping[str, object]) -> None:
             )
 
 
-def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
-    """Build the voice-library CLI around the application's error wrapper."""
-
-    @click.group(
-        "voices",
-        cls=click.RichGroup,
-        short_help="Inspect, rename, forget, or import saved voices.",
-    )
-    def group() -> None:
-        """Manage the voice library that `speakers enroll` fills.
-
-        The library holds voice biometrics of the people you name, shared by
-        every media folder (and by every machine that points at the same
-        directory). `forget` removes one person from it for good; per-folder
-        stores of earlier versions that still hold them are listed, not
-        edited.
-        """
-
+def _add_list_command(group: click.RichGroup, run: Callable[..., Any]) -> None:
     @group.command("list", short_help="List saved identities.")
     @click.option("--scope", help="Only identities enrolled under this scope.")
     @click.option("--json", "as_json", is_flag=True, help="Print JSON.")
@@ -131,6 +114,8 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
             return
         _print_rows(rows, title=f"Voice library {location.root}")
 
+
+def _add_show_command(group: click.RichGroup, run: Callable[..., Any]) -> None:
     @group.command("show", short_help="Show one identity by id or name.")
     @click.argument("query", metavar="ID|NAME")
     @click.option("--json", "as_json", is_flag=True, help="Print JSON.")
@@ -172,6 +157,8 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
         else:
             _print_identity(detail)
 
+
+def _add_rename_command(group: click.RichGroup, run: Callable[..., Any]) -> None:
     @group.command("rename", short_help="Rename an identity everywhere.")
     @click.argument("identity_id", metavar="ID")
     @click.argument("new_name", metavar="NEW_NAME")
@@ -194,6 +181,8 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
         run(apply, reporter=False)
         click.echo(f"{identity_id}: {new_name}")
 
+
+def _add_forget_command(group: click.RichGroup, run: Callable[..., Any]) -> None:
     @group.command("forget", short_help="Delete one person from the library.")
     @click.argument("identity_id", metavar="ID")
     @click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
@@ -244,6 +233,8 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
                 err=True,
             )
 
+
+def _add_import_command(group: click.RichGroup, run: Callable[..., Any]) -> None:
     @group.command("import", short_help="Merge a per-show voices store.")
     @click.argument(
         "store_path",
@@ -328,6 +319,8 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
             f"{summary.exemplars_present} already present{superseded}{scopes_added}"
         )
 
+
+def _add_where_command(group: click.RichGroup, run: Callable[..., Any]) -> None:
     @group.command("where", short_help="Print the voice library directory.")
     @_voices_dir_option
     def where_command(voices_dir: Path | None) -> None:
@@ -337,5 +330,31 @@ def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
         location = voicelibrary.resolve_voices_dir(voices_dir)
         click.echo(str(location.root))
         click.echo(f"source: {location.source}")
+
+
+def build_voices_group(run: Callable[..., Any]) -> click.RichGroup:
+    """Build the voice-library CLI around the application's error wrapper."""
+
+    @click.group(
+        "voices",
+        cls=click.RichGroup,
+        short_help="Inspect, rename, forget, or import saved voices.",
+    )
+    def group() -> None:
+        """Manage the voice library that `speakers enroll` fills.
+
+        The library holds voice biometrics of the people you name, shared by
+        every media folder (and by every machine that points at the same
+        directory). `forget` removes one person from it for good; per-folder
+        stores of earlier versions that still hold them are listed, not
+        edited.
+        """
+
+    _add_list_command(group, run)
+    _add_show_command(group, run)
+    _add_rename_command(group, run)
+    _add_forget_command(group, run)
+    _add_import_command(group, run)
+    _add_where_command(group, run)
 
     return group
