@@ -195,6 +195,7 @@ V2_ONLY_MODULES = (
     "voxweave.core.authority",
     "voxweave.core.canonical_text",
     "voxweave.core.finalizer",
+    "voxweave.core.finalizer_model",
     "voxweave.core.shadow_schema",
     "voxweave.core.speaker_evidence",
     "voxweave.core.subunit",
