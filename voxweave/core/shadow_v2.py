@@ -1226,6 +1226,74 @@ def _shadow_v1_rows(
     return v1_row, comparator_row, classification
 
 
+def _shadow_refiner_comparison(
+    *,
+    refiner_off: Any,
+    optimizer_artifact_bytes: str,
+    raw_partition: Sequence[int],
+    split: Any,
+    parent_unit_count: int,
+    parent_v1_mode: Any,
+) -> dict[str, Any]:
+    # Pure read of the refiner-off solution; the optimize_document call that
+    # produced it stays in the orchestrator because it scores edges on the
+    # shared preview.
+    from voxweave.core.boundary_v2 import _document_partition
+
+    if split.refined_parent_count == 0:
+        refiner_comparison: dict[str, Any] = {
+            "byte_identical": optimizer_artifact_bytes
+            == json.dumps(refiner_off.artifact, sort_keys=True, separators=(",", ":")),
+            "refined_parent_count": 0,
+            "status": "tracked-identity",
+        }
+    else:
+        off_fallbacks = sum(not item.optimized for item in refiner_off.solutions)
+        refiner_off_partition = _document_partition(
+            refiner_off.solutions, parent_unit_count
+        )
+        coarse_ranges = [
+            list(item.unit_range)
+            for item in refiner_off.solutions
+            if item.coarse_caused
+        ]
+        mapped_on: set[int] = set()
+        internal_on: list[int] = []
+        for cut in raw_partition:
+            left_parent = split.origin[cut - 1]
+            right_parent = split.origin[cut]
+            if left_parent == right_parent:
+                internal_on.append(left_parent)
+            else:
+                mapped_on.add(right_parent)
+        external_diff = sorted(mapped_on ^ set(refiner_off_partition))
+
+        def covered(parent: int) -> bool:
+            return any(low <= parent < high for low, high in coarse_ranges)
+
+        diffs_confined = all(covered(parent) for parent in internal_on) and all(
+            covered(max(0, cut - 1)) or covered(cut) for cut in external_diff
+        )
+        refiner_comparison = {
+            "byte_identical": False,
+            "coarse_caused_intervals": refiner_off.artifact["coverage"][
+                "coarse_caused_intervals"
+            ],
+            "coarse_caused_unit_ranges": coarse_ranges,
+            "diffs_confined_to_coarse_caused": diffs_confined,
+            "external_parent_cut_diff": external_diff,
+            "fallback_intervals": off_fallbacks,
+            "internal_refinement_cut_parents": sorted(internal_on),
+            "materialized": off_fallbacks == 0,
+            "off_partition": list(refiner_off_partition),
+            "on_parent_edge_partition": sorted(mapped_on),
+            "parent_v1_projection": parent_v1_mode,
+            "refined_parent_count": split.refined_parent_count,
+            "status": "refined-counterfactual",
+        }
+    return refiner_comparison
+
+
 def _shadow_admit(artifact: dict[str, Any]) -> dict[str, Any]:
     # The optimizer artifact remains schema 1 until this exact completed
     # payload passes the one shared live/harness contract.  Validation ignores
@@ -1717,57 +1785,14 @@ def _shadow_v2_artifact(
         speakers=parent_speakers,
         speaker_weight=W_SPEAKER_INTERIOR,
     )
-    if split.refined_parent_count == 0:
-        refiner_comparison: dict[str, Any] = {
-            "byte_identical": optimizer_artifact_bytes
-            == json.dumps(refiner_off.artifact, sort_keys=True, separators=(",", ":")),
-            "refined_parent_count": 0,
-            "status": "tracked-identity",
-        }
-    else:
-        off_fallbacks = sum(not item.optimized for item in refiner_off.solutions)
-        refiner_off_partition = _document_partition(
-            refiner_off.solutions, len(document.units)
-        )
-        coarse_ranges = [
-            list(item.unit_range)
-            for item in refiner_off.solutions
-            if item.coarse_caused
-        ]
-        mapped_on: set[int] = set()
-        internal_on: list[int] = []
-        for cut in raw_partition:
-            left_parent = split.origin[cut - 1]
-            right_parent = split.origin[cut]
-            if left_parent == right_parent:
-                internal_on.append(left_parent)
-            else:
-                mapped_on.add(right_parent)
-        external_diff = sorted(mapped_on ^ set(refiner_off_partition))
-
-        def covered(parent: int) -> bool:
-            return any(low <= parent < high for low, high in coarse_ranges)
-
-        diffs_confined = all(covered(parent) for parent in internal_on) and all(
-            covered(max(0, cut - 1)) or covered(cut) for cut in external_diff
-        )
-        refiner_comparison = {
-            "byte_identical": False,
-            "coarse_caused_intervals": refiner_off.artifact["coverage"][
-                "coarse_caused_intervals"
-            ],
-            "coarse_caused_unit_ranges": coarse_ranges,
-            "diffs_confined_to_coarse_caused": diffs_confined,
-            "external_parent_cut_diff": external_diff,
-            "fallback_intervals": off_fallbacks,
-            "internal_refinement_cut_parents": sorted(internal_on),
-            "materialized": off_fallbacks == 0,
-            "off_partition": list(refiner_off_partition),
-            "on_parent_edge_partition": sorted(mapped_on),
-            "parent_v1_projection": parent_v1_mode,
-            "refined_parent_count": split.refined_parent_count,
-            "status": "refined-counterfactual",
-        }
+    refiner_comparison: dict[str, Any] = _shadow_refiner_comparison(
+        refiner_off=refiner_off,
+        optimizer_artifact_bytes=optimizer_artifact_bytes,
+        raw_partition=raw_partition,
+        split=split,
+        parent_unit_count=len(document.units),
+        parent_v1_mode=parent_v1_mode,
+    )
 
     rows: dict[str, Any] = {
         "v1": v1_row,
