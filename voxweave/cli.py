@@ -17,6 +17,7 @@ from voxweave.cli_compat import (
 )
 from voxweave.cli_speakers import build_speakers_group
 from voxweave.cli_voices import build_voices_group
+from voxweave.export import EXPORT_RENDERERS
 from voxweave.progress import Reporter
 from voxweave.ui import (
     RichReporter,
@@ -854,7 +855,7 @@ def cmd_translate(
     "formats",
     legacy="--to",
     multiple=True,
-    type=click.Choice(["srt", "ass", "vtt"]),
+    type=click.Choice(list(EXPORT_RENDERERS)),
     default=("srt",),
     help="Output format(s); repeat for several (e.g. -f srt -f ass). Default: srt.",
 )

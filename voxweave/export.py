@@ -269,7 +269,17 @@ def render_vtt_rows(
     )
 
 
-_EXPORT_FORMATS = {"srt", "ass", "vtt"}
+# Format name -> renderer function name, in the order shown by ``--help``. Names
+# (not function objects) so each lookup is late-bound and a monkeypatched
+# renderer still takes effect.
+EXPORT_RENDERERS = {
+    "srt": "render_srt",
+    "ass": "render_ass",
+    "vtt": "render_vtt_rows",
+}
+_EXPORT_FORMATS = set(
+    EXPORT_RENDERERS
+)  # kept for importers; validation uses the mapping
 
 
 def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
@@ -278,7 +288,7 @@ def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
     to the source raise ValueError."""
     from voxweave.subformats import load_subtitle_blocks
 
-    unknown = [f for f in formats if f not in _EXPORT_FORMATS]
+    unknown = [f for f in formats if f not in EXPORT_RENDERERS]
     if unknown:
         raise ValueError(f"unknown export format(s): {', '.join(unknown)}")
     src_fmt = sub_path.suffix.lower().lstrip(".")
@@ -293,12 +303,7 @@ def export_subtitles(sub_path: Path, formats: tuple[str, ...]) -> list[Path]:
     out: list[Path] = []
     for fmt in dict.fromkeys(formats):  # dedupe, keep order
         path = swap_ext(sub_path, f".{fmt}")
-        if fmt == "srt":
-            rendered = render_srt(rows, blocks=blocks)
-        elif fmt == "ass":
-            rendered = render_ass(rows, blocks=blocks)
-        else:
-            rendered = render_vtt_rows(rows, blocks=blocks)
+        rendered = globals()[EXPORT_RENDERERS[fmt]](rows, blocks=blocks)
         fsio.atomic_write_text(path, rendered)
         out.append(path)
     return out
