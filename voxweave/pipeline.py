@@ -51,6 +51,7 @@ from voxweave.core.shadow_v2 import (
     SEG_V2_SHADOW_ENV as SEG_V2_SHADOW_ENV,
     SHADOW_LANE_CORE as SHADOW_LANE_CORE,
     SHADOW_LANE_DELIVERY_LEGACY as SHADOW_LANE_DELIVERY_LEGACY,
+    shadow_enabled,
     SHADOW_LANE_FINALIZER as SHADOW_LANE_FINALIZER,
     SHADOW_LANE_LEGACY_DISPLAY as SHADOW_LANE_LEGACY_DISPLAY,
 )
@@ -78,12 +79,8 @@ from voxweave.segmentation import (
     segment_document,
 )
 from voxweave.sidecars import (
-    align_evidence_candidates,
     artifact_owner,
     inspect_speakers_mapping_path,
-    speaker_suggest_candidates,
-    speakers_html_path,
-    voiceprints_candidates,
     voiceprints_path,
 )
 from voxweave.sidecars import (
@@ -1763,28 +1760,13 @@ def _finish_process_from_units(
         source_mode=source_mode,
         mapping_generation=None,
         mapping_path=None,
-        shadow_enabled=os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1",
+        shadow_enabled=shadow_enabled(),
     )
-    cleanup: list[episode_transaction.ArtifactCleanup] = []
-    if machine_artifact is None:
-        cleanup.extend(
-            episode_transaction.ArtifactCleanup(path, "voiceprints-unlink")
-            for path in voiceprints_candidates(media_path)
-        )
-    cleanup.extend(
-        episode_transaction.ArtifactCleanup(path, "suggest-unlink")
-        for path in speaker_suggest_candidates(media_path)
+    cleanup = episode_transaction.speaker_artifact_cleanups(
+        media_path, media_path, voiceprints=machine_artifact is None
     )
     cleanup.extend(
-        (
-            episode_transaction.ArtifactCleanup(
-                speakers_html_path(media_path), "html-unlink"
-            ),
-        )
-    )
-    cleanup.extend(
-        episode_transaction.ArtifactCleanup(path, "evidence-unlink")
-        for path in align_evidence_candidates(
+        episode_transaction.evidence_cleanups(
             swap_ext(media_path, ".vtt"), media=media_path
         )
     )
@@ -2053,30 +2035,14 @@ def split(
         source_mode=None,
         mapping_generation=mapping_generation,
         mapping_path=mapping_path,
-        shadow_enabled=os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1",
+        shadow_enabled=shadow_enabled(),
     )
     pair_declared = "voiceprint_capture" in data or "voiceprint_media" in data
     cleanup: list[episode_transaction.ArtifactCleanup] = []
     if pair_declared and voiceprint_pair is None:
-        cleanup.extend(
-            episode_transaction.ArtifactCleanup(path, "voiceprints-unlink")
-            for path in voiceprints_candidates(owner)
-        )
-        cleanup.extend(
-            episode_transaction.ArtifactCleanup(path, "suggest-unlink")
-            for path in speaker_suggest_candidates(owner)
-        )
-        cleanup.append(
-            episode_transaction.ArtifactCleanup(
-                speakers_html_path(json_path), "html-unlink"
-            )
-        )
+        cleanup.extend(episode_transaction.speaker_artifact_cleanups(owner, json_path))
     cleanup.extend(
-        episode_transaction.ArtifactCleanup(path, "evidence-unlink")
-        for path in align_evidence_candidates(
-            swap_ext(json_path, ".vtt"),
-            media=owner,
-        )
+        episode_transaction.evidence_cleanups(swap_ext(json_path, ".vtt"), media=owner)
     )
     rep.step("write outputs")
     try:
@@ -3064,7 +3030,7 @@ def align(
                 speaker_turns=keep_turns,
                 voiceprint_pair=voiceprint_pair if preserve_pair else None,
                 manifest=keep_manifest,
-                shadow_requested=os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1",
+                shadow_requested=shadow_enabled(),
                 strict_input_status=sibling_snapshot.strict_input_status,
                 legacy_policy=legacy_policy,
                 stored_language=data.get("language"),
@@ -3079,17 +3045,7 @@ def align(
             cleanup: list[episode_transaction.ArtifactCleanup] = []
             if pair_declared and not preserve_pair:
                 cleanup.extend(
-                    episode_transaction.ArtifactCleanup(path, "voiceprints-unlink")
-                    for path in voiceprints_candidates(media)
-                )
-                cleanup.extend(
-                    episode_transaction.ArtifactCleanup(path, "suggest-unlink")
-                    for path in speaker_suggest_candidates(media)
-                )
-                cleanup.append(
-                    episode_transaction.ArtifactCleanup(
-                        speakers_html_path(vtt_path), "html-unlink"
-                    )
+                    episode_transaction.speaker_artifact_cleanups(media, vtt_path)
                 )
 
             rep.step("write outputs")
@@ -3109,9 +3065,9 @@ def align(
                     raise
             evidence_path = artifacts.align_evidence_path(media, vtt_path)
             cleanup.extend(
-                episode_transaction.ArtifactCleanup(path, "evidence-unlink")
-                for path in align_evidence_candidates(vtt_path, media=media)
-                if path != evidence_path
+                episode_transaction.evidence_cleanups(
+                    vtt_path, media=media, keep=evidence_path
+                )
             )
             evidence_artifact = episode_transaction.EvidencePublication(
                 evidence_path,
@@ -3197,7 +3153,7 @@ def align(
                 raise disposal_failure
         with align_runtime_activity("AO-25", "artifact-and-observer-dispatch"):
             if (
-                os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1"
+                shadow_enabled()
                 and _shadow_observer is not None
                 and completed_selection is not None
                 and observation_input is not None

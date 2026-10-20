@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -61,6 +62,12 @@ log = logging.getLogger("voxweave")
 #: never validated, so a typo is silent and a latched value could leave a user
 #: running a measurement build for months.
 SEG_V2_SHADOW_ENV = "VOXWEAVE_SEG_V2_SHADOW"
+
+
+def shadow_enabled() -> bool:
+    """Whether the shadow lane is requested; reads the environment at call time."""
+    return os.environ.get(SEG_V2_SHADOW_ENV, "").strip() == "1"
+
 
 #: P5's lane names, from the one leaf both this hook and the schema read. Core
 #: and the renamed legacy delivery proxy retain the P4 evidence; the finalizer
