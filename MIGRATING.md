@@ -485,7 +485,7 @@ only and is ignored on CPU/MPS; an unrecognized value warns once and falls back 
 `off`.
 
 Both knobs are described in more detail under
-[Performance knobs](README.md#performance-knobs) in the README.
+[Performance knobs](docs/configuration.md#performance-knobs).
 
 ### Stage timing on stderr
 

@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 312" width="880" height="312" role="img" aria-labelledby="t d">
+  <title id="t">VoxWeave speaker labelling workflow</title>
+  <desc id="d">Transcribe with diarization, open the speaker page, name each speaker and press Save to re-render the VTT with voice tags. Optionally enroll the names into the voice library so later recordings suggest them.</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/>
+    </marker>
+  </defs>
+  <rect width="880" height="312" fill="#ffffff"/>
+  <style>
+    text { font-family: "Times New Roman", "Liberation Serif", Times, serif; fill: #1a1a1a; }
+    .h { font-size: 17px; font-weight: 700; }
+    .b { font-size: 15px; text-anchor: middle; }
+    .s { font-size: 13px; text-anchor: middle; font-style: italic; }
+    .m { font-family: "Courier New", "Liberation Mono", monospace; font-size: 12.5px; text-anchor: middle; }
+    .n { font-size: 12.5px; font-style: italic; }
+    .box { fill: #d4d4d4; stroke: #1a1a1a; stroke-width: 1.6; }
+    .key { fill: #bdbdbd; stroke: #1a1a1a; stroke-width: 2.2; }
+    .io { fill: #ffffff; stroke: #1a1a1a; stroke-width: 2.2; }
+    .opt { fill: #ececec; stroke: #1a1a1a; stroke-width: 1.4; stroke-dasharray: 6 4; }
+    .ln { stroke: #1a1a1a; stroke-width: 1.6; fill: none; marker-end: url(#a); }
+    .ctl { stroke: #1a1a1a; stroke-width: 1.4; fill: none; stroke-dasharray: 6 4; marker-end: url(#a); }
+    .sep { stroke: #8a8a8a; stroke-width: 1.2; stroke-dasharray: 2 5; }
+  </style>
+
+  <text class="h" x="30" y="26">Name the speakers</text>
+  <rect class="box" x="30" y="40" width="190" height="62" rx="9"/>
+  <text class="m" x="125" y="67">voxweave meeting.m4a</text>
+  <text class="m" x="125" y="87">--diarize --voiceprints</text>
+  <rect class="box" x="345" y="40" width="190" height="62" rx="9"/>
+  <text class="m" x="440" y="67">speakers serve</text>
+  <text class="s" x="440" y="88">listen, type a name</text>
+  <rect class="key" x="660" y="40" width="190" height="62" rx="9"/>
+  <text class="b" x="755" y="77" style="font-weight:700">Save</text>
+  <path class="ln" d="M220,71 H345"/>
+  <path class="ln" d="M535,71 H660"/>
+
+  <line class="sep" x1="20" y1="128" x2="860" y2="128"/>
+
+  <rect class="io" x="660" y="230" width="190" height="62" rx="9"/>
+  <text class="b" x="755" y="257">meeting.vtt re-rendered</text>
+  <text class="m" x="755" y="277">&lt;v Name&gt; voice tags</text>
+  <path class="ln" d="M755,102 V230"/>
+  <text class="n" x="765" y="176">every Save</text>
+
+  <text class="h" x="30" y="152">Optional: remember the voices</text>
+  <rect class="opt" x="345" y="230" width="190" height="62" rx="9"/>
+  <text class="m" x="440" y="266">speakers enroll</text>
+  <path class="ctl" d="M700,102 V190 H470 V230"/>
+  <rect class="opt" x="30" y="230" width="190" height="62" rx="9"/>
+  <text class="b" x="125" y="257">voice library</text>
+  <text class="s" x="125" y="277">shared by all folders</text>
+  <path class="ctl" d="M345,261 H220"/>
+  <path class="ctl" d="M125,230 V200 H400 V102"/>
+  <text class="n" x="135" y="193">later recordings: names are suggested</text>
+</svg>
