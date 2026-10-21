@@ -2758,6 +2758,75 @@ def _plan_qwen_crops(
     return crops
 
 
+def _acquire_align_audio(
+    media: Path,
+    *,
+    separate: bool,
+    normalize: bool,
+    bind_voiceprint: bool,
+    media_input_fingerprint: str,
+    rep: Reporter,
+    tmp: list[Path],
+    snapshots: ExitStack,
+) -> tuple[Path, MediaSnapshot | _CachedMediaIdentity | None]:
+    # Prepare-audio stage of align: a vocals-cache hit probe, the private media
+    # snapshot fallback, then the AO-04 acquisition. The caller owns ``snapshots``
+    # and closes it; this stage only enters contexts into it.
+    selected_snapshot: MediaSnapshot | _CachedMediaIdentity | None = None
+    acquisition_media = media
+    cached_wav: Path | None = None
+    if bind_voiceprint and separate:
+        # A bound vocals-cache hit decodes the cache and never reads the
+        # media, so it needs no private copy of the whole file: the cache
+        # companion binds the vocals to this fingerprint, and the commit
+        # rechecks the media against it.
+        try:
+            cached_wav = _prepare_16k_for_align(
+                media,
+                separate=separate,
+                normalize=normalize,
+                reporter=rep,
+                tmp=tmp,
+                cache_media=media,
+                source_fingerprint=media_input_fingerprint,
+                hit_only=True,
+            )
+        except VocalsCacheMiss:
+            pass
+        else:
+            selected_snapshot = _CachedMediaIdentity(media_input_fingerprint)
+    if bind_voiceprint and cached_wav is None:
+        try:
+            selected_snapshot = snapshots.enter_context(MediaSnapshot(media))
+        except SnapshotUnavailable as exc:
+            log.warning(
+                "voiceprint binding will be omitted during align: "
+                "selected media snapshot unavailable: %s",
+                exc,
+            )
+        else:
+            acquisition_media = selected_snapshot.path
+    with align_runtime_activity("AO-04", "prepared-audio-and-cache"):
+        wav = (
+            cached_wav
+            if cached_wav is not None
+            else _prepare_16k_for_align(
+                acquisition_media,
+                separate=separate,
+                normalize=normalize,
+                reporter=rep,
+                tmp=tmp,
+                cache_media=media,
+                source_fingerprint=(
+                    selected_snapshot.fingerprint
+                    if selected_snapshot is not None
+                    else None
+                ),
+            )
+        )
+    return wav, selected_snapshot
+
+
 def align(
     vtt_path: Path,
     *,
@@ -2927,61 +2996,20 @@ def align(
     prepared_audio_sha256: str | None = None
     aligned_cue_count = 0
     aligned_unit_count = 0
-    acquisition_media = media
     production_failure: BaseException | None = None
     try:
         try:
             rep.step("prepare audio")
-            cached_wav: Path | None = None
-            if voiceprint_pair is not None and separate:
-                # A bound vocals-cache hit decodes the cache and never reads the
-                # media, so it needs no private copy of the whole file: the cache
-                # companion binds the vocals to this fingerprint, and the commit
-                # rechecks the media against it.
-                try:
-                    cached_wav = _prepare_16k_for_align(
-                        media,
-                        separate=separate,
-                        normalize=normalize,
-                        reporter=rep,
-                        tmp=tmp,
-                        cache_media=media,
-                        source_fingerprint=media_input_fingerprint,
-                        hit_only=True,
-                    )
-                except VocalsCacheMiss:
-                    pass
-                else:
-                    selected_snapshot = _CachedMediaIdentity(media_input_fingerprint)
-            if voiceprint_pair is not None and cached_wav is None:
-                try:
-                    selected_snapshot = snapshots.enter_context(MediaSnapshot(media))
-                except SnapshotUnavailable as exc:
-                    log.warning(
-                        "voiceprint binding will be omitted during align: "
-                        "selected media snapshot unavailable: %s",
-                        exc,
-                    )
-                else:
-                    acquisition_media = selected_snapshot.path
-            with align_runtime_activity("AO-04", "prepared-audio-and-cache"):
-                wav = (
-                    cached_wav
-                    if cached_wav is not None
-                    else _prepare_16k_for_align(
-                        acquisition_media,
-                        separate=separate,
-                        normalize=normalize,
-                        reporter=rep,
-                        tmp=tmp,
-                        cache_media=media,
-                        source_fingerprint=(
-                            selected_snapshot.fingerprint
-                            if selected_snapshot is not None
-                            else None
-                        ),
-                    )
-                )
+            wav, selected_snapshot = _acquire_align_audio(
+                media,
+                separate=separate,
+                normalize=normalize,
+                bind_voiceprint=voiceprint_pair is not None,
+                media_input_fingerprint=media_input_fingerprint,
+                rep=rep,
+                tmp=tmp,
+                snapshots=snapshots,
+            )
             from voxweave import align_orchestration
 
             with align_runtime_activity("AO-04", "prepared-audio-digest"):
