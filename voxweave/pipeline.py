@@ -94,11 +94,8 @@ from voxweave.songdet import (
 from voxweave.subformats import require_subtitle
 from voxweave.timestamps import shift_units
 from voxweave.transcript_language import (
-    _joined_unit_text as _joined_unit_text,
-    _rebuild_preserves_source as _rebuild_preserves_source,
     _reconcile_word_segment_language as _reconcile_word_segment_language,
     _select_transcript_language as _select_transcript_language,
-    _unit_timings as _unit_timings,
 )
 from voxweave.vocals import (
     ASR_LOUDNORM as ASR_LOUDNORM,
@@ -128,18 +125,11 @@ from voxweave.transcription import (
     SNAP_VAD_THRESHOLD as SNAP_VAD_THRESHOLD,
     SONG_FINE_SILENCE_MS as SONG_FINE_SILENCE_MS,
     plan_song_skip as plan_song_skip,
-    _ChunkPlan as _ChunkPlan,
-    _plan_chunks as _plan_chunks,
-    _union_rescued_spans as _union_rescued_spans,
-    _timing_reference_spans as _timing_reference_spans,
-    _DiarizeSettings as _DiarizeSettings,
-    _diarize_audio_profile as _diarize_audio_profile,
-    _identify_speakers as _identify_speakers,
     transcribe as transcribe,
 )
 from voxweave.process_publication import (
     _ProcessPublication as _ProcessPublication,
-    _ProcessSource as _ProcessSource,
+    _ProcessSource,
     _voiceprint_capture_from_generation as _voiceprint_capture_from_generation,
     _warn_stale_speaker_names as _warn_stale_speaker_names,
     _voiceprints_document as _voiceprints_document,
@@ -154,11 +144,11 @@ from voxweave.failure_annotations import (
 from voxweave.align_route import (
     AlignRoute as AlignRoute,
     resolve_align_route as resolve_align_route,
-    _align_blocks_from_snapshot as _align_blocks_from_snapshot,
-    _prepared_audio_geometry as _prepared_audio_geometry,
-    _align_route_facts as _align_route_facts,
-    _stable_fact_digest as _stable_fact_digest,
-    _plan_qwen_crops as _plan_qwen_crops,
+    _align_blocks_from_snapshot,
+    _align_route_facts,
+    _plan_qwen_crops,
+    _prepared_audio_geometry,
+    _stable_fact_digest,
 )
 
 if TYPE_CHECKING:
