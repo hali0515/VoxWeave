@@ -268,20 +268,10 @@ def _stream_state(value: Any, path: str, errors: list[str]) -> Any | None:
     return tuple(out) if len(out) == len(rows) else None
 
 
-def _trace(value: Any, path: str, errors: list[str]) -> Any | None:
-    from .finalizer import CycleEvidence, NeighbourRead, Trace, TraceLeg
+# Trace legs: closed key set per leg, then the neighbour reads of each leg.
+def _trace_legs(legs_raw: list[Any] | None, path: str, errors: list[str]) -> list[Any]:
+    from .finalizer import NeighbourRead, TraceLeg
 
-    block = _mapping(value, path, errors)
-    if block is None:
-        return None
-    _closed(block, _TRACE_KEYS, path, errors)
-    terminal = block.get("terminal")
-    if terminal not in {"budget-exhausted", "cycle-adoption", "fixed-point"}:
-        errors.append(f"{path}.terminal: outside closed terminal vocabulary")
-    sweeps = _nonnegative_int(block.get("sweeps"), f"{path}.sweeps", errors)
-    if block.get("schedule_canonicality") != "unverified":
-        errors.append(f"{path}.schedule_canonicality: expected 'unverified'")
-    legs_raw = _list(block.get("legs"), f"{path}.legs", errors)
     legs: list[TraceLeg] = []
     if legs_raw is not None:
         for index, raw in enumerate(legs_raw):
@@ -347,8 +337,13 @@ def _trace(value: Any, path: str, errors: list[str]) -> Any | None:
                         tuple(reads),
                     )
                 )
+    return legs
 
-    cycle_value = block.get("cycle")
+
+# Trace cycle evidence: adopted state and members, absent cycle is valid.
+def _trace_cycle(cycle_value: Any, path: str, errors: list[str]) -> tuple[Any, bool]:
+    from .finalizer import CycleEvidence
+
     cycle = None
     cycle_valid = cycle_value is None
     if cycle_value is not None:
@@ -415,6 +410,27 @@ def _trace(value: Any, path: str, errors: list[str]) -> Any | None:
             ):
                 cycle = CycleEvidence(tuple(members), tuple(values), adopted)
                 cycle_valid = True
+    return cycle, cycle_valid
+
+
+def _trace(value: Any, path: str, errors: list[str]) -> Any | None:
+    from .finalizer import Trace
+
+    block = _mapping(value, path, errors)
+    if block is None:
+        return None
+    _closed(block, _TRACE_KEYS, path, errors)
+    terminal = block.get("terminal")
+    if terminal not in {"budget-exhausted", "cycle-adoption", "fixed-point"}:
+        errors.append(f"{path}.terminal: outside closed terminal vocabulary")
+    sweeps = _nonnegative_int(block.get("sweeps"), f"{path}.sweeps", errors)
+    if block.get("schedule_canonicality") != "unverified":
+        errors.append(f"{path}.schedule_canonicality: expected 'unverified'")
+    legs_raw = _list(block.get("legs"), f"{path}.legs", errors)
+    legs = _trace_legs(legs_raw, path, errors)
+
+    cycle_value = block.get("cycle")
+    cycle, cycle_valid = _trace_cycle(cycle_value, path, errors)
     if (
         terminal in {"budget-exhausted", "cycle-adoption", "fixed-point"}
         and sweeps is not None
