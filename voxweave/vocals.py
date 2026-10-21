@@ -318,6 +318,136 @@ class Acquired16k:
     separator: dict[str, object] | None = None
 
 
+# The cache lane of acquire_16k: reuse the vocals cache under its lock, or None.
+def _acquire_from_cache(
+    cache: Path,
+    *,
+    reference: Path,
+    bound: bool,
+    fingerprint: str | None,
+    separator: Mapping[str, object] | None,
+    purpose: str,
+    normalize: bool,
+    reporter: Reporter,
+    tmp: list[Path],
+    want_voc32: bool,
+) -> Acquired16k | None:
+    with cache_lock(Path(cache)) as cache_handle:
+        cache_path = cache_handle.cache_path
+        cache_hit = False
+        bound_separator: dict[str, object] | None = None
+        if cache_path.exists():
+            if bound:
+                try:
+                    companion, _validated = load_cache_companion(
+                        cache_handle.companion_path
+                    )
+                    current_separator = (
+                        separator
+                        if separator is not None
+                        else backend.separator_identity()
+                    )
+                    validated = validate_cache_pair(
+                        companion,
+                        cache_path,
+                        media_fingerprint=fingerprint or "",
+                        separator=current_separator,
+                    )
+                    bound_separator = validated.separator.as_mapping()
+                    cache_hit = True
+                except (OSError, Phase2DataError):
+                    log.info(
+                        "vocals cache is not bound to this %s; re-separating: %s",
+                        purpose,
+                        cache_path,
+                    )
+            else:
+                cache_hit = _vocals_cache_fresh(cache_path, reference)
+        if cache_hit:
+            # Keep the cache lock through decoder completion. A validated
+            # hash followed by an unlocked open is not a stable read.
+            reporter.stage("vocals cache (32k)")
+            log.info("reuse cached vocals %s", cache_path)
+            try:
+                wav = _vocals_to_16k(cache_path, normalize=normalize)
+            except BaseException as exc:
+                classify_cache_decode_failure(exc)
+                raise
+            tmp.append(wav)
+            # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
+            # PANNs reads after the lock is gone, so it gets a private copy taken
+            # under the lock: another run may replace the cache in between, and
+            # song spans must come from the same vocals as the ASR input.
+            voc32 = None
+            if want_voc32:
+                voc32 = _private_copy(cache_path)
+                tmp.append(voc32)
+            return Acquired16k(wav, voc32=voc32, separator=bound_separator)
+    return None
+
+
+# The legacy 16k cache lane of acquire_16k: reuse <stem>.16k.flac, or None.
+def _acquire_legacy_16k(
+    reference: Path,
+    *,
+    normalize: bool,
+    reporter: Reporter,
+    tmp: list[Path],
+) -> Acquired16k | None:
+    legacy = cache_16k_path(reference)
+    if any(
+        artifacts.path_present(candidate)
+        for candidate in (
+            legacy,
+            cache_companion_path(legacy),
+            Path(f"{legacy.resolve()}.lock"),
+        )
+    ):
+        with cache_lock(legacy) as legacy_handle:
+            if legacy_handle.cache_path.exists() and _vocals_cache_fresh(
+                legacy_handle.cache_path,
+                reference,
+            ):
+                reporter.stage("vocals cache (16k legacy)")
+                log.info("reuse legacy 16k vocals %s", legacy_handle.cache_path)
+                try:
+                    wav = decode_to_wav(
+                        legacy_handle.cache_path,
+                        audio_filter=ASR_LOUDNORM if normalize else None,
+                    )
+                except BaseException as exc:
+                    classify_cache_decode_failure(exc)
+                    raise
+                tmp.append(wav)
+                return Acquired16k(wav)
+    return None
+
+
+# The cache write-back of acquire_16k; a failed write is only a warning.
+def _store_vocals_cache(
+    cache: Path,
+    voc32: Path,
+    *,
+    bound: bool,
+    fingerprint: str | None,
+    separated_by: dict[str, object] | None,
+) -> None:
+    try:
+        with cache_write_window(Path(cache)) as cache_handle:
+            _encode_flac(voc32, cache_handle.cache_path)
+            if bound:
+                # Without a companion no later bound run could reuse these vocals.
+                publish_cache_companion(
+                    cache_handle.cache_path,
+                    media_fingerprint=fingerprint or "",
+                    separator=separated_by or {},
+                    companion_path=cache_handle.companion_path,
+                )
+        log.info("cached vocals 32k → %s", cache)
+    except (OSError, subprocess.CalledProcessError, Phase2DataError) as e:
+        log.warning("cache vocals failed (non-fatal): %r", e)
+
+
 def acquire_16k(
     media: Path,
     *,
@@ -366,86 +496,28 @@ def acquire_16k(
     reference = Path(owner) if owner is not None else media
     bound = fingerprint is not None
     if cache is not None:
-        with cache_lock(Path(cache)) as cache_handle:
-            cache_path = cache_handle.cache_path
-            cache_hit = False
-            bound_separator: dict[str, object] | None = None
-            if cache_path.exists():
-                if bound:
-                    try:
-                        companion, _validated = load_cache_companion(
-                            cache_handle.companion_path
-                        )
-                        current_separator = (
-                            separator
-                            if separator is not None
-                            else backend.separator_identity()
-                        )
-                        validated = validate_cache_pair(
-                            companion,
-                            cache_path,
-                            media_fingerprint=fingerprint or "",
-                            separator=current_separator,
-                        )
-                        bound_separator = validated.separator.as_mapping()
-                        cache_hit = True
-                    except (OSError, Phase2DataError):
-                        log.info(
-                            "vocals cache is not bound to this %s; re-separating: %s",
-                            purpose,
-                            cache_path,
-                        )
-                else:
-                    cache_hit = _vocals_cache_fresh(cache_path, reference)
-            if cache_hit:
-                # Keep the cache lock through decoder completion. A validated
-                # hash followed by an unlocked open is not a stable read.
-                reporter.stage("vocals cache (32k)")
-                log.info("reuse cached vocals %s", cache_path)
-                try:
-                    wav = _vocals_to_16k(cache_path, normalize=normalize)
-                except BaseException as exc:
-                    classify_cache_decode_failure(exc)
-                    raise
-                tmp.append(wav)
-                # Cache hit: skip Roformer; PANNs eats 32k directly, ASR downsamples to 16k.
-                # PANNs reads after the lock is gone, so it gets a private copy taken
-                # under the lock: another run may replace the cache in between, and
-                # song spans must come from the same vocals as the ASR input.
-                voc32 = None
-                if want_voc32:
-                    voc32 = _private_copy(cache_path)
-                    tmp.append(voc32)
-                return Acquired16k(wav, voc32=voc32, separator=bound_separator)
+        hit = _acquire_from_cache(
+            cache,
+            reference=reference,
+            bound=bound,
+            fingerprint=fingerprint,
+            separator=separator,
+            purpose=purpose,
+            normalize=normalize,
+            reporter=reporter,
+            tmp=tmp,
+            want_voc32=want_voc32,
+        )
+        if hit is not None:
+            return hit
     if hit_only:
         raise VocalsCacheMiss("the vocals cache cannot serve this media")
     if legacy_16k and not bound:
-        legacy = cache_16k_path(reference)
-        if any(
-            artifacts.path_present(candidate)
-            for candidate in (
-                legacy,
-                cache_companion_path(legacy),
-                Path(f"{legacy.resolve()}.lock"),
-            )
-        ):
-            with cache_lock(legacy) as legacy_handle:
-                if legacy_handle.cache_path.exists() and _vocals_cache_fresh(
-                    legacy_handle.cache_path,
-                    reference,
-                ):
-                    reporter.stage("vocals cache (16k legacy)")
-                    log.info("reuse legacy 16k vocals %s", legacy_handle.cache_path)
-                    try:
-                        wav = decode_to_wav(
-                            legacy_handle.cache_path,
-                            audio_filter=ASR_LOUDNORM if normalize else None,
-                        )
-                    except BaseException as exc:
-                        classify_cache_decode_failure(exc)
-                        raise
-                    tmp.append(wav)
-                    return Acquired16k(wav)
+        hit = _acquire_legacy_16k(
+            reference, normalize=normalize, reporter=reporter, tmp=tmp
+        )
+        if hit is not None:
+            return hit
     separated_by: dict[str, object] | None = None
     if bound:
         fullband, vocals, wav, voc32, separated_by = _separate_to_16k_32k(
@@ -464,18 +536,11 @@ def acquire_16k(
     if on_separated is not None:
         on_separated(fullband, vocals)
     if cache is not None:
-        try:
-            with cache_write_window(Path(cache)) as cache_handle:
-                _encode_flac(voc32, cache_handle.cache_path)
-                if bound:
-                    # Without a companion no later bound run could reuse these vocals.
-                    publish_cache_companion(
-                        cache_handle.cache_path,
-                        media_fingerprint=fingerprint or "",
-                        separator=separated_by or {},
-                        companion_path=cache_handle.companion_path,
-                    )
-            log.info("cached vocals 32k → %s", cache)
-        except (OSError, subprocess.CalledProcessError, Phase2DataError) as e:
-            log.warning("cache vocals failed (non-fatal): %r", e)
+        _store_vocals_cache(
+            cache,
+            voc32,
+            bound=bound,
+            fingerprint=fingerprint,
+            separated_by=separated_by,
+        )
     return Acquired16k(wav, voc32=voc32, fullband=fullband, separator=separated_by)
