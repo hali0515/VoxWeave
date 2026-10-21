@@ -772,6 +772,93 @@ def _shadow_lane_streams(
     return core_v1, core_v2, delivery_v1, delivery_v2
 
 
+# Speaker measurement: measures both finalized rows against one evidence basis and
+# writes artifact['speaker_evidence'], off_row and on_row['cues'] in place.
+def _shadow_measure_speakers(
+    *,
+    artifact: dict[str, Any],
+    solution: DocumentSolution,
+    projected_speakers: Any,
+    on_finalized: Any,
+    off_finalized: Any,
+    on_row: dict[str, Any],
+    off_row: dict[str, Any],
+    on_final_cues: list[Cue],
+    off_final_cues: list[Cue],
+    raw_partition: Sequence[int],
+    off_partition: Sequence[int],
+    unit_count: int,
+) -> None:
+    from voxweave.core.boundary_v2 import selected_evidence_spans
+    from voxweave.core.partition_check import owned_unit_ids
+    from voxweave.core.speaker_evidence import (
+        annotate_speaker_ids,
+        measure_speaker_events,
+        named_multi_cues_unannotated,
+    )
+
+    # Speaker measurement uses one selected evidence basis for both independent
+    # global boundary matching runs. Budget-invalid rows short-circuit here.
+    measurement_refusal: str | None = None
+    row_cardinality_ok = len(raw_partition) + 1 == len(on_final_cues) and len(
+        off_partition
+    ) + 1 == len(off_final_cues)
+    if on_finalized.valid and off_finalized.valid and not row_cardinality_ok:
+        measurement_refusal = "cue/range-cardinality-mismatch"
+    elif on_finalized.valid and off_finalized.valid:
+        try:
+            evidence_spans = selected_evidence_spans(solution)
+        except ValueError as exc:
+            measurement_refusal = str(exc)
+        else:
+            on_measurement = measure_speaker_events(
+                projected_speakers,
+                evidence_spans=evidence_spans,
+                delivered_boundaries=_shadow_boundary_times(on_final_cues),
+                off_boundaries=_shadow_boundary_times(off_final_cues),
+            )
+            off_measurement = measure_speaker_events(
+                projected_speakers,
+                evidence_spans=evidence_spans,
+                delivered_boundaries=_shadow_boundary_times(off_final_cues),
+            )
+            for name, measured in (
+                ("v2", on_measurement),
+                ("v2-speaker-off", off_measurement),
+            ):
+                if (
+                    sum(measured.buckets.values())
+                    != measured.raw_in_speech_turn_changes
+                ):
+                    raise ValueError(f"{name} speaker bucket conservation failed")
+            artifact["speaker_evidence"]["measurement"] = on_measurement.to_dict()
+            artifact["speaker_evidence"]["off_row_measurement"] = (
+                off_measurement.to_dict()
+            )
+            off_row["speaker_measurement"] = off_measurement.to_dict()
+            ranges = owned_unit_ids(raw_partition, unit_count)
+            annotate_speaker_ids(
+                on_final_cues, ranges, projected_speakers.unit_speakers
+            )
+            projected_named_multi = named_multi_cues_unannotated(
+                ranges, projected_speakers.unit_speakers
+            )
+            if projected_named_multi != int(
+                artifact["coverage"]["named_multi_cues_unannotated"]
+            ):
+                raise ValueError(
+                    "speaker projection counter disagrees with selected ownership"
+                )
+            artifact["speaker_evidence"]["projection"] = {
+                "cue_count": len(on_final_cues),
+                "named_multi_cues_unannotated": projected_named_multi,
+                "range_count": len(ranges),
+                "status": "verified",
+            }
+            on_row["cues"] = _shadow_cue_rows(on_final_cues, raw_partition, unit_count)
+    artifact["speaker_evidence"]["measurement_refusal"] = measurement_refusal
+
+
 def _shadow_v2_artifact(
     document: SegDocument, v1_cues: Sequence[Cue], thresholds: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -789,7 +876,6 @@ def _shadow_v2_artifact(
         _document_waivers,
         _optimization_reuse,
         optimize_document,
-        selected_evidence_spans,
     )
     from voxweave.core.finalizer import (
         FinalizeEvidence,
@@ -801,14 +887,10 @@ def _shadow_v2_artifact(
         phase1_from_v1_capture,
         register_optimizer_selection,
     )
-    from voxweave.core.partition_check import owned_unit_ids
     from voxweave.core.speaker_evidence import (
         W_SPEAKER_INTERIOR,
-        annotate_speaker_ids,
         evidence_span_from_cue,
         lyric_for_evidence,
-        measure_speaker_events,
-        named_multi_cues_unannotated,
         project_speaker_evidence,
         speaker_evidence,
     )
@@ -1117,66 +1199,20 @@ def _shadow_v2_artifact(
         policy=finalizer_policy,
     )
 
-    # Speaker measurement uses one selected evidence basis for both independent
-    # global boundary matching runs. Budget-invalid rows short-circuit here.
-    measurement_refusal: str | None = None
-    row_cardinality_ok = len(raw_partition) + 1 == len(on_final_cues) and len(
-        off_partition
-    ) + 1 == len(off_final_cues)
-    if on_finalized.valid and off_finalized.valid and not row_cardinality_ok:
-        measurement_refusal = "cue/range-cardinality-mismatch"
-    elif on_finalized.valid and off_finalized.valid:
-        try:
-            evidence_spans = selected_evidence_spans(solution)
-        except ValueError as exc:
-            measurement_refusal = str(exc)
-        else:
-            on_measurement = measure_speaker_events(
-                projected_speakers,
-                evidence_spans=evidence_spans,
-                delivered_boundaries=_shadow_boundary_times(on_final_cues),
-                off_boundaries=_shadow_boundary_times(off_final_cues),
-            )
-            off_measurement = measure_speaker_events(
-                projected_speakers,
-                evidence_spans=evidence_spans,
-                delivered_boundaries=_shadow_boundary_times(off_final_cues),
-            )
-            for name, measured in (
-                ("v2", on_measurement),
-                ("v2-speaker-off", off_measurement),
-            ):
-                if (
-                    sum(measured.buckets.values())
-                    != measured.raw_in_speech_turn_changes
-                ):
-                    raise ValueError(f"{name} speaker bucket conservation failed")
-            artifact["speaker_evidence"]["measurement"] = on_measurement.to_dict()
-            artifact["speaker_evidence"]["off_row_measurement"] = (
-                off_measurement.to_dict()
-            )
-            off_row["speaker_measurement"] = off_measurement.to_dict()
-            ranges = owned_unit_ids(raw_partition, unit_count)
-            annotate_speaker_ids(
-                on_final_cues, ranges, projected_speakers.unit_speakers
-            )
-            projected_named_multi = named_multi_cues_unannotated(
-                ranges, projected_speakers.unit_speakers
-            )
-            if projected_named_multi != int(
-                artifact["coverage"]["named_multi_cues_unannotated"]
-            ):
-                raise ValueError(
-                    "speaker projection counter disagrees with selected ownership"
-                )
-            artifact["speaker_evidence"]["projection"] = {
-                "cue_count": len(on_final_cues),
-                "named_multi_cues_unannotated": projected_named_multi,
-                "range_count": len(ranges),
-                "status": "verified",
-            }
-            on_row["cues"] = _shadow_cue_rows(on_final_cues, raw_partition, unit_count)
-    artifact["speaker_evidence"]["measurement_refusal"] = measurement_refusal
+    _shadow_measure_speakers(
+        artifact=artifact,
+        solution=solution,
+        projected_speakers=projected_speakers,
+        on_finalized=on_finalized,
+        off_finalized=off_finalized,
+        on_row=on_row,
+        off_row=off_row,
+        on_final_cues=on_final_cues,
+        off_final_cues=off_final_cues,
+        raw_partition=raw_partition,
+        off_partition=off_partition,
+        unit_count=unit_count,
+    )
 
     # Refiner bypass is an exact identity gate on tracked rows and a typed
     # diagnostic on genuinely refined rows. Only a fallback-free bypass can own
