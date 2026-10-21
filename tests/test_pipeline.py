@@ -13,6 +13,7 @@ import pytest
 
 from voxweave import backend, pipeline
 from voxweave import paths
+from voxweave import process_publication
 from voxweave import vocals as vocals_mod
 from voxweave.core import overlay
 
@@ -478,7 +479,7 @@ def test_process_sdh_sidecar_failure_does_not_lose_main_vtt(
         raise RuntimeError("PANNs exploded")
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
-    monkeypatch.setattr(pipeline, "_write_sdh_sidecar", boom_sdh)
+    monkeypatch.setattr(process_publication, "_write_sdh_sidecar", boom_sdh)
 
     with caplog.at_level(logging.WARNING, logger="voxweave"):
         out = pipeline.process(media, sdh=True, shot_snap=False)

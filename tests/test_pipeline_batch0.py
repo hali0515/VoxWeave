@@ -16,6 +16,7 @@ from voxweave import segmentation
 from voxweave.config import gap_thresholds
 from voxweave.core.smart_split import smart_split_segments
 from voxweave.diarize import apply_speaker_format
+from voxweave import process_publication
 from voxweave import transcription
 from voxweave import vocals
 
@@ -298,7 +299,7 @@ def test_process_defers_panns_release_to_the_sdh_pass(tmp_path, monkeypatch):
         order.append("sdh")
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
-    monkeypatch.setattr(pipeline, "_write_sdh_sidecar", fake_sidecar)
+    monkeypatch.setattr(process_publication, "_write_sdh_sidecar", fake_sidecar)
     monkeypatch.setattr(songdet, "release_model", lambda: order.append("release"))
 
     pipeline.process(media, sdh=True, shot_snap=False)
@@ -317,7 +318,7 @@ def test_process_releases_panns_after_failed_sdh_sidecar(tmp_path, monkeypatch):
     monkeypatch.setattr(
         pipeline, "transcribe", lambda *a, **kw: ("en", UNITS, None, [], [], None)
     )
-    monkeypatch.setattr(pipeline, "_write_sdh_sidecar", boom)
+    monkeypatch.setattr(process_publication, "_write_sdh_sidecar", boom)
     monkeypatch.setattr(songdet, "release_model", lambda: order.append("release"))
 
     pipeline.process(media, sdh=True, shot_snap=False)

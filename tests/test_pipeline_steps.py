@@ -10,6 +10,7 @@ import pytest
 
 from voxweave import backend, chunking, diarize, pipeline, shotdet, songdet
 from voxweave import llm_commands
+from voxweave import process_publication
 from voxweave import transcription
 from voxweave import vocals
 from voxweave.progress import Reporter
@@ -163,7 +164,9 @@ def stub_transcription(tmp_path, monkeypatch):
         lambda *_a, **_k: SimpleNamespace(turns=[], centroids={}),
     )
     monkeypatch.setattr(diarize, "release", lambda: None)
-    monkeypatch.setattr(pipeline, "_write_sdh_sidecar", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        process_publication, "_write_sdh_sidecar", lambda *_a, **_k: None
+    )
 
 
 @pytest.mark.parametrize(
