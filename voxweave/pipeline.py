@@ -709,6 +709,78 @@ def _plan_chunks(
     )
 
 
+# Pure interval union behind the persisted vad_speech key: the timing-reference
+# spans plus the rescued speech islands (minus excised song overlap), merged.
+def _union_rescued_spans(
+    vad_spans: list[tuple[float, float]],
+    rescued_spans: list[tuple[float, float]],
+    song_spans: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    # Rescued regions are PANNs-confirmed speech BOTH silero passes under-score
+    # (the separated pass by premise; the original-mix pass credibly too — same
+    # theatrical delivery plus BGM). Union them into the timing reference, minus
+    # any excised song overlap, or downstream consumers (position_units_with_vad,
+    # smart_split gaps, a later `align --vad-mask`) treat the rescued dialogue as
+    # silence — the mask would evict exactly the words the rescue recovered.
+    add = (
+        subtract_spans(rescued_spans, sorted(song_spans))
+        if song_spans
+        else rescued_spans
+    )
+    merged = sorted(vad_spans + [(a, b) for a, b in add if b > a])
+    vad_spans = []
+    for a, b in merged:
+        if vad_spans and a <= vad_spans[-1][1]:
+            vad_spans[-1] = (vad_spans[-1][0], max(vad_spans[-1][1], b))
+        else:
+            vad_spans.append((a, b))
+    return vad_spans
+
+
+# Zero-duration snap: the aligner collapses short words after a pause (e.g. はい)
+# to zero duration. We snap them into the actual speech region using VAD.
+# Vocal separation attenuates secondary-speaker back-channels, so separated-vocals
+# VAD misses them. We run VAD on the ORIGINAL audio (retains attenuated speech) as
+# the timing reference, excluding song spans to avoid snapping onto singing.
+# vad_spans are persisted to .json (vad_speech) for reuse by split.
+# SNAP_VAD_THRESHOLD (0.25) catches attenuated back-channels. The original is the
+# full-band stem on a fresh separation, or the source media itself on a vocals-cache
+# hit (no stem exists then). The two decode to slightly different 16k PCM, so a
+# re-run's reference can differ a little from the first run's (VAD at this
+# threshold has absorbed the difference on the clips checked so far; the samples
+# themselves are not identical). --no-separate reuses the chunking VAD
+# (silero default 0.5): the decoded 16k input already IS the original audio.
+def _timing_reference_spans(
+    media_path: Path,
+    fullband: Path | None,
+    plan: _ChunkPlan,
+    speech_spans: list[tuple[float, float]],
+    *,
+    separate: bool,
+    tmp: list[Path],
+) -> list[tuple[float, float]]:
+    if separate:
+        orig16k = decode_to_wav(fullband if fullband is not None else media_path)
+        tmp.append(orig16k)
+        orig_segs = vad_speech_segments(orig16k, threshold=SNAP_VAD_THRESHOLD)
+        if plan.song_spans:
+            # Subtract only the truly sung/instrumental parts: clean-dialogue
+            # windows inside expanded song spans (dialogue spoken OVER the
+            # song) must survive in vad_speech, otherwise snapping and the
+            # emission mask forbid those words' true location and the aligner
+            # smears them across the song (observed on movie dialogue-over-
+            # montage: a 15s exchange stretched over 65s).
+            orig_segs, _ = excise_spans_from_segments(
+                orig_segs, subtract_spans(plan.song_spans, speech_spans)
+            )
+        vad_spans = [(s["start"], s["end"]) for s in orig_segs]
+    else:
+        vad_spans = [(s["start"], s["end"]) for s in plan.segs]
+    if plan.rescued_spans:
+        vad_spans = _union_rescued_spans(vad_spans, plan.rescued_spans, plan.song_spans)
+    return vad_spans
+
+
 def transcribe(
     media_path: Path,
     *,
@@ -874,7 +946,6 @@ def transcribe(
         chunks = plan.chunks
         segs = plan.segs
         song_spans = plan.song_spans
-        rescued_spans = plan.rescued_spans
         if not chunks:
             raise RuntimeError(f"no speech detected in {media_path.name}")
 
@@ -962,55 +1033,9 @@ def transcribe(
             all_units.extend(realign.reinject_punct(txt, u, iso))
         if not all_units:
             raise RuntimeError(f"no aligned units for {media_path.name}")
-        # Zero-duration snap: the aligner collapses short words after a pause (e.g. はい)
-        # to zero duration. We snap them into the actual speech region using VAD.
-        # Vocal separation attenuates secondary-speaker back-channels, so separated-vocals
-        # VAD misses them. We run VAD on the ORIGINAL audio (retains attenuated speech) as
-        # the timing reference, excluding song spans to avoid snapping onto singing.
-        # vad_spans are persisted to .json (vad_speech) for reuse by split.
-        # SNAP_VAD_THRESHOLD (0.25) catches attenuated back-channels. The original is the
-        # full-band stem on a fresh separation, or the source media itself on a vocals-cache
-        # hit (no stem exists then). The two decode to slightly different 16k PCM, so a
-        # re-run's reference can differ a little from the first run's (VAD at this
-        # threshold has absorbed the difference on the clips checked so far; the samples
-        # themselves are not identical). --no-separate reuses the chunking VAD
-        # (silero default 0.5): the decoded 16k input already IS the original audio.
-        if separate:
-            orig16k = decode_to_wav(fullband if fullband is not None else media_path)
-            tmp.append(orig16k)
-            orig_segs = vad_speech_segments(orig16k, threshold=SNAP_VAD_THRESHOLD)
-            if song_spans:
-                # Subtract only the truly sung/instrumental parts: clean-dialogue
-                # windows inside expanded song spans (dialogue spoken OVER the
-                # song) must survive in vad_speech, otherwise snapping and the
-                # emission mask forbid those words' true location and the aligner
-                # smears them across the song (observed on movie dialogue-over-
-                # montage: a 15s exchange stretched over 65s).
-                orig_segs, _ = excise_spans_from_segments(
-                    orig_segs, subtract_spans(song_spans, speech_spans)
-                )
-            vad_spans = [(s["start"], s["end"]) for s in orig_segs]
-        else:
-            vad_spans = [(s["start"], s["end"]) for s in segs]
-        if rescued_spans:
-            # Rescued regions are PANNs-confirmed speech BOTH silero passes under-score
-            # (the separated pass by premise; the original-mix pass credibly too — same
-            # theatrical delivery plus BGM). Union them into the timing reference, minus
-            # any excised song overlap, or downstream consumers (position_units_with_vad,
-            # smart_split gaps, a later `align --vad-mask`) treat the rescued dialogue as
-            # silence — the mask would evict exactly the words the rescue recovered.
-            add = (
-                subtract_spans(rescued_spans, sorted(song_spans))
-                if song_spans
-                else rescued_spans
-            )
-            merged = sorted(vad_spans + [(a, b) for a, b in add if b > a])
-            vad_spans = []
-            for a, b in merged:
-                if vad_spans and a <= vad_spans[-1][1]:
-                    vad_spans[-1] = (vad_spans[-1][0], max(vad_spans[-1][1], b))
-                else:
-                    vad_spans.append((a, b))
+        vad_spans = _timing_reference_spans(
+            media_path, fullband, plan, speech_spans, separate=separate, tmp=tmp
+        )
         # Qwen aligner has no CTC blank token, so word durations bleed into silence.
         # position_units_with_vad carves true gaps, giving smart_split an accurate signal.
         # Routed through the sink so --debug also records the pre/post snapshots and the
