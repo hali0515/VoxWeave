@@ -300,6 +300,29 @@ def _joined(surfaces: tuple[str, ...], lower: int, upper: int, iso: str) -> str:
     return separator.join(surfaces[lower:upper])
 
 
+# The two lane outcomes that carry no cuts.  lane.frozen() is read when the
+# helper runs, which is at the return, exactly where the inline construction
+# read it.
+def _lane_exhausted(lane: _Counters, denied: DeniedCharge) -> _LaneOutcome:
+    return _LaneOutcome(
+        "budget-exhausted",
+        lane.frozen(),
+        "allocation-budget",
+        None,
+        denied,
+    )
+
+
+def _lane_invalid(lane: _Counters, detail: str) -> _LaneOutcome:
+    return _LaneOutcome(
+        "invalid",
+        lane.frozen(),
+        detail,
+        None,
+        None,
+    )
+
+
 def _run_lane(
     lane_name: Literal["allocator", "verifier"],
     blocks: tuple[AuthorityBlock, ...],
@@ -325,30 +348,12 @@ def _run_lane(
             WorkCounters(0, 0, 0, len(block.alignment_text)),
         )
         if denied is not None:
-            return _LaneOutcome(
-                "budget-exhausted",
-                lane.frozen(),
-                "allocation-budget",
-                None,
-                denied,
-            )
+            return _lane_exhausted(lane, denied)
         normalized_blocks[block_index] = normalize_text(block.alignment_text)
         if not block.alignment_text.strip():
-            return _LaneOutcome(
-                "invalid",
-                lane.frozen(),
-                "partial-empty-ownership",
-                None,
-                None,
-            )
+            return _lane_invalid(lane, "partial-empty-ownership")
         if not normalized_blocks[block_index]:
-            return _LaneOutcome(
-                "invalid",
-                lane.frozen(),
-                "punctuation-only-block",
-                None,
-                None,
-            )
+            return _lane_invalid(lane, "punctuation-only-block")
     denied = budget.charge(
         lane_name,
         lane,
@@ -357,13 +362,7 @@ def _run_lane(
         WorkCounters(1, 0, 0, 0),
     )
     if denied is not None:
-        return _LaneOutcome(
-            "budget-exhausted",
-            lane.frozen(),
-            "allocation-budget",
-            None,
-            denied,
-        )
+        return _lane_exhausted(lane, denied)
     paths[0][0] = 1
     for block_index in range(len(blocks)):
         for lower in sorted(paths[block_index]):
@@ -376,13 +375,7 @@ def _run_lane(
                     WorkCounters(0, 1, 0, 0),
                 )
                 if denied is not None:
-                    return _LaneOutcome(
-                        "budget-exhausted",
-                        lane.frozen(),
-                        "allocation-budget",
-                        None,
-                        denied,
-                    )
+                    return _lane_exhausted(lane, denied)
                 interval = (lower, upper)
                 if interval not in normalized_intervals:
                     denied = budget.charge(
@@ -398,13 +391,7 @@ def _run_lane(
                         ),
                     )
                     if denied is not None:
-                        return _LaneOutcome(
-                            "budget-exhausted",
-                            lane.frozen(),
-                            "allocation-budget",
-                            None,
-                            denied,
-                        )
+                        return _lane_exhausted(lane, denied)
                     normalized_intervals[interval] = normalize_text(
                         _joined(surfaces, lower, upper, iso)
                     )
@@ -425,13 +412,7 @@ def _run_lane(
                         WorkCounters(1, 0, 0, 0),
                     )
                     if denied is not None:
-                        return _LaneOutcome(
-                            "budget-exhausted",
-                            lane.frozen(),
-                            "allocation-budget",
-                            None,
-                            denied,
-                        )
+                        return _lane_exhausted(lane, denied)
                     paths[block_index + 1][upper] = 0
                 paths[block_index + 1][upper] = min(
                     2,
@@ -443,21 +424,9 @@ def _run_lane(
                     parents.pop((block_index + 1, upper), None)
     path_count = paths[len(blocks)].get(len(surfaces), 0)
     if path_count == 0:
-        return _LaneOutcome(
-            "invalid",
-            lane.frozen(),
-            "allocation-no-tiling",
-            None,
-            None,
-        )
+        return _lane_invalid(lane, "allocation-no-tiling")
     if path_count == 2:
-        return _LaneOutcome(
-            "invalid",
-            lane.frozen(),
-            "allocation-ambiguous",
-            None,
-            None,
-        )
+        return _lane_invalid(lane, "allocation-ambiguous")
     cuts = [len(surfaces)]
     boundary = len(surfaces)
     for row_index in range(len(blocks), 0, -1):
