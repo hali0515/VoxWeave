@@ -38,12 +38,6 @@ def _shadow_diff_classification(
     (the two disagree in cardinality) is counted unclassified, never approved on
     the producer's own claim.
     """
-    from voxweave.core.speaker_evidence import (
-        evidence_span_from_cue,
-        lyric_for_evidence,
-    )
-    from voxweave.core.timing import LINGER_CAP_S, TWO_FRAME_S
-
     finalizer = finalizer_row["finalizer"]
     producer_fired = set(finalizer.get("deltas_fired") or ())
     trace_clean = not finalizer.get("trace_errors") and not finalizer.get(
@@ -58,131 +52,198 @@ def _shadow_diff_classification(
     facts: dict[int, dict[str, Any]] = {}
     independent_fired: set[str] = set()
     if len(stream.cues) == len(seed_cues):
-        extends = (
-            stream.profile.min_cue_s > 0
-            or stream.profile.lag_out_s > 0
-            or stream.profile.cps > 0
+        _n11_cue_facts(
+            stream,
+            seed_cues,
+            finalizer,
+            sing_spans,
+            permitted,
+            facts,
+            independent_fired,
         )
-        trace_legs = finalizer.get("trace", {}).get("legs") or ()
-        for index, (phase1, seed) in enumerate(zip(stream.cues, seed_cues)):
-            per_field = {field: set() for field in permitted}
-            if phase1.reading_chars != phase1.raw_reading_chars:
-                per_field["end"].add("FD-1")
-                independent_fired.add("FD-1")
-            if phase1.speech_end is None and extends:
-                per_field["end"].add("FD-8")
-                independent_fired.add("FD-8")
-            if any(
-                report.kind == "stutter-not-proven-fixed-within-4-scans"
-                for report in phase1.reports
+        _n11_fd7(stream, seed_cues, finalizer_row, finalizer, independent_fired)
+    changed, unclassified, relation_failures, alignment_error = _n11_changed_fields(
+        finalizer_row,
+        comparator_row,
+        finalizer=finalizer,
+        facts=facts,
+        stream=stream,
+        trace_clean=trace_clean,
+    )
+    return {
+        "alignment_error": alignment_error,
+        "changed_fields": changed,
+        "independent_fired": sorted(independent_fired),
+        "producer_fired": sorted(producer_fired),
+        "relation_failures": relation_failures,
+        "trigger_mismatches": sorted(independent_fired ^ producer_fired),
+        "unclassified_field_diff": unclassified,
+    }
+
+
+# N11 stage 1: per-cue facts recomputed from the phase-1 stream and the seed cues.
+# Fills ``facts`` and ``independent_fired`` in place; N7 shares nothing with it.
+def _n11_cue_facts(
+    stream: Any,
+    seed_cues: Sequence[Cue],
+    finalizer: Mapping[str, Any],
+    sing_spans: Sequence[tuple[float, float]],
+    permitted: dict[str, set[str]],
+    facts: dict[int, dict[str, Any]],
+    independent_fired: set[str],
+) -> None:
+    from voxweave.core.speaker_evidence import (
+        evidence_span_from_cue,
+        lyric_for_evidence,
+    )
+    from voxweave.core.timing import LINGER_CAP_S, TWO_FRAME_S
+
+    extends = (
+        stream.profile.min_cue_s > 0
+        or stream.profile.lag_out_s > 0
+        or stream.profile.cps > 0
+    )
+    trace_legs = finalizer.get("trace", {}).get("legs") or ()
+    for index, (phase1, seed) in enumerate(zip(stream.cues, seed_cues)):
+        per_field = {field: set() for field in permitted}
+        if phase1.reading_chars != phase1.raw_reading_chars:
+            per_field["end"].add("FD-1")
+            independent_fired.add("FD-1")
+        if phase1.speech_end is None and extends:
+            per_field["end"].add("FD-8")
+            independent_fired.add("FD-8")
+        if any(
+            report.kind == "stutter-not-proven-fixed-within-4-scans"
+            for report in phase1.reports
+        ):
+            per_field["text"].add("FD-9")
+            independent_fired.add("FD-9")
+        if index + 1 < len(seed_cues):
+            next_seed = seed_cues[index + 1]
+            if float(seed["end"]) > float(next_seed["start"]):
+                per_field["end"].add("FD-3")
+                independent_fired.add("FD-3")
+            if float(next_seed["start"]) - float(seed["end"]) < TWO_FRAME_S:
+                per_field["end"].add("FD-6")
+                independent_fired.add("FD-6")
+        target_legs = [
+            leg
+            for leg in trace_legs
+            if int(leg["target"]["cue_index"]) == index
+            and leg["target"]["side"] in ("start", "end")
+        ]
+        for leg in target_legs:
+            if leg["rule_id"] in ("chain", "shot-in", "shot-out") or str(
+                leg["rule_id"]
+            ).startswith("ladder-"):
+                per_field[str(leg["target"]["side"])].add("FD-4")
+                independent_fired.add("FD-4")
+
+        evidence_lyric = lyric_for_evidence(evidence_span_from_cue(seed), sing_spans)
+        start, end = float(seed["start"]), float(seed["end"])
+        duration = end - start
+        overlap = sum(
+            max(0.0, min(end, high) - max(start, low)) for low, high in sing_spans
+        )
+        legacy_lyric = duration > 0 and overlap / duration >= LYRIC_MIN_OVERLAP
+        if evidence_lyric != legacy_lyric:
+            per_field["lyric"].add("FD-2")
+            independent_fired.add("FD-2")
+
+        wanted_end = float(seed["end"])
+        if phase1.speech_end is not None:
+            if stream.profile.min_cue_s > 0:
+                wanted_end = max(
+                    wanted_end,
+                    float(seed["start"]) + stream.profile.min_cue_s,
+                )
+            if stream.profile.lag_out_s > 0:
+                wanted_end = max(
+                    wanted_end,
+                    float(phase1.speech_end) + stream.profile.lag_out_s,
+                )
+            if stream.profile.cps > 0:
+                needed = sum(not char.isspace() for char in phase1.text) / (
+                    stream.profile.cps
+                )
+                wanted_end = max(
+                    wanted_end,
+                    min(
+                        float(seed["start"]) + needed,
+                        float(phase1.speech_end) + LINGER_CAP_S,
+                    ),
+                )
+        facts[index] = {
+            "evidence_lyric": evidence_lyric,
+            "expected_phase1_end": wanted_end,
+            "legacy_lyric": legacy_lyric,
+            "target_legs": target_legs,
+            "triggers": {field: sorted(ids) for field, ids in per_field.items()},
+        }
+
+
+# N11 stage 2: FD-7 from the phase-1 stream, the seed cues and the delivered rows.
+def _n11_fd7(
+    stream: Any,
+    seed_cues: Sequence[Cue],
+    finalizer_row: Mapping[str, Any],
+    finalizer: Mapping[str, Any],
+    independent_fired: set[str],
+) -> None:
+    from voxweave.core.timing import TWO_FRAME_S
+
+    # FD-7 is derived from the phase-1 stream, immutable seed, delivered
+    # state, and trace terminal -- never from either serialized report
+    # channel.  ``entries``/``refusals`` are producer output and are checked
+    # for exact equality by the shared schema validator; reading either here
+    # would let a serializer mutation erase both sides of the N11 check.
+    has_report = any(cue.reports for cue in stream.cues)
+    has_report = has_report or any(
+        float(left["end"]) > float(right["start"])
+        for left, right in zip(seed_cues, seed_cues[1:])
+    )
+    delivered = finalizer_row.get("cues") or ()
+    if len(delivered) == len(stream.cues):
+        for index, (row, cue) in enumerate(zip(delivered, stream.cues)):
+            start, end = float(row["start"]), float(row["end"])
+            if (
+                stream.profile.min_cue_s > 0
+                and end - start < stream.profile.min_cue_s - 1e-9
             ):
-                per_field["text"].add("FD-9")
-                independent_fired.add("FD-9")
-            if index + 1 < len(seed_cues):
-                next_seed = seed_cues[index + 1]
-                if float(seed["end"]) > float(next_seed["start"]):
-                    per_field["end"].add("FD-3")
-                    independent_fired.add("FD-3")
-                if float(next_seed["start"]) - float(seed["end"]) < TWO_FRAME_S:
-                    per_field["end"].add("FD-6")
-                    independent_fired.add("FD-6")
-            target_legs = [
-                leg
-                for leg in trace_legs
-                if int(leg["target"]["cue_index"]) == index
-                and leg["target"]["side"] in ("start", "end")
-            ]
-            for leg in target_legs:
-                if leg["rule_id"] in ("chain", "shot-in", "shot-out") or str(
-                    leg["rule_id"]
-                ).startswith("ladder-"):
-                    per_field[str(leg["target"]["side"])].add("FD-4")
-                    independent_fired.add("FD-4")
-
-            evidence_lyric = lyric_for_evidence(
-                evidence_span_from_cue(seed), sing_spans
-            )
-            start, end = float(seed["start"]), float(seed["end"])
-            duration = end - start
-            overlap = sum(
-                max(0.0, min(end, high) - max(start, low)) for low, high in sing_spans
-            )
-            legacy_lyric = duration > 0 and overlap / duration >= LYRIC_MIN_OVERLAP
-            if evidence_lyric != legacy_lyric:
-                per_field["lyric"].add("FD-2")
-                independent_fired.add("FD-2")
-
-            wanted_end = float(seed["end"])
-            if phase1.speech_end is not None:
-                if stream.profile.min_cue_s > 0:
-                    wanted_end = max(
-                        wanted_end,
-                        float(seed["start"]) + stream.profile.min_cue_s,
-                    )
-                if stream.profile.lag_out_s > 0:
-                    wanted_end = max(
-                        wanted_end,
-                        float(phase1.speech_end) + stream.profile.lag_out_s,
-                    )
-                if stream.profile.cps > 0:
-                    needed = sum(not char.isspace() for char in phase1.text) / (
-                        stream.profile.cps
-                    )
-                    wanted_end = max(
-                        wanted_end,
-                        min(
-                            float(seed["start"]) + needed,
-                            float(phase1.speech_end) + LINGER_CAP_S,
-                        ),
-                    )
-            facts[index] = {
-                "evidence_lyric": evidence_lyric,
-                "expected_phase1_end": wanted_end,
-                "legacy_lyric": legacy_lyric,
-                "target_legs": target_legs,
-                "triggers": {field: sorted(ids) for field, ids in per_field.items()},
-            }
-        # FD-7 is derived from the phase-1 stream, immutable seed, delivered
-        # state, and trace terminal -- never from either serialized report
-        # channel.  ``entries``/``refusals`` are producer output and are checked
-        # for exact equality by the shared schema validator; reading either here
-        # would let a serializer mutation erase both sides of the N11 check.
-        has_report = any(cue.reports for cue in stream.cues)
+                has_report = True
+            if index + 1 >= len(delivered):
+                continue
+            next_start = float(delivered[index + 1]["start"])
+            if (
+                next_start - end < TWO_FRAME_S - 1e-9
+                and cue.speech_end is not None
+                and next_start - TWO_FRAME_S < cue.speech_end <= next_start
+            ):
+                has_report = True
+    trace = finalizer.get("trace") or {}
+    cycle = trace.get("cycle")
+    if isinstance(cycle, Mapping):
         has_report = has_report or any(
-            float(left["end"]) > float(right["start"])
-            for left, right in zip(seed_cues, seed_cues[1:])
+            len(set(row.get("values") or ())) > 1
+            for row in cycle.get("per_boundary_values") or ()
+            if isinstance(row, Mapping)
         )
-        delivered = finalizer_row.get("cues") or ()
-        if len(delivered) == len(stream.cues):
-            for index, (row, cue) in enumerate(zip(delivered, stream.cues)):
-                start, end = float(row["start"]), float(row["end"])
-                if (
-                    stream.profile.min_cue_s > 0
-                    and end - start < stream.profile.min_cue_s - 1e-9
-                ):
-                    has_report = True
-                if index + 1 >= len(delivered):
-                    continue
-                next_start = float(delivered[index + 1]["start"])
-                if (
-                    next_start - end < TWO_FRAME_S - 1e-9
-                    and cue.speech_end is not None
-                    and next_start - TWO_FRAME_S < cue.speech_end <= next_start
-                ):
-                    has_report = True
-        trace = finalizer.get("trace") or {}
-        cycle = trace.get("cycle")
-        if isinstance(cycle, Mapping):
-            has_report = has_report or any(
-                len(set(row.get("values") or ())) > 1
-                for row in cycle.get("per_boundary_values") or ()
-                if isinstance(row, Mapping)
-            )
-        if trace.get("terminal") == "budget-exhausted":
-            has_report = True
-        if has_report:
-            independent_fired.add("FD-7")
+    if trace.get("terminal") == "budget-exhausted":
+        has_report = True
+    if has_report:
+        independent_fired.add("FD-7")
 
+
+# N11 stage 3: classify every changed field against the recomputed facts.
+def _n11_changed_fields(
+    finalizer_row: Mapping[str, Any],
+    comparator_row: Mapping[str, Any],
+    *,
+    finalizer: Mapping[str, Any],
+    facts: dict[int, dict[str, Any]],
+    stream: Any,
+    trace_clean: bool,
+) -> tuple[list[dict[str, Any]], int, int, bool]:
     left = {
         tuple(row["unit_range"]): row
         for row in finalizer_row.get("cues") or ()
@@ -266,15 +327,7 @@ def _shadow_diff_classification(
                     "unit_range": list(unit_range),
                 }
             )
-    return {
-        "alignment_error": alignment_error,
-        "changed_fields": changed,
-        "independent_fired": sorted(independent_fired),
-        "producer_fired": sorted(producer_fired),
-        "relation_failures": relation_failures,
-        "trigger_mismatches": sorted(independent_fired ^ producer_fired),
-        "unclassified_field_diff": unclassified,
-    }
+    return changed, unclassified, relation_failures, alignment_error
 
 
 class _AuditedFinalizerPreview:
