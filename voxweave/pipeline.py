@@ -1224,6 +1224,81 @@ def transcribe(
             c.unlink(missing_ok=True)
 
 
+def _joined_unit_text(
+    units: list[dict],
+    pieces: list[str],
+    meaningful: list[str],
+    stored_iso: str,
+) -> tuple[bool, str]:
+    # A correctly reinjected no-space stream has exactly one visible character
+    # per unit; spaces inside Latin phrases ride on the preceding unit (``T ``).
+    # If only the persisted label is stale, joining such a stream with the
+    # label's English separator would invent ``G P T``.  Recognize the
+    # representation itself and preserve its exact whitespace instead.
+    char_grained = len(meaningful) == len(units) and all(
+        sum(not ch.isspace() for ch in piece) == 1 for piece in meaningful
+    )
+    if char_grained:
+        text = "".join(pieces)
+    else:
+        stored_sep = "" if stored_iso in realign.NO_SPACE_LANGS else " "
+        text = stored_sep.join(meaningful)
+    return char_grained, text
+
+
+def _unit_timings(seq: Sequence[Mapping[str, Any]]) -> list[tuple[float, float]] | None:
+    rows: list[tuple[float, float]] = []
+    for unit in seq:
+        try:
+            start = float(unit["start"])
+            end = float(unit["end"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            return None
+        rows.append((start, end))
+    return rows or None
+
+
+def _rebuild_preserves_source(
+    source_times: list[tuple[float, float]],
+    rebuilt: list[dict],
+    text: str,
+    effective_no_space: bool,
+) -> bool:
+    # schema.Unit carries the surface under ``text`` OR ``word``; read both.
+    from voxweave.core.smart_split import _unit_text
+
+    rebuilt_times = _unit_timings(rebuilt)
+    source_monotone = all(
+        a[0] <= b[0] and a[1] <= b[1] for a, b in zip(source_times, source_times[1:])
+    )
+    rebuilt_monotone = rebuilt_times is not None and all(
+        a[0] <= b[0] and a[1] <= b[1] for a, b in zip(rebuilt_times, rebuilt_times[1:])
+    )
+    if effective_no_space:
+        round_trip_ok = "".join(_unit_text(u) for u in rebuilt) == text
+    else:
+        rebuilt_text = " ".join(_unit_text(u) for u in rebuilt)
+        round_trip_ok = " ".join(rebuilt_text.split()) == " ".join(text.split())
+    envelope_ok = rebuilt_times is not None and all(
+        math.isclose(a, b, abs_tol=1e-6)
+        for a, b in zip(
+            (min(s for s, _e in source_times), max(e for _s, e in source_times)),
+            (
+                min(s for s, _e in rebuilt_times),
+                max(e for _s, e in rebuilt_times),
+            ),
+        )
+    )
+    return not (
+        not rebuilt
+        or not round_trip_ok
+        or not envelope_ok
+        or (source_monotone and not rebuilt_monotone)
+    )
+
+
 def _reconcile_word_segment_language(
     language: str | None,
     units: list[dict],
@@ -1255,19 +1330,7 @@ def _reconcile_word_segment_language(
     if not meaningful:
         return stored_iso, units
 
-    # A correctly reinjected no-space stream has exactly one visible character
-    # per unit; spaces inside Latin phrases ride on the preceding unit (``T ``).
-    # If only the persisted label is stale, joining such a stream with the
-    # label's English separator would invent ``G P T``.  Recognize the
-    # representation itself and preserve its exact whitespace instead.
-    char_grained = len(meaningful) == len(units) and all(
-        sum(not ch.isspace() for ch in piece) == 1 for piece in meaningful
-    )
-    if char_grained:
-        text = "".join(pieces)
-    else:
-        stored_sep = "" if stored_iso in realign.NO_SPACE_LANGS else " "
-        text = stored_sep.join(meaningful)
+    char_grained, text = _joined_unit_text(units, pieces, meaningful, stored_iso)
 
     effective = reconcile_detected_language(language, text, override=override)
     effective_iso = to_iso_or(effective, stored_iso)
@@ -1296,20 +1359,7 @@ def _reconcile_word_segment_language(
         )
         return effective_iso, units
 
-    def _timings(seq: Sequence[Mapping[str, Any]]) -> list[tuple[float, float]] | None:
-        rows: list[tuple[float, float]] = []
-        for unit in seq:
-            try:
-                start = float(unit["start"])
-                end = float(unit["end"])
-            except (KeyError, TypeError, ValueError):
-                return None
-            if not math.isfinite(start) or not math.isfinite(end) or end < start:
-                return None
-            rows.append((start, end))
-        return rows or None
-
-    source_times = _timings(units)
+    source_times = _unit_timings(units)
     if source_times is None:
         log.warning(
             "cannot repair word-segment language %s -> %s: malformed source timings",
@@ -1336,34 +1386,7 @@ def _reconcile_word_segment_language(
         )
         return stored_iso, original_units
 
-    rebuilt_times = _timings(rebuilt)
-    source_monotone = all(
-        a[0] <= b[0] and a[1] <= b[1] for a, b in zip(source_times, source_times[1:])
-    )
-    rebuilt_monotone = rebuilt_times is not None and all(
-        a[0] <= b[0] and a[1] <= b[1] for a, b in zip(rebuilt_times, rebuilt_times[1:])
-    )
-    if effective_no_space:
-        round_trip_ok = "".join(_unit_text(u) for u in rebuilt) == text
-    else:
-        rebuilt_text = " ".join(_unit_text(u) for u in rebuilt)
-        round_trip_ok = " ".join(rebuilt_text.split()) == " ".join(text.split())
-    envelope_ok = rebuilt_times is not None and all(
-        math.isclose(a, b, abs_tol=1e-6)
-        for a, b in zip(
-            (min(s for s, _e in source_times), max(e for _s, e in source_times)),
-            (
-                min(s for s, _e in rebuilt_times),
-                max(e for _s, e in rebuilt_times),
-            ),
-        )
-    )
-    if (
-        not rebuilt
-        or not round_trip_ok
-        or not envelope_ok
-        or (source_monotone and not rebuilt_monotone)
-    ):
+    if not _rebuild_preserves_source(source_times, rebuilt, text, effective_no_space):
         log.warning(
             "cannot repair word-segment language %s -> %s without changing "
             "content/timing; keeping persisted representation",
