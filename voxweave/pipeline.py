@@ -3,10 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math as math
 import os
 import threading
-from collections import Counter as Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -58,11 +56,9 @@ from voxweave.core.shadow_v2 import (
 from voxweave.debug import DebugSink, FileDebugSink
 from voxweave.lang import (
     is_supported,
-    reconcile_detected_language as reconcile_detected_language,
     require_aligner_language,
     to_asr_iso,
     to_iso_or,
-    transcript_content_weight as transcript_content_weight,
 )
 from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
 
