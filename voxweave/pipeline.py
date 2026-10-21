@@ -611,6 +611,104 @@ def plan_song_skip(
     return expanded, final, kept, chunks
 
 
+# What the chunk planning stage of transcribe() decided: the packed ASR chunks, the
+# VAD segments they were packed from (rescue merged, song excised), the song spans
+# left for the later stages (empty under keep-lyrics) and the rescued speech islands.
+@dataclass(frozen=True)
+class _ChunkPlan:
+    chunks: list[dict]
+    segs: list[dict]
+    song_spans: list[tuple[float, float]]
+    rescued_spans: list[tuple[float, float]]
+
+
+def _plan_chunks(
+    wav: Path,
+    segs: list[dict],
+    *,
+    song_spans: list[tuple[float, float]],
+    sing_spans: list[tuple[float, float]],
+    speech_spans: list[tuple[float, float]],
+    keep_lyrics: bool,
+) -> _ChunkPlan:
+    # PANNs speech rescue, computed once against the raw silero segs (same inputs as
+    # plan_song_skip's internal rescue, so the two lists are identical on the song
+    # branch). Used to (a) widen chunk coverage on the keep-lyrics / no-song branches,
+    # which never reach plan_song_skip, and (b) union into the persisted vad_speech
+    # below — without (b) the timing reference calls the rescued dialogue silence and
+    # a later `align --vad-mask` would evict exactly the words the rescue recovered.
+    rescued = rescue_speech_segments(speech_spans, segs) if speech_spans else []
+    rescued_spans = [(r["start"], r["end"]) for r in rescued]
+    if keep_lyrics:
+        # Keep-lyrics: sung regions stay in the chunk stream and get ASR'd like
+        # dialogue; only the singing spans (human vocals) are kept for cue marking.
+        if sing_spans:
+            log.info(
+                "keeping %d singing span(s) as lyrics: %s",
+                len(sing_spans),
+                [(round(a, 1), round(b, 1)) for a, b in sing_spans],
+            )
+        song_spans = []  # disable excision + VAD-reference exclusion below
+        if rescued:
+            log.info(
+                "speech rescue: %d PANNs-only segment(s) silero missed: %s",
+                len(rescued),
+                rescued_spans,
+            )
+            segs = sorted(segs + rescued, key=lambda s: s["start"])
+        chunks = pack_speech_segments(segs, max_sec=MAX_CHUNK_SEC)
+    elif song_spans:
+        # Fine VAD (small min-silence) exposes brief intra-segment pauses; excision
+        # snaps its cut points into these so dialogue words are never bisected.
+        fine = vad_speech_segments(wav, min_silence_ms=SONG_FINE_SILENCE_MS)
+        silences = silence_gaps(fine)
+        # Decision chain lives in plan_song_skip (pure, shared with scenario tests).
+        before = sum(s["end"] - s["start"] for s in segs)
+        expanded, song_spans, segs, chunks = plan_song_skip(
+            song_spans,
+            sing_spans,
+            segs,
+            speech_spans=speech_spans,
+            silences=silences,
+            min_skip_sec=MIN_SONG_SKIP_SEC,
+            max_chunk_sec=MAX_CHUNK_SEC,
+        )
+        log.info(
+            "song spans (expanded): %s",
+            [(round(a, 1), round(b, 1)) for a, b in expanded],
+        )
+        short = [
+            (round(a, 1), round(b, 1))
+            for a, b in song_spans
+            if (b - a) < MIN_SONG_SKIP_SEC
+        ]
+        if short:
+            log.info(
+                "short singing spans excised in-segment (<%.0fs): %s",
+                MIN_SONG_SKIP_SEC,
+                short,
+            )
+        after = sum(s["end"] - s["start"] for s in segs)
+        log.info("excised %.1fs of speech-segment time as song", before - after)
+    else:
+        # skip_songs on but nothing detected: rescue still applies (silero misses are
+        # orthogonal to song presence — a recap episode has no OP yet can lose a cold open).
+        if rescued:
+            log.info(
+                "speech rescue: %d PANNs-only segment(s) silero missed: %s",
+                len(rescued),
+                rescued_spans,
+            )
+            segs = sorted(segs + rescued, key=lambda s: s["start"])
+        chunks = pack_speech_segments(segs, max_sec=MAX_CHUNK_SEC)
+    return _ChunkPlan(
+        chunks=chunks,
+        segs=segs,
+        song_spans=song_spans,
+        rescued_spans=rescued_spans,
+    )
+
+
 def transcribe(
     media_path: Path,
     *,
@@ -765,76 +863,18 @@ def transcribe(
         rep.step("find speech")
         rep.stage("VAD chunking")
         segs = vad_speech_segments(wav)
-        # PANNs speech rescue, computed once against the raw silero segs (same inputs as
-        # plan_song_skip's internal rescue, so the two lists are identical on the song
-        # branch). Used to (a) widen chunk coverage on the keep-lyrics / no-song branches,
-        # which never reach plan_song_skip, and (b) union into the persisted vad_speech
-        # below — without (b) the timing reference calls the rescued dialogue silence and
-        # a later `align --vad-mask` would evict exactly the words the rescue recovered.
-        rescued = rescue_speech_segments(speech_spans, segs) if speech_spans else []
-        rescued_spans = [(r["start"], r["end"]) for r in rescued]
-        if keep_lyrics:
-            # Keep-lyrics: sung regions stay in the chunk stream and get ASR'd like
-            # dialogue; only the singing spans (human vocals) are kept for cue marking.
-            if sing_spans:
-                log.info(
-                    "keeping %d singing span(s) as lyrics: %s",
-                    len(sing_spans),
-                    [(round(a, 1), round(b, 1)) for a, b in sing_spans],
-                )
-            song_spans = []  # disable excision + VAD-reference exclusion below
-            if rescued:
-                log.info(
-                    "speech rescue: %d PANNs-only segment(s) silero missed: %s",
-                    len(rescued),
-                    rescued_spans,
-                )
-                segs = sorted(segs + rescued, key=lambda s: s["start"])
-            chunks = pack_speech_segments(segs, max_sec=MAX_CHUNK_SEC)
-        elif song_spans:
-            # Fine VAD (small min-silence) exposes brief intra-segment pauses; excision
-            # snaps its cut points into these so dialogue words are never bisected.
-            fine = vad_speech_segments(wav, min_silence_ms=SONG_FINE_SILENCE_MS)
-            silences = silence_gaps(fine)
-            # Decision chain lives in plan_song_skip (pure, shared with scenario tests).
-            before = sum(s["end"] - s["start"] for s in segs)
-            expanded, song_spans, segs, chunks = plan_song_skip(
-                song_spans,
-                sing_spans,
-                segs,
-                speech_spans=speech_spans,
-                silences=silences,
-                min_skip_sec=MIN_SONG_SKIP_SEC,
-                max_chunk_sec=MAX_CHUNK_SEC,
-            )
-            log.info(
-                "song spans (expanded): %s",
-                [(round(a, 1), round(b, 1)) for a, b in expanded],
-            )
-            short = [
-                (round(a, 1), round(b, 1))
-                for a, b in song_spans
-                if (b - a) < MIN_SONG_SKIP_SEC
-            ]
-            if short:
-                log.info(
-                    "short singing spans excised in-segment (<%.0fs): %s",
-                    MIN_SONG_SKIP_SEC,
-                    short,
-                )
-            after = sum(s["end"] - s["start"] for s in segs)
-            log.info("excised %.1fs of speech-segment time as song", before - after)
-        else:
-            # skip_songs on but nothing detected: rescue still applies (silero misses are
-            # orthogonal to song presence — a recap episode has no OP yet can lose a cold open).
-            if rescued:
-                log.info(
-                    "speech rescue: %d PANNs-only segment(s) silero missed: %s",
-                    len(rescued),
-                    rescued_spans,
-                )
-                segs = sorted(segs + rescued, key=lambda s: s["start"])
-            chunks = pack_speech_segments(segs, max_sec=MAX_CHUNK_SEC)
+        plan = _plan_chunks(
+            wav,
+            segs,
+            song_spans=song_spans,
+            sing_spans=sing_spans,
+            speech_spans=speech_spans,
+            keep_lyrics=keep_lyrics,
+        )
+        chunks = plan.chunks
+        segs = plan.segs
+        song_spans = plan.song_spans
+        rescued_spans = plan.rescued_spans
         if not chunks:
             raise RuntimeError(f"no speech detected in {media_path.name}")
 
