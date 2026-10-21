@@ -781,6 +781,119 @@ def _timing_reference_spans(
     return vad_spans
 
 
+# The pyannote run configuration of the speaker identification stage: exactly the
+# four values diarize_turns takes from the caller.
+@dataclass(frozen=True)
+class _DiarizeSettings:
+    model: str | None
+    clustering: str | None
+    min_speakers: int | None
+    max_speakers: int | None
+
+
+# What diarize_turns records about the audio it was given. Pure: built from the
+# separation facts of the run, so building it before the diarization stage starts
+# changes nothing observable.
+def _diarize_audio_profile(
+    *,
+    separate: bool,
+    normalize: bool,
+    separator_identity: dict | None,
+) -> dict:
+    return {
+        "separated": separate,
+        "normalized": normalize,
+        "sample_rate": 16000,
+        **(
+            {
+                "separator": {
+                    **(
+                        separator_identity
+                        or {
+                            "repo": backend.SEPARATOR_REPO,
+                            "file": backend.SEPARATOR_REPO_FILE,
+                            "checkpoint": "unresolved",
+                            "config_sha256": "unresolved",
+                        }
+                    ),
+                }
+            }
+            if separate
+            else {}
+        ),
+    }
+
+
+# Speaker identification stage of transcribe(): pyannote turns on the 16k wav, then
+# the voiceprint capture. The two try levels stay separate on purpose: the inner
+# finally frees pyannote before the capture loads its embedder, the outer one frees
+# a kept clustering embedder on any path that never reaches the capture.
+def _identify_speakers(
+    wav: Path,
+    iso: str,
+    settings: _DiarizeSettings,
+    *,
+    voiceprints: bool,
+    voiceprint_model: str | None,
+    audio_profile: dict,
+    rep: Reporter,
+) -> tuple[list[tuple[float, float, str]], VoiceprintCapture | None]:
+    from voxweave import diarize as diarize_mod
+    from voxweave import voiceembed
+
+    rep.step("identify speakers")
+    voiceprint_target: voiceembed.EmbedderSpec | voiceembed.LegacyLane | None = (
+        voiceembed.resolve_voiceprint_model(voiceprint_model, iso)
+        if voiceprints
+        else None
+    )
+    # Voiceprint clustering embeds with ReDimNet2; when the capture below
+    # uses the same model, keep it resident across the two stages. The
+    # capture releases it, and so does the finally below on any path
+    # that never reaches the capture.
+    reuse_clustering_embedder = (
+        settings.clustering == config.DIARIZE_CLUSTERING_VOICEPRINT
+        and isinstance(voiceprint_target, voiceembed.EmbedderSpec)
+        and voiceprint_target.name == voiceembed.REDIMNET2_B6.name
+    )
+    rep.stage("speaker diarization (pyannote)")
+    voiceprint_capture: VoiceprintCapture | None = None
+    try:
+        try:
+            diarization = diarize_mod.diarize_turns(
+                wav,
+                model=settings.model,
+                min_speakers=settings.min_speakers,
+                max_speakers=settings.max_speakers,
+                clustering=settings.clustering,
+                release_embedder=not reuse_clustering_embedder,
+                # Only the legacy lane reads the pipeline's own embeddings;
+                # a dedicated embedder computes its voiceprints below.
+                want_embeddings=voiceprint_target is voiceembed.LEGACY,
+                audio_profile=audio_profile,
+            )
+        finally:
+            diarize_mod.release()
+        speaker_turns = diarization.turns
+        if isinstance(voiceprint_target, voiceembed.EmbedderSpec):
+            voiceprint_capture = _decoupled_voiceprint_capture(
+                wav,
+                diarization,
+                voiceprint_target,
+                reporter=rep,
+            )
+        elif voiceprint_target is voiceembed.LEGACY and diarization.centroids:
+            voiceprint_capture = VoiceprintCapture(
+                centroids=diarization.centroids,
+                provenance=diarization.provenance,
+                turns=diarization.turns,
+            )
+    finally:
+        if reuse_clustering_embedder:
+            voiceembed.release()  # idempotent after the capture's own
+    return speaker_turns, voiceprint_capture
+
+
 def transcribe(
     media_path: Path,
     *,
@@ -1059,81 +1172,21 @@ def transcribe(
         speaker_turns: list[tuple[float, float, str]] = []
         voiceprint_capture: VoiceprintCapture | None = None
         if diarize:
-            from voxweave import diarize as diarize_mod
-            from voxweave import voiceembed
-
-            rep.step("identify speakers")
-            voiceprint_target: (
-                voiceembed.EmbedderSpec | voiceembed.LegacyLane | None
-            ) = (
-                voiceembed.resolve_voiceprint_model(voiceprint_model, iso)
-                if voiceprints
-                else None
+            speaker_turns, voiceprint_capture = _identify_speakers(
+                wav,
+                iso,
+                _DiarizeSettings(
+                    diarize_model, speaker_clustering, min_speakers, max_speakers
+                ),
+                voiceprints=voiceprints,
+                voiceprint_model=voiceprint_model,
+                audio_profile=_diarize_audio_profile(
+                    separate=separate,
+                    normalize=normalize,
+                    separator_identity=separator_identity,
+                ),
+                rep=rep,
             )
-            # Voiceprint clustering embeds with ReDimNet2; when the capture below
-            # uses the same model, keep it resident across the two stages. The
-            # capture releases it, and so does the finally below on any path
-            # that never reaches the capture.
-            reuse_clustering_embedder = (
-                speaker_clustering == config.DIARIZE_CLUSTERING_VOICEPRINT
-                and isinstance(voiceprint_target, voiceembed.EmbedderSpec)
-                and voiceprint_target.name == voiceembed.REDIMNET2_B6.name
-            )
-            rep.stage("speaker diarization (pyannote)")
-            try:
-                try:
-                    diarization = diarize_mod.diarize_turns(
-                        wav,
-                        model=diarize_model,
-                        min_speakers=min_speakers,
-                        max_speakers=max_speakers,
-                        clustering=speaker_clustering,
-                        release_embedder=not reuse_clustering_embedder,
-                        # Only the legacy lane reads the pipeline's own embeddings;
-                        # a dedicated embedder computes its voiceprints below.
-                        want_embeddings=voiceprint_target is voiceembed.LEGACY,
-                        audio_profile={
-                            "separated": separate,
-                            "normalized": normalize,
-                            "sample_rate": 16000,
-                            **(
-                                {
-                                    "separator": {
-                                        **(
-                                            separator_identity
-                                            or {
-                                                "repo": backend.SEPARATOR_REPO,
-                                                "file": backend.SEPARATOR_REPO_FILE,
-                                                "checkpoint": "unresolved",
-                                                "config_sha256": "unresolved",
-                                            }
-                                        ),
-                                    }
-                                }
-                                if separate
-                                else {}
-                            ),
-                        },
-                    )
-                finally:
-                    diarize_mod.release()
-                speaker_turns = diarization.turns
-                if isinstance(voiceprint_target, voiceembed.EmbedderSpec):
-                    voiceprint_capture = _decoupled_voiceprint_capture(
-                        wav,
-                        diarization,
-                        voiceprint_target,
-                        reporter=rep,
-                    )
-                elif voiceprint_target is voiceembed.LEGACY and diarization.centroids:
-                    voiceprint_capture = VoiceprintCapture(
-                        centroids=diarization.centroids,
-                        provenance=diarization.provenance,
-                        turns=diarization.turns,
-                    )
-            finally:
-                if reuse_clustering_embedder:
-                    voiceembed.release()  # idempotent after the capture's own
         panns_handoff = not release_panns
         return (
             iso,
