@@ -60,6 +60,8 @@ from .boundary_lattice import (
     Edge,
     IncrementalPacker,
     IntervalLattice,
+    LatticeAtom,
+    PackMeasure,
     ProfileViolation,
     build_barriers,
     build_document_lattice,
@@ -475,34 +477,14 @@ class V1Reference:
         }
 
 
-def score_v1_global(
+# Lands every v1 cut on an atom node. Returns the node chain, the cuts that did
+# not land on an atom edge, and the v1 cue index for each landed span.
+def _v1_landed_chain(
     v1: V1Partition,
     layer: AtomLayer,
-    ctx: CostContext,
-    *,
-    units: Sequence[SourceUnit] = (),
-) -> V1Reference:
-    """Price v1's actual partition under v2's policy, legality notwithstanding.
-
-    Cut and edge costs are defined on arbitrary node pairs, so v1's answer is
-    scored directly rather than being forced through the lattice first -- which
-    matters because the interesting v1 partitions are exactly the ones the
-    lattice would refuse. Those refusals are recorded separately as typed
-    disagreements instead of being priced as infinities.
-
-    With a speaker track (the P5 rows) v1 is judged and priced under the rules
-    the speaker lattice and its tables use: canonical ``FinalText`` admission in
-    every language, and the phase-1 input bounds, acoustic anchors and owned
-    footprint in the edge price. Scoring v1 under the policy-1 packer and span
-    defaults instead would compare two partitions under two different policies.
-    """
-    profile = ctx.profile
-    lang = profile.language
-    atoms = layer.atoms
-    count = len(atoms)
-    bounds = [layer.unit_bound(node) for node in range(count + 1)]
-    speaker_rows = isinstance(ctx.speaker_evidence, UnitSpeakers)
-
+    bounds: Sequence[int],
+    count: int,
+) -> tuple[tuple[int, ...], list[dict[str, Any]], dict[tuple[int, int], int]]:
     nodes: list[int] = []
     rounded: list[dict[str, Any]] = []
     # The node every v1 cue boundary landed on, in v1 cue order. Rounding can
@@ -531,6 +513,163 @@ def score_v1_global(
         for index, span in enumerate(zip(landed, landed[1:]))
         if span[0] < span[1]
     }
+    return chain, rounded, v1_cue_for_span
+
+
+# Measures one chain cue and builds its edge; None when the prefix packer never
+# produced a measure (an empty span).
+def _v1_chain_edge(
+    atoms: Sequence[LatticeAtom],
+    left: int,
+    right: int,
+    packer: IncrementalPacker | None,
+    profile: DisplayProfile,
+    canonical_work: CanonicalWork,
+    lang: str,
+) -> tuple[Edge, PackMeasure, float | None, float | None] | None:
+    chunk = atoms[left:right]
+    if packer is None:
+        measure = _canonical_pack_measure(atoms, left, right, profile, canonical_work)
+    else:
+        packer.reset()
+        measure = None
+        for atom in chunk:
+            measure = packer.extend(atom.text)
+        if measure is None:
+            return None
+    low = span_min([atom.start for atom in chunk])
+    high = span_max([atom.end for atom in chunk])
+    edge = Edge(
+        start_node=left,
+        end_node=right,
+        text=_join([atom.text for atom in chunk], lang),
+        display_text=measure.text,
+        lines=measure.lines,
+        line_widths=measure.line_widths,
+        span_start=low,
+        span_end=high,
+        waiver=None,
+    )
+    return edge, measure, low, high
+
+
+# The acoustic-or-input evidence span a v1 chain cue is priced with.
+def _v1_evidence_span(
+    ctx: CostContext,
+    v1: V1Partition,
+    v1_cue_for_span: Mapping[tuple[int, int], int],
+    left: int,
+    right: int,
+    low: float | None,
+    high: float | None,
+    unit_range: tuple[int, int],
+) -> EvidenceSpan:
+    v1_index = v1_cue_for_span.get((left, right))
+    if v1_index is not None and v1_index < len(v1.cues):
+        evidence_span = evidence_span_from_cue(v1.cues[v1_index])
+    elif (
+        low is not None
+        and high is not None
+        and isinstance(low, (int, float))
+        and isinstance(high, (int, float))
+        and math.isfinite(low)
+        and math.isfinite(high)
+        and low <= high
+    ):
+        evidence_span = make_evidence_span(
+            ctx.units,
+            unit_range,
+            input_start=float(low),
+            input_end=float(high),
+        )
+    else:
+        evidence_span = EvidenceSpan(0.0, 0.0, "fabricated", "fabricated")
+    return evidence_span
+
+
+# The typed hard disagreements for one chain cue, in the fixed order
+# over-budget, crosses-barrier, over-cap-unwaived.
+def _v1_hard_disagreements(
+    cue_index: int,
+    measure: PackMeasure,
+    barriers: set[int],
+    left: int,
+    right: int,
+    low: float | None,
+    high: float | None,
+    unit_range: tuple[int, int],
+    profile: DisplayProfile,
+    units: Sequence[SourceUnit],
+) -> list[dict[str, Any]]:
+    disagreements: list[dict[str, Any]] = []
+    if not measure.fits:
+        disagreements.append(
+            {
+                "cue_index": cue_index,
+                "detail": f"{measure.lines} lines of widths "
+                f"{list(measure.line_widths)} exceed the budget",
+                "kind": "over-budget",
+                "unit_range": list(unit_range),
+            }
+        )
+    crossed = sorted(node for node in barriers if left < node < right)
+    if crossed:
+        disagreements.append(
+            {
+                "cue_index": cue_index,
+                "detail": f"crosses robust-silence barriers at nodes {crossed}",
+                "kind": "crosses-barrier",
+                "unit_range": list(unit_range),
+            }
+        )
+    if (
+        profile.max_cue_s > 0
+        and low is not None
+        and high is not None
+        and high - low > profile.max_cue_s + CAP_EPS_S
+        and not held_chain_continuous(units, unit_range[0], unit_range[1])
+    ):
+        disagreements.append(
+            {
+                "cue_index": cue_index,
+                "detail": f"span {high - low} exceeds the cap "
+                f"{profile.max_cue_s} with no continuous held chain",
+                "kind": "over-cap-unwaived",
+                "unit_range": list(unit_range),
+            }
+        )
+    return disagreements
+
+
+def score_v1_global(
+    v1: V1Partition,
+    layer: AtomLayer,
+    ctx: CostContext,
+    *,
+    units: Sequence[SourceUnit] = (),
+) -> V1Reference:
+    """Price v1's actual partition under v2's policy, legality notwithstanding.
+
+    Cut and edge costs are defined on arbitrary node pairs, so v1's answer is
+    scored directly rather than being forced through the lattice first -- which
+    matters because the interesting v1 partitions are exactly the ones the
+    lattice would refuse. Those refusals are recorded separately as typed
+    disagreements instead of being priced as infinities.
+
+    With a speaker track (the P5 rows) v1 is judged and priced under the rules
+    the speaker lattice and its tables use: canonical ``FinalText`` admission in
+    every language, and the phase-1 input bounds, acoustic anchors and owned
+    footprint in the edge price. Scoring v1 under the policy-1 packer and span
+    defaults instead would compare two partitions under two different policies.
+    """
+    profile = ctx.profile
+    lang = profile.language
+    atoms = layer.atoms
+    count = len(atoms)
+    bounds = [layer.unit_bound(node) for node in range(count + 1)]
+    speaker_rows = isinstance(ctx.speaker_evidence, UnitSpeakers)
+
+    chain, rounded, v1_cue_for_span = _v1_landed_chain(v1, layer, bounds, count)
 
     barriers = {
         barrier.node
@@ -550,31 +689,12 @@ def score_v1_global(
     for cue_index, (left, right) in enumerate(zip(chain, chain[1:])):
         if left >= right:
             continue
-        chunk = atoms[left:right]
-        if packer is None:
-            measure = _canonical_pack_measure(
-                atoms, left, right, profile, canonical_work
-            )
-        else:
-            packer.reset()
-            measure = None
-            for atom in chunk:
-                measure = packer.extend(atom.text)
-            if measure is None:
-                continue
-        low = span_min([atom.start for atom in chunk])
-        high = span_max([atom.end for atom in chunk])
-        edge = Edge(
-            start_node=left,
-            end_node=right,
-            text=_join([atom.text for atom in chunk], lang),
-            display_text=measure.text,
-            lines=measure.lines,
-            line_widths=measure.line_widths,
-            span_start=low,
-            span_end=high,
-            waiver=None,
+        chain_edge = _v1_chain_edge(
+            atoms, left, right, packer, profile, canonical_work, lang
         )
+        if chain_edge is None:
+            continue
+        edge, measure, low, high = chain_edge
         unit_range = (layer.unit_bound(left), layer.unit_bound(right))
         common = {
             "profile": profile,
@@ -603,26 +723,9 @@ def score_v1_global(
         else:
             base = edge_cost(edge, atoms, **common)
         if isinstance(ctx.speaker_evidence, UnitSpeakers):
-            v1_index = v1_cue_for_span.get((left, right))
-            if v1_index is not None and v1_index < len(v1.cues):
-                evidence_span = evidence_span_from_cue(v1.cues[v1_index])
-            elif (
-                low is not None
-                and high is not None
-                and isinstance(low, (int, float))
-                and isinstance(high, (int, float))
-                and math.isfinite(low)
-                and math.isfinite(high)
-                and low <= high
-            ):
-                evidence_span = make_evidence_span(
-                    ctx.units,
-                    unit_range,
-                    input_start=float(low),
-                    input_end=float(high),
-                )
-            else:
-                evidence_span = EvidenceSpan(0.0, 0.0, "fabricated", "fabricated")
+            evidence_span = _v1_evidence_span(
+                ctx, v1, v1_cue_for_span, left, right, low, high, unit_range
+            )
             speaker = speaker_edge_cost(
                 ctx.speaker_evidence,
                 unit_range,
@@ -645,42 +748,20 @@ def score_v1_global(
                     v1_cut_units=ctx.v1_cut_units,
                 )
             )
-        if not measure.fits:
-            disagreements.append(
-                {
-                    "cue_index": cue_index,
-                    "detail": f"{measure.lines} lines of widths "
-                    f"{list(measure.line_widths)} exceed the budget",
-                    "kind": "over-budget",
-                    "unit_range": list(unit_range),
-                }
+        disagreements.extend(
+            _v1_hard_disagreements(
+                cue_index,
+                measure,
+                barriers,
+                left,
+                right,
+                low,
+                high,
+                unit_range,
+                profile,
+                units,
             )
-        crossed = sorted(node for node in barriers if left < node < right)
-        if crossed:
-            disagreements.append(
-                {
-                    "cue_index": cue_index,
-                    "detail": f"crosses robust-silence barriers at nodes {crossed}",
-                    "kind": "crosses-barrier",
-                    "unit_range": list(unit_range),
-                }
-            )
-        if (
-            profile.max_cue_s > 0
-            and low is not None
-            and high is not None
-            and high - low > profile.max_cue_s + CAP_EPS_S
-            and not held_chain_continuous(units, unit_range[0], unit_range[1])
-        ):
-            disagreements.append(
-                {
-                    "cue_index": cue_index,
-                    "detail": f"span {high - low} exceeds the cap "
-                    f"{profile.max_cue_s} with no continuous held chain",
-                    "kind": "over-cap-unwaived",
-                    "unit_range": list(unit_range),
-                }
-            )
+        )
 
     return V1Reference(
         global_cost=sum_breakdowns(parts),
