@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal as Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from voxweave import (
     artifacts,
@@ -20,7 +20,6 @@ from voxweave import (
     realign,
     songdet,
 )
-from voxweave import sdh as sdh_mod  # noqa: F401
 from voxweave.chunking import (
     decode_to_wav as decode_to_wav,
     pack_speech_segments as pack_speech_segments,
@@ -66,7 +65,7 @@ from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
 # modules; the public names stay importable from here.
 from voxweave.paths import MEDIA_EXTS as MEDIA_EXTS
 from voxweave.paths import find_subtitle_media, require_output_name, swap_ext
-from voxweave.progress import Reporter, progress_bridge as progress_bridge
+from voxweave.progress import Reporter
 from voxweave.segmentation import (
     SEGMENTATION_ENGINE as SEGMENTATION_ENGINE,
     SEGMENTATION_MANIFEST_VERSION as SEGMENTATION_MANIFEST_VERSION,
@@ -92,7 +91,6 @@ from voxweave.songdet import (
     rescue_speech_segments as rescue_speech_segments,
     subtract_spans as subtract_spans,
 )
-from voxweave.speakers import named_speaker_ids as named_speaker_ids
 from voxweave.subformats import require_subtitle
 from voxweave.timestamps import shift_units
 from voxweave.transcript_language import (
@@ -114,16 +112,10 @@ from voxweave.vocals import (
 from voxweave.vocals import cache_16k_path as cache_16k_path
 from voxweave.voicebase import (
     Phase2DataError,
-    VOICEPRINTS_MAX_BYTES as VOICEPRINTS_MAX_BYTES,
-    canonical_turns_digest as canonical_turns_digest,
-    encode_json_bytes as encode_json_bytes,
     media_fingerprint,
-    mint_capture_id as mint_capture_id,
     require_capture_id,
     require_sha256,
     strict_json_object_loads,
-    utc_timestamp as utc_timestamp,
-    validate_voiceprints_mapping as validate_voiceprints_mapping,
 )
 from voxweave.voiceprint_capture import (
     VoiceprintCapture as VoiceprintCapture,
