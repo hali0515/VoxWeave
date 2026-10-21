@@ -770,17 +770,11 @@ def _untimed_run_blocks(
     return untimed
 
 
-def build_interval_lattice(
+# The interval has a span violation inside it: no lattice, a typed preflight reason.
+def _span_preflight_lattice(
     interval: HardInterval,
-    layer: AtomLayer,
-    profile: DisplayProfile,
-    *,
-    units: Sequence[SourceUnit],
-    span_violations: Sequence[SpanViolation] = (),
-    canonical_spaced: bool = False,
-) -> IntervalLattice:
-    """Build one interval's legal cue set, or say precisely why there is none."""
-    lang = profile.language
+    span_violations: Sequence[SpanViolation],
+) -> IntervalLattice | None:
     blocking = [
         violation
         for violation in span_violations
@@ -807,41 +801,52 @@ def build_interval_lattice(
             packer_steps=0,
             canonical_chars=0,
         )
+    return None
 
-    raw = _reindex(layer.atoms[interval.node_start : interval.node_end])
-    raw = tuple(
-        _replace(atom, members=(position,)) for position, atom in enumerate(raw)
+
+# The all-invisible interval: a forced edge chain over the cap partition, no search.
+def _all_invisible_lattice(
+    interval: HardInterval,
+    coalesced: CoalesceResult,
+    units: Sequence[SourceUnit],
+    profile: DisplayProfile,
+    lang: str,
+) -> IntervalLattice:
+    resolution = resolve_cap_partition(
+        coalesced.atoms,
+        units,
+        max_cue_s=profile.max_cue_s,
+        lang=lang,
     )
-    coalesced = coalesce_zero_display(raw, lang=lang)
+    atoms = resolution.atoms
+    edges = (
+        ()
+        if resolution.infeasible is not None
+        else _forced_chain(atoms, resolution.cuts, resolution.waivers, lang)
+    )
+    return IntervalLattice(
+        interval=interval,
+        atoms=atoms,
+        nodes=(0, *resolution.cuts, len(atoms)),
+        edges=edges,
+        edges_from=_edges_from(edges),
+        coalesced_atoms=coalesced.coalesced_atoms,
+        all_invisible=True,
+        relief_injections=resolution.relief_injections,
+        waivers=resolution.waivers,
+        infeasible=resolution.infeasible,
+        packer_steps=0,
+        canonical_chars=0,
+    )
 
-    if coalesced.all_invisible:
-        resolution = resolve_cap_partition(
-            coalesced.atoms,
-            units,
-            max_cue_s=profile.max_cue_s,
-            lang=lang,
-        )
-        atoms = resolution.atoms
-        edges = (
-            ()
-            if resolution.infeasible is not None
-            else _forced_chain(atoms, resolution.cuts, resolution.waivers, lang)
-        )
-        return IntervalLattice(
-            interval=interval,
-            atoms=atoms,
-            nodes=(0, *resolution.cuts, len(atoms)),
-            edges=edges,
-            edges_from=_edges_from(edges),
-            coalesced_atoms=coalesced.coalesced_atoms,
-            all_invisible=True,
-            relief_injections=resolution.relief_injections,
-            waivers=resolution.waivers,
-            infeasible=resolution.infeasible,
-            packer_steps=0,
-            canonical_chars=0,
-        )
 
+# Source-unit relief on the atoms that are over the cap alone, then the re-coalesce.
+def _relieve_interval_atoms(
+    coalesced: CoalesceResult,
+    units: Sequence[SourceUnit],
+    profile: DisplayProfile,
+    lang: str,
+) -> tuple[tuple[LatticeAtom, ...], int, int]:
     atoms = coalesced.atoms
     coalesced_atoms = coalesced.coalesced_atoms
     relief_injections = 0
@@ -863,8 +868,18 @@ def build_interval_lattice(
             coalesced_atoms += recoalesced.coalesced_atoms
         else:
             atoms = relieved
-    nodes = candidate_nodes(atoms, lang)
+    return atoms, coalesced_atoms, relief_injections
 
+
+# Units coarser than a cue: even the relief nodes leave too few cuts, so no search.
+def _coarse_granularity_lattice(
+    interval: HardInterval,
+    atoms: tuple[LatticeAtom, ...],
+    nodes: tuple[int, ...],
+    profile: DisplayProfile,
+    coalesced_atoms: int,
+    relief_injections: int,
+) -> IntervalLattice | None:
     granularity = granularity_check(atoms, nodes, profile)
     if granularity.collapsed:
         widened = nodes
@@ -914,6 +929,43 @@ def build_interval_lattice(
                 canonical_chars=0,
                 cap_relief_nodes=0,
             )
+    return None
+
+
+def build_interval_lattice(
+    interval: HardInterval,
+    layer: AtomLayer,
+    profile: DisplayProfile,
+    *,
+    units: Sequence[SourceUnit],
+    span_violations: Sequence[SpanViolation] = (),
+    canonical_spaced: bool = False,
+) -> IntervalLattice:
+    """Build one interval's legal cue set, or say precisely why there is none."""
+    lang = profile.language
+    preflight = _span_preflight_lattice(interval, span_violations)
+    if preflight is not None:
+        return preflight
+
+    raw = _reindex(layer.atoms[interval.node_start : interval.node_end])
+    raw = tuple(
+        _replace(atom, members=(position,)) for position, atom in enumerate(raw)
+    )
+    coalesced = coalesce_zero_display(raw, lang=lang)
+
+    if coalesced.all_invisible:
+        return _all_invisible_lattice(interval, coalesced, units, profile, lang)
+
+    atoms, coalesced_atoms, relief_injections = _relieve_interval_atoms(
+        coalesced, units, profile, lang
+    )
+    nodes = candidate_nodes(atoms, lang)
+
+    coarse = _coarse_granularity_lattice(
+        interval, atoms, nodes, profile, coalesced_atoms, relief_injections
+    )
+    if coarse is not None:
+        return coarse
 
     canonical_work = CanonicalWork()
     scan, nodes, steps, cap_relief_nodes = _scan_with_cap_nodes(
