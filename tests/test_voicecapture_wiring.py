@@ -16,6 +16,7 @@ from voxweave import (
     episode_transaction,
     pipeline,
     songdet,
+    transcription,
 )
 from voxweave import vocals as vocals_mod
 from voxweave.mediasnapshot import SnapshotUnavailable
@@ -181,11 +182,11 @@ def test_capture_raw_decoder_reads_stable_snapshot_through_truncate_aba(
     monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
     monkeypatch.setattr(vocals_mod, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
-        pipeline,
+        transcription,
         "vad_speech_segments",
         lambda *_args, **_kwargs: [{"start": 0.0, "end": 1.0}],
     )
-    monkeypatch.setattr(pipeline, "slice_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(transcription, "slice_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(backend, "chunk_pass_count", lambda *_args, **_kwargs: 2)
     monkeypatch.setattr(
         backend,
@@ -470,11 +471,11 @@ def _stub_transcribe_tail(tmp_path, monkeypatch):
     wav = tmp_path / "speech.wav"
     wav.write_bytes(b"wav")
     monkeypatch.setattr(
-        pipeline,
+        transcription,
         "vad_speech_segments",
         lambda *_args, **_kwargs: [{"start": 0.0, "end": 1.0}],
     )
-    monkeypatch.setattr(pipeline, "slice_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(transcription, "slice_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(backend, "chunk_pass_count", lambda *_args, **_kwargs: 2)
     monkeypatch.setattr(
         backend,
@@ -588,7 +589,7 @@ def test_capture_cache_hit_validates_pair_before_decode(tmp_path, monkeypatch):
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
     monkeypatch.setattr(vocals_mod, "validate_cache_pair", recording_validate)
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(transcription, "decode_to_wav", fake_decode)
     monkeypatch.setattr(vocals_mod, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
         vocals_mod,
@@ -647,7 +648,7 @@ def test_capture_cache_autocast_change_reseparates_and_rebinds(tmp_path, monkeyp
         "_encode_flac",
         lambda _source, destination: Path(destination).write_bytes(b"bf16 flac"),
     )
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(transcription, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
 
     pipeline.transcribe(
@@ -706,7 +707,7 @@ def test_capture_cache_mismatch_reseparates_and_rebinds(tmp_path, monkeypatch):
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
     monkeypatch.setattr(vocals_mod, "_separate_to_16k_32k", fake_separate)
     monkeypatch.setattr(vocals_mod, "_encode_flac", fake_encode)
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(transcription, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(diarize, "diarize_turns", fake_diarize)
     monkeypatch.setattr(diarize, "release", lambda: None)

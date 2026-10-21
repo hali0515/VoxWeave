@@ -13,6 +13,7 @@ import pytest
 
 from voxweave import backend, chunking, config, pipeline, songdet
 from voxweave import llm_commands
+from voxweave import transcription
 from voxweave import vocals
 from voxweave.progress import Reporter
 
@@ -42,10 +43,10 @@ def _stub_transcribe_stages(tmp_path, monkeypatch, *, vad):
             kwargs["on_done"](index)
         return [("en", "hello world", [dict(u) for u in UNITS]) for _ in chunks]
 
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(transcription, "decode_to_wav", fake_decode)
     monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
-    monkeypatch.setattr(pipeline, "slice_wav", fake_slice)
-    monkeypatch.setattr(pipeline, "vad_speech_segments", vad)
+    monkeypatch.setattr(transcription, "slice_wav", fake_slice)
+    monkeypatch.setattr(transcription, "vad_speech_segments", vad)
     monkeypatch.setattr(backend, "chunk_pass_count", lambda _model: 1)
     monkeypatch.setattr(backend, "transcribe_chunks", transcribe_chunks)
     monkeypatch.setattr(backend, "release", lambda: None)
@@ -238,13 +239,16 @@ def test_malformed_pipeline_knob_does_not_break_import():
         VOXWEAVE_MAX_CHUNK_SEC="12O",
         VOXWEAVE_SONG_FINE_SILENCE_MS="100ms",
         VOXWEAVE_CACHE_DUR_TOL_SEC="half",
+        VOXWEAVE_MIN_SONG_SKIP_SEC="eight",
+        VOXWEAVE_SNAP_VAD_THRESHOLD="quarter",
     )
     proc = subprocess.run(
         [
             sys.executable,
             "-c",
             "from voxweave import pipeline as p;"
-            "print(p.MAX_CHUNK_SEC, p.SONG_FINE_SILENCE_MS, p.CACHE_DUR_TOL_SEC)",
+            "print(p.MAX_CHUNK_SEC, p.SONG_FINE_SILENCE_MS, p.CACHE_DUR_TOL_SEC,"
+            " p.MIN_SONG_SKIP_SEC, p.SNAP_VAD_THRESHOLD)",
         ],
         capture_output=True,
         text=True,
@@ -253,11 +257,13 @@ def test_malformed_pipeline_knob_does_not_break_import():
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.split() == ["120.0", "100", "0.5"]
+    assert proc.stdout.split() == ["120.0", "100", "0.5", "8.0", "0.25"]
     for name in (
         "VOXWEAVE_MAX_CHUNK_SEC",
         "VOXWEAVE_SONG_FINE_SILENCE_MS",
         "VOXWEAVE_CACHE_DUR_TOL_SEC",
+        "VOXWEAVE_MIN_SONG_SKIP_SEC",
+        "VOXWEAVE_SNAP_VAD_THRESHOLD",
     ):
         assert name in proc.stderr
 

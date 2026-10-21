@@ -11,6 +11,7 @@ import pytest
 
 from voxweave import artifacts, pipeline
 from voxweave import sidecars
+from voxweave import transcription
 from voxweave.voiceepisode import episode_lock, episode_lock_path
 from voxweave import vocals
 
@@ -298,7 +299,7 @@ def test_transcribe_debug_sink_is_rooted_in_the_artifact_claim(tmp_path, monkeyp
     class Stop(RuntimeError):
         pass
 
-    monkeypatch.setattr(pipeline, "FileDebugSink", CapturingSink)
+    monkeypatch.setattr(transcription, "FileDebugSink", CapturingSink)
     monkeypatch.setattr(
         vocals,
         "decode_to_wav",
