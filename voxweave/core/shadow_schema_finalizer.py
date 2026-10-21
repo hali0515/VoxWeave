@@ -72,59 +72,10 @@ _MOVEMENT_DISTRIBUTION_KEYS = frozenset({"start", "end"})
 _MOVEMENT_SUMMARY_KEYS = frozenset({"count", "max", "p50", "p90"})
 
 
-def _finalizer_verification(
-    value: Any,
-    row: Mapping[str, Any],
-    *,
-    path: str,
-    errors: list[str],
-    expected_row_id: str | None,
-    profile: Any | None,
-) -> tuple[Any, ...] | None:
-    """Decode and authenticate the phase-1 seed carried for trace replay."""
-    from .authority import AUTHORITY_KINDS, digest_payload
-    from .finalizer import Phase1Cue, _profile_payload
+# Phase-1 seed cues: twelve-field rows decoded into Phase1Cue, malformed rows skipped.
+def _seed_cues(raw_cues: list[Any], path: str, errors: list[str]) -> list[Any]:
+    from .finalizer import Phase1Cue
 
-    block = _mapping(value, path, errors)
-    if block is None:
-        return None
-    _closed(block, _VERIFICATION_KEYS, path, errors)
-    authority_id = block.get("authority_id")
-    authority_kind = block.get("authority_kind")
-    digest = block.get("seed_digest")
-    if not isinstance(authority_id, str) or not authority_id:
-        errors.append(f"{path}.authority_id: expected non-empty string")
-    if authority_kind not in AUTHORITY_KINDS:
-        errors.append(f"{path}.authority_kind: outside closed authority vocabulary")
-    if (
-        not isinstance(digest, str)
-        or len(digest) != 64
-        or any(char not in "0123456789abcdef" for char in digest)
-    ):
-        errors.append(f"{path}.seed_digest: expected lowercase sha256")
-
-    payload = _mapping(block.get("seed_payload"), f"{path}.seed_payload", errors)
-    if payload is None:
-        return None
-    _closed(payload, _SEED_PAYLOAD_KEYS, f"{path}.seed_payload", errors)
-    if isinstance(digest, str) and digest_payload(payload) != digest:
-        errors.append(f"{path}.seed_digest: does not bind seed_payload")
-    wanted_row = (
-        None if expected_row_id is None else f"{LANE_FINALIZER}/{expected_row_id}"
-    )
-    if wanted_row is not None and payload.get("row_id") != wanted_row:
-        errors.append(
-            f"{path}.seed_payload.row_id: expected {wanted_row!r}, "
-            f"got {payload.get('row_id')!r}"
-        )
-    if not isinstance(payload.get("evaluation_id"), str):
-        errors.append(f"{path}.seed_payload.evaluation_id: expected string")
-    if profile is not None and payload.get("profile") != _profile_payload(profile):
-        errors.append(f"{path}.seed_payload.profile: disagrees with artifact profile")
-
-    raw_cues = _list(payload.get("cues"), f"{path}.seed_payload.cues", errors)
-    if raw_cues is None:
-        return None
     cues: list[Phase1Cue] = []
     for position, raw in enumerate(raw_cues):
         cue_path = f"{path}.seed_payload.cues[{position}]"
@@ -226,6 +177,63 @@ def _finalizer_verification(
                     reports=(),
                 )
             )
+    return cues
+
+
+def _finalizer_verification(
+    value: Any,
+    row: Mapping[str, Any],
+    *,
+    path: str,
+    errors: list[str],
+    expected_row_id: str | None,
+    profile: Any | None,
+) -> tuple[Any, ...] | None:
+    """Decode and authenticate the phase-1 seed carried for trace replay."""
+    from .authority import AUTHORITY_KINDS, digest_payload
+    from .finalizer import _profile_payload
+
+    block = _mapping(value, path, errors)
+    if block is None:
+        return None
+    _closed(block, _VERIFICATION_KEYS, path, errors)
+    authority_id = block.get("authority_id")
+    authority_kind = block.get("authority_kind")
+    digest = block.get("seed_digest")
+    if not isinstance(authority_id, str) or not authority_id:
+        errors.append(f"{path}.authority_id: expected non-empty string")
+    if authority_kind not in AUTHORITY_KINDS:
+        errors.append(f"{path}.authority_kind: outside closed authority vocabulary")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+    ):
+        errors.append(f"{path}.seed_digest: expected lowercase sha256")
+
+    payload = _mapping(block.get("seed_payload"), f"{path}.seed_payload", errors)
+    if payload is None:
+        return None
+    _closed(payload, _SEED_PAYLOAD_KEYS, f"{path}.seed_payload", errors)
+    if isinstance(digest, str) and digest_payload(payload) != digest:
+        errors.append(f"{path}.seed_digest: does not bind seed_payload")
+    wanted_row = (
+        None if expected_row_id is None else f"{LANE_FINALIZER}/{expected_row_id}"
+    )
+    if wanted_row is not None and payload.get("row_id") != wanted_row:
+        errors.append(
+            f"{path}.seed_payload.row_id: expected {wanted_row!r}, "
+            f"got {payload.get('row_id')!r}"
+        )
+    if not isinstance(payload.get("evaluation_id"), str):
+        errors.append(f"{path}.seed_payload.evaluation_id: expected string")
+    if profile is not None and payload.get("profile") != _profile_payload(profile):
+        errors.append(f"{path}.seed_payload.profile: disagrees with artifact profile")
+
+    raw_cues = _list(payload.get("cues"), f"{path}.seed_payload.cues", errors)
+    if raw_cues is None:
+        return None
+    cues = _seed_cues(raw_cues, path, errors)
     if len(cues) != len(raw_cues):
         return None
     if len(cues) != row.get("cue_count"):
