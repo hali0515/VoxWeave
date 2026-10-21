@@ -1250,6 +1250,77 @@ def _artifact(
     return artifact
 
 
+# Resolve the audited sub-unit split of a document, declaring the identity
+# mapping when none was supplied.
+def _audited_subunit_split(
+    document: SegDocument, subunit_split: RefineResult | None
+) -> RefineResult:
+    if subunit_split is None:
+        if any(unit.provenance.startswith("subunit-") for unit in document.units):
+            raise ValueError(
+                "a derived sub-unit stream requires its audited subunit_split result"
+            )
+        split = empty_refine_result(document.units, language=document.language)
+    else:
+        split = subunit_split
+    require_issued_refinement(split)
+    if tuple(document.units) != split.units or len(split.origin) != len(document.units):
+        raise ValueError("subunit_split does not describe this document's unit stream")
+    return split
+
+
+# Solve the intervals in order.  fallback_start threads the preceding selected
+# interval's delivered input end, and reuse.document_nodes is filled as each
+# interval's tables are built.
+def _solve_intervals(
+    document: SegDocument,
+    lattice: DocumentLattice,
+    reuse: _OptimizationReuse,
+    ctx: CostContext,
+    v1: V1Partition | None,
+    speaker_enabled: bool,
+) -> tuple[list[IntervalSolution], list[IntervalLattice]]:
+    solutions: list[IntervalSolution] = []
+    resolved_lattices: list[IntervalLattice] = []
+    fallback_start = 0.0
+    adoptions = _adoption_plan(lattice.lattices, v1, len(document.units))
+    for position, raw_interval_lattice in enumerate(lattice.lattices):
+        interval_lattice = (
+            _cache_candidate_evidence(
+                raw_interval_lattice,
+                document,
+                fallback_start=fallback_start,
+            )
+            if speaker_enabled
+            else raw_interval_lattice
+        )
+        cached_nodes = reuse.document_nodes.get(raw_interval_lattice.interval.index)
+        tables = build_cost_tables(
+            interval_lattice,
+            ctx,
+            fallback_start=fallback_start,
+            document_nodes=cached_nodes,
+        )
+        if cached_nodes is None:
+            reuse.document_nodes[raw_interval_lattice.interval.index] = (
+                tables.document_nodes
+            )
+        solution = optimize_interval(
+            interval_lattice,
+            tables,
+            ctx,
+            units=document.units,
+            v1=v1,
+            fallback_start=fallback_start,
+            adopted=adoptions.get(position),
+        )
+        solutions.append(solution)
+        resolved_lattices.append(solution.lattice)
+        if solution.cues:
+            fallback_start = float(solution.cues[-1]["end"])
+    return solutions, resolved_lattices
+
+
 def optimize_document(
     document: SegDocument,
     *,
@@ -1270,17 +1341,7 @@ def optimize_document(
     supplied parent projection): ``None`` preserves the pre-W4 live call, while
     W4 can request the full and counterfactual rows with ``3.0`` and ``0.0``.
     """
-    if subunit_split is None:
-        if any(unit.provenance.startswith("subunit-") for unit in document.units):
-            raise ValueError(
-                "a derived sub-unit stream requires its audited subunit_split result"
-            )
-        split = empty_refine_result(document.units, language=document.language)
-    else:
-        split = subunit_split
-    require_issued_refinement(split)
-    if tuple(document.units) != split.units or len(split.origin) != len(document.units):
-        raise ValueError("subunit_split does not describe this document's unit stream")
+    split = _audited_subunit_split(document, subunit_split)
 
     speaker_enabled = speakers is not None or speaker_weight is not None
     invalid = preflight_profile(document.profile)
@@ -1322,44 +1383,9 @@ def optimize_document(
         speaker_weight=resolved_weight,
     )
 
-    solutions: list[IntervalSolution] = []
-    resolved_lattices: list[IntervalLattice] = []
-    fallback_start = 0.0
-    adoptions = _adoption_plan(lattice.lattices, v1, len(document.units))
-    for position, raw_interval_lattice in enumerate(lattice.lattices):
-        interval_lattice = (
-            _cache_candidate_evidence(
-                raw_interval_lattice,
-                document,
-                fallback_start=fallback_start,
-            )
-            if speaker_enabled
-            else raw_interval_lattice
-        )
-        cached_nodes = reuse.document_nodes.get(raw_interval_lattice.interval.index)
-        tables = build_cost_tables(
-            interval_lattice,
-            ctx,
-            fallback_start=fallback_start,
-            document_nodes=cached_nodes,
-        )
-        if cached_nodes is None:
-            reuse.document_nodes[raw_interval_lattice.interval.index] = (
-                tables.document_nodes
-            )
-        solution = optimize_interval(
-            interval_lattice,
-            tables,
-            ctx,
-            units=document.units,
-            v1=v1,
-            fallback_start=fallback_start,
-            adopted=adoptions.get(position),
-        )
-        solutions.append(solution)
-        resolved_lattices.append(solution.lattice)
-        if solution.cues:
-            fallback_start = float(solution.cues[-1]["end"])
+    solutions, resolved_lattices = _solve_intervals(
+        document, lattice, reuse, ctx, v1, speaker_enabled
+    )
 
     lattice = replace(lattice, lattices=tuple(resolved_lattices))
 
