@@ -1048,32 +1048,13 @@ def _resolve_speaker_evidence(
     )
 
 
-def _artifact(
-    document: SegDocument,
-    lattice: DocumentLattice,
+# Count the materialized cues that carry more than one named speaker; the
+# ownership check raises at the same point the inline block did.
+def _named_multi_cues(
     solutions: Sequence[IntervalSolution],
-    v1_reference: V1Reference | None,
-    document_check: PartitionCheckResult,
-    subunit_split: RefineResult,
     speakers: UnitSpeakers | None,
-    speaker_weight: float,
-) -> dict[str, Any]:
-    unit_count = len(document.units)
-    optimized = [solution for solution in solutions if solution.optimized]
-    optimized_units = sum(
-        solution.interval.unit_end - solution.interval.unit_start
-        for solution in optimized
-    )
-    waivers: list[dict[str, Any]] = []
-    for solution in solutions:
-        waivers.extend(waiver.to_dict() for waiver in solution.waivers)
-    interval_hard = sum(
-        len(solution.validator_raw.exit_driving) for solution in solutions
-    )
-    coarse_caused_intervals = sum(solution.coarse_caused for solution in solutions)
-    speaker_pricing = (
-        _speaker_pricing_totals(solutions) if speakers is not None else None
-    )
+    unit_count: int,
+) -> int:
     named_multi = 0
     if speakers is not None:
         materialized = tuple(solution for solution in solutions if solution.cues)
@@ -1102,6 +1083,87 @@ def _artifact(
             named_multi = named_multi_cues_unannotated(
                 cue_ranges, speakers.unit_speakers
             )
+    return named_multi
+
+
+# The ``totals`` block of the artifact; the caller keeps its key position.
+def _artifact_totals(
+    lattice: DocumentLattice,
+    solutions: Sequence[IntervalSolution],
+    optimized: Sequence[IntervalSolution],
+    optimized_units: int,
+    unit_count: int,
+    interval_hard: int,
+    coarse_caused_intervals: int,
+    waivers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "all_invisible_intervals": sum(
+            1 for solution in solutions if solution.lattice.all_invisible
+        ),
+        "atom_count": len(lattice.layer.atoms),
+        "barrier_count": len(lattice.barriers),
+        "cap_relief_nodes": sum(
+            solution.lattice.cap_relief_nodes for solution in solutions
+        ),
+        "coalesced_atoms": sum(
+            solution.lattice.coalesced_atoms for solution in solutions
+        ),
+        "canonical_chars": sum(
+            solution.lattice.canonical_chars for solution in solutions
+        ),
+        "coarse_granularity_intervals": sum(
+            1
+            for solution in solutions
+            if solution.lattice.infeasible is not None
+            and solution.lattice.infeasible.reason == COARSE_GRANULARITY
+        ),
+        "coarse_caused_intervals": coarse_caused_intervals,
+        "dp_relaxations": sum(solution.dp_relaxations for solution in solutions),
+        "fallback_intervals": len(solutions) - len(optimized),
+        "hard_violations": interval_hard,
+        "interval_count": len(solutions),
+        "optimized_intervals": len(optimized),
+        "optimized_unit_ratio": 1.0
+        if unit_count == 0
+        else optimized_units / unit_count,
+        "packer_steps": sum(solution.packer_steps for solution in solutions),
+        "relief_injections": sum(
+            solution.lattice.relief_injections for solution in solutions
+        ),
+        "sentence_ends_missed": lattice.sentence_ends.missed,
+        "unit_count": unit_count,
+        "waivers": waivers,
+    }
+
+
+def _artifact(
+    document: SegDocument,
+    lattice: DocumentLattice,
+    solutions: Sequence[IntervalSolution],
+    v1_reference: V1Reference | None,
+    document_check: PartitionCheckResult,
+    subunit_split: RefineResult,
+    speakers: UnitSpeakers | None,
+    speaker_weight: float,
+) -> dict[str, Any]:
+    unit_count = len(document.units)
+    optimized = [solution for solution in solutions if solution.optimized]
+    optimized_units = sum(
+        solution.interval.unit_end - solution.interval.unit_start
+        for solution in optimized
+    )
+    waivers: list[dict[str, Any]] = []
+    for solution in solutions:
+        waivers.extend(waiver.to_dict() for waiver in solution.waivers)
+    interval_hard = sum(
+        len(solution.validator_raw.exit_driving) for solution in solutions
+    )
+    coarse_caused_intervals = sum(solution.coarse_caused for solution in solutions)
+    speaker_pricing = (
+        _speaker_pricing_totals(solutions) if speakers is not None else None
+    )
+    named_multi = _named_multi_cues(solutions, speakers, unit_count)
     artifact: dict[str, Any] = {
         "coverage": {
             "coarse_caused_intervals": coarse_caused_intervals,
@@ -1157,44 +1219,16 @@ def _artifact(
         ),
         "subunit_split": subunit_split.to_dict(),
         "vad_state": _vad_state_totals(solutions),
-        "totals": {
-            "all_invisible_intervals": sum(
-                1 for solution in solutions if solution.lattice.all_invisible
-            ),
-            "atom_count": len(lattice.layer.atoms),
-            "barrier_count": len(lattice.barriers),
-            "cap_relief_nodes": sum(
-                solution.lattice.cap_relief_nodes for solution in solutions
-            ),
-            "coalesced_atoms": sum(
-                solution.lattice.coalesced_atoms for solution in solutions
-            ),
-            "canonical_chars": sum(
-                solution.lattice.canonical_chars for solution in solutions
-            ),
-            "coarse_granularity_intervals": sum(
-                1
-                for solution in solutions
-                if solution.lattice.infeasible is not None
-                and solution.lattice.infeasible.reason == COARSE_GRANULARITY
-            ),
-            "coarse_caused_intervals": coarse_caused_intervals,
-            "dp_relaxations": sum(solution.dp_relaxations for solution in solutions),
-            "fallback_intervals": len(solutions) - len(optimized),
-            "hard_violations": interval_hard,
-            "interval_count": len(solutions),
-            "optimized_intervals": len(optimized),
-            "optimized_unit_ratio": 1.0
-            if unit_count == 0
-            else optimized_units / unit_count,
-            "packer_steps": sum(solution.packer_steps for solution in solutions),
-            "relief_injections": sum(
-                solution.lattice.relief_injections for solution in solutions
-            ),
-            "sentence_ends_missed": lattice.sentence_ends.missed,
-            "unit_count": unit_count,
-            "waivers": waivers,
-        },
+        "totals": _artifact_totals(
+            lattice,
+            solutions,
+            optimized,
+            optimized_units,
+            unit_count,
+            interval_hard,
+            coarse_caused_intervals,
+            waivers,
+        ),
         "v1": None if v1_reference is None else v1_reference.to_dict(),
         "validator": {
             "core": None,
