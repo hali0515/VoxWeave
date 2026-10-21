@@ -189,7 +189,7 @@ def _stub_transcribe_models(monkeypatch, tmp_path):
     """Stub every model call inside transcribe (decode/VAD/ASR/alignment)."""
     wav = tmp_path / "audio.wav"
     wav.write_bytes(b"x")
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *a, **kw: wav)
+    monkeypatch.setattr(transcription, "decode_to_wav", lambda *a, **kw: wav)
     monkeypatch.setattr(vocals, "decode_to_wav", lambda *a, **kw: wav)
     monkeypatch.setattr(
         transcription,

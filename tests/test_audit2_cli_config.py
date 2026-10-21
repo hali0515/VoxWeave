@@ -14,6 +14,7 @@ import pytest
 from click.testing import CliRunner
 
 from voxweave import backend, config, pipeline, vocalscache
+from voxweave import transcription
 from voxweave import vocals
 from voxweave.cli import cli
 from voxweave.voicebase import media_fingerprint
@@ -170,7 +171,7 @@ def test_bound_align_cache_miss_publishes_a_companion_the_next_run_reuses(
     monkeypatch.setattr(
         vocals, "_encode_flac", lambda _src, dst: Path(dst).write_bytes(b"flac")
     )
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_a, **_k: decoded)
+    monkeypatch.setattr(transcription, "decode_to_wav", lambda *_a, **_k: decoded)
     monkeypatch.setattr(vocals, "decode_to_wav", lambda *_a, **_k: decoded)
 
     def prepare() -> Path:

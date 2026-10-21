@@ -10,6 +10,7 @@ from voxweave import artifacts, episode_transaction, pipeline, sdh, songdet
 from voxweave import llm_commands
 from voxweave import paths
 from voxweave import process_publication
+from voxweave import transcription
 from voxweave import vocals
 
 
@@ -193,10 +194,13 @@ def test_process_injected_words_is_media_free_with_absent_nominal_path(
     nominal = tmp_path / "absent.input.movie.mkv"
 
     def forbidden(*_args, **_kwargs):
-        raise AssertionError("injected words touched media or PANNs")
+        # pytest.fail is not an Exception, so the SDH step's ``except Exception``
+        # cannot turn a forbidden call into a logged warning.
+        pytest.fail("injected words touched media or PANNs")
 
     monkeypatch.setattr(pipeline, "transcribe", forbidden)
-    monkeypatch.setattr(pipeline, "decode_to_wav", forbidden)
+    monkeypatch.setattr(process_publication, "decode_to_wav", forbidden)
+    monkeypatch.setattr(transcription, "decode_to_wav", forbidden)
     monkeypatch.setattr(vocals, "decode_to_wav", forbidden)
     monkeypatch.setattr(pipeline, "media_fingerprint", forbidden)
     monkeypatch.setattr(songdet, "release_model", forbidden)

@@ -7,6 +7,7 @@ import pytest
 from click.testing import CliRunner
 
 from voxweave import backend, episode_transaction, pipeline
+from voxweave import transcription
 from voxweave import vocals
 from voxweave.cli import cli
 from voxweave.mediasnapshot import SnapshotUnavailable
@@ -554,7 +555,7 @@ def test_bound_align_validates_cache_while_lock_is_held(tmp_path, monkeypatch):
 
     monkeypatch.setattr(backend, "separator_identity", lambda: dict(SEPARATOR))
     monkeypatch.setattr(vocals, "cache_lock", tracking_lock)
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(transcription, "decode_to_wav", fake_decode)
     monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
         vocals,

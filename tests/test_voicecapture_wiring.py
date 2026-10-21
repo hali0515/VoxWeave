@@ -179,7 +179,7 @@ def test_capture_raw_decoder_reads_stable_snapshot_through_truncate_aba(
         assert source.read_bytes() == original
         return wav
 
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(transcription, "decode_to_wav", fake_decode)
     monkeypatch.setattr(vocals_mod, "decode_to_wav", fake_decode)
     monkeypatch.setattr(
         transcription,
@@ -532,7 +532,7 @@ def test_smoothing_active_capture_publishes_valid_four_part_conjunction(
     media.write_bytes(b"stable media bytes")
     wav = _stub_transcribe_tail(tmp_path, monkeypatch)
     sf.write(wav, np.zeros(16000, dtype=np.float32), 16000)
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(transcription, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
     # diarize_turns resolves the HF token before reaching the stubbed pipeline;
     # provide one so the test does not depend on ambient credentials.
@@ -798,7 +798,7 @@ def _run_smoothing_capture(tmp_path, monkeypatch, *, lane):
     media.write_bytes(b"stable media bytes")
     wav = _stub_transcribe_tail(tmp_path / lane, monkeypatch)
     sf.write(wav, np.zeros(3 * 16000, dtype=np.float32), 16000)
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(transcription, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     monkeypatch.setattr(
@@ -873,7 +873,7 @@ def _stub_decoupled_transcribe(tmp_path, monkeypatch, *, language="English"):
         "transcribe_chunks",
         lambda *_args, **_kwargs: [(language, "hello", [dict(UNIT)])],
     )
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(transcription, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(vocals_mod, "decode_to_wav", lambda *_args, **_kwargs: wav)
     seen: dict[str, object] = {}
 
