@@ -10,10 +10,14 @@ module scope, so a flag-off run still pulls none of them into the process.
 
 Import direction: this module never imports :mod:`voxweave.pipeline` or
 :mod:`voxweave.segmentation`. The production overlays the lane replays
-(``mark_lyric_cues``, ``copied_spans``, ``copied_turns``, ``resnap_shots``,
-``LYRIC_MIN_OVERLAP``) come from :mod:`voxweave.core.overlay`, the leaf the
-v1 entry point runs them from. The lane constants below are re-exported from
-``pipeline`` for downstream readers.
+(``mark_lyric_cues``, ``copied_spans``, ``copied_turns``, ``resnap_shots``)
+come from :mod:`voxweave.core.overlay`, the leaf the v1 entry point runs them
+from. The two independent oracles (N11 diff classification, N7 audited
+preview) live in :mod:`voxweave.core.shadow_oracles` and are re-exported here
+so that the test seams on this module keep biting. The row builders (cue
+rows, stream blocks, finalizer rows) live in :mod:`voxweave.core.shadow_rows`
+and are re-exported the same way; every caller of those seams stays here. The
+lane constants below are re-exported from ``pipeline`` for downstream readers.
 """
 
 from __future__ import annotations
@@ -26,14 +30,13 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from voxweave.core.overlay import (
-    LYRIC_MIN_OVERLAP,
     copied_spans,
     copied_turns,
     mark_lyric_cues,
     resnap_shots,
 )
 from voxweave.core.providers import degradation_capture
-from voxweave.core.schema import Cue, Unit
+from voxweave.core.schema import Cue
 from voxweave.core.segdoc import SegDocument
 from voxweave.core.shadow_lanes import (
     LANE_CORE,
@@ -41,12 +44,44 @@ from voxweave.core.shadow_lanes import (
     LANE_FINALIZER,
     LANE_LEGACY,
 )
+from voxweave.core.shadow_oracles import (
+    _AuditedFinalizerPreview as _AuditedFinalizerPreview,
+)
+from voxweave.core.shadow_oracles import (
+    _shadow_diff_classification as _shadow_diff_classification,
+)
+from voxweave.core.shadow_rows import (
+    _shadow_boundary_times as _shadow_boundary_times,
+)
+from voxweave.core.shadow_rows import (
+    _shadow_cue_rows as _shadow_cue_rows,
+)
+from voxweave.core.shadow_rows import (
+    _shadow_finalizer_row as _shadow_finalizer_row,
+)
+from voxweave.core.shadow_rows import (
+    _shadow_finalizer_verification as _shadow_finalizer_verification,
+)
+from voxweave.core.shadow_rows import (
+    _shadow_movement_distribution as _shadow_movement_distribution,
+)
+from voxweave.core.shadow_rows import (
+    _shadow_source_units as _shadow_source_units,
+)
+from voxweave.core.shadow_rows import (
+    _shadow_stream_block as _shadow_stream_block,
+)
 
 if TYPE_CHECKING:  # the v2 modules are import-free unless the flag is on
+    from voxweave.core.authority import AuthorityKind, AuthorityLedger
     from voxweave.core.boundary_v2 import DocumentSolution
-    from voxweave.core.finalizer import FinalizerPreview
+    from voxweave.core.finalizer import (
+        FinalizeEvidence,
+        FinalizePolicy,
+        Phase1CueStream,
+        V1ReferenceCapture,
+    )
     from voxweave.core.partition_check import Origin, Stage
-    from voxweave.core.timing_preview import CueCandidate, CuePreview
 
 log = logging.getLogger("voxweave")
 
@@ -144,37 +179,6 @@ def _shadow_v1_partition(
     return None, f"parent:{parent_mode}"
 
 
-def _shadow_cue_rows(
-    cues: Sequence[Cue], partition: Sequence[int] | None, unit_count: int
-) -> list[dict[str, Any]]:
-    """The artifact projection of one cue stream: display facts plus ownership."""
-    from voxweave.core.partition_check import owned_unit_ids
-
-    bounds = (
-        owned_unit_ids(partition, unit_count)
-        if partition is not None and len(partition) + 1 == len(cues)
-        else None
-    )
-    rows: list[dict[str, Any]] = []
-    for index, cue in enumerate(cues):
-        text = str(cue["text"])
-        rows.append(
-            {
-                "end": cue.get("end"),
-                "index": index,
-                "lines": len(text.split("\n")),
-                "lyric": bool(cue.get("lyric", False)),
-                "speaker_ids": list(cue.get("speaker_ids") or ()),
-                "speech_end": cue.get("speech_end"),
-                "speech_start": cue.get("speech_start"),
-                "start": cue.get("start"),
-                "text": text,
-                "unit_range": None if bounds is None else list(bounds[index]),
-            }
-        )
-    return rows
-
-
 def _restamp_by_footprint(
     waivers: Mapping[int, Any], partition: Sequence[int] | None, unit_count: int
 ) -> dict[int, Any]:
@@ -243,48 +247,6 @@ def _origins_by_footprint(
         for index, (start, end) in enumerate(bounds)
         if any(start < high and end > low for low, high in fallback_ranges)
     }
-
-
-def _shadow_stream_block(
-    cues: Sequence[Cue],
-    partition: Sequence[int] | None,
-    projection: str,
-    *,
-    document: SegDocument,
-    origin: Origin,
-    stage: Stage,
-    waivers: Mapping[int, Any] | None = None,
-    origins: Mapping[int, Origin] | None = None,
-    extra: Mapping[str, Any] | None = None,
-    validator: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """One engine's stream at one lane: rows, its partition, and its validator.
-
-    ``validator`` supplies a check another stage already ran on this exact
-    stream instead of running a second one.
-    """
-    from voxweave.core.partition_check import check_partition
-
-    if validator is None and partition is not None:
-        validator = check_partition(
-            partition,
-            cues,
-            units=document.units,
-            profile=document.profile,
-            origin=origin,
-            stage=stage,
-            waivers=waivers,
-            origins=origins,
-        ).to_dict()
-    block: dict[str, Any] = {
-        "cue_count": len(cues),
-        "cues": _shadow_cue_rows(cues, partition, len(document.units)),
-        "partition": None if partition is None else list(partition),
-        "projection": projection,
-        "validator": validator,
-    }
-    block.update(extra or {})
-    return block
 
 
 def _shadow_lane_block(
@@ -390,168 +352,6 @@ def _shadow_overlay_cues(
     return out
 
 
-def _shadow_boundary_times(cues: Sequence[Cue]) -> tuple[float, ...]:
-    """Delivered interior boundaries in the one frozen transition coordinate."""
-    from voxweave.core.boundary_cost import transition_time
-
-    values: list[float] = []
-    for left, right in zip(cues, cues[1:]):
-        value = transition_time(left.get("end"), right.get("start"))
-        if value is not None:
-            values.append(float(value))
-    return tuple(values)
-
-
-def _shadow_movement_distribution(movement: Sequence[Any]) -> dict[str, Any]:
-    """Compact absolute phase-2 movement distribution, nearest-rank."""
-    import math
-
-    def summary(values: list[float]) -> dict[str, Any]:
-        ordered = sorted(values)
-
-        def rank(percentile: float) -> float | None:
-            if not ordered:
-                return None
-            return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
-
-        return {
-            "count": len(ordered),
-            "max": max(ordered) if ordered else None,
-            "p50": rank(0.50),
-            "p90": rank(0.90),
-        }
-
-    return {
-        side: summary(
-            [abs(float(item.delta)) for item in movement if item.boundary.side == side]
-        )
-        for side in ("start", "end")
-    }
-
-
-def _shadow_source_units(units: Sequence[Any]) -> list[dict[str, Any]]:
-    """Closed source-unit authority used by schema-side partition replay."""
-    return [
-        {
-            "confidence": unit.confidence,
-            "end": unit.end,
-            "id": unit.id,
-            "provenance": unit.provenance,
-            "start": unit.start,
-            "surface": unit.surface,
-        }
-        for unit in units
-    ]
-
-
-def _shadow_finalizer_verification(
-    stream: Any, evidence: Any, policy: Any
-) -> dict[str, Any]:
-    """Digest-bound canonical inputs for schema-side finalizer replay."""
-    from voxweave.core.finalizer import _stream_payload
-
-    seed = _stream_payload(
-        stream.cues,
-        stream.profile,
-        stream.row_id,
-        stream.evaluation_id,
-    )
-    return {
-        "authority_id": stream.seed_id,
-        "authority_kind": stream.authority_kind,
-        "evidence": {
-            "shots": list(evidence.shots),
-            "sing_spans": [list(span) for span in evidence.sing_spans],
-        },
-        "policy": {
-            "grid": policy.grid,
-            "min_gap": policy.min_gap,
-            "overlap_policy": policy.overlap_policy,
-        },
-        "seed_digest": stream.capability.seal.digest,
-        "seed_payload": seed,
-    }
-
-
-def _shadow_finalizer_row(
-    result: Any,
-    stream: Any,
-    partition: Sequence[int] | None,
-    *,
-    document: SegDocument,
-    origin: Any,
-    evidence: Any,
-    policy: Any,
-    projection: str = "solver-partition",
-) -> tuple[dict[str, Any], list[Cue]]:
-    """Verify and serialize one finalizer root without trusting its trace.
-
-    ``projection`` names where ``partition`` came from: the solver for the v2
-    rows, the surface projection (``v1_projection``) for the v1 row.
-    """
-    from voxweave.core.partition_check import check_partition
-    from voxweave.core.trace_validator import replay_trace, stability_check
-
-    cues = [copy.deepcopy(cue) for cue in result.cues]
-    delivered = tuple((float(cue["start"]), float(cue["end"])) for cue in cues)
-    trace_errors = replay_trace(
-        result.trace,
-        stream.cues,
-        profile=document.profile,
-        evidence=evidence,
-        policy=policy,
-        delivered=delivered,
-    )
-    stability_errors = stability_check(
-        delivered,
-        stream.cues,
-        profile=document.profile,
-        evidence=evidence,
-        policy=policy,
-        terminal=result.trace.terminal,
-    )
-    validator = None
-    partition_cardinality_ok = partition is not None and len(partition) + 1 == len(cues)
-    if result.valid and partition is not None and len(partition) + 1 == len(cues):
-        validator = check_partition(
-            partition,
-            cues,
-            units=document.units,
-            profile=document.profile,
-            origin=origin,
-            stage="finalizer",
-            reports=result.report.entries,
-            waivers={waiver.cue_index: waiver for waiver in result.report.waivers},
-        ).to_dict()
-    finalizer = {
-        **result.report.to_dict(),
-        "movement_distribution": _shadow_movement_distribution(result.report.movement),
-        "refusals": [entry.to_dict() for entry in result.report.entries],
-        "stability_errors": list(stability_errors),
-        "trace": result.trace.to_dict(),
-        "trace_errors": list(trace_errors),
-        "valid": bool(result.valid),
-    }
-    return (
-        {
-            "cue_count": len(cues),
-            "cues": _shadow_cue_rows(cues, partition, len(document.units)),
-            "finalizer": finalizer,
-            "partition": None if partition is None else list(partition),
-            "projection": (
-                projection
-                if partition_cardinality_ok
-                else "cue/range-cardinality-mismatch"
-                if partition is not None
-                else "unresolved"
-            ),
-            "validator": validator,
-            "verification": _shadow_finalizer_verification(stream, evidence, policy),
-        },
-        cues,
-    )
-
-
 def _shadow_fallback_rechecks(
     stream: Any,
     footprints: Sequence[str],
@@ -627,417 +427,6 @@ def _shadow_stamp_comparator_deltas(
     finalizer["deltas_fired"] = sorted(fired)
 
 
-def _shadow_diff_classification(
-    finalizer_row: Mapping[str, Any],
-    comparator_row: Mapping[str, Any],
-    *,
-    stream: Any,
-    seed_cues: Sequence[Cue],
-    sing_spans: Sequence[tuple[float, float]] = (),
-) -> dict[str, Any]:
-    """N11: independently recompute per-cue triggers and allowed relations.
-
-    A changed field is approved only against a fact recomputed here from the
-    phase-1 ``stream`` and the immutable ``seed_cues``; a cue with no such fact
-    (the two disagree in cardinality) is counted unclassified, never approved on
-    the producer's own claim.
-    """
-    from voxweave.core.speaker_evidence import (
-        evidence_span_from_cue,
-        lyric_for_evidence,
-    )
-    from voxweave.core.timing import LINGER_CAP_S, TWO_FRAME_S
-
-    finalizer = finalizer_row["finalizer"]
-    producer_fired = set(finalizer.get("deltas_fired") or ())
-    trace_clean = not finalizer.get("trace_errors") and not finalizer.get(
-        "stability_errors"
-    )
-    permitted = {
-        "text": {"FD-9"},
-        "start": {"FD-4"},
-        "end": {"FD-1", "FD-3", "FD-4", "FD-6", "FD-8"},
-        "lyric": {"FD-2"},
-    }
-    facts: dict[int, dict[str, Any]] = {}
-    independent_fired: set[str] = set()
-    if len(stream.cues) == len(seed_cues):
-        extends = (
-            stream.profile.min_cue_s > 0
-            or stream.profile.lag_out_s > 0
-            or stream.profile.cps > 0
-        )
-        trace_legs = finalizer.get("trace", {}).get("legs") or ()
-        for index, (phase1, seed) in enumerate(zip(stream.cues, seed_cues)):
-            per_field = {field: set() for field in permitted}
-            if phase1.reading_chars != phase1.raw_reading_chars:
-                per_field["end"].add("FD-1")
-                independent_fired.add("FD-1")
-            if phase1.speech_end is None and extends:
-                per_field["end"].add("FD-8")
-                independent_fired.add("FD-8")
-            if any(
-                report.kind == "stutter-not-proven-fixed-within-4-scans"
-                for report in phase1.reports
-            ):
-                per_field["text"].add("FD-9")
-                independent_fired.add("FD-9")
-            if index + 1 < len(seed_cues):
-                next_seed = seed_cues[index + 1]
-                if float(seed["end"]) > float(next_seed["start"]):
-                    per_field["end"].add("FD-3")
-                    independent_fired.add("FD-3")
-                if float(next_seed["start"]) - float(seed["end"]) < TWO_FRAME_S:
-                    per_field["end"].add("FD-6")
-                    independent_fired.add("FD-6")
-            target_legs = [
-                leg
-                for leg in trace_legs
-                if int(leg["target"]["cue_index"]) == index
-                and leg["target"]["side"] in ("start", "end")
-            ]
-            for leg in target_legs:
-                if leg["rule_id"] in ("chain", "shot-in", "shot-out") or str(
-                    leg["rule_id"]
-                ).startswith("ladder-"):
-                    per_field[str(leg["target"]["side"])].add("FD-4")
-                    independent_fired.add("FD-4")
-
-            evidence_lyric = lyric_for_evidence(
-                evidence_span_from_cue(seed), sing_spans
-            )
-            start, end = float(seed["start"]), float(seed["end"])
-            duration = end - start
-            overlap = sum(
-                max(0.0, min(end, high) - max(start, low)) for low, high in sing_spans
-            )
-            legacy_lyric = duration > 0 and overlap / duration >= LYRIC_MIN_OVERLAP
-            if evidence_lyric != legacy_lyric:
-                per_field["lyric"].add("FD-2")
-                independent_fired.add("FD-2")
-
-            wanted_end = float(seed["end"])
-            if phase1.speech_end is not None:
-                if stream.profile.min_cue_s > 0:
-                    wanted_end = max(
-                        wanted_end,
-                        float(seed["start"]) + stream.profile.min_cue_s,
-                    )
-                if stream.profile.lag_out_s > 0:
-                    wanted_end = max(
-                        wanted_end,
-                        float(phase1.speech_end) + stream.profile.lag_out_s,
-                    )
-                if stream.profile.cps > 0:
-                    needed = sum(not char.isspace() for char in phase1.text) / (
-                        stream.profile.cps
-                    )
-                    wanted_end = max(
-                        wanted_end,
-                        min(
-                            float(seed["start"]) + needed,
-                            float(phase1.speech_end) + LINGER_CAP_S,
-                        ),
-                    )
-            facts[index] = {
-                "evidence_lyric": evidence_lyric,
-                "expected_phase1_end": wanted_end,
-                "legacy_lyric": legacy_lyric,
-                "target_legs": target_legs,
-                "triggers": {field: sorted(ids) for field, ids in per_field.items()},
-            }
-        # FD-7 is derived from the phase-1 stream, immutable seed, delivered
-        # state, and trace terminal -- never from either serialized report
-        # channel.  ``entries``/``refusals`` are producer output and are checked
-        # for exact equality by the shared schema validator; reading either here
-        # would let a serializer mutation erase both sides of the N11 check.
-        has_report = any(cue.reports for cue in stream.cues)
-        has_report = has_report or any(
-            float(left["end"]) > float(right["start"])
-            for left, right in zip(seed_cues, seed_cues[1:])
-        )
-        delivered = finalizer_row.get("cues") or ()
-        if len(delivered) == len(stream.cues):
-            for index, (row, cue) in enumerate(zip(delivered, stream.cues)):
-                start, end = float(row["start"]), float(row["end"])
-                if (
-                    stream.profile.min_cue_s > 0
-                    and end - start < stream.profile.min_cue_s - 1e-9
-                ):
-                    has_report = True
-                if index + 1 >= len(delivered):
-                    continue
-                next_start = float(delivered[index + 1]["start"])
-                if (
-                    next_start - end < TWO_FRAME_S - 1e-9
-                    and cue.speech_end is not None
-                    and next_start - TWO_FRAME_S < cue.speech_end <= next_start
-                ):
-                    has_report = True
-        trace = finalizer.get("trace") or {}
-        cycle = trace.get("cycle")
-        if isinstance(cycle, Mapping):
-            has_report = has_report or any(
-                len(set(row.get("values") or ())) > 1
-                for row in cycle.get("per_boundary_values") or ()
-                if isinstance(row, Mapping)
-            )
-        if trace.get("terminal") == "budget-exhausted":
-            has_report = True
-        if has_report:
-            independent_fired.add("FD-7")
-
-    left = {
-        tuple(row["unit_range"]): row
-        for row in finalizer_row.get("cues") or ()
-        if row.get("unit_range") is not None
-    }
-    right = {
-        tuple(row["unit_range"]): row
-        for row in comparator_row.get("cues") or ()
-        if row.get("unit_range") is not None
-    }
-    changed: list[dict[str, Any]] = []
-    unclassified = 0
-    relation_failures = 0
-    alignment_error = set(left) != set(right)
-    movement = {
-        (
-            int(item["boundary"]["cue_index"]),
-            str(item["boundary"]["side"]),
-        ): item
-        for item in finalizer.get("movement") or ()
-    }
-    for unit_range in sorted(set(left) & set(right)):
-        before, after = right[unit_range], left[unit_range]
-        index = int(after["index"])
-        fact = facts.get(index)
-        for field in ("text", "start", "end", "lyric"):
-            if before.get(field) == after.get(field):
-                continue
-            eligible = [] if fact is None else list(fact["triggers"][field])
-            relation_ok = False
-            if fact is not None and field == "lyric" and "FD-2" in eligible:
-                relation_ok = (
-                    bool(after.get("lyric")) == fact["evidence_lyric"]
-                    and bool(before.get("lyric")) == fact["legacy_lyric"]
-                )
-            elif fact is not None and field == "text" and "FD-9" in eligible:
-                relation_ok = str(after.get("text")) == stream.cues[index].text
-            elif fact is not None and field in ("start", "end"):
-                move = movement.get((index, field))
-                delivered_matches = move is not None and float(
-                    move["delivered"]
-                ) == float(after[field])
-                targeted = any(
-                    leg["target"]["side"] == field for leg in fact["target_legs"]
-                )
-                if field == "start":
-                    relation_ok = delivered_matches and trace_clean and targeted
-                else:
-                    phase1_matches = move is not None and float(
-                        move["phase1"]
-                    ) == float(fact["expected_phase1_end"])
-                    relation_ok = delivered_matches and any(
-                        (
-                            trigger == "FD-1"
-                            and phase1_matches
-                            and (not targeted or trace_clean)
-                        )
-                        or (
-                            trigger in {"FD-3", "FD-4", "FD-6"}
-                            and targeted
-                            and trace_clean
-                        )
-                        or (
-                            trigger == "FD-8"
-                            and phase1_matches
-                            and (not targeted or trace_clean)
-                        )
-                        for trigger in eligible
-                    )
-            if not eligible:
-                unclassified += 1
-            elif not relation_ok:
-                relation_failures += 1
-            changed.append(
-                {
-                    "allowed_relation": relation_ok,
-                    "field": field,
-                    "from": before.get(field),
-                    "trigger_ids": eligible,
-                    "to": after.get(field),
-                    "unit_range": list(unit_range),
-                }
-            )
-    return {
-        "alignment_error": alignment_error,
-        "changed_fields": changed,
-        "independent_fired": sorted(independent_fired),
-        "producer_fired": sorted(producer_fired),
-        "relation_failures": relation_failures,
-        "trigger_mismatches": sorted(independent_fired ^ producer_fired),
-        "unclassified_field_diff": unclassified,
-    }
-
-
-class _AuditedFinalizerPreview:
-    """N7: compare every consumed preview with phase 1 itself, exactly.
-
-    Wraps the finalizer's own preview for the optimizer: every scored candidate
-    is re-derived through ``phase1_cue`` and compared field for field, and
-    :meth:`check_selected` bridges each row's selected edges to the seed that
-    row's factory actually minted.
-    """
-
-    def __init__(self, delegate: FinalizerPreview) -> None:
-        self.delegate = delegate
-        self.scored_edges = 0
-        self.checked_edges = 0
-        self.uncheckable_edges = 0
-        self.mismatches: list[dict[str, Any]] = []
-        self.selected_rows: dict[str, dict[str, Any]] = {}
-
-    @staticmethod
-    def _facts(value: CuePreview) -> dict[str, Any]:
-        return {
-            "display_end": value.display_end,
-            "display_start": value.display_start,
-            "final_text": value.final_text,
-            "line_count": value.line_count,
-            "reading_chars": value.reading_chars,
-            "refusals": [row.to_dict() for row in value.refusals],
-            "waivers": [row.to_dict() for row in value.waivers],
-        }
-
-    def preview_cue(self, candidate: CueCandidate) -> CuePreview:
-        from voxweave.core.finalizer import phase1_cue
-        from voxweave.core.timing_preview import CuePreview
-
-        consumed = self.delegate.preview_cue(candidate)
-        edge_index = self.scored_edges
-        self.scored_edges += 1
-        if candidate.start is None or candidate.end is None:
-            self.uncheckable_edges += 1
-            return consumed
-        seed: Cue = {
-            "text": candidate.text,
-            "start": candidate.start,
-            "end": candidate.end,
-            "word_data": list(candidate.word_data),
-            "speech_start": candidate.speech_start,
-            "speech_end": candidate.speech_end,
-        }
-        phase1 = phase1_cue(
-            seed,
-            profile=candidate.profile,
-            index=0,
-            expected_footprint=candidate.expected_footprint,
-        )
-        expected = CuePreview(
-            display_start=phase1.start,
-            display_end=phase1.end,
-            final_text=phase1.text,
-            line_count=len(phase1.lines),
-            reading_chars=phase1.reading_chars,
-            waivers=(),
-            refusals=phase1.reports,
-        )
-        self.checked_edges += 1
-        if consumed != expected:
-            self.mismatches.append(
-                {
-                    "consumed": self._facts(consumed),
-                    "edge_index": edge_index,
-                    "phase1": self._facts(expected),
-                }
-            )
-        return consumed
-
-    def preview_display_span(
-        self,
-        start: float,
-        end: float,
-        next_start: float | None,
-        *,
-        text: str,
-        word_data: Sequence[Unit],
-        min_cue_s: float,
-        max_cue_s: float,
-        cps: float = 0.0,
-        lag_out_s: float = 0.0,
-    ) -> float:
-        return self.delegate.preview_display_span(
-            start,
-            end,
-            next_start,
-            text=text,
-            word_data=word_data,
-            min_cue_s=min_cue_s,
-            max_cue_s=max_cue_s,
-            cps=cps,
-            lag_out_s=lag_out_s,
-        )
-
-    def check_selected(self, row_id: str, solution: Any, stream: Any) -> None:
-        """Bridge scored selected-edge facts to the factory's actual seed."""
-        edge_facts = [
-            part.features
-            for interval in solution.solutions
-            if interval.selection is not None
-            for part in interval.selection.policy_selected.edge_breakdowns
-        ]
-        mismatches: list[dict[str, Any]] = []
-        if len(edge_facts) != len(stream.cues):
-            mismatches.append(
-                {
-                    "cue_count": len(stream.cues),
-                    "edge_count": len(edge_facts),
-                    "reason": "cardinality",
-                }
-            )
-        for index, (facts, cue) in enumerate(zip(edge_facts, stream.cues)):
-            consumed = {
-                "display_end": facts.get("preview_display_end"),
-                "display_start": facts.get("preview_display_start"),
-                "final_text": facts.get("preview_final_text"),
-                "line_count": facts.get("preview_line_count"),
-                "reading_chars": facts.get("preview_reading_chars"),
-                "refusal_count": facts.get("preview_refusal_count"),
-            }
-            phase1 = {
-                "display_end": cue.end,
-                "display_start": cue.start,
-                "final_text": cue.text,
-                "line_count": len(cue.lines),
-                "reading_chars": cue.reading_chars,
-                "refusal_count": len(cue.reports),
-            }
-            if consumed != phase1:
-                mismatches.append(
-                    {
-                        "consumed": consumed,
-                        "cue_index": index,
-                        "phase1": phase1,
-                        "reason": "facts",
-                    }
-                )
-        self.selected_rows[row_id] = {
-            "cue_count": len(stream.cues),
-            "edge_count": len(edge_facts),
-            "mismatches": mismatches,
-        }
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "checked_edges": self.checked_edges,
-            "mismatches": list(self.mismatches),
-            "scored_edges": self.scored_edges,
-            "selected_rows": copy.deepcopy(self.selected_rows),
-            "uncheckable_edges": self.uncheckable_edges,
-        }
-
-
 class ShadowAdmissionError(ValueError):
     """A fully assembled artifact that the schema-2 contract refuses.
 
@@ -1083,6 +472,393 @@ def _incomplete(
     }
 
 
+def _shadow_owned_footprints(
+    document: SegDocument, unit_count: int, partition: Sequence[int] | None
+) -> list[str]:
+    # The authority and layout modules load here, not at import: the flag-off
+    # path must stay free of the v2-only modules.
+    from voxweave.core.layout import _join
+    from voxweave.core.partition_check import owned_unit_ids
+
+    if partition is None:
+        return []
+    return [
+        _join(
+            [unit.surface for unit in document.units[low:high]],
+            document.language,
+        )
+        for low, high in owned_unit_ids(partition, unit_count)
+    ]
+
+
+def _shadow_publish_validators(
+    artifact: dict[str, Any],
+    core_v2: dict[str, Any],
+    delivery_v2: dict[str, Any],
+    overlapping: bool,
+    finalizer: dict[str, Any] | None,
+) -> None:
+    artifact["validator"]["core"] = core_v2["validator"]
+    artifact["validator"]["legacy_overlay"] = delivery_v2["validator"]
+    artifact["validator"]["raw_duplicate_v1_cues"] = overlapping
+    artifact["validator"]["finalizer"] = finalizer
+
+
+def _shadow_lanes(
+    core_v1: dict[str, Any],
+    core_v2: dict[str, Any],
+    delivery_v1: dict[str, Any],
+    delivery_v2: dict[str, Any],
+    finalizer_rows: dict[str, Any],
+    comparator_row: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        SHADOW_LANE_CORE: _shadow_lane_block(
+            SHADOW_LANE_CORE, "core", core_v1, core_v2
+        ),
+        SHADOW_LANE_DELIVERY_LEGACY: _shadow_lane_block(
+            SHADOW_LANE_DELIVERY_LEGACY,
+            "legacy-overlay",
+            delivery_v1,
+            delivery_v2,
+        ),
+        SHADOW_LANE_FINALIZER: {
+            "lane": SHADOW_LANE_FINALIZER,
+            "rows": finalizer_rows,
+            "stage": "finalizer",
+        },
+        SHADOW_LANE_LEGACY_DISPLAY: {
+            "lane": SHADOW_LANE_LEGACY_DISPLAY,
+            "rows": {"v1": comparator_row},
+            "stage": "legacy-display",
+        },
+    }
+
+
+def _shadow_authorities(
+    ledger: AuthorityLedger, expected: dict[str, AuthorityKind]
+) -> dict[str, Any]:
+    # Loaded here for the same flag-off reason as in _shadow_owned_footprints.
+    from voxweave.core.authority import check_roots, lineage_tuples
+
+    return {
+        "events": [event.to_dict() for event in ledger.events],
+        "expected": expected,
+        "lineage": [list(record) for record in lineage_tuples(ledger)],
+        "violations": list(check_roots(ledger, expected=expected)),
+    }
+
+
+def _shadow_v1_rows(
+    *,
+    v1_stream: Phase1CueStream,
+    capture: V1ReferenceCapture,
+    v1_partition: Sequence[int] | None,
+    v1_projection: str,
+    document: SegDocument,
+    evidence: FinalizeEvidence,
+    policy: FinalizePolicy,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """The v1 finalizer row, its legacy-display comparator, and N11 on both.
+
+    The comparator is the exact captured input with only the legacy
+    display-span lyric classification applied (set and clear): no speaker
+    overlay, no resnap.
+    """
+    # Loaded here, not at import: the flag-off path must stay free of the
+    # v2-only modules.
+    from voxweave.core.finalizer import finalize
+
+    v1_finalized = finalize(
+        v1_stream,
+        profile=document.profile,
+        evidence=evidence,
+        policy=policy,
+    )
+    v1_row, _v1_final_cues = _shadow_finalizer_row(
+        v1_finalized,
+        v1_stream,
+        v1_partition,
+        document=document,
+        origin="v1",
+        evidence=evidence,
+        policy=policy,
+        projection=v1_projection,
+    )
+    comparator_cues = [copy.deepcopy(cue) for cue in capture.cues]
+    for cue in comparator_cues:
+        cue.pop("lyric", None)
+    mark_lyric_cues(comparator_cues, copied_spans(document.sing_spans))
+    comparator_row = _shadow_stream_block(
+        comparator_cues,
+        v1_partition,
+        v1_projection,
+        document=document,
+        origin="v1",
+        stage="core",
+    )
+    _shadow_stamp_comparator_deltas(v1_row, comparator_row)
+    classification = _shadow_diff_classification(
+        v1_row,
+        comparator_row,
+        stream=v1_stream,
+        seed_cues=capture.cues,
+        sing_spans=tuple(document.sing_spans or ()),
+    )
+    return v1_row, comparator_row, classification
+
+
+def _shadow_refiner_comparison(
+    *,
+    refiner_off: Any,
+    optimizer_artifact_bytes: str,
+    raw_partition: Sequence[int],
+    split: Any,
+    parent_unit_count: int,
+    parent_v1_mode: Any,
+) -> dict[str, Any]:
+    # Pure read of the refiner-off solution; the optimize_document call that
+    # produced it stays in the orchestrator because it scores edges on the
+    # shared preview.
+    from voxweave.core.boundary_v2 import _document_partition
+
+    if split.refined_parent_count == 0:
+        refiner_comparison: dict[str, Any] = {
+            "byte_identical": optimizer_artifact_bytes
+            == json.dumps(refiner_off.artifact, sort_keys=True, separators=(",", ":")),
+            "refined_parent_count": 0,
+            "status": "tracked-identity",
+        }
+    else:
+        off_fallbacks = sum(not item.optimized for item in refiner_off.solutions)
+        refiner_off_partition = _document_partition(
+            refiner_off.solutions, parent_unit_count
+        )
+        coarse_ranges = [
+            list(item.unit_range)
+            for item in refiner_off.solutions
+            if item.coarse_caused
+        ]
+        mapped_on: set[int] = set()
+        internal_on: list[int] = []
+        for cut in raw_partition:
+            left_parent = split.origin[cut - 1]
+            right_parent = split.origin[cut]
+            if left_parent == right_parent:
+                internal_on.append(left_parent)
+            else:
+                mapped_on.add(right_parent)
+        external_diff = sorted(mapped_on ^ set(refiner_off_partition))
+
+        def covered(parent: int) -> bool:
+            return any(low <= parent < high for low, high in coarse_ranges)
+
+        diffs_confined = all(covered(parent) for parent in internal_on) and all(
+            covered(max(0, cut - 1)) or covered(cut) for cut in external_diff
+        )
+        refiner_comparison = {
+            "byte_identical": False,
+            "coarse_caused_intervals": refiner_off.artifact["coverage"][
+                "coarse_caused_intervals"
+            ],
+            "coarse_caused_unit_ranges": coarse_ranges,
+            "diffs_confined_to_coarse_caused": diffs_confined,
+            "external_parent_cut_diff": external_diff,
+            "fallback_intervals": off_fallbacks,
+            "internal_refinement_cut_parents": sorted(internal_on),
+            "materialized": off_fallbacks == 0,
+            "off_partition": list(refiner_off_partition),
+            "on_parent_edge_partition": sorted(mapped_on),
+            "parent_v1_projection": parent_v1_mode,
+            "refined_parent_count": split.refined_parent_count,
+            "status": "refined-counterfactual",
+        }
+    return refiner_comparison
+
+
+def _shadow_admit(artifact: dict[str, Any]) -> dict[str, Any]:
+    # The optimizer artifact remains schema 1 until this exact completed
+    # payload passes the one shared live/harness contract.  Validation ignores
+    # only the version field for this pre-admission pass; every other top-level
+    # key, lane/row, evidence block, and cross-block cardinality is live.
+    from voxweave.core.shadow_schema import (
+        LIVE_SHADOW_SCHEMA_VERSION,
+        validate_shadow_v2_payload,
+    )
+
+    if artifact.get("schema_version") != 1:
+        raise ValueError("live shadow admission requires a schema-1 optimizer payload")
+    errors = validate_shadow_v2_payload(artifact, require_version=False)
+    if errors:
+        raise ShadowAdmissionError(artifact, errors)
+    artifact["schema_version"] = LIVE_SHADOW_SCHEMA_VERSION
+    return artifact
+
+
+# Lane streams: the core and legacy-overlay stream blocks of both engines.
+# Returns (core_v1, core_v2, delivery_v1, delivery_v2); touches nothing else.
+def _shadow_lane_streams(
+    *,
+    solution: DocumentSolution,
+    shadow_document: SegDocument,
+    thresholds: Mapping[str, Any],
+    raw_partition: Sequence[int],
+    solver_waivers: Mapping[int, Any],
+    fallback_ranges: Sequence[Sequence[int]],
+    unit_count: int,
+    reference: Sequence[Cue],
+    v1_partition: Sequence[int] | None,
+    v1_projection: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    core_cues = _shadow_core_cues(solution, shadow_document, thresholds)
+    core_projection, core_projection_mode = _shadow_surface_partition(
+        shadow_document.units, core_cues
+    )
+    core_v2 = _shadow_stream_block(
+        core_cues,
+        raw_partition,
+        "solver-partition",
+        document=shadow_document,
+        origin="v2",
+        stage="core",
+        waivers=_restamp_by_footprint(solver_waivers, raw_partition, unit_count),
+        origins=_origins_by_footprint(fallback_ranges, raw_partition, unit_count),
+        extra={
+            "projection_cross_check": {
+                "agrees": core_projection == raw_partition,
+                "mode": core_projection_mode,
+            }
+        },
+    )
+    core_v1 = _shadow_stream_block(
+        reference,
+        v1_partition,
+        v1_projection,
+        document=shadow_document,
+        origin="v1",
+        stage="core",
+    )
+
+    delivery_v2_cues = _shadow_overlay_cues(core_cues, shadow_document, thresholds)
+    delivery_v2_partition, delivery_v2_mode = _shadow_surface_partition(
+        shadow_document.units, delivery_v2_cues
+    )
+    delivery_v1_cues = _shadow_overlay_cues(reference, shadow_document, thresholds)
+    delivery_v1_partition, delivery_v1_mode = _shadow_surface_partition(
+        shadow_document.units, delivery_v1_cues
+    )
+    delivery_v2 = _shadow_stream_block(
+        delivery_v2_cues,
+        delivery_v2_partition,
+        delivery_v2_mode,
+        document=shadow_document,
+        origin="v2",
+        stage="legacy-overlay",
+        waivers=_restamp_by_footprint(
+            solver_waivers, delivery_v2_partition, unit_count
+        ),
+        origins=_origins_by_footprint(
+            fallback_ranges, delivery_v2_partition, unit_count
+        ),
+    )
+    delivery_v1 = _shadow_stream_block(
+        delivery_v1_cues,
+        delivery_v1_partition,
+        delivery_v1_mode,
+        document=shadow_document,
+        origin="v1",
+        stage="legacy-overlay",
+    )
+    return core_v1, core_v2, delivery_v1, delivery_v2
+
+
+# Speaker measurement: measures both finalized rows against one evidence basis and
+# writes artifact['speaker_evidence'], off_row and on_row['cues'] in place.
+def _shadow_measure_speakers(
+    *,
+    artifact: dict[str, Any],
+    solution: DocumentSolution,
+    projected_speakers: Any,
+    on_finalized: Any,
+    off_finalized: Any,
+    on_row: dict[str, Any],
+    off_row: dict[str, Any],
+    on_final_cues: list[Cue],
+    off_final_cues: list[Cue],
+    raw_partition: Sequence[int],
+    off_partition: Sequence[int],
+    unit_count: int,
+) -> None:
+    from voxweave.core.boundary_v2 import selected_evidence_spans
+    from voxweave.core.partition_check import owned_unit_ids
+    from voxweave.core.speaker_evidence import (
+        annotate_speaker_ids,
+        measure_speaker_events,
+        named_multi_cues_unannotated,
+    )
+
+    # Speaker measurement uses one selected evidence basis for both independent
+    # global boundary matching runs. Budget-invalid rows short-circuit here.
+    measurement_refusal: str | None = None
+    row_cardinality_ok = len(raw_partition) + 1 == len(on_final_cues) and len(
+        off_partition
+    ) + 1 == len(off_final_cues)
+    if on_finalized.valid and off_finalized.valid and not row_cardinality_ok:
+        measurement_refusal = "cue/range-cardinality-mismatch"
+    elif on_finalized.valid and off_finalized.valid:
+        try:
+            evidence_spans = selected_evidence_spans(solution)
+        except ValueError as exc:
+            measurement_refusal = str(exc)
+        else:
+            on_measurement = measure_speaker_events(
+                projected_speakers,
+                evidence_spans=evidence_spans,
+                delivered_boundaries=_shadow_boundary_times(on_final_cues),
+                off_boundaries=_shadow_boundary_times(off_final_cues),
+            )
+            off_measurement = measure_speaker_events(
+                projected_speakers,
+                evidence_spans=evidence_spans,
+                delivered_boundaries=_shadow_boundary_times(off_final_cues),
+            )
+            for name, measured in (
+                ("v2", on_measurement),
+                ("v2-speaker-off", off_measurement),
+            ):
+                if (
+                    sum(measured.buckets.values())
+                    != measured.raw_in_speech_turn_changes
+                ):
+                    raise ValueError(f"{name} speaker bucket conservation failed")
+            artifact["speaker_evidence"]["measurement"] = on_measurement.to_dict()
+            artifact["speaker_evidence"]["off_row_measurement"] = (
+                off_measurement.to_dict()
+            )
+            off_row["speaker_measurement"] = off_measurement.to_dict()
+            ranges = owned_unit_ids(raw_partition, unit_count)
+            annotate_speaker_ids(
+                on_final_cues, ranges, projected_speakers.unit_speakers
+            )
+            projected_named_multi = named_multi_cues_unannotated(
+                ranges, projected_speakers.unit_speakers
+            )
+            if projected_named_multi != int(
+                artifact["coverage"]["named_multi_cues_unannotated"]
+            ):
+                raise ValueError(
+                    "speaker projection counter disagrees with selected ownership"
+                )
+            artifact["speaker_evidence"]["projection"] = {
+                "cue_count": len(on_final_cues),
+                "named_multi_cues_unannotated": projected_named_multi,
+                "range_count": len(ranges),
+                "status": "verified",
+            }
+            on_row["cues"] = _shadow_cue_rows(on_final_cues, raw_partition, unit_count)
+    artifact["speaker_evidence"]["measurement_refusal"] = measurement_refusal
+
+
 def _shadow_v2_artifact(
     document: SegDocument, v1_cues: Sequence[Cue], thresholds: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1093,20 +869,13 @@ def _shadow_v2_artifact(
     :class:`ShadowAdmissionError` when the assembled artifact fails the
     contract.
     """
-    from voxweave.core.authority import (
-        AuthorityKind,
-        AuthorityLedger,
-        check_roots,
-        digest_payload,
-        lineage_tuples,
-    )
+    from voxweave.core.authority import AuthorityLedger, digest_payload
     from voxweave.core.boundary_v2 import (
         V1Partition,
         _document_partition,
         _document_waivers,
         _optimization_reuse,
         optimize_document,
-        selected_evidence_spans,
     )
     from voxweave.core.finalizer import (
         FinalizeEvidence,
@@ -1118,15 +887,10 @@ def _shadow_v2_artifact(
         phase1_from_v1_capture,
         register_optimizer_selection,
     )
-    from voxweave.core.layout import _join
-    from voxweave.core.partition_check import owned_unit_ids
     from voxweave.core.speaker_evidence import (
         W_SPEAKER_INTERIOR,
-        annotate_speaker_ids,
         evidence_span_from_cue,
         lyric_for_evidence,
-        measure_speaker_events,
-        named_multi_cues_unannotated,
         project_speaker_evidence,
         speaker_evidence,
     )
@@ -1226,75 +990,17 @@ def _shadow_v2_artifact(
     )
     artifact["raw"] = raw_v2
 
-    def owned_footprints(partition: Sequence[int] | None) -> list[str]:
-        if partition is None:
-            return []
-        return [
-            _join(
-                [unit.surface for unit in shadow_document.units[low:high]],
-                shadow_document.language,
-            )
-            for low, high in owned_unit_ids(partition, unit_count)
-        ]
-
-    core_cues = _shadow_core_cues(solution, shadow_document, thresholds)
-    core_projection, core_projection_mode = _shadow_surface_partition(
-        shadow_document.units, core_cues
-    )
-    core_v2 = _shadow_stream_block(
-        core_cues,
-        raw_partition,
-        "solver-partition",
-        document=shadow_document,
-        origin="v2",
-        stage="core",
-        waivers=_restamp_by_footprint(solver_waivers, raw_partition, unit_count),
-        origins=_origins_by_footprint(fallback_ranges, raw_partition, unit_count),
-        extra={
-            "projection_cross_check": {
-                "agrees": core_projection == raw_partition,
-                "mode": core_projection_mode,
-            }
-        },
-    )
-    core_v1 = _shadow_stream_block(
-        reference,
-        v1_partition,
-        v1_projection,
-        document=shadow_document,
-        origin="v1",
-        stage="core",
-    )
-
-    delivery_v2_cues = _shadow_overlay_cues(core_cues, shadow_document, thresholds)
-    delivery_v2_partition, delivery_v2_mode = _shadow_surface_partition(
-        shadow_document.units, delivery_v2_cues
-    )
-    delivery_v1_cues = _shadow_overlay_cues(reference, shadow_document, thresholds)
-    delivery_v1_partition, delivery_v1_mode = _shadow_surface_partition(
-        shadow_document.units, delivery_v1_cues
-    )
-    delivery_v2 = _shadow_stream_block(
-        delivery_v2_cues,
-        delivery_v2_partition,
-        delivery_v2_mode,
-        document=shadow_document,
-        origin="v2",
-        stage="legacy-overlay",
-        waivers=_restamp_by_footprint(
-            solver_waivers, delivery_v2_partition, unit_count
-        ),
-        origins=_origins_by_footprint(
-            fallback_ranges, delivery_v2_partition, unit_count
-        ),
-    )
-    delivery_v1 = _shadow_stream_block(
-        delivery_v1_cues,
-        delivery_v1_partition,
-        delivery_v1_mode,
-        document=shadow_document,
-        origin="v1",
-        stage="legacy-overlay",
+    core_v1, core_v2, delivery_v1, delivery_v2 = _shadow_lane_streams(
+        solution=solution,
+        shadow_document=shadow_document,
+        thresholds=thresholds,
+        raw_partition=raw_partition,
+        solver_waivers=solver_waivers,
+        fallback_ranges=fallback_ranges,
+        unit_count=unit_count,
+        reference=reference,
+        v1_partition=v1_partition,
+        v1_projection=v1_projection,
     )
 
     # Typed fallbacks adopt COMPLETE v1 cues, and the optimizer's adoption plan
@@ -1338,96 +1044,20 @@ def _shadow_v2_artifact(
         evaluation_id=evaluation_id,
     )
 
-    def v1_rows() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-        """The v1 finalizer row, its legacy-display comparator, and N11 on both.
-
-        The comparator is the exact captured input with only the legacy
-        display-span lyric classification applied (set and clear): no speaker
-        overlay, no resnap.
-        """
-        v1_finalized = finalize(
-            v1_stream,
-            profile=shadow_document.profile,
-            evidence=finalizer_evidence,
-            policy=finalizer_policy,
-        )
-        v1_row, _v1_final_cues = _shadow_finalizer_row(
-            v1_finalized,
-            v1_stream,
-            v1_partition,
-            document=shadow_document,
-            origin="v1",
-            evidence=finalizer_evidence,
-            policy=finalizer_policy,
-            projection=v1_projection,
-        )
-        comparator_cues = [copy.deepcopy(cue) for cue in capture.cues]
-        for cue in comparator_cues:
-            cue.pop("lyric", None)
-        mark_lyric_cues(comparator_cues, copied_spans(shadow_document.sing_spans))
-        comparator_row = _shadow_stream_block(
-            comparator_cues,
-            v1_partition,
-            v1_projection,
-            document=shadow_document,
-            origin="v1",
-            stage="core",
-        )
-        _shadow_stamp_comparator_deltas(v1_row, comparator_row)
-        classification = _shadow_diff_classification(
-            v1_row,
-            comparator_row,
-            stream=v1_stream,
-            seed_cues=capture.cues,
-            sing_spans=tuple(shadow_document.sing_spans or ()),
-        )
-        return v1_row, comparator_row, classification
-
-    def publish_validators(finalizer: dict[str, Any] | None) -> None:
-        artifact["validator"]["core"] = core_v2["validator"]
-        artifact["validator"]["legacy_overlay"] = delivery_v2["validator"]
-        artifact["validator"]["raw_duplicate_v1_cues"] = overlapping
-        artifact["validator"]["finalizer"] = finalizer
-
-    def lanes(
-        finalizer_rows: dict[str, Any], comparator_row: dict[str, Any]
-    ) -> dict[str, Any]:
-        return {
-            SHADOW_LANE_CORE: _shadow_lane_block(
-                SHADOW_LANE_CORE, "core", core_v1, core_v2
-            ),
-            SHADOW_LANE_DELIVERY_LEGACY: _shadow_lane_block(
-                SHADOW_LANE_DELIVERY_LEGACY,
-                "legacy-overlay",
-                delivery_v1,
-                delivery_v2,
-            ),
-            SHADOW_LANE_FINALIZER: {
-                "lane": SHADOW_LANE_FINALIZER,
-                "rows": finalizer_rows,
-                "stage": "finalizer",
-            },
-            SHADOW_LANE_LEGACY_DISPLAY: {
-                "lane": SHADOW_LANE_LEGACY_DISPLAY,
-                "rows": {"v1": comparator_row},
-                "stage": "legacy-display",
-            },
-        }
-
-    def authorities(expected: dict[str, AuthorityKind]) -> dict[str, Any]:
-        return {
-            "events": [event.to_dict() for event in ledger.events],
-            "expected": expected,
-            "lineage": [list(record) for record in lineage_tuples(ledger)],
-            "violations": list(check_roots(ledger, expected=expected)),
-        }
-
     if any(unavailable.values()):
         # The frozen optimizer factory correctly refuses an adopted-v1 interval:
         # it has no optimizer selection to seal. Preserve the useful core/legacy
         # diagnostics and state the unmaterialized rows instead of letting that
         # typed precondition collapse the whole fail-open artifact to ``error``.
-        v1_row, comparator_row, diff_classification = v1_rows()
+        v1_row, comparator_row, diff_classification = _shadow_v1_rows(
+            v1_stream=v1_stream,
+            capture=capture,
+            v1_partition=v1_partition,
+            v1_projection=v1_projection,
+            document=shadow_document,
+            evidence=finalizer_evidence,
+            policy=finalizer_policy,
+        )
         actual_fallbacks = sum(not item.optimized for item in solution.solutions)
         optimized_units = sum(
             item.interval.unit_end - item.interval.unit_start
@@ -1452,12 +1082,16 @@ def _shadow_v2_artifact(
             "unit_count": unit_count,
             "v1_unprojected": v1_partition is None,
         }
-        publish_validators(None)
+        _shadow_publish_validators(artifact, core_v2, delivery_v2, overlapping, None)
         unmaterialized = {
             "materialized": False,
             "reason": "adopted-v1-has-no-optimizer-authority",
         }
-        artifact["lanes"] = lanes(
+        artifact["lanes"] = _shadow_lanes(
+            core_v1,
+            core_v2,
+            delivery_v1,
+            delivery_v2,
             {
                 "v1": v1_row,
                 "v2": dict(unmaterialized),
@@ -1465,13 +1099,13 @@ def _shadow_v2_artifact(
             },
             comparator_row,
         )
-        artifact["authorities"] = authorities(
-            {f"{SHADOW_LANE_FINALIZER}/v1": "v1-capture"}
+        artifact["authorities"] = _shadow_authorities(
+            ledger, {f"{SHADOW_LANE_FINALIZER}/v1": "v1-capture"}
         )
         artifact["diff_classification"] = diff_classification
         artifact["canonical_fallback_rechecks"] = _shadow_fallback_rechecks(
             v1_stream,
-            owned_footprints(v1_partition),
+            _shadow_owned_footprints(shadow_document, unit_count, v1_partition),
             row_id="v1",
         )
         artifact["finalizer"] = None
@@ -1511,21 +1145,29 @@ def _shadow_v2_artifact(
     canonical_fallback_rechecks = [
         *_shadow_fallback_rechecks(
             v1_stream,
-            owned_footprints(v1_partition),
+            _shadow_owned_footprints(shadow_document, unit_count, v1_partition),
             row_id="v1",
         ),
         *_shadow_fallback_rechecks(
             on_stream,
-            owned_footprints(raw_partition),
+            _shadow_owned_footprints(shadow_document, unit_count, raw_partition),
             row_id="v2",
         ),
         *_shadow_fallback_rechecks(
             off_stream,
-            owned_footprints(off_partition),
+            _shadow_owned_footprints(shadow_document, unit_count, off_partition),
             row_id="v2-speaker-off",
         ),
     ]
-    v1_row, comparator_row, diff_classification = v1_rows()
+    v1_row, comparator_row, diff_classification = _shadow_v1_rows(
+        v1_stream=v1_stream,
+        capture=capture,
+        v1_partition=v1_partition,
+        v1_projection=v1_projection,
+        document=shadow_document,
+        evidence=finalizer_evidence,
+        policy=finalizer_policy,
+    )
     on_finalized = finalize(
         on_stream,
         profile=shadow_document.profile,
@@ -1557,66 +1199,20 @@ def _shadow_v2_artifact(
         policy=finalizer_policy,
     )
 
-    # Speaker measurement uses one selected evidence basis for both independent
-    # global boundary matching runs. Budget-invalid rows short-circuit here.
-    measurement_refusal: str | None = None
-    row_cardinality_ok = len(raw_partition) + 1 == len(on_final_cues) and len(
-        off_partition
-    ) + 1 == len(off_final_cues)
-    if on_finalized.valid and off_finalized.valid and not row_cardinality_ok:
-        measurement_refusal = "cue/range-cardinality-mismatch"
-    elif on_finalized.valid and off_finalized.valid:
-        try:
-            evidence_spans = selected_evidence_spans(solution)
-        except ValueError as exc:
-            measurement_refusal = str(exc)
-        else:
-            on_measurement = measure_speaker_events(
-                projected_speakers,
-                evidence_spans=evidence_spans,
-                delivered_boundaries=_shadow_boundary_times(on_final_cues),
-                off_boundaries=_shadow_boundary_times(off_final_cues),
-            )
-            off_measurement = measure_speaker_events(
-                projected_speakers,
-                evidence_spans=evidence_spans,
-                delivered_boundaries=_shadow_boundary_times(off_final_cues),
-            )
-            for name, measured in (
-                ("v2", on_measurement),
-                ("v2-speaker-off", off_measurement),
-            ):
-                if (
-                    sum(measured.buckets.values())
-                    != measured.raw_in_speech_turn_changes
-                ):
-                    raise ValueError(f"{name} speaker bucket conservation failed")
-            artifact["speaker_evidence"]["measurement"] = on_measurement.to_dict()
-            artifact["speaker_evidence"]["off_row_measurement"] = (
-                off_measurement.to_dict()
-            )
-            off_row["speaker_measurement"] = off_measurement.to_dict()
-            ranges = owned_unit_ids(raw_partition, unit_count)
-            annotate_speaker_ids(
-                on_final_cues, ranges, projected_speakers.unit_speakers
-            )
-            projected_named_multi = named_multi_cues_unannotated(
-                ranges, projected_speakers.unit_speakers
-            )
-            if projected_named_multi != int(
-                artifact["coverage"]["named_multi_cues_unannotated"]
-            ):
-                raise ValueError(
-                    "speaker projection counter disagrees with selected ownership"
-                )
-            artifact["speaker_evidence"]["projection"] = {
-                "cue_count": len(on_final_cues),
-                "named_multi_cues_unannotated": projected_named_multi,
-                "range_count": len(ranges),
-                "status": "verified",
-            }
-            on_row["cues"] = _shadow_cue_rows(on_final_cues, raw_partition, unit_count)
-    artifact["speaker_evidence"]["measurement_refusal"] = measurement_refusal
+    _shadow_measure_speakers(
+        artifact=artifact,
+        solution=solution,
+        projected_speakers=projected_speakers,
+        on_finalized=on_finalized,
+        off_finalized=off_finalized,
+        on_row=on_row,
+        off_row=off_row,
+        on_final_cues=on_final_cues,
+        off_final_cues=off_final_cues,
+        raw_partition=raw_partition,
+        off_partition=off_partition,
+        unit_count=unit_count,
+    )
 
     # Refiner bypass is an exact identity gate on tracked rows and a typed
     # diagnostic on genuinely refined rows. Only a fallback-free bypass can own
@@ -1637,57 +1233,14 @@ def _shadow_v2_artifact(
         speakers=parent_speakers,
         speaker_weight=W_SPEAKER_INTERIOR,
     )
-    if split.refined_parent_count == 0:
-        refiner_comparison: dict[str, Any] = {
-            "byte_identical": optimizer_artifact_bytes
-            == json.dumps(refiner_off.artifact, sort_keys=True, separators=(",", ":")),
-            "refined_parent_count": 0,
-            "status": "tracked-identity",
-        }
-    else:
-        off_fallbacks = sum(not item.optimized for item in refiner_off.solutions)
-        refiner_off_partition = _document_partition(
-            refiner_off.solutions, len(document.units)
-        )
-        coarse_ranges = [
-            list(item.unit_range)
-            for item in refiner_off.solutions
-            if item.coarse_caused
-        ]
-        mapped_on: set[int] = set()
-        internal_on: list[int] = []
-        for cut in raw_partition:
-            left_parent = split.origin[cut - 1]
-            right_parent = split.origin[cut]
-            if left_parent == right_parent:
-                internal_on.append(left_parent)
-            else:
-                mapped_on.add(right_parent)
-        external_diff = sorted(mapped_on ^ set(refiner_off_partition))
-
-        def covered(parent: int) -> bool:
-            return any(low <= parent < high for low, high in coarse_ranges)
-
-        diffs_confined = all(covered(parent) for parent in internal_on) and all(
-            covered(max(0, cut - 1)) or covered(cut) for cut in external_diff
-        )
-        refiner_comparison = {
-            "byte_identical": False,
-            "coarse_caused_intervals": refiner_off.artifact["coverage"][
-                "coarse_caused_intervals"
-            ],
-            "coarse_caused_unit_ranges": coarse_ranges,
-            "diffs_confined_to_coarse_caused": diffs_confined,
-            "external_parent_cut_diff": external_diff,
-            "fallback_intervals": off_fallbacks,
-            "internal_refinement_cut_parents": sorted(internal_on),
-            "materialized": off_fallbacks == 0,
-            "off_partition": list(refiner_off_partition),
-            "on_parent_edge_partition": sorted(mapped_on),
-            "parent_v1_projection": parent_v1_mode,
-            "refined_parent_count": split.refined_parent_count,
-            "status": "refined-counterfactual",
-        }
+    refiner_comparison: dict[str, Any] = _shadow_refiner_comparison(
+        refiner_off=refiner_off,
+        optimizer_artifact_bytes=optimizer_artifact_bytes,
+        raw_partition=raw_partition,
+        split=split,
+        parent_unit_count=len(document.units),
+        parent_v1_mode=parent_v1_mode,
+    )
 
     rows: dict[str, Any] = {
         "v1": v1_row,
@@ -1740,7 +1293,9 @@ def _shadow_v2_artifact(
         canonical_fallback_rechecks.extend(
             _shadow_fallback_rechecks(
                 refiner_stream,
-                owned_footprints(refiner_partition),
+                _shadow_owned_footprints(
+                    shadow_document, unit_count, refiner_partition
+                ),
                 row_id="refiner-off",
             )
         )
@@ -1758,10 +1313,14 @@ def _shadow_v2_artifact(
         "unit_count": totals["unit_count"],
         "v1_unprojected": v1_partition is None,
     }
-    publish_validators(on_row["validator"])
+    _shadow_publish_validators(
+        artifact, core_v2, delivery_v2, overlapping, on_row["validator"]
+    )
     artifact["finalizer"] = on_row["finalizer"]
-    artifact["lanes"] = lanes(rows, comparator_row)
-    artifact["authorities"] = authorities(expected)
+    artifact["lanes"] = _shadow_lanes(
+        core_v1, core_v2, delivery_v1, delivery_v2, rows, comparator_row
+    )
+    artifact["authorities"] = _shadow_authorities(ledger, expected)
     artifact["diff_classification"] = diff_classification
     artifact["canonical_fallback_rechecks"] = canonical_fallback_rechecks
     artifact["preview_fidelity"] = preview.to_dict()
@@ -1784,22 +1343,7 @@ def _shadow_v2_artifact(
             reason="refiner-off-unavailable",
             detail="refiner-off optimizer selection authority unavailable",
         )
-    # The optimizer artifact remains schema 1 until this exact completed
-    # payload passes the one shared live/harness contract.  Validation ignores
-    # only the version field for this pre-admission pass; every other top-level
-    # key, lane/row, evidence block, and cross-block cardinality is live.
-    from voxweave.core.shadow_schema import (
-        LIVE_SHADOW_SCHEMA_VERSION,
-        validate_shadow_v2_payload,
-    )
-
-    if artifact.get("schema_version") != 1:
-        raise ValueError("live shadow admission requires a schema-1 optimizer payload")
-    errors = validate_shadow_v2_payload(artifact, require_version=False)
-    if errors:
-        raise ShadowAdmissionError(artifact, errors)
-    artifact["schema_version"] = LIVE_SHADOW_SCHEMA_VERSION
-    return artifact
+    return _shadow_admit(artifact)
 
 
 def run_shadow(

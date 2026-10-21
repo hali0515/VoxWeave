@@ -98,27 +98,7 @@ def translate(
     rep = reporter or Reporter()
     rep.plan(("read subtitles", "translate cues", "write translation"))
     rep.step("read subtitles")
-    source_bytes = vtt_path.read_bytes()
-    is_ass = is_ass_path(vtt_path)
-    blocks = load_subtitle_blocks_bytes(vtt_path, source_bytes, ass_events=is_ass)
-    ass_script = decode_subtitle_bytes(source_bytes, vtt_path.name) if is_ass else None
-    # Position tags are markup, not dialogue: translate the text without them
-    # and put them back on the output cue.
-    positions: list[str | None] = []
-    for index, block in enumerate(blocks):
-        position, bare = _split_position(block["text"])
-        positions.append(position)
-        if position:
-            blocks[index] = {**block, "text": bare}
-    if any(b.get("start") is None for b in blocks):
-        if ext != ".vtt":
-            raise ValueError(
-                f"{vtt_path.name} has cues without timestamps; cannot render {ext}"
-            )
-        log.warning(
-            "%s has no timestamps; translated output will be plain-text blocks (run align first)",
-            vtt_path.name,
-        )
+    blocks, ass_script, positions = _read_translation_source(vtt_path, ext)
 
     payload = translate_mod.build_payload(blocks)
     # Progress sidecar: completed windows survive a mid-run failure (network,
@@ -149,6 +129,74 @@ def translate(
     )
     rep.step("translate cues")
     rep.stage(f"translate {len(payload)} cues -> {to}")
+    trans = _translate_with_retry(
+        payload,
+        blocks,
+        tx_kwargs,
+        concurrency=concurrency,
+        window_cues=window_cues,
+        allow_partial=allow_partial,
+        progress_path=progress_path,
+        rep=rep,
+    )
+
+    rep.step("write translation")
+    rep.stage(f"write translated {ext.lstrip('.').upper()}")
+    content = _render_translation(
+        blocks, trans, ext=ext, to=to, ass_script=ass_script, positions=positions
+    )
+    fsio.atomic_write_text(out_path, content)
+    _retire_translation_progress(
+        progress_owner, vtt_path, to, progress_candidates, progress_path
+    )
+    log.info("wrote %s (%d cues → %s)", out_path.name, len(blocks), to)
+    return out_path
+
+
+def _read_translation_source(
+    vtt_path: Path, ext: str
+) -> tuple[list[dict], str | None, list[str | None]]:
+    # Read the subtitle once and return (blocks without position tags, the decoded
+    # ASS script or None, per-block position tag or None). The ``ext`` is the
+    # output extension (SSA already mapped to ASS).
+    source_bytes = vtt_path.read_bytes()
+    is_ass = is_ass_path(vtt_path)
+    blocks = load_subtitle_blocks_bytes(vtt_path, source_bytes, ass_events=is_ass)
+    ass_script = decode_subtitle_bytes(source_bytes, vtt_path.name) if is_ass else None
+    # Position tags are markup, not dialogue: translate the text without them
+    # and put them back on the output cue.
+    positions: list[str | None] = []
+    for index, block in enumerate(blocks):
+        position, bare = _split_position(block["text"])
+        positions.append(position)
+        if position:
+            blocks[index] = {**block, "text": bare}
+    if any(b.get("start") is None for b in blocks):
+        if ext != ".vtt":
+            raise ValueError(
+                f"{vtt_path.name} has cues without timestamps; cannot render {ext}"
+            )
+        log.warning(
+            "%s has no timestamps; translated output will be plain-text blocks (run align first)",
+            vtt_path.name,
+        )
+    return blocks, ass_script, positions
+
+
+def _translate_with_retry(
+    payload: list[dict],
+    blocks: list[dict],
+    tx_kwargs: dict[str, Any],
+    *,
+    concurrency: int,
+    window_cues: int,
+    allow_partial: bool,
+    progress_path: Path,
+    rep: Reporter,
+) -> dict[int, str]:
+    # Run the main translate pass, then one sequential retry for the cues it left
+    # missing. ``blocks`` is filled in place by ``validate_and_fill``. Any failure
+    # logs where the progress sidecar is before it propagates.
     try:
         trans = translate_mod.translate_cues(payload, **tx_kwargs, reporter=rep)
 
@@ -197,9 +245,20 @@ def translate(
                 progress_path.name,
             )
         raise
+    return trans
 
-    rep.step("write translation")
-    rep.stage(f"write translated {ext.lstrip('.').upper()}")
+
+def _render_translation(
+    blocks: list[dict],
+    trans: dict[int, str],
+    *,
+    ext: str,
+    to: str,
+    ass_script: str | None,
+    positions: list[str | None],
+) -> str:
+    # Render the translated cues in the input's format (VTT, SRT, or the ASS script
+    # with only each event's text replaced).
     rows = translate_mod.translated_rows(
         blocks,
         trans,
@@ -230,7 +289,19 @@ def translate(
             if ext == ".srt"
             else render_ass(timed, blocks=timed_blocks)
         )
-    fsio.atomic_write_text(out_path, content)
+    return content
+
+
+def _retire_translation_progress(
+    progress_owner: Path,
+    vtt_path: Path,
+    to: str,
+    progress_candidates: tuple[Path, ...],
+    progress_path: Path,
+) -> None:
+    # Delete the progress sidecars after the output is written. The other lanes go
+    # first and only when the candidate set is unchanged; the selected lane is kept
+    # whenever any cleanup step failed.
     try:
         live_progress_candidates = artifacts.translation_progress_candidates(
             progress_owner,
@@ -266,8 +337,6 @@ def translate(
                 progress_path,
                 exc,
             )
-    log.info("wrote %s (%d cues → %s)", out_path.name, len(blocks), to)
-    return out_path
 
 
 def _write_back_ass(
@@ -302,6 +371,100 @@ def _warn_correction_not_realigned(vtt_path: Path, applied: Sequence[Mapping]) -
         vtt_path,
         "\n".join(shown),
     )
+
+
+# Write stage of correct: --apply commits the corrected VTT in place, otherwise the
+# review sidecar VTT and its audit json are written as a pair. Returns the output path
+# and the audit path (None for --apply).
+def _write_correction(
+    *,
+    apply: bool,
+    rendered: str,
+    owner: Path,
+    vtt_path: Path,
+    vtt_input_bytes: bytes,
+    applied: Sequence[Mapping],
+    rejected: Sequence[Mapping],
+    sidecar_path: Path | None,
+    rep: Reporter,
+) -> tuple[Path, Path | None]:
+    audit_path: Path | None = None
+    if apply:
+        # in-place edit: overwrite the original, no sidecar json (diff lives in the summary)
+        rep.stage("overwrite VTT in place")
+        rendered_bytes = rendered.encode("utf-8")
+        episode_transaction.commit_correction(
+            episode_path=owner,
+            vtt_path=vtt_path,
+            expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
+            rendered_vtt_bytes=rendered_bytes,
+            evidence_paths=artifacts.align_evidence_candidates(
+                owner,
+                vtt_path,
+            ),
+        )
+        out_path = vtt_path
+    else:
+        rep.stage("write sidecar VTT + audit json")
+        assert sidecar_path is not None
+        out_path = sidecar_path
+        audit_path = artifacts.asrfix_audit_path(owner, vtt_path)
+        fsio.atomic_write_text(out_path, rendered)
+        try:
+            fsio.atomic_write_text(
+                audit_path,
+                json.dumps(
+                    {"applied": applied, "rejected": rejected},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                private=True,
+            )
+        except Exception:
+            # Sidecar VTT + audit JSON are a pair; if the audit write fails, unlink
+            # the VTT so no orphaned half-pair is left behind (source stays untouched).
+            out_path.unlink(missing_ok=True)
+            raise
+    return out_path, audit_path
+
+
+# Realign stage of correct --apply --align: refresh the timing of the text that was
+# just committed. Returns True when pipeline.align ran to completion.
+def _realign_after_correction(
+    out_path: Path,
+    applied: Sequence[Mapping],
+    rendered: str,
+    *,
+    media_path: Path | None,
+    separate: bool,
+    normalize: bool,
+    lang_override: str | None,
+    rep: Reporter,
+) -> bool:
+    rep.step("check and refresh timing")
+    if not applied:
+        rep.stage("no text changes; alignment not needed")
+    if applied:
+        try:
+            pipeline.align(
+                out_path,
+                media_path=media_path,
+                separate=separate,
+                normalize=normalize,
+                lang_override=lang_override,
+                reporter=NestedReporter(rep),
+                _expected_vtt_sha256=hashlib.sha256(
+                    rendered.encode("utf-8")
+                ).hexdigest(),
+            )
+        except BaseException:
+            # The text is already committed: re-running correct finds nothing left to
+            # change, so keep the diff the summary would have shown and say how to
+            # finish the job.
+            _warn_correction_not_realigned(out_path, applied)
+            raise
+        return True
+    return False
 
 
 def correct(
@@ -379,43 +542,17 @@ def correct(
     rendered = asrfix_mod.render_vtt(blocks, new_texts)
 
     rep.step("write correction")
-    audit_path: Path | None = None
-    if apply:
-        # in-place edit: overwrite the original, no sidecar json (diff lives in the summary)
-        rep.stage("overwrite VTT in place")
-        rendered_bytes = rendered.encode("utf-8")
-        episode_transaction.commit_correction(
-            episode_path=owner,
-            vtt_path=vtt_path,
-            expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
-            rendered_vtt_bytes=rendered_bytes,
-            evidence_paths=artifacts.align_evidence_candidates(
-                owner,
-                vtt_path,
-            ),
-        )
-        out_path = vtt_path
-    else:
-        rep.stage("write sidecar VTT + audit json")
-        assert sidecar_path is not None
-        out_path = sidecar_path
-        audit_path = artifacts.asrfix_audit_path(owner, vtt_path)
-        fsio.atomic_write_text(out_path, rendered)
-        try:
-            fsio.atomic_write_text(
-                audit_path,
-                json.dumps(
-                    {"applied": applied, "rejected": rejected},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                private=True,
-            )
-        except Exception:
-            # Sidecar VTT + audit JSON are a pair; if the audit write fails, unlink
-            # the VTT so no orphaned half-pair is left behind (source stays untouched).
-            out_path.unlink(missing_ok=True)
-            raise
+    out_path, audit_path = _write_correction(
+        apply=apply,
+        rendered=rendered,
+        owner=owner,
+        vtt_path=vtt_path,
+        vtt_input_bytes=vtt_input_bytes,
+        applied=applied,
+        rejected=rejected,
+        sidecar_path=sidecar_path,
+        rep=rep,
+    )
     log.info(
         "asrfix %s: %d applied / %d rejected → %s",
         vtt_path.name,
@@ -428,29 +565,16 @@ def correct(
     # if something actually changed; an empty diff leaves the VTT identical).
     aligned = False
     if apply and align_after:
-        rep.step("check and refresh timing")
-        if not applied:
-            rep.stage("no text changes; alignment not needed")
-    if apply and align_after and applied:
-        try:
-            pipeline.align(
-                out_path,
-                media_path=media_path,
-                separate=separate,
-                normalize=normalize,
-                lang_override=lang_override,
-                reporter=NestedReporter(rep),
-                _expected_vtt_sha256=hashlib.sha256(
-                    rendered.encode("utf-8")
-                ).hexdigest(),
-            )
-        except BaseException:
-            # The text is already committed: re-running correct finds nothing left to
-            # change, so keep the diff the summary would have shown and say how to
-            # finish the job.
-            _warn_correction_not_realigned(out_path, applied)
-            raise
-        aligned = True
+        aligned = _realign_after_correction(
+            out_path,
+            applied,
+            rendered,
+            media_path=media_path,
+            separate=separate,
+            normalize=normalize,
+            lang_override=lang_override,
+            rep=rep,
+        )
 
     return {
         "out": out_path,

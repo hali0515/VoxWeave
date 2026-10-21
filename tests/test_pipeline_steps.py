@@ -10,6 +10,8 @@ import pytest
 
 from voxweave import backend, chunking, diarize, pipeline, shotdet, songdet
 from voxweave import llm_commands
+from voxweave import process_publication
+from voxweave import transcription
 from voxweave import vocals
 from voxweave.progress import Reporter
 
@@ -123,9 +125,9 @@ def stub_transcription(tmp_path, monkeypatch):
     # process() preflights diarization before any audio work: the gated default
     # model needs a token even though pyannote itself is faked below.
     monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
-    monkeypatch.setattr(pipeline, "decode_to_wav", audio)
+    monkeypatch.setattr(transcription, "decode_to_wav", audio)
     monkeypatch.setattr(vocals, "decode_to_wav", audio)
-    monkeypatch.setattr(pipeline, "slice_wav", audio)
+    monkeypatch.setattr(transcription, "slice_wav", audio)
     monkeypatch.setattr(
         vocals,
         "_separate_to_16k_32k",
@@ -137,9 +139,13 @@ def stub_transcription(tmp_path, monkeypatch):
         lambda source, destination: destination.write_bytes(source.read_bytes()),
     )
     monkeypatch.setattr(
-        pipeline, "vad_speech_segments", lambda *_a, **_k: [{"start": 0.0, "end": 1.0}]
+        transcription,
+        "vad_speech_segments",
+        lambda *_a, **_k: [{"start": 0.0, "end": 1.0}],
     )
-    monkeypatch.setattr(pipeline, "detect_song_spans", lambda *_a, **_k: ([], [], []))
+    monkeypatch.setattr(
+        transcription, "detect_song_spans", lambda *_a, **_k: ([], [], [])
+    )
     monkeypatch.setattr(backend, "chunk_pass_count", lambda _model: 1)
 
     def transcribe_chunks(chunks, _language, **kwargs):
@@ -158,7 +164,9 @@ def stub_transcription(tmp_path, monkeypatch):
         lambda *_a, **_k: SimpleNamespace(turns=[], centroids={}),
     )
     monkeypatch.setattr(diarize, "release", lambda: None)
-    monkeypatch.setattr(pipeline, "_write_sdh_sidecar", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        process_publication, "_write_sdh_sidecar", lambda *_a, **_k: None
+    )
 
 
 @pytest.mark.parametrize(

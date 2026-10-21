@@ -209,27 +209,7 @@ def _failure_valid(value: object) -> bool:
     )
 
 
-def _validate_rich_artifact(value: Mapping[str, Any]) -> None:
-    """Validate the exact rich union member without a runtime schema dependency."""
-    _ordered_keys(value, _RICH_KEYS, label="top-level")
-    if value["schema_version"] != 2 or value["artifact_kind"] != "rich":
-        raise ValueError("rich align shadow discriminator is invalid")
-    if value["status"] not in ("valid", "invalid"):
-        raise ValueError("rich align shadow status is invalid")
-    failure = value["failure"]
-    if failure is not None and not _failure_valid(failure):
-        raise ValueError("rich align shadow failure is invalid")
-    if (value["status"] == "valid") != (failure is None):
-        raise ValueError("rich align shadow failure does not match status")
-
-    _ordered_keys(value["input"], _INPUT_KEYS, label="input")
-    _ordered_keys(value["fresh"], _FRESH_KEYS, label="fresh")
-    _ordered_keys(value["legacy"], _LEGACY_KEYS, label="legacy")
-    _ordered_keys(value["v2"], ("semantic", "validators"), label="v2")
-    _ordered_keys(value["comparison"], ("result",), label="comparison")
-    _ordered_keys(value["selected"], _SELECTED_KEYS, label="selected")
-
-    input_value = value["input"]
+def _check_rich_input(input_value: Mapping[str, Any]) -> None:
     if (
         not _sha256(input_value["context_content_digest"])
         or not _sha256(input_value["vtt_sha256"])
@@ -260,7 +240,8 @@ def _validate_rich_artifact(value: Mapping[str, Any]) -> None:
     ):
         raise ValueError("rich align shadow input facts are invalid")
 
-    fresh = value["fresh"]
+
+def _check_rich_fresh(fresh: Mapping[str, Any]) -> None:
     if (
         not all(
             _sha256(fresh[key])
@@ -290,7 +271,8 @@ def _validate_rich_artifact(value: Mapping[str, Any]) -> None:
     ):
         raise ValueError("rich align shadow fresh facts are invalid")
 
-    legacy = value["legacy"]
+
+def _check_rich_legacy(legacy: Mapping[str, Any]) -> None:
     if (
         not isinstance(legacy["normalized_delivery"], list)
         or not _sha256(legacy["vtt_sha256"])
@@ -315,14 +297,15 @@ def _validate_rich_artifact(value: Mapping[str, Any]) -> None:
         ):
             raise ValueError("rich align shadow legacy delivery is invalid")
 
-    selected = value["selected"]
+
+def _check_rich_selected(selected: Mapping[str, Any]) -> None:
     if selected["engine_family"] not in ("legacy-v1", "boundary-v2"):
         raise ValueError("rich align shadow selected family is invalid")
     if not all(_sha256(selected[key]) for key in _SELECTED_KEYS[1:]):
         raise ValueError("rich align shadow selected hash is invalid")
-    semantic = value["v2"]["semantic"]
-    validators = value["v2"]["validators"]
-    comparison = value["comparison"]["result"]
+
+
+def _check_rich_v2(semantic: Any, validators: Any) -> None:
     if semantic is None and validators is not None:
         raise ValueError("rich align shadow validators lack semantic facts")
     if semantic is not None:
@@ -351,6 +334,9 @@ def _validate_rich_artifact(value: Mapping[str, Any]) -> None:
             or not isinstance(validators["stability_problems"], list)
         ):
             raise ValueError("rich align shadow validator facts are invalid")
+
+
+def _check_rich_comparison(comparison: Any, semantic: Any) -> None:
     if comparison is not None:
         _ordered_keys(comparison, _COMPARISON_KEYS, label="comparison result")
         if semantic is None:
@@ -376,26 +362,70 @@ def _validate_rich_artifact(value: Mapping[str, Any]) -> None:
         ):
             raise ValueError("rich align shadow comparison values are invalid")
 
+
+def _check_rich_valid(
+    fresh: Mapping[str, Any], semantic: Any, validators: Any, comparison: Any
+) -> None:
+    if semantic is None or validators is None or comparison is None:
+        raise ValueError("valid rich align shadow lacks complete v2 facts")
+    if any(
+        fresh[key] != "valid"
+        for key in (
+            "authority_distribution_status",
+            "seed_status",
+            "strict_input_status",
+            "v2_policy_status",
+            "profile_status",
+            "evidence_status",
+            "v2_admission_status",
+        )
+    ):
+        raise ValueError("valid rich align shadow carries an invalid status")
+    if validators["trace_problems"] or validators["stability_problems"]:
+        raise ValueError("valid rich align shadow carries validator problems")
+    if comparison["violations"]:
+        raise ValueError("valid rich align shadow carries comparison violations")
+
+
+def _validate_rich_artifact(value: Mapping[str, Any]) -> None:
+    """Validate the exact rich union member without a runtime schema dependency."""
+    _ordered_keys(value, _RICH_KEYS, label="top-level")
+    if value["schema_version"] != 2 or value["artifact_kind"] != "rich":
+        raise ValueError("rich align shadow discriminator is invalid")
+    if value["status"] not in ("valid", "invalid"):
+        raise ValueError("rich align shadow status is invalid")
+    failure = value["failure"]
+    if failure is not None and not _failure_valid(failure):
+        raise ValueError("rich align shadow failure is invalid")
+    if (value["status"] == "valid") != (failure is None):
+        raise ValueError("rich align shadow failure does not match status")
+
+    _ordered_keys(value["input"], _INPUT_KEYS, label="input")
+    _ordered_keys(value["fresh"], _FRESH_KEYS, label="fresh")
+    _ordered_keys(value["legacy"], _LEGACY_KEYS, label="legacy")
+    _ordered_keys(value["v2"], ("semantic", "validators"), label="v2")
+    _ordered_keys(value["comparison"], ("result",), label="comparison")
+    _ordered_keys(value["selected"], _SELECTED_KEYS, label="selected")
+
+    input_value = value["input"]
+    _check_rich_input(input_value)
+
+    fresh = value["fresh"]
+    _check_rich_fresh(fresh)
+
+    legacy = value["legacy"]
+    _check_rich_legacy(legacy)
+
+    selected = value["selected"]
+    _check_rich_selected(selected)
+    semantic = value["v2"]["semantic"]
+    validators = value["v2"]["validators"]
+    comparison = value["comparison"]["result"]
+    _check_rich_v2(semantic, validators)
+    _check_rich_comparison(comparison, semantic)
+
     if value["status"] == "valid":
-        if semantic is None or validators is None or comparison is None:
-            raise ValueError("valid rich align shadow lacks complete v2 facts")
-        if any(
-            fresh[key] != "valid"
-            for key in (
-                "authority_distribution_status",
-                "seed_status",
-                "strict_input_status",
-                "v2_policy_status",
-                "profile_status",
-                "evidence_status",
-                "v2_admission_status",
-            )
-        ):
-            raise ValueError("valid rich align shadow carries an invalid status")
-        if validators["trace_problems"] or validators["stability_problems"]:
-            raise ValueError("valid rich align shadow carries validator problems")
-        if comparison["violations"]:
-            raise ValueError("valid rich align shadow carries comparison violations")
+        _check_rich_valid(fresh, semantic, validators, comparison)
     _canonical_bytes(value)
 
 

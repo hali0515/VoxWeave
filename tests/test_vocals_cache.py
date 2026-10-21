@@ -10,6 +10,7 @@ import pytest
 import soundfile as sf
 
 from voxweave import pipeline, vocals, vocalscache
+from voxweave import transcription
 
 
 def _durations(mapping):
@@ -215,7 +216,7 @@ def test_transcribe_rerun_decodes_the_cache_like_its_first_run(
 
     monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
     monkeypatch.setattr(vocals, "_encode_flac", fake_encode)
-    monkeypatch.setattr(pipeline, "vad_speech_segments", stop)
+    monkeypatch.setattr(transcription, "vad_speech_segments", stop)
     monkeypatch.setattr(
         pipeline.backend, "separate_vocals", lambda *_a, **_k: tmp_path / "v.wav"
     )

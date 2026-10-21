@@ -424,7 +424,14 @@ _PLAIN = {
 def test_the_lane_names_are_defined_once():
     import inspect
 
-    from voxweave.core import shadow_lanes, shadow_schema
+    from voxweave.core import (
+        shadow_lanes,
+        shadow_oracles,
+        shadow_rows,
+        shadow_schema,
+        shadow_schema_fields,
+        shadow_schema_finalizer,
+    )
 
     names = (
         shadow_lanes.LANE_CORE,
@@ -444,7 +451,14 @@ def test_the_lane_names_are_defined_once():
         shadow_v2.SHADOW_LANE_FINALIZER,
         shadow_v2.SHADOW_LANE_LEGACY_DISPLAY,
     ) == names
-    for module in (shadow_schema, shadow_v2):
+    for module in (
+        shadow_schema,
+        shadow_schema_fields,
+        shadow_schema_finalizer,
+        shadow_v2,
+        shadow_oracles,
+        shadow_rows,
+    ):
         source = inspect.getsource(module)
         assert not [name for name in names if f'"{name}"' in source], module
 

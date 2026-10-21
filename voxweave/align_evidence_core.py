@@ -1356,6 +1356,157 @@ def _r_receipt_equal(left: PhysicalCallReceipt, right: PhysicalCallReceipt) -> b
     return True
 
 
+# Reference stage: the per-call sample geometry and origin checks, in the
+# original order; each failed check raises its own projection error.
+def _r_check_call_geometry(raw_call: ReferencePhysicalCallFacts) -> None:
+    if (
+        type(raw_call.sample_rate) is not int
+        or raw_call.sample_rate <= 0
+        or type(raw_call.sample_count) is not int
+        or raw_call.sample_count < 0
+        or not 0
+        <= raw_call.audio_sample_start
+        <= raw_call.audio_sample_end
+        <= raw_call.sample_count
+    ):
+        raise EvidenceCoreProjectionError("reference physical geometry is invalid")
+    quotient = raw_call.audio_sample_start / raw_call.sample_rate
+    if (
+        raw_call.physical_origin_seconds.hex() != quotient.hex()
+        or raw_call.authority_origin_seconds.hex() != quotient.hex()
+    ):
+        raise EvidenceCoreProjectionError("reference physical origin is invalid")
+    if raw_call.legacy_origin_kind == "identity":
+        if (
+            raw_call.audio_sample_start != 0
+            or raw_call.legacy_origin_seconds.hex() != (0.0).hex()
+        ):
+            raise EvidenceCoreProjectionError("reference identity origin is invalid")
+    elif raw_call.legacy_origin_kind == "sample-origin":
+        if raw_call.legacy_origin_seconds.hex() != quotient.hex():
+            raise EvidenceCoreProjectionError("reference sample origin is invalid")
+    elif raw_call.legacy_origin_kind != "nominal-route":
+        raise EvidenceCoreProjectionError("reference origin kind is invalid")
+
+
+# Reference stage: rebuild one call's capture, legacy slice and transform from
+# the raw call facts, compare each with the issuer snapshots and record the
+# legacy owners per source block (the maps are filled in place).
+def _r_cross_link_call(
+    facts: EvidenceCoreReferenceInputs,
+    index: int,
+    raw_call: ReferencePhysicalCallFacts,
+    blocks_by_source: Mapping[int, AuthorityBlock],
+    global_legacy: Mapping[int, tuple[Mapping[str, Any], ...]],
+    ordered_legacy: dict[int, tuple[Mapping[str, Any], ...]],
+    ordered_relative_legacy: dict[int, tuple[Mapping[str, Any], ...]],
+) -> tuple[
+    StrictCaptureResult,
+    AuthorityTransformResult,
+    LegacyCallDistributionReceipt,
+    tuple[tuple[Mapping[str, Any], ...], ...],
+]:
+    capture = _r_capture(raw_call)
+    legacy_receipt, call_legacy, call_relative_legacy = _r_legacy_call(
+        raw_call, blocks_by_source, facts.language, facts.route_kind
+    )
+    retained_count = len(legacy_receipt.consumed_prefix_unit_ids)
+    transform = _r_transform(raw_call, capture, retained_count)
+    if capture != facts.captures[index]:
+        raise EvidenceCoreProjectionError(
+            "reference strict snapshot cross-link mismatch"
+        )
+    if transform != facts.transforms[index]:
+        raise EvidenceCoreProjectionError(
+            "reference authority snapshot cross-link mismatch"
+        )
+    if legacy_receipt != facts.legacy_receipts[index]:
+        raise EvidenceCoreProjectionError(
+            "reference legacy receipt cross-link mismatch"
+        )
+    for source, owner in zip(raw_call.source_block_indices, call_legacy, strict=True):
+        if global_legacy.get(source) != owner:
+            raise EvidenceCoreProjectionError(
+                "reference legacy block cross-link mismatch"
+            )
+        ordered_legacy[source] = owner
+    for source, owner in zip(
+        raw_call.source_block_indices, call_relative_legacy, strict=True
+    ):
+        ordered_relative_legacy[source] = owner
+    return capture, transform, legacy_receipt, call_legacy
+
+
+# Reference stage: build the expected physical call receipt and compare it with
+# the claimed one.
+def _r_expected_receipt(
+    facts: EvidenceCoreReferenceInputs,
+    index: int,
+    raw_call: ReferencePhysicalCallFacts,
+    capture: StrictCaptureResult,
+    transform: AuthorityTransformResult,
+    legacy_receipt: LegacyCallDistributionReceipt,
+    call_legacy: tuple[tuple[Mapping[str, Any], ...], ...],
+    model_digest: str,
+    route_digest: str,
+) -> PhysicalCallReceipt:
+    legacy_slice_digest = _r_stable_digest(legacy_receipt)
+    legacy_absolute_digest = _r_stable_digest(call_legacy)
+    physical = PhysicalCallReceipt(
+        call_index=raw_call.call_index,
+        source_block_indices=raw_call.source_block_indices,
+        audio_sample_start=raw_call.audio_sample_start,
+        audio_sample_end=raw_call.audio_sample_end,
+        sample_rate=raw_call.sample_rate,
+        physical_origin_seconds=raw_call.physical_origin_seconds,
+        legacy_origin_seconds=raw_call.legacy_origin_seconds,
+        legacy_origin_kind=raw_call.legacy_origin_kind,
+        authority_origin_seconds=raw_call.authority_origin_seconds,
+        backend_model_config_digest=model_digest,
+        route_input_digest=route_digest,
+        strict_unit_status=capture.status,
+        strict_failure=transform.failure,
+        raw_units_digest=capture.raw_units_digest,
+        normalized_relative_digest=capture.normalized_relative_digest,
+        legacy_slice_digest=legacy_slice_digest,
+        legacy_absolute_digest=legacy_absolute_digest,
+        authority_transform_status=transform.status,
+        authority_absolute_digest=transform.authority_absolute_digest,
+        raw_unit_ids=raw_call.raw_unit_ids,
+    )
+    if not _r_receipt_equal(physical, facts.claimed_physical_calls[index]):
+        raise EvidenceCoreProjectionError(
+            "reference physical digest/cross-link mismatch"
+        )
+    return physical
+
+
+# Reference stage: map one expected receipt onto its EvidenceCore call record.
+def _r_evidence_call(physical: PhysicalCallReceipt) -> EvidenceCorePhysicalCall:
+    return EvidenceCorePhysicalCall(
+        physical.call_index,
+        physical.source_block_indices,
+        physical.audio_sample_start,
+        physical.audio_sample_end,
+        physical.sample_rate,
+        physical.physical_origin_seconds,
+        physical.legacy_origin_seconds,
+        physical.legacy_origin_kind,
+        physical.authority_origin_seconds,
+        physical.backend_model_config_digest,
+        physical.route_input_digest,
+        physical.strict_unit_status,
+        physical.strict_failure,
+        physical.raw_units_digest,
+        physical.normalized_relative_digest,
+        physical.legacy_slice_digest,
+        physical.legacy_absolute_digest,
+        physical.authority_transform_status,
+        physical.authority_absolute_digest,
+        physical.raw_unit_ids,
+    )
+
+
 def _r_rebuild_calls(
     facts: EvidenceCoreReferenceInputs,
 ) -> tuple[
@@ -1393,118 +1544,28 @@ def _r_rebuild_calls(
     for index, raw_call in enumerate(facts.reference_calls):
         if raw_call.call_index != index:
             raise EvidenceCoreProjectionError("reference call order is invalid")
-        if (
-            type(raw_call.sample_rate) is not int
-            or raw_call.sample_rate <= 0
-            or type(raw_call.sample_count) is not int
-            or raw_call.sample_count < 0
-            or not 0
-            <= raw_call.audio_sample_start
-            <= raw_call.audio_sample_end
-            <= raw_call.sample_count
-        ):
-            raise EvidenceCoreProjectionError("reference physical geometry is invalid")
-        quotient = raw_call.audio_sample_start / raw_call.sample_rate
-        if (
-            raw_call.physical_origin_seconds.hex() != quotient.hex()
-            or raw_call.authority_origin_seconds.hex() != quotient.hex()
-        ):
-            raise EvidenceCoreProjectionError("reference physical origin is invalid")
-        if raw_call.legacy_origin_kind == "identity":
-            if (
-                raw_call.audio_sample_start != 0
-                or raw_call.legacy_origin_seconds.hex() != (0.0).hex()
-            ):
-                raise EvidenceCoreProjectionError(
-                    "reference identity origin is invalid"
-                )
-        elif raw_call.legacy_origin_kind == "sample-origin":
-            if raw_call.legacy_origin_seconds.hex() != quotient.hex():
-                raise EvidenceCoreProjectionError("reference sample origin is invalid")
-        elif raw_call.legacy_origin_kind != "nominal-route":
-            raise EvidenceCoreProjectionError("reference origin kind is invalid")
-        capture = _r_capture(raw_call)
-        legacy_receipt, call_legacy, call_relative_legacy = _r_legacy_call(
-            raw_call, blocks_by_source, facts.language, facts.route_kind
+        _r_check_call_geometry(raw_call)
+        capture, transform, legacy_receipt, call_legacy = _r_cross_link_call(
+            facts,
+            index,
+            raw_call,
+            blocks_by_source,
+            global_legacy,
+            ordered_legacy,
+            ordered_relative_legacy,
         )
-        retained_count = len(legacy_receipt.consumed_prefix_unit_ids)
-        transform = _r_transform(raw_call, capture, retained_count)
-        if capture != facts.captures[index]:
-            raise EvidenceCoreProjectionError(
-                "reference strict snapshot cross-link mismatch"
-            )
-        if transform != facts.transforms[index]:
-            raise EvidenceCoreProjectionError(
-                "reference authority snapshot cross-link mismatch"
-            )
-        if legacy_receipt != facts.legacy_receipts[index]:
-            raise EvidenceCoreProjectionError(
-                "reference legacy receipt cross-link mismatch"
-            )
-        for source, owner in zip(
-            raw_call.source_block_indices, call_legacy, strict=True
-        ):
-            if global_legacy.get(source) != owner:
-                raise EvidenceCoreProjectionError(
-                    "reference legacy block cross-link mismatch"
-                )
-            ordered_legacy[source] = owner
-        for source, owner in zip(
-            raw_call.source_block_indices, call_relative_legacy, strict=True
-        ):
-            ordered_relative_legacy[source] = owner
-        legacy_slice_digest = _r_stable_digest(legacy_receipt)
-        legacy_absolute_digest = _r_stable_digest(call_legacy)
-        physical = PhysicalCallReceipt(
-            call_index=raw_call.call_index,
-            source_block_indices=raw_call.source_block_indices,
-            audio_sample_start=raw_call.audio_sample_start,
-            audio_sample_end=raw_call.audio_sample_end,
-            sample_rate=raw_call.sample_rate,
-            physical_origin_seconds=raw_call.physical_origin_seconds,
-            legacy_origin_seconds=raw_call.legacy_origin_seconds,
-            legacy_origin_kind=raw_call.legacy_origin_kind,
-            authority_origin_seconds=raw_call.authority_origin_seconds,
-            backend_model_config_digest=model_digest,
-            route_input_digest=route_digest,
-            strict_unit_status=capture.status,
-            strict_failure=transform.failure,
-            raw_units_digest=capture.raw_units_digest,
-            normalized_relative_digest=capture.normalized_relative_digest,
-            legacy_slice_digest=legacy_slice_digest,
-            legacy_absolute_digest=legacy_absolute_digest,
-            authority_transform_status=transform.status,
-            authority_absolute_digest=transform.authority_absolute_digest,
-            raw_unit_ids=raw_call.raw_unit_ids,
+        physical = _r_expected_receipt(
+            facts,
+            index,
+            raw_call,
+            capture,
+            transform,
+            legacy_receipt,
+            call_legacy,
+            model_digest,
+            route_digest,
         )
-        if not _r_receipt_equal(physical, facts.claimed_physical_calls[index]):
-            raise EvidenceCoreProjectionError(
-                "reference physical digest/cross-link mismatch"
-            )
-        evidence_calls.append(
-            EvidenceCorePhysicalCall(
-                physical.call_index,
-                physical.source_block_indices,
-                physical.audio_sample_start,
-                physical.audio_sample_end,
-                physical.sample_rate,
-                physical.physical_origin_seconds,
-                physical.legacy_origin_seconds,
-                physical.legacy_origin_kind,
-                physical.authority_origin_seconds,
-                physical.backend_model_config_digest,
-                physical.route_input_digest,
-                physical.strict_unit_status,
-                physical.strict_failure,
-                physical.raw_units_digest,
-                physical.normalized_relative_digest,
-                physical.legacy_slice_digest,
-                physical.legacy_absolute_digest,
-                physical.authority_transform_status,
-                physical.authority_absolute_digest,
-                physical.raw_unit_ids,
-            )
-        )
+        evidence_calls.append(_r_evidence_call(physical))
         captures.append(capture)
         transforms.append(transform)
         receipts.append(legacy_receipt)

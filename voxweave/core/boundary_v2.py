@@ -49,7 +49,6 @@ from .boundary_cost import (
     edge_cost,
     make_breakdown,
     pause_knees,
-    quantize,
     sum_breakdowns,
 )
 from .boundary_lattice import (
@@ -59,21 +58,48 @@ from .boundary_lattice import (
     AtomLayer,
     DocumentLattice,
     Edge,
-    HardInterval,
     IncrementalPacker,
     IntervalLattice,
     LatticeAtom,
+    PackMeasure,
     ProfileViolation,
     build_barriers,
     build_document_lattice,
     _cache_candidate_evidence,
     _canonical_pack_measure,
-    _resolve_candidate_evidence,
     _resolve_edge_input_bounds,
     held_chain_continuous,
     preflight_profile,
     span_max,
     span_min,
+)
+from .boundary_select import (
+    POLICY_MARGIN as POLICY_MARGIN,
+    CostTables as CostTables,
+    DPResult as DPResult,
+    PathResult as PathResult,
+    Selection as Selection,
+    V1Partition as V1Partition,
+    _assemble_path as _assemble_path,
+    _margin_summary as _margin_summary,
+    _nearest_rank as _nearest_rank,
+    _pinned_neighbour_margins as _pinned_neighbour_margins,
+    _select as _select,
+    _v1_local_cuts as _v1_local_cuts,
+    score_path as score_path,
+    solve_interval as solve_interval,
+)
+from .boundary_interval import (
+    ADOPTION_ABSORBED as ADOPTION_ABSORBED,
+    AdoptedV1 as AdoptedV1,
+    IntervalSolution as IntervalSolution,
+    _adopt_v1 as _adopt_v1,
+    _adoption_plan as _adoption_plan,
+    _path_edges as _path_edges,
+    _resolve_edge_for_previous as _resolve_edge_for_previous,
+    _resolve_selected_path as _resolve_selected_path,
+    materialize_cues as materialize_cues,
+    optimize_interval as optimize_interval,
 )
 from .canonical_text import CanonicalWork
 from .layout import _join, _no_spaces
@@ -82,10 +108,8 @@ from .partition_check import (
     PartitionCheckResult,
     Waiver,
     check_partition,
-    owned_unit_ids,
 )
 from .policy_delta import delta_registry_data
-from .schema import Cue, Unit
 from .segdoc import DisplayProfile, SegDocument, SourceUnit
 from .subunit import (
     RefineResult,
@@ -144,11 +168,6 @@ ENGINE_V2: str = "boundary-optimizer-v2"
 #: stamps version 2 at that later admission boundary.
 SCHEMA_VERSION: int = 1
 
-#: How much worse than the raw optimum a legal v1 path may be and still be
-#: selected. A margin rather than an equality test because the point of the
-#: shadow lane is to migrate only where v2 is *convincingly* better, not
-#: wherever it is better by a rounding error.
-POLICY_MARGIN: float = 1.0
 
 #: Places where v2 knowingly does something v1 does not. Recorded on every
 #: artifact so a reader never has to discover a divergence by diffing output.
@@ -164,18 +183,6 @@ SPEAKER_POLICY_DELTAS: tuple[str, ...] = (*POLICY_DELTAS, "PD-SPK")
 
 
 # ---------------------------------------------------------------- cost tables
-
-
-@dataclass(frozen=True)
-class CostTables:
-    """Every edge and cut price of one interval, computed exactly once."""
-
-    edges: Mapping[tuple[int, int], CostBreakdown]
-    cuts: Mapping[int, CostBreakdown]
-    speaker_pricing: SpeakerPricingSummary | None = None
-    speaker_context: CostContext | None = None
-    fallback_start: float = 0.0
-    document_nodes: tuple[int, ...] = ()
 
 
 @dataclass
@@ -359,36 +366,6 @@ def _base_edge_cost(
     )
 
 
-def _resolve_edge_for_previous(
-    lattice: IntervalLattice,
-    edge: Edge,
-    ctx: CostContext,
-    *,
-    previous_end: float,
-) -> Edge:
-    """Resolve/cache an edge against one actual predecessor-state value."""
-    input_start, input_end = _resolve_edge_input_bounds(
-        edge,
-        previous_end=previous_end,
-    )
-    if (
-        edge.input_start == input_start
-        and edge.input_end == input_end
-        and (
-            isinstance(edge.evidence_span, EvidenceSpan)
-            or edge.evidence_unavailable_reason is not None
-        )
-    ):
-        return edge
-    return _resolve_candidate_evidence(
-        edge,
-        lattice,
-        units=ctx.units,
-        sing_spans=ctx.sing_spans,
-        previous_end=previous_end,
-    )
-
-
 def build_cost_tables(
     lattice: IntervalLattice,
     ctx: CostContext,
@@ -471,406 +448,7 @@ def build_cost_tables(
     )
 
 
-# ------------------------------------------------------------------- paths
-
-
-@dataclass(frozen=True)
-class PathResult:
-    """One scored node path: its cuts, its total, and how the total was made."""
-
-    cuts: tuple[int, ...]
-    total: float
-    edge_breakdowns: tuple[CostBreakdown, ...]
-    cut_breakdowns: tuple[CostBreakdown, ...]
-    breakdown: CostBreakdown
-    unit_cuts: tuple[int, ...] = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        """Node ids in Python, source-unit ids in the artifact.
-
-        ``cuts`` is the unit-space projection because every persisted coordinate
-        is a source-unit id; the node tuple is kept alongside it so a reader
-        debugging the solver can still see what the DP actually chose.
-
-        ``breakdown`` is a ``sum_breakdowns`` aggregate, and aggregation is lossy
-        in exactly the place AD-3 cares about: a categorical feature has no sum,
-        so ``vad_state`` -- the field that says what kind of evidence a boundary
-        rested on -- vanishes from it entirely, and ``gap_ms_raw``/
-        ``effective_ms``/``overlap_fraction``/``ramp_ms`` survive only as
-        interval totals nobody can re-weight a single decision from. AD-3
-        requires the features "per cut candidate", so the raw halves are emitted
-        per cut and per edge alongside the aggregate. Weighted terms are NOT
-        repeated here: those are the policy's opinion and the aggregate already
-        carries them under a stated ``policy_version``.
-        """
-        return {
-            "breakdown": self.breakdown.to_dict(),
-            "cut_features": [
-                {"unit": unit, **{k: part.features[k] for k in sorted(part.features)}}
-                for unit, part in zip(self.unit_cuts, self.cut_breakdowns)
-            ],
-            "cuts": list(self.unit_cuts),
-            "edge_features": [
-                {k: part.features[k] for k in sorted(part.features)}
-                for part in self.edge_breakdowns
-            ],
-            "node_cuts": list(self.cuts),
-            "total": self.total,
-        }
-
-
-def _assemble_path(
-    lattice: IntervalLattice, tables: CostTables, cuts: Sequence[int]
-) -> PathResult:
-    count = len(lattice.atoms)
-    nodes = (0, *cuts, count)
-    edge_index = {(edge.start_node, edge.end_node) for edge in lattice.edges}
-    total = 0.0
-    edge_parts: list[CostBreakdown] = []
-    cut_parts: list[CostBreakdown] = []
-    for left, right in zip(nodes, nodes[1:]):
-        key = (left, right)
-        edge = tables.edges.get(key)
-        if edge is None or key not in edge_index:
-            raise ValueError(f"edge({left}, {right}): no legal cue spans these atoms")
-        edge_parts.append(edge)
-        total = quantize(total + edge.total)
-        if right != count:
-            cut = tables.cuts.get(right)
-            if cut is None:
-                raise ValueError(f"node {right} is not a candidate boundary")
-            cut_parts.append(cut)
-            total = quantize(total + cut.total)
-    return PathResult(
-        cuts=tuple(cuts),
-        total=total,
-        edge_breakdowns=tuple(edge_parts),
-        cut_breakdowns=tuple(cut_parts),
-        breakdown=sum_breakdowns([*edge_parts, *cut_parts]),
-        unit_cuts=tuple(lattice.unit_bound(node) for node in cuts),
-    )
-
-
-def score_path(
-    lattice: IntervalLattice, tables: CostTables, cuts: Sequence[int]
-) -> PathResult:
-    """Score an arbitrary node path over one interval's lattice.
-
-    The accumulation order is fixed and shared with the DP -- edge, then the cut
-    that opened the next cue -- so an independently scored path and the solver's
-    own total agree bit for bit rather than to a tolerance. A path whose
-    consecutive pair is not a legal edge raises, which is how the v1 reference
-    learns that v1's partition is not expressible here.
-    """
-    return _assemble_path(lattice, tables, cuts)
-
-
-@dataclass(frozen=True)
-class DPResult:
-    """The optimum and the work spent finding it."""
-
-    best: PathResult
-    relaxations: int
-
-
-def solve_interval(lattice: IntervalLattice, tables: CostTables) -> DPResult:
-    """Exact forward DP over one whole hard interval.
-
-    Nodes are processed in ascending order and every edge runs forward, so by the
-    time a node is finalized all of its incoming candidates have been offered:
-    one pass suffices and no queue is needed. Each node keeps its best
-    ``(total, predecessor)``, ordered by total then by the smaller predecessor --
-    the local tie-break, which induces the path that minimises the last cut, then
-    the one before it, and so on.
-    """
-    count = len(lattice.atoms)
-    best: dict[int, tuple[float, int]] = {0: (0.0, -1)}
-    pending: dict[int, list[tuple[float, int]]] = {}
-    relaxations = 0
-
-    for node in lattice.nodes:
-        if node != 0:
-            pool = pending.get(node)
-            if not pool:
-                continue
-            best[node] = min(pool)
-        entry = best.get(node)
-        if entry is None:
-            continue
-        total = entry[0]
-        for edge in lattice.edges_from.get(node, ()):
-            relaxations += 1
-            step = tables.edges[(edge.start_node, edge.end_node)].total
-            interior = edge.end_node != count
-            value = quantize(total + step)
-            if interior:
-                value = quantize(value + tables.cuts[edge.end_node].total)
-            pending.setdefault(edge.end_node, []).append((value, node))
-
-    if count not in best:
-        raise ValueError(
-            f"interval {lattice.interval.index}: no legal path reaches node {count}"
-        )
-    cuts: list[int] = []
-    node = count
-    while node != 0:
-        pred = best[node][1]
-        if pred < 0:
-            break
-        if pred != 0:
-            cuts.append(pred)
-        node = pred
-    return DPResult(
-        best=_assemble_path(lattice, tables, tuple(reversed(cuts))),
-        relaxations=relaxations,
-    )
-
-
-# ---------------------------------------------------------------- selection
-
-
-@dataclass(frozen=True)
-class Selection:
-    """What the optimizer found versus what the policy is willing to ship.
-
-    ``v1_supplied`` separates "v1 chose nothing here" from "there is no v1
-    reference at all". Without it every v1 field reads as a measurement -- legal:
-    no, cost: none, selected: no -- when in truth nothing was measured, and a
-    reader cannot tell the two apart from the artifact.
-    """
-
-    raw_optimum: PathResult
-    policy_selected: PathResult
-    selected_is_v1: bool
-    v1_path_legal: bool
-    v1_illegality: str | None
-    v1_cost_under_v2: CostBreakdown | None
-    v1_supplied: bool = True
-
-
-def _v1_local_cuts(
-    lattice: IntervalLattice, v1: V1Partition
-) -> tuple[tuple[int, ...] | None, str | None]:
-    """Project v1's unit-space cuts onto this interval's node space.
-
-    A v1 cut that falls strictly inside an atom has no node to land on, which is
-    itself a finding rather than an error: v1 committed a boundary this lattice
-    cannot express, and the reason is recorded instead of being rounded away.
-    """
-    interval = lattice.interval
-    wanted = sorted(
-        cut for cut in v1.cuts if interval.unit_start < cut < interval.unit_end
-    )
-    by_unit: dict[int, int] = {}
-    for node in range(1, len(lattice.atoms)):
-        by_unit.setdefault(lattice.unit_bound(node), node)
-    cuts: list[int] = []
-    for unit in wanted:
-        node = by_unit.get(unit)
-        if node is None:
-            return None, f"unit {unit} is not an atom edge in this interval"
-        cuts.append(node)
-    return tuple(cuts), None
-
-
-def _select(
-    lattice: IntervalLattice,
-    tables: CostTables,
-    dp: DPResult,
-    v1: V1Partition | None,
-) -> Selection:
-    raw = dp.best
-
-    v1_path: PathResult | None = None
-    illegality: str | None = None
-    if v1 is not None:
-        cuts, reason = _v1_local_cuts(lattice, v1)
-        if cuts is None:
-            illegality = reason
-        else:
-            try:
-                v1_path = score_path(lattice, tables, cuts)
-            except ValueError as exc:
-                illegality = str(exc)
-
-    within = v1_path is not None and v1_path.total <= raw.total + POLICY_MARGIN
-    return Selection(
-        raw_optimum=raw,
-        policy_selected=v1_path if (within and v1_path is not None) else raw,
-        selected_is_v1=within,
-        v1_path_legal=v1_path is not None,
-        v1_illegality=illegality,
-        v1_cost_under_v2=None if v1_path is None else v1_path.breakdown,
-        v1_supplied=v1 is not None,
-    )
-
-
-def _pinned_neighbour_margins(
-    lattice: IntervalLattice,
-    tables: CostTables,
-    selected: PathResult,
-) -> tuple[float, ...]:
-    """Best single-cut relocation delta with adjacent selected cuts pinned.
-
-    A relocated path shares the selected path's accumulation up to the cut
-    before the moved one, so the fold restarts from that prefix total and only
-    replays the changed edges and the unchanged tail. Totals are therefore the
-    same floats :func:`score_path` would give, without rescoring the whole path
-    (or rebuilding its edge index) once per candidate node.
-    """
-    if not selected.cuts:
-        return ()
-    count = len(lattice.atoms)
-    chain = (0, *selected.cuts, count)
-    # score_path's accumulation order: an edge, then the cut that opens the
-    # next cue. Edge ``j`` sits at step ``2j`` and the cut after it at ``2j+1``.
-    steps: list[float] = []
-    for left, right in zip(chain, chain[1:]):
-        steps.append(tables.edges[(left, right)].total)
-        if right != count:
-            steps.append(tables.cuts[right].total)
-    prefix = [0.0]
-    for step in steps:
-        prefix.append(quantize(prefix[-1] + step))
-    nodes = sorted(lattice.nodes)
-    margins: list[float] = []
-    for index, cut in enumerate(selected.cuts):
-        previous_node, next_node = chain[index], chain[index + 2]
-        head = prefix[2 * index]
-        tail = steps[2 * index + 3 :]
-        alternatives: list[float] = []
-        low = bisect.bisect_right(nodes, previous_node)
-        high = bisect.bisect_left(nodes, next_node)
-        for candidate in nodes[low:high]:
-            if candidate == cut:
-                continue
-            left = tables.edges.get((previous_node, candidate))
-            right = tables.edges.get((candidate, next_node))
-            opened = tables.cuts.get(candidate)
-            if left is None or right is None or opened is None:
-                continue
-            total = head
-            for step in (left.total, opened.total, right.total, *tail):
-                total = quantize(total + step)
-            alternatives.append(quantize(total - selected.total))
-        if alternatives:
-            margins.append(min(alternatives))
-    return tuple(margins)
-
-
-def _nearest_rank(values: Sequence[float], percentile: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    rank = max(0, math.ceil(percentile * len(ordered)) - 1)
-    return ordered[rank]
-
-
-def _margin_summary(
-    margins: Sequence[float], *, selected_cut_count: int
-) -> dict[str, Any] | None:
-    """Artifact-only pinned-neighbour relocation summary (nearest-rank)."""
-    if selected_cut_count == 0:
-        return None
-    values = tuple(margins)
-    return {
-        "count": len(values),
-        "exact_ties": sum(value == 0.0 for value in values),
-        "min": min(values) if values else None,
-        "p05": _nearest_rank(values, 0.05),
-        "p50": _nearest_rank(values, 0.50),
-    }
-
-
-# ---------------------------------------------------------- materialization
-
-
-def materialize_cues(
-    edges: Sequence[Edge],
-    atoms: Sequence[LatticeAtom],
-    lang: str,
-    *,
-    fallback_start: float = 0.0,
-    units: Sequence[SourceUnit] | None = None,
-) -> tuple[Cue, ...]:
-    """Turn a chosen edge chain into cues with the engine's own cue shapes.
-
-    ``word_data`` is *atom* level and carries ``text``, exactly as the v1
-    materializer emits it: handing back raw per-character entries instead would
-    make every later reader fall through to a character cursor and report a total
-    diff for reasons that have nothing to do with boundaries.
-
-    One divergence is unavoidable and deliberate. v1 lays an untimed chunk over
-    the stretch between the nearest real bounds inside its parent cue (and short
-    made-up cues borrow display time from their siblings), and a v2 partition has
-    no parent cue, so the fallback here is the previous cue's end (or
-    ``fallback_start`` at the front). The acoustic anchors take no fallback at all in either engine:
-    invented display time must never be laundered into the evidence layer.  If
-    ``units`` contains derived provenance, each cue's exact start/end is taken
-    only from its first/last owned aligner unit; an all-aligner stream retains
-    the legacy edge fold byte-for-byte.
-    """
-    cues: list[Cue] = []
-    # Absolute byte freeze for the ordinary stream: when every source unit is
-    # still aligner-provenance, retain the original edge span fold verbatim.
-    # Only a mixed-provenance shadow stream takes the W2 sibling fold.
-    provenance_aware = bool(units) and any(
-        unit.provenance != "aligner" for unit in units or ()
-    )
-    previous_end = float(fallback_start)
-    for edge in edges:
-        chunk = list(atoms[edge.start_node : edge.end_node])
-        speech_start = edge.span_start
-        speech_end = edge.span_end
-        if provenance_aware and units is not None and chunk:
-            unit_start = chunk[0].unit_start
-            unit_end = chunk[-1].unit_end
-            speech_start, speech_end = speech_span_units(units[unit_start:unit_end])
-        # Derived sub-unit spans remain the display/cap time authority even when
-        # provenance correctly withholds an acoustic anchor.  Conflating these
-        # channels would collapse every all-refined cue to zero duration.
-        if (edge.input_start is None) != (edge.input_end is None):
-            raise ValueError("candidate input-bound cache is only partially populated")
-        if edge.input_start is not None and edge.input_end is not None:
-            start = float(edge.input_start)
-            end = float(edge.input_end)
-        else:
-            start, end = _resolve_edge_input_bounds(
-                edge,
-                previous_end=previous_end,
-            )
-        word_data: list[Unit] = [
-            {"text": atom.text, "start": atom.start, "end": atom.end} for atom in chunk
-        ]
-        cue: Cue = {
-            "text": _join([atom.text for atom in chunk], lang),
-            "start": start,
-            "end": end,
-            "word_data": word_data,
-            "speech_start": speech_start,
-            "speech_end": speech_end,
-        }
-        if edge.lyric:
-            cue["lyric"] = True
-        cues.append(cue)
-        previous_end = end
-    return tuple(cues)
-
-
 # ------------------------------------------------------------- v1 reference
-
-
-@dataclass(frozen=True)
-class V1Partition:
-    """v1's committed answer: interior cuts in unit-id space, plus its cues.
-
-    ``cues`` is optional because most of what the shadow asks of v1 needs only
-    the cut set; the typed fallback is the one consumer that cannot work without
-    the cue dicts, and it reports an empty adoption rather than inventing them.
-    """
-
-    cuts: tuple[int, ...]
-    cues: tuple[Cue, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -897,6 +475,170 @@ class V1Reference:
             "hard_disagreements": list(self.hard_disagreements),
             "rounded_cuts": list(self.rounded_cuts),
         }
+
+
+# Lands every v1 cut on an atom node. Returns the node chain, the cuts that did
+# not land on an atom edge, and the v1 cue index for each landed span.
+def _v1_landed_chain(
+    v1: V1Partition,
+    layer: AtomLayer,
+    bounds: Sequence[int],
+    count: int,
+) -> tuple[tuple[int, ...], list[dict[str, Any]], dict[tuple[int, int], int]]:
+    nodes: list[int] = []
+    rounded: list[dict[str, Any]] = []
+    # The node every v1 cue boundary landed on, in v1 cue order. Rounding can
+    # collapse several v1 cuts onto one node (or onto a document end), so a
+    # chain cue is matched to the v1 cue whose landed span it is -- never to the
+    # v1 cue that merely shares its position in the shortened chain.
+    landed: list[int] = [0]
+    for cut in sorted(set(v1.cuts)):
+        if not 0 < cut < layer.unit_count:
+            landed.append(0 if cut <= 0 else count)
+            continue
+        position = bisect.bisect_left(bounds, cut)
+        if bounds[position] != cut:
+            # Includes a cut inside the last atom, which rounds up onto the
+            # document end and so vanishes from the chain: still a finding.
+            rounded.append(
+                {"landed_unit": bounds[position], "node": position, "unit": cut}
+            )
+        landed.append(position)
+        if 0 < position < count:
+            nodes.append(position)
+    landed.append(count)
+    chain = (0, *sorted(set(nodes)), count)
+    v1_cue_for_span = {
+        span: index
+        for index, span in enumerate(zip(landed, landed[1:]))
+        if span[0] < span[1]
+    }
+    return chain, rounded, v1_cue_for_span
+
+
+# Measures one chain cue and builds its edge; None when the prefix packer never
+# produced a measure (an empty span).
+def _v1_chain_edge(
+    atoms: Sequence[LatticeAtom],
+    left: int,
+    right: int,
+    packer: IncrementalPacker | None,
+    profile: DisplayProfile,
+    canonical_work: CanonicalWork,
+    lang: str,
+) -> tuple[Edge, PackMeasure, float | None, float | None] | None:
+    chunk = atoms[left:right]
+    if packer is None:
+        measure = _canonical_pack_measure(atoms, left, right, profile, canonical_work)
+    else:
+        packer.reset()
+        measure = None
+        for atom in chunk:
+            measure = packer.extend(atom.text)
+        if measure is None:
+            return None
+    low = span_min([atom.start for atom in chunk])
+    high = span_max([atom.end for atom in chunk])
+    edge = Edge(
+        start_node=left,
+        end_node=right,
+        text=_join([atom.text for atom in chunk], lang),
+        display_text=measure.text,
+        lines=measure.lines,
+        line_widths=measure.line_widths,
+        span_start=low,
+        span_end=high,
+        waiver=None,
+    )
+    return edge, measure, low, high
+
+
+# The acoustic-or-input evidence span a v1 chain cue is priced with.
+def _v1_evidence_span(
+    ctx: CostContext,
+    v1: V1Partition,
+    v1_cue_for_span: Mapping[tuple[int, int], int],
+    left: int,
+    right: int,
+    low: float | None,
+    high: float | None,
+    unit_range: tuple[int, int],
+) -> EvidenceSpan:
+    v1_index = v1_cue_for_span.get((left, right))
+    if v1_index is not None and v1_index < len(v1.cues):
+        evidence_span = evidence_span_from_cue(v1.cues[v1_index])
+    elif (
+        low is not None
+        and high is not None
+        and isinstance(low, (int, float))
+        and isinstance(high, (int, float))
+        and math.isfinite(low)
+        and math.isfinite(high)
+        and low <= high
+    ):
+        evidence_span = make_evidence_span(
+            ctx.units,
+            unit_range,
+            input_start=float(low),
+            input_end=float(high),
+        )
+    else:
+        evidence_span = EvidenceSpan(0.0, 0.0, "fabricated", "fabricated")
+    return evidence_span
+
+
+# The typed hard disagreements for one chain cue, in the fixed order
+# over-budget, crosses-barrier, over-cap-unwaived.
+def _v1_hard_disagreements(
+    cue_index: int,
+    measure: PackMeasure,
+    barriers: set[int],
+    left: int,
+    right: int,
+    low: float | None,
+    high: float | None,
+    unit_range: tuple[int, int],
+    profile: DisplayProfile,
+    units: Sequence[SourceUnit],
+) -> list[dict[str, Any]]:
+    disagreements: list[dict[str, Any]] = []
+    if not measure.fits:
+        disagreements.append(
+            {
+                "cue_index": cue_index,
+                "detail": f"{measure.lines} lines of widths "
+                f"{list(measure.line_widths)} exceed the budget",
+                "kind": "over-budget",
+                "unit_range": list(unit_range),
+            }
+        )
+    crossed = sorted(node for node in barriers if left < node < right)
+    if crossed:
+        disagreements.append(
+            {
+                "cue_index": cue_index,
+                "detail": f"crosses robust-silence barriers at nodes {crossed}",
+                "kind": "crosses-barrier",
+                "unit_range": list(unit_range),
+            }
+        )
+    if (
+        profile.max_cue_s > 0
+        and low is not None
+        and high is not None
+        and high - low > profile.max_cue_s + CAP_EPS_S
+        and not held_chain_continuous(units, unit_range[0], unit_range[1])
+    ):
+        disagreements.append(
+            {
+                "cue_index": cue_index,
+                "detail": f"span {high - low} exceeds the cap "
+                f"{profile.max_cue_s} with no continuous held chain",
+                "kind": "over-cap-unwaived",
+                "unit_range": list(unit_range),
+            }
+        )
+    return disagreements
 
 
 def score_v1_global(
@@ -927,34 +669,7 @@ def score_v1_global(
     bounds = [layer.unit_bound(node) for node in range(count + 1)]
     speaker_rows = isinstance(ctx.speaker_evidence, UnitSpeakers)
 
-    nodes: list[int] = []
-    rounded: list[dict[str, Any]] = []
-    # The node every v1 cue boundary landed on, in v1 cue order. Rounding can
-    # collapse several v1 cuts onto one node (or onto a document end), so a
-    # chain cue is matched to the v1 cue whose landed span it is -- never to the
-    # v1 cue that merely shares its position in the shortened chain.
-    landed: list[int] = [0]
-    for cut in sorted(set(v1.cuts)):
-        if not 0 < cut < layer.unit_count:
-            landed.append(0 if cut <= 0 else count)
-            continue
-        position = bisect.bisect_left(bounds, cut)
-        if bounds[position] != cut:
-            # Includes a cut inside the last atom, which rounds up onto the
-            # document end and so vanishes from the chain: still a finding.
-            rounded.append(
-                {"landed_unit": bounds[position], "node": position, "unit": cut}
-            )
-        landed.append(position)
-        if 0 < position < count:
-            nodes.append(position)
-    landed.append(count)
-    chain = (0, *sorted(set(nodes)), count)
-    v1_cue_for_span = {
-        span: index
-        for index, span in enumerate(zip(landed, landed[1:]))
-        if span[0] < span[1]
-    }
+    chain, rounded, v1_cue_for_span = _v1_landed_chain(v1, layer, bounds, count)
 
     barriers = {
         barrier.node
@@ -974,31 +689,12 @@ def score_v1_global(
     for cue_index, (left, right) in enumerate(zip(chain, chain[1:])):
         if left >= right:
             continue
-        chunk = atoms[left:right]
-        if packer is None:
-            measure = _canonical_pack_measure(
-                atoms, left, right, profile, canonical_work
-            )
-        else:
-            packer.reset()
-            measure = None
-            for atom in chunk:
-                measure = packer.extend(atom.text)
-            if measure is None:
-                continue
-        low = span_min([atom.start for atom in chunk])
-        high = span_max([atom.end for atom in chunk])
-        edge = Edge(
-            start_node=left,
-            end_node=right,
-            text=_join([atom.text for atom in chunk], lang),
-            display_text=measure.text,
-            lines=measure.lines,
-            line_widths=measure.line_widths,
-            span_start=low,
-            span_end=high,
-            waiver=None,
+        chain_edge = _v1_chain_edge(
+            atoms, left, right, packer, profile, canonical_work, lang
         )
+        if chain_edge is None:
+            continue
+        edge, measure, low, high = chain_edge
         unit_range = (layer.unit_bound(left), layer.unit_bound(right))
         common = {
             "profile": profile,
@@ -1027,26 +723,9 @@ def score_v1_global(
         else:
             base = edge_cost(edge, atoms, **common)
         if isinstance(ctx.speaker_evidence, UnitSpeakers):
-            v1_index = v1_cue_for_span.get((left, right))
-            if v1_index is not None and v1_index < len(v1.cues):
-                evidence_span = evidence_span_from_cue(v1.cues[v1_index])
-            elif (
-                low is not None
-                and high is not None
-                and isinstance(low, (int, float))
-                and isinstance(high, (int, float))
-                and math.isfinite(low)
-                and math.isfinite(high)
-                and low <= high
-            ):
-                evidence_span = make_evidence_span(
-                    ctx.units,
-                    unit_range,
-                    input_start=float(low),
-                    input_end=float(high),
-                )
-            else:
-                evidence_span = EvidenceSpan(0.0, 0.0, "fabricated", "fabricated")
+            evidence_span = _v1_evidence_span(
+                ctx, v1, v1_cue_for_span, left, right, low, high, unit_range
+            )
             speaker = speaker_edge_cost(
                 ctx.speaker_evidence,
                 unit_range,
@@ -1069,453 +748,26 @@ def score_v1_global(
                     v1_cut_units=ctx.v1_cut_units,
                 )
             )
-        if not measure.fits:
-            disagreements.append(
-                {
-                    "cue_index": cue_index,
-                    "detail": f"{measure.lines} lines of widths "
-                    f"{list(measure.line_widths)} exceed the budget",
-                    "kind": "over-budget",
-                    "unit_range": list(unit_range),
-                }
+        disagreements.extend(
+            _v1_hard_disagreements(
+                cue_index,
+                measure,
+                barriers,
+                left,
+                right,
+                low,
+                high,
+                unit_range,
+                profile,
+                units,
             )
-        crossed = sorted(node for node in barriers if left < node < right)
-        if crossed:
-            disagreements.append(
-                {
-                    "cue_index": cue_index,
-                    "detail": f"crosses robust-silence barriers at nodes {crossed}",
-                    "kind": "crosses-barrier",
-                    "unit_range": list(unit_range),
-                }
-            )
-        if (
-            profile.max_cue_s > 0
-            and low is not None
-            and high is not None
-            and high - low > profile.max_cue_s + CAP_EPS_S
-            and not held_chain_continuous(units, unit_range[0], unit_range[1])
-        ):
-            disagreements.append(
-                {
-                    "cue_index": cue_index,
-                    "detail": f"span {high - low} exceeds the cap "
-                    f"{profile.max_cue_s} with no continuous held chain",
-                    "kind": "over-cap-unwaived",
-                    "unit_range": list(unit_range),
-                }
-            )
+        )
 
     return V1Reference(
         global_cost=sum_breakdowns(parts),
         hard_disagreements=tuple(disagreements),
         cut_units=frozenset(v1.cuts),
         rounded_cuts=tuple(rounded),
-    )
-
-
-@dataclass(frozen=True)
-class AdoptedV1:
-    """The typed fallback: v1's own cues stand in for an infeasible interval."""
-
-    unit_range: tuple[int, int]
-    fallback_expansion_units: tuple[int, int] | None
-    cues: tuple[Cue, ...]
-    reason: str
-    cuts: tuple[int, ...] = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "cuts": list(self.cuts),
-            "fallback_expansion_units": None
-            if self.fallback_expansion_units is None
-            else list(self.fallback_expansion_units),
-            "reason": self.reason,
-            "unit_range": list(self.unit_range),
-        }
-
-
-def _adopt_v1(
-    interval: HardInterval,
-    reason: str,
-    v1: V1Partition | None,
-    unit_count: int,
-) -> AdoptedV1:
-    """Adopt the smallest set of COMPLETE v1 cues that covers the interval.
-
-    Complete cues, never a slice of one: half a v1 cue is neither engine's
-    answer. When the covering cues reach past the interval the adopted region
-    expands with them and the expansion is recorded, so a reader can see that the
-    fallback owns more than the interval it was asked about.
-    """
-    span = (interval.unit_start, interval.unit_end)
-    if v1 is None or not v1.cues:
-        return AdoptedV1(
-            unit_range=span, fallback_expansion_units=None, cues=(), reason=reason
-        )
-    bounds = owned_unit_ids(v1.cuts, unit_count)
-    picked = [
-        index
-        for index, (low, high) in enumerate(bounds)
-        if low < interval.unit_end and high > interval.unit_start
-    ]
-    if not picked:
-        return AdoptedV1(
-            unit_range=span, fallback_expansion_units=None, cues=(), reason=reason
-        )
-    low = bounds[picked[0]][0]
-    high = bounds[picked[-1]][1]
-    covered = (low, high)
-    return AdoptedV1(
-        unit_range=covered,
-        fallback_expansion_units=None if covered == span else covered,
-        cues=tuple(v1.cues[index] for index in picked if index < len(v1.cues)),
-        reason=reason,
-        cuts=tuple(bounds[index][1] for index in picked[:-1]),
-    )
-
-
-#: Why a solvable interval carries v1 cues: a neighbouring fallback's complete
-#: v1 cues reach into it.
-ADOPTION_ABSORBED: str = "absorbed-by-fallback"
-
-
-def _adoption_plan(
-    lattices: Sequence[IntervalLattice],
-    v1: V1Partition | None,
-    unit_count: int,
-) -> dict[int, AdoptedV1]:
-    """Every fallback interval's adoption, grown until the adoptions tile.
-
-    A covering v1 cue can straddle a barrier, so a fallback's complete cues can
-    reach into the neighbouring interval, before or after it. Keeping that
-    neighbour's own cues as well would own the straddled units twice, and the
-    document pass would report the duplicate against the neighbour -- as a false
-    exit-driving v2 violation when the neighbour was optimized. So a fallback
-    absorbs every interval its adoption touches, repeating until the adopted
-    span starts and ends on both an interval boundary and a v1 cue boundary.
-    Inside that span each member carries the v1 cues that start in it, so the
-    members' ranges still tile the stream in interval order; a member whose
-    units all sit inside an earlier member's cue carries an empty range. An
-    adoption that reaches no neighbour is exactly :func:`_adopt_v1`'s.
-    """
-    if v1 is None or not v1.cues:
-        return {}
-    bounds = owned_unit_ids(v1.cuts, unit_count)
-    spans = [(item.interval.unit_start, item.interval.unit_end) for item in lattices]
-    plan: dict[int, AdoptedV1] = {}
-    for seed, seed_lattice in enumerate(lattices):
-        infeasible = seed_lattice.infeasible
-        if infeasible is None or seed in plan:
-            continue
-        low, high = spans[seed]
-        first = last = seed
-        while True:
-            picked = [
-                index for index, (a, b) in enumerate(bounds) if a < high and b > low
-            ]
-            grown_low = min([low, *(bounds[index][0] for index in picked)])
-            grown_high = max([high, *(bounds[index][1] for index in picked)])
-            touched = [
-                position
-                for position, (start, end) in enumerate(spans)
-                if start < grown_high and end > grown_low
-            ]
-            grown_first = min([first, *touched])
-            grown_last = max([last, *touched])
-            grown_low = min(grown_low, spans[grown_first][0])
-            grown_high = max(grown_high, spans[grown_last][1])
-            if (grown_low, grown_high, grown_first, grown_last) == (
-                low,
-                high,
-                first,
-                last,
-            ):
-                break
-            low, high, first, last = grown_low, grown_high, grown_first, grown_last
-        if first == last:
-            plan[seed] = _adopt_v1(
-                seed_lattice.interval, infeasible.reason, v1, unit_count
-            )
-            continue
-        members = range(first, last + 1)
-        owned: dict[int, list[int]] = {position: [] for position in members}
-        for index in picked:
-            owner = first
-            for position in members:
-                if spans[position][0] <= bounds[index][0]:
-                    owner = position
-            owned[owner].append(index)
-        cursor = low
-        for position in members:
-            indices = owned[position]
-            covered = (
-                (bounds[indices[0]][0], bounds[indices[-1]][1])
-                if indices
-                else (cursor, cursor)
-            )
-            cursor = covered[1]
-            terminal = lattices[position].infeasible
-            plan[position] = AdoptedV1(
-                unit_range=covered,
-                fallback_expansion_units=None
-                if covered == spans[position]
-                else covered,
-                cues=tuple(v1.cues[index] for index in indices if index < len(v1.cues)),
-                reason=ADOPTION_ABSORBED if terminal is None else terminal.reason,
-                cuts=tuple(bounds[index][1] for index in indices[:-1]),
-            )
-    return plan
-
-
-# ------------------------------------------------------- interval solutions
-
-
-@dataclass(frozen=True)
-class IntervalSolution:
-    """One interval's committed answer plus everything a reader must audit it."""
-
-    interval: HardInterval
-    lattice: IntervalLattice
-    selection: Selection | None
-    adopted: AdoptedV1 | None
-    cues: tuple[Cue, ...]
-    partition_units: tuple[int, ...]
-    validator_raw: PartitionCheckResult
-    dp_relaxations: int
-    packer_steps: int
-    waivers: tuple[Waiver, ...] = ()
-    speaker_pricing: SpeakerPricingSummary | None = None
-    decision_margins: tuple[float, ...] = ()
-
-    @property
-    def optimized(self) -> bool:
-        return self.adopted is None
-
-    @property
-    def unit_range(self) -> tuple[int, int]:
-        if self.adopted is not None:
-            return self.adopted.unit_range
-        return (self.interval.unit_start, self.interval.unit_end)
-
-    @property
-    def coarse_caused(self) -> bool:
-        """Whether shared-unit atoms caused this interval's infeasibility.
-
-        ``coarse-granularity`` is only one possible terminal for that input
-        class.  A locally collapsed stream can honestly end as ``no-path`` or
-        ``relief-insufficient`` too, so the cause is the shared footprint plus
-        any typed infeasibility, never the terminal's spelling.
-        """
-        atoms = self.lattice.atoms
-        shared = any(
-            left.unit_end > right.unit_start for left, right in zip(atoms, atoms[1:])
-        )
-        return self.lattice.infeasible is not None and shared
-
-    def to_dict(self) -> dict[str, Any]:
-        selection = self.selection
-        infeasible = self.lattice.infeasible
-        return {
-            "adopted_v1": self.adopted is not None,
-            "all_invisible": self.lattice.all_invisible,
-            "atom_count": len(self.lattice.atoms),
-            "barrier_left": self.interval.left.kind,
-            "barrier_right": self.interval.right.kind,
-            "candidate_count": len(self.lattice.nodes),
-            "canonical_chars": self.lattice.canonical_chars,
-            "cap_relief_nodes": self.lattice.cap_relief_nodes,
-            "coalesced_atoms": self.lattice.coalesced_atoms,
-            "coarse_caused": self.coarse_caused,
-            "dp_relaxations": self.dp_relaxations,
-            "edge_count": len(self.lattice.edges),
-            "fallback_expansion_units": None
-            if self.adopted is None or self.adopted.fallback_expansion_units is None
-            else list(self.adopted.fallback_expansion_units),
-            "infeasible": None if infeasible is None else infeasible.to_dict(),
-            "interval_index": self.interval.index,
-            "margin_summary": _margin_summary(
-                self.decision_margins,
-                selected_cut_count=0
-                if selection is None
-                else len(selection.policy_selected.cuts),
-            ),
-            "node_range": [self.interval.node_start, self.interval.node_end],
-            "packer_steps": self.packer_steps,
-            "policy_selected": None
-            if selection is None
-            else selection.policy_selected.to_dict(),
-            "raw_optimum": None
-            if selection is None
-            else selection.raw_optimum.to_dict(),
-            "relief_injections": self.lattice.relief_injections,
-            "selected_is_v1": None
-            if selection is None or not selection.v1_supplied
-            else selection.selected_is_v1,
-            "unit_range": list(self.unit_range),
-            "v1_cost_under_v2": None
-            if selection is None or selection.v1_cost_under_v2 is None
-            else selection.v1_cost_under_v2.to_dict(),
-            "v1_illegality": None if selection is None else selection.v1_illegality,
-            "v1_path_legal": None
-            if selection is None or not selection.v1_supplied
-            else selection.v1_path_legal,
-            "v2_partition": list(self.partition_units),
-            "validator_raw": self.validator_raw.to_dict(),
-            "waivers": [waiver.to_dict() for waiver in self.waivers],
-        }
-
-
-def _path_edges(lattice: IntervalLattice, cuts: Sequence[int]) -> tuple[Edge, ...]:
-    index = {(edge.start_node, edge.end_node): edge for edge in lattice.edges}
-    nodes = (0, *cuts, len(lattice.atoms))
-    return tuple(index[(left, right)] for left, right in zip(nodes, nodes[1:]))
-
-
-def _resolve_selected_path(
-    lattice: IntervalLattice,
-    tables: CostTables,
-    cuts: Sequence[int],
-) -> tuple[IntervalLattice, tuple[Edge, ...]]:
-    """Resolve the selected chain and install those exact facts before sealing."""
-    selected = _path_edges(lattice, cuts)
-    ctx = tables.speaker_context
-    if ctx is None:
-        return lattice, selected
-
-    previous_end = tables.fallback_start
-    resolved: list[Edge] = []
-    for edge in selected:
-        item = _resolve_edge_for_previous(
-            lattice,
-            edge,
-            ctx,
-            previous_end=previous_end,
-        )
-        if item.input_end is None:
-            raise ValueError("selected speaker edge has no resolved input end")
-        resolved.append(item)
-        previous_end = float(item.input_end)
-
-    replacements = {(edge.start_node, edge.end_node): edge for edge in resolved}
-    edges = tuple(
-        replacements.get((edge.start_node, edge.end_node), edge)
-        for edge in lattice.edges
-    )
-    # One pass over the edges (not one per node): same keys in lattice.nodes
-    # order, same per-node edge order as the edge tuple.
-    nodes = set(lattice.nodes)
-    grouped: dict[int, list[Edge]] = {}
-    for edge in edges:
-        if edge.start_node in nodes:
-            grouped.setdefault(edge.start_node, []).append(edge)
-    edges_from: dict[int, tuple[Edge, ...]] = {
-        node: tuple(grouped[node]) for node in lattice.nodes if node in grouped
-    }
-    sealed_lattice = replace(lattice, edges=edges, edges_from=edges_from)
-    return sealed_lattice, tuple(resolved)
-
-
-def optimize_interval(
-    lattice: IntervalLattice,
-    tables: CostTables,
-    ctx: CostContext,
-    *,
-    units: Sequence[SourceUnit],
-    v1: V1Partition | None = None,
-    fallback_start: float = 0.0,
-    adopted: AdoptedV1 | None = None,
-) -> IntervalSolution:
-    """Solve one interval, or adopt v1's cues for it and say why.
-
-    ``ctx`` is a deviation from the reviewed signature: the validator needs the
-    resolved display profile and materialization needs the language, and both
-    already ride on the cost context rather than being threaded a second time.
-    ``adopted`` is the document's adoption plan for this interval (see
-    :func:`_adoption_plan`); without one an infeasible interval adopts alone.
-    """
-    interval = lattice.interval
-    profile = ctx.profile
-    lang = profile.language
-
-    if adopted is None and lattice.infeasible is not None:
-        adopted = _adopt_v1(interval, lattice.infeasible.reason, v1, len(units))
-    if adopted is not None:
-        low, high = adopted.unit_range
-        return IntervalSolution(
-            interval=interval,
-            lattice=lattice,
-            selection=None,
-            adopted=adopted,
-            cues=adopted.cues,
-            partition_units=adopted.cuts,
-            # An empty range with no cue has nothing to conserve: its units
-            # belong to a cue an earlier member of the same fallback adopted.
-            validator_raw=PartitionCheckResult(
-                origin="v1",
-                stage="raw",
-                violations=(),
-                waivers=(),
-                cue_count=0,
-                unit_count=0,
-            )
-            if low == high and not adopted.cues
-            else check_partition(
-                [cut - low for cut in adopted.cuts],
-                adopted.cues,
-                units=units[low:high],
-                profile=profile,
-                # Units no adopted v1 cue covers are v2's failure to cover them.
-                origin="v1" if adopted.cues else "v2",
-                stage="raw",
-            ),
-            dp_relaxations=0,
-            packer_steps=lattice.packer_steps,
-            speaker_pricing=tables.speaker_pricing,
-        )
-
-    dp = solve_interval(lattice, tables)
-    selection = _select(lattice, tables, dp, v1)
-    decision_margins = _pinned_neighbour_margins(
-        lattice, tables, selection.policy_selected
-    )
-    chosen = selection.policy_selected
-    selected_lattice, edges = _resolve_selected_path(lattice, tables, chosen.cuts)
-    cues = materialize_cues(
-        edges,
-        selected_lattice.atoms,
-        lang,
-        fallback_start=fallback_start,
-        units=units,
-    )
-    waivers = tuple(
-        replace(edge.waiver, cue_index=index)
-        for index, edge in enumerate(edges)
-        if edge.waiver is not None
-    )
-    partition_units = tuple(lattice.unit_bound(node) for node in chosen.cuts)
-    low, high = interval.unit_start, interval.unit_end
-    return IntervalSolution(
-        interval=interval,
-        lattice=selected_lattice,
-        selection=selection,
-        adopted=None,
-        cues=cues,
-        partition_units=partition_units,
-        validator_raw=check_partition(
-            [cut - low for cut in partition_units],
-            cues,
-            units=units[low:high],
-            profile=profile,
-            origin="v2",
-            stage="raw",
-            waivers={waiver.cue_index: waiver for waiver in waivers},
-        ),
-        dp_relaxations=dp.relaxations,
-        packer_steps=lattice.packer_steps,
-        waivers=waivers,
-        speaker_pricing=tables.speaker_pricing,
-        decision_margins=decision_margins,
     )
 
 
@@ -1796,32 +1048,13 @@ def _resolve_speaker_evidence(
     )
 
 
-def _artifact(
-    document: SegDocument,
-    lattice: DocumentLattice,
+# Count the materialized cues that carry more than one named speaker; the
+# ownership check raises at the same point the inline block did.
+def _named_multi_cues(
     solutions: Sequence[IntervalSolution],
-    v1_reference: V1Reference | None,
-    document_check: PartitionCheckResult,
-    subunit_split: RefineResult,
     speakers: UnitSpeakers | None,
-    speaker_weight: float,
-) -> dict[str, Any]:
-    unit_count = len(document.units)
-    optimized = [solution for solution in solutions if solution.optimized]
-    optimized_units = sum(
-        solution.interval.unit_end - solution.interval.unit_start
-        for solution in optimized
-    )
-    waivers: list[dict[str, Any]] = []
-    for solution in solutions:
-        waivers.extend(waiver.to_dict() for waiver in solution.waivers)
-    interval_hard = sum(
-        len(solution.validator_raw.exit_driving) for solution in solutions
-    )
-    coarse_caused_intervals = sum(solution.coarse_caused for solution in solutions)
-    speaker_pricing = (
-        _speaker_pricing_totals(solutions) if speakers is not None else None
-    )
+    unit_count: int,
+) -> int:
     named_multi = 0
     if speakers is not None:
         materialized = tuple(solution for solution in solutions if solution.cues)
@@ -1850,6 +1083,87 @@ def _artifact(
             named_multi = named_multi_cues_unannotated(
                 cue_ranges, speakers.unit_speakers
             )
+    return named_multi
+
+
+# The ``totals`` block of the artifact; the caller keeps its key position.
+def _artifact_totals(
+    lattice: DocumentLattice,
+    solutions: Sequence[IntervalSolution],
+    optimized: Sequence[IntervalSolution],
+    optimized_units: int,
+    unit_count: int,
+    interval_hard: int,
+    coarse_caused_intervals: int,
+    waivers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "all_invisible_intervals": sum(
+            1 for solution in solutions if solution.lattice.all_invisible
+        ),
+        "atom_count": len(lattice.layer.atoms),
+        "barrier_count": len(lattice.barriers),
+        "cap_relief_nodes": sum(
+            solution.lattice.cap_relief_nodes for solution in solutions
+        ),
+        "coalesced_atoms": sum(
+            solution.lattice.coalesced_atoms for solution in solutions
+        ),
+        "canonical_chars": sum(
+            solution.lattice.canonical_chars for solution in solutions
+        ),
+        "coarse_granularity_intervals": sum(
+            1
+            for solution in solutions
+            if solution.lattice.infeasible is not None
+            and solution.lattice.infeasible.reason == COARSE_GRANULARITY
+        ),
+        "coarse_caused_intervals": coarse_caused_intervals,
+        "dp_relaxations": sum(solution.dp_relaxations for solution in solutions),
+        "fallback_intervals": len(solutions) - len(optimized),
+        "hard_violations": interval_hard,
+        "interval_count": len(solutions),
+        "optimized_intervals": len(optimized),
+        "optimized_unit_ratio": 1.0
+        if unit_count == 0
+        else optimized_units / unit_count,
+        "packer_steps": sum(solution.packer_steps for solution in solutions),
+        "relief_injections": sum(
+            solution.lattice.relief_injections for solution in solutions
+        ),
+        "sentence_ends_missed": lattice.sentence_ends.missed,
+        "unit_count": unit_count,
+        "waivers": waivers,
+    }
+
+
+def _artifact(
+    document: SegDocument,
+    lattice: DocumentLattice,
+    solutions: Sequence[IntervalSolution],
+    v1_reference: V1Reference | None,
+    document_check: PartitionCheckResult,
+    subunit_split: RefineResult,
+    speakers: UnitSpeakers | None,
+    speaker_weight: float,
+) -> dict[str, Any]:
+    unit_count = len(document.units)
+    optimized = [solution for solution in solutions if solution.optimized]
+    optimized_units = sum(
+        solution.interval.unit_end - solution.interval.unit_start
+        for solution in optimized
+    )
+    waivers: list[dict[str, Any]] = []
+    for solution in solutions:
+        waivers.extend(waiver.to_dict() for waiver in solution.waivers)
+    interval_hard = sum(
+        len(solution.validator_raw.exit_driving) for solution in solutions
+    )
+    coarse_caused_intervals = sum(solution.coarse_caused for solution in solutions)
+    speaker_pricing = (
+        _speaker_pricing_totals(solutions) if speakers is not None else None
+    )
+    named_multi = _named_multi_cues(solutions, speakers, unit_count)
     artifact: dict[str, Any] = {
         "coverage": {
             "coarse_caused_intervals": coarse_caused_intervals,
@@ -1905,44 +1219,16 @@ def _artifact(
         ),
         "subunit_split": subunit_split.to_dict(),
         "vad_state": _vad_state_totals(solutions),
-        "totals": {
-            "all_invisible_intervals": sum(
-                1 for solution in solutions if solution.lattice.all_invisible
-            ),
-            "atom_count": len(lattice.layer.atoms),
-            "barrier_count": len(lattice.barriers),
-            "cap_relief_nodes": sum(
-                solution.lattice.cap_relief_nodes for solution in solutions
-            ),
-            "coalesced_atoms": sum(
-                solution.lattice.coalesced_atoms for solution in solutions
-            ),
-            "canonical_chars": sum(
-                solution.lattice.canonical_chars for solution in solutions
-            ),
-            "coarse_granularity_intervals": sum(
-                1
-                for solution in solutions
-                if solution.lattice.infeasible is not None
-                and solution.lattice.infeasible.reason == COARSE_GRANULARITY
-            ),
-            "coarse_caused_intervals": coarse_caused_intervals,
-            "dp_relaxations": sum(solution.dp_relaxations for solution in solutions),
-            "fallback_intervals": len(solutions) - len(optimized),
-            "hard_violations": interval_hard,
-            "interval_count": len(solutions),
-            "optimized_intervals": len(optimized),
-            "optimized_unit_ratio": 1.0
-            if unit_count == 0
-            else optimized_units / unit_count,
-            "packer_steps": sum(solution.packer_steps for solution in solutions),
-            "relief_injections": sum(
-                solution.lattice.relief_injections for solution in solutions
-            ),
-            "sentence_ends_missed": lattice.sentence_ends.missed,
-            "unit_count": unit_count,
-            "waivers": waivers,
-        },
+        "totals": _artifact_totals(
+            lattice,
+            solutions,
+            optimized,
+            optimized_units,
+            unit_count,
+            interval_hard,
+            coarse_caused_intervals,
+            waivers,
+        ),
         "v1": None if v1_reference is None else v1_reference.to_dict(),
         "validator": {
             "core": None,
@@ -1962,6 +1248,77 @@ def _artifact(
     if speakers is not None:
         artifact["delta_registry"] = delta_registry_data()
     return artifact
+
+
+# Resolve the audited sub-unit split of a document, declaring the identity
+# mapping when none was supplied.
+def _audited_subunit_split(
+    document: SegDocument, subunit_split: RefineResult | None
+) -> RefineResult:
+    if subunit_split is None:
+        if any(unit.provenance.startswith("subunit-") for unit in document.units):
+            raise ValueError(
+                "a derived sub-unit stream requires its audited subunit_split result"
+            )
+        split = empty_refine_result(document.units, language=document.language)
+    else:
+        split = subunit_split
+    require_issued_refinement(split)
+    if tuple(document.units) != split.units or len(split.origin) != len(document.units):
+        raise ValueError("subunit_split does not describe this document's unit stream")
+    return split
+
+
+# Solve the intervals in order.  fallback_start threads the preceding selected
+# interval's delivered input end, and reuse.document_nodes is filled as each
+# interval's tables are built.
+def _solve_intervals(
+    document: SegDocument,
+    lattice: DocumentLattice,
+    reuse: _OptimizationReuse,
+    ctx: CostContext,
+    v1: V1Partition | None,
+    speaker_enabled: bool,
+) -> tuple[list[IntervalSolution], list[IntervalLattice]]:
+    solutions: list[IntervalSolution] = []
+    resolved_lattices: list[IntervalLattice] = []
+    fallback_start = 0.0
+    adoptions = _adoption_plan(lattice.lattices, v1, len(document.units))
+    for position, raw_interval_lattice in enumerate(lattice.lattices):
+        interval_lattice = (
+            _cache_candidate_evidence(
+                raw_interval_lattice,
+                document,
+                fallback_start=fallback_start,
+            )
+            if speaker_enabled
+            else raw_interval_lattice
+        )
+        cached_nodes = reuse.document_nodes.get(raw_interval_lattice.interval.index)
+        tables = build_cost_tables(
+            interval_lattice,
+            ctx,
+            fallback_start=fallback_start,
+            document_nodes=cached_nodes,
+        )
+        if cached_nodes is None:
+            reuse.document_nodes[raw_interval_lattice.interval.index] = (
+                tables.document_nodes
+            )
+        solution = optimize_interval(
+            interval_lattice,
+            tables,
+            ctx,
+            units=document.units,
+            v1=v1,
+            fallback_start=fallback_start,
+            adopted=adoptions.get(position),
+        )
+        solutions.append(solution)
+        resolved_lattices.append(solution.lattice)
+        if solution.cues:
+            fallback_start = float(solution.cues[-1]["end"])
+    return solutions, resolved_lattices
 
 
 def optimize_document(
@@ -1984,17 +1341,7 @@ def optimize_document(
     supplied parent projection): ``None`` preserves the pre-W4 live call, while
     W4 can request the full and counterfactual rows with ``3.0`` and ``0.0``.
     """
-    if subunit_split is None:
-        if any(unit.provenance.startswith("subunit-") for unit in document.units):
-            raise ValueError(
-                "a derived sub-unit stream requires its audited subunit_split result"
-            )
-        split = empty_refine_result(document.units, language=document.language)
-    else:
-        split = subunit_split
-    require_issued_refinement(split)
-    if tuple(document.units) != split.units or len(split.origin) != len(document.units):
-        raise ValueError("subunit_split does not describe this document's unit stream")
+    split = _audited_subunit_split(document, subunit_split)
 
     speaker_enabled = speakers is not None or speaker_weight is not None
     invalid = preflight_profile(document.profile)
@@ -2036,44 +1383,9 @@ def optimize_document(
         speaker_weight=resolved_weight,
     )
 
-    solutions: list[IntervalSolution] = []
-    resolved_lattices: list[IntervalLattice] = []
-    fallback_start = 0.0
-    adoptions = _adoption_plan(lattice.lattices, v1, len(document.units))
-    for position, raw_interval_lattice in enumerate(lattice.lattices):
-        interval_lattice = (
-            _cache_candidate_evidence(
-                raw_interval_lattice,
-                document,
-                fallback_start=fallback_start,
-            )
-            if speaker_enabled
-            else raw_interval_lattice
-        )
-        cached_nodes = reuse.document_nodes.get(raw_interval_lattice.interval.index)
-        tables = build_cost_tables(
-            interval_lattice,
-            ctx,
-            fallback_start=fallback_start,
-            document_nodes=cached_nodes,
-        )
-        if cached_nodes is None:
-            reuse.document_nodes[raw_interval_lattice.interval.index] = (
-                tables.document_nodes
-            )
-        solution = optimize_interval(
-            interval_lattice,
-            tables,
-            ctx,
-            units=document.units,
-            v1=v1,
-            fallback_start=fallback_start,
-            adopted=adoptions.get(position),
-        )
-        solutions.append(solution)
-        resolved_lattices.append(solution.lattice)
-        if solution.cues:
-            fallback_start = float(solution.cues[-1]["end"])
+    solutions, resolved_lattices = _solve_intervals(
+        document, lattice, reuse, ctx, v1, speaker_enabled
+    )
 
     lattice = replace(lattice, lattices=tuple(resolved_lattices))
 

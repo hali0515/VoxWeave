@@ -900,6 +900,23 @@ def _asr_pass(
     return out
 
 
+def _chunk_units(
+    full: list[list[dict]] | None,
+    i: int,
+    wav: Path,
+    text: str,
+    align_lang: str,
+    n: int,
+) -> list[dict]:
+    """Units for chunk ``i``: none for blank text, else the full-file pass result
+    when there is one, else a contained per-chunk alignment."""
+    if not text.strip():
+        return []
+    if full is not None:
+        return full[i]
+    return _align_chunk_safe(wav, text, align_lang, i, n)
+
+
 def transcribe_chunks(
     wav_paths: list[Path],
     language: str | None,
@@ -1013,24 +1030,8 @@ def transcribe_chunks(
         for i, (w, (dw, tw, aw), (dq, tq, aq)) in enumerate(
             zip(wav_paths, w_asr, q_asr)
         ):
-            uw = (
-                (
-                    full_w[i]
-                    if full_w is not None
-                    else _align_chunk_safe(w, tw, aw, i, n)
-                )
-                if tw.strip()
-                else []
-            )
-            uq = (
-                (
-                    full_q[i]
-                    if full_q is not None
-                    else _align_chunk_safe(w, tq, aq, i, n)
-                )
-                if tq.strip()
-                else []
-            )
+            uw = _chunk_units(full_w, i, w, tw, aw, n)
+            uq = _chunk_units(full_q, i, w, tq, aq, n)
             out.append(_fuse_chunk((dw, tw, uw), (dq, tq, uq), language))
             _empty_cache()
             _tick()
@@ -1055,12 +1056,7 @@ def transcribe_chunks(
     )
     out2: list[tuple[str | None, str, list[dict]]] = []
     for i, (w, (det, text, align_lang)) in enumerate(zip(wav_paths, asr_out)):
-        if not text.strip():
-            units: list[dict] = []
-        elif full_units is not None:
-            units = full_units[i]
-        else:
-            units = _align_chunk_safe(w, text, align_lang, i, n)
+        units = _chunk_units(full_units, i, w, text, align_lang, n)
         out2.append((det, text, units))
         _empty_cache()  # alignment matrix grows with length; reclaim after each chunk
         _tick()

@@ -9,15 +9,11 @@ origin; it never borrows the selected legacy route origin.
 from __future__ import annotations
 
 import copy
-import dataclasses
-import hashlib
-import json
 import math
 import secrets
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal
 
 from voxweave.align_context import (
     IssuedAlignContext,
@@ -45,309 +41,71 @@ from voxweave.align_distribution import (
 from voxweave.align_failures import CanonicalFailure, SecondaryFailure
 from voxweave.align_runtime import align_runtime_activity
 from voxweave.align_snapshot import (
-    FROZEN_NULL,
     FrozenArray,
-    FrozenJSON,
-    FrozenObject,
-    freeze_json,
     frozen_json_digest,
 )
-
-
-Provenance = Literal["aligner", "align-interpolated"]
-
-
-@dataclass(frozen=True)
-class StrictCapturedUnit:
-    unit_id: str
-    call_index: int
-    call_unit_index: int
-    surface: str
-    relative_start: float | None
-    relative_end: float | None
-    provenance: Provenance
-    original_relative_start: float | None
-    original_relative_end: float | None
-    raw: FrozenJSON
-
-
-@dataclass(frozen=True)
-class StrictCaptureResult:
-    call_index: int
-    status: Literal["valid", "invalid"]
-    units: tuple[StrictCapturedUnit, ...] | None
-    raw_units_digest: str | None
-    normalized_relative_digest: str | None
-    failure: StrictFailureLocator | None
-    observed_unit_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class FreshUnit:
-    unit_id: str
-    call_index: int
-    call_unit_index: int
-    surface: str
-    relative_start: float | None
-    relative_end: float | None
-    physical_origin_seconds: float
-    start: float | None
-    end: float | None
-    provenance: Provenance
-    original_relative_start: float | None
-    original_relative_end: float | None
-    raw: FrozenJSON
-
-
-@dataclass(frozen=True)
-class AuthorityTransformResult:
-    call_index: int
-    status: Literal["valid", "invalid"]
-    capture: StrictCaptureResult
-    units: tuple[FreshUnit, ...] | None
-    authority_absolute_digest: str | None
-    failure: StrictFailureLocator | None
-
-
-@dataclass(frozen=True)
-class QwenSampleGeometry:
-    sample_start: int
-    sample_end: int
-    sample_rate: int
-    sample_count: int
-    physical_origin_seconds: float
-    legacy_origin_seconds: float
-    legacy_origin_kind: Literal["nominal-route"]
-    authority_origin_seconds: float
-
-
-@dataclass(frozen=True)
-class PhysicalCallReceipt:
-    call_index: int
-    source_block_indices: tuple[int, ...]
-    audio_sample_start: int
-    audio_sample_end: int
-    sample_rate: int
-    physical_origin_seconds: float
-    legacy_origin_seconds: float
-    legacy_origin_kind: Literal["identity", "sample-origin", "nominal-route"]
-    authority_origin_seconds: float
-    backend_model_config_digest: str
-    route_input_digest: str
-    strict_unit_status: Literal["valid", "invalid"]
-    strict_failure: StrictFailureLocator | None
-    raw_units_digest: str | None
-    normalized_relative_digest: str | None
-    legacy_slice_digest: str
-    legacy_absolute_digest: str | None
-    authority_transform_status: Literal["valid", "invalid"]
-    authority_absolute_digest: str | None
-    raw_unit_ids: tuple[str, ...]
-
-
-class SampleGeometryError(ValueError):
-    """Qwen route bounds cannot name one valid physical call."""
-
-    def __init__(self, detail_code: str, message: str):
-        super().__init__(message)
-        self.detail_code = detail_code
-
-
-def _attach_canonical_failure(
-    exc: BaseException,
-    *,
-    kind: str,
-    phase: str,
-    detail_code: str,
-) -> None:
-    """Classify an unchanged historical exception boundary."""
-    try:
-        if not isinstance(getattr(exc, "failure", None), CanonicalFailure):
-            setattr(exc, "failure", CanonicalFailure(kind, phase, detail_code))
-    except Exception:
-        pass
-
-
-def _exact_index(value: Any, *, name: str) -> int:
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{name} must be an exact nonnegative integer")
-    return value
-
-
-def _exact_optional_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if type(value) is not float:
-        raise TypeError("relative bounds must be exact floats or null")
-    return value
-
-
-def _same_optional_float(left: float | None, right: float | None) -> bool:
-    if left is None or right is None:
-        return left is right
-    return left.hex() == right.hex()
-
-
-def _strict_node(
-    node: Any,
-    *,
-    original: Any | None,
-    unit_id: str,
-    call_index: int,
-    call_unit_index: int,
-) -> StrictCapturedUnit:
-    if not isinstance(node, Mapping):
-        raise TypeError("raw alignment unit must be an object")
-    if "text" not in node or "start" not in node or "end" not in node:
-        raise TypeError("raw alignment unit is missing a required member")
-    surface = node["text"]
-    if type(surface) is not str:
-        raise TypeError("raw alignment unit text must be an exact string")
-    relative_start = _exact_optional_float(node["start"])
-    relative_end = _exact_optional_float(node["end"])
-    raw = freeze_json(node)
-
-    if original is None:
-        original_start = relative_start
-        original_end = relative_end
-        provenance: Provenance = "aligner"
-    else:
-        if not isinstance(original, Mapping):
-            raise TypeError("original alignment unit must be an object")
-        if "start" not in original or "end" not in original:
-            raise TypeError("original alignment unit is missing a bound")
-        original_start = _exact_optional_float(original["start"])
-        original_end = _exact_optional_float(original["end"])
-        provenance = (
-            "aligner"
-            if _same_optional_float(relative_start, original_start)
-            and _same_optional_float(relative_end, original_end)
-            else "align-interpolated"
-        )
-    return StrictCapturedUnit(
-        unit_id,
-        call_index,
-        call_unit_index,
-        surface,
-        relative_start,
-        relative_end,
-        provenance,
-        original_start,
-        original_end,
-        raw,
-    )
-
-
-def _optional_json_float(value: float | None) -> FrozenJSON:
-    return FROZEN_NULL if value is None else freeze_json(value)
-
-
-def _relative_unit_value(unit: StrictCapturedUnit) -> FrozenArray:
-    """Every relative-unit field, in the fixed order its digest encoding binds."""
-    return FrozenArray(
-        (
-            freeze_json(unit.unit_id),
-            freeze_json(unit.call_index),
-            freeze_json(unit.call_unit_index),
-            freeze_json(unit.surface),
-            _optional_json_float(unit.relative_start),
-            _optional_json_float(unit.relative_end),
-            freeze_json(unit.provenance),
-            _optional_json_float(unit.original_relative_start),
-            _optional_json_float(unit.original_relative_end),
-            unit.raw,
-        )
-    )
-
-
-def capture_strict_units(
-    raw_units: Sequence[Any],
-    *,
-    call_index: int,
-    raw_unit_ids: Sequence[str],
-    original_units: Sequence[Any] | None = None,
-) -> StrictCaptureResult:
-    """Capture every outer result node or expose no typed member at all."""
-    call = _exact_index(call_index, name="call_index")
-    try:
-        raw_count = len(raw_units)
-    except Exception as exc:  # pragma: no cover - defensive API boundary
-        classified = TypeError("raw_units must be a sized sequence")
-        _attach_canonical_failure(
-            classified,
-            kind="fresh-backend-output-invalid",
-            phase="backend-output",
-            detail_code="backend-call-shape",
-        )
-        raise classified from exc
-    observed_ids = tuple(raw_unit_ids)
-    if len(observed_ids) != raw_count or any(
-        type(unit_id) is not str or not unit_id for unit_id in observed_ids
-    ):
-        raise ValueError("raw_unit_ids must assign one exact string to every raw node")
-    if original_units is not None and len(original_units) != raw_count:
-        exc = ValueError("original_units must match the current raw result length")
-        _attach_canonical_failure(
-            exc,
-            kind="fresh-backend-output-invalid",
-            phase="relative-normalization",
-            detail_code="relative-normalization",
-        )
-        raise exc
-
-    captured: list[StrictCapturedUnit] = []
-    raw_values: list[FrozenJSON] = []
-    for index in range(raw_count):
-        try:
-            unit = _strict_node(
-                raw_units[index],
-                original=original_units[index] if original_units is not None else None,
-                unit_id=observed_ids[index],
-                call_index=call,
-                call_unit_index=index,
-            )
-        except Exception:  # noqa: BLE001 - all raw-domain defects share one locator
-            return StrictCaptureResult(
-                call,
-                "invalid",
-                None,
-                None,
-                None,
-                StrictFailureLocator("strict-capture", index, "strict-raw-node"),
-                observed_ids,
-            )
-        captured.append(unit)
-        raw_values.append(unit.raw)
-    units = tuple(captured)
-    return StrictCaptureResult(
-        call,
-        "valid",
-        units,
-        frozen_json_digest(FrozenArray(tuple(raw_values))),
-        frozen_json_digest(FrozenArray(tuple(_relative_unit_value(u) for u in units))),
-        None,
-        observed_ids,
-    )
-
-
-def _absolute_unit_value(unit: FreshUnit) -> FrozenArray:
-    return FrozenArray(
-        (
-            freeze_json(unit.unit_id),
-            freeze_json(unit.call_index),
-            freeze_json(unit.call_unit_index),
-            freeze_json(unit.surface),
-            _optional_json_float(unit.relative_start),
-            _optional_json_float(unit.relative_end),
-            freeze_json(unit.physical_origin_seconds),
-            _optional_json_float(unit.start),
-            _optional_json_float(unit.end),
-            freeze_json(unit.provenance),
-            _optional_json_float(unit.original_relative_start),
-            _optional_json_float(unit.original_relative_end),
-            unit.raw,
-        )
-    )
+from voxweave.align_strict_capture import (
+    Provenance as Provenance,
+    StrictCapturedUnit as StrictCapturedUnit,
+    StrictCaptureResult as StrictCaptureResult,
+    FreshUnit as FreshUnit,
+    AuthorityTransformResult as AuthorityTransformResult,
+    QwenSampleGeometry as QwenSampleGeometry,
+    PhysicalCallReceipt as PhysicalCallReceipt,
+    SampleGeometryError as SampleGeometryError,
+    _attach_canonical_failure as _attach_canonical_failure,
+    _exact_index as _exact_index,
+    _exact_optional_float as _exact_optional_float,
+    _same_optional_float as _same_optional_float,
+    _strict_node as _strict_node,
+    _optional_json_float as _optional_json_float,
+    _relative_unit_value as _relative_unit_value,
+    capture_strict_units as capture_strict_units,
+    _absolute_unit_value as _absolute_unit_value,
+    qwen_sample_geometry as qwen_sample_geometry,
+)
+from voxweave.align_fresh_seals import (
+    AcquisitionAdmissionEvent as AcquisitionAdmissionEvent,
+    AcquisitionAdmissionLedger as AcquisitionAdmissionLedger,
+    FreshSealBroken as FreshSealBroken,
+    _distribution_seal_failure as _distribution_seal_failure,
+    IssuedFreshAlignment as IssuedFreshAlignment,
+    VerifiedFreshAlignment as VerifiedFreshAlignment,
+    FreshAlignmentSession as FreshAlignmentSession,
+    _ObservedPhysicalCall as _ObservedPhysicalCall,
+    ReferencePhysicalCallFacts as ReferencePhysicalCallFacts,
+    _AdapterPayload as _AdapterPayload,
+    _FreshSeals as _FreshSeals,
+    _FreshRecord as _FreshRecord,
+    _VerifiedRecord as _VerifiedRecord,
+    _SessionRecord as _SessionRecord,
+    EvidenceCoreProducerInputs as EvidenceCoreProducerInputs,
+    EvidenceCoreReferenceInputs as EvidenceCoreReferenceInputs,
+    _stable_fact_digest as _stable_fact_digest,
+    _capture_digest_facts as _capture_digest_facts,
+    _stable_value as _stable_value,
+    _stable_digest as _stable_digest,
+    _physical_projection as _physical_projection,
+    _context_seal_inputs as _context_seal_inputs,
+    _context_seal_digest as _context_seal_digest,
+    _capture_seal_inputs as _capture_seal_inputs,
+    _raw_seal_digest as _raw_seal_digest,
+    _relative_seal_digest as _relative_seal_digest,
+    _legacy_slice_seal_inputs as _legacy_slice_seal_inputs,
+    _legacy_slice_seal_digest as _legacy_slice_seal_digest,
+    _authority_seal_inputs as _authority_seal_inputs,
+    _authority_seal_digest as _authority_seal_digest,
+    _distribution_seal_inputs as _distribution_seal_inputs,
+    _distribution_seal_digest as _distribution_seal_digest,
+    _phase1_seal_inputs as _phase1_seal_inputs,
+    _phase1_seal_digest as _phase1_seal_digest,
+    _SEALS as _SEALS,
+    _seal_fresh_record as _seal_fresh_record,
+    _same_objects as _same_objects,
+    _SEAL_PHASES as _SEAL_PHASES,
+    _raise_component_seal as _raise_component_seal,
+    _verify_fresh_seals as _verify_fresh_seals,
+)
 
 
 def transform_strict_units(
@@ -450,94 +208,6 @@ def transform_strict_units(
     )
 
 
-def qwen_sample_geometry(
-    *,
-    nominal_start: float,
-    nominal_end: float,
-    sample_rate: int,
-    sample_count: int,
-) -> QwenSampleGeometry:
-    """Mirror ``chunking.slice_wav``'s sample arithmetic; retain both time origins."""
-    if type(nominal_start) is not float or type(nominal_end) is not float:
-        raise SampleGeometryError(
-            "sample-geometry", "Qwen nominal bounds must be exact floats"
-        )
-    if not math.isfinite(nominal_start) or not math.isfinite(nominal_end):
-        raise SampleGeometryError(
-            "sample-geometry", "Qwen nominal bounds must be finite"
-        )
-    if type(sample_rate) is not int or sample_rate <= 0:
-        raise SampleGeometryError(
-            "sample-geometry", "sample rate must be a positive exact integer"
-        )
-    if type(sample_count) is not int or sample_count < 0:
-        raise SampleGeometryError(
-            "sample-geometry", "sample count must be an exact nonnegative integer"
-        )
-    try:
-        sample_start = min(max(0, int(nominal_start * sample_rate)), sample_count)
-        sample_end = min(sample_count, int(nominal_end * sample_rate))
-    except (
-        OverflowError,
-        ValueError,
-    ) as exc:  # pragma: no cover - finite checked above
-        raise SampleGeometryError(
-            "sample-geometry", "invalid Qwen sample bounds"
-        ) from exc
-    if sample_end < sample_start or sample_end < 0:
-        raise SampleGeometryError(
-            "sample-geometry", "Qwen sample interval is reversed or negative"
-        )
-    physical_origin = sample_start / sample_rate
-    return QwenSampleGeometry(
-        sample_start,
-        sample_end,
-        sample_rate,
-        sample_count,
-        physical_origin,
-        nominal_start,
-        "nominal-route",
-        physical_origin,
-    )
-
-
-@dataclass(frozen=True)
-class AcquisitionAdmissionEvent:
-    terminal: Literal["acquisition-failed"]
-    subject: tuple[str, str]
-    payload: tuple[str, str, str, str, int, tuple[()]]
-
-
-@dataclass
-class AcquisitionAdmissionLedger:
-    events: list[AcquisitionAdmissionEvent] = field(default_factory=list)
-    _terminal_contexts: set[int] = field(default_factory=set, init=False, repr=False)
-    _lock: threading.RLock = field(
-        default_factory=threading.RLock, init=False, repr=False
-    )
-
-
-class FreshSealBroken(RuntimeError):
-    def __init__(self, failure: CanonicalFailure):
-        super().__init__(
-            f"{failure.kind}/{failure.phase}/{failure.detail_code}: an internal"
-            " alignment record changed after it was sealed. This is a VoxWeave bug,"
-            " not a problem with your files; please report it with this message"
-        )
-        self.failure = failure
-
-
-def _distribution_seal_failure(
-    secondary: tuple[SecondaryFailure, ...] = (),
-) -> CanonicalFailure:
-    return CanonicalFailure(
-        "fresh-seal-broken",
-        "authority-distribution",
-        "distribution-seal",
-        secondary,
-    )
-
-
 def raise_distribution_seal_mismatch(
     context: IssuedAlignContext,
     *,
@@ -590,613 +260,11 @@ def raise_distribution_seal_mismatch(
     raise FreshSealBroken(_distribution_seal_failure(secondary))
 
 
-@dataclass(frozen=True, init=False)
-class IssuedFreshAlignment:
-    context_content_digest: str
-    receipt_digest: str
-    physical_calls: tuple[PhysicalCallReceipt, ...]
-    distribution: AuthorityDistributionReceipt
-    seed_status: Literal["valid", "invalid"]
-    seed_reasons: tuple[str, ...]
-    _binding: str = field(repr=False, compare=False)
-
-    def __init__(self) -> None:
-        raise TypeError("IssuedFreshAlignment is issuer-only")
-
-
-@dataclass(frozen=True, init=False)
-class VerifiedFreshAlignment:
-    context_content_digest: str
-    receipt_digest: str
-    _binding: str = field(repr=False, compare=False)
-
-    def __init__(self) -> None:
-        raise TypeError("VerifiedFreshAlignment is issuer-only")
-
-
-@dataclass(frozen=True, init=False)
-class FreshAlignmentSession:
-    context_content_digest: str
-    _binding: str = field(repr=False, compare=False)
-
-    def __init__(self) -> None:
-        raise TypeError("FreshAlignmentSession is issuer-only")
-
-
-@dataclass
-class _ObservedPhysicalCall:
-    call_index: int
-    source_block_indices: tuple[int, ...]
-    post_units: Sequence[Any]
-    original_units: Sequence[Any] | None
-    raw_unit_ids: tuple[str, ...]
-    raw_node_range: tuple[int, int]
-    audio_sample_start: int
-    audio_sample_end: int
-    sample_rate: int
-    sample_count: int
-    physical_origin_seconds: float
-    legacy_origin_seconds: float
-    legacy_origin_kind: Literal["identity", "sample-origin", "nominal-route"]
-    authority_origin_seconds: float
-    backend_model_config_digest: str
-    route_input_digest: str
-    geometry_failure: StrictFailureLocator | None
-
-
-@dataclass(frozen=True)
-class ReferencePhysicalCallFacts:
-    """Issuer-time call facts retained independently from its public receipt."""
-
-    call_index: int
-    source_block_indices: tuple[int, ...]
-    raw_nodes: tuple[Any, ...]
-    original_nodes: tuple[Any, ...] | None
-    raw_unit_ids: tuple[str, ...]
-    raw_node_range: tuple[int, int]
-    audio_sample_start: int
-    audio_sample_end: int
-    sample_rate: int
-    sample_count: int
-    physical_origin_seconds: float
-    legacy_origin_seconds: float
-    legacy_origin_kind: Literal["identity", "sample-origin", "nominal-route"]
-    authority_origin_seconds: float
-    geometry_failure: StrictFailureLocator | None
-
-
-@dataclass(frozen=True)
-class _AdapterPayload:
-    legacy_delivery: object
-    projection_inputs: object
-    strict_input_status: object
-    v2_policy_status: object
-    profile_resolution: object
-    evidence_resolution: object
-
-
-@dataclass(frozen=True)
-class _FreshSeals:
-    context: str
-    raw: str
-    relative: str
-    legacy_slice: str
-    authority: str
-    distribution: str
-    phase1: str
-
-
-@dataclass
-class _FreshRecord:
-    context: IssuedAlignContext
-    issued: IssuedFreshAlignment
-    public_snapshot: tuple[object, ...]
-    blocks: tuple[AuthorityBlock, ...]
-    captures: tuple[StrictCaptureResult, ...]
-    transforms: tuple[AuthorityTransformResult, ...]
-    distribution: AuthorityDistributionReceipt
-    seed: object
-    physical_calls: tuple[PhysicalCallReceipt, ...]
-    legacy_receipts: tuple[LegacyCallDistributionReceipt, ...]
-    legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
-    legacy_relative_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
-    reference_calls: tuple[ReferencePhysicalCallFacts, ...]
-    backend_model_config_facts: FrozenJSON
-    route_input_facts: FrozenJSON
-    adapter_payload: _AdapterPayload | None = None
-    verified: VerifiedFreshAlignment | None = None
-    transfer_terminal: Literal["live", "consumed", "retired"] = "live"
-    seals: _FreshSeals | None = None
-    # Per seal detail code, the exact objects its digest last matched.
-    verified_seal_inputs: dict[str, tuple[object, ...]] = field(default_factory=dict)
-
-
-@dataclass
-class _VerifiedRecord:
-    context: IssuedAlignContext
-    acquisition: IssuedFreshAlignment
-    verified: VerifiedFreshAlignment
-    seed_snapshot: object
-    profile_snapshot: object
-    sing_spans_snapshot: tuple[tuple[float, float], ...]
-    binding: str
-
-
-@dataclass
-class _SessionRecord:
-    session: FreshAlignmentSession
-    issuer: FreshAlignmentIssuer
-    binding: str
-    sealed: bool = False
-
-
-@dataclass(frozen=True)
-class EvidenceCoreProducerInputs:
-    """One producer-side thaw of every pre-selected-output EvidenceCore fact."""
-
-    context_content_digest: str
-    receipt_digest: str
-    engine_family: str
-    language: str
-    route_kind: str
-    stable_fields: FrozenObject
-    authority_profile: AuthorityLimitProfile
-    blocks: tuple[AuthorityBlock, ...]
-    captures: tuple[StrictCaptureResult, ...]
-    transforms: tuple[AuthorityTransformResult, ...]
-    distribution: AuthorityDistributionReceipt
-    seed_status: Literal["valid", "invalid"]
-    seed_reasons: tuple[str, ...]
-    physical_calls: tuple[PhysicalCallReceipt, ...]
-    legacy_receipts: tuple[LegacyCallDistributionReceipt, ...]
-    legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
-    legacy_relative_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
-    backend_model_config_facts: FrozenJSON
-    route_input_facts: FrozenJSON
-    strict_input_status: object
-    v2_policy_status: object
-    profile_status: object
-    evidence_status: object
-
-
-@dataclass(frozen=True)
-class EvidenceCoreReferenceInputs:
-    """Independent issuer/context thaws used only by projector C."""
-
-    claimed_context_content_digest: str
-    claimed_receipt_digest: str
-    engine_family: str
-    language: str
-    route_kind: str
-    stable_fields: FrozenObject
-    authority_profile: AuthorityLimitProfile
-    blocks: tuple[AuthorityBlock, ...]
-    captures: tuple[StrictCaptureResult, ...]
-    transforms: tuple[AuthorityTransformResult, ...]
-    distribution: AuthorityDistributionReceipt
-    seed_status: Literal["valid", "invalid"]
-    seed_reasons: tuple[str, ...]
-    claimed_physical_calls: tuple[PhysicalCallReceipt, ...]
-    legacy_receipts: tuple[LegacyCallDistributionReceipt, ...]
-    legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
-    legacy_relative_block_units: tuple[tuple[Mapping[str, Any], ...], ...]
-    reference_calls: tuple[ReferencePhysicalCallFacts, ...]
-    backend_model_config_facts: FrozenJSON
-    route_input_facts: FrozenJSON
-    strict_input_status: object
-    v2_policy_status: object
-    profile_status: object
-    evidence_status: object
-
-
 _FRESH: dict[int, _FreshRecord] = {}
 _VERIFIED_FRESH: dict[int, _VerifiedRecord] = {}
 _FRESH_SESSIONS: dict[int, _SessionRecord] = {}
 _FRESH_LOCK = threading.RLock()
 _ISSUER_TOKEN = object()
-
-
-def _stable_fact_digest(value: object) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _capture_digest_facts(
-    facts: object | None,
-    claimed_digest: str | None,
-    *,
-    label: str,
-    default_facts: object,
-) -> tuple[FrozenJSON, str]:
-    if facts is None:
-        if claimed_digest is not None:
-            raise ValueError(f"{label} facts are required with an explicit digest")
-        value = default_facts
-    else:
-        value = facts
-    try:
-        digest = _stable_fact_digest(value)
-        frozen = freeze_json(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{label} facts are outside the stable JSON domain") from exc
-    if claimed_digest is not None and claimed_digest != digest:
-        raise ValueError(f"{label} digest does not match its stable facts")
-    return frozen, digest
-
-
-def _stable_value(value: Any) -> Any:
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: _stable_value(getattr(value, field.name))
-            for field in dataclasses.fields(value)
-        }
-    if isinstance(value, tuple):
-        return [_stable_value(member) for member in value]
-    if isinstance(value, list):
-        return [_stable_value(member) for member in value]
-    if isinstance(value, Mapping):
-        return {str(key): _stable_value(member) for key, member in value.items()}
-    return value
-
-
-def _stable_digest(value: Any) -> str:
-    return frozen_json_digest(freeze_json(_stable_value(value)))
-
-
-def _physical_projection(
-    calls: tuple[PhysicalCallReceipt, ...], names: tuple[str, ...]
-) -> tuple[tuple[object, ...], ...]:
-    return tuple(tuple(getattr(call, name) for name in names) for call in calls)
-
-
-# Each seal is split into an inputs projection and a digest over exactly those
-# inputs.  The projection returns the sealed objects themselves (record fields,
-# issued-receipt fields and the context's scalar attributes), so the digest can
-# read nothing the projection does not name and the verifier can memoize on
-# the identity of that tuple (see ``_verify_fresh_seals``).
-def _context_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
-    stable = _align_context_stable_fields(record.context)
-    context = record.context
-    return (
-        context.context_content_digest,
-        context.context_binding_digest,
-        context.engine_family,
-        context.effective_iso,
-        context.route_kind,
-        context._issuance_nonce,
-        record.issued.context_content_digest,
-        stable,
-    )
-
-
-def _context_seal_digest(*facts: object) -> str:
-    return _stable_digest(facts)
-
-
-def _capture_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
-    return (record.captures, record.physical_calls, record.issued.physical_calls)
-
-
-def _raw_seal_digest(
-    record_captures: tuple[StrictCaptureResult, ...],
-    physical_calls: tuple[PhysicalCallReceipt, ...],
-    issued_physical_calls: tuple[PhysicalCallReceipt, ...],
-) -> str:
-    captures = tuple(
-        (
-            capture.call_index,
-            capture.status,
-            capture.raw_units_digest,
-            capture.failure,
-            capture.observed_unit_ids,
-            None
-            if capture.units is None
-            else tuple((unit.unit_id, unit.raw) for unit in capture.units),
-        )
-        for capture in record_captures
-    )
-    names = (
-        "call_index",
-        "strict_unit_status",
-        "strict_failure",
-        "raw_units_digest",
-        "raw_unit_ids",
-    )
-    return _stable_digest(
-        (
-            captures,
-            _physical_projection(physical_calls, names),
-            _physical_projection(issued_physical_calls, names),
-        )
-    )
-
-
-def _relative_seal_digest(
-    record_captures: tuple[StrictCaptureResult, ...],
-    physical_calls: tuple[PhysicalCallReceipt, ...],
-    issued_physical_calls: tuple[PhysicalCallReceipt, ...],
-) -> str:
-    captures = tuple(
-        (
-            capture.call_index,
-            capture.status,
-            capture.normalized_relative_digest,
-            None
-            if capture.units is None
-            else tuple(
-                (
-                    unit.unit_id,
-                    unit.call_index,
-                    unit.call_unit_index,
-                    unit.surface,
-                    unit.relative_start,
-                    unit.relative_end,
-                    unit.provenance,
-                    unit.original_relative_start,
-                    unit.original_relative_end,
-                )
-                for unit in capture.units
-            ),
-        )
-        for capture in record_captures
-    )
-    names = ("call_index", "normalized_relative_digest")
-    return _stable_digest(
-        (
-            captures,
-            _physical_projection(physical_calls, names),
-            _physical_projection(issued_physical_calls, names),
-        )
-    )
-
-
-def _legacy_slice_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
-    return (
-        record.legacy_receipts,
-        record.legacy_block_units,
-        record.legacy_relative_block_units,
-        record.physical_calls,
-        record.issued.physical_calls,
-    )
-
-
-def _legacy_slice_seal_digest(
-    legacy_receipts: tuple[LegacyCallDistributionReceipt, ...],
-    legacy_block_units: tuple[tuple[Mapping[str, Any], ...], ...],
-    legacy_relative_block_units: tuple[tuple[Mapping[str, Any], ...], ...],
-    physical_calls: tuple[PhysicalCallReceipt, ...],
-    issued_physical_calls: tuple[PhysicalCallReceipt, ...],
-) -> str:
-    names = ("call_index", "legacy_slice_digest", "legacy_absolute_digest")
-    return _stable_digest(
-        (
-            legacy_receipts,
-            legacy_block_units,
-            legacy_relative_block_units,
-            _physical_projection(physical_calls, names),
-            _physical_projection(issued_physical_calls, names),
-        )
-    )
-
-
-def _authority_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
-    return (
-        record.transforms,
-        record.physical_calls,
-        record.issued.physical_calls,
-        record.backend_model_config_facts,
-        record.route_input_facts,
-        record.reference_calls,
-    )
-
-
-def _authority_seal_digest(
-    record_transforms: tuple[AuthorityTransformResult, ...],
-    physical_calls: tuple[PhysicalCallReceipt, ...],
-    issued_physical_calls: tuple[PhysicalCallReceipt, ...],
-    backend_model_config_facts: FrozenJSON,
-    route_input_facts: FrozenJSON,
-    reference_calls: tuple[ReferencePhysicalCallFacts, ...],
-) -> str:
-    transforms = tuple(
-        (
-            transform.call_index,
-            transform.status,
-            transform.authority_absolute_digest,
-            transform.failure,
-            None
-            if transform.units is None
-            else tuple(
-                (
-                    unit.unit_id,
-                    unit.call_index,
-                    unit.call_unit_index,
-                    unit.surface,
-                    unit.relative_start,
-                    unit.relative_end,
-                    unit.physical_origin_seconds,
-                    unit.start,
-                    unit.end,
-                    unit.provenance,
-                    unit.original_relative_start,
-                    unit.original_relative_end,
-                )
-                for unit in transform.units
-            ),
-        )
-        for transform in record_transforms
-    )
-    names = (
-        "call_index",
-        "source_block_indices",
-        "audio_sample_start",
-        "audio_sample_end",
-        "sample_rate",
-        "physical_origin_seconds",
-        "legacy_origin_seconds",
-        "legacy_origin_kind",
-        "authority_origin_seconds",
-        "backend_model_config_digest",
-        "route_input_digest",
-        "authority_transform_status",
-        "authority_absolute_digest",
-    )
-    return _stable_digest(
-        (
-            transforms,
-            _physical_projection(physical_calls, names),
-            _physical_projection(issued_physical_calls, names),
-            backend_model_config_facts,
-            route_input_facts,
-            tuple(
-                (
-                    call.call_index,
-                    call.source_block_indices,
-                    call.raw_unit_ids,
-                    call.raw_node_range,
-                    call.audio_sample_start,
-                    call.audio_sample_end,
-                    call.sample_rate,
-                    call.sample_count,
-                    call.physical_origin_seconds,
-                    call.legacy_origin_seconds,
-                    call.legacy_origin_kind,
-                    call.authority_origin_seconds,
-                    call.geometry_failure,
-                )
-                for call in reference_calls
-            ),
-        )
-    )
-
-
-def _distribution_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
-    return (record.distribution, record.issued.distribution)
-
-
-def _distribution_seal_digest(
-    distribution: AuthorityDistributionReceipt,
-    issued_distribution: AuthorityDistributionReceipt,
-) -> str:
-    return _stable_digest((distribution, issued_distribution))
-
-
-def _phase1_seal_inputs(record: _FreshRecord) -> tuple[object, ...]:
-    return (record.seed, record.issued.seed_status, record.issued.seed_reasons)
-
-
-def _phase1_seal_digest(
-    seed: object, seed_status: str, seed_reasons: tuple[str, ...]
-) -> str:
-    return _stable_digest((seed, seed_status, seed_reasons))
-
-
-# (detail code, ``_FreshSeals`` field, inputs projection, digest over the
-# projected inputs), in verification order.
-_SEALS: tuple[
-    tuple[str, str, Callable[[_FreshRecord], tuple[object, ...]], Callable[..., str]],
-    ...,
-] = (
-    ("context-seal", "context", _context_seal_inputs, _context_seal_digest),
-    ("raw-seal", "raw", _capture_seal_inputs, _raw_seal_digest),
-    ("relative-seal", "relative", _capture_seal_inputs, _relative_seal_digest),
-    (
-        "legacy-slice-seal",
-        "legacy_slice",
-        _legacy_slice_seal_inputs,
-        _legacy_slice_seal_digest,
-    ),
-    ("authority-seal", "authority", _authority_seal_inputs, _authority_seal_digest),
-    (
-        "distribution-seal",
-        "distribution",
-        _distribution_seal_inputs,
-        _distribution_seal_digest,
-    ),
-    ("phase1-seal", "phase1", _phase1_seal_inputs, _phase1_seal_digest),
-)
-
-
-def _seal_fresh_record(record: _FreshRecord) -> None:
-    """Digest every component seal once and remember the objects it covered."""
-    digests: dict[str, str] = {}
-    covered: dict[str, tuple[object, ...]] = {}
-    for detail_code, name, inputs_of, digest_of in _SEALS:
-        inputs = inputs_of(record)
-        digests[name] = digest_of(*inputs)
-        covered[detail_code] = inputs
-    record.seals = _FreshSeals(**digests)
-    record.verified_seal_inputs = covered
-
-
-def _same_objects(left: tuple[object, ...], right: tuple[object, ...]) -> bool:
-    return len(left) == len(right) and all(
-        member is other for member, other in zip(left, right)
-    )
-
-
-_SEAL_PHASES = {
-    "context-seal": "context",
-    "raw-seal": "strict-capture",
-    "relative-seal": "relative-normalization",
-    "legacy-slice-seal": "legacy-distribution",
-    "authority-seal": "authority-transform",
-    "distribution-seal": "authority-distribution",
-    "phase1-seal": "w1-admission",
-}
-
-
-def _raise_component_seal(detail_code: str) -> NoReturn:
-    raise FreshSealBroken(
-        CanonicalFailure(
-            "fresh-seal-broken",
-            _SEAL_PHASES[detail_code],
-            detail_code,
-        )
-    )
-
-
-def _verify_fresh_seals(record: _FreshRecord) -> None:
-    """Re-digest every component seal whose covered objects were swapped.
-
-    A seal whose inputs projection still returns the very objects that were
-    last digested is not recomputed: re-digesting them on every
-    ``_fresh_record`` access cost seven full digests per access, the phase-1
-    seed alone seconds on a long full-pass episode.  Reassigning a record
-    field (a ``dataclasses.replace`` swap included) or an attribute of the
-    context or the issued receipt changes that identity, so the seal is
-    digested again and must still match.
-
-    Not caught: in-place mutation inside an already verified object, such as
-    item assignment in the plain unit mappings of the legacy block units or
-    the reference call nodes, or an ``object.__setattr__`` bypass on a nested
-    frozen dataclass.  Every record field is a private deep copy taken at
-    seal time and every thaw hands out deep copies, so nothing outside this
-    module holds a reference into those objects, and the issued receipt's
-    fields are frozen dataclasses and tuples.  Code that reaches into
-    ``_FRESH`` can rewrite ``seals`` as easily, so the seals never covered it.
-    """
-    expected = record.seals
-    if expected is None:
-        _raise_component_seal("context-seal")
-    for detail_code, name, inputs_of, digest_of in _SEALS:
-        try:
-            inputs = inputs_of(record)
-            covered = record.verified_seal_inputs.get(detail_code)
-            if covered is not None and _same_objects(covered, inputs):
-                continue
-            current = digest_of(*inputs)
-        except Exception:
-            _raise_component_seal(detail_code)
-        if current != getattr(expected, name):
-            _raise_component_seal(detail_code)
-        record.verified_seal_inputs[detail_code] = inputs
 
 
 def _invalid_capture(
@@ -1315,6 +383,78 @@ class FreshAlignmentIssuer:
         """AO-07 callback: retain identity/length only; recurse only at sealing."""
         if self.sealed:
             raise RuntimeError("fresh acquisition issuer is already sealed")
+        raw_count = self._checked_raw_count(post_units, original_units)
+        sources = self._delivery_sources(source_indices)
+        call_index = len(self.observed)
+        raw_start = self.raw_cursor
+        raw_ids = tuple(
+            f"r{index}" for index in range(raw_start, raw_start + raw_count)
+        )
+        self.raw_cursor += raw_count
+
+        legacy_origin, rate, count, start, end, geometry_failure = (
+            self._resolve_sample_window(
+                legacy_origin_seconds,
+                audio_sample_start,
+                audio_sample_end,
+                sample_rate,
+                sample_count,
+            )
+        )
+        physical_origin = start / rate
+        if self.context.route_kind == "qwen-crop":
+            legacy_kind: Literal["identity", "sample-origin", "nominal-route"] = (
+                "nominal-route"
+            )
+            geometry_failure = self._nominal_route_failure(
+                geometry_failure,
+                legacy_origin,
+                nominal_end_seconds,
+                rate,
+                count,
+                start,
+                end,
+            )
+        elif start == 0 and legacy_origin == 0.0:
+            legacy_kind = "identity"
+        else:
+            legacy_kind = "sample-origin"
+            if physical_origin.hex() != legacy_origin.hex():
+                geometry_failure = StrictFailureLocator(
+                    "sample-geometry", None, "physical-origin-mismatch"
+                )
+
+        # Every call shares the issuer's validated source-fact digests.
+        model_digest = self.backend_model_config_digest
+        input_digest = self.route_input_digest
+        with align_runtime_activity("AO-07", "raw-id-and-call-observation"):
+            self.observed.append(
+                _ObservedPhysicalCall(
+                    call_index,
+                    sources,
+                    post_units,
+                    original_units,
+                    raw_ids,
+                    (raw_start, raw_start + raw_count),
+                    start,
+                    end,
+                    rate,
+                    count,
+                    physical_origin,
+                    legacy_origin,
+                    legacy_kind,
+                    physical_origin,
+                    model_digest,
+                    input_digest,
+                    geometry_failure,
+                )
+            )
+
+    # Stage 1 of the observation: both backend results must be sized.
+    @staticmethod
+    def _checked_raw_count(
+        post_units: Sequence[Any], original_units: Sequence[Any] | None
+    ) -> int:
         try:
             raw_count = len(post_units)
         except Exception as exc:
@@ -1338,6 +478,10 @@ class FreshAlignmentIssuer:
                     detail_code="backend-call-shape",
                 )
                 raise classified from exc
+        return raw_count
+
+    # Stage 2: validate the delivery positions and map them to source indices.
+    def _delivery_sources(self, source_indices: Sequence[int]) -> tuple[int, ...]:
         source_positions = tuple(source_indices)
         if (
             not source_positions
@@ -1351,13 +495,18 @@ class FreshAlignmentIssuer:
         sources = tuple(
             self.blocks[position].source_index for position in source_positions
         )
-        call_index = len(self.observed)
-        raw_start = self.raw_cursor
-        raw_ids = tuple(
-            f"r{index}" for index in range(raw_start, raw_start + raw_count)
-        )
-        self.raw_cursor += raw_count
+        return sources
 
+    # Stage 3: resolve origin, rate, count and the sample window. Each failed
+    # check overwrites the failure locator, so the last assignment wins.
+    def _resolve_sample_window(
+        self,
+        legacy_origin_seconds: float,
+        audio_sample_start: int | None,
+        audio_sample_end: int | None,
+        sample_rate: int | None,
+        sample_count: int | None,
+    ) -> tuple[float, int, int, int, int, StrictFailureLocator | None]:
         rate = self.sample_rate if sample_rate is None else sample_rate
         count = (
             self.prepared_audio_sample_count if sample_count is None else sample_count
@@ -1407,66 +556,42 @@ class FreshAlignmentIssuer:
             )
             start = 0
             end = 0
-        physical_origin = start / rate
-        if self.context.route_kind == "qwen-crop":
-            legacy_kind: Literal["identity", "sample-origin", "nominal-route"] = (
-                "nominal-route"
+        return legacy_origin, rate, count, start, end, geometry_failure
+
+    # Stage 4 (Qwen crop route): compare the observed window with the nominal
+    # route geometry. Returns the incoming failure unless a check replaces it.
+    @staticmethod
+    def _nominal_route_failure(
+        geometry_failure: StrictFailureLocator | None,
+        legacy_origin: float,
+        nominal_end_seconds: float | None,
+        rate: int,
+        count: int,
+        start: int,
+        end: int,
+    ) -> StrictFailureLocator | None:
+        if nominal_end_seconds is None:
+            geometry_failure = StrictFailureLocator(
+                "sample-geometry", None, "sample-geometry"
             )
-            if nominal_end_seconds is None:
+        else:
+            try:
+                expected = qwen_sample_geometry(
+                    nominal_start=legacy_origin,
+                    nominal_end=nominal_end_seconds,
+                    sample_rate=rate,
+                    sample_count=count,
+                )
+            except SampleGeometryError:
                 geometry_failure = StrictFailureLocator(
                     "sample-geometry", None, "sample-geometry"
                 )
             else:
-                try:
-                    expected = qwen_sample_geometry(
-                        nominal_start=legacy_origin,
-                        nominal_end=nominal_end_seconds,
-                        sample_rate=rate,
-                        sample_count=count,
-                    )
-                except SampleGeometryError:
+                if expected.sample_start != start or expected.sample_end != end:
                     geometry_failure = StrictFailureLocator(
-                        "sample-geometry", None, "sample-geometry"
+                        "sample-geometry", None, "physical-origin-mismatch"
                     )
-                else:
-                    if expected.sample_start != start or expected.sample_end != end:
-                        geometry_failure = StrictFailureLocator(
-                            "sample-geometry", None, "physical-origin-mismatch"
-                        )
-        elif start == 0 and legacy_origin == 0.0:
-            legacy_kind = "identity"
-        else:
-            legacy_kind = "sample-origin"
-            if physical_origin.hex() != legacy_origin.hex():
-                geometry_failure = StrictFailureLocator(
-                    "sample-geometry", None, "physical-origin-mismatch"
-                )
-
-        # Every call shares the issuer's validated source-fact digests.
-        model_digest = self.backend_model_config_digest
-        input_digest = self.route_input_digest
-        with align_runtime_activity("AO-07", "raw-id-and-call-observation"):
-            self.observed.append(
-                _ObservedPhysicalCall(
-                    call_index,
-                    sources,
-                    post_units,
-                    original_units,
-                    raw_ids,
-                    (raw_start, raw_start + raw_count),
-                    start,
-                    end,
-                    rate,
-                    count,
-                    physical_origin,
-                    legacy_origin,
-                    legacy_kind,
-                    physical_origin,
-                    model_digest,
-                    input_digest,
-                    geometry_failure,
-                )
-            )
+        return geometry_failure
 
     def _invoke_backend_call(self, backend_call: Callable[[], Any]) -> Any:
         """Preserve a backend exception while attaching its closed classification."""

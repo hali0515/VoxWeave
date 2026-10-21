@@ -26,6 +26,7 @@ from voxweave import (
     pipeline,
     songdet,
     speakercluster,
+    transcription,
     voiceembed,
 )
 from voxweave.voicebase import canonical_json_bytes
@@ -770,11 +771,11 @@ def _stub_asr(tmp_path: Path, monkeypatch, *, language="English") -> Path:
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_a, **_k: wav)
     monkeypatch.setattr(vocals, "decode_to_wav", lambda *_a, **_k: wav)
     monkeypatch.setattr(
-        pipeline,
+        transcription,
         "vad_speech_segments",
         lambda *_a, **_k: [{"start": 0.0, "end": 1.0}],
     )
-    monkeypatch.setattr(pipeline, "slice_wav", lambda *_a, **_k: wav)
+    monkeypatch.setattr(transcription, "slice_wav", lambda *_a, **_k: wav)
     monkeypatch.setattr(backend, "chunk_pass_count", lambda *_a, **_k: 2)
     monkeypatch.setattr(
         backend,

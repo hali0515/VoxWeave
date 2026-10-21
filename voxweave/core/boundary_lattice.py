@@ -44,23 +44,71 @@ still shows.
 from __future__ import annotations
 
 import math
-from bisect import bisect_right
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace as dataclass_replace
-from typing import Any
 
+from .boundary_atoms import (
+    BARRIER_UNCERTAINTY_MS as BARRIER_UNCERTAINTY_MS,
+    CAP_EPS_S as CAP_EPS_S,
+    RELIEF_TRIGGER_FACTOR as RELIEF_TRIGGER_FACTOR,
+    HELD_CHAIN_MAX_GAP_S as HELD_CHAIN_MAX_GAP_S,
+    INFLUENCE_RADIUS_UNITS as INFLUENCE_RADIUS_UNITS,
+    BARRIER_KINDS as BARRIER_KINDS,
+    COARSE_GRANULARITY as COARSE_GRANULARITY,
+    UNTIMED_RUN as UNTIMED_RUN,
+    INFEASIBLE_REASONS as INFEASIBLE_REASONS,
+    SPAN_VIOLATION_REASONS as SPAN_VIOLATION_REASONS,
+    span_min as span_min,
+    span_max as span_max,
+    _real as _real,
+    SpanViolation as SpanViolation,
+    preflight_units as preflight_units,
+    ProfileViolation as ProfileViolation,
+    _PROFILE_FLOAT_KNOBS as _PROFILE_FLOAT_KNOBS,
+    preflight_profile as preflight_profile,
+    LatticeAtom as LatticeAtom,
+    AtomLayer as AtomLayer,
+    band_atoms as band_atoms,
+    CoalesceResult as CoalesceResult,
+    _reindex as _reindex,
+    _replace as _replace,
+    coalesce_zero_display as coalesce_zero_display,
+    _merge_group as _merge_group,
+    unit_edge_nodes as unit_edge_nodes,
+    _latest_unit_edge as _latest_unit_edge,
+    exclusively_owned as exclusively_owned,
+    Edge as Edge,
+    Infeasible as Infeasible,
+)
+from .boundary_nodes import (
+    HardBarrier as HardBarrier,
+    build_barriers as build_barriers,
+    HardInterval as HardInterval,
+    build_intervals as build_intervals,
+    candidate_nodes as candidate_nodes,
+    split_candidate_at_unit as split_candidate_at_unit,
+    _piece_from_units as _piece_from_units,
+    relief_trigger as relief_trigger,
+    relief_nodes as relief_nodes,
+    GranularityCheck as GranularityCheck,
+    granularity_check as granularity_check,
+    SentenceEnds as SentenceEnds,
+    sentence_end_nodes as sentence_end_nodes,
+)
+from .boundary_packing import (
+    PackMeasure as PackMeasure,
+    _PackState as _PackState,
+    IncrementalPacker as IncrementalPacker,
+    _canonical_pack_measure as _canonical_pack_measure,
+)
 from .canonical_text import (
     CanonicalWork,
     band_scan_lower_bound_exceeded,
-    canonical_legal,
-    canonical_text,
 )
 from .layout import (
-    _PUNCT_TO_SPACE_RE,
     _join,
     _line_budget_width,
     _no_spaces,
-    _token_char_count,
     _vis_width,
     strip_punct_for_subtitles,
 )
@@ -72,290 +120,7 @@ from .smart_split import (
     _build_atoms,
     _display_chars,
     _phrase_boundary_atoms,
-    _segment_sentences,
-    _snap_sentence_breaks,
-    _tokens,
 )
-from .timing import HELD_WORD_MAX_GAP_S
-
-#: Half of the robust-silence band. A barrier needs the configured skip
-#: threshold *plus* this margin on top, so a gap has to clear the threshold by
-#: more than the measurement uncertainty before the topology is allowed to
-#: depend on it. It does not make barriers immune to a probe of the same size --
-#: it relocates the cliff, and the perturbation runner probes the new location.
-BARRIER_UNCERTAINTY_MS: float = 50.0
-
-#: Duration-legality tolerance, inherited verbatim from the v1 hard-edge builder
-#: so an edge this module certifies is one v1 would also have accepted.
-CAP_EPS_S: float = 1e-9
-
-#: v1's ``FORCE_BREAK_FACTOR``: how far a boundary-less run may exceed the line
-#: budget before the relief valve is allowed to invent break points.
-RELIEF_TRIGGER_FACTOR: float = 1.5
-
-#: The held-word chain tolerance, taken from the timing pass rather than
-#: restated, so the evidence test and the pass that consumes it cannot drift.
-HELD_CHAIN_MAX_GAP_S: float = HELD_WORD_MAX_GAP_S
-
-#: Locality cell for the perturbation lanes, in source units (one legacy
-#: locality window per side). Declared here; consumed by the harness.
-INFLUENCE_RADIUS_UNITS: int = 96
-
-BARRIER_KINDS: tuple[str, ...] = ("document", "robust-silence")
-
-#: The one infeasibility that is a statement about the INPUT rather than about
-#: the search: the source units are coarser than a cue, so the expressible node
-#: space cannot tile the interval however the solver is tuned. Named so a reader
-#: (and the harness) can tell it apart from a genuine optimizer failure.
-COARSE_GRANULARITY: str = "coarse-granularity"
-
-#: The infeasibility of an interval that WOULD have a legal path if its
-#: untimed words carried timing: every cue able to cover them is timeless, and
-#: a timeless cue is never admitted in a mixed interval. The v1 fallback it
-#: takes is the declared ``v2-untimed-chunk-fallback`` policy delta.
-UNTIMED_RUN: str = "untimed-run"
-
-INFEASIBLE_REASONS: tuple[str, ...] = (
-    COARSE_GRANULARITY,
-    "duration-unwaivable",
-    "no-path",
-    "relief-insufficient",
-    "span-preflight",
-    UNTIMED_RUN,
-)
-
-SPAN_VIOLATION_REASONS: tuple[str, ...] = (
-    "bool-bound",
-    "ends-non-monotone",
-    "non-finite",
-    "reversed",
-    "starts-non-monotone",
-)
-
-
-# --------------------------------------------------------------------- spans
-
-
-def span_min(values: Iterable[float | None]) -> float | None:
-    """Smallest non-``None`` value, or ``None`` when nothing is timed.
-
-    The ``None``-propagating semantics of the engine's own span helpers: a
-    missing bound is missing evidence, not a zero.
-    """
-    known = [v for v in values if v is not None]
-    return min(known) if known else None
-
-
-def span_max(values: Iterable[float | None]) -> float | None:
-    """Largest non-``None`` value, or ``None`` when nothing is timed."""
-    known = [v for v in values if v is not None]
-    return max(known) if known else None
-
-
-def _real(value: Any) -> bool:
-    """A finite, non-bool number. ``None`` is missing evidence, not a failure."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    return math.isfinite(value)
-
-
-# ---------------------------------------------------------------- preflights
-
-
-@dataclass(frozen=True)
-class SpanViolation:
-    """One source unit whose recorded span cannot be interpreted at all."""
-
-    unit_index: int
-    unit_id: str
-    reason: str
-    detail: str
-
-
-def preflight_units(units: Sequence[SourceUnit]) -> tuple[SpanViolation, ...]:
-    """Reject unit spans no downstream rule can give a meaning to.
-
-    ``None`` is deliberately **tolerated**: a ghost unit carries no timing and
-    the span-resolution rules already answer for it. What is refused is a bound
-    that claims to be a measurement and is not -- a bool, a non-number, NaN or an
-    infinity -- plus a reversed span and a stream whose known starts or known
-    ends walk backwards. ``None`` bounds are skipped without breaking the
-    monotonicity chain.
-
-    A violation marks the enclosing hard interval infeasible; it never aborts
-    the document, because one unreadable row must not throw away a whole file.
-    """
-    out: list[SpanViolation] = []
-    last_start: float | None = None
-    last_end: float | None = None
-    for index, unit in enumerate(units):
-        bad = False
-        for name, value in (("start", unit.start), ("end", unit.end)):
-            if value is None:
-                continue
-            if isinstance(value, bool):
-                out.append(
-                    SpanViolation(index, unit.id, "bool-bound", f"{name}={value!r}")
-                )
-                bad = True
-            elif not _real(value):
-                out.append(
-                    SpanViolation(index, unit.id, "non-finite", f"{name}={value!r}")
-                )
-                bad = True
-        if bad:
-            continue
-        start, end = unit.start, unit.end
-        if start is not None and end is not None and end < start:
-            out.append(
-                SpanViolation(index, unit.id, "reversed", f"end {end} < start {start}")
-            )
-            continue
-        if start is not None:
-            if last_start is not None and start < last_start:
-                out.append(
-                    SpanViolation(
-                        index,
-                        unit.id,
-                        "starts-non-monotone",
-                        f"start {start} < previous start {last_start}",
-                    )
-                )
-            last_start = start
-        if end is not None:
-            if last_end is not None and end < last_end:
-                out.append(
-                    SpanViolation(
-                        index,
-                        unit.id,
-                        "ends-non-monotone",
-                        f"end {end} < previous end {last_end}",
-                    )
-                )
-            last_end = end
-    out.sort(key=lambda v: (v.unit_index, v.reason))
-    return tuple(out)
-
-
-@dataclass(frozen=True)
-class ProfileViolation:
-    """One resolved display knob the shadow refuses to interpret."""
-
-    key: str
-    value: float
-    reason: str
-
-    def to_dict(self) -> dict[str, Any]:
-        # A non-finite value is written as its name ("nan", "inf"): the
-        # artifact stays valid JSON and still says what was refused.
-        value: float | str = (
-            self.value if math.isfinite(self.value) else str(self.value)
-        )
-        return {"key": self.key, "reason": self.reason, "value": value}
-
-
-#: Every float knob of :class:`DisplayProfile`. NaN compares false against any
-#: bound, so without a finiteness check a NaN cap reads as "no cap" and a NaN
-#: threshold crashes deep inside the solver.
-_PROFILE_FLOAT_KNOBS: tuple[str, ...] = (
-    "clause_ms",
-    "vad_skip_ms",
-    "offline_ms",
-    "min_cue_s",
-    "max_cue_s",
-    "glue_gap_s",
-    "cps",
-    "lag_out_s",
-    "shot_snap_s",
-)
-
-
-def preflight_profile(profile: DisplayProfile) -> tuple[ProfileViolation, ...]:
-    """Refuse a profile whose knobs have no defined meaning.
-
-    Zero **disables** the duration cap, which is what the timing pass' own truth
-    test means by it; a negative cap is refused outright rather than
-    reinterpreted, so the shadow never quietly disagrees with cleanup about what
-    a negative cap does. A NaN or infinite knob is refused too. A non-empty
-    result aborts the measurement for that document -- an invalid measurement,
-    never a silent fallback.
-    """
-    out: list[ProfileViolation] = []
-    non_finite = {
-        key
-        for key in _PROFILE_FLOAT_KNOBS
-        if not math.isfinite(float(getattr(profile, key)))
-    }
-    for key in _PROFILE_FLOAT_KNOBS:
-        if key in non_finite:
-            out.append(
-                ProfileViolation(key, float(getattr(profile, key)), "non-finite")
-            )
-    for key in ("clause_ms", "offline_ms", "vad_skip_ms"):
-        value = float(getattr(profile, key))
-        if key not in non_finite and value <= 0:
-            out.append(ProfileViolation(key, value, "not-positive"))
-    if "max_cue_s" not in non_finite and profile.max_cue_s < 0:
-        out.append(ProfileViolation("max_cue_s", float(profile.max_cue_s), "negative"))
-    if profile.max_line_length < 1:
-        out.append(
-            ProfileViolation(
-                "max_line_length", float(profile.max_line_length), "too-small"
-            )
-        )
-    if profile.max_lines < 1:
-        out.append(ProfileViolation("max_lines", float(profile.max_lines), "too-small"))
-    return tuple(out)
-
-
-# --------------------------------------------------------------- atom layer
-
-
-@dataclass(frozen=True)
-class LatticeAtom:
-    """One non-breakable packing unit, with its source-unit footprint.
-
-    ``text`` is the pre-strip surface (what the cue will store), ``display`` what
-    every cue holding the atom still shows of it, whatever follows -- empty means
-    some cue renders the atom to nothing. The footprint ``[unit_start, unit_end)``
-    is the only granularity-safe way to slice the unit stream back, so every
-    ownership question is answered by it rather than by re-deriving a character
-    cursor.
-    """
-
-    index: int
-    text: str
-    start: float | None
-    end: float | None
-    unit_start: int
-    unit_end: int
-    end_pen: int
-    start_pen: int
-    boundary_pen: int
-    phrase_start: bool
-    forced_boundary: bool
-    display: str
-    members: tuple[int, ...]
-
-    @property
-    def visible(self) -> bool:
-        return bool(self.display)
-
-
-@dataclass(frozen=True)
-class AtomLayer:
-    """The document's whole atom stream, in the engine's own construction."""
-
-    lang: str
-    text: str
-    atoms: tuple[LatticeAtom, ...]
-    unit_count: int
-
-    def unit_bound(self, node: int) -> int:
-        """The source-unit id an atom-edge node cuts at."""
-        if node >= len(self.atoms):
-            return self.unit_count
-        return self.atoms[max(node, 0)].unit_start
 
 
 def build_atom_layer(document: SegDocument) -> AtomLayer:
@@ -413,748 +178,6 @@ def build_atom_layer(document: SegDocument) -> AtomLayer:
         for index, atom in enumerate(raw)
     )
     return AtomLayer(lang=lang, text=text, atoms=atoms, unit_count=len(document.units))
-
-
-def band_atoms(profile: DisplayProfile) -> int:
-    """The proven hard band on a legal edge's atom span, in coalesced atoms.
-
-    Every coalesced atom is worth at least one half-width cell, so a cue that
-    fits ``max_lines`` lines of the resolved budget cannot contain more than this
-    many of them; the ``+1`` is the overflow-discovery atom.
-    """
-    return (
-        profile.max_lines
-        * _line_budget_width(profile.max_line_length, profile.language)
-        + 1
-    )
-
-
-# --------------------------------------------------------------- coalescing
-
-
-@dataclass(frozen=True)
-class CoalesceResult:
-    atoms: tuple[LatticeAtom, ...]
-    coalesced_atoms: int
-    all_invisible: bool
-
-
-def _reindex(atoms: Sequence[LatticeAtom]) -> tuple[LatticeAtom, ...]:
-    """Renumber a sequence's ``index`` fields to its own positions."""
-    return tuple(
-        atom if atom.index == position else _replace(atom, index=position)
-        for position, atom in enumerate(atoms)
-    )
-
-
-def _replace(atom: LatticeAtom, **over: Any) -> LatticeAtom:
-    fields = {
-        "index": atom.index,
-        "text": atom.text,
-        "start": atom.start,
-        "end": atom.end,
-        "unit_start": atom.unit_start,
-        "unit_end": atom.unit_end,
-        "end_pen": atom.end_pen,
-        "start_pen": atom.start_pen,
-        "boundary_pen": atom.boundary_pen,
-        "phrase_start": atom.phrase_start,
-        "forced_boundary": atom.forced_boundary,
-        "display": atom.display,
-        "members": atom.members,
-    }
-    fields.update(over)
-    return LatticeAtom(**fields)
-
-
-def coalesce_zero_display(
-    atoms: Sequence[LatticeAtom], *, lang: str = "en"
-) -> CoalesceResult:
-    """Fold every invisible atom into a visible carrier (canonical, in order).
-
-    An invisible atom joins the nearest **preceding** visible atom; a leading
-    invisible run, which has no predecessor, joins the **first** visible atom.
-    Ownership merges exactly by footprint and spans by ``None``-propagating
-    min/max, so nothing is lost and nothing is invented; the carrier keeps its
-    own penalties, because they describe a break at a boundary that still
-    exists. The merged surface is the *language join* of its members rather than
-    a bare concatenation, so the interval's text still reconstructs byte for
-    byte and a trailing full stop is still visible to the punctuation-affinity
-    feature.
-
-    A boundary between two invisible atoms is meaningless for subtitles, which
-    is the policy justification; the mechanical consequence is that every
-    surviving atom has positive display width, which is what bounds the edge
-    scan. When *every* atom is invisible nothing is folded and the caller takes
-    the all-invisible branch instead.
-
-    ``lang`` selects that join and defaults to the space-delimited one, so a
-    positional caller keeps the shape it had before the parameter existed.
-    """
-    if not atoms:
-        return CoalesceResult((), 0, False)
-    first_visible = next((i for i, atom in enumerate(atoms) if atom.visible), None)
-    if first_visible is None:
-        return CoalesceResult(tuple(atoms), 0, True)
-
-    groups: list[list[LatticeAtom]] = [list(atoms[: first_visible + 1])]
-    carriers: list[LatticeAtom] = [atoms[first_visible]]
-    for atom in atoms[first_visible + 1 :]:
-        if atom.visible:
-            groups.append([atom])
-            carriers.append(atom)
-        else:
-            groups[-1].append(atom)
-
-    folded = sum(len(group) - 1 for group in groups)
-    return CoalesceResult(
-        atoms=tuple(
-            _merge_group(group, carrier, position, lang)
-            for position, (group, carrier) in enumerate(zip(groups, carriers))
-        ),
-        coalesced_atoms=folded,
-        all_invisible=False,
-    )
-
-
-def _merge_group(
-    group: Sequence[LatticeAtom], carrier: LatticeAtom, position: int, lang: str
-) -> LatticeAtom:
-    if len(group) == 1:
-        return _replace(group[0], index=position)
-    members: list[int] = []
-    for atom in group:
-        members.extend(atom.members)
-    return LatticeAtom(
-        index=position,
-        text=_join([atom.text for atom in group], lang),
-        start=span_min([atom.start for atom in group]),
-        end=span_max([atom.end for atom in group]),
-        unit_start=group[0].unit_start,
-        unit_end=group[-1].unit_end,
-        end_pen=carrier.end_pen,
-        start_pen=carrier.start_pen,
-        boundary_pen=carrier.boundary_pen,
-        phrase_start=carrier.phrase_start,
-        forced_boundary=carrier.forced_boundary,
-        display=carrier.display,
-        members=tuple(sorted(members)),
-    )
-
-
-# ------------------------------------------------------ C1 unit-edge node space
-
-
-def unit_edge_nodes(atoms: Sequence[LatticeAtom]) -> tuple[int, ...]:
-    """The atom edges that are also source-unit edges -- the whole node space.
-
-    C1 puts the node space in *unit* ids, and every conservation argument
-    downstream restates that as a fact about atoms ("every cut is an atom edge
-    and therefore a source-unit edge"). It is not one. ``_build_atoms``
-    subdivides a source unit freely: one atom per CJK glyph however many glyphs
-    the aligner packed into a unit, one atom per word however many words a
-    coarse-grained ``word_data`` entry carries. Word-level ja/zh evidence and the
-    legacy sentence-level granularity therefore both produce atom edges that sit
-    *inside* a unit, and they are the common case rather than the exotic one.
-
-    Cutting there does not merely give a worse boundary, it gives an
-    unrepresentable one. The partition is reported in unit ids, so both sides of
-    such a cut collapse onto the same id: the emitted cut list stops being
-    strictly increasing, the cue stream splits a unit its own partition calls
-    whole, the owned-unit text no longer matches the cue text, and -- since every
-    atom of a subdivided unit inherits that unit's full span -- the two cues
-    overlap in time. Restricting the node space here is what makes the footprint
-    the single ownership authority the rest of the design assumes it already is.
-
-    The two ends are always edges: a node space that could not close the interval
-    would have no legal path at all.
-    """
-    count = len(atoms)
-    nodes = {0, count}
-    for index in range(1, count):
-        if atoms[index].unit_start >= atoms[index - 1].unit_end:
-            nodes.add(index)
-    return tuple(sorted(nodes))
-
-
-def _latest_unit_edge(legal: Sequence[int], upper: int, lower: int) -> int | None:
-    """The largest unit edge in ``(lower, upper]``, or None when there is none."""
-    position = bisect_right(legal, upper) - 1
-    if position < 0:
-        return None
-    node = legal[position]
-    return node if node > lower else None
-
-
-def exclusively_owned(atoms: Sequence[LatticeAtom], index: int) -> bool:
-    """Does this atom own every unit in its footprint, sharing none of them?
-
-    The relief seam mints its pieces from the *unit* stream, which is only sound
-    when the atom it is splitting owns those units outright. It does not always:
-    a source unit subdivided into several atoms leaves each of them claiming the
-    same unit id, and coalescing can then hand the trailing piece a footprint
-    that starts on a unit its left neighbour already carries. Re-minting such a
-    piece from ``units[lo:hi]`` resurrects the whole unit surface next to the
-    sibling that still holds part of it, duplicating text that conservation then
-    correctly reports as missing from the other side.
-
-    So relief asks this first. An atom that shares a unit is left alone and the
-    duration ladder continues to the held-chain test and the typed fallback --
-    the outcomes that exist for "no legal cut is available here".
-    """
-    atom = atoms[index]
-    if index > 0 and atoms[index - 1].unit_end > atom.unit_start:
-        return False
-    if index + 1 < len(atoms) and atoms[index + 1].unit_start < atom.unit_end:
-        return False
-    return True
-
-
-# --------------------------------------------------------------- C4 barriers
-
-
-@dataclass(frozen=True)
-class HardBarrier:
-    """A cut point no partition may cross: a document end or a robust silence."""
-
-    node: int
-    unit_id: int
-    kind: str
-    gap_ms: float | None
-
-
-def build_barriers(
-    layer: AtomLayer, profile: DisplayProfile
-) -> tuple[HardBarrier, ...]:
-    """The two document ends plus every inter-atom gap that is robustly silent.
-
-    "Robustly" means the gap clears ``vad_skip_ms`` by more than the measurement
-    uncertainty and *both* of its bounds are real -- a gap next to a ghost unit
-    is unmeasured, not long.
-
-    A barrier is a cut like any other, so it is restricted to the same unit-edge
-    node space (see :func:`unit_edge_nodes`): an interval boundary interior to a
-    source unit would hand two intervals overlapping ownership of it. Today the
-    restriction never fires on its own -- atoms of one unit share that unit's
-    span, so the gap between them measures zero -- but that is a property of the
-    atom builder rather than of this rule, and the topology must not depend on it.
-
-    DECLARED POLICY DELTA: this ignores v1's phrase gate and its sticky-token
-    suppression, so a no-space language can get a barrier mid-phrase where v1
-    would have crossed. That is a deliberate v2 choice, recorded in the artifact
-    rather than inherited as truth.
-    """
-    threshold = profile.vad_skip_ms + BARRIER_UNCERTAINTY_MS
-    barriers = [
-        HardBarrier(node=0, unit_id=layer.unit_bound(0), kind="document", gap_ms=None)
-    ]
-    representable = set(unit_edge_nodes(layer.atoms))
-    for node in range(1, len(layer.atoms)):
-        if node not in representable:
-            continue
-        left_end = layer.atoms[node - 1].end
-        right_start = layer.atoms[node].start
-        if left_end is None or right_start is None:
-            continue
-        if not (_real(left_end) and _real(right_start)):
-            continue
-        gap_ms = max(0.0, (right_start - left_end) * 1000.0)
-        if gap_ms >= threshold:
-            barriers.append(
-                HardBarrier(
-                    node=node,
-                    unit_id=layer.unit_bound(node),
-                    kind="robust-silence",
-                    gap_ms=gap_ms,
-                )
-            )
-    last = len(layer.atoms)
-    if last != 0:
-        barriers.append(
-            HardBarrier(
-                node=last, unit_id=layer.unit_bound(last), kind="document", gap_ms=None
-            )
-        )
-    seen: dict[int, HardBarrier] = {}
-    for barrier in barriers:
-        seen.setdefault(barrier.node, barrier)
-    return tuple(seen[node] for node in sorted(seen))
-
-
-@dataclass(frozen=True)
-class HardInterval:
-    """One barrier-to-barrier region, solved independently of every other."""
-
-    index: int
-    node_start: int
-    node_end: int
-    unit_start: int
-    unit_end: int
-    left: HardBarrier
-    right: HardBarrier
-
-    @property
-    def atom_count(self) -> int:
-        return self.node_end - self.node_start
-
-
-def build_intervals(
-    layer: AtomLayer, barriers: Sequence[HardBarrier]
-) -> tuple[HardInterval, ...]:
-    """Consecutive barrier pairs; empty regions are dropped, the rest tile."""
-    out: list[HardInterval] = []
-    for left, right in zip(barriers, barriers[1:]):
-        if left.node == right.node:
-            continue
-        out.append(
-            HardInterval(
-                index=len(out),
-                node_start=left.node,
-                node_end=right.node,
-                unit_start=layer.unit_bound(left.node),
-                unit_end=layer.unit_bound(right.node),
-                left=left,
-                right=right,
-            )
-        )
-    return tuple(out)
-
-
-# ------------------------------------------------------------ C1 node space
-
-
-def candidate_nodes(atoms: Sequence[LatticeAtom], lang: str) -> tuple[int, ...]:
-    """Atom edges a cue boundary may sit on.
-
-    Space-delimited languages may break between any two words. No-space
-    languages may break only at a phrase start, plus wherever an overlong
-    embedded Latin run was forced to expose its internal whitespace -- that is a
-    permission the packer needs, not a mandate to use it.
-
-    Both readings are then intersected with :func:`unit_edge_nodes`, because a
-    linguistically attractive break interior to a source unit is still one the
-    partition cannot express. Where the aligner emitted one unit per atom the
-    intersection removes nothing; where it emitted coarser units it removes
-    exactly the boundaries that had no unit-level evidence behind them.
-    """
-    count = len(atoms)
-    nodes = {0, count}
-    if not _no_spaces(lang):
-        nodes.update(range(count))
-    else:
-        for index, atom in enumerate(atoms):
-            if atom.phrase_start or atom.forced_boundary:
-                nodes.add(index)
-    nodes &= set(unit_edge_nodes(atoms))
-    nodes |= {0, count}
-    return tuple(sorted(nodes))
-
-
-def split_candidate_at_unit(
-    atoms: Sequence[LatticeAtom],
-    unit_id: int,
-    units: Sequence[SourceUnit],
-    lang: str,
-) -> tuple[LatticeAtom, ...]:
-    """Expose one source-unit boundary that an atom is currently hiding.
-
-    This is the relief seam: an atom that owns several units has internal
-    boundaries the packer cannot see, and this is the only sanctioned way to
-    make one of them a candidate. Splitting is by footprint, so the pieces'
-    surfaces and spans come from the units themselves rather than from a
-    re-derived cursor into the atom's own text.
-
-    Penalty transport is conservative on purpose: the newly exposed edge carries
-    no linguistic evidence at all (zero on both sides of it), while the parent's
-    start-side penalties stay with the left piece and its end-side penalty with
-    the right. Inventing a penalty for a boundary no analyzer ever scored would
-    be worse than scoring it neutral.
-    """
-    target = next(
-        (i for i, a in enumerate(atoms) if a.unit_start < unit_id < a.unit_end), None
-    )
-    if target is None:
-        raise ValueError(
-            f"unit {unit_id} is not strictly inside any atom footprint: "
-            "the boundary is already exposed or out of range"
-        )
-    parent = atoms[target]
-    left = _piece_from_units(
-        parent,
-        parent.unit_start,
-        unit_id,
-        units,
-        lang,
-        end_pen=0,
-        start_pen=parent.start_pen,
-        boundary_pen=parent.boundary_pen,
-        phrase_start=parent.phrase_start,
-        forced_boundary=False,
-        members=parent.members,
-    )
-    right = _piece_from_units(
-        parent,
-        unit_id,
-        parent.unit_end,
-        units,
-        lang,
-        end_pen=parent.end_pen,
-        start_pen=0,
-        boundary_pen=0,
-        phrase_start=True,
-        forced_boundary=parent.forced_boundary,
-        members=(),
-    )
-    return _reindex([*atoms[:target], left, right, *atoms[target + 1 :]])
-
-
-def _piece_from_units(
-    parent: LatticeAtom,
-    lo: int,
-    hi: int,
-    units: Sequence[SourceUnit],
-    lang: str,
-    *,
-    end_pen: int,
-    start_pen: int,
-    boundary_pen: int,
-    phrase_start: bool,
-    forced_boundary: bool,
-    members: tuple[int, ...],
-) -> LatticeAtom:
-    owned = [units[i] for i in range(lo, hi) if 0 <= i < len(units)]
-    text = _join([unit.surface for unit in owned], lang)
-    return LatticeAtom(
-        index=parent.index,
-        text=text,
-        start=span_min([unit.start for unit in owned]),
-        end=span_max([unit.end for unit in owned]),
-        unit_start=lo,
-        unit_end=hi,
-        end_pen=end_pen,
-        start_pen=start_pen,
-        boundary_pen=boundary_pen,
-        phrase_start=phrase_start,
-        forced_boundary=forced_boundary,
-        display="".join(_display_chars([text])),
-        members=members,
-    )
-
-
-# --------------------------------------------------------- C6 packing oracle
-
-
-@dataclass(frozen=True)
-class PackMeasure:
-    """The batch layout answer for one atom prefix."""
-
-    fits: bool
-    lines: int
-    line_widths: tuple[int, ...]
-    text: str
-
-    @property
-    def balance(self) -> float:
-        if self.lines != 2:
-            return 0.0
-        return float(abs(self.line_widths[0] - self.line_widths[1]))
-
-
-class _PackState:
-    """Everything about a prefix measurement that the flush can still change."""
-
-    __slots__ = (
-        "started",
-        "space_pending",
-        "token",
-        "finished",
-        "cur_width",
-        "cur_open",
-    )
-
-    def __init__(self) -> None:
-        self.started = False
-        self.space_pending = False
-        self.token = ""
-        self.finished: list[int] = []
-        self.cur_width = 0
-        self.cur_open = False
-
-    def clone(self) -> _PackState:
-        other = _PackState()
-        other.started = self.started
-        other.space_pending = self.space_pending
-        other.token = self.token
-        other.finished = list(self.finished)
-        other.cur_width = self.cur_width
-        other.cur_open = self.cur_open
-        return other
-
-
-class IncrementalPacker:
-    """Prefix-extension oracle over the normalized display stream.
-
-    The input projection is ``strip_punct_for_subtitles(_join(texts, lang))``,
-    and the naive way to get it per prefix is to redo all four passes every
-    time. The fold is for spaced languages only, where it is differential-pinned
-    to the batch packing oracle, and refuses a no-space language. No-space
-    admission is governed by cached :func:`canonical_text` projections instead:
-    kinsoku can move a closing glyph across a normalized gap, so no bounded
-    streaming state is allowed to approximate that decision.
-
-    Each pass is a left-to-right fold with bounded lookahead, so the whole chain
-    streams:
-
-    * punctuation stripping needs exactly **one character** of lookahead -- the
-      rule that keeps the dot of ``3.75`` is ``[.,](?!\\d)``, and every match is a
-      single character, so the production regex can be asked about one character
-      at a time by matching it against ``char + next_char``;
-    * whitespace collapsing and trimming need only a "space pending" flag;
-    * tokenization is local, and greedy first-fit line packing never re-flows a
-      line once a later token has been placed.
-
-    What cannot be committed early is held: the last raw character (awaiting its
-    lookahead) and a partial token. A measurement
-    therefore flushes a **copy** of that bounded tail, which is what makes the
-    reported answer the batch answer for the current prefix rather than for the
-    prefix plus whatever comes next.
-
-    One honest caveat: the *decision* (fits, line count, widths) is O(1)
-    amortised per atom, but materializing ``PackMeasure.text`` is linear in the
-    prefix. That is not a shortcoming of the fold -- the caller needs that exact
-    string for the edge it is about to build, so the cost is inherent to the
-    output rather than to the measurement.
-    """
-
-    def __init__(self, lang: str, max_line_length: int, max_lines: int) -> None:
-        if _no_spaces(lang):
-            raise ValueError(
-                f"IncrementalPacker is the spaced-language fold; {lang!r} is "
-                "admitted through canonical_text"
-            )
-        self._sep = " "
-        self._sep_width = _vis_width(self._sep)
-        self._budget = _line_budget_width(max_line_length, lang)
-        self._max_lines = max_lines
-        self._steps = 0
-        self.reset()
-
-    def reset(self) -> None:
-        """Start a fresh prefix. The step counter deliberately survives."""
-        self._first = True
-        self._hold: str | None = None
-        self._norm: list[str] = []
-        self._state = _PackState()
-
-    @property
-    def steps(self) -> int:
-        """Cumulative extension steps -- the work counter, not a prefix length."""
-        return self._steps
-
-    def extend(self, atom_text: str) -> PackMeasure:
-        """Append one atom and return the batch measure for the whole prefix."""
-        self._steps += 1
-        chunk = atom_text if self._first else self._sep + atom_text
-        self._first = False
-        for char in chunk:
-            if self._hold is not None:
-                self._norm.append(
-                    self._feed(self._state, self._resolve(self._hold, char))
-                )
-            self._hold = char
-        return self._measure()
-
-    # -- stage A: punctuation, resolved one character at a time ---------------
-
-    @staticmethod
-    def _resolve(char: str, nxt: str | None) -> str:
-        """The character the strip pass keeps, given its single lookahead.
-
-        Asked of the production regex directly: every alternative it can match is
-        exactly one character wide, so a match anchored at position 0 of
-        ``char + lookahead`` is precisely the substitution the batch pass would
-        make at that offset.
-        """
-        return " " if _PUNCT_TO_SPACE_RE.match(char + (nxt or "")) else char
-
-    # -- stages B and C: whitespace, tokenization ----------------------------
-
-    def _feed(self, state: _PackState, char: str) -> str:
-        """Push one stripped character through collapsing and tokenization."""
-        if char.isspace():
-            if state.started:
-                state.space_pending = True
-            return ""
-        out = ""
-        if state.space_pending:
-            state.space_pending = False
-            out += " "
-            self._feed_token(state, " ")
-        state.started = True
-        self._feed_token(state, char)
-        return out + char
-
-    def _feed_token(self, state: _PackState, char: str) -> None:
-        if char == " ":
-            self._close_token(state)
-        else:
-            state.token += char
-
-    def _close_token(self, state: _PackState) -> None:
-        if state.token:
-            self._commit_token(state, state.token)
-        state.token = ""
-
-    # -- stage D: greedy first-fit packing -----------------------------------
-
-    def _commit_token(self, state: _PackState, token: str) -> None:
-        width = _vis_width(token)
-        extra = self._sep_width if state.cur_open else 0
-        if state.cur_open and state.cur_width + width + extra > self._budget:
-            state.finished.append(state.cur_width)
-            state.cur_width = width
-        else:
-            state.cur_width += width + extra
-        state.cur_open = True
-
-    def _measure(self) -> PackMeasure:
-        state = self._state.clone()
-        tail = ""
-        if self._hold is not None:
-            tail = self._feed(state, self._resolve(self._hold, None))
-        self._close_token(state)
-        widths = list(state.finished)
-        if state.cur_open:
-            widths.append(state.cur_width)
-        if not widths:
-            # An empty projection is one zero-width line, matching the batch
-            # call's behaviour on the empty string.
-            widths = [0]
-        return PackMeasure(
-            fits=len(widths) <= self._max_lines
-            and all(width <= self._budget for width in widths),
-            lines=len(widths),
-            line_widths=tuple(widths),
-            text="".join(self._norm) + tail,
-        )
-
-
-def _canonical_pack_measure(
-    atoms: Sequence[LatticeAtom],
-    start: int,
-    end: int,
-    profile: DisplayProfile,
-    work: CanonicalWork,
-) -> PackMeasure:
-    """Direct no-space admission facts for one cached lattice span.
-
-    The cache key is the lattice's own ``(start, end)`` pair. Legality and the
-    recorded line facts come only from ``FinalText``; the unwrapped display text
-    remains the direct batch strip used by the cost model before finalization.
-    """
-    chunk = atoms[start:end]
-    lang = profile.language
-    raw = _join([atom.text for atom in chunk], lang)
-    final = work.cached(
-        (start, end),
-        lambda: canonical_text(
-            [
-                {"text": atom.text, "start": atom.start, "end": atom.end}
-                for atom in chunk
-            ],
-            fallback_text=raw,
-            lang=lang,
-            profile=profile,
-            expected_footprint=raw,
-            work=work,
-        ),
-    )
-    return PackMeasure(
-        fits=canonical_legal(final, profile),
-        lines=len(final.lines),
-        line_widths=final.cell_widths,
-        text=strip_punct_for_subtitles(raw),
-    )
-
-
-# ------------------------------------------------------------------- edges
-
-
-@dataclass(frozen=True)
-class Edge:
-    """One hard-legal candidate cue, spanning ``[start_node, end_node)``."""
-
-    start_node: int
-    end_node: int
-    text: str
-    display_text: str
-    lines: int
-    line_widths: tuple[int, ...]
-    span_start: float | None
-    span_end: float | None
-    waiver: Waiver | None
-    # W3 candidate cache.  Typed as Any here so the hard-lattice module does
-    # not import the policy module at import time; build_document_lattice fills
-    # it through one local import after hard admission has finished.
-    evidence_span: Any | None = None
-    lyric: bool = False
-    input_start: float | None = None
-    input_end: float | None = None
-    evidence_unavailable_reason: str | None = None
-
-    @property
-    def vis_width(self) -> int:
-        return _vis_width(self.display_text)
-
-    @property
-    def balance(self) -> float:
-        if self.lines != 2:
-            return 0.0
-        return float(abs(self.line_widths[0] - self.line_widths[1]))
-
-    def to_dict(self) -> dict[str, Any]:
-        result = {
-            "display_text": self.display_text,
-            "end_node": self.end_node,
-            "line_widths": list(self.line_widths),
-            "lines": self.lines,
-            "span": [self.span_start, self.span_end],
-            "start_node": self.start_node,
-            "waiver": None if self.waiver is None else self.waiver.to_dict(),
-        }
-        if self.evidence_span is not None:
-            result.update(
-                {
-                    "evidence_span": self.evidence_span.to_dict(),
-                    "input_span": [self.input_start, self.input_end],
-                    "lyric": self.lyric,
-                }
-            )
-        elif self.evidence_unavailable_reason is not None:
-            result.update(
-                {
-                    "evidence_span_refusal": self.evidence_unavailable_reason,
-                    "input_span": [self.input_start, self.input_end],
-                    "lyric": False,
-                }
-            )
-        return result
-
-
-@dataclass(frozen=True)
-class Infeasible:
-    """A typed reason one interval produced no legal partition at all."""
-
-    reason: str
-    detail: str
-    unit_range: tuple[int, int]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "detail": self.detail,
-            "reason": self.reason,
-            "unit_range": list(self.unit_range),
-        }
 
 
 def held_chain_continuous(
@@ -1358,198 +381,6 @@ def resolve_cap_partition(
         relief_injections=injections,
         infeasible=None,
     )
-
-
-# --------------------------------------------------------------- C16 relief
-
-
-def relief_trigger(
-    atoms: Sequence[LatticeAtom], *, max_line_length: int, max_lines: int
-) -> bool:
-    """v1's trigger verbatim, unit quirk included.
-
-    The left side is a non-space **character** count and the right side is
-    native **cells** times lines. Those are different units, and on a wide-glyph
-    language they differ by a factor of two -- but reproducing the quirk is the
-    point: this decides when the valve opens, and a "fixed" threshold would open
-    it somewhere v1 never did.
-    """
-    load = sum(_token_char_count(atom.text) for atom in atoms)
-    return load > round(RELIEF_TRIGGER_FACTOR * max_line_length * max_lines)
-
-
-def relief_nodes(
-    atoms: Sequence[LatticeAtom], *, max_line_length: int, max_lines: int
-) -> tuple[int, ...]:
-    """Unit edges nearest each budget multiple, ties resolved toward the left.
-
-    The valve exists for text with no legal break point of its own; these edges
-    are invented, so they are placed by the only defensible rule available -- as
-    close as possible to where a full cue would have ended -- and never at the
-    interval's own ends, which are already barriers.
-
-    Invented is not the same as arbitrary: the candidates are still drawn from
-    :func:`unit_edge_nodes`, since a relief cut interior to a source unit would
-    break the ownership the valve is trying to rescue. An interval with no
-    interior unit edge at all gets no relief, and the caller's path-existence
-    check turns that into a typed ``relief-insufficient`` fallback rather than an
-    unrepresentable partition.
-    """
-    budget = max_line_length * max_lines
-    if budget <= 0 or len(atoms) < 2:
-        return ()
-    legal = [node for node in unit_edge_nodes(atoms) if 0 < node < len(atoms)]
-    if not legal:
-        return ()
-    cumulative = [0]
-    for atom in atoms:
-        cumulative.append(cumulative[-1] + _token_char_count(atom.text))
-    total = cumulative[-1]
-    out: set[int] = set()
-    target = budget
-    while target < total:
-        best: int | None = None
-        best_distance: int | None = None
-        for node in legal:
-            distance = abs(cumulative[node] - target)
-            if best_distance is None or distance < best_distance:
-                best, best_distance = node, distance
-        if best is not None:
-            out.add(best)
-        target += budget
-    return tuple(sorted(out))
-
-
-# ------------------------------------------------------- granularity preflight
-
-
-@dataclass(frozen=True)
-class GranularityCheck:
-    """Whether a node space can express *any* legal partition of its interval."""
-
-    required_cuts: int
-    available_cuts: int
-
-    @property
-    def collapsed(self) -> bool:
-        return self.available_cuts < self.required_cuts
-
-
-def granularity_check(
-    atoms: Sequence[LatticeAtom], nodes: Sequence[int], profile: DisplayProfile
-) -> GranularityCheck:
-    """Count the interior cuts a legal partition needs against the ones on offer.
-
-    ``candidate_nodes`` intersects the linguistic break set with the source-unit
-    edges, because a boundary interior to a source unit is one the partition
-    cannot express. On a word-level stream that removes nothing. On a stream
-    whose ``word_data`` is coarser than a phrase -- the legacy sentence-level
-    granularity this repo documents as valid -- it can remove *everything*: the
-    phrase starts a no-space segmenter finds sit inside the units, so the node
-    space collapses to ``{0, N}`` and no cue short enough to fit the layout
-    budget can be expressed at all.
-
-    That is a structural fact about the input, not a search that failed, and it
-    is worth its own answer: the required cut count comes from a greedy chunking
-    at the loosest capacity a cue could ever have (``max_lines`` whole lines,
-    and the separator a line break replaces never charged: the first
-    ``max_lines - 1`` joins of a chunk are free), with every atom at the fewest
-    cells any cue can show of it -- an atom that shows nothing takes neither
-    width nor a join. That width is the atom's text normalized on its own, the
-    same context-free projection :func:`build_atom_layer` gives
-    ``LatticeAtom.display``: on the stream joined without spaces the ``.`` of
-    ``de.`` before ``5`` survives ``[.,](?!\\d)``, while a cue joins a space
-    there (or ends) and strips it. Every other strip rule is context-free, so the
-    text alone strips at least what any cue does. The count is therefore a
-    strict lower bound, and a ``collapsed`` verdict cannot be wrong about there
-    being no legal path.
-
-    Being a lower bound, it is deliberately one-sided. A coarse stream that has
-    *enough* candidate boundaries but none of them in a usable place still fails,
-    and keeps the honest ``no-path``/``relief-insufficient`` reason -- this
-    counts boundaries, it does not place them.
-
-    P5 resolves this class by splitting *below* the source unit; P4 measures the
-    boundary decision on the units it is given and refuses to invent evidence,
-    so a collapsed interval takes the typed ``coarse-granularity`` fallback.
-    """
-    count = len(atoms)
-    capacity = profile.max_lines * _line_budget_width(
-        profile.max_line_length, profile.language
-    )
-    available = sum(1 for node in nodes if 0 < node < count)
-    if count == 0 or capacity <= 0:
-        return GranularityCheck(required_cuts=0, available_cuts=available)
-    separator = 0 if _no_spaces(profile.language) else 1
-    chunks = 1
-    width = 0
-    pieces = 0
-    for atom in atoms:
-        piece = _vis_width(_display_chars([atom.text])[0])
-        if not piece:
-            continue
-        extra = separator if pieces >= profile.max_lines else 0
-        if pieces and width + extra + piece > capacity:
-            chunks += 1
-            width = piece
-            pieces = 1
-        else:
-            width += extra + piece
-            pieces += 1
-    return GranularityCheck(required_cuts=chunks - 1, available_cuts=available)
-
-
-# --------------------------------------------------------------- sentences
-
-
-@dataclass(frozen=True)
-class SentenceEnds:
-    nodes: frozenset[int]
-    missed: int
-
-
-def sentence_end_nodes(layer: AtomLayer) -> SentenceEnds:
-    """Sentence-segmenter cuts mapped onto atom edges, misses included.
-
-    The engine's own mapping silently drops a sentence cut that does not land on
-    an atom edge. That is the right behaviour for the engine and the wrong one
-    for a measurement, so the count is recorded here: a document with many
-    misses is one whose sentence-crossing feature is under-informed, and a
-    reader deserves to know that rather than infer it.
-
-    A cut that lands on an atom edge interior to a source unit counts as a miss
-    for the same reason: no partition can end a cue there, so charging every path
-    alike for crossing it would describe the stream as better informed than it is.
-    """
-    lang = layer.lang
-    text = layer.text
-    atoms = layer.atoms
-    sentences = _snap_sentence_breaks(text, _segment_sentences(text, lang), lang)
-    if len(sentences) < 2:
-        return SentenceEnds(frozenset(), 0)
-    no_space = _no_spaces(lang)
-    atom_ends: dict[int, int] = {}
-    consumed = 0
-    for index, atom in enumerate(atoms, 1):
-        consumed += _token_char_count(atom.text) if no_space else 1
-        atom_ends[consumed] = index
-    representable = set(unit_edge_nodes(atoms))
-    wanted: set[int] = set()
-    missed = 0
-    consumed = 0
-    for sentence in sentences[:-1]:
-        tokens = _tokens(sentence, lang)
-        consumed += (
-            sum(_token_char_count(token) for token in tokens)
-            if no_space
-            else len(tokens)
-        )
-        index = atom_ends.get(consumed)
-        if index is not None and 0 < index < len(atoms) and index in representable:
-            wanted.add(index)
-        else:
-            missed += 1
-    return SentenceEnds(frozenset(wanted), missed)
 
 
 # -------------------------------------------------------------- the lattice
@@ -1939,17 +770,11 @@ def _untimed_run_blocks(
     return untimed
 
 
-def build_interval_lattice(
+# The interval has a span violation inside it: no lattice, a typed preflight reason.
+def _span_preflight_lattice(
     interval: HardInterval,
-    layer: AtomLayer,
-    profile: DisplayProfile,
-    *,
-    units: Sequence[SourceUnit],
-    span_violations: Sequence[SpanViolation] = (),
-    canonical_spaced: bool = False,
-) -> IntervalLattice:
-    """Build one interval's legal cue set, or say precisely why there is none."""
-    lang = profile.language
+    span_violations: Sequence[SpanViolation],
+) -> IntervalLattice | None:
     blocking = [
         violation
         for violation in span_violations
@@ -1976,41 +801,52 @@ def build_interval_lattice(
             packer_steps=0,
             canonical_chars=0,
         )
+    return None
 
-    raw = _reindex(layer.atoms[interval.node_start : interval.node_end])
-    raw = tuple(
-        _replace(atom, members=(position,)) for position, atom in enumerate(raw)
+
+# The all-invisible interval: a forced edge chain over the cap partition, no search.
+def _all_invisible_lattice(
+    interval: HardInterval,
+    coalesced: CoalesceResult,
+    units: Sequence[SourceUnit],
+    profile: DisplayProfile,
+    lang: str,
+) -> IntervalLattice:
+    resolution = resolve_cap_partition(
+        coalesced.atoms,
+        units,
+        max_cue_s=profile.max_cue_s,
+        lang=lang,
     )
-    coalesced = coalesce_zero_display(raw, lang=lang)
+    atoms = resolution.atoms
+    edges = (
+        ()
+        if resolution.infeasible is not None
+        else _forced_chain(atoms, resolution.cuts, resolution.waivers, lang)
+    )
+    return IntervalLattice(
+        interval=interval,
+        atoms=atoms,
+        nodes=(0, *resolution.cuts, len(atoms)),
+        edges=edges,
+        edges_from=_edges_from(edges),
+        coalesced_atoms=coalesced.coalesced_atoms,
+        all_invisible=True,
+        relief_injections=resolution.relief_injections,
+        waivers=resolution.waivers,
+        infeasible=resolution.infeasible,
+        packer_steps=0,
+        canonical_chars=0,
+    )
 
-    if coalesced.all_invisible:
-        resolution = resolve_cap_partition(
-            coalesced.atoms,
-            units,
-            max_cue_s=profile.max_cue_s,
-            lang=lang,
-        )
-        atoms = resolution.atoms
-        edges = (
-            ()
-            if resolution.infeasible is not None
-            else _forced_chain(atoms, resolution.cuts, resolution.waivers, lang)
-        )
-        return IntervalLattice(
-            interval=interval,
-            atoms=atoms,
-            nodes=(0, *resolution.cuts, len(atoms)),
-            edges=edges,
-            edges_from=_edges_from(edges),
-            coalesced_atoms=coalesced.coalesced_atoms,
-            all_invisible=True,
-            relief_injections=resolution.relief_injections,
-            waivers=resolution.waivers,
-            infeasible=resolution.infeasible,
-            packer_steps=0,
-            canonical_chars=0,
-        )
 
+# Source-unit relief on the atoms that are over the cap alone, then the re-coalesce.
+def _relieve_interval_atoms(
+    coalesced: CoalesceResult,
+    units: Sequence[SourceUnit],
+    profile: DisplayProfile,
+    lang: str,
+) -> tuple[tuple[LatticeAtom, ...], int, int]:
     atoms = coalesced.atoms
     coalesced_atoms = coalesced.coalesced_atoms
     relief_injections = 0
@@ -2032,8 +868,18 @@ def build_interval_lattice(
             coalesced_atoms += recoalesced.coalesced_atoms
         else:
             atoms = relieved
-    nodes = candidate_nodes(atoms, lang)
+    return atoms, coalesced_atoms, relief_injections
 
+
+# Units coarser than a cue: even the relief nodes leave too few cuts, so no search.
+def _coarse_granularity_lattice(
+    interval: HardInterval,
+    atoms: tuple[LatticeAtom, ...],
+    nodes: tuple[int, ...],
+    profile: DisplayProfile,
+    coalesced_atoms: int,
+    relief_injections: int,
+) -> IntervalLattice | None:
     granularity = granularity_check(atoms, nodes, profile)
     if granularity.collapsed:
         widened = nodes
@@ -2083,6 +929,43 @@ def build_interval_lattice(
                 canonical_chars=0,
                 cap_relief_nodes=0,
             )
+    return None
+
+
+def build_interval_lattice(
+    interval: HardInterval,
+    layer: AtomLayer,
+    profile: DisplayProfile,
+    *,
+    units: Sequence[SourceUnit],
+    span_violations: Sequence[SpanViolation] = (),
+    canonical_spaced: bool = False,
+) -> IntervalLattice:
+    """Build one interval's legal cue set, or say precisely why there is none."""
+    lang = profile.language
+    preflight = _span_preflight_lattice(interval, span_violations)
+    if preflight is not None:
+        return preflight
+
+    raw = _reindex(layer.atoms[interval.node_start : interval.node_end])
+    raw = tuple(
+        _replace(atom, members=(position,)) for position, atom in enumerate(raw)
+    )
+    coalesced = coalesce_zero_display(raw, lang=lang)
+
+    if coalesced.all_invisible:
+        return _all_invisible_lattice(interval, coalesced, units, profile, lang)
+
+    atoms, coalesced_atoms, relief_injections = _relieve_interval_atoms(
+        coalesced, units, profile, lang
+    )
+    nodes = candidate_nodes(atoms, lang)
+
+    coarse = _coarse_granularity_lattice(
+        interval, atoms, nodes, profile, coalesced_atoms, relief_injections
+    )
+    if coarse is not None:
+        return coarse
 
     canonical_work = CanonicalWork()
     scan, nodes, steps, cap_relief_nodes = _scan_with_cap_nodes(

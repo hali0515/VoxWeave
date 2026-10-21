@@ -291,6 +291,168 @@ def _adapter_semantic_observation(
     return deepcopy(_adapter_record(context, result).semantic_observation)
 
 
+def _same_bound(left: float | None, right: float | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return left.hex() == right.hex()
+
+
+# W1 phase-1 fidelity: the seed blocks must preview to the phase-1 cues exactly.
+def _w1_check_phase1_fidelity(seed_blocks, seed_cues, profile) -> None:
+    from voxweave.core.finalizer import FinalizerPreview
+    from voxweave.core.timing_preview import CueCandidate
+
+    preview = FinalizerPreview()
+    for block, phase1 in zip(seed_blocks, seed_cues, strict=True):
+        candidate = CueCandidate(
+            block.display_start,
+            block.display_end,
+            None,
+            block.text,
+            tuple(
+                {
+                    "text": unit.surface,
+                    "start": unit.start,
+                    "end": unit.end,
+                }
+                for unit in block.units
+            ),
+            block.speech_start,
+            block.speech_end,
+            profile,
+            block.footprint,
+        )
+        promised = preview.preview_cue(candidate)
+        if (
+            promised.final_text != phase1.text
+            or promised.line_count != len(phase1.lines)
+            or promised.reading_chars != phase1.reading_chars
+            or not _same_bound(promised.display_start, phase1.start)
+            or not _same_bound(promised.display_end, phase1.end)
+        ):
+            raise AlignAdapterError(
+                CanonicalFailure(
+                    "finalizer-output-invalid", "w1-finalizer", "phase1-fidelity"
+                )
+            )
+
+
+# W1 terminal table: report and trace must agree on a valid fixed-point or cycle.
+def _w1_check_terminal(finalized) -> None:
+    terminal = getattr(finalized.report, "terminal", None)
+    trace_terminal = getattr(finalized.trace, "terminal", None)
+    if terminal != trace_terminal:
+        raise AlignAdapterError(
+            CanonicalFailure(
+                "finalizer-output-invalid", "w1-finalizer", "terminal-validity"
+            )
+        )
+    if terminal == "budget-exhausted":
+        if finalized.valid is not False:
+            raise AlignAdapterError(
+                CanonicalFailure(
+                    "finalizer-output-invalid",
+                    "w1-finalizer",
+                    "terminal-validity",
+                )
+            )
+        raise AlignAdapterError(
+            CanonicalFailure(
+                "finalizer-budget-exhausted", "w1-finalizer", "sweep-budget"
+            )
+        )
+    if terminal not in ("fixed-point", "cycle-adoption") or finalized.valid is not True:
+        raise AlignAdapterError(
+            CanonicalFailure(
+                "finalizer-output-invalid", "w1-finalizer", "terminal-validity"
+            )
+        )
+
+
+# W1 footprint check: no canonical-text fallback and unit ranges match the blocks.
+def _w1_check_footprint(seed_cues, seed_blocks) -> None:
+    if any(
+        getattr(report, "kind", None) == "canonical-text-fallback"
+        for cue in seed_cues
+        for report in getattr(cue, "reports", ())
+    ) or any(
+        getattr(cue, "unit_range", None) != block.unit_range
+        for block, cue in zip(seed_blocks, seed_cues, strict=True)
+    ):
+        raise AlignAdapterError(
+            CanonicalFailure(
+                "finalizer-output-invalid", "w1-finalizer", "footprint-fallback"
+            )
+        )
+
+
+# W1 cue schema: finalized cues are one-to-one with blocks and well typed.
+def _w1_check_cue_schema(seed_blocks, finalized_cues) -> None:
+    if len(seed_blocks) != len(finalized_cues):
+        raise AlignAdapterError(
+            CanonicalFailure("finalizer-output-invalid", "w1-finalizer", "cue-schema")
+        )
+    for cue in finalized_cues:
+        if (
+            not isinstance(cue, dict)
+            or type(cue.get("text")) is not str
+            or type(cue.get("start")) is not float
+            or type(cue.get("end")) is not float
+            or not isinstance(cue.get("word_data"), list)
+            or not math.isfinite(cue["start"])
+            or not math.isfinite(cue["end"])
+            or cue["start"] < 0.0
+            or cue["start"] > cue["end"]
+            or ("lyric" in cue and type(cue["lyric"]) is not bool)
+        ):
+            raise AlignAdapterError(
+                CanonicalFailure(
+                    "finalizer-output-invalid", "w1-finalizer", "cue-schema"
+                )
+            )
+
+
+# W1 delivery assembly: pure construction of the delivered cues and word segments.
+def _w1_assemble_delivery(
+    context: IssuedAlignContext,
+    receipt_digest: str,
+    seed_blocks,
+    finalized_cues,
+    ordered_units,
+) -> AlignDelivery:
+    delivery_cues = tuple(
+        AlignDeliveryCue(
+            block.source_index,
+            str(cue["text"]),
+            float(cue["start"]),
+            float(cue["end"]),
+            True if cue.get("lyric") is True else None,
+            block.owner_unit_ids,
+            tuple(
+                PersistedAlignUnit(unit.surface, float(unit.start), float(unit.end))
+                for unit in block.units
+                if unit.start is not None and unit.end is not None
+            ),
+            block.speech_start,
+            block.speech_end,
+        )
+        for block, cue in zip(seed_blocks, finalized_cues, strict=True)
+    )
+    delivery = AlignDelivery(
+        context.context_content_digest,
+        receipt_digest,
+        "boundary-v2",
+        context.route_kind,
+        delivery_cues,
+        tuple(
+            PersistedAlignUnit(unit.surface, float(unit.start), float(unit.end))
+            for unit in ordered_units
+            if unit.start is not None and unit.end is not None
+        ),
+    )
+    return delivery
+
+
 def _w1_delivery(
     context: IssuedAlignContext,
     acquisition: object,
@@ -309,7 +471,6 @@ def _w1_delivery(
     from voxweave.core.finalizer import (
         FinalizeEvidence,
         FinalizePolicy,
-        FinalizerPreview,
         finalize,
         phase1_from_fresh_alignment,
     )
@@ -317,7 +478,6 @@ def _w1_delivery(
     from voxweave.core.schema import Cue
     from voxweave.core.segdoc import SourceUnit
     from voxweave.core.trace_validator import replay_trace, stability_check
-    from voxweave.core.timing_preview import CueCandidate
 
     if not isinstance(acquisition, IssuedFreshAlignment):
         raise AlignAdapterError(
@@ -354,45 +514,7 @@ def _w1_delivery(
                 "finalizer-output-invalid", "w1-finalizer", "phase1-fidelity"
             )
         )
-    preview = FinalizerPreview()
-
-    def same_bound(left: float | None, right: float | None) -> bool:
-        if left is None or right is None:
-            return left is right
-        return left.hex() == right.hex()
-
-    for block, phase1 in zip(seed_blocks, seed_cues, strict=True):
-        candidate = CueCandidate(
-            block.display_start,
-            block.display_end,
-            None,
-            block.text,
-            tuple(
-                {
-                    "text": unit.surface,
-                    "start": unit.start,
-                    "end": unit.end,
-                }
-                for unit in block.units
-            ),
-            block.speech_start,
-            block.speech_end,
-            profile,
-            block.footprint,
-        )
-        promised = preview.preview_cue(candidate)
-        if (
-            promised.final_text != phase1.text
-            or promised.line_count != len(phase1.lines)
-            or promised.reading_chars != phase1.reading_chars
-            or not same_bound(promised.display_start, phase1.start)
-            or not same_bound(promised.display_end, phase1.end)
-        ):
-            raise AlignAdapterError(
-                CanonicalFailure(
-                    "finalizer-output-invalid", "w1-finalizer", "phase1-fidelity"
-                )
-            )
+    _w1_check_phase1_fidelity(seed_blocks, seed_cues, profile)
     finalizer_evidence = FinalizeEvidence(
         shots=tuple(evidence_resolution.shots or ()),
         sing_spans=tuple(evidence_resolution.sing_spans or ()),
@@ -405,34 +527,7 @@ def _w1_delivery(
         evidence=finalizer_evidence,
         policy=policy,
     )
-    terminal = getattr(finalized.report, "terminal", None)
-    trace_terminal = getattr(finalized.trace, "terminal", None)
-    if terminal != trace_terminal:
-        raise AlignAdapterError(
-            CanonicalFailure(
-                "finalizer-output-invalid", "w1-finalizer", "terminal-validity"
-            )
-        )
-    if terminal == "budget-exhausted":
-        if finalized.valid is not False:
-            raise AlignAdapterError(
-                CanonicalFailure(
-                    "finalizer-output-invalid",
-                    "w1-finalizer",
-                    "terminal-validity",
-                )
-            )
-        raise AlignAdapterError(
-            CanonicalFailure(
-                "finalizer-budget-exhausted", "w1-finalizer", "sweep-budget"
-            )
-        )
-    if terminal not in ("fixed-point", "cycle-adoption") or finalized.valid is not True:
-        raise AlignAdapterError(
-            CanonicalFailure(
-                "finalizer-output-invalid", "w1-finalizer", "terminal-validity"
-            )
-        )
+    _w1_check_terminal(finalized)
     semantic_observation = _SemanticObservation(
         semantic_root_lineage,
         deepcopy(stream.cues),
@@ -457,42 +552,9 @@ def _w1_delivery(
         raise AlignAdapterError(
             CanonicalFailure("fresh-authority-invalid", "w1-admission", "w1-root-event")
         )
-    if any(
-        getattr(report, "kind", None) == "canonical-text-fallback"
-        for cue in seed_cues
-        for report in getattr(cue, "reports", ())
-    ) or any(
-        getattr(cue, "unit_range", None) != block.unit_range
-        for block, cue in zip(seed_blocks, seed_cues, strict=True)
-    ):
-        raise AlignAdapterError(
-            CanonicalFailure(
-                "finalizer-output-invalid", "w1-finalizer", "footprint-fallback"
-            )
-        )
+    _w1_check_footprint(seed_cues, seed_blocks)
     ordered_units = tuple(getattr(seed, "ordered_units", ()))
-    if len(seed_blocks) != len(finalized.cues):
-        raise AlignAdapterError(
-            CanonicalFailure("finalizer-output-invalid", "w1-finalizer", "cue-schema")
-        )
-    for cue in finalized.cues:
-        if (
-            not isinstance(cue, dict)
-            or type(cue.get("text")) is not str
-            or type(cue.get("start")) is not float
-            or type(cue.get("end")) is not float
-            or not isinstance(cue.get("word_data"), list)
-            or not math.isfinite(cue["start"])
-            or not math.isfinite(cue["end"])
-            or cue["start"] < 0.0
-            or cue["start"] > cue["end"]
-            or ("lyric" in cue and type(cue["lyric"]) is not bool)
-        ):
-            raise AlignAdapterError(
-                CanonicalFailure(
-                    "finalizer-output-invalid", "w1-finalizer", "cue-schema"
-                )
-            )
+    _w1_check_cue_schema(seed_blocks, finalized.cues)
     delivered = tuple((cue["start"], cue["end"]) for cue in finalized.cues)
     sources = tuple(
         SourceUnit(
@@ -568,35 +630,12 @@ def _w1_delivery(
                 "stability-check",
             )
         )
-    delivery_cues = tuple(
-        AlignDeliveryCue(
-            block.source_index,
-            str(cue["text"]),
-            float(cue["start"]),
-            float(cue["end"]),
-            True if cue.get("lyric") is True else None,
-            block.owner_unit_ids,
-            tuple(
-                PersistedAlignUnit(unit.surface, float(unit.start), float(unit.end))
-                for unit in block.units
-                if unit.start is not None and unit.end is not None
-            ),
-            block.speech_start,
-            block.speech_end,
-        )
-        for block, cue in zip(seed_blocks, finalized.cues, strict=True)
-    )
-    delivery = AlignDelivery(
-        context.context_content_digest,
+    delivery = _w1_assemble_delivery(
+        context,
         acquisition.receipt_digest,
-        "boundary-v2",
-        context.route_kind,
-        delivery_cues,
-        tuple(
-            PersistedAlignUnit(unit.surface, float(unit.start), float(unit.end))
-            for unit in ordered_units
-            if unit.start is not None and unit.end is not None
-        ),
+        seed_blocks,
+        finalized.cues,
+        ordered_units,
     )
     return delivery, semantic_observation
 

@@ -300,6 +300,29 @@ def _joined(surfaces: tuple[str, ...], lower: int, upper: int, iso: str) -> str:
     return separator.join(surfaces[lower:upper])
 
 
+# The two lane outcomes that carry no cuts.  lane.frozen() is read when the
+# helper runs, which is at the return, exactly where the inline construction
+# read it.
+def _lane_exhausted(lane: _Counters, denied: DeniedCharge) -> _LaneOutcome:
+    return _LaneOutcome(
+        "budget-exhausted",
+        lane.frozen(),
+        "allocation-budget",
+        None,
+        denied,
+    )
+
+
+def _lane_invalid(lane: _Counters, detail: str) -> _LaneOutcome:
+    return _LaneOutcome(
+        "invalid",
+        lane.frozen(),
+        detail,
+        None,
+        None,
+    )
+
+
 def _run_lane(
     lane_name: Literal["allocator", "verifier"],
     blocks: tuple[AuthorityBlock, ...],
@@ -325,30 +348,12 @@ def _run_lane(
             WorkCounters(0, 0, 0, len(block.alignment_text)),
         )
         if denied is not None:
-            return _LaneOutcome(
-                "budget-exhausted",
-                lane.frozen(),
-                "allocation-budget",
-                None,
-                denied,
-            )
+            return _lane_exhausted(lane, denied)
         normalized_blocks[block_index] = normalize_text(block.alignment_text)
         if not block.alignment_text.strip():
-            return _LaneOutcome(
-                "invalid",
-                lane.frozen(),
-                "partial-empty-ownership",
-                None,
-                None,
-            )
+            return _lane_invalid(lane, "partial-empty-ownership")
         if not normalized_blocks[block_index]:
-            return _LaneOutcome(
-                "invalid",
-                lane.frozen(),
-                "punctuation-only-block",
-                None,
-                None,
-            )
+            return _lane_invalid(lane, "punctuation-only-block")
     denied = budget.charge(
         lane_name,
         lane,
@@ -357,13 +362,7 @@ def _run_lane(
         WorkCounters(1, 0, 0, 0),
     )
     if denied is not None:
-        return _LaneOutcome(
-            "budget-exhausted",
-            lane.frozen(),
-            "allocation-budget",
-            None,
-            denied,
-        )
+        return _lane_exhausted(lane, denied)
     paths[0][0] = 1
     for block_index in range(len(blocks)):
         for lower in sorted(paths[block_index]):
@@ -376,13 +375,7 @@ def _run_lane(
                     WorkCounters(0, 1, 0, 0),
                 )
                 if denied is not None:
-                    return _LaneOutcome(
-                        "budget-exhausted",
-                        lane.frozen(),
-                        "allocation-budget",
-                        None,
-                        denied,
-                    )
+                    return _lane_exhausted(lane, denied)
                 interval = (lower, upper)
                 if interval not in normalized_intervals:
                     denied = budget.charge(
@@ -398,13 +391,7 @@ def _run_lane(
                         ),
                     )
                     if denied is not None:
-                        return _LaneOutcome(
-                            "budget-exhausted",
-                            lane.frozen(),
-                            "allocation-budget",
-                            None,
-                            denied,
-                        )
+                        return _lane_exhausted(lane, denied)
                     normalized_intervals[interval] = normalize_text(
                         _joined(surfaces, lower, upper, iso)
                     )
@@ -425,13 +412,7 @@ def _run_lane(
                         WorkCounters(1, 0, 0, 0),
                     )
                     if denied is not None:
-                        return _LaneOutcome(
-                            "budget-exhausted",
-                            lane.frozen(),
-                            "allocation-budget",
-                            None,
-                            denied,
-                        )
+                        return _lane_exhausted(lane, denied)
                     paths[block_index + 1][upper] = 0
                 paths[block_index + 1][upper] = min(
                     2,
@@ -443,21 +424,9 @@ def _run_lane(
                     parents.pop((block_index + 1, upper), None)
     path_count = paths[len(blocks)].get(len(surfaces), 0)
     if path_count == 0:
-        return _LaneOutcome(
-            "invalid",
-            lane.frozen(),
-            "allocation-no-tiling",
-            None,
-            None,
-        )
+        return _lane_invalid(lane, "allocation-no-tiling")
     if path_count == 2:
-        return _LaneOutcome(
-            "invalid",
-            lane.frozen(),
-            "allocation-ambiguous",
-            None,
-            None,
-        )
+        return _lane_invalid(lane, "allocation-ambiguous")
     cuts = [len(surfaces)]
     boundary = len(surfaces)
     for row_index in range(len(blocks), 0, -1):
@@ -576,15 +545,12 @@ def _reasons(work: AuthorityJobWorkReceipt) -> tuple[str, ...]:
 
 def _job(
     *,
+    work: AuthorityJobWorkReceipt,
     status: str,
     mismatch: RouteMismatch | None,
-    claims: tuple[RouteClaim, ...],
     route_count: int,
     calls: tuple[AuthorityCallInput, ...],
     skipped: tuple[AuthoritySkippedBlockInput, ...],
-    profile_kind: Literal["production", "test-only"],
-    profile_digest: str,
-    job_limits: JobWorkLimits,
     charged_calls: int,
     totals: WorkCounters,
     terminal_call_index: int | None,
@@ -596,15 +562,15 @@ def _job(
         status,  # type: ignore[arg-type]
         "invalid" if mismatch is not None else "valid",
         mismatch,
-        claims,
+        work.route_claims,
         route_count,
         len(calls),
         len(skipped),
         sum(len(call.raw_unit_ids) for call in calls),
         charged_calls,
-        profile_kind,
-        profile_digest,
-        job_limits,
+        work.limit_profile_kind,
+        work.limit_profile_digest,
+        work.limits,
         totals,
         terminal_call_index,
         denied,
@@ -613,26 +579,13 @@ def _job(
     )
 
 
-def replay_authority_distribution(
-    *,
+# Input-shape checks of the replay, in their raise order: unique blocks,
+# contiguous call indexes, then per call the contiguous raw range and the
+# capture facts.  Returns the blocks keyed by source index.
+def _require_input_shape(
     blocks: tuple[AuthorityBlock, ...],
     calls: tuple[AuthorityCallInput, ...],
-    skipped: tuple[AuthoritySkippedBlockInput, ...],
-    receipt: AuthorityDistributionReceipt,
-    iso: str,
-    call_limits: CallWorkLimits | None = None,
-) -> None:
-    """Recompute and require the complete producer receipt exactly.
-
-    ``call_limits`` is the per-call half of the effective limit profile the
-    producer ran under.  When given, every call row must carry it and the
-    receipt's profile digest is recomputed from it, which is the only way to
-    check the digest of a zero-call receipt under a lowered test-only profile.
-    """
-    work = receipt.work
-    call_limits = _validate_profile(work, call_limits)
-    if type(iso) is not str or not iso:
-        raise DistributionReferenceError("allocator language is invalid")
+) -> dict[int, AuthorityBlock]:
     blocks_by_source = {block.source_index: block for block in blocks}
     if len(blocks_by_source) != len(blocks):
         raise DistributionReferenceError("allocator blocks are not unique")
@@ -651,7 +604,16 @@ def replay_authority_distribution(
                 raise DistributionReferenceError("capture-invalid facts disagree")
         elif call.unit_surfaces is None:
             raise DistributionReferenceError("capture-valid call lacks surfaces")
+    return blocks_by_source
 
+
+# The lossless delivery route the inputs imply: every block is owned by
+# exactly one call or exactly one skipped block.
+def _expected_route(
+    blocks: tuple[AuthorityBlock, ...],
+    calls: tuple[AuthorityCallInput, ...],
+    skipped: tuple[AuthoritySkippedBlockInput, ...],
+) -> list[_Expectation]:
     call_owner = {
         source: call.call_index
         for call in calls
@@ -678,11 +640,16 @@ def replay_authority_distribution(
             route.append(
                 _Expectation(delivery_index, block.source_index, "skip", skip_index)
             )
-    claims = work.route_claims
-    mismatch = _route_mismatch(claims, tuple(route), calls, skipped)
-    claim_positions = _owner_positions(claims)
-    skip_rows = _skip_rows(skipped, claim_positions)
-    raw_ids = tuple(unit_id for call in calls for unit_id in call.raw_unit_ids)
+    return route
+
+
+# The not-run preflight status that ends the replay before any call runs, if
+# any, and the terminal call index it names.
+def _preflight_status(
+    mismatch: RouteMismatch | None,
+    skipped: tuple[AuthoritySkippedBlockInput, ...],
+    calls: tuple[AuthorityCallInput, ...],
+) -> tuple[str | None, int | None]:
     preflight: str | None = None
     terminal: int | None = None
     if mismatch is not None:
@@ -692,42 +659,59 @@ def replay_authority_distribution(
     elif any(call.strict_failure is not None for call in calls):
         preflight = "not-run-strict-unavailable"
         terminal = _first_strict_call(calls)
-    if preflight is not None:
-        expected_work = _job(
-            status=preflight,
-            mismatch=mismatch,
-            claims=claims,
-            route_count=len(route),
-            calls=calls,
-            skipped=skipped,
-            profile_kind=work.limit_profile_kind,
-            profile_digest=work.limit_profile_digest,
-            job_limits=work.limits,
-            charged_calls=0,
-            totals=_ZERO,
-            terminal_call_index=terminal,
-            denied=None,
-            rows=tuple(
-                _base_row(call, claim_positions, blocks_by_source, call_limits)
-                for call in calls
-            ),
-            skip_rows=skip_rows,
-        )
-        expected = AuthorityDistributionReceipt(
-            "invalid",
-            tuple(item.source_index for item in route),
-            None,
-            None,
-            _reasons(expected_work),
-            0,
-            raw_ids,
-            expected_work,
-        )
-        if receipt != expected:
-            raise DistributionReferenceError("allocator preflight receipt mismatch")
-        return
+    return preflight, terminal
 
-    budget = _Budget(call_limits, work.limits)
+
+# A copy of a base call row that carries the given lane receipts.
+def _row_with(
+    row: AuthorityCallWorkReceipt,
+    allocator: WorkLaneReceipt,
+    verifier: WorkLaneReceipt | None,
+) -> AuthorityCallWorkReceipt:
+    return AuthorityCallWorkReceipt(
+        row.call_index,
+        row.route_claim_positions,
+        row.source_block_indices,
+        row.raw_node_range,
+        row.block_count,
+        row.raw_node_count,
+        row.typed_unit_count,
+        row.surface_chars,
+        row.strict_preflight_status,
+        row.strict_failure,
+        row.limits,
+        allocator,
+        verifier,
+    )
+
+
+# The work receipt of one lane outcome; a unique lane completed.
+def _lane_receipt(outcome: _LaneOutcome) -> WorkLaneReceipt:
+    return WorkLaneReceipt(
+        "complete" if outcome.status == "unique" else outcome.status,
+        outcome.counters,
+        outcome.detail,  # type: ignore[arg-type]
+    )
+
+
+# The per-call budget state machine.  The caller owns the budget and reads its
+# call count and totals afterwards.  Returns the call rows, the raw unit
+# groups by source block, the job status, the denied charge and the terminal
+# call index.
+def _replay_calls(
+    calls: tuple[AuthorityCallInput, ...],
+    claim_positions: dict[tuple[str, int], tuple[int, ...]],
+    blocks_by_source: dict[int, AuthorityBlock],
+    call_limits: CallWorkLimits,
+    iso: str,
+    budget: _Budget,
+) -> tuple[
+    list[AuthorityCallWorkReceipt],
+    dict[int, tuple[str, ...]],
+    str,
+    DeniedCharge | None,
+    int | None,
+]:
     rows: list[AuthorityCallWorkReceipt] = []
     owners: dict[int, tuple[str, ...]] = {}
     job_status = "complete"
@@ -750,18 +734,8 @@ def replay_authority_distribution(
         row = _base_row(call, claim_positions, blocks_by_source, call_limits)
         if denied is not None:
             rows.append(
-                AuthorityCallWorkReceipt(
-                    row.call_index,
-                    row.route_claim_positions,
-                    row.source_block_indices,
-                    row.raw_node_range,
-                    row.block_count,
-                    row.raw_node_count,
-                    row.typed_unit_count,
-                    row.surface_chars,
-                    row.strict_preflight_status,
-                    row.strict_failure,
-                    row.limits,
+                _row_with(
+                    row,
                     WorkLaneReceipt("budget-exhausted", _ZERO, "allocation-budget"),
                     None,
                 )
@@ -777,29 +751,9 @@ def replay_authority_distribution(
             blocks_by_source[source] for source in call.source_block_indices
         )
         allocator = _run_lane("allocator", call_blocks, call.unit_surfaces, iso, budget)
-        allocator_receipt = WorkLaneReceipt(
-            "complete" if allocator.status == "unique" else allocator.status,
-            allocator.counters,
-            allocator.detail,  # type: ignore[arg-type]
-        )
+        allocator_receipt = _lane_receipt(allocator)
         if allocator.status != "unique":
-            rows.append(
-                AuthorityCallWorkReceipt(
-                    row.call_index,
-                    row.route_claim_positions,
-                    row.source_block_indices,
-                    row.raw_node_range,
-                    row.block_count,
-                    row.raw_node_count,
-                    row.typed_unit_count,
-                    row.surface_chars,
-                    row.strict_preflight_status,
-                    row.strict_failure,
-                    row.limits,
-                    allocator_receipt,
-                    None,
-                )
-            )
+            rows.append(_row_with(row, allocator_receipt, None))
             job_status = (
                 "budget-exhausted"
                 if allocator.status == "budget-exhausted"
@@ -810,28 +764,8 @@ def replay_authority_distribution(
             stopped = True
             continue
         verifier = _run_lane("verifier", call_blocks, call.unit_surfaces, iso, budget)
-        verifier_receipt = WorkLaneReceipt(
-            "complete" if verifier.status == "unique" else verifier.status,
-            verifier.counters,
-            verifier.detail,  # type: ignore[arg-type]
-        )
-        rows.append(
-            AuthorityCallWorkReceipt(
-                row.call_index,
-                row.route_claim_positions,
-                row.source_block_indices,
-                row.raw_node_range,
-                row.block_count,
-                row.raw_node_count,
-                row.typed_unit_count,
-                row.surface_chars,
-                row.strict_preflight_status,
-                row.strict_failure,
-                row.limits,
-                allocator_receipt,
-                verifier_receipt,
-            )
-        )
+        verifier_receipt = _lane_receipt(verifier)
+        rows.append(_row_with(row, allocator_receipt, verifier_receipt))
         if verifier.status == "budget-exhausted":
             job_status = "budget-exhausted"
             denied_charge = verifier.denied
@@ -839,18 +773,8 @@ def replay_authority_distribution(
             stopped = True
             continue
         if verifier.status != "unique" or verifier.cuts != allocator.cuts:
-            rows[-1] = AuthorityCallWorkReceipt(
-                row.call_index,
-                row.route_claim_positions,
-                row.source_block_indices,
-                row.raw_node_range,
-                row.block_count,
-                row.raw_node_count,
-                row.typed_unit_count,
-                row.surface_chars,
-                row.strict_preflight_status,
-                row.strict_failure,
-                row.limits,
+            rows[-1] = _row_with(
+                row,
                 allocator_receipt,
                 WorkLaneReceipt(
                     "seal-mismatch",
@@ -870,19 +794,94 @@ def replay_authority_distribution(
         )
         for source, group in zip(call.source_block_indices, groups, strict=True):
             owners[source] = group
+    return rows, owners, job_status, denied_charge, terminal_call
 
+
+# The invalid distribution receipt: no owner groups, and every raw unit is
+# left over.
+def _invalid_receipt(
+    sources: tuple[int, ...],
+    raw_ids: tuple[str, ...],
+    expected_work: AuthorityJobWorkReceipt,
+) -> AuthorityDistributionReceipt:
+    return AuthorityDistributionReceipt(
+        "invalid",
+        sources,
+        None,
+        None,
+        _reasons(expected_work),
+        0,
+        raw_ids,
+        expected_work,
+    )
+
+
+def replay_authority_distribution(
+    *,
+    blocks: tuple[AuthorityBlock, ...],
+    calls: tuple[AuthorityCallInput, ...],
+    skipped: tuple[AuthoritySkippedBlockInput, ...],
+    receipt: AuthorityDistributionReceipt,
+    iso: str,
+    call_limits: CallWorkLimits | None = None,
+) -> None:
+    """Recompute and require the complete producer receipt exactly.
+
+    ``call_limits`` is the per-call half of the effective limit profile the
+    producer ran under.  When given, every call row must carry it and the
+    receipt's profile digest is recomputed from it, which is the only way to
+    check the digest of a zero-call receipt under a lowered test-only profile.
+    """
+    work = receipt.work
+    call_limits = _validate_profile(work, call_limits)
+    if type(iso) is not str or not iso:
+        raise DistributionReferenceError("allocator language is invalid")
+    blocks_by_source = _require_input_shape(blocks, calls)
+    route = _expected_route(blocks, calls, skipped)
+    claims = work.route_claims
+    mismatch = _route_mismatch(claims, tuple(route), calls, skipped)
+    claim_positions = _owner_positions(claims)
+    skip_rows = _skip_rows(skipped, claim_positions)
+    raw_ids = tuple(unit_id for call in calls for unit_id in call.raw_unit_ids)
+    preflight, terminal = _preflight_status(mismatch, skipped, calls)
+    if preflight is not None:
+        expected_work = _job(
+            work=work,
+            status=preflight,
+            mismatch=mismatch,
+            route_count=len(route),
+            calls=calls,
+            skipped=skipped,
+            charged_calls=0,
+            totals=_ZERO,
+            terminal_call_index=terminal,
+            denied=None,
+            rows=tuple(
+                _base_row(call, claim_positions, blocks_by_source, call_limits)
+                for call in calls
+            ),
+            skip_rows=skip_rows,
+        )
+        expected = _invalid_receipt(
+            tuple(item.source_index for item in route), raw_ids, expected_work
+        )
+        if receipt != expected:
+            raise DistributionReferenceError("allocator preflight receipt mismatch")
+        return
+
+    budget = _Budget(call_limits, work.limits)
+    rows, owners, job_status, denied_charge, terminal_call = _replay_calls(
+        calls, claim_positions, blocks_by_source, call_limits, iso, budget
+    )
     if budget.totals is None:  # pragma: no cover - construction invariant
         raise DistributionReferenceError("reference totals disappeared")
     expected_work = _job(
+        work=work,
         status=job_status,
         mismatch=None,
-        claims=claims,
         route_count=len(route),
         calls=calls,
         skipped=skipped,
-        profile_kind=work.limit_profile_kind,
-        profile_digest=work.limit_profile_digest,
-        job_limits=work.limits,
         charged_calls=budget.calls,
         totals=budget.totals.frozen(),
         terminal_call_index=terminal_call,
@@ -904,16 +903,7 @@ def replay_authority_distribution(
             expected_work,
         )
     else:
-        expected = AuthorityDistributionReceipt(
-            "invalid",
-            sources,
-            None,
-            None,
-            _reasons(expected_work),
-            0,
-            raw_ids,
-            expected_work,
-        )
+        expected = _invalid_receipt(sources, raw_ids, expected_work)
     if receipt != expected:
         raise DistributionReferenceError("allocator receipt replay mismatch")
 

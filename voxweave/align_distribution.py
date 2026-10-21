@@ -21,15 +21,21 @@ from voxweave.align_failures import (
     AUTHORITY_REASON_ORDER,
     CanonicalFailure,
 )
+from voxweave.align_legacy_distribution import (
+    LegacyCallDistributionReceipt as LegacyCallDistributionReceipt,
+    LegacyDistributionResult as LegacyDistributionResult,
+    _legacy_count as _legacy_count,
+    legacy_distribute_before_shift as legacy_distribute_before_shift,
+    legacy_retain_qwen_before_shift as legacy_retain_qwen_before_shift,
+)
 from voxweave.align_snapshot import (
     FrozenArray,
     FrozenInt,
     FrozenString,
     frozen_json_digest,
 )
-from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS, LANGUAGES_WITHOUT_SPACES
+from voxweave.core.langsets import LANGUAGES_WITHOUT_SPACES
 from voxweave.core.partition_check import normalize_text
-from voxweave.timestamps import shift_units
 
 # Shipped production limits.  The duplicate private literals are the immutable
 # import-time qualification reference; mutating a public global without a
@@ -1080,18 +1086,46 @@ def _job_receipt(
     )
 
 
-def _build_authority_distribution_impl(
+def _final_receipt(
     *,
-    blocks: tuple[AuthorityBlock, ...],
+    work: AuthorityJobWorkReceipt,
+    job_status: str,
     delivery_route: tuple[RouteExpectation, ...],
-    calls: tuple[AuthorityCallInput, ...],
-    skipped_blocks: tuple[AuthoritySkippedBlockInput, ...],
-    route_claims: tuple[RouteClaim, ...],
-    iso: str,
-    profile: AuthorityLimitProfile,
+    owners_by_source: dict[int, tuple[str, ...]],
+    all_raw_ids: tuple[str, ...],
 ) -> AuthorityDistributionReceipt:
-    """Run preflight, producer, and verifier under one sealed effective profile."""
-    effective_profile = validate_authority_limit_profile(profile)
+    # The job receipt after both lanes ran: valid owners, or the invalid leftovers.
+    reasons = project_authority_reasons(work)
+    owner_sources = tuple(item.source_index for item in delivery_route)
+    if job_status != "complete":
+        return AuthorityDistributionReceipt(
+            "invalid",
+            owner_sources,
+            None,
+            None,
+            reasons,
+            0,
+            all_raw_ids,
+            work,
+        )
+    owners = tuple(owners_by_source[source] for source in owner_sources)
+    return AuthorityDistributionReceipt(
+        "valid",
+        owner_sources,
+        owners,
+        tuple(len(owner) for owner in owners),
+        (),
+        len(all_raw_ids),
+        (),
+        work,
+    )
+
+
+def _check_authority_inputs(
+    blocks: tuple[AuthorityBlock, ...],
+    calls: tuple[AuthorityCallInput, ...],
+) -> dict[int, AuthorityBlock]:
+    # Structural checks on the caller's blocks and calls; returns the block index.
     blocks_by_source = {block.source_index: block for block in blocks}
     if len(blocks_by_source) != len(blocks):
         raise ValueError("authority blocks must have unique source indices")
@@ -1112,12 +1146,24 @@ def _build_authority_distribution_impl(
                 raise ValueError("capture-invalid call has impossible strict facts")
         elif call.unit_surfaces is None:
             raise ValueError("capture-valid call requires every captured surface")
-    mismatch = project_route_mismatch(
-        route_claims, delivery_route, calls, skipped_blocks
-    )
-    positions_by_owner = _claim_positions(route_claims)
-    skip_rows = _skip_receipts(skipped_blocks, positions_by_owner)
-    all_raw_ids = tuple(unit_id for call in calls for unit_id in call.raw_unit_ids)
+    return blocks_by_source
+
+
+def _preflight_invalid_receipt(
+    *,
+    mismatch: RouteMismatch | None,
+    route_claims: tuple[RouteClaim, ...],
+    delivery_route: tuple[RouteExpectation, ...],
+    calls: tuple[AuthorityCallInput, ...],
+    skipped_blocks: tuple[AuthoritySkippedBlockInput, ...],
+    effective_profile: AuthorityLimitProfile,
+    blocks_by_source: dict[int, AuthorityBlock],
+    positions_by_owner: _ClaimPositions,
+    skip_rows: tuple[AuthoritySkippedBlockReceipt, ...],
+    all_raw_ids: tuple[str, ...],
+) -> AuthorityDistributionReceipt | None:
+    # The zero-work receipt for a job whose preflight already failed, or None when
+    # the producer and verifier lanes should run.
     preflight_status: str | None = None
     terminal_call: int | None = None
     if mismatch is not None:
@@ -1159,6 +1205,42 @@ def _build_authority_distribution_impl(
             all_raw_ids,
             work,
         )
+    return None
+
+
+def _build_authority_distribution_impl(
+    *,
+    blocks: tuple[AuthorityBlock, ...],
+    delivery_route: tuple[RouteExpectation, ...],
+    calls: tuple[AuthorityCallInput, ...],
+    skipped_blocks: tuple[AuthoritySkippedBlockInput, ...],
+    route_claims: tuple[RouteClaim, ...],
+    iso: str,
+    profile: AuthorityLimitProfile,
+) -> AuthorityDistributionReceipt:
+    """Run preflight, producer, and verifier under one sealed effective profile."""
+    effective_profile = validate_authority_limit_profile(profile)
+    blocks_by_source = _check_authority_inputs(blocks, calls)
+    mismatch = project_route_mismatch(
+        route_claims, delivery_route, calls, skipped_blocks
+    )
+    positions_by_owner = _claim_positions(route_claims)
+    skip_rows = _skip_receipts(skipped_blocks, positions_by_owner)
+    all_raw_ids = tuple(unit_id for call in calls for unit_id in call.raw_unit_ids)
+    invalid_receipt = _preflight_invalid_receipt(
+        mismatch=mismatch,
+        route_claims=route_claims,
+        delivery_route=delivery_route,
+        calls=calls,
+        skipped_blocks=skipped_blocks,
+        effective_profile=effective_profile,
+        blocks_by_source=blocks_by_source,
+        positions_by_owner=positions_by_owner,
+        skip_rows=skip_rows,
+        all_raw_ids=all_raw_ids,
+    )
+    if invalid_receipt is not None:
+        return invalid_receipt
 
     budget = _BudgetLedger(effective_profile)
     rows: list[AuthorityCallWorkReceipt] = []
@@ -1287,29 +1369,12 @@ def _build_authority_distribution_impl(
         call_rows=tuple(rows),
         skip_rows=skip_rows,
     )
-    reasons = project_authority_reasons(work)
-    owner_sources = tuple(item.source_index for item in delivery_route)
-    if job_status != "complete":
-        return AuthorityDistributionReceipt(
-            "invalid",
-            owner_sources,
-            None,
-            None,
-            reasons,
-            0,
-            all_raw_ids,
-            work,
-        )
-    owners = tuple(owners_by_source[source] for source in owner_sources)
-    return AuthorityDistributionReceipt(
-        "valid",
-        owner_sources,
-        owners,
-        tuple(len(owner) for owner in owners),
-        (),
-        len(all_raw_ids),
-        (),
-        work,
+    return _final_receipt(
+        work=work,
+        job_status=job_status,
+        delivery_route=delivery_route,
+        owners_by_source=owners_by_source,
+        all_raw_ids=all_raw_ids,
     )
 
 
@@ -1414,158 +1479,3 @@ def project_authority_failure(
                 "fresh-distribution-invalid", "authority-distribution", detail
             )
     raise ValueError("invalid authority receipt has no canonical failure projection")
-
-
-@dataclass(frozen=True)
-class LegacyCallDistributionReceipt:
-    owner_source_indices: tuple[int, ...]
-    expected_counts: tuple[int, ...]
-    requested_ranges: tuple[tuple[int, int], ...]
-    realized_ranges: tuple[tuple[int, int], ...]
-    owner_unit_ids: tuple[tuple[str, ...], ...]
-    final_cursor: int
-    consumed_prefix_unit_ids: tuple[str, ...]
-    shortage_source_indices: tuple[int, ...]
-    leftover_unit_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class LegacyDistributionResult:
-    block_units: tuple[tuple[Any, ...], ...]
-    receipt: LegacyCallDistributionReceipt
-    relative_block_units: tuple[tuple[Any, ...], ...]
-
-
-def _legacy_count(text: str, iso: str) -> int:
-    """Owner size exactly as ``align_common._distribute_units`` counts it.
-
-    The legacy lane mirrors that slicer, so it uses the aligners' own no-space set
-    (``realign.NO_SPACE_LANGS``), not the wider layout set: a th/lo/my full pass is
-    sliced by words there, and counting characters here would disagree with the
-    delivered units.
-    """
-    stripped = (text or "").strip()
-    if iso in ALIGNER_NO_SPACE_LANGS:
-        return sum(1 for character in stripped if character.isalnum())
-    return len(stripped.split())
-
-
-def legacy_distribute_before_shift(
-    relative_flat: Sequence[Any],
-    *,
-    texts: tuple[str, ...],
-    iso: str,
-    origin: float,
-    identity: bool,
-    raw_unit_ids: tuple[str, ...],
-    source_indices: tuple[int, ...] | None = None,
-) -> LegacyDistributionResult:
-    """Freeze count-only slices, then transform only their retained members."""
-    if len(raw_unit_ids) != len(relative_flat):
-        raise ValueError("raw unit ids must cover the complete flat result")
-    owner_sources = (
-        tuple(range(len(texts))) if source_indices is None else tuple(source_indices)
-    )
-    if (
-        len(owner_sources) != len(texts)
-        or len(set(owner_sources)) != len(owner_sources)
-        or any(type(index) is not int or index < 0 for index in owner_sources)
-    ):
-        raise ValueError("legacy source indices must be unique nonnegative integers")
-    requested: list[tuple[int, int]] = []
-    realized: list[tuple[int, int]] = []
-    expected: list[int] = []
-    owner_ids: list[tuple[str, ...]] = []
-    retained: list[Sequence[Any]] = []
-    shortages: list[int] = []
-    cursor = 0
-    raw_count = len(relative_flat)
-    for delivery_index, text in enumerate(texts):
-        count = _legacy_count(text, iso)
-        lower, upper = cursor, cursor + count
-        requested.append((lower, upper))
-        realized_lower = min(lower, raw_count)
-        realized_upper = min(upper, raw_count)
-        realized.append((realized_lower, realized_upper))
-        expected.append(count)
-        retained.append(relative_flat[lower:upper])
-        owner_ids.append(raw_unit_ids[lower:upper])
-        if realized_upper - realized_lower < count:
-            shortages.append(owner_sources[delivery_index])
-        cursor += count
-    relative_projected = tuple(
-        tuple(
-            {
-                "text": unit["text"],
-                "start": unit["start"],
-                "end": unit["end"],
-            }
-            for unit in group
-        )
-        for group in retained
-    )
-    if identity:
-        projected = tuple(
-            tuple(dict(unit) for unit in group) for group in relative_projected
-        )
-    else:
-        projected = tuple(
-            tuple(shift_units(list(group), origin)) for group in relative_projected
-        )
-    consumed = min(cursor, raw_count)
-    receipt = LegacyCallDistributionReceipt(
-        owner_source_indices=owner_sources,
-        expected_counts=tuple(expected),
-        requested_ranges=tuple(requested),
-        realized_ranges=tuple(realized),
-        owner_unit_ids=tuple(owner_ids),
-        final_cursor=cursor,
-        consumed_prefix_unit_ids=raw_unit_ids[:consumed],
-        shortage_source_indices=tuple(shortages),
-        leftover_unit_ids=raw_unit_ids[consumed:],
-    )
-    return LegacyDistributionResult(projected, receipt, relative_projected)
-
-
-def legacy_retain_qwen_before_shift(
-    relative_flat: Sequence[Any],
-    *,
-    origin: float,
-    identity: bool,
-    raw_unit_ids: tuple[str, ...],
-    source_indices: tuple[int, ...],
-) -> LegacyDistributionResult:
-    """Assign one Qwen call's complete raw result to its sole cue owner."""
-    if len(raw_unit_ids) != len(relative_flat):
-        raise ValueError("raw unit ids must cover the complete flat result")
-    if (
-        len(source_indices) != 1
-        or type(source_indices[0]) is not int
-        or source_indices[0] < 0
-    ):
-        raise ValueError("a Qwen call must have one nonnegative source owner")
-    relative_owner = tuple(
-        {
-            "text": unit["text"],
-            "start": unit["start"],
-            "end": unit["end"],
-        }
-        for unit in relative_flat
-    )
-    if identity:
-        owner = tuple(dict(unit) for unit in relative_owner)
-    else:
-        owner = tuple(shift_units(list(relative_owner), origin))
-    raw_count = len(relative_flat)
-    receipt = LegacyCallDistributionReceipt(
-        owner_source_indices=source_indices,
-        expected_counts=(raw_count,),
-        requested_ranges=((0, raw_count),),
-        realized_ranges=((0, raw_count),),
-        owner_unit_ids=(raw_unit_ids,),
-        final_cursor=raw_count,
-        consumed_prefix_unit_ids=raw_unit_ids,
-        shortage_source_indices=(),
-        leftover_unit_ids=(),
-    )
-    return LegacyDistributionResult((owner,), receipt, (relative_owner,))

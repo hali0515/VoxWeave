@@ -12,7 +12,15 @@ from typing import Any, Iterator, Mapping, cast
 
 import pytest
 
-from voxweave import artifacts, pipeline, speakers, speakerserve, turnembed, vocalscache
+from voxweave import (
+    artifacts,
+    pipeline,
+    speakers,
+    speakerserve,
+    speakerserve_split,
+    turnembed,
+    vocalscache,
+)
 from voxweave.voicebase import (
     VOICEPRINTS_MAX_BYTES,
     canonical_turns_digest,
@@ -238,7 +246,7 @@ def _running_split_server(
         observations["clips"].append((Path(source), start, end))  # type: ignore[union-attr]
         output.write_bytes(f"clip:{start:.1f}:{end:.1f}".encode("ascii"))
 
-    monkeypatch.setattr(speakerserve, "_prepare_split_wav", fake_prepare)
+    monkeypatch.setattr(speakerserve_split, "_prepare_split_wav", fake_prepare)
     monkeypatch.setattr(speakerserve.turnembed, "turn_embeddings", fake_embeddings)
     monkeypatch.setattr(speakerserve.turnembed, "bisect_embeddings", fake_bisect)
     monkeypatch.setattr("voxweave.speakers.extract_clip", fake_extract)
@@ -1111,7 +1119,7 @@ def test_confirm_rolls_back_a_write_that_interrupts_after_replace(
         _preview_split(server)
         proposal = server.split_proposal
         assert proposal is not None
-        real_write = speakerserve._write_bytes
+        real_write = speakerserve_split._write_bytes
         interrupted = False
 
         def write_then_interrupt(path: Path, raw: bytes, **kwargs: bool) -> None:
@@ -1121,7 +1129,7 @@ def test_confirm_rolls_back_a_write_that_interrupts_after_replace(
                 interrupted = True
                 raise KeyboardInterrupt
 
-        monkeypatch.setattr(speakerserve, "_write_bytes", write_then_interrupt)
+        monkeypatch.setattr(speakerserve_split, "_write_bytes", write_then_interrupt)
 
         with pytest.raises(KeyboardInterrupt):
             speakerserve._confirm_split(server, proposal)
@@ -1182,7 +1190,7 @@ def test_undo_rolls_back_a_write_that_interrupts_after_replace_and_can_retry(
             field: paths[field].read_bytes()
             for field in ("sibling", "sidecar", "mapping")
         }
-        real_write = speakerserve._write_bytes
+        real_write = speakerserve_split._write_bytes
         interrupted = False
 
         def write_then_interrupt(path: Path, raw: bytes, **kwargs: bool) -> None:
@@ -1192,7 +1200,7 @@ def test_undo_rolls_back_a_write_that_interrupts_after_replace_and_can_retry(
                 interrupted = True
                 raise KeyboardInterrupt
 
-        monkeypatch.setattr(speakerserve, "_write_bytes", write_then_interrupt)
+        monkeypatch.setattr(speakerserve_split, "_write_bytes", write_then_interrupt)
 
         with pytest.raises(KeyboardInterrupt):
             speakerserve._undo_split(server)
@@ -1204,7 +1212,7 @@ def test_undo_rolls_back_a_write_that_interrupts_after_replace_and_can_retry(
         } == split_bytes
         assert paths["undo"].is_file()
 
-        monkeypatch.setattr(speakerserve, "_write_bytes", real_write)
+        monkeypatch.setattr(speakerserve_split, "_write_bytes", real_write)
         speakerserve._undo_split(server)
 
         assert paths["sibling"].read_bytes() == originals["sibling"]

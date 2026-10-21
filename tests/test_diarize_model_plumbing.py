@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from voxweave import backend, chunking, diarize, pipeline, songdet
 from voxweave.cli import cli
+from voxweave import transcription
 from voxweave import vocals
 
 
@@ -97,11 +98,11 @@ def test_transcribe_forwards_diarize_model_to_diarize_turns(
     monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(vocals, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(
-        pipeline,
+        transcription,
         "vad_speech_segments",
         lambda *_args, **_kwargs: [{"start": 0.0, "end": 1.0}],
     )
-    monkeypatch.setattr(pipeline, "slice_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(transcription, "slice_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(backend, "chunk_pass_count", lambda *_args, **_kwargs: 2)
     monkeypatch.setattr(
         backend,

@@ -9,6 +9,7 @@ import pytest
 from voxweave import artifacts, episode_transaction, pipeline, sdh, songdet
 from voxweave import llm_commands
 from voxweave import paths
+from voxweave import process_publication
 from voxweave import vocals
 
 
@@ -233,7 +234,7 @@ def test_process_output_generation_change_stale_aborts_without_overwrite(
         vtt_path.write_bytes(concurrent_vtt)
         return result
 
-    monkeypatch.setattr(pipeline, "segment_document", concurrent_segment)
+    monkeypatch.setattr(process_publication, "segment_document", concurrent_segment)
     with pytest.raises(InputStaleError) as caught:
         pipeline.process(nominal, word_segments=("en", _units()))
     assert caught.value.failure.detail_code == "process-output-generation"
@@ -257,7 +258,7 @@ def test_process_json_only_generation_change_stale_aborts(tmp_path, monkeypatch)
         json_path.write_bytes(concurrent_json)
         return result
 
-    monkeypatch.setattr(pipeline, "segment_document", concurrent_segment)
+    monkeypatch.setattr(process_publication, "segment_document", concurrent_segment)
     with pytest.raises(InputStaleError) as caught:
         pipeline.process(nominal, word_segments=("en", _units()))
 
@@ -278,7 +279,7 @@ def test_process_releases_panns_after_handoff_when_segmentation_fails(
         lambda *_args, **_kwargs: ("en", _units(), None, [], [], None),
     )
     monkeypatch.setattr(
-        pipeline,
+        process_publication,
         "segment_document",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("segmentation failed")),
     )
@@ -313,7 +314,7 @@ def test_process_panns_release_failure_preserves_exception_and_landed_accounting
         release_calls.append("panns")
         raise ReleaseFailure("release failed exactly")
 
-    monkeypatch.setattr(pipeline, "_write_sdh_sidecar", write_sidecar)
+    monkeypatch.setattr(process_publication, "_write_sdh_sidecar", write_sidecar)
     monkeypatch.setattr(songdet, "release_model", fail_release)
 
     with pytest.raises(ReleaseFailure, match="release failed exactly") as caught:
@@ -342,7 +343,7 @@ def test_process_panns_release_failure_is_secondary_to_earlier_failure(
         lambda *_args, **_kwargs: ("en", _units(), None, [], [], None),
     )
     monkeypatch.setattr(
-        pipeline,
+        process_publication,
         "segment_document",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("segmentation failed")),
     )
@@ -377,7 +378,9 @@ def test_sdh_generation_change_retains_existing_auxiliary(
         "transcribe",
         lambda *_args, **_kwargs: ("en", _units(), None, [], [], None),
     )
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(
+        process_publication, "decode_to_wav", lambda *_args, **_kwargs: wav
+    )
     monkeypatch.setattr(vocals, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(songdet, "release_model", lambda: released.append("panns"))
 
