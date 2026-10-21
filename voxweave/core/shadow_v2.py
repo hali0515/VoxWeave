@@ -695,6 +695,83 @@ def _shadow_admit(artifact: dict[str, Any]) -> dict[str, Any]:
     return artifact
 
 
+# Lane streams: the core and legacy-overlay stream blocks of both engines.
+# Returns (core_v1, core_v2, delivery_v1, delivery_v2); touches nothing else.
+def _shadow_lane_streams(
+    *,
+    solution: DocumentSolution,
+    shadow_document: SegDocument,
+    thresholds: Mapping[str, Any],
+    raw_partition: Sequence[int],
+    solver_waivers: Mapping[int, Any],
+    fallback_ranges: Sequence[Sequence[int]],
+    unit_count: int,
+    reference: Sequence[Cue],
+    v1_partition: Sequence[int] | None,
+    v1_projection: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    core_cues = _shadow_core_cues(solution, shadow_document, thresholds)
+    core_projection, core_projection_mode = _shadow_surface_partition(
+        shadow_document.units, core_cues
+    )
+    core_v2 = _shadow_stream_block(
+        core_cues,
+        raw_partition,
+        "solver-partition",
+        document=shadow_document,
+        origin="v2",
+        stage="core",
+        waivers=_restamp_by_footprint(solver_waivers, raw_partition, unit_count),
+        origins=_origins_by_footprint(fallback_ranges, raw_partition, unit_count),
+        extra={
+            "projection_cross_check": {
+                "agrees": core_projection == raw_partition,
+                "mode": core_projection_mode,
+            }
+        },
+    )
+    core_v1 = _shadow_stream_block(
+        reference,
+        v1_partition,
+        v1_projection,
+        document=shadow_document,
+        origin="v1",
+        stage="core",
+    )
+
+    delivery_v2_cues = _shadow_overlay_cues(core_cues, shadow_document, thresholds)
+    delivery_v2_partition, delivery_v2_mode = _shadow_surface_partition(
+        shadow_document.units, delivery_v2_cues
+    )
+    delivery_v1_cues = _shadow_overlay_cues(reference, shadow_document, thresholds)
+    delivery_v1_partition, delivery_v1_mode = _shadow_surface_partition(
+        shadow_document.units, delivery_v1_cues
+    )
+    delivery_v2 = _shadow_stream_block(
+        delivery_v2_cues,
+        delivery_v2_partition,
+        delivery_v2_mode,
+        document=shadow_document,
+        origin="v2",
+        stage="legacy-overlay",
+        waivers=_restamp_by_footprint(
+            solver_waivers, delivery_v2_partition, unit_count
+        ),
+        origins=_origins_by_footprint(
+            fallback_ranges, delivery_v2_partition, unit_count
+        ),
+    )
+    delivery_v1 = _shadow_stream_block(
+        delivery_v1_cues,
+        delivery_v1_partition,
+        delivery_v1_mode,
+        document=shadow_document,
+        origin="v1",
+        stage="legacy-overlay",
+    )
+    return core_v1, core_v2, delivery_v1, delivery_v2
+
+
 def _shadow_v2_artifact(
     document: SegDocument, v1_cues: Sequence[Cue], thresholds: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -831,64 +908,17 @@ def _shadow_v2_artifact(
     )
     artifact["raw"] = raw_v2
 
-    core_cues = _shadow_core_cues(solution, shadow_document, thresholds)
-    core_projection, core_projection_mode = _shadow_surface_partition(
-        shadow_document.units, core_cues
-    )
-    core_v2 = _shadow_stream_block(
-        core_cues,
-        raw_partition,
-        "solver-partition",
-        document=shadow_document,
-        origin="v2",
-        stage="core",
-        waivers=_restamp_by_footprint(solver_waivers, raw_partition, unit_count),
-        origins=_origins_by_footprint(fallback_ranges, raw_partition, unit_count),
-        extra={
-            "projection_cross_check": {
-                "agrees": core_projection == raw_partition,
-                "mode": core_projection_mode,
-            }
-        },
-    )
-    core_v1 = _shadow_stream_block(
-        reference,
-        v1_partition,
-        v1_projection,
-        document=shadow_document,
-        origin="v1",
-        stage="core",
-    )
-
-    delivery_v2_cues = _shadow_overlay_cues(core_cues, shadow_document, thresholds)
-    delivery_v2_partition, delivery_v2_mode = _shadow_surface_partition(
-        shadow_document.units, delivery_v2_cues
-    )
-    delivery_v1_cues = _shadow_overlay_cues(reference, shadow_document, thresholds)
-    delivery_v1_partition, delivery_v1_mode = _shadow_surface_partition(
-        shadow_document.units, delivery_v1_cues
-    )
-    delivery_v2 = _shadow_stream_block(
-        delivery_v2_cues,
-        delivery_v2_partition,
-        delivery_v2_mode,
-        document=shadow_document,
-        origin="v2",
-        stage="legacy-overlay",
-        waivers=_restamp_by_footprint(
-            solver_waivers, delivery_v2_partition, unit_count
-        ),
-        origins=_origins_by_footprint(
-            fallback_ranges, delivery_v2_partition, unit_count
-        ),
-    )
-    delivery_v1 = _shadow_stream_block(
-        delivery_v1_cues,
-        delivery_v1_partition,
-        delivery_v1_mode,
-        document=shadow_document,
-        origin="v1",
-        stage="legacy-overlay",
+    core_v1, core_v2, delivery_v1, delivery_v2 = _shadow_lane_streams(
+        solution=solution,
+        shadow_document=shadow_document,
+        thresholds=thresholds,
+        raw_partition=raw_partition,
+        solver_waivers=solver_waivers,
+        fallback_ranges=fallback_ranges,
+        unit_count=unit_count,
+        reference=reference,
+        v1_partition=v1_partition,
+        v1_projection=v1_projection,
     )
 
     # Typed fallbacks adopt COMPLETE v1 cues, and the optimizer's adoption plan
