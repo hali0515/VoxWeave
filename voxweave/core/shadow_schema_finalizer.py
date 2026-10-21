@@ -514,6 +514,212 @@ def _movement_distribution(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+# Report entries: closed key set, cue index, kind vocabulary and fallback reason.
+def _finalizer_entries(entries: list[Any], path: str, errors: list[str]) -> None:
+    from .finalizer import REPORT_KINDS
+
+    for index, raw in enumerate(entries):
+        entry_path = f"{path}.entries[{index}]"
+        entry = _mapping(raw, entry_path, errors)
+        if entry is None:
+            continue
+        _closed(
+            entry,
+            frozenset({"cue_index", "evidence", "kind"}),
+            entry_path,
+            errors,
+        )
+        cue_index = entry.get("cue_index")
+        if cue_index is not None and (
+            isinstance(cue_index, bool) or not isinstance(cue_index, int)
+        ):
+            errors.append(f"{entry_path}.cue_index: expected integer or null")
+        if entry.get("kind") not in REPORT_KINDS:
+            errors.append(f"{entry_path}.kind: outside closed report vocabulary")
+        evidence = _mapping(entry.get("evidence"), f"{entry_path}.evidence", errors)
+        if (
+            entry.get("kind") == "canonical-text-fallback"
+            and evidence is not None
+            and not isinstance(evidence.get("reason"), str)
+        ):
+            errors.append(
+                f"{entry_path}.evidence.reason: expected canonical fallback reason"
+            )
+
+
+# Shape of the movement_distribution block: closed keys per side and summary.
+def _finalizer_distribution_shape(
+    distribution: Mapping[str, Any], path: str, errors: list[str]
+) -> None:
+    _closed(
+        distribution,
+        _MOVEMENT_DISTRIBUTION_KEYS,
+        f"{path}.movement_distribution",
+        errors,
+    )
+    for side in ("start", "end"):
+        summary = _mapping(
+            distribution.get(side), f"{path}.movement_distribution.{side}", errors
+        )
+        if summary is None:
+            continue
+        _closed(
+            summary,
+            _MOVEMENT_SUMMARY_KEYS,
+            f"{path}.movement_distribution.{side}",
+            errors,
+        )
+        _nonnegative_int(
+            summary.get("count"),
+            f"{path}.movement_distribution.{side}.count",
+            errors,
+        )
+        for name in ("max", "p50", "p90"):
+            if summary.get(name) is not None:
+                _finite_number(
+                    summary.get(name),
+                    f"{path}.movement_distribution.{side}.{name}",
+                    errors,
+                )
+
+
+# Delivered cue times, then the trace and stability replays. Returns the
+# delivered times when the row, the seed and the delivered cues have the same
+# length, otherwise None.
+def _finalizer_replay(
+    path: str,
+    errors: list[str],
+    *,
+    trace: Any,
+    seed: tuple[Any, ...],
+    profile: Any,
+    inputs: tuple[Any, Any],
+    row_cues: list[Any],
+    trace_error_rows: list[str] | None,
+    stability_rows: list[str] | None,
+) -> tuple[tuple[float, float], ...] | None:
+    from .trace_validator import replay_trace, stability_check
+
+    evidence, policy = inputs
+    delivered_rows: list[tuple[float, float]] = []
+    for index, cue in enumerate(row_cues):
+        if not isinstance(cue, Mapping):
+            break
+        start = _finite_number(
+            cue.get("start"), f"{path}.row.cues[{index}].start", errors
+        )
+        end = _finite_number(cue.get("end"), f"{path}.row.cues[{index}].end", errors)
+        if start is None or end is None:
+            break
+        delivered_rows.append((start, end))
+    if len(delivered_rows) == len(row_cues) == len(seed):
+        delivered = tuple(delivered_rows)
+        recomputed_trace_errors = list(
+            replay_trace(
+                trace,
+                seed,
+                profile=profile,
+                evidence=evidence,
+                policy=policy,
+                delivered=delivered,
+            )
+        )
+        if trace_error_rows is not None and trace_error_rows != recomputed_trace_errors:
+            errors.append(
+                f"{path}.trace_errors: stale trace replay; recomputed "
+                f"{recomputed_trace_errors!r}"
+            )
+        recomputed_stability_errors = list(
+            stability_check(
+                delivered,
+                seed,
+                profile=profile,
+                evidence=evidence,
+                policy=policy,
+                terminal=trace.terminal,
+            )
+        )
+        if stability_rows is not None and stability_rows != recomputed_stability_errors:
+            errors.append(
+                f"{path}.stability_errors: stale stability replay; recomputed "
+                f"{recomputed_stability_errors!r}"
+            )
+        return delivered
+    return None
+
+
+# Movement ledger against seed and delivered cues, then the derived maxima and
+# the terminal. The terminal is read from block last.
+def _finalizer_movement(
+    block: Mapping[str, Any],
+    path: str,
+    errors: list[str],
+    *,
+    seed: tuple[Any, ...],
+    delivered: tuple[tuple[float, float], ...],
+    trace: Any,
+    movement_rows: list[Any] | None,
+    distribution: Mapping[str, Any] | None,
+    max_start: float | None,
+    max_sweeps: int | None,
+) -> None:
+    expected_movement: list[dict[str, Any]] = []
+    for index, (phase1, delivered_pair) in enumerate(zip(seed, delivered)):
+        for side, slot in (("start", 0), ("end", 1)):
+            phase1_value = phase1.start if slot == 0 else phase1.end
+            delivered_value = delivered_pair[slot]
+            expected_movement.append(
+                {
+                    "boundary": {"cue_index": index, "side": side},
+                    "delivered": delivered_value,
+                    "delta": delivered_value - phase1_value,
+                    "phase1": phase1_value,
+                }
+            )
+    decoded_movement: list[Mapping[str, Any]] = []
+    if movement_rows is not None:
+        for index, raw in enumerate(movement_rows):
+            movement_path = f"{path}.movement[{index}]"
+            movement = _mapping(raw, movement_path, errors)
+            if movement is None:
+                continue
+            _closed(movement, _MOVEMENT_KEYS, movement_path, errors)
+            _boundary_ref(movement.get("boundary"), f"{movement_path}.boundary", errors)
+            for key in ("delivered", "delta", "phase1"):
+                _finite_number(movement.get(key), f"{movement_path}.{key}", errors)
+            decoded_movement.append(movement)
+        if movement_rows != expected_movement:
+            errors.append(
+                f"{path}.movement: ledger is detached from seed/delivered row"
+            )
+    if distribution is not None and decoded_movement:
+        recomputed_distribution = _movement_distribution(decoded_movement)
+        if distribution != recomputed_distribution:
+            errors.append(
+                f"{path}.movement_distribution: stale; recomputed "
+                f"{recomputed_distribution!r}"
+            )
+    expected_max_start = max(
+        (
+            abs(delivered_pair[0] - phase1.start)
+            for phase1, delivered_pair in zip(seed, delivered)
+        ),
+        default=0.0,
+    )
+    if max_start is not None and max_start != expected_max_start:
+        errors.append(
+            f"{path}.max_start_movement_s: expected {expected_max_start}, "
+            f"got {max_start}"
+        )
+    if max_sweeps is not None and max_sweeps != trace.sweeps:
+        errors.append(
+            f"{path}.max_sweeps_observed: expected trace sweeps "
+            f"{trace.sweeps}, got {max_sweeps}"
+        )
+    if block.get("terminal") != trace.terminal:
+        errors.append(f"{path}.terminal: disagrees with trace terminal")
+
+
 def _finalizer(
     value: Any,
     path: str,
@@ -533,35 +739,7 @@ def _finalizer(
     if entries is not None and refusals is not None and entries != refusals:
         errors.append(f"{path}: entries/refusals report channels differ")
     if entries is not None:
-        from .finalizer import REPORT_KINDS
-
-        for index, raw in enumerate(entries):
-            entry_path = f"{path}.entries[{index}]"
-            entry = _mapping(raw, entry_path, errors)
-            if entry is None:
-                continue
-            _closed(
-                entry,
-                frozenset({"cue_index", "evidence", "kind"}),
-                entry_path,
-                errors,
-            )
-            cue_index = entry.get("cue_index")
-            if cue_index is not None and (
-                isinstance(cue_index, bool) or not isinstance(cue_index, int)
-            ):
-                errors.append(f"{entry_path}.cue_index: expected integer or null")
-            if entry.get("kind") not in REPORT_KINDS:
-                errors.append(f"{entry_path}.kind: outside closed report vocabulary")
-            evidence = _mapping(entry.get("evidence"), f"{entry_path}.evidence", errors)
-            if (
-                entry.get("kind") == "canonical-text-fallback"
-                and evidence is not None
-                and not isinstance(evidence.get("reason"), str)
-            ):
-                errors.append(
-                    f"{entry_path}.evidence.reason: expected canonical fallback reason"
-                )
+        _finalizer_entries(entries, path, errors)
     _string_list(block.get("deltas_fired"), f"{path}.deltas_fired", errors)
     movement_rows = _list(block.get("movement"), f"{path}.movement", errors)
     stability_rows = _string_list(
@@ -600,36 +778,7 @@ def _finalizer(
         block.get("movement_distribution"), f"{path}.movement_distribution", errors
     )
     if distribution is not None:
-        _closed(
-            distribution,
-            _MOVEMENT_DISTRIBUTION_KEYS,
-            f"{path}.movement_distribution",
-            errors,
-        )
-        for side in ("start", "end"):
-            summary = _mapping(
-                distribution.get(side), f"{path}.movement_distribution.{side}", errors
-            )
-            if summary is None:
-                continue
-            _closed(
-                summary,
-                _MOVEMENT_SUMMARY_KEYS,
-                f"{path}.movement_distribution.{side}",
-                errors,
-            )
-            _nonnegative_int(
-                summary.get("count"),
-                f"{path}.movement_distribution.{side}.count",
-                errors,
-            )
-            for name in ("max", "p50", "p90"):
-                if summary.get(name) is not None:
-                    _finite_number(
-                        summary.get(name),
-                        f"{path}.movement_distribution.{side}.{name}",
-                        errors,
-                    )
+        _finalizer_distribution_shape(distribution, path, errors)
 
     inputs = _finalizer_inputs(verification, f"{path}.verification", errors)
     row_cues = row.get("cues")
@@ -640,118 +789,28 @@ def _finalizer(
         and trace is not None
         and isinstance(row_cues, list)
     ):
-        from .trace_validator import replay_trace, stability_check
-
-        evidence, policy = inputs
-        delivered_rows: list[tuple[float, float]] = []
-        for index, cue in enumerate(row_cues):
-            if not isinstance(cue, Mapping):
-                break
-            start = _finite_number(
-                cue.get("start"), f"{path}.row.cues[{index}].start", errors
+        delivered = _finalizer_replay(
+            path,
+            errors,
+            trace=trace,
+            seed=seed,
+            profile=profile,
+            inputs=inputs,
+            row_cues=row_cues,
+            trace_error_rows=trace_error_rows,
+            stability_rows=stability_rows,
+        )
+        if delivered is not None:
+            _finalizer_movement(
+                block,
+                path,
+                errors,
+                seed=seed,
+                delivered=delivered,
+                trace=trace,
+                movement_rows=movement_rows,
+                distribution=distribution,
+                max_start=max_start,
+                max_sweeps=max_sweeps,
             )
-            end = _finite_number(
-                cue.get("end"), f"{path}.row.cues[{index}].end", errors
-            )
-            if start is None or end is None:
-                break
-            delivered_rows.append((start, end))
-        if len(delivered_rows) == len(row_cues) == len(seed):
-            delivered = tuple(delivered_rows)
-            recomputed_trace_errors = list(
-                replay_trace(
-                    trace,
-                    seed,
-                    profile=profile,
-                    evidence=evidence,
-                    policy=policy,
-                    delivered=delivered,
-                )
-            )
-            if (
-                trace_error_rows is not None
-                and trace_error_rows != recomputed_trace_errors
-            ):
-                errors.append(
-                    f"{path}.trace_errors: stale trace replay; recomputed "
-                    f"{recomputed_trace_errors!r}"
-                )
-            recomputed_stability_errors = list(
-                stability_check(
-                    delivered,
-                    seed,
-                    profile=profile,
-                    evidence=evidence,
-                    policy=policy,
-                    terminal=trace.terminal,
-                )
-            )
-            if (
-                stability_rows is not None
-                and stability_rows != recomputed_stability_errors
-            ):
-                errors.append(
-                    f"{path}.stability_errors: stale stability replay; recomputed "
-                    f"{recomputed_stability_errors!r}"
-                )
-
-            expected_movement: list[dict[str, Any]] = []
-            for index, (phase1, delivered_pair) in enumerate(zip(seed, delivered)):
-                for side, slot in (("start", 0), ("end", 1)):
-                    phase1_value = phase1.start if slot == 0 else phase1.end
-                    delivered_value = delivered_pair[slot]
-                    expected_movement.append(
-                        {
-                            "boundary": {"cue_index": index, "side": side},
-                            "delivered": delivered_value,
-                            "delta": delivered_value - phase1_value,
-                            "phase1": phase1_value,
-                        }
-                    )
-            decoded_movement: list[Mapping[str, Any]] = []
-            if movement_rows is not None:
-                for index, raw in enumerate(movement_rows):
-                    movement_path = f"{path}.movement[{index}]"
-                    movement = _mapping(raw, movement_path, errors)
-                    if movement is None:
-                        continue
-                    _closed(movement, _MOVEMENT_KEYS, movement_path, errors)
-                    _boundary_ref(
-                        movement.get("boundary"), f"{movement_path}.boundary", errors
-                    )
-                    for key in ("delivered", "delta", "phase1"):
-                        _finite_number(
-                            movement.get(key), f"{movement_path}.{key}", errors
-                        )
-                    decoded_movement.append(movement)
-                if movement_rows != expected_movement:
-                    errors.append(
-                        f"{path}.movement: ledger is detached from seed/delivered row"
-                    )
-            if distribution is not None and decoded_movement:
-                recomputed_distribution = _movement_distribution(decoded_movement)
-                if distribution != recomputed_distribution:
-                    errors.append(
-                        f"{path}.movement_distribution: stale; recomputed "
-                        f"{recomputed_distribution!r}"
-                    )
-            expected_max_start = max(
-                (
-                    abs(delivered_pair[0] - phase1.start)
-                    for phase1, delivered_pair in zip(seed, delivered)
-                ),
-                default=0.0,
-            )
-            if max_start is not None and max_start != expected_max_start:
-                errors.append(
-                    f"{path}.max_start_movement_s: expected {expected_max_start}, "
-                    f"got {max_start}"
-                )
-            if max_sweeps is not None and max_sweeps != trace.sweeps:
-                errors.append(
-                    f"{path}.max_sweeps_observed: expected trace sweeps "
-                    f"{trace.sweeps}, got {max_sweeps}"
-                )
-            if block.get("terminal") != trace.terminal:
-                errors.append(f"{path}.terminal: disagrees with trace terminal")
     return block
