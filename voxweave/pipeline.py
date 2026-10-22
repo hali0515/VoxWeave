@@ -3,13 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from voxweave import (
     artifacts,
@@ -141,6 +140,7 @@ from voxweave.failure_annotations import (
     _append_secondary_terminal as _append_secondary_terminal,
     _record_disposal_failure as _record_disposal_failure,
 )
+from voxweave.align_blocks import AlignBlocksRequest, align_blocks as run_align_blocks
 from voxweave.align_route import (
     AlignRoute as AlignRoute,
     resolve_align_route as resolve_align_route,
@@ -1003,16 +1003,6 @@ class _SelectedLegacyAlignResult:
     all_units: tuple[Mapping[str, Any], ...]
 
 
-@dataclass(frozen=True)
-class _PreparedQwenCall:
-    source_index: int
-    wav_path: Path
-    text: str
-    nominal_start: float
-    nominal_end: float
-    sample_geometry: tuple[int, int, int, int] | None
-
-
 def _retain_qwen_owner_slice(raw_units: Sequence[dict]) -> list[dict]:
     """Assign one physical Qwen result to its single historical cue owner."""
 
@@ -1060,186 +1050,35 @@ def _align_blocks(
 ) -> list[list[dict]]:
     """Route blocks to the configured aligner and return per-block units.
 
-    Three paths — these ARE the hard-constraint full-pass routing; do NOT collapse them:
-    - ja MMS: one full-file pass (``align_blocks_full_mms``).
-    - en wav2vec2 CTC: one full-file windowed-emission pass (``align_blocks_full_ctc``).
-    - zh·yue (no CTC config): per-cue tight-crop Qwen — each cue gets its own audio slice so
-      error is contained within the sentence and inter-sentence pauses are preserved.
+    :mod:`voxweave.align_blocks` holds one aligner per route (ja MMS full pass,
+    en CTC full pass, zh·yue per-cue Qwen); do NOT collapse them. The Qwen route's
+    audio slicing, time shifting and owner slicing are looked up on this module
+    when the call starts.
 
     Per-cue slices are appended to ``tmp_chunks`` for the caller's ``finally`` to clean up.
     """
-    if (legacy_distribution_invoker is None) != (legacy_shift_invoker is None):
-        raise ValueError("legacy projection phase invokers must be supplied together")
-
-    # MMS/CTC full passes: cue (start,end) bounds are used ONLY as silence anchors to split
-    # movie-length audio into memory-sized chunks when it overflows the single-pass DP
-    # budget — NOT to crop/route per cue. These routes are routing-free because the input
-    # VTT timestamps are exactly what may be wrong (the reason to re-align); the global DP
-    # self-locates every word. None for cues without timestamps. (The Qwen per-cue route
-    # below crops each cue from ``crops`` instead.)
-    bounds = [
-        (b["start"], b["end"])
-        if b["start"] is not None and b["end"] is not None
-        else None
-        for b in blocks
-    ]
-    if mms:
-        reporter.task("full-file alignment (MMS)", 1)
-        units = backend.align_blocks_full_mms(
-            wav,
-            [b.get("alignment_text", b["text"]) for b in blocks],
-            iso,
-            bounds=bounds,
-            _raw_call_observer=raw_call_observer,
-            _backend_invoker=backend_invoker,
-            _preparation_invoker=physical_preparation_invoker,
-            _legacy_distribution_invoker=legacy_distribution_invoker,
-            _legacy_shift_invoker=legacy_shift_invoker,
-        )
-        reporter.advance(1)
-        return units
-    if ctc_model:  # en wav2vec2: windowed emission + single global DP (routing-free)
-        reporter.task("full-file alignment (CTC)", 1)
-        units = backend.align_blocks_full_ctc(
-            wav,
-            [b.get("alignment_text", b["text"]) for b in blocks],
-            iso,
-            ctc_model,
-            bounds=bounds,
+    return run_align_blocks(
+        resolve_align_route(mms, ctc_model).kind,
+        AlignBlocksRequest(
+            wav=wav,
+            blocks=blocks,
+            iso=iso,
+            ctc_model=ctc_model,
+            crops=crops,
+            reporter=reporter,
+            tmp_chunks=tmp_chunks,
             speech_spans=speech_spans,
-            _raw_call_observer=raw_call_observer,
-            _backend_invoker=backend_invoker,
-            _preparation_invoker=physical_preparation_invoker,
-            _legacy_distribution_invoker=legacy_distribution_invoker,
-            _legacy_shift_invoker=legacy_shift_invoker,
-        )
-        reporter.advance(1)
-        return units
-    if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() == "1":
-        # The VAD emission mask is wired into the wav2vec2 CTC pass only.
-        log.warning(
-            "--vad-mask / VOXWEAVE_VAD_EMISSION_MASK has no effect on Qwen alignment"
-            " (language %s); only the wav2vec2 CTC aligner applies it",
-            iso,
-        )
-    reporter.task("per-cue alignment", len(blocks))
-    block_units: list[list[dict]] = [[] for _ in blocks]
-
-    def prepare_qwen_calls() -> list[_PreparedQwenCall]:
-        prepared: list[_PreparedQwenCall] = []
-        for i, crop in enumerate(crops):
-            text = realign.join_block_texts(
-                [blocks[i].get("alignment_text", blocks[i]["text"])], iso
-            )
-            if crop is None or not text:  # insertion block or empty: skip
-                reporter.advance(1)
-                continue
-            cs, ce = crop
-            observed_geometry: tuple[int, int, int, int] | None = None
-
-            def observe_sample_geometry(
-                sample_start: int,
-                sample_end: int,
-                sample_rate: int,
-                sample_count: int,
-            ) -> None:
-                nonlocal observed_geometry
-                if observed_geometry is not None:
-                    raise RuntimeError("Qwen slice reported sample geometry twice")
-                observed_geometry = (
-                    sample_start,
-                    sample_end,
-                    sample_rate,
-                    sample_count,
-                )
-
-            cwav = slice_wav(
-                wav,
-                cs,
-                ce,
-                _sample_geometry_observer=observe_sample_geometry,
-                _canonical_qwen_failures=True,
-            )
-            tmp_chunks.append(cwav)
-            prepared.append(
-                _PreparedQwenCall(
-                    source_index=i,
-                    wav_path=cwav,
-                    text=text,
-                    nominal_start=float(cs),
-                    nominal_end=float(ce),
-                    sample_geometry=observed_geometry,
-                )
-            )
-        return prepared
-
-    prepared_qwen = (
-        prepare_qwen_calls()
-        if physical_preparation_invoker is None
-        else cast(
-            list[_PreparedQwenCall],
-            physical_preparation_invoker(prepare_qwen_calls),
-        )
+            raw_call_observer=raw_call_observer,
+            qwen_invoker=qwen_invoker,
+            backend_invoker=backend_invoker,
+            physical_preparation_invoker=physical_preparation_invoker,
+            legacy_distribution_invoker=legacy_distribution_invoker,
+            legacy_shift_invoker=legacy_shift_invoker,
+            slice_audio=slice_wav,
+            shift_units=shift_units,
+            retain_owner_slice=_retain_qwen_owner_slice,
+        ),
     )
-    pending_qwen: list[tuple[int, list[dict], float]] = []
-    for prepared in prepared_qwen:
-        geometry = prepared.sample_geometry
-        if qwen_invoker is None:
-            raw_units = backend.align_text(prepared.wav_path, prepared.text, iso)
-        else:
-            raw_units = cast(
-                list[dict[str, Any]],
-                qwen_invoker(
-                    lambda: backend.align_text(
-                        prepared.wav_path,
-                        prepared.text,
-                        iso,
-                    ),
-                    prepared.source_index,
-                    prepared.nominal_start,
-                    prepared.nominal_end,
-                    audio_sample_start=None if geometry is None else geometry[0],
-                    audio_sample_end=None if geometry is None else geometry[1],
-                    sample_rate=None if geometry is None else geometry[2],
-                    sample_count=None if geometry is None else geometry[3],
-                ),
-            )
-
-        pending_qwen.append((prepared.source_index, raw_units, prepared.nominal_start))
-        # One tick per aligned cue as it lands (skipped cues ticked at preparation),
-        # so the bar moves with the work instead of jumping from 0/N at the end.
-        reporter.advance(1)
-
-    if not pending_qwen:
-        with align_runtime_activity("AO-07", "no-physical-calls"):
-            pass
-
-    def retain_owners() -> list[tuple[int, list[dict], float]]:
-        return [
-            (index, _retain_qwen_owner_slice(raw_units), origin)
-            for index, raw_units, origin in pending_qwen
-        ]
-
-    retained_owners = (
-        retain_owners()
-        if legacy_distribution_invoker is None
-        else cast(
-            list[tuple[int, list[dict], float]],
-            legacy_distribution_invoker(retain_owners),
-        )
-    )
-
-    def shift_owners() -> list[list[dict]]:
-        for index, owner_units, origin in retained_owners:
-            block_units[index] = shift_units(owner_units, origin)
-        return block_units
-
-    block_units = (
-        shift_owners()
-        if legacy_shift_invoker is None
-        else cast(list[list[dict]], legacy_shift_invoker(shift_owners))
-    )
-    return block_units
 
 
 def _notify_align_shadow_observer(
