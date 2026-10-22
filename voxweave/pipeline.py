@@ -6,6 +6,8 @@ import logging
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -341,6 +343,223 @@ def _replay_voiceprint_pair(
     return capture, media
 
 
+@dataclass(frozen=True)
+class _ProcessRequest:
+    # The arguments of one process call, bundled so that each stage takes one value.
+    media_path: Path
+    lang_override: str | None
+    separate: bool
+    debug: bool
+    normalize: bool
+    skip_songs: bool
+    keep_lyrics: bool
+    sdh: bool
+    diarize: bool
+    voiceprints: bool
+    word_segments: tuple[str, list[dict]] | None
+    asr_model: str | None
+    context: str | None
+    timestamps: bool
+    shot_snap: bool
+    min_speakers: int | None
+    max_speakers: int | None
+    diarize_model: str | None
+    voiceprint_model: str | None
+    speaker_clustering: str | None
+
+
+@dataclass(frozen=True)
+class _ProcessGenerations:
+    # What the sibling files and the media looked like before any work started;
+    # the commit rechecks them.
+    expected_json: episode_transaction.FileGeneration
+    expected_vtt: episode_transaction.FileGeneration
+    expected_media: str | None
+    source_mode: episode_transaction.ProcessSourceMode
+
+
+def _process_steps(request: _ProcessRequest) -> list[str]:
+    # The progress plan: the steps this call reports, in order.
+    steps = ["inspect source"]
+    if request.word_segments is None:
+        steps.append("prepare audio")
+        if request.separate and (request.skip_songs or request.keep_lyrics):
+            steps.append("detect songs")
+        steps.extend(("find speech", "transcribe and align"))
+        if request.diarize:
+            steps.append("identify speakers")
+        if request.shot_snap:
+            steps.append("detect shot changes")
+    steps.extend(("layout subtitles", "write outputs"))
+    if request.sdh and request.word_segments is None:
+        steps.append("create SDH sidecar")
+    return steps
+
+
+def _preflight_process(request: _ProcessRequest, rep: Reporter) -> bool:
+    # Refuse a run that cannot succeed before any audio work. Returns whether
+    # voiceprint capture is ready.
+    if request.voiceprints and (
+        not request.diarize or request.word_segments is not None
+    ):
+        raise ValueError("voiceprint capture requires a fresh diarization run")
+    if request.diarize and request.word_segments is None:
+        from voxweave import diarize as diarize_mod
+
+        # Refuse a diarization that cannot succeed (a gated model without a
+        # token, impossible speaker bounds) now, not after separation and ASR.
+        diarize_mod.preflight(
+            request.diarize_model,
+            min_speakers=request.min_speakers,
+            max_speakers=request.max_speakers,
+        )
+    capture_ready = False
+    if request.voiceprints:
+        from voxweave import voiceembed
+
+        # Fail on a bad --voiceprint-model / env / conf value before any audio
+        # work; the per-language routing itself waits for the detected language.
+        voiceembed.resolve_voiceprint_choice(request.voiceprint_model)
+        _log_voiceprint_notice_once()
+        capture_ready = _prefetch_voiceprint_models(
+            request.voiceprint_model, request.lang_override, rep
+        )
+    return capture_ready
+
+
+def _capture_process_generations(request: _ProcessRequest) -> _ProcessGenerations:
+    media_path = request.media_path
+    try:
+        expected_json = episode_transaction.capture_file_generation(
+            swap_ext(media_path, ".json")
+        )
+    except OSError as exc:
+        _attach_canonical_failure(
+            exc,
+            kind="subtitle-snapshot-failed",
+            phase="snapshot",
+            detail_code="sibling-read",
+        )
+        raise
+    try:
+        expected_vtt = episode_transaction.capture_file_generation(
+            swap_ext(media_path, ".vtt")
+        )
+    except OSError as exc:
+        _attach_canonical_failure(
+            exc,
+            kind="subtitle-snapshot-failed",
+            phase="snapshot",
+            detail_code="vtt-read",
+        )
+        raise
+    source_mode: episode_transaction.ProcessSourceMode = (
+        "injected-words" if request.word_segments is not None else "transcribed-media"
+    )
+    expected_media: str | None
+    if source_mode == "injected-words":
+        expected_media = None
+    else:
+        try:
+            expected_media = media_fingerprint(media_path)
+        except OSError as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="media-identity-invalid",
+                phase="media",
+                detail_code=(
+                    "media-not-found"
+                    if isinstance(exc, FileNotFoundError)
+                    else "media-fingerprint"
+                ),
+            )
+            raise
+    return _ProcessGenerations(expected_json, expected_vtt, expected_media, source_mode)
+
+
+def _transcribe_for_process(
+    request: _ProcessRequest,
+    rep: Reporter,
+    debug_root: Path | None,
+    source_path: Path,
+    snapshot_fingerprint: str | None,
+    capture_enabled: bool,
+) -> tuple[
+    str,
+    list[dict],
+    list[tuple[float, float]],
+    list[tuple[float, float]],
+    list[tuple[float, float, str]],
+    VoiceprintCapture | None,
+]:
+    # Called by _process_from_source after the shot detection job starts;
+    # ``transcribe`` and ``cache_vocals_path`` are looked up when it runs.
+    return transcribe(
+        source_path,
+        lang_override=request.lang_override,
+        separate=request.separate,
+        skip_songs=request.skip_songs,
+        keep_lyrics=request.keep_lyrics,
+        diarize=request.diarize,
+        diarize_model=request.diarize_model,
+        voiceprints=capture_enabled,
+        voiceprint_model=request.voiceprint_model,
+        speaker_clustering=request.speaker_clustering,
+        normalize=request.normalize,
+        reporter=rep,
+        debug=request.debug,
+        debug_root=debug_root,
+        cache_vocals=cache_vocals_path(request.media_path),
+        source_fingerprint=snapshot_fingerprint,
+        asr_model=request.asr_model,
+        context=request.context,
+        min_speakers=request.min_speakers,
+        max_speakers=request.max_speakers,
+        # SDH reuses the successfully returned deferred PANNs owner.
+        release_panns=not request.sdh,
+    )
+
+
+def _run_process(
+    request: _ProcessRequest,
+    rep: Reporter,
+    generations: _ProcessGenerations,
+    debug_root: Path | None,
+    source_path: Path,
+    snapshot_fingerprint: str | None,
+    capture_enabled: bool,
+) -> Path:
+    # Run one process call against the selected source: the media itself, or the
+    # private snapshot when voiceprint capture needs bytes that cannot change.
+    source = _ProcessSource(
+        path=source_path,
+        snapshot_fingerprint=snapshot_fingerprint,
+        expected_json=generations.expected_json,
+        expected_vtt=generations.expected_vtt,
+        expected_media_fingerprint=generations.expected_media,
+        mode=generations.source_mode,
+    )
+    return _process_from_source(
+        request.media_path,
+        source=source,
+        lang_override=request.lang_override,
+        reporter=rep,
+        sdh=request.sdh,
+        word_segments=request.word_segments,
+        timestamps=request.timestamps,
+        shot_snap=request.shot_snap,
+        transcribe_source=partial(
+            _transcribe_for_process,
+            request,
+            rep,
+            debug_root,
+            source_path,
+            snapshot_fingerprint,
+            capture_enabled,
+        ),
+    )
+
+
 def process(
     media_path: Path,
     lang_override: str | None = None,
@@ -381,162 +600,39 @@ def process(
     if lang_override and lang_override.strip():
         # A --language typo fails here, not after separation and VAD.
         to_asr_iso(lang_override)
+    request = _ProcessRequest(
+        media_path=media_path,
+        lang_override=lang_override,
+        separate=separate,
+        debug=debug,
+        normalize=normalize,
+        skip_songs=skip_songs,
+        keep_lyrics=keep_lyrics,
+        sdh=sdh,
+        diarize=diarize,
+        voiceprints=voiceprints,
+        word_segments=word_segments,
+        asr_model=asr_model,
+        context=context,
+        timestamps=timestamps,
+        shot_snap=shot_snap,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        diarize_model=diarize_model,
+        voiceprint_model=voiceprint_model,
+        speaker_clustering=speaker_clustering,
+    )
     # The deliverables keep their names beside the media: refuse one that cannot
     # exist before any audio work, not at the final write.
     writes_sdh = sdh and word_segments is None
     for suffix in (".json", ".vtt", *((".sdh.vtt",) if writes_sdh else ())):
         require_output_name(swap_ext(media_path, suffix))
     rep = reporter or Reporter()
-    steps = ["inspect source"]
-    if word_segments is None:
-        steps.append("prepare audio")
-        if separate and (skip_songs or keep_lyrics):
-            steps.append("detect songs")
-        steps.extend(("find speech", "transcribe and align"))
-        if diarize:
-            steps.append("identify speakers")
-        if shot_snap:
-            steps.append("detect shot changes")
-    steps.extend(("layout subtitles", "write outputs"))
-    if sdh and word_segments is None:
-        steps.append("create SDH sidecar")
-    rep.plan(steps)
+    rep.plan(_process_steps(request))
     rep.step("inspect source")
-    expected_json: episode_transaction.FileGeneration | None = None
-    expected_vtt: episode_transaction.FileGeneration | None = None
-    expected_media: str | None = None
-    source_mode: episode_transaction.ProcessSourceMode | None = None
     debug_root = artifacts.claim_paths(media_path).debug if debug else None
-
-    def run_with_source(
-        source_path: Path,
-        snapshot_fingerprint: str | None,
-        capture_enabled: bool,
-    ) -> Path:
-        assert expected_json is not None
-        assert expected_vtt is not None
-        assert source_mode is not None
-        # Built at call time: expected_json, expected_vtt, expected_media and
-        # source_mode are assigned after this closure is defined.
-        source = _ProcessSource(
-            path=source_path,
-            snapshot_fingerprint=snapshot_fingerprint,
-            expected_json=expected_json,
-            expected_vtt=expected_vtt,
-            expected_media_fingerprint=expected_media,
-            mode=source_mode,
-        )
-
-        # Called by _process_from_source after the shot detection job starts;
-        # ``transcribe`` and ``cache_vocals_path`` are looked up when it runs.
-        def transcribe_source() -> tuple[
-            str,
-            list[dict],
-            list[tuple[float, float]],
-            list[tuple[float, float]],
-            list[tuple[float, float, str]],
-            VoiceprintCapture | None,
-        ]:
-            return transcribe(
-                source_path,
-                lang_override=lang_override,
-                separate=separate,
-                skip_songs=skip_songs,
-                keep_lyrics=keep_lyrics,
-                diarize=diarize,
-                diarize_model=diarize_model,
-                voiceprints=capture_enabled,
-                voiceprint_model=voiceprint_model,
-                speaker_clustering=speaker_clustering,
-                normalize=normalize,
-                reporter=rep,
-                debug=debug,
-                debug_root=debug_root,
-                cache_vocals=cache_vocals_path(media_path),
-                source_fingerprint=snapshot_fingerprint,
-                asr_model=asr_model,
-                context=context,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers,
-                # SDH reuses the successfully returned deferred PANNs owner.
-                release_panns=not sdh,
-            )
-
-        return _process_from_source(
-            media_path,
-            source=source,
-            lang_override=lang_override,
-            reporter=rep,
-            sdh=sdh,
-            word_segments=word_segments,
-            timestamps=timestamps,
-            shot_snap=shot_snap,
-            transcribe_source=transcribe_source,
-        )
-
-    if voiceprints and (not diarize or word_segments is not None):
-        raise ValueError("voiceprint capture requires a fresh diarization run")
-    if diarize and word_segments is None:
-        from voxweave import diarize as diarize_mod
-
-        # Refuse a diarization that cannot succeed (a gated model without a
-        # token, impossible speaker bounds) now, not after separation and ASR.
-        diarize_mod.preflight(
-            diarize_model, min_speakers=min_speakers, max_speakers=max_speakers
-        )
-    capture_ready = False
-    if voiceprints:
-        from voxweave import voiceembed
-
-        # Fail on a bad --voiceprint-model / env / conf value before any audio
-        # work; the per-language routing itself waits for the detected language.
-        voiceembed.resolve_voiceprint_choice(voiceprint_model)
-        _log_voiceprint_notice_once()
-        capture_ready = _prefetch_voiceprint_models(
-            voiceprint_model, lang_override, rep
-        )
-    try:
-        expected_json = episode_transaction.capture_file_generation(
-            swap_ext(media_path, ".json")
-        )
-    except OSError as exc:
-        _attach_canonical_failure(
-            exc,
-            kind="subtitle-snapshot-failed",
-            phase="snapshot",
-            detail_code="sibling-read",
-        )
-        raise
-    try:
-        expected_vtt = episode_transaction.capture_file_generation(
-            swap_ext(media_path, ".vtt")
-        )
-    except OSError as exc:
-        _attach_canonical_failure(
-            exc,
-            kind="subtitle-snapshot-failed",
-            phase="snapshot",
-            detail_code="vtt-read",
-        )
-        raise
-    source_mode = "injected-words" if word_segments is not None else "transcribed-media"
-    if source_mode == "injected-words":
-        expected_media = None
-    else:
-        try:
-            expected_media = media_fingerprint(media_path)
-        except OSError as exc:
-            _attach_canonical_failure(
-                exc,
-                kind="media-identity-invalid",
-                phase="media",
-                detail_code=(
-                    "media-not-found"
-                    if isinstance(exc, FileNotFoundError)
-                    else "media-fingerprint"
-                ),
-            )
-            raise
+    capture_ready = _preflight_process(request, rep)
+    generations = _capture_process_generations(request)
     if capture_ready:
         snapshots = ExitStack()
         try:
@@ -550,7 +646,11 @@ def process(
         else:
             with snapshots:
                 try:
-                    return run_with_source(
+                    return _run_process(
+                        request,
+                        rep,
+                        generations,
+                        debug_root,
                         snapshot.path,
                         snapshot.fingerprint,
                         True,
@@ -558,7 +658,7 @@ def process(
                 except chunking.NoAudioStreamError as exc:
                     # The decode saw the private snapshot copy; name the user's file.
                     raise chunking.NoAudioStreamError(media_path.name) from exc
-    return run_with_source(media_path, None, False)
+    return _run_process(request, rep, generations, debug_root, media_path, None, False)
 
 
 def _process_from_source(
