@@ -695,31 +695,42 @@ def _cue_content(vtt_path: Path, raw: bytes) -> list[tuple[Any, Any, str, bool]]
     ]
 
 
-def split(
-    json_path: Path,
-    timestamps: bool = True,
-    *,
-    reporter: Reporter | None = None,
-    keep_vtt_edits: bool = False,
-    **smart_split_kwargs,
-) -> Path:
-    """Re-run smart_split from persisted word_segments.
+@dataclass(frozen=True)
+class _SplitSource:
+    # Everything ``split`` reads before it lays anything out: the exact sibling
+    # JSON bytes, the replay carriers decoded from them, and the speaker mapping.
+    json_path: Path
+    owner: Path
+    input_bytes: bytes
+    voiceprint_pair: tuple[str, str] | None
+    pair_declared: bool
+    iso: str
+    units: list[dict]
+    speech_spans: list[tuple[float, float]] | None
+    shot_changes: list[float] | None
+    sing_spans: list[tuple[float, float]] | None
+    speaker_turns: list[tuple[float, float, str]] | None
+    annotate_speakers: bool
+    mapping_path: Path
+    mapping_generation: episode_transaction.SpeakerMappingGeneration
 
-    Reuses ``vad_speech`` from the sibling JSON for gap splitting; falls back to gap-only
-    mode if absent. ``timestamps`` behaves as in :func:`process`.
 
-    ``keep_vtt_edits`` writes only when the existing VTT is missing or differs from
-    the new one in speaker names alone; otherwise it raises :class:`VttEditsKeptError`
-    and writes nothing. A VTT changed after that check is not overwritten either. Use
-    it when the caller did not ask to replace the VTT (render after a speakers Save):
-    the VTT may hold hand edits the JSON does not have yet.
-    """
-    # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
-    # WEBVTT bytes to json.loads.
-    json_path = swap_ext(Path(json_path), ".json")
-    rep = reporter or Reporter()
-    rep.plan(("read subtitle data", "layout subtitles", "write outputs"))
-    rep.step("read subtitle data")
+@dataclass(frozen=True)
+class _SplitCommit:
+    # What ``split`` publishes: the verified selection and the generations the
+    # commit must still find on disk.
+    vtt_path: Path
+    selection: Any
+    expected_json: episode_transaction.FileGeneration
+    expected_vtt: episode_transaction.FileGeneration | None
+    cleanup: tuple[episode_transaction.ArtifactCleanup, ...]
+
+
+def _read_split_source(
+    json_path: Path, layout_overrides: Mapping[str, Any]
+) -> _SplitSource:
+    # Read stage of split: snapshot the sibling JSON, decode the replay carriers
+    # and capture the speaker mapping. Nothing is laid out or written here.
     owner = artifact_owner(json_path)
     try:
         input_bytes = json_path.read_bytes()
@@ -758,7 +769,7 @@ def split(
     log.debug("replaying %s (%s)", json_path.name, resolve_segmentation_manifest(data))
     units = data["word_segments"]
     iso, units = _reconcile_word_segment_language(data.get("language", "en"), units)
-    _check_layout_overrides(iso, smart_split_kwargs)
+    _check_layout_overrides(iso, layout_overrides)
     speech_spans = spans_in(data.get("vad_speech"))
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = spans_in(data.get("sing_spans"))
@@ -773,24 +784,40 @@ def split(
         warn=lambda message: log.warning("%s", message),
     )
     speaker_names = dict(mapping_generation.names)
-    rep.step("layout subtitles")
-    segmented = segment_document(
-        language=iso,
-        word_segments=units,
-        vad_speech=speech_spans,
+    return _SplitSource(
+        json_path=json_path,
+        owner=owner,
+        input_bytes=input_bytes,
+        voiceprint_pair=voiceprint_pair,
+        pair_declared="voiceprint_capture" in data or "voiceprint_media" in data,
+        iso=iso,
+        units=units,
+        speech_spans=speech_spans,
         shot_changes=shot_changes,
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
-        smart_split_kwargs=smart_split_kwargs,
         annotate_speakers=bool(speaker_names),
+        mapping_path=mapping_path,
+        mapping_generation=mapping_generation,
     )
-    units, cues = segmented.units, segmented.cues
+
+
+def _plan_split_commit(
+    source: _SplitSource,
+    segmented: SegmentationResult,
+    *,
+    timestamps: bool,
+    keep_vtt_edits: bool,
+) -> _SplitCommit:
+    # Select stage of split: bind the laid-out cues to the generations read
+    # earlier and build the verified selection with its cleanup list.
     from voxweave import segmentation_orchestration
     from voxweave.align_snapshot import decode_sibling_json_snapshot
 
+    json_path = source.json_path
     if segmented.document is None or segmented.manifest is None:
         raise RuntimeError("segmentation result lacks its production authority")
-    expected_json = episode_transaction.FileGeneration(True, input_bytes)
+    expected_json = episode_transaction.FileGeneration(True, source.input_bytes)
     vtt_path = swap_ext(json_path, ".vtt")
     expected_vtt: episode_transaction.FileGeneration | None = None
     if keep_vtt_edits:
@@ -800,38 +827,54 @@ def split(
             )
         except FileNotFoundError:
             expected_vtt = episode_transaction.FileGeneration(False, None)
-    lexical_snapshot = decode_sibling_json_snapshot(json_path.name, input_bytes)
+    lexical_snapshot = decode_sibling_json_snapshot(json_path.name, source.input_bytes)
     selection = segmentation_orchestration.build_segmentation_selection(
         command="split",
         target_path=swap_ext(json_path, ".vtt"),
         sibling_path=json_path,
-        language=iso,
-        cues=cues,
-        top_level_units=units,
+        language=source.iso,
+        cues=segmented.cues,
+        top_level_units=segmented.units,
         document=segmented.document,
         manifest=segmented.manifest,
-        vad_speech=speech_spans,
-        shot_changes=shot_changes,
-        sing_spans=sing_spans,
+        vad_speech=source.speech_spans,
+        shot_changes=source.shot_changes,
+        sing_spans=source.sing_spans,
         speaker_turns=lexical_snapshot.carrier("speaker_turns"),
-        voiceprint_pair=voiceprint_pair,
+        voiceprint_pair=source.voiceprint_pair,
         timestamps=timestamps,
-        speaker_names=mapping_generation.names,
+        speaker_names=source.mapping_generation.names,
         expected_json=expected_json,
         expected_vtt=expected_vtt,
         source_mode=None,
-        mapping_generation=mapping_generation,
-        mapping_path=mapping_path,
+        mapping_generation=source.mapping_generation,
+        mapping_path=source.mapping_path,
         shadow_enabled=shadow_enabled(),
     )
-    pair_declared = "voiceprint_capture" in data or "voiceprint_media" in data
     cleanup: list[episode_transaction.ArtifactCleanup] = []
-    if pair_declared and voiceprint_pair is None:
-        cleanup.extend(episode_transaction.speaker_artifact_cleanups(owner, json_path))
+    if source.pair_declared and source.voiceprint_pair is None:
+        cleanup.extend(
+            episode_transaction.speaker_artifact_cleanups(source.owner, json_path)
+        )
     cleanup.extend(
-        episode_transaction.evidence_cleanups(swap_ext(json_path, ".vtt"), media=owner)
+        episode_transaction.evidence_cleanups(
+            swap_ext(json_path, ".vtt"), media=source.owner
+        )
     )
-    rep.step("write outputs")
+    return _SplitCommit(
+        vtt_path, selection, expected_json, expected_vtt, tuple(cleanup)
+    )
+
+
+def _commit_split(source: _SplitSource, plan: _SplitCommit) -> None:
+    # Write stage of split: refuse to replace hand edits when asked to keep them,
+    # commit, and retire the selection however the commit ends.
+    from voxweave import segmentation_orchestration
+
+    json_path = source.json_path
+    vtt_path = plan.vtt_path
+    selection = plan.selection
+    expected_vtt = plan.expected_vtt
     try:
         if expected_vtt is not None and expected_vtt.bytes_value is not None:
             old = _cue_content(vtt_path, expected_vtt.bytes_value)
@@ -846,23 +889,66 @@ def split(
                 )
         episode_transaction.commit_primary_outputs(
             command="split",
-            episode_path=owner,
+            episode_path=source.owner,
             json_path=json_path,
             vtt_path=vtt_path,
-            expected_json=expected_json,
+            expected_json=plan.expected_json,
             expected_vtt=expected_vtt,
             main_json_bytes=selection.verified.main_json_bytes,
             vtt_bytes=selection.verified.vtt_bytes,
-            cleanup_paths=tuple(cleanup),
+            cleanup_paths=plan.cleanup,
             context=selection.context,
-            speaker_mapping_path=mapping_path,
-            expected_speaker_mapping=mapping_generation,
+            speaker_mapping_path=source.mapping_path,
+            expected_speaker_mapping=source.mapping_generation,
         )
     finally:
         segmentation_orchestration.retire_segmentation_selection(selection)
-    vtt_out = swap_ext(json_path, ".vtt")
-    log.info("rendered %s → %d cues", vtt_out.name, len(cues))
-    return vtt_out
+
+
+def split(
+    json_path: Path,
+    timestamps: bool = True,
+    *,
+    reporter: Reporter | None = None,
+    keep_vtt_edits: bool = False,
+    **smart_split_kwargs,
+) -> Path:
+    """Re-run smart_split from persisted word_segments.
+
+    Reuses ``vad_speech`` from the sibling JSON for gap splitting; falls back to gap-only
+    mode if absent. ``timestamps`` behaves as in :func:`process`.
+
+    ``keep_vtt_edits`` writes only when the existing VTT is missing or differs from
+    the new one in speaker names alone; otherwise it raises :class:`VttEditsKeptError`
+    and writes nothing. A VTT changed after that check is not overwritten either. Use
+    it when the caller did not ask to replace the VTT (render after a speakers Save):
+    the VTT may hold hand edits the JSON does not have yet.
+    """
+    # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
+    # WEBVTT bytes to json.loads.
+    json_path = swap_ext(Path(json_path), ".json")
+    rep = reporter or Reporter()
+    rep.plan(("read subtitle data", "layout subtitles", "write outputs"))
+    rep.step("read subtitle data")
+    source = _read_split_source(json_path, smart_split_kwargs)
+    rep.step("layout subtitles")
+    segmented = segment_document(
+        language=source.iso,
+        word_segments=source.units,
+        vad_speech=source.speech_spans,
+        shot_changes=source.shot_changes,
+        sing_spans=source.sing_spans,
+        speaker_turns=source.speaker_turns,
+        smart_split_kwargs=smart_split_kwargs,
+        annotate_speakers=source.annotate_speakers,
+    )
+    plan = _plan_split_commit(
+        source, segmented, timestamps=timestamps, keep_vtt_edits=keep_vtt_edits
+    )
+    rep.step("write outputs")
+    _commit_split(source, plan)
+    log.info("rendered %s → %d cues", plan.vtt_path.name, len(segmented.cues))
+    return plan.vtt_path
 
 
 def _prepare_16k_for_align(
