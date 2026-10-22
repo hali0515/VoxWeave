@@ -139,6 +139,7 @@ from voxweave.failure_annotations import (
     _record_disposal_failure as _record_disposal_failure,
 )
 from voxweave.align_blocks import AlignBlocksRequest, align_blocks as run_align_blocks
+from voxweave.align_observer import notify_align_shadow_observer
 from voxweave.align_run import (
     MIN_CUE_SEC as MIN_CUE_SEC,
     TINY_CUE_SEC as TINY_CUE_SEC,
@@ -1053,70 +1054,6 @@ def _align_blocks(
     )
 
 
-def _notify_align_shadow_observer(
-    observer: Callable[[object], object],
-    *,
-    selection: Any,
-    input_summary: Mapping[str, Any],
-    prepared_audio_sha256: str,
-) -> None:
-    """Build rich/minimal observation after disposal; never change production."""
-    from voxweave.align_evidence import encode_align_evidence
-
-    evidence_sha256 = hashlib.sha256(
-        encode_align_evidence(selection.evidence)
-    ).hexdigest()
-    try:
-        from voxweave import align_shadow
-
-        artifact = align_shadow.build_rich_align_shadow_artifact(
-            selection=selection,
-            input_summary=input_summary,
-            prepared_audio_sha256=prepared_audio_sha256,
-        )
-    except Exception as rich_error:
-        log.warning("rich align shadow construction failed: %s", rich_error)
-        try:
-            from voxweave import align_shadow_minimal
-
-            artifact = align_shadow_minimal.build_minimal_align_shadow_failure_artifact(
-                context_content_digest=selection.context.context_content_digest,
-                receipt_digest=selection.result.receipt_digest,
-                engine_family=selection.verified.engine_family,
-                vtt_sha256=selection.verified.vtt_sha256,
-                json_sha256=selection.verified.main_json_sha256,
-                evidence_sha256=evidence_sha256,
-                prior_failure=(
-                    selection.observation_failure or selection.result.v2_status.failure
-                ),
-            )
-        except Exception as minimal_error:
-            failure = CanonicalFailure(
-                "shadow-artifact-unavailable",
-                "minimal-artifact",
-                "minimal-artifact-construction",
-            )
-            log.warning(
-                "align shadow artifact unavailable: %s",
-                minimal_error,
-                extra={"failure": failure},
-            )
-            return
-    try:
-        observer(artifact)
-    except Exception as exc:
-        failure = CanonicalFailure(
-            "observer-failed",
-            "observer",
-            "observer-callback",
-        )
-        log.warning(
-            "align shadow observer failed: %s",
-            exc,
-            extra={"failure": failure},
-        )
-
-
 def _media_not_found_error(vtt_path: Path) -> FileNotFoundError:
     """The classified error :func:`align` raises when the source media is missing."""
     exc = FileNotFoundError(
@@ -1480,7 +1417,7 @@ def align(
                 and run.observation_input is not None
                 and run.prepared_audio_sha256 is not None
             ):
-                _notify_align_shadow_observer(
+                notify_align_shadow_observer(
                     _shadow_observer,
                     selection=run.completed_selection,
                     input_summary=run.observation_input,
