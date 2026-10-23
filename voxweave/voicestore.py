@@ -524,6 +524,113 @@ def plan_indexed_enrollment(
     return IndexedPlan("enroll", evict=evict)
 
 
+def _resolve_or_create_identity(
+    identities: dict[str, object],
+    normalized_name: str,
+    raw_name: str,
+    identity_id_factory: Callable[[], str],
+) -> str:
+    owners = _identity_owners(identities, normalized_name)
+    if len(owners) > 1:
+        raise EnrollmentRefusal(
+            "speaker name is owned by multiple identities: " + ", ".join(sorted(owners))
+        )
+
+    used_identity_ids = set(identities)
+    identity_id = next(iter(owners), None)
+    if identity_id is None:
+        identity_id = mint_unique_id(
+            identity_id_factory,
+            used_identity_ids,
+            require_identity_id,
+            "identity",
+        )
+        identities[identity_id] = {
+            "display_name": raw_name,
+            "aliases": [],
+            "exemplars": [],
+        }
+    return identity_id
+
+
+def _exemplar_keys(exemplars: Sequence[Mapping[str, object]]) -> list[ExemplarKey]:
+    return [
+        ExemplarKey(
+            id=cast(str, item["id"]),
+            capture_id=cast(str, item["capture_id"]),
+            media_fingerprint=cast(str, item["media_fingerprint"]),
+            episode=normalize_episode(item["episode"]),
+            vector=cast(list[int | float], item["vector"]),
+            added=cast(str, item["added"]),
+        )
+        for item in exemplars
+    ]
+
+
+def _replace_exemplar(
+    log: list[object],
+    event_at: str,
+    identity_id: str,
+    exemplars: list[dict[str, object]],
+    target: int,
+    new_exemplar: dict[str, object],
+) -> None:
+    replacement = exemplars[target]
+    old_id = cast(str, replacement["id"])
+    old_capture = cast(str, replacement["capture_id"])
+    exemplars[target] = new_exemplar
+    _append_log(
+        log,
+        {
+            "at": event_at,
+            "action": "replace",
+            "identity": identity_id,
+            "old_exemplar": old_id,
+            "new_exemplar": new_exemplar["id"],
+            "episode": new_exemplar["episode"],
+            "old_capture": old_capture,
+            "new_capture": new_exemplar["capture_id"],
+        },
+    )
+
+
+def _append_exemplar(
+    log: list[object],
+    event_at: str,
+    identity_id: str,
+    exemplars: list[dict[str, object]],
+    evict: int | None,
+    new_exemplar: dict[str, object],
+) -> str | None:
+    """Add ``new_exemplar``, displacing ``exemplars[evict]``; return the displaced id."""
+    evicted_id: str | None = None
+    if evict is not None:
+        oldest = exemplars.pop(evict)
+        evicted_id = cast(str, oldest["id"])
+        _append_log(
+            log,
+            {
+                "at": event_at,
+                "action": "evict",
+                "identity": identity_id,
+                "exemplar": evicted_id,
+                "episode": cast(str, oldest["episode"]),
+            },
+        )
+    exemplars.append(new_exemplar)
+    _append_log(
+        log,
+        {
+            "at": event_at,
+            "action": "enroll",
+            "identity": identity_id,
+            "exemplar": new_exemplar["id"],
+            "episode": new_exemplar["episode"],
+        },
+    )
+    return evicted_id
+
+
 def enroll_exemplar(
     store: Mapping[str, object],
     *,
@@ -556,41 +663,14 @@ def enroll_exemplar(
 
     result_store = cast(dict[str, object], copy.deepcopy(dict(store)))
     identities = cast(dict[str, object], result_store["identities"])
-    owners = _identity_owners(identities, normalized_name)
-    if len(owners) > 1:
-        raise EnrollmentRefusal(
-            "speaker name is owned by multiple identities: " + ", ".join(sorted(owners))
-        )
-
-    used_identity_ids = set(identities)
-    identity_id = next(iter(owners), None)
-    if identity_id is None:
-        identity_id = mint_unique_id(
-            identity_id_factory,
-            used_identity_ids,
-            require_identity_id,
-            "identity",
-        )
-        identities[identity_id] = {
-            "display_name": raw_name,
-            "aliases": [],
-            "exemplars": [],
-        }
+    identity_id = _resolve_or_create_identity(
+        identities, normalized_name, raw_name, identity_id_factory
+    )
 
     identity = cast(dict[str, object], identities[identity_id])
     exemplars = cast(list[dict[str, object]], identity["exemplars"])
     plan = plan_indexed_enrollment(
-        [
-            ExemplarKey(
-                id=cast(str, item["id"]),
-                capture_id=cast(str, item["capture_id"]),
-                media_fingerprint=cast(str, item["media_fingerprint"]),
-                episode=normalize_episode(item["episode"]),
-                vector=cast(list[int | float], item["vector"]),
-                added=cast(str, item["added"]),
-            )
-            for item in exemplars
-        ],
+        _exemplar_keys(exemplars),
         capture_id=incoming_capture,
         media_fingerprint=incoming_media,
         episode=incoming_episode,
@@ -605,7 +685,6 @@ def enroll_exemplar(
             identity_id=identity_id,
             exemplar_id=cast(str, exemplars[plan.target]["id"]),
         )
-    replacement = exemplars[plan.target] if plan.target is not None else None
 
     used_exemplar_ids = _active_exemplar_ids(identities)
     new_exemplar_id = mint_unique_id(
@@ -624,50 +703,16 @@ def enroll_exemplar(
     }
     log = cast(list[object], result_store["log"])
     evicted_id: str | None = None
+    outcome: Literal["enroll", "replace"]
 
-    if replacement is not None:
-        assert plan.target is not None
-        old_id = cast(str, replacement["id"])
-        old_capture = cast(str, replacement["capture_id"])
-        exemplars[plan.target] = new_exemplar
-        _append_log(
-            log,
-            {
-                "at": event_at,
-                "action": "replace",
-                "identity": identity_id,
-                "old_exemplar": old_id,
-                "new_exemplar": new_exemplar_id,
-                "episode": incoming_episode,
-                "old_capture": old_capture,
-                "new_capture": incoming_capture,
-            },
+    if plan.target is not None:
+        _replace_exemplar(
+            log, event_at, identity_id, exemplars, plan.target, new_exemplar
         )
-        outcome: Literal["enroll", "replace"] = "replace"
+        outcome = "replace"
     else:
-        if plan.evict is not None:
-            oldest = exemplars.pop(plan.evict)
-            evicted_id = cast(str, oldest["id"])
-            _append_log(
-                log,
-                {
-                    "at": event_at,
-                    "action": "evict",
-                    "identity": identity_id,
-                    "exemplar": evicted_id,
-                    "episode": cast(str, oldest["episode"]),
-                },
-            )
-        exemplars.append(new_exemplar)
-        _append_log(
-            log,
-            {
-                "at": event_at,
-                "action": "enroll",
-                "identity": identity_id,
-                "exemplar": new_exemplar_id,
-                "episode": incoming_episode,
-            },
+        evicted_id = _append_exemplar(
+            log, event_at, identity_id, exemplars, plan.evict, new_exemplar
         )
         outcome = "enroll"
 
