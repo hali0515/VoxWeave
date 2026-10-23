@@ -1294,12 +1294,12 @@ def test_ctc_failure_empties_cache_before_qwen_fallback(monkeypatch, tmp_path):
     monkeypatch.setattr(backend, "_use_mlx", lambda: False)
     seen: list[list[str]] = []
 
-    class _FakeAligner:
-        def align(self, wav, text, lang):
-            seen.append(list(calls))  # snapshot: cache state when Qwen runs
-            return [[]]
+    def _fake_units(aligner, wav, text, lang):
+        seen.append(list(calls))  # snapshot: cache state when Qwen runs
+        return []
 
-    monkeypatch.setattr(backend, "_get_aligner", lambda: _FakeAligner())
+    monkeypatch.setattr(backend, "_get_aligner", lambda: object())
+    monkeypatch.setattr(backend, "_qwen_units", _fake_units)
     wav = tmp_path / "c.wav"
     wav.write_bytes(b"x")
     out = backend.align_text(wav, "hello", "english")
