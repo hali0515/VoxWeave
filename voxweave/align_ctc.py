@@ -13,6 +13,8 @@ import logging
 import os
 from collections import namedtuple
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -403,6 +405,138 @@ def _ctc_full_pass(
     return _legacy_distribution_invoker(distribute)
 
 
+def _prepare_ctc_calls(
+    wav_path: Path,
+    texts: list[str],
+    bounds: Sequence[tuple[float, float] | None] | None,
+    mute_spans: Sequence[tuple[float, float]] | None,
+    crop_to_envelope: bool,
+) -> list[_PreparedDpCall]:
+    norm = [(text or "").strip() for text in texts]
+    wav = _load_mono(wav_path, CTC_AUDIO_SR)
+    _preflight_over_budget_hints(wav, CTC_AUDIO_SR, norm, bounds)
+    if mute_spans:
+        # excised song intervals (see align_blocks_full_mms): no transcript belongs
+        # there, muting only removes the acoustic bait that smears neighbouring
+        # sentences.
+        wav = mute_spans_in_wav(wav, CTC_AUDIO_SR, mute_spans)
+    return _prepare_dp_calls(
+        wav,
+        CTC_AUDIO_SR,
+        norm,
+        bounds,
+        "CTC",
+        crop_to_envelope=crop_to_envelope,
+    )
+
+
+def _load_fixed_rate_ctc_aligner(iso: str, model_name: str):
+    loaded = _get_ctc_aligner(iso, model_name)
+    if loaded.sr != CTC_AUDIO_SR:
+        raise RuntimeError(
+            "configured CTC aligner sample rate differs from prepared call rate"
+        )
+    return loaded
+
+
+@dataclass
+class _CtcBlockPasses:
+    """The aligner and invokers shared by the physical passes of one
+    :func:`align_blocks_full_ctc` call; ``source_cursor`` numbers the blocks."""
+
+    al: Any
+    iso: str
+    nospace: bool
+    speech_spans: list[tuple[float, float]] | None
+    raw_call_observer: Callable[..., None] | None
+    backend_invoker: Callable[[Callable[[], Any]], Any] | None
+    legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None
+    source_cursor: int = 0
+
+    def run(
+        self,
+        w,
+        sub: list[str],
+        offset_s: float = 0.0,
+        *,
+        audio_sample_start: int,
+        audio_sample_end: int,
+        sample_count: int,
+    ) -> list[list[dict]] | _DeferredLegacyProjection:
+        al = self.al
+        _raw_call_observer = self.raw_call_observer
+        source_indices = tuple(range(self.source_cursor, self.source_cursor + len(sub)))
+        self.source_cursor += len(sub)
+        spans_rel = None
+        if self.speech_spans:
+            end_s = offset_s + w.shape[-1] / al.sr
+            spans_rel = [
+                (max(0.0, s - offset_s), min(end_s, e) - offset_s)
+                for s, e in self.speech_spans
+                if e > offset_s and s < end_s
+            ]
+        raw_result: list[dict] | None = None
+        original_result: list[dict] | None = None
+
+        def capture_raw(value: list[dict]) -> None:
+            nonlocal raw_result
+            raw_result = value
+            if _raw_call_observer is not None:
+                _raw_call_observer(
+                    raw_result if raw_result is not None else [],
+                    original_result,
+                    source_indices,
+                    offset_s,
+                    audio_sample_start=audio_sample_start,
+                    audio_sample_end=audio_sample_end,
+                    sample_rate=al.sr,
+                    sample_count=sample_count,
+                    nominal_end_seconds=None,
+                )
+
+        def capture_original(value: list[dict] | None) -> None:
+            nonlocal original_result
+            original_result = value
+
+        flat_observer = capture_raw if _raw_call_observer is not None else None
+        original_observer = capture_original if _raw_call_observer is not None else None
+        if self.legacy_distribution_invoker is None:
+            out: list[list[dict]] | _DeferredLegacyProjection = _ctc_full_pass(
+                al,
+                w,
+                sub,
+                self.nospace,
+                self.iso,
+                speech_spans=spans_rel,
+                _raw_result_observer=flat_observer,
+                _raw_original_observer=original_observer,
+                _backend_invoker=self.backend_invoker,
+            )
+        else:
+            flat = _ctc_flat_pass(
+                al,
+                w,
+                sub,
+                self.nospace,
+                speech_spans=spans_rel,
+                _raw_result_observer=flat_observer,
+                _raw_original_observer=original_observer,
+                _backend_invoker=self.backend_invoker,
+            )
+
+            def distribute() -> list[list[dict]]:
+                return _distribute_units(flat, sub, self.iso)
+
+            out = _DeferredLegacyProjection(distribute, offset_s)
+        if _raw_call_observer is not None and raw_result is None:
+            raise RuntimeError("CTC flat result was not observed before distribution")
+        if self.backend_invoker is None:
+            _empty_cache()
+        else:
+            self.backend_invoker(_empty_cache)
+        return out
+
+
 def align_blocks_full_ctc(
     wav_path: Path,
     texts: list[str],
@@ -440,130 +574,34 @@ def align_blocks_full_ctc(
     if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() != "1":
         speech_spans = None
 
-    def prepare_full_pass() -> list[_PreparedDpCall]:
-        norm = [(text or "").strip() for text in texts]
-        wav = _load_mono(wav_path, CTC_AUDIO_SR)
-        _preflight_over_budget_hints(wav, CTC_AUDIO_SR, norm, bounds)
-        if mute_spans:
-            # excised song intervals (see align_blocks_full_mms): no transcript belongs
-            # there, muting only removes the acoustic bait that smears neighbouring
-            # sentences.
-            wav = mute_spans_in_wav(wav, CTC_AUDIO_SR, mute_spans)
-        return _prepare_dp_calls(
-            wav,
-            CTC_AUDIO_SR,
-            norm,
-            bounds,
-            "CTC",
-            crop_to_envelope=crop_to_envelope,
-        )
-
     prepared_calls = cast(
         list[_PreparedDpCall],
-        (_preparation_invoker or _run_directly)(prepare_full_pass),
+        (_preparation_invoker or _run_directly)(
+            partial(
+                _prepare_ctc_calls,
+                wav_path,
+                texts,
+                bounds,
+                mute_spans,
+                crop_to_envelope,
+            )
+        ),
     )
 
-    def load_fixed_rate_aligner():
-        loaded = _get_ctc_aligner(iso, model_name)
-        if loaded.sr != CTC_AUDIO_SR:
-            raise RuntimeError(
-                "configured CTC aligner sample rate differs from prepared call rate"
-            )
-        return loaded
-
-    al = (
-        load_fixed_rate_aligner()
-        if _backend_invoker is None
-        else _backend_invoker(load_fixed_rate_aligner)
+    load_aligner = partial(_load_fixed_rate_ctc_aligner, iso, model_name)
+    al = load_aligner() if _backend_invoker is None else _backend_invoker(load_aligner)
+    passes = _CtcBlockPasses(
+        al=al,
+        iso=iso,
+        nospace=iso in ALIGNER_NO_SPACE_LANGS,
+        speech_spans=speech_spans,
+        raw_call_observer=_raw_call_observer,
+        backend_invoker=_backend_invoker,
+        legacy_distribution_invoker=_legacy_distribution_invoker,
     )
-    nospace = iso in ALIGNER_NO_SPACE_LANGS
-
-    source_cursor = 0
-
-    def _pass(
-        w,
-        sub: list[str],
-        offset_s: float = 0.0,
-        *,
-        audio_sample_start: int,
-        audio_sample_end: int,
-        sample_count: int,
-    ) -> list[list[dict]] | _DeferredLegacyProjection:
-        nonlocal source_cursor
-        source_indices = tuple(range(source_cursor, source_cursor + len(sub)))
-        source_cursor += len(sub)
-        spans_rel = None
-        if speech_spans:
-            end_s = offset_s + w.shape[-1] / al.sr
-            spans_rel = [
-                (max(0.0, s - offset_s), min(end_s, e) - offset_s)
-                for s, e in speech_spans
-                if e > offset_s and s < end_s
-            ]
-        raw_result: list[dict] | None = None
-        original_result: list[dict] | None = None
-
-        def capture_raw(value: list[dict]) -> None:
-            nonlocal raw_result
-            raw_result = value
-            if _raw_call_observer is not None:
-                _raw_call_observer(
-                    raw_result if raw_result is not None else [],
-                    original_result,
-                    source_indices,
-                    offset_s,
-                    audio_sample_start=audio_sample_start,
-                    audio_sample_end=audio_sample_end,
-                    sample_rate=al.sr,
-                    sample_count=sample_count,
-                    nominal_end_seconds=None,
-                )
-
-        def capture_original(value: list[dict] | None) -> None:
-            nonlocal original_result
-            original_result = value
-
-        flat_observer = capture_raw if _raw_call_observer is not None else None
-        original_observer = capture_original if _raw_call_observer is not None else None
-        if _legacy_distribution_invoker is None:
-            out: list[list[dict]] | _DeferredLegacyProjection = _ctc_full_pass(
-                al,
-                w,
-                sub,
-                nospace,
-                iso,
-                speech_spans=spans_rel,
-                _raw_result_observer=flat_observer,
-                _raw_original_observer=original_observer,
-                _backend_invoker=_backend_invoker,
-            )
-        else:
-            flat = _ctc_flat_pass(
-                al,
-                w,
-                sub,
-                nospace,
-                speech_spans=spans_rel,
-                _raw_result_observer=flat_observer,
-                _raw_original_observer=original_observer,
-                _backend_invoker=_backend_invoker,
-            )
-
-            def distribute() -> list[list[dict]]:
-                return _distribute_units(flat, sub, iso)
-
-            out = _DeferredLegacyProjection(distribute, offset_s)
-        if _raw_call_observer is not None and raw_result is None:
-            raise RuntimeError("CTC flat result was not observed before distribution")
-        if _backend_invoker is None:
-            _empty_cache()
-        else:
-            _backend_invoker(_empty_cache)
-        return out
-
     return _execute_dp_calls(
         prepared_calls,
-        _pass,
+        passes.run,
         pass_physical_geometry=True,
         legacy_distribution_invoker=_legacy_distribution_invoker,
         legacy_shift_invoker=_legacy_shift_invoker,
