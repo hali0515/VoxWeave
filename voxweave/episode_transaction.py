@@ -20,7 +20,7 @@ import stat
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -758,6 +758,196 @@ def _consume_commit_role(
     consume_context_role(context, "commit", consumer=consumer)
 
 
+def _validate_commit_request(
+    *,
+    command: TransactionCommand,
+    media_path: Path | None,
+    expected_media_fingerprint: str | None,
+    expected_voiceprint_media_fingerprint: str | None,
+    expected_pair_decision: bool | None,
+    evidence_artifact: EvidencePublication | None,
+    speaker_mapping_path: Path | None,
+    expected_speaker_mapping: SpeakerMappingGeneration | None,
+) -> None:
+    if command not in ("process", "split", "align"):
+        raise ValueError("unknown transaction command")
+    if evidence_artifact is not None and command != "align":
+        raise ValueError("only align may publish durable evidence")
+    if (speaker_mapping_path is None) != (expected_speaker_mapping is None):
+        raise ValueError("split mapping CAS requires both path and S0 generation")
+    if speaker_mapping_path is not None and command != "split":
+        raise ValueError("only split may recheck a speaker mapping generation")
+    if (expected_voiceprint_media_fingerprint is None) != (
+        expected_pair_decision is None
+    ):
+        raise ValueError("pair decision recheck requires its fingerprint and decision")
+    if expected_pair_decision is not None and type(expected_pair_decision) is not bool:
+        raise TypeError("expected pair decision must be an exact bool")
+    if expected_pair_decision is not None and (
+        command != "align" or media_path is None or expected_media_fingerprint is None
+    ):
+        raise ValueError("pair decision recheck requires an align media generation")
+
+
+@dataclass(frozen=True)
+class _CommitRequest:
+    """What one :func:`commit_primary_outputs` call was asked to publish."""
+
+    command: TransactionCommand
+    json_target: Path
+    vtt_target: Path
+    expected_json: FileGeneration
+    expected_vtt: FileGeneration | None
+    main_json_bytes: bytes
+    vtt_bytes: bytes
+    cleanup_paths: Sequence[ArtifactCleanup]
+    context: IssuedAlignContext | IssuedSegmentationContext | None
+    media_path: Path | None
+    expected_media_fingerprint: str | None
+    expected_voiceprint_media_fingerprint: str | None
+    expected_pair_decision: bool | None
+    machine_artifact: MachineArtifactPublication | None
+    evidence_artifact: EvidencePublication | None
+    speaker_mapping_path: Path | None
+    expected_speaker_mapping: SpeakerMappingGeneration | None
+
+
+@dataclass
+class _CommitRun:
+    """What a commit has staged and landed so far, for the failure path to unwind."""
+
+    stages: list[_OwnedStage] = field(default_factory=list)
+    landed: list[Path] = field(default_factory=list)
+    machine_landed: list[Path] = field(default_factory=list)
+    machine_stage: _OwnedStage | None = None
+    evidence_stage: _OwnedStage | None = None
+
+
+def _stage_outputs(request: _CommitRequest, run: _CommitRun) -> None:
+    run.stages.append(
+        _stage_primary(request.json_target, request.main_json_bytes, "main-json-stage")
+    )
+    run.stages.append(
+        _stage_primary(request.vtt_target, request.vtt_bytes, "vtt-stage")
+    )
+    machine_artifact = request.machine_artifact
+    if machine_artifact is not None:
+        run.machine_stage = _stage_primary(
+            machine_artifact.path,
+            machine_artifact.bytes_value,
+            "machine-artifact-stage",
+            private=True,
+        )
+        run.stages.append(run.machine_stage)
+    evidence_artifact = request.evidence_artifact
+    if evidence_artifact is not None:
+        run.evidence_stage = _stage_primary(
+            evidence_artifact.path,
+            evidence_artifact.bytes_value,
+            "evidence-stage",
+            private=True,
+        )
+        run.stages.append(run.evidence_stage)
+
+
+def _recheck_inputs(request: _CommitRequest) -> None:
+    command = request.command
+    media_path = request.media_path
+    _check_primary_generations(
+        command=command,
+        json_path=request.json_target,
+        vtt_path=request.vtt_target,
+        expected_json=request.expected_json,
+        expected_vtt=request.expected_vtt,
+    )
+    if request.expected_media_fingerprint is not None:
+        if media_path is None:
+            raise ValueError("media generation requires a media path")
+        require_media_generation(media_path, request.expected_media_fingerprint)
+    if request.expected_pair_decision is not None:
+        assert media_path is not None
+        assert request.expected_voiceprint_media_fingerprint is not None
+        require_media_pair_decision(
+            media_path,
+            voiceprint_media_fingerprint=(
+                request.expected_voiceprint_media_fingerprint
+            ),
+            expected_decision=request.expected_pair_decision,
+        )
+    if request.speaker_mapping_path is not None:
+        assert request.expected_speaker_mapping is not None
+        segmentation_context = (
+            request.context
+            if isinstance(request.context, IssuedSegmentationContext)
+            else None
+        )
+        _require_bound_speaker_mapping(
+            segmentation_context,
+            request.speaker_mapping_path,
+            request.expected_speaker_mapping,
+        )
+        observed_mapping = observe_speaker_mapping_generation(
+            request.speaker_mapping_path
+        )
+        if not same_speaker_mapping_generation(
+            request.expected_speaker_mapping, observed_mapping
+        ):
+            raise _stale(command, "speaker-mapping-generation")
+    _consume_commit_role(
+        request.context,
+        command=command,
+        vtt_path=request.vtt_target,
+        json_path=request.json_target,
+        media_path=media_path,
+    )
+
+
+def _land_outputs(request: _CommitRequest, run: _CommitRun) -> None:
+    for stage, detail_code in zip(
+        run.stages[:2], ("main-json-replace", "vtt-replace"), strict=True
+    ):
+        _replace_primary(stage, detail_code)
+        run.landed.append(stage.target)
+    # A failed cleanup is raised only after the remaining cleanups
+    # and the machine artifact (it binds the primaries that already
+    # landed) have run. Durable evidence attests a complete
+    # publication, so it is withheld once any cleanup failed.
+    cleanup_failures: list[ArtifactCleanupError] = []
+    for cleanup in (
+        item for item in request.cleanup_paths if item.detail_code != "evidence-unlink"
+    ):
+        _defer_cleanup(cleanup, cleanup_failures)
+    machine_artifact = request.machine_artifact
+    if machine_artifact is not None:
+        assert run.machine_stage is not None
+        try:
+            _replace_primary(run.machine_stage, "machine-artifact-replace")
+        except TransactionOperationError as exc:
+            if not cleanup_failures:
+                raise
+            _append_secondary(
+                cleanup_failures[0],
+                SecondaryFailure(
+                    exc.failure.kind,
+                    exc.failure.phase,
+                    exc.failure.detail_code,
+                ),
+            )
+            raise cleanup_failures[0]
+        run.machine_landed.append(machine_artifact.path)
+    for cleanup in (
+        item for item in request.cleanup_paths if item.detail_code == "evidence-unlink"
+    ):
+        _defer_cleanup(cleanup, cleanup_failures)
+    if cleanup_failures:
+        raise cleanup_failures[0]
+    evidence_artifact = request.evidence_artifact
+    if evidence_artifact is not None:
+        assert run.evidence_stage is not None
+        _replace_primary(run.evidence_stage, "evidence-replace")
+        run.landed.append(evidence_artifact.path)
+
+
 def commit_primary_outputs(
     *,
     command: TransactionCommand,
@@ -780,169 +970,68 @@ def commit_primary_outputs(
     expected_speaker_mapping: SpeakerMappingGeneration | None = None,
 ) -> TransactionReceipt:
     """Stage final bytes, recheck, authorize, and publish in command order."""
-    if command not in ("process", "split", "align"):
-        raise ValueError("unknown transaction command")
-    if evidence_artifact is not None and command != "align":
-        raise ValueError("only align may publish durable evidence")
-    if (speaker_mapping_path is None) != (expected_speaker_mapping is None):
-        raise ValueError("split mapping CAS requires both path and S0 generation")
-    if speaker_mapping_path is not None and command != "split":
-        raise ValueError("only split may recheck a speaker mapping generation")
-    if (expected_voiceprint_media_fingerprint is None) != (
-        expected_pair_decision is None
-    ):
-        raise ValueError("pair decision recheck requires its fingerprint and decision")
-    if expected_pair_decision is not None and type(expected_pair_decision) is not bool:
-        raise TypeError("expected pair decision must be an exact bool")
-    if expected_pair_decision is not None and (
-        command != "align" or media_path is None or expected_media_fingerprint is None
-    ):
-        raise ValueError("pair decision recheck requires an align media generation")
-    json_target, vtt_target = Path(json_path), Path(vtt_path)
-    stages: list[_OwnedStage] = []
-    landed: list[Path] = []
-    machine_landed: list[Path] = []
-    machine_stage: _OwnedStage | None = None
-    evidence_stage: _OwnedStage | None = None
+    _validate_commit_request(
+        command=command,
+        media_path=media_path,
+        expected_media_fingerprint=expected_media_fingerprint,
+        expected_voiceprint_media_fingerprint=expected_voiceprint_media_fingerprint,
+        expected_pair_decision=expected_pair_decision,
+        evidence_artifact=evidence_artifact,
+        speaker_mapping_path=speaker_mapping_path,
+        expected_speaker_mapping=expected_speaker_mapping,
+    )
+    request = _CommitRequest(
+        command=command,
+        json_target=Path(json_path),
+        vtt_target=Path(vtt_path),
+        expected_json=expected_json,
+        expected_vtt=expected_vtt,
+        main_json_bytes=main_json_bytes,
+        vtt_bytes=vtt_bytes,
+        cleanup_paths=cleanup_paths,
+        context=context,
+        media_path=media_path,
+        expected_media_fingerprint=expected_media_fingerprint,
+        expected_voiceprint_media_fingerprint=expected_voiceprint_media_fingerprint,
+        expected_pair_decision=expected_pair_decision,
+        machine_artifact=machine_artifact,
+        evidence_artifact=evidence_artifact,
+        speaker_mapping_path=speaker_mapping_path,
+        expected_speaker_mapping=expected_speaker_mapping,
+    )
+    run = _CommitRun()
     try:
         with align_runtime_activity("AO-22", "primary-and-evidence-stage"):
-            stages.append(
-                _stage_primary(json_target, main_json_bytes, "main-json-stage")
-            )
-            stages.append(_stage_primary(vtt_target, vtt_bytes, "vtt-stage"))
-            if machine_artifact is not None:
-                machine_stage = _stage_primary(
-                    machine_artifact.path,
-                    machine_artifact.bytes_value,
-                    "machine-artifact-stage",
-                    private=True,
-                )
-                stages.append(machine_stage)
-            if evidence_artifact is not None:
-                evidence_stage = _stage_primary(
-                    evidence_artifact.path,
-                    evidence_artifact.bytes_value,
-                    "evidence-stage",
-                    private=True,
-                )
-                stages.append(evidence_stage)
+            _stage_outputs(request, run)
         with _transaction_lock(Path(episode_path)):
             with align_runtime_activity("AO-23", "generation-and-binding-recheck"):
-                _check_primary_generations(
-                    command=command,
-                    json_path=json_target,
-                    vtt_path=vtt_target,
-                    expected_json=expected_json,
-                    expected_vtt=expected_vtt,
-                )
-                if expected_media_fingerprint is not None:
-                    if media_path is None:
-                        raise ValueError("media generation requires a media path")
-                    require_media_generation(media_path, expected_media_fingerprint)
-                if expected_pair_decision is not None:
-                    assert media_path is not None
-                    assert expected_voiceprint_media_fingerprint is not None
-                    require_media_pair_decision(
-                        media_path,
-                        voiceprint_media_fingerprint=(
-                            expected_voiceprint_media_fingerprint
-                        ),
-                        expected_decision=expected_pair_decision,
-                    )
-                if speaker_mapping_path is not None:
-                    assert expected_speaker_mapping is not None
-                    segmentation_context = (
-                        context
-                        if isinstance(context, IssuedSegmentationContext)
-                        else None
-                    )
-                    _require_bound_speaker_mapping(
-                        segmentation_context,
-                        speaker_mapping_path,
-                        expected_speaker_mapping,
-                    )
-                    observed_mapping = observe_speaker_mapping_generation(
-                        speaker_mapping_path
-                    )
-                    if not same_speaker_mapping_generation(
-                        expected_speaker_mapping, observed_mapping
-                    ):
-                        raise _stale(command, "speaker-mapping-generation")
-                _consume_commit_role(
-                    context,
-                    command=command,
-                    vtt_path=vtt_target,
-                    json_path=json_target,
-                    media_path=media_path,
-                )
+                _recheck_inputs(request)
             with align_runtime_activity("AO-24", "commit-and-required-cleanup"):
-                for stage, detail_code in zip(
-                    stages[:2], ("main-json-replace", "vtt-replace"), strict=True
-                ):
-                    _replace_primary(stage, detail_code)
-                    landed.append(stage.target)
-                # A failed cleanup is raised only after the remaining cleanups
-                # and the machine artifact (it binds the primaries that already
-                # landed) have run. Durable evidence attests a complete
-                # publication, so it is withheld once any cleanup failed.
-                cleanup_failures: list[ArtifactCleanupError] = []
-                for cleanup in (
-                    item
-                    for item in cleanup_paths
-                    if item.detail_code != "evidence-unlink"
-                ):
-                    _defer_cleanup(cleanup, cleanup_failures)
-                if machine_artifact is not None:
-                    assert machine_stage is not None
-                    try:
-                        _replace_primary(machine_stage, "machine-artifact-replace")
-                    except TransactionOperationError as exc:
-                        if not cleanup_failures:
-                            raise
-                        _append_secondary(
-                            cleanup_failures[0],
-                            SecondaryFailure(
-                                exc.failure.kind,
-                                exc.failure.phase,
-                                exc.failure.detail_code,
-                            ),
-                        )
-                        raise cleanup_failures[0]
-                    machine_landed.append(machine_artifact.path)
-                for cleanup in (
-                    item
-                    for item in cleanup_paths
-                    if item.detail_code == "evidence-unlink"
-                ):
-                    _defer_cleanup(cleanup, cleanup_failures)
-                if cleanup_failures:
-                    raise cleanup_failures[0]
-                if evidence_artifact is not None:
-                    assert evidence_stage is not None
-                    _replace_primary(evidence_stage, "evidence-replace")
-                    landed.append(evidence_artifact.path)
+                _land_outputs(request, run)
     except BaseException as exc:
-        leftovers = _discard_stages(stages)
+        leftovers = _discard_stages(run.stages)
         if leftovers:
             _append_stage_residue_secondary(exc)
         _annotate_failure(
             exc,
-            landed=landed,
+            landed=run.landed,
             leftovers=leftovers,
-            machine_landed=machine_landed,
+            machine_landed=run.machine_landed,
         )
         raise
-    leftovers = _discard_stages(stages)
+    leftovers = _discard_stages(run.stages)
     if leftovers:
         error = StageResidueError(leftovers)
         _annotate_failure(
             error,
-            landed=landed,
+            landed=run.landed,
             leftovers=leftovers,
-            machine_landed=machine_landed,
+            machine_landed=run.machine_landed,
         )
         raise error
-    return TransactionReceipt(tuple(landed), machine_landed=tuple(machine_landed))
+    return TransactionReceipt(
+        tuple(run.landed), machine_landed=tuple(run.machine_landed)
+    )
 
 
 def commit_correction(

@@ -6,7 +6,7 @@ import copy
 import secrets
 import threading
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from voxweave.align_adapter import V2Status
 from voxweave.align_context import IssuedSegmentationContext, consume_context_role
@@ -317,8 +317,23 @@ def _freeze_cue(cue: Cue, unit_range: tuple[int, int]) -> SegmentationDeliveryCu
     )
 
 
-def _build_boundary_delivery(record: _LegacyRecord) -> SegmentationDelivery:
-    from voxweave.core.authority import AuthorityLedger, check_roots
+@dataclass
+class _BoundaryRun:
+    """What the optimizer and the finalizer produced for one legacy record."""
+
+    refined: Any
+    projected_speakers: Any
+    authority: Any
+    ledger: Any
+    stream: Any
+    evidence: Any
+    policy: Any
+    result: Any
+    degraded: list[Any]
+
+
+def _finalize_boundary_document(record: _LegacyRecord) -> _BoundaryRun:
+    from voxweave.core.authority import AuthorityLedger
     from voxweave.core.boundary_v2 import optimize_document
     from voxweave.core.finalizer import (
         FinalizeEvidence,
@@ -328,18 +343,13 @@ def _build_boundary_delivery(record: _LegacyRecord) -> SegmentationDelivery:
         phase1_from_optimizer_selection,
         register_optimizer_selection,
     )
-    from voxweave.core.partition_check import check_partition, owned_unit_ids
-    from voxweave.core.policy_delta import DELTA_REGISTRY
-    from voxweave.core.providers import degradation_capture, provider_snapshot
+    from voxweave.core.providers import degradation_capture
     from voxweave.core.speaker_evidence import (
         W_SPEAKER_INTERIOR,
-        annotate_speaker_ids,
-        named_multi_cues_unannotated,
         project_speaker_evidence,
         speaker_evidence,
     )
     from voxweave.core.subunit import refine_document
-    from voxweave.core.trace_validator import replay_trace, stability_check
 
     document = copy.deepcopy(record.document)
     parent_speakers = speaker_evidence(document)
@@ -385,8 +395,27 @@ def _build_boundary_delivery(record: _LegacyRecord) -> SegmentationDelivery:
             evidence=evidence,
             policy=policy,
         )
-    roots = check_roots(
+    return _BoundaryRun(
+        refined,
+        projected_speakers,
+        authority,
         ledger,
+        stream,
+        evidence,
+        policy,
+        result,
+        degraded,
+    )
+
+
+def _verified_cues(run: _BoundaryRun) -> list[Cue]:
+    """The finalized cues, once the roots, the trace and the stability pass hold."""
+    from voxweave.core.authority import check_roots
+    from voxweave.core.trace_validator import replay_trace, stability_check
+
+    result = run.result
+    roots = check_roots(
+        run.ledger,
         expected={"segmentation-production/v2": "optimizer-selection"},
     )
     if roots:
@@ -401,27 +430,43 @@ def _build_boundary_delivery(record: _LegacyRecord) -> SegmentationDelivery:
     delivered = tuple((float(cue["start"]), float(cue["end"])) for cue in cues)
     trace_errors = replay_trace(
         result.trace,
-        stream.cues,
-        profile=refined.profile,
-        evidence=evidence,
-        policy=policy,
+        run.stream.cues,
+        profile=run.refined.profile,
+        evidence=run.evidence,
+        policy=run.policy,
         delivered=delivered,
     )
     if trace_errors:
         raise _failure("finalizer-trace-failed", "segmentation-adapter", "trace-replay")
     stability_errors = stability_check(
         delivered,
-        stream.cues,
-        profile=refined.profile,
-        evidence=evidence,
-        policy=policy,
+        run.stream.cues,
+        profile=run.refined.profile,
+        evidence=run.evidence,
+        policy=run.policy,
         terminal=result.trace.terminal,
     )
     if stability_errors:
         raise _failure(
             "finalizer-stability-failed", "segmentation-adapter", "stability-check"
         )
-    partition = authority.partition
+    return cues
+
+
+def _attributed_ranges(
+    run: _BoundaryRun, cues: list[Cue]
+) -> tuple[tuple[int, int], ...]:
+    """The unit range of every cue, after the partition and speaker checks."""
+    from voxweave.core.partition_check import check_partition, owned_unit_ids
+    from voxweave.core.policy_delta import DELTA_REGISTRY
+    from voxweave.core.speaker_evidence import (
+        annotate_speaker_ids,
+        named_multi_cues_unannotated,
+    )
+
+    refined = run.refined
+    result = run.result
+    partition = run.authority.partition
     ranges = owned_unit_ids(partition, len(refined.units))
     if len(ranges) != len(cues):
         raise _failure(
@@ -448,17 +493,28 @@ def _build_boundary_delivery(record: _LegacyRecord) -> SegmentationDelivery:
     delta_ids = {record.id for record in DELTA_REGISTRY}
     if any(delta not in delta_ids for delta in result.report.deltas_fired):
         raise _failure("align-delta-invalid", "segmentation-adapter", "trigger-set")
-    annotate_speaker_ids(cues, ranges, projected_speakers.unit_speakers)
-    if named_multi_cues_unannotated(ranges, projected_speakers.unit_speakers):
+    unit_speakers = run.projected_speakers.unit_speakers
+    annotate_speaker_ids(cues, ranges, unit_speakers)
+    if named_multi_cues_unannotated(ranges, unit_speakers):
         raise _failure(
             "segmentation-v2-invalid",
             "segmentation-adapter",
             "named-multi-unattributed",
         )
+    return ranges
+
+
+def _build_boundary_delivery(record: _LegacyRecord) -> SegmentationDelivery:
+    from voxweave.core.providers import provider_snapshot
+
+    run = _finalize_boundary_document(record)
+    cues = _verified_cues(run)
+    ranges = _attributed_ranges(run, cues)
+    refined = run.refined
     manifest = copy.deepcopy(_manifest_value(record.issued.delivery))
     manifest["engine"] = MANIFEST_ENGINE_BY_FAMILY["boundary-v2"]
     manifest["providers"] = provider_snapshot(refined.language)
-    manifest["degraded"] = copy.deepcopy(degraded)
+    manifest["degraded"] = copy.deepcopy(run.degraded)
     return SegmentationDelivery(
         record.context.context_content_digest,
         "boundary-v2",

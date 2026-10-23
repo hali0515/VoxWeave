@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast
@@ -313,6 +313,338 @@ class EnrollOutcome:
     created: bool = False
 
 
+@dataclass
+class _SpaceEdit:
+    """One transition in flight: private copies of the identity document and of
+    one space, edited in place, plus what has changed so far."""
+
+    state: LibraryState
+    space_name: str
+    space: dict[str, object]
+    identities_document: dict[str, object]
+    event_at: str
+    orphan_identities: set[str]
+    used_exemplars: set[str]
+    history: list[dict[str, object]] = field(default_factory=list)
+    identities_changed: bool = False
+    space_changed: bool = False
+
+    @classmethod
+    def begin(
+        cls,
+        state: LibraryState,
+        space_name: str,
+        space: dict[str, object],
+        event_at: str,
+    ) -> _SpaceEdit:
+        identities_document = copy.deepcopy(state.identities)
+        orphan_identities, orphan_exemplars = state.orphan_ids(space_name)
+        return cls(
+            state=state,
+            space_name=space_name,
+            space=space,
+            identities_document=identities_document,
+            event_at=event_at,
+            orphan_identities=orphan_identities,
+            used_exemplars=_used_exemplar_ids(space) | orphan_exemplars,
+        )
+
+    @property
+    def identities(self) -> dict[str, dict[str, object]]:
+        return cast(
+            dict[str, dict[str, object]], self.identities_document["identities"]
+        )
+
+    @property
+    def exemplars_by_identity(self) -> dict[str, list[dict[str, object]]]:
+        return cast(dict[str, list[dict[str, object]]], self.space["exemplars"])
+
+    def settle(self) -> None:
+        """A changed space may change what the identity document lists."""
+        if self.space_changed and _list_space(
+            self.identities_document, self.space_name
+        ):
+            self.identities_changed = True
+
+    def change(self) -> LibraryChange:
+        if self.identities_changed:
+            self.identities_document["revision"] = (
+                cast(int, self.identities_document["revision"]) + 1
+            )
+        if self.space_changed:
+            self.space["revision"] = cast(int, self.space["revision"]) + 1
+        return LibraryChange(
+            identities=self.identities_document if self.identities_changed else None,
+            spaces={self.space_name: self.space} if self.space_changed else {},
+            history=tuple(self.history),
+        )
+
+    def evict(
+        self, identity_id: str, current: list[dict[str, object]], index: int
+    ) -> str:
+        """Drop the oldest exemplar of ``current`` and log it; return its id."""
+        oldest = current.pop(index)
+        self.history.append(
+            history_row(
+                "evict",
+                self.event_at,
+                identity=identity_id,
+                space=self.space_name,
+                exemplar=cast(str, oldest["id"]),
+                episode=cast(Mapping[str, object], oldest["source"])["episode"],
+            )
+        )
+        return cast(str, oldest["id"])
+
+
+@dataclass(frozen=True)
+class _EnrollTerms:
+    """What every speaker of one enrollment shares, already validated."""
+
+    scope: str
+    episode: str
+    capture: str
+    media_hash: str
+    turns_digest: str | None
+    media_path: str | None
+    replace_episode: bool
+    identity_id_factory: Callable[[], str]
+    exemplar_id_factory: Callable[[], str]
+
+
+def _enroll_terms(
+    scope: str,
+    source: EpisodeSource,
+    replace_episode: bool,
+    identity_id_factory: Callable[[], str],
+    exemplar_id_factory: Callable[[], str],
+) -> _EnrollTerms:
+    scope = normalize_scope(scope)
+    episode = normalize_episode(source.episode)
+    capture = require_capture_id(source.capture_id)
+    media_hash = require_sha256(source.media_fingerprint, "media_fingerprint")
+    turns_digest = (
+        None
+        if source.turns_digest is None
+        else require_sha256(source.turns_digest, "turns_digest")
+    )
+    media_path = (
+        None
+        if source.media_path is None
+        else require_string(
+            source.media_path, "media_path", max_bytes=MAX_MEDIA_PATH_BYTES
+        )
+    )
+    return _EnrollTerms(
+        scope=scope,
+        episode=episode,
+        capture=capture,
+        media_hash=media_hash,
+        turns_digest=turns_digest,
+        media_path=media_path,
+        replace_episode=replace_episode,
+        identity_id_factory=identity_id_factory,
+        exemplar_id_factory=exemplar_id_factory,
+    )
+
+
+def _entry_identity_id(
+    edit: _SpaceEdit, terms: _EnrollTerms, entry: EnrollEntry
+) -> str:
+    if entry.identity_id is None:
+        return mint_unique_id(
+            terms.identity_id_factory,
+            set(edit.identities) | edit.orphan_identities,
+            require_identity_id,
+            "identity",
+        )
+    identity_id = require_identity_id(entry.identity_id)
+    if identity_id in edit.state.forgotten:
+        raise EnrollmentRefusal(
+            f"identity {identity_id} was forgotten (`voxweave voices "
+            "forget`) and cannot be enrolled again"
+        )
+    return identity_id
+
+
+def _file_identity(
+    edit: _SpaceEdit, terms: _EnrollTerms, identity_id: str, name: str
+) -> bool:
+    """Create the identity or add the scope to it; return whether it was created."""
+    created = identity_id not in edit.identities
+    if created:
+        edit.identities[identity_id] = {
+            "display_name": name,
+            "aliases": [],
+            "scopes": [terms.scope],
+            "created": edit.event_at,
+            "updated": edit.event_at,
+        }
+        edit.history.append(
+            history_row(
+                "create", edit.event_at, identity=identity_id, scope=terms.scope
+            )
+        )
+        edit.identities_changed = True
+    elif _add_scopes(
+        edit.state,
+        identity_id,
+        edit.identities[identity_id],
+        [terms.scope],
+        space_name=edit.space_name,
+        space_exemplars=edit.exemplars_by_identity,
+        event_at=edit.event_at,
+    ):
+        edit.identities_changed = True
+    return created
+
+
+def _rescope_exemplar(
+    edit: _SpaceEdit,
+    terms: _EnrollTerms,
+    identity_id: str,
+    entry: EnrollEntry,
+    current: list[dict[str, object]],
+    plan: LibraryPlan,
+) -> EnrollOutcome:
+    # The same voice sample, now filed under the new scope; it keeps
+    # its id, vector and age.
+    assert plan.target is not None
+    moved = copy.deepcopy(current[plan.target])
+    old_scope = moved["scope"]
+    moved["scope"] = terms.scope
+    moved_source = cast(dict[str, object], moved["source"])
+    if terms.media_path is not None:
+        moved_source["media_path"] = terms.media_path
+    moved_source["speaker_label"] = entry.speaker_label
+    current[plan.target] = moved
+    edit.exemplars_by_identity[identity_id] = current
+    edit.space_changed = True
+    edit.history.append(
+        history_row(
+            "rescope",
+            edit.event_at,
+            identity=identity_id,
+            space=edit.space_name,
+            exemplar=moved["id"],
+            old_scope=old_scope,
+            scope=terms.scope,
+            episode=terms.episode,
+        )
+    )
+    return EnrollOutcome(identity_id, "rescope", cast(str, moved["id"]))
+
+
+def _place_exemplar(
+    edit: _SpaceEdit,
+    terms: _EnrollTerms,
+    identity_id: str,
+    entry: EnrollEntry,
+    vector: list[int | float],
+    current: list[dict[str, object]],
+    plan: LibraryPlan,
+    created: bool,
+) -> EnrollOutcome:
+    """File a new voice sample: it replaces one of the same episode or is added
+    (the oldest displaced at the cap)."""
+    exemplar_id = mint_unique_id(
+        terms.exemplar_id_factory,
+        edit.used_exemplars,
+        require_exemplar_id,
+        "exemplar",
+    )
+    edit.used_exemplars.add(exemplar_id)
+    exemplar: dict[str, object] = {
+        "id": exemplar_id,
+        "vector": vector,
+        "scope": terms.scope,
+        "source": {
+            "media_path": terms.media_path,
+            "media_fingerprint": terms.media_hash,
+            "capture_id": terms.capture,
+            "turns_digest": terms.turns_digest,
+            "speaker_label": entry.speaker_label,
+            "episode": terms.episode,
+        },
+        "added": edit.event_at,
+    }
+    evicted: str | None = None
+    if plan.outcome == "replace":
+        assert plan.target is not None
+        old_id = cast(str, current[plan.target]["id"])
+        current[plan.target] = exemplar
+        edit.history.append(
+            history_row(
+                "replace",
+                edit.event_at,
+                identity=identity_id,
+                space=edit.space_name,
+                old_exemplar=old_id,
+                new_exemplar=exemplar_id,
+                scope=terms.scope,
+                episode=terms.episode,
+            )
+        )
+    else:
+        if plan.evict is not None:
+            evicted = edit.evict(identity_id, current, plan.evict)
+        current.append(exemplar)
+        edit.history.append(
+            history_row(
+                "enroll",
+                edit.event_at,
+                identity=identity_id,
+                space=edit.space_name,
+                exemplar=exemplar_id,
+                scope=terms.scope,
+                episode=terms.episode,
+            )
+        )
+    edit.exemplars_by_identity[identity_id] = current
+    edit.space_changed = True
+    return EnrollOutcome(
+        identity_id, plan.outcome, exemplar_id, evicted, created=created
+    )
+
+
+def _enroll_speaker(
+    edit: _SpaceEdit,
+    terms: _EnrollTerms,
+    dim: int,
+    entry: EnrollEntry,
+    targets: set[str],
+) -> EnrollOutcome:
+    name = require_string(entry.raw_name, "speaker name", max_bytes=MAX_NAME_BYTES)
+    normalize_speaker_key(name)
+    vector = list(validate_vector(entry.vector, dim=dim, field="incoming vector"))
+    identity_id = _entry_identity_id(edit, terms, entry)
+    if identity_id in targets:
+        raise EnrollmentRefusal(
+            f"two speakers of one episode resolve to identity {identity_id}"
+        )
+    targets.add(identity_id)
+    current = list(edit.exemplars_by_identity.get(identity_id, []))
+    plan = plan_library_enrollment(
+        current,
+        capture_id=terms.capture,
+        media_fingerprint=terms.media_hash,
+        scope=terms.scope,
+        episode=terms.episode,
+        vector=vector,
+        turns_digest=terms.turns_digest,
+        replace_episode=terms.replace_episode,
+    )
+    if plan.outcome == "noop":
+        assert plan.target is not None
+        return EnrollOutcome(identity_id, "noop", cast(str, current[plan.target]["id"]))
+    created = _file_identity(edit, terms, identity_id, name)
+    if plan.outcome == "rescope":
+        return _rescope_exemplar(edit, terms, identity_id, entry, current, plan)
+    return _place_exemplar(
+        edit, terms, identity_id, entry, vector, current, plan, created
+    )
+
+
 def enroll_entries(
     state: LibraryState,
     *,
@@ -336,214 +668,18 @@ def enroll_entries(
     if type(replace_episode) is not bool:
         raise EnrollmentRefusal("replace_episode must be a boolean")
     event_at = event_time(at, "event timestamp")
-    scope = normalize_scope(scope)
-    episode = normalize_episode(source.episode)
-    capture = require_capture_id(source.capture_id)
-    media_hash = require_sha256(source.media_fingerprint, "media_fingerprint")
-    turns_digest = (
-        None
-        if source.turns_digest is None
-        else require_sha256(source.turns_digest, "turns_digest")
-    )
-    media_path = (
-        None
-        if source.media_path is None
-        else require_string(
-            source.media_path, "media_path", max_bytes=MAX_MEDIA_PATH_BYTES
-        )
+    terms = _enroll_terms(
+        scope, source, replace_episode, identity_id_factory, exemplar_id_factory
     )
     space_name, space = _space_for(state, provenance)
     dim = validate_space(space, name=space_name).embedding_dim
-    identities_document = copy.deepcopy(state.identities)
-    identities = cast(dict[str, dict[str, object]], identities_document["identities"])
-    exemplars_by_identity = cast(dict[str, list[dict[str, object]]], space["exemplars"])
-    orphan_identities, orphan_exemplars = state.orphan_ids(space_name)
-    used_exemplars = _used_exemplar_ids(space) | orphan_exemplars
-    history: list[dict[str, object]] = []
-    outcomes: list[EnrollOutcome] = []
+    edit = _SpaceEdit.begin(state, space_name, space, event_at)
     targets: set[str] = set()
-    identities_changed = False
-    space_changed = False
-
+    outcomes: list[EnrollOutcome] = []
     for entry in entries:
-        name = require_string(entry.raw_name, "speaker name", max_bytes=MAX_NAME_BYTES)
-        normalize_speaker_key(name)
-        vector = list(validate_vector(entry.vector, dim=dim, field="incoming vector"))
-        if entry.identity_id is None:
-            identity_id = mint_unique_id(
-                identity_id_factory,
-                set(identities) | orphan_identities,
-                require_identity_id,
-                "identity",
-            )
-        else:
-            identity_id = require_identity_id(entry.identity_id)
-            if identity_id in state.forgotten:
-                raise EnrollmentRefusal(
-                    f"identity {identity_id} was forgotten (`voxweave voices "
-                    "forget`) and cannot be enrolled again"
-                )
-        if identity_id in targets:
-            raise EnrollmentRefusal(
-                f"two speakers of one episode resolve to identity {identity_id}"
-            )
-        targets.add(identity_id)
-        current = list(exemplars_by_identity.get(identity_id, []))
-        plan = plan_library_enrollment(
-            current,
-            capture_id=capture,
-            media_fingerprint=media_hash,
-            scope=scope,
-            episode=episode,
-            vector=vector,
-            turns_digest=turns_digest,
-            replace_episode=replace_episode,
-        )
-        if plan.outcome == "noop":
-            assert plan.target is not None
-            outcomes.append(
-                EnrollOutcome(
-                    identity_id, "noop", cast(str, current[plan.target]["id"])
-                )
-            )
-            continue
-
-        created = identity_id not in identities
-        if created:
-            identities[identity_id] = {
-                "display_name": name,
-                "aliases": [],
-                "scopes": [scope],
-                "created": event_at,
-                "updated": event_at,
-            }
-            history.append(
-                history_row("create", event_at, identity=identity_id, scope=scope)
-            )
-            identities_changed = True
-        elif _add_scopes(
-            state,
-            identity_id,
-            identities[identity_id],
-            [scope],
-            space_name=space_name,
-            space_exemplars=exemplars_by_identity,
-            event_at=event_at,
-        ):
-            identities_changed = True
-
-        if plan.outcome == "rescope":
-            # The same voice sample, now filed under the new scope; it keeps
-            # its id, vector and age.
-            assert plan.target is not None
-            moved = copy.deepcopy(current[plan.target])
-            old_scope = moved["scope"]
-            moved["scope"] = scope
-            moved_source = cast(dict[str, object], moved["source"])
-            if media_path is not None:
-                moved_source["media_path"] = media_path
-            moved_source["speaker_label"] = entry.speaker_label
-            current[plan.target] = moved
-            exemplars_by_identity[identity_id] = current
-            space_changed = True
-            history.append(
-                history_row(
-                    "rescope",
-                    event_at,
-                    identity=identity_id,
-                    space=space_name,
-                    exemplar=moved["id"],
-                    old_scope=old_scope,
-                    scope=scope,
-                    episode=episode,
-                )
-            )
-            outcomes.append(
-                EnrollOutcome(identity_id, "rescope", cast(str, moved["id"]))
-            )
-            continue
-
-        exemplar_id = mint_unique_id(
-            exemplar_id_factory, used_exemplars, require_exemplar_id, "exemplar"
-        )
-        used_exemplars.add(exemplar_id)
-        exemplar: dict[str, object] = {
-            "id": exemplar_id,
-            "vector": vector,
-            "scope": scope,
-            "source": {
-                "media_path": media_path,
-                "media_fingerprint": media_hash,
-                "capture_id": capture,
-                "turns_digest": turns_digest,
-                "speaker_label": entry.speaker_label,
-                "episode": episode,
-            },
-            "added": event_at,
-        }
-        evicted: str | None = None
-        if plan.outcome == "replace":
-            assert plan.target is not None
-            old_id = cast(str, current[plan.target]["id"])
-            current[plan.target] = exemplar
-            history.append(
-                history_row(
-                    "replace",
-                    event_at,
-                    identity=identity_id,
-                    space=space_name,
-                    old_exemplar=old_id,
-                    new_exemplar=exemplar_id,
-                    scope=scope,
-                    episode=episode,
-                )
-            )
-        else:
-            if plan.evict is not None:
-                oldest = current.pop(plan.evict)
-                evicted = cast(str, oldest["id"])
-                history.append(
-                    history_row(
-                        "evict",
-                        event_at,
-                        identity=identity_id,
-                        space=space_name,
-                        exemplar=evicted,
-                        episode=cast(Mapping[str, object], oldest["source"])["episode"],
-                    )
-                )
-            current.append(exemplar)
-            history.append(
-                history_row(
-                    "enroll",
-                    event_at,
-                    identity=identity_id,
-                    space=space_name,
-                    exemplar=exemplar_id,
-                    scope=scope,
-                    episode=episode,
-                )
-            )
-        exemplars_by_identity[identity_id] = current
-        space_changed = True
-        outcomes.append(
-            EnrollOutcome(
-                identity_id, plan.outcome, exemplar_id, evicted, created=created
-            )
-        )
-
-    if space_changed and _list_space(identities_document, space_name):
-        identities_changed = True
-    if identities_changed:
-        identities_document["revision"] = cast(int, identities_document["revision"]) + 1
-    if space_changed:
-        space["revision"] = cast(int, space["revision"]) + 1
-    change = LibraryChange(
-        identities=identities_document if identities_changed else None,
-        spaces={space_name: space} if space_changed else {},
-        history=tuple(history),
-    )
-    return change, tuple(outcomes)
+        outcomes.append(_enroll_speaker(edit, terms, dim, entry, targets))
+    edit.settle()
+    return edit.change(), tuple(outcomes)
 
 
 def _identity_or_raise(state: LibraryState, identity_id: str) -> dict[str, object]:
@@ -681,6 +817,159 @@ def default_import_scopes(store_path: Path, show: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys([episode_scope(Path(store_path)), show_scope]))
 
 
+@dataclass(frozen=True)
+class _ImportTerms:
+    """What every identity of one import shares, already validated."""
+
+    scope: str
+    import_scopes: list[str]
+    exemplar_id_factory: Callable[[], str]
+
+
+@dataclass
+class _ImportTally:
+    """What an import did so far; it ends up in the :class:`ImportSummary`."""
+
+    created: int = 0
+    added: int = 0
+    present: int = 0
+    superseded: int = 0
+    scopes_added: int = 0
+    refused: list[str] = field(default_factory=list)
+
+
+def _import_exemplar(
+    edit: _SpaceEdit,
+    terms: _ImportTerms,
+    tally: _ImportTally,
+    identity_id: str,
+    current: list[dict[str, object]],
+    legacy_exemplar: Mapping[str, object],
+) -> bool:
+    """Merge one legacy voice sample into ``current``; return whether it was added."""
+    episode = normalize_episode(legacy_exemplar["episode"])
+    vector = cast(list[int | float], legacy_exemplar["vector"])
+    keys = _exemplar_keys(current)
+    if any(
+        key.capture_id == legacy_exemplar["capture_id"]
+        and list(key.vector) == list(vector)
+        and key.media_fingerprint == legacy_exemplar["media_fingerprint"]
+        for key in keys
+    ):
+        # Imported before, possibly under another --scope.
+        tally.present += 1
+        return False
+    if _older_than_retained(
+        keys,
+        cast(str, legacy_exemplar["added"]),
+        cast(str, legacy_exemplar["id"]),
+    ):
+        tally.superseded += 1
+        return False
+    try:
+        # replace_episode only tells a replacement apart: an import
+        # never replaces a library sample, it reports the conflict.
+        plan = plan_indexed_enrollment(
+            keys,
+            capture_id=cast(str, legacy_exemplar["capture_id"]),
+            media_fingerprint=cast(str, legacy_exemplar["media_fingerprint"]),
+            episode=scoped_episode(terms.scope, episode),
+            vector=vector,
+            replace_episode=True,
+        )
+    except EnrollmentRefusal as exc:
+        tally.refused.append(f"{identity_id}/{legacy_exemplar['id']}: {exc}")
+        return False
+    if plan.outcome == "noop":
+        tally.present += 1
+        return False
+    if plan.outcome == "replace":
+        tally.refused.append(
+            f"{identity_id}/{legacy_exemplar['id']}: conflicts with a voice "
+            f"sample already in the library (episode {episode!r}, scope "
+            f"{terms.scope!r}); not imported"
+        )
+        return False
+    legacy_id = cast(str, legacy_exemplar["id"])
+    exemplar_id = (
+        legacy_id
+        if legacy_id not in edit.used_exemplars
+        else mint_unique_id(
+            terms.exemplar_id_factory,
+            edit.used_exemplars,
+            require_exemplar_id,
+            "exemplar",
+        )
+    )
+    edit.used_exemplars.add(exemplar_id)
+    if plan.evict is not None:
+        edit.evict(identity_id, current, plan.evict)
+    current.append(
+        {
+            "id": exemplar_id,
+            "vector": list(vector),
+            "scope": terms.scope,
+            "source": {
+                "media_path": None,
+                "media_fingerprint": legacy_exemplar["media_fingerprint"],
+                "capture_id": legacy_exemplar["capture_id"],
+                "turns_digest": None,
+                "speaker_label": None,
+                "episode": episode,
+            },
+            "added": legacy_exemplar["added"],
+        }
+    )
+    return True
+
+
+def _import_identity(
+    edit: _SpaceEdit,
+    terms: _ImportTerms,
+    tally: _ImportTally,
+    identity_id: str,
+    legacy: Mapping[str, object],
+) -> None:
+    current = list(edit.exemplars_by_identity.get(identity_id, []))
+    added_here = 0
+    legacy_exemplars = sorted(
+        cast(list[Mapping[str, object]], legacy["exemplars"]),
+        key=lambda item: (cast(str, item["added"]), cast(str, item["id"])),
+        reverse=True,
+    )
+    for legacy_exemplar in legacy_exemplars:
+        if _import_exemplar(edit, terms, tally, identity_id, current, legacy_exemplar):
+            added_here += 1
+
+    if added_here:
+        edit.exemplars_by_identity[identity_id] = current
+        tally.added += added_here
+        edit.space_changed = True
+    if identity_id not in edit.identities:
+        edit.identities[identity_id] = {
+            "display_name": legacy["display_name"],
+            "aliases": list(cast(list[str], legacy["aliases"])),
+            "scopes": list(terms.import_scopes),
+            "created": edit.event_at,
+            "updated": edit.event_at,
+        }
+        tally.created += 1
+        edit.identities_changed = True
+    else:
+        added_scopes = _add_scopes(
+            edit.state,
+            identity_id,
+            edit.identities[identity_id],
+            terms.import_scopes,
+            space_name=edit.space_name,
+            space_exemplars=edit.exemplars_by_identity,
+            event_at=edit.event_at,
+        )
+        if added_scopes:
+            edit.identities_changed = True
+            tally.scopes_added += added_scopes
+
+
 def import_store(
     state: LibraryState,
     store: Mapping[str, object],
@@ -710,179 +999,47 @@ def import_store(
     import_scopes = list(
         dict.fromkeys([scope, *(normalize_scope(extra) for extra in also_scopes)])
     )
-    scopes_added = 0
     event_at = event_time(at, "event timestamp")
     provenance = cast(Mapping[str, object], store["provenance"])
     space_name, space = _space_for(state, provenance)
-    identities_document = copy.deepcopy(state.identities)
-    identities = cast(dict[str, dict[str, object]], identities_document["identities"])
-    exemplars_by_identity = cast(dict[str, list[dict[str, object]]], space["exemplars"])
-    used_exemplars = _used_exemplar_ids(space) | state.orphan_ids(space_name)[1]
-    history: list[dict[str, object]] = []
-    refused: list[str] = []
-    created_count = added_count = present_count = superseded_count = 0
-    identities_changed = space_changed = False
+    edit = _SpaceEdit.begin(state, space_name, space, event_at)
+    terms = _ImportTerms(scope, import_scopes, exemplar_id_factory)
+    tally = _ImportTally()
     tombstones = state.forgotten
     skipped_forgotten = sorted(set(validated.identities) & tombstones)
 
     for identity_id in sorted(set(validated.identities) - tombstones):
         legacy = cast(Mapping[str, object], validated.identities[identity_id])
-        current = list(exemplars_by_identity.get(identity_id, []))
-        added_here = 0
-        legacy_exemplars = sorted(
-            cast(list[Mapping[str, object]], legacy["exemplars"]),
-            key=lambda item: (cast(str, item["added"]), cast(str, item["id"])),
-            reverse=True,
-        )
-        for legacy_exemplar in legacy_exemplars:
-            episode = normalize_episode(legacy_exemplar["episode"])
-            vector = cast(list[int | float], legacy_exemplar["vector"])
-            keys = _exemplar_keys(current)
-            if any(
-                key.capture_id == legacy_exemplar["capture_id"]
-                and list(key.vector) == list(vector)
-                and key.media_fingerprint == legacy_exemplar["media_fingerprint"]
-                for key in keys
-            ):
-                # Imported before, possibly under another --scope.
-                present_count += 1
-                continue
-            if _older_than_retained(
-                keys,
-                cast(str, legacy_exemplar["added"]),
-                cast(str, legacy_exemplar["id"]),
-            ):
-                superseded_count += 1
-                continue
-            try:
-                # replace_episode only tells a replacement apart: an import
-                # never replaces a library sample, it reports the conflict.
-                plan = plan_indexed_enrollment(
-                    keys,
-                    capture_id=cast(str, legacy_exemplar["capture_id"]),
-                    media_fingerprint=cast(str, legacy_exemplar["media_fingerprint"]),
-                    episode=scoped_episode(scope, episode),
-                    vector=vector,
-                    replace_episode=True,
-                )
-            except EnrollmentRefusal as exc:
-                refused.append(f"{identity_id}/{legacy_exemplar['id']}: {exc}")
-                continue
-            if plan.outcome == "noop":
-                present_count += 1
-                continue
-            if plan.outcome == "replace":
-                refused.append(
-                    f"{identity_id}/{legacy_exemplar['id']}: conflicts with a voice "
-                    f"sample already in the library (episode {episode!r}, scope "
-                    f"{scope!r}); not imported"
-                )
-                continue
-            legacy_id = cast(str, legacy_exemplar["id"])
-            exemplar_id = (
-                legacy_id
-                if legacy_id not in used_exemplars
-                else mint_unique_id(
-                    exemplar_id_factory, used_exemplars, require_exemplar_id, "exemplar"
-                )
-            )
-            used_exemplars.add(exemplar_id)
-            if plan.evict is not None:
-                oldest = current.pop(plan.evict)
-                history.append(
-                    history_row(
-                        "evict",
-                        event_at,
-                        identity=identity_id,
-                        space=space_name,
-                        exemplar=cast(str, oldest["id"]),
-                        episode=cast(Mapping[str, object], oldest["source"])["episode"],
-                    )
-                )
-            current.append(
-                {
-                    "id": exemplar_id,
-                    "vector": list(vector),
-                    "scope": scope,
-                    "source": {
-                        "media_path": None,
-                        "media_fingerprint": legacy_exemplar["media_fingerprint"],
-                        "capture_id": legacy_exemplar["capture_id"],
-                        "turns_digest": None,
-                        "speaker_label": None,
-                        "episode": episode,
-                    },
-                    "added": legacy_exemplar["added"],
-                }
-            )
-            added_here += 1
-
-        if added_here:
-            exemplars_by_identity[identity_id] = current
-            added_count += added_here
-            space_changed = True
-        if identity_id not in identities:
-            identities[identity_id] = {
-                "display_name": legacy["display_name"],
-                "aliases": list(cast(list[str], legacy["aliases"])),
-                "scopes": list(import_scopes),
-                "created": event_at,
-                "updated": event_at,
-            }
-            created_count += 1
-            identities_changed = True
-        else:
-            added_scopes = _add_scopes(
-                state,
-                identity_id,
-                identities[identity_id],
-                import_scopes,
-                space_name=space_name,
-                space_exemplars=exemplars_by_identity,
-                event_at=event_at,
-            )
-            if added_scopes:
-                identities_changed = True
-                scopes_added += added_scopes
+        _import_identity(edit, terms, tally, identity_id, legacy)
 
     summary = ImportSummary(
         space=space_name,
         scope=scope,
-        identities_created=created_count,
-        exemplars_added=added_count,
-        exemplars_present=present_count,
-        refused=tuple(refused),
-        exemplars_superseded=superseded_count,
+        identities_created=tally.created,
+        exemplars_added=tally.added,
+        exemplars_present=tally.present,
+        refused=tuple(tally.refused),
+        exemplars_superseded=tally.superseded,
         forgotten=tuple(skipped_forgotten),
         scopes=tuple(import_scopes),
-        scopes_added=scopes_added,
+        scopes_added=tally.scopes_added,
     )
-    if space_changed and _list_space(identities_document, space_name):
-        identities_changed = True
-    if not (identities_changed or space_changed):
+    edit.settle()
+    if not (edit.identities_changed or edit.space_changed):
         return LibraryChange(), summary
-    if identities_changed:
-        identities_document["revision"] = cast(int, identities_document["revision"]) + 1
-    if space_changed:
-        space["revision"] = cast(int, space["revision"]) + 1
-    history.append(
+    edit.history.append(
         history_row(
             "import",
             event_at,
             source=source_label,
             scopes=list(import_scopes),
             space=space_name,
-            identities_created=created_count,
-            exemplars_added=added_count,
-            scopes_added=scopes_added,
+            identities_created=tally.created,
+            exemplars_added=tally.added,
+            scopes_added=tally.scopes_added,
         )
     )
-    change = LibraryChange(
-        identities=identities_document if identities_changed else None,
-        spaces={space_name: space} if space_changed else {},
-        history=tuple(history),
-    )
-    return change, summary
+    return edit.change(), summary
 
 
 # --------------------------------------------------------------------------

@@ -7,7 +7,9 @@ import re
 import threading
 from collections.abc import Callable
 import queue
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from voxweave import config, fsio
 from voxweave.core.overlay import wrap_lyric
@@ -614,6 +616,134 @@ def _collapse_units(payload: list[dict], unit_trans: dict[int, str]) -> dict[int
     return out
 
 
+@dataclass
+class _TranslateRun:
+    """One :func:`translate_cues` call in flight: the request settings, the planned
+    windows and what has been translated so far."""
+
+    client: Any
+    model: str
+    to: str
+    context: str | None
+    glossary: dict[str, str] | str | None
+    reasoning_effort: str | None
+    units: list[dict]
+    windows: list[list[dict]]
+    on_entry: Callable[[int], None] | None
+    result: dict[int, str]
+    progress_path: Path | None
+    progress_sig: str | None
+    context_tail: int
+    tail: list[tuple[str, str]]
+
+    def covered(self, win: list[dict]) -> bool:
+        return all(self.result.get(c["i"], "").strip() for c in win)
+
+    def request(
+        self,
+        position: int,
+        win: list[dict],
+        msgs: list[dict],
+        entry: Callable[[int], None] | None,
+    ) -> dict:
+        return _request_window(
+            self.client,
+            self.model,
+            msgs,
+            win_ids=[c["i"] for c in win],
+            label=_window_label(position, win),
+            on_entry=entry,
+            reasoning_effort=self.reasoning_effort,
+        )
+
+    def save(self) -> None:
+        if self.progress_path is not None:
+            save_progress(self.progress_path, self.progress_sig, self.result)
+
+
+def _translate_sequentially(run: _TranslateRun) -> dict[int, str]:
+    for position, win in enumerate(run.windows):
+        if run.covered(win):
+            if run.on_entry is not None:
+                run.on_entry(len(win))  # resumed from progress: count it as done
+        else:
+            msgs = build_messages(
+                win,
+                to=run.to,
+                context=run.context,
+                glossary=run.glossary,
+                tail=run.tail,
+            )
+            run.result.update(run.request(position, win, msgs, run.on_entry))
+            run.save()
+        recent = (
+            win[-run.context_tail :] if run.context_tail > 0 else []
+        )  # win[-0:] is all
+        run.tail = [(c["t"], run.result.get(c["i"], "")) for c in recent]
+    return run.result
+
+
+def _translate_concurrently(run: _TranslateRun, concurrency: int) -> dict[int, str]:
+    # One lock serialises result merging, progress saves and reporter advances
+    # (rich's Progress is thread-safe, arbitrary Reporter subclasses need not be).
+    lock = threading.Lock()
+    entry: Callable[[int], None] | None = None
+    if run.on_entry is not None:
+        advance = run.on_entry
+
+        def guarded_entry(n: int) -> None:
+            with lock:
+                advance(n)
+
+        entry = guarded_entry
+    starts: list[int] = []
+    offset = 0
+    for win in run.windows:
+        starts.append(offset)
+        offset += len(win)
+    pending: list[int] = []
+    for position, win in enumerate(run.windows):
+        if run.covered(win):
+            if run.on_entry is not None:
+                run.on_entry(len(win))
+        else:
+            pending.append(position)
+    if not pending:
+        return run.result
+
+    def translate_window(position: int) -> None:
+        win = run.windows[position]
+        start = starts[position]
+        if start == 0:
+            msgs = build_messages(
+                win,
+                to=run.to,
+                context=run.context,
+                glossary=run.glossary,
+                tail=run.tail,
+            )
+        else:
+            msgs = build_messages(
+                win,
+                to=run.to,
+                context=run.context,
+                glossary=run.glossary,
+                source_tail=[
+                    u["t"] for u in run.units[max(0, start - run.context_tail) : start]
+                ],
+            )
+        parsed = run.request(position, win, msgs, entry)
+        with lock:
+            run.result.update(parsed)
+            run.save()
+
+    _run_windows_concurrently(
+        translate_window, pending, workers=min(concurrency, len(pending))
+    )
+    run.result = dict(sorted(run.result.items()))
+    return run.result
+
+
 def translate_cues(
     payload: list[dict],
     *,
@@ -701,92 +831,25 @@ def translate_cues(
     result: dict[int, str] = {}
     if progress_path is not None:
         result.update(load_progress(progress_path, progress_sig))
-    tail = list(tail) if tail else []
-
-    def covered(win: list[dict]) -> bool:
-        return all(result.get(c["i"], "").strip() for c in win)
-
-    def request(position: int, win: list[dict], msgs: list[dict], entry) -> dict:
-        return _request_window(
-            client,
-            model,
-            msgs,
-            win_ids=[c["i"] for c in win],
-            label=_window_label(position, win),
-            on_entry=entry,
-            reasoning_effort=reasoning_effort,
-        )
-
+    run = _TranslateRun(
+        client=client,
+        model=model,
+        to=to,
+        context=context,
+        glossary=glossary,
+        reasoning_effort=reasoning_effort,
+        units=units,
+        windows=windows,
+        on_entry=on_entry,
+        result=result,
+        progress_path=progress_path,
+        progress_sig=progress_sig,
+        context_tail=context_tail,
+        tail=list(tail) if tail else [],
+    )
     if concurrency == 1 or len(windows) == 1:
-        for position, win in enumerate(windows):
-            if covered(win):
-                if on_entry is not None:
-                    on_entry(len(win))  # resumed from progress: count it as done
-            else:
-                msgs = build_messages(
-                    win, to=to, context=context, glossary=glossary, tail=tail
-                )
-                result.update(request(position, win, msgs, on_entry))
-                if progress_path is not None:
-                    save_progress(progress_path, progress_sig, result)
-            recent = win[-context_tail:] if context_tail > 0 else []  # win[-0:] is all
-            tail = [(c["t"], result.get(c["i"], "")) for c in recent]
-        return _collapse_units(payload, result)
-
-    # Concurrent lane: one lock serialises result merging, progress saves and
-    # reporter advances (rich's Progress is thread-safe, arbitrary Reporter
-    # subclasses need not be).
-    lock = threading.Lock()
-    entry: Callable[[int], None] | None = None
-    if on_entry is not None:
-        advance = on_entry
-
-        def guarded_entry(n: int) -> None:
-            with lock:
-                advance(n)
-
-        entry = guarded_entry
-    starts: list[int] = []
-    offset = 0
-    for win in windows:
-        starts.append(offset)
-        offset += len(win)
-    pending: list[int] = []
-    for position, win in enumerate(windows):
-        if covered(win):
-            if on_entry is not None:
-                on_entry(len(win))
-        else:
-            pending.append(position)
-    if not pending:
-        return _collapse_units(payload, result)
-
-    def run(position: int) -> None:
-        win = windows[position]
-        start = starts[position]
-        if start == 0:
-            msgs = build_messages(
-                win, to=to, context=context, glossary=glossary, tail=tail
-            )
-        else:
-            msgs = build_messages(
-                win,
-                to=to,
-                context=context,
-                glossary=glossary,
-                source_tail=[
-                    u["t"] for u in units[max(0, start - context_tail) : start]
-                ],
-            )
-        parsed = request(position, win, msgs, entry)
-        with lock:
-            result.update(parsed)
-            if progress_path is not None:
-                save_progress(progress_path, progress_sig, result)
-
-    _run_windows_concurrently(run, pending, workers=min(concurrency, len(pending)))
-    result = dict(sorted(result.items()))
-    return _collapse_units(payload, result)
+        return _collapse_units(payload, _translate_sequentially(run))
+    return _collapse_units(payload, _translate_concurrently(run, concurrency))
 
 
 def _run_windows_concurrently(

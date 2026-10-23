@@ -329,6 +329,245 @@ def _forged_min_gap(tag: ReportTag) -> str | None:
     return None
 
 
+class _PartitionAudit:
+    """The context of one :func:`check_partition` pass and the violations it found."""
+
+    def __init__(
+        self,
+        *,
+        units: Sequence[SourceUnit],
+        profile: DisplayProfile,
+        origin: Origin,
+        stage: Stage,
+        waivers: Mapping[int, Waiver] | None,
+        origins: Mapping[int, Origin] | None,
+        reports: Sequence[ReportTag],
+    ) -> None:
+        self.supplied: dict[int, Waiver] = dict(waivers or {})
+        self.by_cue: dict[int, Origin] = dict(origins or {})
+        self.units = units
+        self.unit_count = len(units)
+        self.profile = profile
+        self.lang = profile.language
+        self.cap = profile.max_cue_s
+        self.origin: Origin = origin
+        self.stage: Stage = stage
+        self.reports = reports
+        self.finalizing = stage == "finalizer"
+        self.min_gap_reported = {
+            tag.cue_index
+            for tag in reports
+            if tag.kind == "min-gap-unmet" and tag.cue_index is not None
+        }
+        self.violations: list[Violation] = []
+
+    def report(
+        self,
+        kind: str,
+        cue_index: int | None,
+        unit_ids: tuple[int, ...],
+        detail: str,
+        waived_by: Waiver | None = None,
+    ) -> None:
+        self.violations.append(
+            Violation(
+                kind=kind,
+                origin=(
+                    self.origin
+                    if cue_index is None
+                    else self.by_cue.get(cue_index, self.origin)
+                ),
+                stage=self.stage,
+                cue_index=cue_index,
+                unit_ids=unit_ids,
+                detail=detail,
+                waived_by=waived_by,
+            )
+        )
+
+    def check_tiling(self, cut_list: list[int], cue_count: int) -> None:
+        well_formed = (
+            all(isinstance(c, int) and not isinstance(c, bool) for c in cut_list)
+            and all(0 < int(c) < self.unit_count for c in cut_list)
+            and all(int(a) < int(b) for a, b in zip(cut_list, cut_list[1:]))
+            and cue_count == len(cut_list) + 1
+        )
+        if not well_formed:
+            self.report(
+                "unit-conservation",
+                None,
+                (),
+                f"partition {cut_list!r} does not tile {self.unit_count} units into "
+                f"{cue_count} cues",
+            )
+
+    def check_cue(
+        self,
+        index: int,
+        cues: Sequence[Cue],
+        bounds: tuple[tuple[int, int], ...],
+        budget: int,
+    ) -> None:
+        cue = cues[index]
+        raw_range = (
+            bounds[index] if index < len(bounds) else (self.unit_count, self.unit_count)
+        )
+        lo, hi = _clamp_range(raw_range[0], raw_range[1], self.unit_count)
+        unit_ids = tuple(range(lo, hi))
+        self._check_text(index, cue, unit_ids)
+        start = cue.get("start")
+        end = cue.get("end")
+        timed = _is_real(start) and _is_real(end)
+        if not timed:
+            self.report(
+                "non-finite-time",
+                index,
+                unit_ids,
+                f"start={start!r} end={end!r} is not a finite pair",
+            )
+        else:
+            self._check_times(index, cues, start, end, unit_ids)
+        self._check_lines(index, cue, unit_ids, budget)
+        if self.cap > 0 and timed and end - start > self.cap + EPS:
+            candidate = self.supplied.get(index)
+            self.report(
+                "duration-cap",
+                index,
+                unit_ids,
+                f"span {end - start} exceeds the cap {self.cap}",
+                waived_by=candidate if _whitelisted(candidate) else None,
+            )
+
+    def _check_text(self, index: int, cue: Cue, unit_ids: tuple[int, ...]) -> None:
+        expected = normalize_text(
+            _join([self.units[i].surface for i in unit_ids], self.lang)
+        )
+        actual = normalize_text(str(cue.get("text", "")))
+        if expected != actual:
+            self.report(
+                "text-conservation",
+                index,
+                unit_ids,
+                f"owned units normalize to {expected!r}, cue text to {actual!r}",
+            )
+
+    def _check_times(
+        self,
+        index: int,
+        cues: Sequence[Cue],
+        start: float,
+        end: float,
+        unit_ids: tuple[int, ...],
+    ) -> None:
+        cue = cues[index]
+        if end < start - EPS:
+            self.report(
+                "reversed-cue", index, unit_ids, f"end {end} precedes start {start}"
+            )
+
+        if index > 0:
+            self._check_against_previous(index, cues[index - 1], start, unit_ids)
+
+        speech_start = cue.get("speech_start")
+        if _is_real(speech_start) and start > speech_start + EPS:
+            self.report(
+                "speech-truncated-start",
+                index,
+                unit_ids,
+                f"display start {start} is later than speech start {speech_start}",
+            )
+        speech_end = cue.get("speech_end")
+        if _is_real(speech_end) and end < speech_end - EPS:
+            self.report(
+                "speech-truncated-end",
+                index,
+                unit_ids,
+                f"display end {end} is earlier than speech end {speech_end}",
+            )
+
+    def _check_against_previous(
+        self, index: int, prev: Cue, start: float, unit_ids: tuple[int, ...]
+    ) -> None:
+        p_start = prev.get("start")
+        p_end = prev.get("end")
+        if not (_is_real(p_start) and _is_real(p_end)):
+            return
+        # Exactly p4-api.md section 1 item 5: monotone *starts*. A
+        # start that sits between the previous cue's start and its
+        # end is an ``overlap`` and nothing else -- reporting it as
+        # both doubled every overlap in the ledger, which would make
+        # any future count-based v1/v2 comparison read 2x for this
+        # one class.
+        if start < p_start - EPS:
+            self.report(
+                "non-monotone-time",
+                index,
+                unit_ids,
+                f"start {start} precedes the previous cue's start {p_start}",
+            )
+        if start < p_end - EPS:
+            self.report(
+                "overlap",
+                index,
+                unit_ids,
+                f"start {start} overlaps the previous cue's end {p_end}",
+            )
+        # PF-2: two-frame separation, the exact complement of the
+        # ladder's own trigger. A sub-floor gap is legal only when
+        # the producer said so about THIS pair -- speech that runs
+        # into the two-frame band is a reported fact, never a silent
+        # one, and an unreported one is a violation.
+        gap = start - p_end
+        if self.finalizing and -EPS <= gap < TWO_FRAME_S - EPS:
+            if index - 1 not in self.min_gap_reported:
+                self.report(
+                    "min-gap",
+                    index,
+                    unit_ids,
+                    f"gap {gap} to the previous cue is below "
+                    f"{TWO_FRAME_S} with no min-gap-unmet report",
+                )
+
+    def _check_lines(
+        self, index: int, cue: Cue, unit_ids: tuple[int, ...], budget: int
+    ) -> None:
+        text = str(cue.get("text", ""))
+        lines = text.split("\n")
+        widths = [_vis_width(line) for line in lines]
+        # PF-1: at the finalizer stage what ships IS the delivered text, so the
+        # question is whether those lines are legal -- not whether some rewrap
+        # could have folded them. ``_wrappable`` answers the second question and
+        # at degenerate profiles admits text that ships over-wide.
+        over_wide = any(w > budget for w in widths)
+        if len(lines) > self.profile.max_lines or (
+            over_wide
+            and (self.finalizing or not _wrappable(text, self.profile, self.lang))
+        ):
+            self.report(
+                "line-capacity",
+                index,
+                unit_ids,
+                f"{len(lines)} lines of widths {widths} exceed "
+                f"{self.profile.max_lines} x {budget}",
+            )
+
+    def check_forged_reports(self, bounds: tuple[tuple[int, int], ...]) -> None:
+        if not self.finalizing:
+            return
+        for tag in self.reports:
+            if tag.kind != "min-gap-unmet":
+                continue
+            detail = _forged_min_gap(tag)
+            if detail is not None:
+                index = tag.cue_index
+                lo, hi = (
+                    _clamp_range(*bounds[index], self.unit_count)
+                    if index is not None and index < len(bounds)
+                    else (self.unit_count, self.unit_count)
+                )
+                self.report("forged-report", index, tuple(range(lo, hi)), detail)
+
+
 def check_partition(
     partition: Sequence[int],
     cues: Sequence[Cue],
@@ -382,196 +621,30 @@ def check_partition(
     comparisons those times would poison, since a NaN compares false against
     everything and would otherwise manufacture a violation on both sides.
     """
-    supplied = dict(waivers or {})
-    by_cue: dict[int, Origin] = dict(origins or {})
-    unit_count = len(units)
-    lang = profile.language
-    violations: list[Violation] = []
-    finalizing = stage == "finalizer"
-    min_gap_reported = {
-        tag.cue_index
-        for tag in reports
-        if tag.kind == "min-gap-unmet" and tag.cue_index is not None
-    }
-
-    def report(
-        kind: str,
-        cue_index: int | None,
-        unit_ids: tuple[int, ...],
-        detail: str,
-        waived_by: Waiver | None = None,
-    ) -> None:
-        violations.append(
-            Violation(
-                kind=kind,
-                origin=origin if cue_index is None else by_cue.get(cue_index, origin),
-                stage=stage,
-                cue_index=cue_index,
-                unit_ids=unit_ids,
-                detail=detail,
-                waived_by=waived_by,
-            )
-        )
-
-    cut_list = list(partition)
-    well_formed = (
-        all(isinstance(c, int) and not isinstance(c, bool) for c in cut_list)
-        and all(0 < int(c) < unit_count for c in cut_list)
-        and all(int(a) < int(b) for a, b in zip(cut_list, cut_list[1:]))
-        and len(cues) == len(cut_list) + 1
+    audit = _PartitionAudit(
+        units=units,
+        profile=profile,
+        origin=origin,
+        stage=stage,
+        waivers=waivers,
+        origins=origins,
+        reports=reports,
     )
-    if not well_formed:
-        report(
-            "unit-conservation",
-            None,
-            (),
-            f"partition {cut_list!r} does not tile {unit_count} units into "
-            f"{len(cues)} cues",
-        )
+    cut_list = list(partition)
+    audit.check_tiling(cut_list, len(cues))
+    bounds = owned_unit_ids(cut_list, audit.unit_count)
+    budget = _line_budget_width(profile.max_line_length, audit.lang)
+    for index in range(len(cues)):
+        audit.check_cue(index, cues, bounds, budget)
+    audit.check_forged_reports(bounds)
 
-    bounds = owned_unit_ids(cut_list, unit_count)
-    budget = _line_budget_width(profile.max_line_length, lang)
-    cap = profile.max_cue_s
-
-    for index, cue in enumerate(cues):
-        raw_range = bounds[index] if index < len(bounds) else (unit_count, unit_count)
-        lo, hi = _clamp_range(raw_range[0], raw_range[1], unit_count)
-        unit_ids = tuple(range(lo, hi))
-
-        expected = normalize_text(_join([units[i].surface for i in unit_ids], lang))
-        actual = normalize_text(str(cue.get("text", "")))
-        if expected != actual:
-            report(
-                "text-conservation",
-                index,
-                unit_ids,
-                f"owned units normalize to {expected!r}, cue text to {actual!r}",
-            )
-
-        start = cue.get("start")
-        end = cue.get("end")
-        timed = _is_real(start) and _is_real(end)
-        if not timed:
-            report(
-                "non-finite-time",
-                index,
-                unit_ids,
-                f"start={start!r} end={end!r} is not a finite pair",
-            )
-        else:
-            if end < start - EPS:
-                report(
-                    "reversed-cue", index, unit_ids, f"end {end} precedes start {start}"
-                )
-
-            if index > 0:
-                prev = cues[index - 1]
-                p_start = prev.get("start")
-                p_end = prev.get("end")
-                if _is_real(p_start) and _is_real(p_end):
-                    # Exactly p4-api.md section 1 item 5: monotone *starts*. A
-                    # start that sits between the previous cue's start and its
-                    # end is an ``overlap`` and nothing else -- reporting it as
-                    # both doubled every overlap in the ledger, which would make
-                    # any future count-based v1/v2 comparison read 2x for this
-                    # one class.
-                    if start < p_start - EPS:
-                        report(
-                            "non-monotone-time",
-                            index,
-                            unit_ids,
-                            f"start {start} precedes the previous cue's "
-                            f"start {p_start}",
-                        )
-                    if start < p_end - EPS:
-                        report(
-                            "overlap",
-                            index,
-                            unit_ids,
-                            f"start {start} overlaps the previous cue's end {p_end}",
-                        )
-                    # PF-2: two-frame separation, the exact complement of the
-                    # ladder's own trigger. A sub-floor gap is legal only when
-                    # the producer said so about THIS pair -- speech that runs
-                    # into the two-frame band is a reported fact, never a silent
-                    # one, and an unreported one is a violation.
-                    gap = start - p_end
-                    if finalizing and -EPS <= gap < TWO_FRAME_S - EPS:
-                        if index - 1 not in min_gap_reported:
-                            report(
-                                "min-gap",
-                                index,
-                                unit_ids,
-                                f"gap {gap} to the previous cue is below "
-                                f"{TWO_FRAME_S} with no min-gap-unmet report",
-                            )
-
-            speech_start = cue.get("speech_start")
-            if _is_real(speech_start) and start > speech_start + EPS:
-                report(
-                    "speech-truncated-start",
-                    index,
-                    unit_ids,
-                    f"display start {start} is later than speech start {speech_start}",
-                )
-            speech_end = cue.get("speech_end")
-            if _is_real(speech_end) and end < speech_end - EPS:
-                report(
-                    "speech-truncated-end",
-                    index,
-                    unit_ids,
-                    f"display end {end} is earlier than speech end {speech_end}",
-                )
-
-        text = str(cue.get("text", ""))
-        lines = text.split("\n")
-        widths = [_vis_width(line) for line in lines]
-        # PF-1: at the finalizer stage what ships IS the delivered text, so the
-        # question is whether those lines are legal -- not whether some rewrap
-        # could have folded them. ``_wrappable`` answers the second question and
-        # at degenerate profiles admits text that ships over-wide.
-        over_wide = any(w > budget for w in widths)
-        if len(lines) > profile.max_lines or (
-            over_wide and (finalizing or not _wrappable(text, profile, lang))
-        ):
-            report(
-                "line-capacity",
-                index,
-                unit_ids,
-                f"{len(lines)} lines of widths {widths} exceed "
-                f"{profile.max_lines} x {budget}",
-            )
-
-        if cap > 0 and timed and end - start > cap + EPS:
-            candidate = supplied.get(index)
-            report(
-                "duration-cap",
-                index,
-                unit_ids,
-                f"span {end - start} exceeds the cap {cap}",
-                waived_by=candidate if _whitelisted(candidate) else None,
-            )
-
-    if finalizing:
-        for tag in reports:
-            if tag.kind != "min-gap-unmet":
-                continue
-            detail = _forged_min_gap(tag)
-            if detail is not None:
-                index = tag.cue_index
-                lo, hi = (
-                    _clamp_range(*bounds[index], unit_count)
-                    if index is not None and index < len(bounds)
-                    else (unit_count, unit_count)
-                )
-                report("forged-report", index, tuple(range(lo, hi)), detail)
-
+    violations = audit.violations
     violations.sort(key=lambda v: (-1 if v.cue_index is None else v.cue_index, v.kind))
     return PartitionCheckResult(
         origin=origin,
         stage=stage,
         violations=tuple(violations),
-        waivers=tuple(supplied[k] for k in sorted(supplied)),
+        waivers=tuple(audit.supplied[k] for k in sorted(audit.supplied)),
         cue_count=len(cues),
-        unit_count=unit_count,
+        unit_count=audit.unit_count,
     )
