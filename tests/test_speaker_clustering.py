@@ -768,7 +768,7 @@ UNIT = {"text": "hello", "start": 0.0, "end": 1.0}
 def _stub_asr(tmp_path: Path, monkeypatch, *, language="English") -> Path:
     wav = tmp_path / "speech.wav"
     sf.write(wav, _signal(6.0, 16000), 16000, subtype="FLOAT")
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_a, **_k: wav)
+    monkeypatch.setattr(transcription, "decode_to_wav", lambda *_a, **_k: wav)
     monkeypatch.setattr(vocals, "decode_to_wav", lambda *_a, **_k: wav)
     monkeypatch.setattr(
         transcription,

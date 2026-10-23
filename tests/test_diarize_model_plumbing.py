@@ -95,7 +95,7 @@ def test_transcribe_forwards_diarize_model_to_diarize_turns(
     media.write_bytes(b"media")
     wav = tmp_path / "speech.wav"
     wav.write_bytes(b"wav")
-    monkeypatch.setattr(pipeline, "decode_to_wav", lambda *_args, **_kwargs: wav)
+    monkeypatch.setattr(transcription, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(vocals, "decode_to_wav", lambda *_args, **_kwargs: wav)
     monkeypatch.setattr(
         transcription,

@@ -3,19 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from voxweave import (
     artifacts,
     backend,
     chunking,
-    config,
     episode_transaction,
     realign,
     songdet,
@@ -30,7 +29,6 @@ from voxweave.chunking import (
 from voxweave.align_failures import CanonicalFailure, SecondaryFailure
 from voxweave.align_runtime import (
     align_runtime_activity,
-    bind_align_runtime_identity,
 )
 from voxweave.core.overlay import (
     LYRIC_MIN_OVERLAP as LYRIC_MIN_OVERLAP,
@@ -94,11 +92,8 @@ from voxweave.songdet import (
 from voxweave.subformats import require_subtitle
 from voxweave.timestamps import shift_units
 from voxweave.transcript_language import (
-    _joined_unit_text as _joined_unit_text,
-    _rebuild_preserves_source as _rebuild_preserves_source,
     _reconcile_word_segment_language as _reconcile_word_segment_language,
     _select_transcript_language as _select_transcript_language,
-    _unit_timings as _unit_timings,
 )
 from voxweave.vocals import (
     ASR_LOUDNORM as ASR_LOUDNORM,
@@ -128,18 +123,11 @@ from voxweave.transcription import (
     SNAP_VAD_THRESHOLD as SNAP_VAD_THRESHOLD,
     SONG_FINE_SILENCE_MS as SONG_FINE_SILENCE_MS,
     plan_song_skip as plan_song_skip,
-    _ChunkPlan as _ChunkPlan,
-    _plan_chunks as _plan_chunks,
-    _union_rescued_spans as _union_rescued_spans,
-    _timing_reference_spans as _timing_reference_spans,
-    _DiarizeSettings as _DiarizeSettings,
-    _diarize_audio_profile as _diarize_audio_profile,
-    _identify_speakers as _identify_speakers,
     transcribe as transcribe,
 )
 from voxweave.process_publication import (
     _ProcessPublication as _ProcessPublication,
-    _ProcessSource as _ProcessSource,
+    _ProcessSource,
     _voiceprint_capture_from_generation as _voiceprint_capture_from_generation,
     _warn_stale_speaker_names as _warn_stale_speaker_names,
     _voiceprints_document as _voiceprints_document,
@@ -151,14 +139,35 @@ from voxweave.failure_annotations import (
     _append_secondary_terminal as _append_secondary_terminal,
     _record_disposal_failure as _record_disposal_failure,
 )
+from voxweave.align_blocks import AlignBlocksRequest, align_blocks as run_align_blocks
+from voxweave.align_observer import notify_align_shadow_observer
+from voxweave.align_run import (
+    MIN_CUE_SEC as MIN_CUE_SEC,
+    TINY_CUE_SEC as TINY_CUE_SEC,
+    TINY_CUE_TARGET as TINY_CUE_TARGET,
+    AlignInputs,
+    AlignRun,
+    CachedMediaIdentity,
+    begin_fresh_acquisition,
+    build_align_selection,
+    commit_align_outputs,
+    dispose_align_run,
+    invoke_legacy_distribution,
+    invoke_legacy_shift,
+    invoke_physical_preparation,
+    select_legacy_alignment,
+)
+from voxweave.split_run import (
+    SplitSource,
+    VttEditsKeptError as VttEditsKeptError,
+    commit_split,
+    plan_split_commit,
+)
 from voxweave.align_route import (
     AlignRoute as AlignRoute,
     resolve_align_route as resolve_align_route,
-    _align_blocks_from_snapshot as _align_blocks_from_snapshot,
-    _prepared_audio_geometry as _prepared_audio_geometry,
-    _align_route_facts as _align_route_facts,
-    _stable_fact_digest as _stable_fact_digest,
-    _plan_qwen_crops as _plan_qwen_crops,
+    _align_blocks_from_snapshot,
+    _plan_qwen_crops,
 )
 
 if TYPE_CHECKING:
@@ -179,17 +188,6 @@ def _log_voiceprint_notice_once() -> None:
             "voiceprint capture enabled: a sensitive voice-biometric sidecar may be written"
         )
         _voiceprint_notice_logged = True
-
-
-# Align-stage cue duration floor. Default 0 (disabled): enforce_min_duration only
-# resolves overlaps without padding, so short back-channels keep their real ~0.6s.
-# Set VOXWEAVE_MIN_CUE_SEC=0.8 to re-enable padding. Distinct from VOXWEAVE_SEG_MIN_CUE_SEC.
-MIN_CUE_SEC = config._env_float("VOXWEAVE_MIN_CUE_SEC", 0.0)
-# Flash-cue rescue (orthogonal to MIN_CUE_SEC): genuine flash cues (so/あ at 0.1-0.2s)
-# are extended to TINY_CUE_TARGET, allowed to overlap only the immediately following cue.
-# VOXWEAVE_TINY_CUE_SEC=0 disables.
-TINY_CUE_SEC = config._env_float("VOXWEAVE_TINY_CUE_SEC", 0.2)
-TINY_CUE_TARGET = config._env_float("VOXWEAVE_TINY_CUE_TARGET", 0.5)
 
 
 def _attach_json_decode_failure(exc: BaseException) -> None:
@@ -345,6 +343,223 @@ def _replay_voiceprint_pair(
     return capture, media
 
 
+@dataclass(frozen=True)
+class _ProcessRequest:
+    # The arguments of one process call, bundled so that each stage takes one value.
+    media_path: Path
+    lang_override: str | None
+    separate: bool
+    debug: bool
+    normalize: bool
+    skip_songs: bool
+    keep_lyrics: bool
+    sdh: bool
+    diarize: bool
+    voiceprints: bool
+    word_segments: tuple[str, list[dict]] | None
+    asr_model: str | None
+    context: str | None
+    timestamps: bool
+    shot_snap: bool
+    min_speakers: int | None
+    max_speakers: int | None
+    diarize_model: str | None
+    voiceprint_model: str | None
+    speaker_clustering: str | None
+
+
+@dataclass(frozen=True)
+class _ProcessGenerations:
+    # What the sibling files and the media looked like before any work started;
+    # the commit rechecks them.
+    expected_json: episode_transaction.FileGeneration
+    expected_vtt: episode_transaction.FileGeneration
+    expected_media: str | None
+    source_mode: episode_transaction.ProcessSourceMode
+
+
+def _process_steps(request: _ProcessRequest) -> list[str]:
+    # The progress plan: the steps this call reports, in order.
+    steps = ["inspect source"]
+    if request.word_segments is None:
+        steps.append("prepare audio")
+        if request.separate and (request.skip_songs or request.keep_lyrics):
+            steps.append("detect songs")
+        steps.extend(("find speech", "transcribe and align"))
+        if request.diarize:
+            steps.append("identify speakers")
+        if request.shot_snap:
+            steps.append("detect shot changes")
+    steps.extend(("layout subtitles", "write outputs"))
+    if request.sdh and request.word_segments is None:
+        steps.append("create SDH sidecar")
+    return steps
+
+
+def _preflight_process(request: _ProcessRequest, rep: Reporter) -> bool:
+    # Refuse a run that cannot succeed before any audio work. Returns whether
+    # voiceprint capture is ready.
+    if request.voiceprints and (
+        not request.diarize or request.word_segments is not None
+    ):
+        raise ValueError("voiceprint capture requires a fresh diarization run")
+    if request.diarize and request.word_segments is None:
+        from voxweave import diarize as diarize_mod
+
+        # Refuse a diarization that cannot succeed (a gated model without a
+        # token, impossible speaker bounds) now, not after separation and ASR.
+        diarize_mod.preflight(
+            request.diarize_model,
+            min_speakers=request.min_speakers,
+            max_speakers=request.max_speakers,
+        )
+    capture_ready = False
+    if request.voiceprints:
+        from voxweave import voiceembed
+
+        # Fail on a bad --voiceprint-model / env / conf value before any audio
+        # work; the per-language routing itself waits for the detected language.
+        voiceembed.resolve_voiceprint_choice(request.voiceprint_model)
+        _log_voiceprint_notice_once()
+        capture_ready = _prefetch_voiceprint_models(
+            request.voiceprint_model, request.lang_override, rep
+        )
+    return capture_ready
+
+
+def _capture_process_generations(request: _ProcessRequest) -> _ProcessGenerations:
+    media_path = request.media_path
+    try:
+        expected_json = episode_transaction.capture_file_generation(
+            swap_ext(media_path, ".json")
+        )
+    except OSError as exc:
+        _attach_canonical_failure(
+            exc,
+            kind="subtitle-snapshot-failed",
+            phase="snapshot",
+            detail_code="sibling-read",
+        )
+        raise
+    try:
+        expected_vtt = episode_transaction.capture_file_generation(
+            swap_ext(media_path, ".vtt")
+        )
+    except OSError as exc:
+        _attach_canonical_failure(
+            exc,
+            kind="subtitle-snapshot-failed",
+            phase="snapshot",
+            detail_code="vtt-read",
+        )
+        raise
+    source_mode: episode_transaction.ProcessSourceMode = (
+        "injected-words" if request.word_segments is not None else "transcribed-media"
+    )
+    expected_media: str | None
+    if source_mode == "injected-words":
+        expected_media = None
+    else:
+        try:
+            expected_media = media_fingerprint(media_path)
+        except OSError as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="media-identity-invalid",
+                phase="media",
+                detail_code=(
+                    "media-not-found"
+                    if isinstance(exc, FileNotFoundError)
+                    else "media-fingerprint"
+                ),
+            )
+            raise
+    return _ProcessGenerations(expected_json, expected_vtt, expected_media, source_mode)
+
+
+def _transcribe_for_process(
+    request: _ProcessRequest,
+    rep: Reporter,
+    debug_root: Path | None,
+    source_path: Path,
+    snapshot_fingerprint: str | None,
+    capture_enabled: bool,
+) -> tuple[
+    str,
+    list[dict],
+    list[tuple[float, float]],
+    list[tuple[float, float]],
+    list[tuple[float, float, str]],
+    VoiceprintCapture | None,
+]:
+    # Called by _process_from_source after the shot detection job starts;
+    # ``transcribe`` and ``cache_vocals_path`` are looked up when it runs.
+    return transcribe(
+        source_path,
+        lang_override=request.lang_override,
+        separate=request.separate,
+        skip_songs=request.skip_songs,
+        keep_lyrics=request.keep_lyrics,
+        diarize=request.diarize,
+        diarize_model=request.diarize_model,
+        voiceprints=capture_enabled,
+        voiceprint_model=request.voiceprint_model,
+        speaker_clustering=request.speaker_clustering,
+        normalize=request.normalize,
+        reporter=rep,
+        debug=request.debug,
+        debug_root=debug_root,
+        cache_vocals=cache_vocals_path(request.media_path),
+        source_fingerprint=snapshot_fingerprint,
+        asr_model=request.asr_model,
+        context=request.context,
+        min_speakers=request.min_speakers,
+        max_speakers=request.max_speakers,
+        # SDH reuses the successfully returned deferred PANNs owner.
+        release_panns=not request.sdh,
+    )
+
+
+def _run_process(
+    request: _ProcessRequest,
+    rep: Reporter,
+    generations: _ProcessGenerations,
+    debug_root: Path | None,
+    source_path: Path,
+    snapshot_fingerprint: str | None,
+    capture_enabled: bool,
+) -> Path:
+    # Run one process call against the selected source: the media itself, or the
+    # private snapshot when voiceprint capture needs bytes that cannot change.
+    source = _ProcessSource(
+        path=source_path,
+        snapshot_fingerprint=snapshot_fingerprint,
+        expected_json=generations.expected_json,
+        expected_vtt=generations.expected_vtt,
+        expected_media_fingerprint=generations.expected_media,
+        mode=generations.source_mode,
+    )
+    return _process_from_source(
+        request.media_path,
+        source=source,
+        lang_override=request.lang_override,
+        reporter=rep,
+        sdh=request.sdh,
+        word_segments=request.word_segments,
+        timestamps=request.timestamps,
+        shot_snap=request.shot_snap,
+        transcribe_source=partial(
+            _transcribe_for_process,
+            request,
+            rep,
+            debug_root,
+            source_path,
+            snapshot_fingerprint,
+            capture_enabled,
+        ),
+    )
+
+
 def process(
     media_path: Path,
     lang_override: str | None = None,
@@ -385,162 +600,39 @@ def process(
     if lang_override and lang_override.strip():
         # A --language typo fails here, not after separation and VAD.
         to_asr_iso(lang_override)
+    request = _ProcessRequest(
+        media_path=media_path,
+        lang_override=lang_override,
+        separate=separate,
+        debug=debug,
+        normalize=normalize,
+        skip_songs=skip_songs,
+        keep_lyrics=keep_lyrics,
+        sdh=sdh,
+        diarize=diarize,
+        voiceprints=voiceprints,
+        word_segments=word_segments,
+        asr_model=asr_model,
+        context=context,
+        timestamps=timestamps,
+        shot_snap=shot_snap,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        diarize_model=diarize_model,
+        voiceprint_model=voiceprint_model,
+        speaker_clustering=speaker_clustering,
+    )
     # The deliverables keep their names beside the media: refuse one that cannot
     # exist before any audio work, not at the final write.
     writes_sdh = sdh and word_segments is None
     for suffix in (".json", ".vtt", *((".sdh.vtt",) if writes_sdh else ())):
         require_output_name(swap_ext(media_path, suffix))
     rep = reporter or Reporter()
-    steps = ["inspect source"]
-    if word_segments is None:
-        steps.append("prepare audio")
-        if separate and (skip_songs or keep_lyrics):
-            steps.append("detect songs")
-        steps.extend(("find speech", "transcribe and align"))
-        if diarize:
-            steps.append("identify speakers")
-        if shot_snap:
-            steps.append("detect shot changes")
-    steps.extend(("layout subtitles", "write outputs"))
-    if sdh and word_segments is None:
-        steps.append("create SDH sidecar")
-    rep.plan(steps)
+    rep.plan(_process_steps(request))
     rep.step("inspect source")
-    expected_json: episode_transaction.FileGeneration | None = None
-    expected_vtt: episode_transaction.FileGeneration | None = None
-    expected_media: str | None = None
-    source_mode: episode_transaction.ProcessSourceMode | None = None
     debug_root = artifacts.claim_paths(media_path).debug if debug else None
-
-    def run_with_source(
-        source_path: Path,
-        snapshot_fingerprint: str | None,
-        capture_enabled: bool,
-    ) -> Path:
-        assert expected_json is not None
-        assert expected_vtt is not None
-        assert source_mode is not None
-        # Built at call time: expected_json, expected_vtt, expected_media and
-        # source_mode are assigned after this closure is defined.
-        source = _ProcessSource(
-            path=source_path,
-            snapshot_fingerprint=snapshot_fingerprint,
-            expected_json=expected_json,
-            expected_vtt=expected_vtt,
-            expected_media_fingerprint=expected_media,
-            mode=source_mode,
-        )
-
-        # Called by _process_from_source after the shot detection job starts;
-        # ``transcribe`` and ``cache_vocals_path`` are looked up when it runs.
-        def transcribe_source() -> tuple[
-            str,
-            list[dict],
-            list[tuple[float, float]],
-            list[tuple[float, float]],
-            list[tuple[float, float, str]],
-            VoiceprintCapture | None,
-        ]:
-            return transcribe(
-                source_path,
-                lang_override=lang_override,
-                separate=separate,
-                skip_songs=skip_songs,
-                keep_lyrics=keep_lyrics,
-                diarize=diarize,
-                diarize_model=diarize_model,
-                voiceprints=capture_enabled,
-                voiceprint_model=voiceprint_model,
-                speaker_clustering=speaker_clustering,
-                normalize=normalize,
-                reporter=rep,
-                debug=debug,
-                debug_root=debug_root,
-                cache_vocals=cache_vocals_path(media_path),
-                source_fingerprint=snapshot_fingerprint,
-                asr_model=asr_model,
-                context=context,
-                min_speakers=min_speakers,
-                max_speakers=max_speakers,
-                # SDH reuses the successfully returned deferred PANNs owner.
-                release_panns=not sdh,
-            )
-
-        return _process_from_source(
-            media_path,
-            source=source,
-            lang_override=lang_override,
-            reporter=rep,
-            sdh=sdh,
-            word_segments=word_segments,
-            timestamps=timestamps,
-            shot_snap=shot_snap,
-            transcribe_source=transcribe_source,
-        )
-
-    if voiceprints and (not diarize or word_segments is not None):
-        raise ValueError("voiceprint capture requires a fresh diarization run")
-    if diarize and word_segments is None:
-        from voxweave import diarize as diarize_mod
-
-        # Refuse a diarization that cannot succeed (a gated model without a
-        # token, impossible speaker bounds) now, not after separation and ASR.
-        diarize_mod.preflight(
-            diarize_model, min_speakers=min_speakers, max_speakers=max_speakers
-        )
-    capture_ready = False
-    if voiceprints:
-        from voxweave import voiceembed
-
-        # Fail on a bad --voiceprint-model / env / conf value before any audio
-        # work; the per-language routing itself waits for the detected language.
-        voiceembed.resolve_voiceprint_choice(voiceprint_model)
-        _log_voiceprint_notice_once()
-        capture_ready = _prefetch_voiceprint_models(
-            voiceprint_model, lang_override, rep
-        )
-    try:
-        expected_json = episode_transaction.capture_file_generation(
-            swap_ext(media_path, ".json")
-        )
-    except OSError as exc:
-        _attach_canonical_failure(
-            exc,
-            kind="subtitle-snapshot-failed",
-            phase="snapshot",
-            detail_code="sibling-read",
-        )
-        raise
-    try:
-        expected_vtt = episode_transaction.capture_file_generation(
-            swap_ext(media_path, ".vtt")
-        )
-    except OSError as exc:
-        _attach_canonical_failure(
-            exc,
-            kind="subtitle-snapshot-failed",
-            phase="snapshot",
-            detail_code="vtt-read",
-        )
-        raise
-    source_mode = "injected-words" if word_segments is not None else "transcribed-media"
-    if source_mode == "injected-words":
-        expected_media = None
-    else:
-        try:
-            expected_media = media_fingerprint(media_path)
-        except OSError as exc:
-            _attach_canonical_failure(
-                exc,
-                kind="media-identity-invalid",
-                phase="media",
-                detail_code=(
-                    "media-not-found"
-                    if isinstance(exc, FileNotFoundError)
-                    else "media-fingerprint"
-                ),
-            )
-            raise
+    capture_ready = _preflight_process(request, rep)
+    generations = _capture_process_generations(request)
     if capture_ready:
         snapshots = ExitStack()
         try:
@@ -554,7 +646,11 @@ def process(
         else:
             with snapshots:
                 try:
-                    return run_with_source(
+                    return _run_process(
+                        request,
+                        rep,
+                        generations,
+                        debug_root,
                         snapshot.path,
                         snapshot.fingerprint,
                         True,
@@ -562,7 +658,7 @@ def process(
                 except chunking.NoAudioStreamError as exc:
                     # The decode saw the private snapshot copy; name the user's file.
                     raise chunking.NoAudioStreamError(media_path.name) from exc
-    return run_with_source(media_path, None, False)
+    return _run_process(request, rep, generations, debug_root, media_path, None, False)
 
 
 def _process_from_source(
@@ -687,49 +783,11 @@ def _check_layout_overrides(iso: str, overrides: Mapping[str, Any]) -> None:
         )
 
 
-class VttEditsKeptError(RuntimeError):
-    """``split(keep_vtt_edits=True)`` found cues the JSON would not reproduce."""
-
-
-def _cue_content(vtt_path: Path, raw: bytes) -> list[tuple[Any, Any, str, bool]] | None:
-    """Cue times, text and lyric flag of a VTT, without speaker names (None = unreadable)."""
-    from voxweave.subformats import load_subtitle_blocks_bytes
-
-    try:
-        blocks = load_subtitle_blocks_bytes(vtt_path, raw)
-    except (RuntimeError, ValueError, UnicodeError):
-        return None
-    return [
-        (block.get("start"), block.get("end"), block["text"], bool(block.get("lyric")))
-        for block in blocks
-    ]
-
-
-def split(
-    json_path: Path,
-    timestamps: bool = True,
-    *,
-    reporter: Reporter | None = None,
-    keep_vtt_edits: bool = False,
-    **smart_split_kwargs,
-) -> Path:
-    """Re-run smart_split from persisted word_segments.
-
-    Reuses ``vad_speech`` from the sibling JSON for gap splitting; falls back to gap-only
-    mode if absent. ``timestamps`` behaves as in :func:`process`.
-
-    ``keep_vtt_edits`` writes only when the existing VTT is missing or differs from
-    the new one in speaker names alone; otherwise it raises :class:`VttEditsKeptError`
-    and writes nothing. A VTT changed after that check is not overwritten either. Use
-    it when the caller did not ask to replace the VTT (render after a speakers Save):
-    the VTT may hold hand edits the JSON does not have yet.
-    """
-    # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
-    # WEBVTT bytes to json.loads.
-    json_path = swap_ext(Path(json_path), ".json")
-    rep = reporter or Reporter()
-    rep.plan(("read subtitle data", "layout subtitles", "write outputs"))
-    rep.step("read subtitle data")
+def _read_split_source(
+    json_path: Path, layout_overrides: Mapping[str, Any]
+) -> SplitSource:
+    # Read stage of split: snapshot the sibling JSON, decode the replay carriers
+    # and capture the speaker mapping. Nothing is laid out or written here.
     owner = artifact_owner(json_path)
     try:
         input_bytes = json_path.read_bytes()
@@ -768,7 +826,7 @@ def split(
     log.debug("replaying %s (%s)", json_path.name, resolve_segmentation_manifest(data))
     units = data["word_segments"]
     iso, units = _reconcile_word_segment_language(data.get("language", "en"), units)
-    _check_layout_overrides(iso, smart_split_kwargs)
+    _check_layout_overrides(iso, layout_overrides)
     speech_spans = spans_in(data.get("vad_speech"))
     shot_changes = [float(t) for t in data.get("shot_changes") or []] or None
     sing_spans = spans_in(data.get("sing_spans"))
@@ -783,96 +841,68 @@ def split(
         warn=lambda message: log.warning("%s", message),
     )
     speaker_names = dict(mapping_generation.names)
-    rep.step("layout subtitles")
-    segmented = segment_document(
-        language=iso,
-        word_segments=units,
-        vad_speech=speech_spans,
+    return SplitSource(
+        json_path=json_path,
+        owner=owner,
+        input_bytes=input_bytes,
+        voiceprint_pair=voiceprint_pair,
+        pair_declared="voiceprint_capture" in data or "voiceprint_media" in data,
+        iso=iso,
+        units=units,
+        speech_spans=speech_spans,
         shot_changes=shot_changes,
         sing_spans=sing_spans,
         speaker_turns=speaker_turns,
-        smart_split_kwargs=smart_split_kwargs,
         annotate_speakers=bool(speaker_names),
-    )
-    units, cues = segmented.units, segmented.cues
-    from voxweave import segmentation_orchestration
-    from voxweave.align_snapshot import decode_sibling_json_snapshot
-
-    if segmented.document is None or segmented.manifest is None:
-        raise RuntimeError("segmentation result lacks its production authority")
-    expected_json = episode_transaction.FileGeneration(True, input_bytes)
-    vtt_path = swap_ext(json_path, ".vtt")
-    expected_vtt: episode_transaction.FileGeneration | None = None
-    if keep_vtt_edits:
-        try:
-            expected_vtt = episode_transaction.FileGeneration(
-                True, vtt_path.read_bytes()
-            )
-        except FileNotFoundError:
-            expected_vtt = episode_transaction.FileGeneration(False, None)
-    lexical_snapshot = decode_sibling_json_snapshot(json_path.name, input_bytes)
-    selection = segmentation_orchestration.build_segmentation_selection(
-        command="split",
-        target_path=swap_ext(json_path, ".vtt"),
-        sibling_path=json_path,
-        language=iso,
-        cues=cues,
-        top_level_units=units,
-        document=segmented.document,
-        manifest=segmented.manifest,
-        vad_speech=speech_spans,
-        shot_changes=shot_changes,
-        sing_spans=sing_spans,
-        speaker_turns=lexical_snapshot.carrier("speaker_turns"),
-        voiceprint_pair=voiceprint_pair,
-        timestamps=timestamps,
-        speaker_names=mapping_generation.names,
-        expected_json=expected_json,
-        expected_vtt=expected_vtt,
-        source_mode=None,
-        mapping_generation=mapping_generation,
         mapping_path=mapping_path,
-        shadow_enabled=shadow_enabled(),
+        mapping_generation=mapping_generation,
     )
-    pair_declared = "voiceprint_capture" in data or "voiceprint_media" in data
-    cleanup: list[episode_transaction.ArtifactCleanup] = []
-    if pair_declared and voiceprint_pair is None:
-        cleanup.extend(episode_transaction.speaker_artifact_cleanups(owner, json_path))
-    cleanup.extend(
-        episode_transaction.evidence_cleanups(swap_ext(json_path, ".vtt"), media=owner)
+
+
+def split(
+    json_path: Path,
+    timestamps: bool = True,
+    *,
+    reporter: Reporter | None = None,
+    keep_vtt_edits: bool = False,
+    **smart_split_kwargs,
+) -> Path:
+    """Re-run smart_split from persisted word_segments.
+
+    Reuses ``vad_speech`` from the sibling JSON for gap splitting; falls back to gap-only
+    mode if absent. ``timestamps`` behaves as in :func:`process`.
+
+    ``keep_vtt_edits`` writes only when the existing VTT is missing or differs from
+    the new one in speaker names alone; otherwise it raises :class:`VttEditsKeptError`
+    and writes nothing. A VTT changed after that check is not overwritten either. Use
+    it when the caller did not ask to replace the VTT (render after a speakers Save):
+    the VTT may hold hand edits the JSON does not have yet.
+    """
+    # Accept the .vtt sibling too: `voxweave split foo.vtt` should not feed
+    # WEBVTT bytes to json.loads.
+    json_path = swap_ext(Path(json_path), ".json")
+    rep = reporter or Reporter()
+    rep.plan(("read subtitle data", "layout subtitles", "write outputs"))
+    rep.step("read subtitle data")
+    source = _read_split_source(json_path, smart_split_kwargs)
+    rep.step("layout subtitles")
+    segmented = segment_document(
+        language=source.iso,
+        word_segments=source.units,
+        vad_speech=source.speech_spans,
+        shot_changes=source.shot_changes,
+        sing_spans=source.sing_spans,
+        speaker_turns=source.speaker_turns,
+        smart_split_kwargs=smart_split_kwargs,
+        annotate_speakers=source.annotate_speakers,
+    )
+    plan = plan_split_commit(
+        source, segmented, timestamps=timestamps, keep_vtt_edits=keep_vtt_edits
     )
     rep.step("write outputs")
-    try:
-        if expected_vtt is not None and expected_vtt.bytes_value is not None:
-            old = _cue_content(vtt_path, expected_vtt.bytes_value)
-            if old is None or old != _cue_content(
-                vtt_path, selection.verified.vtt_bytes
-            ):
-                raise VttEditsKeptError(
-                    f"{vtt_path.name} was not overwritten: its cue text or timing"
-                    f" differs from what {json_path.name} produces (hand edits, align"
-                    " output, or other render options); run"
-                    f" 'voxweave render {json_path}' to replace it anyway"
-                )
-        episode_transaction.commit_primary_outputs(
-            command="split",
-            episode_path=owner,
-            json_path=json_path,
-            vtt_path=vtt_path,
-            expected_json=expected_json,
-            expected_vtt=expected_vtt,
-            main_json_bytes=selection.verified.main_json_bytes,
-            vtt_bytes=selection.verified.vtt_bytes,
-            cleanup_paths=tuple(cleanup),
-            context=selection.context,
-            speaker_mapping_path=mapping_path,
-            expected_speaker_mapping=mapping_generation,
-        )
-    finally:
-        segmentation_orchestration.retire_segmentation_selection(selection)
-    vtt_out = swap_ext(json_path, ".vtt")
-    log.info("rendered %s → %d cues", vtt_out.name, len(cues))
-    return vtt_out
+    commit_split(source, plan)
+    log.info("rendered %s → %d cues", plan.vtt_path.name, len(segmented.cues))
+    return plan.vtt_path
 
 
 def _prepare_16k_for_align(
@@ -920,48 +950,10 @@ def _prepare_16k_for_align(
     ).wav
 
 
-@dataclass(frozen=True)
-class _SelectedLegacyAlignResult:
-    block_units: tuple[tuple[Mapping[str, Any], ...], ...]
-    spans: tuple[tuple[float, float], ...]
-    all_units: tuple[Mapping[str, Any], ...]
-
-
-@dataclass(frozen=True)
-class _PreparedQwenCall:
-    source_index: int
-    wav_path: Path
-    text: str
-    nominal_start: float
-    nominal_end: float
-    sample_geometry: tuple[int, int, int, int] | None
-
-
 def _retain_qwen_owner_slice(raw_units: Sequence[dict]) -> list[dict]:
     """Assign one physical Qwen result to its single historical cue owner."""
 
     return list(raw_units)
-
-
-def _seal_selected_legacy_align_result(
-    block_units: Sequence[Sequence[Mapping[str, Any]]],
-    spans: Sequence[tuple[float, float]],
-    all_units: Sequence[Mapping[str, Any]],
-) -> _SelectedLegacyAlignResult:
-    """Seal the exact selected-legacy projection before strict AO work begins."""
-
-    def seal_unit(unit: Mapping[str, Any]) -> Mapping[str, Any]:
-        return {
-            "text": unit["text"],
-            "start": unit["start"],
-            "end": unit["end"],
-        }
-
-    return _SelectedLegacyAlignResult(
-        tuple(tuple(seal_unit(unit) for unit in owner) for owner in block_units),
-        tuple((start, end) for start, end in spans),
-        tuple(seal_unit(unit) for unit in all_units),
-    )
 
 
 def _align_blocks(
@@ -984,250 +976,35 @@ def _align_blocks(
 ) -> list[list[dict]]:
     """Route blocks to the configured aligner and return per-block units.
 
-    Three paths — these ARE the hard-constraint full-pass routing; do NOT collapse them:
-    - ja MMS: one full-file pass (``align_blocks_full_mms``).
-    - en wav2vec2 CTC: one full-file windowed-emission pass (``align_blocks_full_ctc``).
-    - zh·yue (no CTC config): per-cue tight-crop Qwen — each cue gets its own audio slice so
-      error is contained within the sentence and inter-sentence pauses are preserved.
+    :mod:`voxweave.align_blocks` holds one aligner per route (ja MMS full pass,
+    en CTC full pass, zh·yue per-cue Qwen); do NOT collapse them. The Qwen route's
+    audio slicing, time shifting and owner slicing are looked up on this module
+    when the call starts.
 
     Per-cue slices are appended to ``tmp_chunks`` for the caller's ``finally`` to clean up.
     """
-    if (legacy_distribution_invoker is None) != (legacy_shift_invoker is None):
-        raise ValueError("legacy projection phase invokers must be supplied together")
-
-    # MMS/CTC full passes: cue (start,end) bounds are used ONLY as silence anchors to split
-    # movie-length audio into memory-sized chunks when it overflows the single-pass DP
-    # budget — NOT to crop/route per cue. These routes are routing-free because the input
-    # VTT timestamps are exactly what may be wrong (the reason to re-align); the global DP
-    # self-locates every word. None for cues without timestamps. (The Qwen per-cue route
-    # below crops each cue from ``crops`` instead.)
-    bounds = [
-        (b["start"], b["end"])
-        if b["start"] is not None and b["end"] is not None
-        else None
-        for b in blocks
-    ]
-    if mms:
-        reporter.task("full-file alignment (MMS)", 1)
-        units = backend.align_blocks_full_mms(
-            wav,
-            [b.get("alignment_text", b["text"]) for b in blocks],
-            iso,
-            bounds=bounds,
-            _raw_call_observer=raw_call_observer,
-            _backend_invoker=backend_invoker,
-            _preparation_invoker=physical_preparation_invoker,
-            _legacy_distribution_invoker=legacy_distribution_invoker,
-            _legacy_shift_invoker=legacy_shift_invoker,
-        )
-        reporter.advance(1)
-        return units
-    if ctc_model:  # en wav2vec2: windowed emission + single global DP (routing-free)
-        reporter.task("full-file alignment (CTC)", 1)
-        units = backend.align_blocks_full_ctc(
-            wav,
-            [b.get("alignment_text", b["text"]) for b in blocks],
-            iso,
-            ctc_model,
-            bounds=bounds,
+    return run_align_blocks(
+        resolve_align_route(mms, ctc_model).kind,
+        AlignBlocksRequest(
+            wav=wav,
+            blocks=blocks,
+            iso=iso,
+            ctc_model=ctc_model,
+            crops=crops,
+            reporter=reporter,
+            tmp_chunks=tmp_chunks,
             speech_spans=speech_spans,
-            _raw_call_observer=raw_call_observer,
-            _backend_invoker=backend_invoker,
-            _preparation_invoker=physical_preparation_invoker,
-            _legacy_distribution_invoker=legacy_distribution_invoker,
-            _legacy_shift_invoker=legacy_shift_invoker,
-        )
-        reporter.advance(1)
-        return units
-    if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() == "1":
-        # The VAD emission mask is wired into the wav2vec2 CTC pass only.
-        log.warning(
-            "--vad-mask / VOXWEAVE_VAD_EMISSION_MASK has no effect on Qwen alignment"
-            " (language %s); only the wav2vec2 CTC aligner applies it",
-            iso,
-        )
-    reporter.task("per-cue alignment", len(blocks))
-    block_units: list[list[dict]] = [[] for _ in blocks]
-
-    def prepare_qwen_calls() -> list[_PreparedQwenCall]:
-        prepared: list[_PreparedQwenCall] = []
-        for i, crop in enumerate(crops):
-            text = realign.join_block_texts(
-                [blocks[i].get("alignment_text", blocks[i]["text"])], iso
-            )
-            if crop is None or not text:  # insertion block or empty: skip
-                reporter.advance(1)
-                continue
-            cs, ce = crop
-            observed_geometry: tuple[int, int, int, int] | None = None
-
-            def observe_sample_geometry(
-                sample_start: int,
-                sample_end: int,
-                sample_rate: int,
-                sample_count: int,
-            ) -> None:
-                nonlocal observed_geometry
-                if observed_geometry is not None:
-                    raise RuntimeError("Qwen slice reported sample geometry twice")
-                observed_geometry = (
-                    sample_start,
-                    sample_end,
-                    sample_rate,
-                    sample_count,
-                )
-
-            cwav = slice_wav(
-                wav,
-                cs,
-                ce,
-                _sample_geometry_observer=observe_sample_geometry,
-                _canonical_qwen_failures=True,
-            )
-            tmp_chunks.append(cwav)
-            prepared.append(
-                _PreparedQwenCall(
-                    source_index=i,
-                    wav_path=cwav,
-                    text=text,
-                    nominal_start=float(cs),
-                    nominal_end=float(ce),
-                    sample_geometry=observed_geometry,
-                )
-            )
-        return prepared
-
-    prepared_qwen = (
-        prepare_qwen_calls()
-        if physical_preparation_invoker is None
-        else cast(
-            list[_PreparedQwenCall],
-            physical_preparation_invoker(prepare_qwen_calls),
-        )
+            raw_call_observer=raw_call_observer,
+            qwen_invoker=qwen_invoker,
+            backend_invoker=backend_invoker,
+            physical_preparation_invoker=physical_preparation_invoker,
+            legacy_distribution_invoker=legacy_distribution_invoker,
+            legacy_shift_invoker=legacy_shift_invoker,
+            slice_audio=slice_wav,
+            shift_units=shift_units,
+            retain_owner_slice=_retain_qwen_owner_slice,
+        ),
     )
-    pending_qwen: list[tuple[int, list[dict], float]] = []
-    for prepared in prepared_qwen:
-        geometry = prepared.sample_geometry
-        if qwen_invoker is None:
-            raw_units = backend.align_text(prepared.wav_path, prepared.text, iso)
-        else:
-            raw_units = cast(
-                list[dict[str, Any]],
-                qwen_invoker(
-                    lambda: backend.align_text(
-                        prepared.wav_path,
-                        prepared.text,
-                        iso,
-                    ),
-                    prepared.source_index,
-                    prepared.nominal_start,
-                    prepared.nominal_end,
-                    audio_sample_start=None if geometry is None else geometry[0],
-                    audio_sample_end=None if geometry is None else geometry[1],
-                    sample_rate=None if geometry is None else geometry[2],
-                    sample_count=None if geometry is None else geometry[3],
-                ),
-            )
-
-        pending_qwen.append((prepared.source_index, raw_units, prepared.nominal_start))
-        # One tick per aligned cue as it lands (skipped cues ticked at preparation),
-        # so the bar moves with the work instead of jumping from 0/N at the end.
-        reporter.advance(1)
-
-    if not pending_qwen:
-        with align_runtime_activity("AO-07", "no-physical-calls"):
-            pass
-
-    def retain_owners() -> list[tuple[int, list[dict], float]]:
-        return [
-            (index, _retain_qwen_owner_slice(raw_units), origin)
-            for index, raw_units, origin in pending_qwen
-        ]
-
-    retained_owners = (
-        retain_owners()
-        if legacy_distribution_invoker is None
-        else cast(
-            list[tuple[int, list[dict], float]],
-            legacy_distribution_invoker(retain_owners),
-        )
-    )
-
-    def shift_owners() -> list[list[dict]]:
-        for index, owner_units, origin in retained_owners:
-            block_units[index] = shift_units(owner_units, origin)
-        return block_units
-
-    block_units = (
-        shift_owners()
-        if legacy_shift_invoker is None
-        else cast(list[list[dict]], legacy_shift_invoker(shift_owners))
-    )
-    return block_units
-
-
-def _notify_align_shadow_observer(
-    observer: Callable[[object], object],
-    *,
-    selection: Any,
-    input_summary: Mapping[str, Any],
-    prepared_audio_sha256: str,
-) -> None:
-    """Build rich/minimal observation after disposal; never change production."""
-    from voxweave.align_evidence import encode_align_evidence
-
-    evidence_sha256 = hashlib.sha256(
-        encode_align_evidence(selection.evidence)
-    ).hexdigest()
-    try:
-        from voxweave import align_shadow
-
-        artifact = align_shadow.build_rich_align_shadow_artifact(
-            selection=selection,
-            input_summary=input_summary,
-            prepared_audio_sha256=prepared_audio_sha256,
-        )
-    except Exception as rich_error:
-        log.warning("rich align shadow construction failed: %s", rich_error)
-        try:
-            from voxweave import align_shadow_minimal
-
-            artifact = align_shadow_minimal.build_minimal_align_shadow_failure_artifact(
-                context_content_digest=selection.context.context_content_digest,
-                receipt_digest=selection.result.receipt_digest,
-                engine_family=selection.verified.engine_family,
-                vtt_sha256=selection.verified.vtt_sha256,
-                json_sha256=selection.verified.main_json_sha256,
-                evidence_sha256=evidence_sha256,
-                prior_failure=(
-                    selection.observation_failure or selection.result.v2_status.failure
-                ),
-            )
-        except Exception as minimal_error:
-            failure = CanonicalFailure(
-                "shadow-artifact-unavailable",
-                "minimal-artifact",
-                "minimal-artifact-construction",
-            )
-            log.warning(
-                "align shadow artifact unavailable: %s",
-                minimal_error,
-                extra={"failure": failure},
-            )
-            return
-    try:
-        observer(artifact)
-    except Exception as exc:
-        failure = CanonicalFailure(
-            "observer-failed",
-            "observer",
-            "observer-callback",
-        )
-        log.warning(
-            "align shadow observer failed: %s",
-            exc,
-            extra={"failure": failure},
-        )
 
 
 def _media_not_found_error(vtt_path: Path) -> FileNotFoundError:
@@ -1245,17 +1022,6 @@ def _media_not_found_error(vtt_path: Path) -> FileNotFoundError:
     return exc
 
 
-@dataclass(frozen=True)
-class _CachedMediaIdentity:
-    """Selected-media identity for align when a bound vocals cache serves the audio.
-
-    Stands where a :class:`MediaSnapshot` would: the media bytes are never read,
-    so only the fingerprint the cache companion was validated against is needed.
-    """
-
-    fingerprint: str
-
-
 def _acquire_align_audio(
     media: Path,
     *,
@@ -1266,11 +1032,11 @@ def _acquire_align_audio(
     rep: Reporter,
     tmp: list[Path],
     snapshots: ExitStack,
-) -> tuple[Path, MediaSnapshot | _CachedMediaIdentity | None]:
+) -> tuple[Path, MediaSnapshot | CachedMediaIdentity | None]:
     # Prepare-audio stage of align: a vocals-cache hit probe, the private media
     # snapshot fallback, then the AO-04 acquisition. The caller owns ``snapshots``
     # and closes it; this stage only enters contexts into it.
-    selected_snapshot: MediaSnapshot | _CachedMediaIdentity | None = None
+    selected_snapshot: MediaSnapshot | CachedMediaIdentity | None = None
     acquisition_media = media
     cached_wav: Path | None = None
     if bind_voiceprint and separate:
@@ -1292,7 +1058,7 @@ def _acquire_align_audio(
         except VocalsCacheMiss:
             pass
         else:
-            selected_snapshot = _CachedMediaIdentity(media_input_fingerprint)
+            selected_snapshot = CachedMediaIdentity(media_input_fingerprint)
     if bind_voiceprint and cached_wav is None:
         try:
             selected_snapshot = snapshots.enter_context(MediaSnapshot(media))
@@ -1325,41 +1091,55 @@ def _acquire_align_audio(
     return wav, selected_snapshot
 
 
-def align(
+def _select_align_media(vtt_path: Path, media_path: Path | None) -> tuple[Path, str]:
+    # AO-03: the media align re-times against (explicit or the VTT's sibling) and
+    # its fingerprint.
+    with align_runtime_activity("AO-03", "selected-media-identity"):
+        media = Path(media_path) if media_path else find_subtitle_media(vtt_path)
+        if media is None or not media.exists():
+            raise _media_not_found_error(vtt_path)
+        try:
+            media_input_fingerprint = media_fingerprint(media)
+        except OSError as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="media-identity-invalid",
+                phase="media",
+                detail_code="media-fingerprint",
+            )
+            raise
+    return media, media_input_fingerprint
+
+
+def _plan_align_route(iso: str) -> tuple[bool, str | None, AlignRoute]:
+    # Full-file single-pass alignment (whisperx fork align_ctc) for both MMS (ja) and wav2vec2
+    # CTC (en): concatenate all cue text, run one global monotone forced-align over the whole
+    # audio, slice units back per cue by char/word count. The global path self-locates every
+    # token (blank / <star> absorbs silence + song spans), immune to per-cue cropping drift
+    # (observed: wrong coarse crop displaced エルダドワーフ by 11s; crammed en "blocks" into dead
+    # air). Needs no has_ts/route/crop. ja MMS emission is windowed inside ctc-forced-aligner;
+    # en wav2vec2 emission is windowed in align_blocks_full_ctc (full-file xlsr is O(T^2) -> OOM
+    # at 23min). zh·yue have no CTC config -> per-cue tight-crop Qwen (routing+crop below). Do
+    # NOT revert ja to per-cue MMS: repeated small ONNX calls corrupt the heap (~180-226 cues).
+    from voxweave.config import align_model_for
+
+    with align_runtime_activity("AO-03", "route-family-plan"):
+        mms = backend.uses_mms(iso)
+        ctc_model = None if mms else align_model_for(iso)
+        align_route = resolve_align_route(mms, ctc_model)
+    return mms, ctc_model, align_route
+
+
+def _read_align_inputs(
     vtt_path: Path,
     *,
-    media_path: Path | None = None,
-    separate: bool = True,
-    normalize: bool = False,
-    lang_override: str | None = None,
-    reporter: Reporter | None = None,
-    _shadow_observer: Callable[[object], object] | None = None,
-    _expected_vtt_sha256: str | None = None,
-) -> Path:
-    """Re-align edited VTT text against original audio; overwrite VTT and update JSON.
-
-    The language's configured aligner (:func:`voxweave.config.align_model_for`)
-    picks one of three routes:
-
-    - MMS full pass (default for ja): one global forced alignment of all cue text
-      over the whole audio; cue timestamps serve only as silence anchors when the
-      audio overflows the single-pass budget.
-    - CTC full pass (wav2vec2, default for en): the same routing-free global
-      alignment over windowed emissions (optionally soft-masked by the persisted
-      ``vad_speech`` under ``--vad-mask``).
-    - Qwen per-cue crop (every language without an MMS/CTC aligner, e.g. zh/yue):
-      each block is routed to its audio window (via word_segments or VTT
-      timestamps), tightly cropped and aligned on its own.
-
-    Insertion blocks are then interpolated and timing is written. ASR is not re-run;
-    smart_split is not touched. All models run in-process (no network calls).
-    """
-    vtt_path = require_vtt(Path(vtt_path))  # align overwrites the input as VTT
-    require_output_name(swap_ext(vtt_path, ".json"))  # refuse before the model work
+    media_path: Path | None,
+    lang_override: str | None,
+    expected_vtt_sha256: str | None,
+) -> AlignInputs:
+    # Read stage of align (AO-01 to AO-03): snapshot the VTT and the sibling JSON,
+    # decode both, select the media and plan the aligner route.
     explicit_media_requested = media_path is not None
-    rep = reporter or Reporter()
-    rep.plan(("read subtitles", "prepare audio", "align subtitles", "write outputs"))
-    rep.step("read subtitles")
     json_path = swap_ext(vtt_path, ".json")
     with align_runtime_activity("AO-01", "vtt-generation-snapshot"):
         try:
@@ -1373,8 +1153,8 @@ def align(
             )
             raise
         if (
-            _expected_vtt_sha256 is not None
-            and hashlib.sha256(vtt_input_bytes).hexdigest() != _expected_vtt_sha256
+            expected_vtt_sha256 is not None
+            and hashlib.sha256(vtt_input_bytes).hexdigest() != expected_vtt_sha256
         ):
             raise episode_transaction.InputStaleError(
                 "vtt-generation", "input changed before alignment; re-run"
@@ -1440,38 +1220,9 @@ def align(
             _attach_vtt_decode_failure(exc, vtt_path.name)
             raise
 
-    with align_runtime_activity("AO-03", "selected-media-identity"):
-        media = Path(media_path) if media_path else find_subtitle_media(vtt_path)
-        if media is None or not media.exists():
-            raise _media_not_found_error(vtt_path)
-        try:
-            media_input_fingerprint = media_fingerprint(media)
-        except OSError as exc:
-            _attach_canonical_failure(
-                exc,
-                kind="media-identity-invalid",
-                phase="media",
-                detail_code="media-fingerprint",
-            )
-            raise
-
-    # Full-file single-pass alignment (whisperx fork align_ctc) for both MMS (ja) and wav2vec2
-    # CTC (en): concatenate all cue text, run one global monotone forced-align over the whole
-    # audio, slice units back per cue by char/word count. The global path self-locates every
-    # token (blank / <star> absorbs silence + song spans), immune to per-cue cropping drift
-    # (observed: wrong coarse crop displaced エルダドワーフ by 11s; crammed en "blocks" into dead
-    # air). Needs no has_ts/route/crop. ja MMS emission is windowed inside ctc-forced-aligner;
-    # en wav2vec2 emission is windowed in align_blocks_full_ctc (full-file xlsr is O(T^2) -> OOM
-    # at 23min). zh·yue have no CTC config -> per-cue tight-crop Qwen (routing+crop below). Do
-    # NOT revert ja to per-cue MMS: repeated small ONNX calls corrupt the heap (~180-226 cues).
-    from voxweave.config import align_model_for
-
-    with align_runtime_activity("AO-03", "route-family-plan"):
-        mms = backend.uses_mms(iso)
-        ctc_model = None if mms else align_model_for(iso)
-        align_route = resolve_align_route(mms, ctc_model)
-        full_pass = align_route.full_pass
-        route_kind = align_route.kind
+    media, media_input_fingerprint = _select_align_media(vtt_path, media_path)
+    mms, ctc_model, align_route = _plan_align_route(iso)
+    full_pass = align_route.full_pass
     delivery_order = (
         tuple(range(len(input_snapshot.blocks)))
         if full_pass
@@ -1483,399 +1234,158 @@ def align(
     ] = []  # set + looped only on the per-cue (zh·yue) path
     if not full_pass:
         crops = _plan_qwen_crops(blocks, word_segments, json_path)
+    return AlignInputs(
+        vtt_path=vtt_path,
+        json_path=json_path,
+        vtt_input_bytes=vtt_input_bytes,
+        expected_json=expected_json,
+        json_input_bytes=json_input_bytes,
+        sibling_snapshot=sibling_snapshot,
+        data=data,
+        pair_declared=pair_declared,
+        voiceprint_pair=voiceprint_pair,
+        iso=iso,
+        input_snapshot=input_snapshot,
+        media=media,
+        media_input_fingerprint=media_input_fingerprint,
+        explicit_media=explicit_media_requested,
+        mms=mms,
+        ctc_model=ctc_model,
+        route=align_route,
+        blocks=blocks,
+        crops=crops,
+    )
 
-    tmp: list[Path] = []
-    tmp_chunks: list[Path] = []
-    snapshots = ExitStack()
-    selected_snapshot: MediaSnapshot | _CachedMediaIdentity | None = None
-    align_context = None
-    completed_selection = None
-    observation_input: Mapping[str, Any] | None = None
-    prepared_audio_sha256: str | None = None
-    aligned_cue_count = 0
-    aligned_unit_count = 0
+
+def align(
+    vtt_path: Path,
+    *,
+    media_path: Path | None = None,
+    separate: bool = True,
+    normalize: bool = False,
+    lang_override: str | None = None,
+    reporter: Reporter | None = None,
+    _shadow_observer: Callable[[object], object] | None = None,
+    _expected_vtt_sha256: str | None = None,
+) -> Path:
+    """Re-align edited VTT text against original audio; overwrite VTT and update JSON.
+
+    The language's configured aligner (:func:`voxweave.config.align_model_for`)
+    picks one of three routes:
+
+    - MMS full pass (default for ja): one global forced alignment of all cue text
+      over the whole audio; cue timestamps serve only as silence anchors when the
+      audio overflows the single-pass budget.
+    - CTC full pass (wav2vec2, default for en): the same routing-free global
+      alignment over windowed emissions (optionally soft-masked by the persisted
+      ``vad_speech`` under ``--vad-mask``).
+    - Qwen per-cue crop (every language without an MMS/CTC aligner, e.g. zh/yue):
+      each block is routed to its audio window (via word_segments or VTT
+      timestamps), tightly cropped and aligned on its own.
+
+    Insertion blocks are then interpolated and timing is written. ASR is not re-run;
+    smart_split is not touched. All models run in-process (no network calls).
+    """
+    vtt_path = require_vtt(Path(vtt_path))  # align overwrites the input as VTT
+    require_output_name(swap_ext(vtt_path, ".json"))  # refuse before the model work
+    rep = reporter or Reporter()
+    rep.plan(("read subtitles", "prepare audio", "align subtitles", "write outputs"))
+    rep.step("read subtitles")
+    inputs = _read_align_inputs(
+        vtt_path,
+        media_path=media_path,
+        lang_override=lang_override,
+        expected_vtt_sha256=_expected_vtt_sha256,
+    )
+    run = AlignRun()
     production_failure: BaseException | None = None
     try:
         try:
             rep.step("prepare audio")
-            wav, selected_snapshot = _acquire_align_audio(
-                media,
+            binding = begin_fresh_acquisition(
+                inputs,
+                run,
+                acquire_audio=_acquire_align_audio,
+                rep=rep,
                 separate=separate,
                 normalize=normalize,
-                bind_voiceprint=voiceprint_pair is not None,
-                media_input_fingerprint=media_input_fingerprint,
-                rep=rep,
-                tmp=tmp,
-                snapshots=snapshots,
+                expected_vtt_sha256=_expected_vtt_sha256,
             )
-            from voxweave import align_orchestration
-
-            with align_runtime_activity("AO-04", "prepared-audio-digest"):
-                prepared_audio_sha256 = align_orchestration.file_sha256(wav)
-            from voxweave.align_inputs import LegacyAlignPolicy
-
-            legacy_policy = LegacyAlignPolicy(
-                MIN_CUE_SEC,
-                TINY_CUE_SEC,
-                TINY_CUE_TARGET,
-            )
-            stored_manifest_value = data.get("segmentation")
-            strict_shot_changes = data.get("shot_changes")
-            strict_sing_spans = data.get("sing_spans")
-            with align_runtime_activity("AO-05", "context-and-limit-profile-issuance"):
-                align_context = align_orchestration.issue_public_align_context(
-                    target_path=vtt_path,
-                    sibling_path=json_path,
-                    media_path=media,
-                    prepared_audio_path=wav,
-                    expected_vtt=episode_transaction.FileGeneration(
-                        True, vtt_input_bytes
-                    ),
-                    expected_json=expected_json,
-                    expected_vtt_sha256=_expected_vtt_sha256,
-                    media_fingerprint=media_input_fingerprint,
-                    effective_iso=iso,
-                    route_kind=route_kind,
-                    blocks=blocks,
-                    prepared_audio_sha256=prepared_audio_sha256,
-                    legacy_policy=legacy_policy,
-                    stored_language=data.get("language"),
-                    segmentation=stored_manifest_value,
-                    strict_shot_changes=strict_shot_changes,
-                    strict_sing_spans=strict_sing_spans,
-                    explicit_media=explicit_media_requested,
-                    block_content_sha256=input_snapshot.block_content_sha256,
-                )
-            bind_align_runtime_identity(
-                route_kind=align_context.route_kind,
-                engine_family=align_context.engine_family,
-            )
-            observation_input = {
-                "context_content_digest": align_context.context_content_digest,
-                "vtt_sha256": hashlib.sha256(vtt_input_bytes).hexdigest(),
-                "sibling_present": json_input_bytes is not None,
-                "sibling_sha256": (
-                    None
-                    if json_input_bytes is None
-                    else hashlib.sha256(json_input_bytes).hexdigest()
-                ),
-                "media_fingerprint": media_input_fingerprint,
-                "media_logical_id": align_orchestration._media_logical_identity(
-                    media,
-                    explicit_media=explicit_media_requested,
-                ),
-                "effective_iso": iso,
-                "route": route_kind,
-                "block_count": len(blocks),
-                "block_content_sha256": input_snapshot.block_content_sha256,
-                "profile_source": (
-                    "manifest-absent"
-                    if not isinstance(stored_manifest_value, Mapping)
-                    else "stored-or-default"
-                ),
-            }
-            from voxweave.align_acquisition import (
-                _fresh_alignment_backend_invoker,
-                _fresh_alignment_call_observer,
-                _fresh_alignment_qwen_invoker,
-                begin_fresh_alignment,
-                seal_fresh_alignment,
-            )
-
-            prepared_sample_rate, prepared_sample_count = _prepared_audio_geometry(wav)
-
-            model_facts = {
-                "route": route_kind,
-                "language": iso,
-                "backend": align_route.backend_label(lambda: backend._use_mlx()),
-                "model": align_route.model_label(backend.ALIGNER_MODEL),
-                "sample_rate": prepared_sample_rate,
-            }
-            route_facts = _align_route_facts(route_kind, iso, blocks, crops)
-
-            with align_runtime_activity("AO-05", "acquisition-authorization"):
-                fresh_session = begin_fresh_alignment(
-                    align_context,
-                    alignment_texts=tuple(
-                        str(block.get("alignment_text", block["text"]))
-                        for block in blocks
-                    ),
-                    source_texts=tuple(str(block["text"]) for block in blocks),
-                    source_indices=tuple(
-                        int(block["source_index"]) for block in blocks
-                    ),
-                    language=iso,
-                    prepared_audio_sample_count=prepared_sample_count,
-                    sample_rate=prepared_sample_rate,
-                    backend_model_config_digest=_stable_fact_digest(model_facts),
-                    route_input_digest=_stable_fact_digest(route_facts),
-                    backend_model_config_facts=model_facts,
-                    route_input_facts=route_facts,
-                )
-            capture_raw_call = _fresh_alignment_call_observer(fresh_session)
-            invoke_backend_call = _fresh_alignment_backend_invoker(fresh_session)
-            invoke_qwen_call = _fresh_alignment_qwen_invoker(fresh_session)
-
-            def invoke_physical_preparation(operation: Callable[[], Any]) -> Any:
-                with align_runtime_activity("AO-06", "physical-call-preparation"):
-                    return operation()
-
-            def invoke_legacy_distribution(operation: Callable[[], Any]) -> Any:
-                with align_runtime_activity("AO-08", "legacy-owner-slice"):
-                    return operation()
-
-            def invoke_legacy_shift(operation: Callable[[], Any]) -> Any:
-                with align_runtime_activity("AO-09", "legacy-time-transform"):
-                    return operation()
+            fresh_session = binding.fresh_session
+            from voxweave.align_acquisition import seal_fresh_alignment
 
             rep.step("align subtitles")
             block_units = _align_blocks(
-                wav,
-                blocks,
-                iso,
-                mms=mms,
-                ctc_model=ctc_model,
-                crops=crops,
+                binding.wav,
+                inputs.blocks,
+                inputs.iso,
+                mms=inputs.mms,
+                ctc_model=inputs.ctc_model,
+                crops=inputs.crops,
                 reporter=rep,
-                tmp_chunks=tmp_chunks,
+                tmp_chunks=run.tmp_chunks,
                 # vad_speech persisted by transcribe (same media timeline): lets the CTC
                 # full pass mask non-speech emissions; absent/empty -> no masking
-                speech_spans=spans_in(data.get("vad_speech")),
-                raw_call_observer=capture_raw_call,
-                qwen_invoker=invoke_qwen_call,
-                backend_invoker=invoke_backend_call,
+                speech_spans=spans_in(inputs.data.get("vad_speech")),
+                raw_call_observer=binding.capture_raw_call,
+                qwen_invoker=binding.invoke_qwen_call,
+                backend_invoker=binding.invoke_backend_call,
                 physical_preparation_invoker=invoke_physical_preparation,
                 legacy_distribution_invoker=invoke_legacy_distribution,
                 legacy_shift_invoker=invoke_legacy_shift,
             )
 
+            # AO-10 and the seal below stay in this body: scripts/p6_oracle.py
+            # rewrites this seam in a copy of this file, so it must not move.
             # position_units_with_vad is not needed here (unlike the transcribe path): on
             # the Qwen per-cue route the tight crop already stops a cue's last word from
             # drifting into inter-sentence silence, and the MMS/CTC full passes absorb
             # silence in their blank tokens.
             with align_runtime_activity("AO-10", "group-block-spans"):
                 final, all_units = realign.group_block_spans(block_units)
-            with align_runtime_activity("AO-10", "common-all-empty-decision"):
-                if not all_units:
-                    exc = RuntimeError(f"no aligned units for {media.name}")
-                    _attach_canonical_failure(
-                        exc,
-                        kind="no-aligned-units",
-                        phase="fresh-acquisition",
-                        detail_code="all-block-units-empty",
-                    )
-                    raise exc
-            # Preserve the exact historical helper chain.  The selected result is sealed
-            # before seal_fresh_alignment may begin AO-11 strict recursive capture.
-            with align_runtime_activity("AO-10", "fill-insert-blocks"):
-                filled = realign.fill_insert_blocks(final)
-            with align_runtime_activity("AO-10", "enforce-min-duration"):
-                duration_enforced = realign.enforce_min_duration(
-                    filled,
-                    min_dur=MIN_CUE_SEC,
-                )
-            with align_runtime_activity("AO-10", "rescue-tiny-cues"):
-                rescued = realign.rescue_tiny_cues(
-                    duration_enforced,
-                    trig=TINY_CUE_SEC,
-                    target=TINY_CUE_TARGET,
-                )
-            with align_runtime_activity("AO-10", "clamp-spans"):
-                spans_filled = realign.clamp_spans(rescued)
-            with align_runtime_activity("AO-10", "seal-selected-legacy-result"):
-                selected_legacy = _seal_selected_legacy_align_result(
-                    block_units,
-                    spans_filled,
-                    all_units,
-                )
+            selected_legacy = select_legacy_alignment(
+                block_units, final, all_units, inputs.media
+            )
             acquisition = seal_fresh_alignment(fresh_session)
 
-            # Preserve vad_speech / shot_changes from the original JSON (computed by
-            # transcribe from the original media; align does not recompute them).
-            keep_vad = spans_in(data.get("vad_speech"))
-            keep_shots = [float(t) for t in data.get("shot_changes") or []] or None
-            keep_sing = spans_in(data.get("sing_spans"))
-            keep_turns = sibling_snapshot.carrier("speaker_turns")
-            # align never re-segments, so the segmentation manifest is preserved
-            # verbatim (and stays absent when the document never had one).
-            stored_manifest = data.get("segmentation")
-            keep_manifest = (
-                stored_manifest if isinstance(stored_manifest, Mapping) else None
+            selection, preserve_pair, cleanup = build_align_selection(
+                inputs, run, binding, acquisition, selected_legacy
             )
-            preserve_pair = bool(
-                voiceprint_pair is not None
-                and selected_snapshot is not None
-                and selected_snapshot.fingerprint == voiceprint_pair[1]
+            commit_align_outputs(
+                inputs, run, selection, preserve_pair, cleanup, rep=rep
             )
-            if (
-                voiceprint_pair is not None
-                and selected_snapshot is not None
-                and not preserve_pair
-            ):
-                log.warning(
-                    "voiceprint binding omitted during align: "
-                    "selected media does not match the sibling binding"
-                )
-            assert align_context is not None
-            selection = align_orchestration.build_align_selection(
-                context=align_context,
-                acquisition=acquisition,
-                blocks=blocks,
-                block_units=selected_legacy.block_units,
-                spans=selected_legacy.spans,
-                all_units=selected_legacy.all_units,
-                language=iso,
-                vad_speech=keep_vad,
-                shot_changes=keep_shots,
-                sing_spans=keep_sing,
-                speaker_turns=keep_turns,
-                voiceprint_pair=voiceprint_pair if preserve_pair else None,
-                manifest=keep_manifest,
-                shadow_requested=shadow_enabled(),
-                strict_input_status=sibling_snapshot.strict_input_status,
-                legacy_policy=legacy_policy,
-                stored_language=data.get("language"),
-                strict_shot_changes=strict_shot_changes,
-                strict_sing_spans=strict_sing_spans,
-            )
-            if observation_input is not None:
-                observation_input = {
-                    **observation_input,
-                    "profile_source": selection.profile_status.source,
-                }
-            cleanup: list[episode_transaction.ArtifactCleanup] = []
-            if pair_declared and not preserve_pair:
-                cleanup.extend(
-                    episode_transaction.speaker_artifact_cleanups(media, vtt_path)
-                )
-
-            rep.step("write outputs")
-            rep.stage("write VTT + JSON")
-            from voxweave.align_evidence import encode_align_evidence
-
-            with align_runtime_activity("AO-22", "selected-evidence-preencode"):
-                try:
-                    evidence_bytes = encode_align_evidence(selection.evidence)
-                except BaseException as exc:
-                    _attach_canonical_failure(
-                        exc,
-                        kind="preencode-failed",
-                        phase="preencode",
-                        detail_code="evidence-encode",
-                    )
-                    raise
-            evidence_path = artifacts.align_evidence_path(media, vtt_path)
-            cleanup.extend(
-                episode_transaction.evidence_cleanups(
-                    vtt_path, media=media, keep=evidence_path
-                )
-            )
-            evidence_artifact = episode_transaction.EvidencePublication(
-                evidence_path,
-                evidence_bytes,
-            )
-            episode_transaction.commit_primary_outputs(
-                command="align",
-                episode_path=media,
-                json_path=json_path,
-                vtt_path=vtt_path,
-                expected_json=expected_json,
-                expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
-                main_json_bytes=selection.verified.main_json_bytes,
-                vtt_bytes=selection.verified.vtt_bytes,
-                cleanup_paths=tuple(cleanup),
-                context=selection.context,
-                media_path=media,
-                expected_media_fingerprint=media_input_fingerprint,
-                expected_voiceprint_media_fingerprint=(
-                    voiceprint_pair[1]
-                    if voiceprint_pair is not None and selected_snapshot is not None
-                    else None
-                ),
-                expected_pair_decision=(
-                    preserve_pair
-                    if voiceprint_pair is not None and selected_snapshot is not None
-                    else None
-                ),
-                evidence_artifact=evidence_artifact,
-            )
-            completed_selection = selection
-            aligned_cue_count = len(blocks)
-            aligned_unit_count = len(selected_legacy.all_units)
+            run.completed_selection = selection
+            run.aligned_cue_count = len(inputs.blocks)
+            run.aligned_unit_count = len(selected_legacy.all_units)
         except BaseException as exc:
             production_failure = exc
             raise
         finally:
-            # Release aligner singleton VRAM (separation self-releases earlier).
-            disposal_failure: BaseException | None = None
-            with align_runtime_activity("AO-24", "media-snapshot-disposal"):
-                try:
-                    snapshots.close()
-                except BaseException as exc:
-                    disposal_failure = _record_disposal_failure(
-                        production_failure,
-                        disposal_failure,
-                        exc,
-                        detail_code="media-snapshot-residue",
-                    )
-            with align_runtime_activity("AO-24", "backend-and-audio-temp-disposal"):
-                # Guarded: a release that raises (e.g. torch.cuda.empty_cache after a CUDA
-                # fault) must neither mask the original error nor skip the temp cleanup.
-                try:
-                    backend.release()
-                except Exception as exc:
-                    log.warning("releasing the alignment models failed: %r", exc)
-                for p in tmp:
-                    try:
-                        p.unlink(missing_ok=True)
-                    except BaseException as exc:
-                        disposal_failure = _record_disposal_failure(
-                            production_failure,
-                            disposal_failure,
-                            exc,
-                            detail_code="audio-temp-residue",
-                        )
-                for c in tmp_chunks:
-                    try:
-                        c.unlink(missing_ok=True)
-                    except BaseException as exc:
-                        disposal_failure = _record_disposal_failure(
-                            production_failure,
-                            disposal_failure,
-                            exc,
-                            detail_code="audio-temp-residue",
-                        )
-            with align_runtime_activity("AO-24", "selection-role-retirement"):
-                if align_context is not None:
-                    from voxweave import align_orchestration
-
-                    align_orchestration.retire_align_selection(align_context)
-            if production_failure is None and disposal_failure is not None:
-                raise disposal_failure
+            dispose_align_run(run, production_failure)
         with align_runtime_activity("AO-25", "artifact-and-observer-dispatch"):
             if (
                 shadow_enabled()
                 and _shadow_observer is not None
-                and completed_selection is not None
-                and observation_input is not None
-                and prepared_audio_sha256 is not None
+                and run.completed_selection is not None
+                and run.observation_input is not None
+                and run.prepared_audio_sha256 is not None
             ):
-                _notify_align_shadow_observer(
+                notify_align_shadow_observer(
                     _shadow_observer,
-                    selection=completed_selection,
-                    input_summary=observation_input,
-                    prepared_audio_sha256=prepared_audio_sha256,
+                    selection=run.completed_selection,
+                    input_summary=run.observation_input,
+                    prepared_audio_sha256=run.prepared_audio_sha256,
                 )
     finally:
         # Only after AO-25: the shadow observer still reads the registries.
-        if align_context is not None:
+        if run.align_context is not None:
             from voxweave import align_orchestration
 
-            align_orchestration.release_align_selection(align_context)
+            align_orchestration.release_align_selection(run.align_context)
     log.info(
         "aligned %s → %d cues, %d units",
         vtt_path.name,
-        aligned_cue_count,
-        aligned_unit_count,
+        run.aligned_cue_count,
+        run.aligned_unit_count,
     )
     return vtt_path

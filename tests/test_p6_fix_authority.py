@@ -221,7 +221,7 @@ def test_ctc_production_seam_preserves_pre_and_post_interpolation_values():
 
 
 def test_qwen_mismatch_is_typed_and_rat5_semantics_are_live():
-    from voxweave import align_acquisition, pipeline
+    from voxweave import align_acquisition, align_blocks
     from voxweave.align_acquisition import qwen_sample_geometry
     from voxweave.core import align_compare
     from voxweave.p6_ratifications import QWEN_SELECTED_V2_ENABLED
@@ -239,13 +239,13 @@ def test_qwen_mismatch_is_typed_and_rat5_semantics_are_live():
 
     acquisition_source = inspect.getsource(align_acquisition)
     assert "physical-origin-mismatch" in acquisition_source
-    align_blocks_source = inspect.getsource(pipeline._align_blocks)
-    if "def observe_sample_geometry" in align_blocks_source:
-        observer_source = align_blocks_source.split(
-            "def observe_sample_geometry", maxsplit=1
-        )[1].split("cwav = slice_wav", maxsplit=1)[0]
-        assert "except Exception" not in observer_source
-        assert "physical_origin = cs" not in align_blocks_source
+    align_blocks_source = inspect.getsource(align_blocks)
+    assert "def observe_sample_geometry" in align_blocks_source
+    observer_source = align_blocks_source.split(
+        "def observe_sample_geometry", maxsplit=1
+    )[1].split("cwav = request.slice_audio", maxsplit=1)[0]
+    assert "except Exception" not in observer_source
+    assert "physical_origin = cs" not in align_blocks_source
 
     assert QWEN_SELECTED_V2_ENABLED is True
     assert align_compare.semantic_comparison_available() is True

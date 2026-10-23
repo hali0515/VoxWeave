@@ -120,6 +120,7 @@ def test_hook_resolves_the_lane_from_shadow_v2_at_call_time(monkeypatch) -> None
 # only with the flag on, behind ``shadow_schema``.
 _SPLIT_DEFAULT_PATH = ("shadow_oracles", "shadow_rows")
 _SPLIT_FLAG_ONLY = ("shadow_schema_fields", "shadow_schema_finalizer")
+_CORE_PACKAGE = ("voxweave", "core")
 
 
 def _imported_modules(node: ast.Import | ast.ImportFrom) -> set[str]:
@@ -127,7 +128,11 @@ def _imported_modules(node: ast.Import | ast.ImportFrom) -> set[str]:
         return {alias.name for alias in node.names}
     base = node.module or ""
     if node.level:
-        base = f"voxweave.core.{base}" if base else "voxweave.core"
+        # One dot is the split module's own package (voxweave.core); every extra
+        # dot goes one package up, so ``from ..segmentation import x`` is
+        # voxweave.segmentation.
+        package = ".".join(_CORE_PACKAGE[: len(_CORE_PACKAGE) - (node.level - 1)])
+        base = f"{package}.{base}" if base else package
     names = {base}
     names |= {f"{base}.{alias.name}" for alias in node.names}
     return names
@@ -174,9 +179,7 @@ def test_the_split_shadow_modules_import_nothing_upward() -> None:
                 assert not _imported_modules(node) & forbidden, (name, ast.dump(node))
 
 
-def test_the_two_independent_oracles_share_no_module() -> None:
-    # N11 and N7 audit the finalizer from different sides: neither may borrow the
-    # other's helpers, or one wrong helper would satisfy both.
+def test_the_oracle_and_row_modules_import_neither_each_other() -> None:
     for name, other in (
         ("shadow_oracles", "shadow_rows"),
         ("shadow_rows", "shadow_oracles"),
@@ -184,6 +187,39 @@ def test_the_two_independent_oracles_share_no_module() -> None:
         for node in ast.walk(_split_source(name)):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 assert f"voxweave.core.{other}" not in _imported_modules(node), name
+
+
+def test_the_two_independent_oracles_share_no_helper() -> None:
+    # N11 and N7 audit the finalizer from different sides: neither may borrow the
+    # other's helpers, or one wrong helper would satisfy both. They live in the
+    # same module, so compare the module-level functions and classes each reads.
+    defs = {
+        node.name: node
+        for node in _split_source("shadow_oracles").body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    }
+    n11 = {
+        name
+        for name in defs
+        if name == "_shadow_diff_classification" or name.startswith("_n11_")
+    }
+    n7 = {"_AuditedFinalizerPreview"}
+    assert "_shadow_diff_classification" in n11 and n7 <= set(defs)
+
+    def reads(group: set[str]) -> set[str]:
+        return {
+            sub.id
+            for name in group
+            for sub in ast.walk(defs[name])
+            if isinstance(sub, ast.Name)
+            and isinstance(sub.ctx, ast.Load)
+            and sub.id in defs
+        }
+
+    assert not reads(n7) & n11
+    assert not reads(n11) & n7
+    shared = (reads(n7) - n7) & (reads(n11) - n11)
+    assert not shared, shared
 
 
 def test_the_default_path_split_modules_import_no_v2_module_at_module_scope() -> None:

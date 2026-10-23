@@ -342,7 +342,7 @@ def test_backend_raised_invoker_is_wired_to_both_live_full_pass_leaves(
     import inspect
     from types import SimpleNamespace
 
-    from voxweave import align_ctc, align_mms, pipeline
+    from voxweave import align_blocks, align_ctc, align_mms
     from voxweave.align_acquisition import _fresh_alignment_backend_invoker
 
     def fail_backend(*_args, **_kwargs):
@@ -379,8 +379,8 @@ def test_backend_raised_invoker_is_wired_to_both_live_full_pass_leaves(
     assert mms_failure.kind == "fresh-backend-output-invalid"
     assert mms_failure.detail_code == "backend-raised"
 
-    source = inspect.getsource(pipeline._align_blocks)
-    assert source.count("_backend_invoker=backend_invoker") == 2
+    source = inspect.getsource(align_blocks)
+    assert source.count("_backend_invoker=request.backend_invoker") == 2
 
 
 @pytest.mark.parametrize(

@@ -148,7 +148,7 @@ def test_separation_cleans_its_temps_on_keyboard_interrupt(tmp_path, monkeypatch
     def interrupted(*_args, **_kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(pipeline, "decode_to_wav", fake_decode)
+    monkeypatch.setattr(transcription, "decode_to_wav", fake_decode)
     monkeypatch.setattr(vocals, "decode_to_wav", fake_decode)
     monkeypatch.setattr(backend, "separate_vocals", interrupted)
 
