@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -252,6 +253,206 @@ def _add_purge_command(
     return purge_command
 
 
+def _serve_params(
+    episode_type: click.Path, voices_type: click.Path, voices_dir_type: VoicesDirPath
+) -> Callable[[Callable[..., None]], Callable[..., None]]:
+    # The `speakers serve` argument and options, in the order --help lists them.
+    params = (
+        click.argument("episode_path", metavar="EPISODE", type=episode_type),
+        click.option(
+            "--voices-dir",
+            type=voices_dir_type,
+            help=f"Voice library for name suggestions ({VOICES_DIR_DEFAULT}).",
+        ),
+        click.option(
+            "--voices",
+            type=voices_type,
+            help="Suggest from this per-show voices store instead of the voice library.",
+        ),
+        click.option(
+            "--show",
+            help="Scope for suggestions (default: the media folder's name, prefixed with "
+            "its parent's for generic folders like 'Season 1'): voices "
+            "of this scope first, other scopes only on a stricter match.",
+        ),
+        click.option(
+            "--manual", is_flag=True, help="Name speakers without voice matching."
+        ),
+        click.option("--no-match", is_flag=True, hidden=True),
+        click.option(
+            "--host",
+            type=click.Choice(["127.0.0.1", "0.0.0.0"]),
+            default="127.0.0.1",
+            show_default=True,
+            help=(
+                "HTTP bind address; 0.0.0.0 allows access from other devices. The page"
+                " opens only through the printed access link (/?k=...); anyone who has"
+                " that link can play the audio and edit names, and on the network the"
+                " connection is plain HTTP."
+            ),
+        ),
+        click.option(
+            "--ngrok",
+            is_flag=True,
+            help=(
+                "Discover this port's public URLs from the local ngrok agent"
+                " automatically. Open the tunnel URL with the printed /?k=... appended;"
+                " anyone who has that link can play the audio and edit names."
+            ),
+        ),
+        click.option(
+            "--port",
+            type=click.IntRange(0, 65535),
+            default=0,
+            metavar="PORT",
+            show_default=True,
+            help="HTTP port; 0 selects an available port.",
+        ),
+        click.option(
+            "--open/--no-open",
+            "open_browser",
+            default=True,
+            help="Open the audition in a browser.",
+        ),
+        click.option(
+            "--render/--no-render",
+            default=True,
+            help=(
+                "Re-render the episode's VTT after each Save so it shows the new names"
+                " (default: on). A VTT with cue text or timing the JSON would not"
+                " reproduce, such as hand edits, is left unchanged."
+            ),
+        ),
+        click.option("--enroll", is_flag=True, hidden=True),
+        click.option("--purge-voiceprints", is_flag=True, hidden=True),
+        click.option("--episode", hidden=True),
+        click.option("--replace-episode", is_flag=True, hidden=True),
+    )
+
+    def decorate(callback: Callable[..., None]) -> Callable[..., None]:
+        # Apply bottom-up, as stacked decorators would.
+        for param in reversed(params):
+            callback = param(callback)
+        return callback
+
+    return decorate
+
+
+@dataclass(frozen=True)
+class _ServeRequest:
+    # The `speakers serve` option values, with --no-match folded into manual.
+    episode_path: Path
+    voices_dir: Path | None
+    voices: Path | None
+    show: str | None
+    manual: bool
+    host: str
+    ngrok: bool
+    port: int
+    open_browser: bool
+    render: bool
+    enroll: bool
+    episode: str | None
+    replace_episode: bool
+
+
+def _serve_legacy_purge(
+    ctx: click.Context, purge_command: click.Command, request: _ServeRequest
+) -> None:
+    # The deprecated `serve --purge-voiceprints` route to `speakers purge`.
+    if any(
+        (
+            request.voices,
+            request.voices_dir,
+            request.show,
+            request.manual,
+            request.host != "127.0.0.1",
+            request.ngrok,
+            request.port,
+            not request.open_browser,
+            request.enroll,
+            request.episode,
+            request.replace_episode,
+        )
+    ):
+        raise click.UsageError(
+            "--purge-voiceprints is mutually exclusive with generation/enrollment options"
+        )
+    warn_deprecated("--purge-voiceprints is deprecated; use speakers purge EPISODE")
+    ctx.invoke(purge_command, episode_path=request.episode_path)
+
+
+def _serve_legacy_enroll(
+    ctx: click.Context, enroll_command: click.Command, request: _ServeRequest
+) -> None:
+    # The deprecated `serve --enroll` route to `speakers enroll`.
+    if request.manual:
+        raise click.UsageError("manual mode cannot be combined with --enroll")
+    if (
+        request.host != "127.0.0.1"
+        or request.ngrok
+        or request.port
+        or not request.open_browser
+    ):
+        raise click.UsageError(
+            "--host/--ngrok/--port/--no-open cannot be combined with --enroll"
+        )
+    warn_deprecated("--enroll is deprecated; use speakers enroll EPISODE")
+    ctx.invoke(
+        enroll_command,
+        episode_path=request.episode_path,
+        voices_dir=request.voices_dir,
+        voices=request.voices,
+        show=request.show,
+        episode=request.episode,
+        replace=False,
+        replace_episode=request.replace_episode,
+    )
+
+
+def _serve_audition(
+    run: Callable[..., Any],
+    report: Callable[[str], None],
+    request: _ServeRequest,
+    library: dict[str, Path | None],
+    create_speaker_audition: Callable[..., Any],
+    serve: Callable[..., Any],
+) -> None:
+    # Builds the audition page, then serves it until the user stops the service.
+    def prepare(_rep: object) -> Any:
+        owner = _episode_owner(request.episode_path, require_media=True)
+        return create_speaker_audition(
+            owner,
+            voices=request.voices,
+            show=request.show,
+            no_match=request.manual,
+            **library,
+        )
+
+    audition = run(prepare, reporter=False)
+    run(
+        lambda _rep: serve(
+            page=audition.page,
+            media_path=audition.media_path,
+            mapping_path=audition.mapping_path,
+            sibling_path=audition.sibling_json_path,
+            speaker_ids=audition.speaker_ids,
+            pristine_mapping_generation=audition.pristine_mapping_generation,
+            host=request.host,
+            ngrok=request.ngrok,
+            port=request.port,
+            open_browser=request.open_browser,
+            report=report,
+            render=(
+                _render_after_save(audition.sibling_json_path)
+                if request.render
+                else None
+            ),
+        ),
+        reporter=False,
+    )
+
+
 def _add_serve_command(
     group: click.Group,
     run: Callable[..., Any],
@@ -266,75 +467,7 @@ def _add_serve_command(
     # Registers `speakers serve`, the group's default command; the deprecated
     # --enroll and --purge-voiceprints flags invoke the two commands passed in.
     @group.command("serve", short_help="Review speaker names in a local browser.")
-    @click.argument("episode_path", metavar="EPISODE", type=episode_type)
-    @click.option(
-        "--voices-dir",
-        type=voices_dir_type,
-        help=f"Voice library for name suggestions ({VOICES_DIR_DEFAULT}).",
-    )
-    @click.option(
-        "--voices",
-        type=voices_type,
-        help="Suggest from this per-show voices store instead of the voice library.",
-    )
-    @click.option(
-        "--show",
-        help="Scope for suggestions (default: the media folder's name, prefixed with "
-        "its parent's for generic folders like 'Season 1'): voices "
-        "of this scope first, other scopes only on a stricter match.",
-    )
-    @click.option(
-        "--manual", is_flag=True, help="Name speakers without voice matching."
-    )
-    @click.option("--no-match", is_flag=True, hidden=True)
-    @click.option(
-        "--host",
-        type=click.Choice(["127.0.0.1", "0.0.0.0"]),
-        default="127.0.0.1",
-        show_default=True,
-        help=(
-            "HTTP bind address; 0.0.0.0 allows access from other devices. The page opens"
-            " only through the printed access link (/?k=...); anyone who has that link can"
-            " play the audio and edit names, and on the network the connection is plain"
-            " HTTP."
-        ),
-    )
-    @click.option(
-        "--ngrok",
-        is_flag=True,
-        help=(
-            "Discover this port's public URLs from the local ngrok agent automatically."
-            " Open the tunnel URL with the printed /?k=... appended; anyone who has that"
-            " link can play the audio and edit names."
-        ),
-    )
-    @click.option(
-        "--port",
-        type=click.IntRange(0, 65535),
-        default=0,
-        metavar="PORT",
-        show_default=True,
-        help="HTTP port; 0 selects an available port.",
-    )
-    @click.option(
-        "--open/--no-open",
-        "open_browser",
-        default=True,
-        help="Open the audition in a browser.",
-    )
-    @click.option(
-        "--render/--no-render",
-        default=True,
-        help=(
-            "Re-render the episode's VTT after each Save so it shows the new names"
-            " (default: on). A VTT with cue text or timing the JSON would not"
-            " reproduce, such as hand edits, is left unchanged."
-        ),
-    )
-    @click.option("--enroll", is_flag=True, hidden=True)
-    @click.option("--purge-voiceprints", is_flag=True, hidden=True)
-    @click.option("--episode", hidden=True)
-    @click.option("--replace-episode", is_flag=True, hidden=True)
+    @_serve_params(episode_type, voices_type, voices_dir_type)
     @click.pass_context
     def serve_command(
         ctx: click.Context,
@@ -362,82 +495,33 @@ def _add_serve_command(
             raise click.UsageError("use either --manual or --no-match, not both")
         if no_match:
             warn_deprecated("--no-match is deprecated; use speakers serve --manual")
-        manual = manual or no_match
+        request = _ServeRequest(
+            episode_path=episode_path,
+            voices_dir=voices_dir,
+            voices=voices,
+            show=show,
+            manual=manual or no_match,
+            host=host,
+            ngrok=ngrok,
+            port=port,
+            open_browser=open_browser,
+            render=render,
+            enroll=enroll,
+            episode=episode,
+            replace_episode=replace_episode,
+        )
         if purge_voiceprints:
-            if any(
-                (
-                    voices,
-                    voices_dir,
-                    show,
-                    manual,
-                    host != "127.0.0.1",
-                    ngrok,
-                    port,
-                    not open_browser,
-                    enroll,
-                    episode,
-                    replace_episode,
-                )
-            ):
-                raise click.UsageError(
-                    "--purge-voiceprints is mutually exclusive with generation/enrollment options"
-                )
-            warn_deprecated(
-                "--purge-voiceprints is deprecated; use speakers purge EPISODE"
-            )
-            ctx.invoke(purge_command, episode_path=episode_path)
+            _serve_legacy_purge(ctx, purge_command, request)
             return
         library = library_kwargs(voices, voices_dir)
         if enroll:
-            if manual:
-                raise click.UsageError("manual mode cannot be combined with --enroll")
-            if host != "127.0.0.1" or ngrok or port or not open_browser:
-                raise click.UsageError(
-                    "--host/--ngrok/--port/--no-open cannot be combined with --enroll"
-                )
-            warn_deprecated("--enroll is deprecated; use speakers enroll EPISODE")
-            ctx.invoke(
-                enroll_command,
-                episode_path=episode_path,
-                voices_dir=voices_dir,
-                voices=voices,
-                show=show,
-                episode=episode,
-                replace=False,
-                replace_episode=replace_episode,
-            )
+            _serve_legacy_enroll(ctx, enroll_command, request)
             return
         if episode is not None or replace_episode:
             raise click.UsageError(
                 "--episode/--replace-episode require speakers enroll"
             )
-
-        def prepare(_rep: object) -> Any:
-            owner = _episode_owner(episode_path, require_media=True)
-            return create_speaker_audition(
-                owner, voices=voices, show=show, no_match=manual, **library
-            )
-
-        audition = run(prepare, reporter=False)
-        run(
-            lambda _rep: serve(
-                page=audition.page,
-                media_path=audition.media_path,
-                mapping_path=audition.mapping_path,
-                sibling_path=audition.sibling_json_path,
-                speaker_ids=audition.speaker_ids,
-                pristine_mapping_generation=audition.pristine_mapping_generation,
-                host=host,
-                ngrok=ngrok,
-                port=port,
-                open_browser=open_browser,
-                report=report,
-                render=(
-                    _render_after_save(audition.sibling_json_path) if render else None
-                ),
-            ),
-            reporter=False,
-        )
+        _serve_audition(run, report, request, library, create_speaker_audition, serve)
 
     return serve_command
 
