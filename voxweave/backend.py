@@ -19,6 +19,7 @@ from voxweave.align_mms import (
     uses_mms as uses_mms,  # re-export (pipeline-facing)
 )
 from voxweave.core.langsets import ALIGNER_NO_SPACE_LANGS, LANGUAGES_WITHOUT_SPACES
+from voxweave.qwen_decode import decode_slot_times
 from voxweave.runtime import (
     _MISSING_WHISPER,
     _empty_cache,
@@ -1090,6 +1091,37 @@ def _get_aligner():
     return _aligner
 
 
+def _qwen_units(aligner, wav_path: Path, text: str, language: str) -> list[dict]:
+    """Units [{text,start,end}] from the Qwen aligner, decoded by qwen_decode.
+
+    Runs the same prompt and forward pass as ``aligner.align`` but decodes the slot logits with
+    ``qwen_decode.decode_slot_times`` instead of the wrapper's argmax + LIS repair.
+    """
+    import torch
+    from qwen_asr.inference.utils import SAMPLE_RATE, normalize_audios
+
+    words, prompt = aligner.aligner_processor.encode_timestamp(text, language)
+    if not words:
+        raise ValueError("no alignable tokens in the text")
+    audios = normalize_audios(str(wav_path))
+    inputs = aligner.processor(
+        text=[prompt], audio=audios, return_tensors="pt", padding=True
+    )
+    inputs = inputs.to(aligner.model.device).to(aligner.model.dtype)
+    with torch.inference_mode():
+        logits = aligner.model.thinker(**inputs).logits[0]
+    slots = logits[inputs["input_ids"][0] == aligner.timestamp_token_id]
+    times = decode_slot_times(
+        slots.float().cpu().numpy(),
+        aligner.timestamp_segment_time,
+        len(audios[0]) / SAMPLE_RATE,
+    )
+    return [
+        {"text": word, "start": float(times[2 * i]), "end": float(times[2 * i + 1])}
+        for i, word in enumerate(words)
+    ]
+
+
 def _parse_whisper_device() -> tuple[str, int]:
     """Resolved device ('cuda:0'/'cuda'/'mps'/'cpu') -> faster-whisper's (device, device_index).
     ctranslate2 has no Metal backend, so mps (and anything non-cuda) maps to CPU."""
@@ -1150,7 +1182,9 @@ def align_text(wav_path: Path, text: str, language: str) -> list[dict]:
     CUDA on Linux, CPU on macOS — CoreML is avoided as its Metal context segfaults alongside MLX,
     see _mms_providers), so English keeps its WhisperX-grade wav2vec2 alignment even on Apple
     Silicon. Only the Qwen fallback differs: on the MLX backend the torch qwen-asr aligner is
-    absent, so the native MLX Qwen3-ForcedAligner serves it instead.
+    absent, so the native MLX Qwen3-ForcedAligner serves it instead. The torch Qwen route decodes
+    its slot logits with qwen_decode (monotone path + soft boundaries); the MLX port keeps the
+    upstream argmax decode.
     """
     from voxweave.lang import is_supported, to_aligner_name, to_iso
 
@@ -1177,12 +1211,7 @@ def align_text(wav_path: Path, text: str, language: str) -> list[dict]:
 
         return backend_mlx.align(wav_path, text, language)
 
-    aligner = _get_aligner()
-    results = aligner.align(str(wav_path), text, to_aligner_name(language))
-    units = [
-        {"text": it.text, "start": float(it.start_time), "end": float(it.end_time)}
-        for it in results[0]
-    ]
+    units = _qwen_units(_get_aligner(), wav_path, text, to_aligner_name(language))
     _empty_cache()
     return units
 
