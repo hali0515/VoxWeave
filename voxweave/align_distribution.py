@@ -14,7 +14,7 @@ import contextvars
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from voxweave.align_failures import (
@@ -1208,6 +1208,117 @@ def _preflight_invalid_receipt(
     return None
 
 
+@dataclass
+class _AuthorityRun:
+    # The job state the producer and verifier lanes advance call by call.
+    budget: _BudgetLedger
+    rows: list[AuthorityCallWorkReceipt] = field(default_factory=list)
+    owners_by_source: dict[int, tuple[str, ...]] = field(default_factory=dict)
+    job_status: str = "complete"
+    denied_charge: DeniedCharge | None = None
+    terminal_call_index: int | None = None
+    stopped: bool = False
+
+    def stop(self, job_status: str, call_index: int) -> None:
+        # The first terminal call ends the job; later calls are not run.
+        self.job_status = job_status
+        self.terminal_call_index = call_index
+        self.stopped = True
+
+
+def _lane_receipt(lane: _LaneResult) -> WorkLaneReceipt:
+    status = "complete" if lane.status == "unique" else lane.status
+    return WorkLaneReceipt(status, lane.counters, lane.detail)
+
+
+def _run_authority_call(
+    run: _AuthorityRun,
+    call: AuthorityCallInput,
+    iso: str,
+    positions_by_owner: _ClaimPositions,
+    blocks_by_source: dict[int, AuthorityBlock],
+    effective_profile: AuthorityLimitProfile,
+) -> None:
+    # Charge one call, run the allocator lane, then the verifier lane on a unique tiling.
+    budget = run.budget
+    call_denied = budget.reserve_call(call.call_index)
+    if call_denied is not None:
+        row = _base_call_receipt(
+            call, positions_by_owner, blocks_by_source, effective_profile.call
+        )
+        run.rows.append(
+            replace(
+                row,
+                allocator=WorkLaneReceipt(
+                    "budget-exhausted", ZERO_COUNTERS, "allocation-budget"
+                ),
+            )
+        )
+        run.denied_charge = call_denied
+        run.stop("budget-exhausted", call.call_index)
+        return
+    assert call.unit_surfaces is not None
+    call_blocks = tuple(
+        blocks_by_source[source_index] for source_index in call.source_block_indices
+    )
+    allocator = _run_allocator_lane(call_blocks, call.unit_surfaces, iso, budget)
+    row = _base_call_receipt(
+        call, positions_by_owner, blocks_by_source, effective_profile.call
+    )
+    allocator_receipt = _lane_receipt(allocator)
+    if allocator.status != "unique":
+        run.rows.append(replace(row, allocator=allocator_receipt))
+        run.denied_charge = allocator.denied
+        run.stop(
+            "budget-exhausted" if allocator.status == "budget-exhausted" else "invalid",
+            call.call_index,
+        )
+        return
+    verifier = _run_verifier_lane(call_blocks, call.unit_surfaces, iso, budget)
+    _settle_verified_call(run, call, row, allocator, allocator_receipt, verifier)
+
+
+def _settle_verified_call(
+    run: _AuthorityRun,
+    call: AuthorityCallInput,
+    row: AuthorityCallWorkReceipt,
+    allocator: _LaneResult,
+    allocator_receipt: WorkLaneReceipt,
+    verifier: _LaneResult,
+) -> None:
+    # Record the verifier outcome: budget stop, seal mismatch, or the call's owners.
+    verifier_receipt = _lane_receipt(verifier)
+    if verifier.status == "budget-exhausted":
+        run.rows.append(
+            replace(row, allocator=allocator_receipt, verifier=verifier_receipt)
+        )
+        run.denied_charge = verifier.denied
+        run.stop("budget-exhausted", call.call_index)
+        return
+    if verifier.status != "unique" or verifier.cuts != allocator.cuts:
+        run.rows.append(
+            replace(
+                row,
+                allocator=allocator_receipt,
+                verifier=WorkLaneReceipt(
+                    "seal-mismatch", verifier.counters, "distribution-seal"
+                ),
+            )
+        )
+        run.stop("seal-mismatch", call.call_index)
+        return
+    assert allocator.cuts is not None
+    owner_groups = tuple(
+        call.raw_unit_ids[allocator.cuts[index] : allocator.cuts[index + 1]]
+        for index in range(len(call.source_block_indices))
+    )
+    for source_index, owner in zip(call.source_block_indices, owner_groups):
+        run.owners_by_source[source_index] = owner
+    run.rows.append(
+        replace(row, allocator=allocator_receipt, verifier=verifier_receipt)
+    )
+
+
 def _build_authority_distribution_impl(
     *,
     blocks: tuple[AuthorityBlock, ...],
@@ -1242,16 +1353,10 @@ def _build_authority_distribution_impl(
     if invalid_receipt is not None:
         return invalid_receipt
 
-    budget = _BudgetLedger(effective_profile)
-    rows: list[AuthorityCallWorkReceipt] = []
-    owners_by_source: dict[int, tuple[str, ...]] = {}
-    job_status: str = "complete"
-    denied_charge: DeniedCharge | None = None
-    terminal_call_index: int | None = None
-    stopped = False
+    run = _AuthorityRun(_BudgetLedger(effective_profile))
     for call in calls:
-        if stopped:
-            rows.append(
+        if run.stopped:
+            run.rows.append(
                 _base_call_receipt(
                     call,
                     positions_by_owner,
@@ -1261,101 +1366,14 @@ def _build_authority_distribution_impl(
                 )
             )
             continue
-        call_denied = budget.reserve_call(call.call_index)
-        if call_denied is not None:
-            row = _base_call_receipt(
-                call, positions_by_owner, blocks_by_source, effective_profile.call
-            )
-            rows.append(
-                replace(
-                    row,
-                    allocator=WorkLaneReceipt(
-                        "budget-exhausted", ZERO_COUNTERS, "allocation-budget"
-                    ),
-                )
-            )
-            job_status = "budget-exhausted"
-            denied_charge = call_denied
-            terminal_call_index = call.call_index
-            stopped = True
-            continue
-        assert call.unit_surfaces is not None
-        call_blocks = tuple(
-            blocks_by_source[source_index] for source_index in call.source_block_indices
-        )
-        allocator = _run_allocator_lane(call_blocks, call.unit_surfaces, iso, budget)
-        row = _base_call_receipt(
-            call, positions_by_owner, blocks_by_source, effective_profile.call
-        )
-        allocator_receipt = WorkLaneReceipt(
-            "complete" if allocator.status == "unique" else allocator.status,
-            allocator.counters,
-            allocator.detail,
-        )
-        if allocator.status != "unique":
-            rows.append(replace(row, allocator=allocator_receipt))
-            job_status = (
-                "budget-exhausted"
-                if allocator.status == "budget-exhausted"
-                else "invalid"
-            )
-            denied_charge = allocator.denied
-            terminal_call_index = call.call_index
-            stopped = True
-            continue
-        verifier = _run_verifier_lane(call_blocks, call.unit_surfaces, iso, budget)
-        verifier_receipt = WorkLaneReceipt(
-            "complete" if verifier.status == "unique" else verifier.status,
-            verifier.counters,
-            verifier.detail,
-        )
-        if verifier.status == "budget-exhausted":
-            rows.append(
-                replace(
-                    row,
-                    allocator=allocator_receipt,
-                    verifier=verifier_receipt,
-                )
-            )
-            job_status = "budget-exhausted"
-            denied_charge = verifier.denied
-            terminal_call_index = call.call_index
-            stopped = True
-            continue
-        if verifier.status != "unique" or verifier.cuts != allocator.cuts:
-            rows.append(
-                replace(
-                    row,
-                    allocator=allocator_receipt,
-                    verifier=WorkLaneReceipt(
-                        "seal-mismatch",
-                        verifier.counters,
-                        "distribution-seal",
-                    ),
-                )
-            )
-            job_status = "seal-mismatch"
-            terminal_call_index = call.call_index
-            stopped = True
-            continue
-        assert allocator.cuts is not None
-        owner_groups = tuple(
-            call.raw_unit_ids[allocator.cuts[index] : allocator.cuts[index + 1]]
-            for index in range(len(call.source_block_indices))
-        )
-        for source_index, owner in zip(call.source_block_indices, owner_groups):
-            owners_by_source[source_index] = owner
-        rows.append(
-            replace(
-                row,
-                allocator=allocator_receipt,
-                verifier=verifier_receipt,
-            )
+        _run_authority_call(
+            run, call, iso, positions_by_owner, blocks_by_source, effective_profile
         )
 
+    budget = run.budget
     assert budget.totals is not None
     work = _job_receipt(
-        status=job_status,
+        status=run.job_status,
         mismatch=None,
         route_claims=route_claims,
         route_count=len(delivery_route),
@@ -1364,16 +1382,16 @@ def _build_authority_distribution_impl(
         profile=effective_profile,
         charged_calls=budget.calls,
         totals=budget.totals.frozen(),
-        terminal_call_index=terminal_call_index,
-        denied=denied_charge,
-        call_rows=tuple(rows),
+        terminal_call_index=run.terminal_call_index,
+        denied=run.denied_charge,
+        call_rows=tuple(run.rows),
         skip_rows=skip_rows,
     )
     return _final_receipt(
         work=work,
-        job_status=job_status,
+        job_status=run.job_status,
         delivery_route=delivery_route,
-        owners_by_source=owners_by_source,
+        owners_by_source=run.owners_by_source,
         all_raw_ids=all_raw_ids,
     )
 
