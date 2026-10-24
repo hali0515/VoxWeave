@@ -3,6 +3,28 @@
 What changed per release, newest first. Only releases that need an action or a
 heads-up appear here.
 
+## 0.19.0
+
+Word timings for Chinese and Cantonese change slightly. The rest of this release is
+internal restructuring and a shorter README (the reference moved to `docs/`).
+
+### Qwen forced alignment decodes timestamps differently
+
+Chinese and Cantonese, any language without a dedicated CTC aligner, and the fallback after a
+failed CTC/MMS pass align with Qwen3-ForcedAligner. The upstream wrapper took the best class
+for every timestamp slot and then repaired non-increasing slots, which left zero-duration
+words, copied or interpolated slots the model never predicted, and put every boundary on
+the 80 ms class grid. voxweave now decodes the same model output as the best
+non-decreasing path in which every word ends at least one class after it starts, then
+refines each boundary with a soft estimate over the three neighbouring classes.
+
+On two Chinese episodes the word text and the cue count stay the same, zero-duration words
+drop from 2.11% and 0.59% to 0.05% and 0%, the median word moves 1-2 ms, and the largest cue
+boundary moves 96 ms. Word times are no longer multiples of 80 ms, so a re-run with
+`voxweave align` can differ from a 0.18.0 result by a few tens of milliseconds on some words
+(a handful move by more than 100 ms). Re-run `align` if you want the new timings; nothing
+needs to change in your files. Apple Silicon (MLX) keeps the upstream decode.
+
 ## 0.18.0
 
 Most of this release concerns `--voiceprints` (cross-episode voice matching and **Split
