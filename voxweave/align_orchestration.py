@@ -20,6 +20,7 @@ from voxweave.align_acquisition import (
     _release_fresh_alignments,
 )
 from voxweave.align_adapter import (
+    AlignAdapterResult,
     AlignDelivery,
     AlignDeliveryCue,
     AlignEvaluatedResult,
@@ -53,7 +54,9 @@ from voxweave.align_evidence_core import (
 from voxweave.align_failures import CanonicalFailure
 from voxweave.align_inputs import (
     EvidenceStatus,
+    FinalizerEvidenceResolution,
     LegacyAlignPolicy,
+    ProfileResolution,
     ProfileStatus,
     V2PolicyStatus,
 )
@@ -329,6 +332,315 @@ def _source_decoration(index: int, block: Mapping[str, Any]) -> SourceBlockDecor
     )
 
 
+@dataclass(frozen=True)
+class _SelectionInputs:
+    # The input verdicts that AO-14 admits and AO-16 and AO-21 record.
+    strict_input_status: StrictInputStatus
+    v2_policy_status: V2PolicyStatus
+    profile: ProfileResolution | _FailedProfileResolution
+    evidence_resolution: FinalizerEvidenceResolution
+
+
+@dataclass(frozen=True)
+class _SelectedCandidates:
+    # The AO-18 through AO-20 outputs that AO-21 and the selection keep.
+    result: AlignEvaluatedResult
+    candidates: candidate_encoder.CandidateSet
+    legacy_candidate: candidate_encoder.EncodedCandidate
+    verified: candidate_encoder.VerifiedEncodedCandidate
+
+
+# A profile that fails to resolve is fatal for boundary-v2 and recorded otherwise.
+def _resolve_selection_profile(
+    context: IssuedAlignContext,
+    manifest: Mapping[str, Any] | None,
+    *,
+    language: str,
+    stored_language: object,
+) -> ProfileResolution | _FailedProfileResolution:
+    try:
+        return align_inputs.resolve_align_profile(
+            manifest,
+            effective_iso=language,
+            stored_iso=stored_language if isinstance(stored_language, str) else None,
+        )
+    except Exception as exc:
+        profile_failure = CanonicalFailure(
+            "shadow-internal-error",
+            "profile-stage",
+            "profile-stage",
+        )
+        if context.engine_family == "boundary-v2":
+            _classify_unchanged_exception(exc, profile_failure)
+            raise
+        return _FailedProfileResolution(
+            None,
+            ProfileStatus(
+                "invalid",
+                "manifest-absent" if manifest is None else "stored-profile",
+                "profile-shape",
+            ),
+            profile_failure,
+        )
+
+
+# The legacy delivery carries the fresh seed's anchors onto each source block.
+def _legacy_delivery(
+    context: IssuedAlignContext,
+    acquisition: IssuedFreshAlignment,
+    *,
+    source_indices: tuple[int, ...],
+    blocks: Sequence[Mapping[str, Any]],
+    block_units: Sequence[Sequence[Mapping[str, Any]]],
+    spans: Sequence[tuple[float, float]],
+    all_units: Sequence[Mapping[str, Any]],
+) -> AlignDelivery:
+    seed = _fresh_seed(context, acquisition)
+    seed_blocks = getattr(seed, "blocks", None)
+    anchors = (
+        {}
+        if seed_blocks is None
+        else {block.source_index: block for block in seed_blocks}
+    )
+    delivery_cues = tuple(
+        AlignDeliveryCue(
+            source_index,
+            str(block["text"]),
+            float(span[0]),
+            float(span[1]),
+            True if block.get("lyric") is True else None,
+            anchors[source_index].owner_unit_ids if source_index in anchors else (),
+            tuple(_persisted_unit(unit) for unit in block_units[delivery_index]),
+            anchors[source_index].speech_start if source_index in anchors else None,
+            anchors[source_index].speech_end if source_index in anchors else None,
+        )
+        for delivery_index, (source_index, block, span) in enumerate(
+            zip(source_indices, blocks, spans, strict=True)
+        )
+    )
+    return AlignDelivery(
+        context.context_content_digest,
+        acquisition.receipt_digest,
+        "legacy-v1",
+        context.route_kind,
+        delivery_cues,
+        tuple(_persisted_unit(unit) for unit in all_units),
+    )
+
+
+# The projection inputs seal the display carriers the adapter projects onto.
+def _projection_inputs(
+    *,
+    source_indices: tuple[int, ...],
+    blocks: Sequence[Mapping[str, Any]],
+    language: str,
+    vad_speech: Sequence[tuple[float, float]] | None,
+    shot_changes: Sequence[float] | None,
+    sing_spans: Sequence[tuple[float, float]] | None,
+    speaker_turns: object | None,
+    voiceprint_pair: tuple[str, str] | None,
+    manifest: Mapping[str, Any] | None,
+) -> AlignProjectionInputs:
+    frozen_manifest = None if manifest is None else freeze_json(dict(manifest))
+    if frozen_manifest is not None and not isinstance(frozen_manifest, FrozenObject):
+        raise TypeError("align segmentation manifest is not an object")
+    if isinstance(speaker_turns, RawJSONCarrier) or speaker_turns is None:
+        sealed_turns = speaker_turns
+    else:
+        sealed_turns = tuple(speaker_turns)  # type: ignore[arg-type]
+    return AlignProjectionInputs(
+        language,
+        tuple(
+            _source_decoration(source_index, block)
+            for source_index, block in zip(source_indices, blocks, strict=True)
+        ),
+        None if vad_speech is None else tuple(vad_speech),
+        None if shot_changes is None else tuple(float(value) for value in shot_changes),
+        None if sing_spans is None else tuple(sing_spans),
+        sealed_turns,  # type: ignore[arg-type]
+        None if voiceprint_pair is None else voiceprint_pair[0],
+        None if voiceprint_pair is None else voiceprint_pair[1],
+        frozen_manifest,
+    )
+
+
+# AO-14 binds the adapter payload; the adapter then runs AO-14 and AO-15 once.
+def _run_bound_adapter(
+    context: IssuedAlignContext,
+    acquisition: IssuedFreshAlignment,
+    *,
+    delivery: AlignDelivery,
+    projection_inputs: AlignProjectionInputs,
+    inputs: _SelectionInputs,
+    shadow_requested: bool,
+) -> AlignAdapterResult:
+    with align_runtime_activity("AO-14", "adapter-binding-and-admission"):
+        _bind_fresh_adapter_payload(
+            context,
+            acquisition,
+            legacy_delivery=delivery,
+            projection_inputs=projection_inputs,
+            strict_input_status=inputs.strict_input_status,
+            v2_policy_status=inputs.v2_policy_status,
+            profile_resolution=inputs.profile,
+            evidence_resolution=inputs.evidence_resolution,
+        )
+    return run_locked_align_adapter(
+        context,
+        acquisition,
+        shadow_enabled=shadow_requested,
+    )
+
+
+# AO-16 builds the producer core and checks it against the independent projection.
+def _mandatory_evidence_core(
+    context: IssuedAlignContext,
+    acquisition: IssuedFreshAlignment,
+    inputs: _SelectionInputs,
+) -> EvidenceCore:
+    with align_runtime_activity("AO-16", "mandatory-evidence-core-and-ald6"):
+        producer_core = build_evidence_core(
+            _fresh_producer_core_inputs(
+                context,
+                acquisition,
+                strict_input_status=inputs.strict_input_status,
+                v2_policy_status=inputs.v2_policy_status,
+                profile_status=inputs.profile.status,
+                evidence_status=inputs.evidence_resolution.status,
+            )
+        )
+        reference_core = project_evidence_core(
+            _fresh_reference_core_inputs(context, acquisition)
+        )
+        if not evaluate_ald6(producer_core, reference_core).passed:
+            raise RuntimeError(
+                "internal alignment consistency check failed: the independent"
+                " evidence projection disagrees with the aligner output"
+                f" ({_first_core_difference(producer_core, reference_core)});"
+                " no subtitle file was written. This is a VoxWeave bug; please"
+                " report it with this message"
+            )
+    return producer_core
+
+
+# AO-17 runs only for a valid v2 result; a comparator failure is fatal only for
+# boundary-v2 and otherwise becomes the recorded comparison.
+def _semantic_comparison(
+    context: IssuedAlignContext,
+    adapter_result: AlignAdapterResult,
+    semantic_observation: object | None,
+    *,
+    producer_core: EvidenceCore,
+    inputs: _SelectionInputs,
+) -> object | None:
+    comparison = None
+    profile = inputs.profile
+    if adapter_result.v2_status.kind == "valid":
+        if adapter_result.v2 is None:
+            raise RuntimeError("valid adapter result lacks its v2 delivery")
+        from voxweave.core.align_compare import compare_semantic_deltas
+
+        if semantic_observation is None:
+            raise RuntimeError("valid adapter result lacks its AO-15 observation")
+        if profile.profile is None:
+            raise RuntimeError("valid adapter result lacks its display profile")
+
+        with align_runtime_activity("AO-17", "semantic-comparison"):
+            try:
+                comparison = compare_semantic_deltas(
+                    route_kind=context.route_kind,
+                    physical_calls=producer_core.physical_calls,
+                    authority_blocks=producer_core.blocks,
+                    legacy=adapter_result.legacy,
+                    v2=adapter_result.v2,
+                    semantic_observation=semantic_observation,
+                    profile=profile.profile,
+                    evidence=inputs.evidence_resolution,
+                )
+            except Exception as exc:
+                comparator_failure = CanonicalFailure(
+                    "shadow-internal-error",
+                    "comparator-stage",
+                    "comparator-stage",
+                )
+                if context.engine_family == "boundary-v2":
+                    _classify_unchanged_exception(exc, comparator_failure)
+                    raise
+                comparison = comparator_failure
+    return comparison
+
+
+# AO-18 through AO-20 issue the result, encode both families and verify the pick.
+def _select_candidates(
+    context: IssuedAlignContext,
+    adapter_result: AlignAdapterResult,
+    *,
+    producer_core: EvidenceCore,
+    comparison: object | None,
+) -> _SelectedCandidates:
+    with align_runtime_activity("AO-18", "selected-v2-admissibility"):
+        result = issue_align_evaluated_result(
+            context,
+            adapter_result,
+            evidence_core=producer_core,
+            comparison=comparison,
+        )
+    with align_runtime_activity("AO-19", "composite-candidate-encode"):
+        candidates = candidate_encoder.encode_align_candidates(context, result)
+    with align_runtime_activity("AO-20", "selector-and-independent-projection"):
+        # The legacy candidate is required whichever family is selected: its hashes
+        # are recorded. A failed encode names its cause (SelectedCandidateError).
+        legacy_candidate = candidate_encoder._select_candidate(
+            context, candidates, "legacy-v1"
+        )
+        selected = candidate_encoder.select_align_candidate(context, candidates)
+        verified = candidate_encoder.verify_selected_align_projection(
+            context, result, selected
+        )
+    return _SelectedCandidates(result, candidates, legacy_candidate, verified)
+
+
+# A legacy-v1 run records why a valid v2 result produced no boundary candidate.
+def _observation_failure(
+    context: IssuedAlignContext,
+    selected: _SelectedCandidates,
+) -> CanonicalFailure | None:
+    boundary_candidate = selected.candidates.outcome_for("boundary-v2")
+    return (
+        boundary_candidate.failure
+        if (
+            context.engine_family == "legacy-v1"
+            and selected.result.v2_status.kind == "valid"
+            and isinstance(boundary_candidate, candidate_encoder.CandidateFailure)
+        )
+        else None
+    )
+
+
+# AO-21 binds the selected hashes and the input verdicts into the final evidence.
+def _bind_selected_evidence(
+    context: IssuedAlignContext,
+    acquisition: IssuedFreshAlignment,
+    producer_core: EvidenceCore,
+    *,
+    inputs: _SelectionInputs,
+    verified: candidate_encoder.VerifiedEncodedCandidate,
+) -> FinalAlignEvidence:
+    with align_runtime_activity("AO-21", "selected-hashes-and-evidence-bind"):
+        return bind_align_evidence(
+            context,
+            producer_core,
+            acquisition=acquisition,
+            strict_input_status=inputs.strict_input_status,
+            v2_policy_status=inputs.v2_policy_status,
+            profile_status=inputs.profile.status,
+            evidence_status=inputs.evidence_resolution.status,
+            engine_family=verified.engine_family,
+            vtt_sha256=verified.vtt_sha256,
+            main_json_sha256=verified.main_json_sha256,
+        )
+
+
 def build_align_selection(
     *,
     context: IssuedAlignContext,
@@ -356,208 +668,74 @@ def build_align_selection(
         raise TypeError("align selection requires one issued fresh acquisition")
     source_indices = _original_source_indices(blocks)
     v2_policy_status = align_inputs.validate_v2_policy(legacy_policy)
-    try:
-        profile = align_inputs.resolve_align_profile(
-            manifest,
-            effective_iso=language,
-            stored_iso=stored_language if isinstance(stored_language, str) else None,
-        )
-    except Exception as exc:
-        profile_failure = CanonicalFailure(
-            "shadow-internal-error",
-            "profile-stage",
-            "profile-stage",
-        )
-        if context.engine_family == "boundary-v2":
-            _classify_unchanged_exception(exc, profile_failure)
-            raise
-        profile = _FailedProfileResolution(
-            None,
-            ProfileStatus(
-                "invalid",
-                "manifest-absent" if manifest is None else "stored-profile",
-                "profile-shape",
-            ),
-            profile_failure,
-        )
+    profile = _resolve_selection_profile(
+        context, manifest, language=language, stored_language=stored_language
+    )
     evidence_resolution = align_inputs.resolve_finalize_evidence(
         shot_changes=strict_shot_changes,  # type: ignore[arg-type]
         sing_spans=strict_sing_spans,  # type: ignore[arg-type]
     )
-    seed = _fresh_seed(context, acquisition)
-    seed_blocks = getattr(seed, "blocks", None)
-    anchors = (
-        {}
-        if seed_blocks is None
-        else {block.source_index: block for block in seed_blocks}
+    inputs = _SelectionInputs(
+        strict_input_status, v2_policy_status, profile, evidence_resolution
     )
-    delivery_cues = tuple(
-        AlignDeliveryCue(
-            source_index,
-            str(block["text"]),
-            float(span[0]),
-            float(span[1]),
-            True if block.get("lyric") is True else None,
-            anchors[source_index].owner_unit_ids if source_index in anchors else (),
-            tuple(_persisted_unit(unit) for unit in block_units[delivery_index]),
-            anchors[source_index].speech_start if source_index in anchors else None,
-            anchors[source_index].speech_end if source_index in anchors else None,
-        )
-        for delivery_index, (source_index, block, span) in enumerate(
-            zip(source_indices, blocks, spans, strict=True)
-        )
-    )
-    delivery = AlignDelivery(
-        context.context_content_digest,
-        acquisition.receipt_digest,
-        "legacy-v1",
-        context.route_kind,
-        delivery_cues,
-        tuple(_persisted_unit(unit) for unit in all_units),
-    )
-    frozen_manifest = None if manifest is None else freeze_json(dict(manifest))
-    if frozen_manifest is not None and not isinstance(frozen_manifest, FrozenObject):
-        raise TypeError("align segmentation manifest is not an object")
-    if isinstance(speaker_turns, RawJSONCarrier) or speaker_turns is None:
-        sealed_turns = speaker_turns
-    else:
-        sealed_turns = tuple(speaker_turns)  # type: ignore[arg-type]
-    projection_inputs = AlignProjectionInputs(
-        language,
-        tuple(
-            _source_decoration(source_index, block)
-            for source_index, block in zip(source_indices, blocks, strict=True)
-        ),
-        None if vad_speech is None else tuple(vad_speech),
-        None if shot_changes is None else tuple(float(value) for value in shot_changes),
-        None if sing_spans is None else tuple(sing_spans),
-        sealed_turns,  # type: ignore[arg-type]
-        None if voiceprint_pair is None else voiceprint_pair[0],
-        None if voiceprint_pair is None else voiceprint_pair[1],
-        frozen_manifest,
-    )
-    with align_runtime_activity("AO-14", "adapter-binding-and-admission"):
-        _bind_fresh_adapter_payload(
-            context,
-            acquisition,
-            legacy_delivery=delivery,
-            projection_inputs=projection_inputs,
-            strict_input_status=strict_input_status,
-            v2_policy_status=v2_policy_status,
-            profile_resolution=profile,
-            evidence_resolution=evidence_resolution,
-        )
-    adapter_result = run_locked_align_adapter(
+    delivery = _legacy_delivery(
         context,
         acquisition,
-        shadow_enabled=shadow_requested,
+        source_indices=source_indices,
+        blocks=blocks,
+        block_units=block_units,
+        spans=spans,
+        all_units=all_units,
+    )
+    projection_inputs = _projection_inputs(
+        source_indices=source_indices,
+        blocks=blocks,
+        language=language,
+        vad_speech=vad_speech,
+        shot_changes=shot_changes,
+        sing_spans=sing_spans,
+        speaker_turns=speaker_turns,
+        voiceprint_pair=voiceprint_pair,
+        manifest=manifest,
+    )
+    adapter_result = _run_bound_adapter(
+        context,
+        acquisition,
+        delivery=delivery,
+        projection_inputs=projection_inputs,
+        inputs=inputs,
+        shadow_requested=shadow_requested,
     )
     semantic_observation = _adapter_semantic_observation(context, adapter_result)
 
-    with align_runtime_activity("AO-16", "mandatory-evidence-core-and-ald6"):
-        producer_core = build_evidence_core(
-            _fresh_producer_core_inputs(
-                context,
-                acquisition,
-                strict_input_status=strict_input_status,
-                v2_policy_status=v2_policy_status,
-                profile_status=profile.status,
-                evidence_status=evidence_resolution.status,
-            )
-        )
-        reference_core = project_evidence_core(
-            _fresh_reference_core_inputs(context, acquisition)
-        )
-        if not evaluate_ald6(producer_core, reference_core).passed:
-            raise RuntimeError(
-                "internal alignment consistency check failed: the independent"
-                " evidence projection disagrees with the aligner output"
-                f" ({_first_core_difference(producer_core, reference_core)});"
-                " no subtitle file was written. This is a VoxWeave bug; please"
-                " report it with this message"
-            )
-
-    comparison = None
-    if adapter_result.v2_status.kind == "valid":
-        if adapter_result.v2 is None:
-            raise RuntimeError("valid adapter result lacks its v2 delivery")
-        from voxweave.core.align_compare import compare_semantic_deltas
-
-        if semantic_observation is None:
-            raise RuntimeError("valid adapter result lacks its AO-15 observation")
-        if profile.profile is None:
-            raise RuntimeError("valid adapter result lacks its display profile")
-
-        with align_runtime_activity("AO-17", "semantic-comparison"):
-            try:
-                comparison = compare_semantic_deltas(
-                    route_kind=context.route_kind,
-                    physical_calls=producer_core.physical_calls,
-                    authority_blocks=producer_core.blocks,
-                    legacy=adapter_result.legacy,
-                    v2=adapter_result.v2,
-                    semantic_observation=semantic_observation,
-                    profile=profile.profile,
-                    evidence=evidence_resolution,
-                )
-            except Exception as exc:
-                comparator_failure = CanonicalFailure(
-                    "shadow-internal-error",
-                    "comparator-stage",
-                    "comparator-stage",
-                )
-                if context.engine_family == "boundary-v2":
-                    _classify_unchanged_exception(exc, comparator_failure)
-                    raise
-                comparison = comparator_failure
-    with align_runtime_activity("AO-18", "selected-v2-admissibility"):
-        result = issue_align_evaluated_result(
-            context,
-            adapter_result,
-            evidence_core=producer_core,
-            comparison=comparison,
-        )
-    with align_runtime_activity("AO-19", "composite-candidate-encode"):
-        candidates = candidate_encoder.encode_align_candidates(context, result)
-    with align_runtime_activity("AO-20", "selector-and-independent-projection"):
-        # The legacy candidate is required whichever family is selected: its hashes
-        # are recorded. A failed encode names its cause (SelectedCandidateError).
-        legacy_candidate = candidate_encoder._select_candidate(
-            context, candidates, "legacy-v1"
-        )
-        selected = candidate_encoder.select_align_candidate(context, candidates)
-        verified = candidate_encoder.verify_selected_align_projection(
-            context, result, selected
-        )
-    boundary_candidate = candidates.outcome_for("boundary-v2")
-    observation_failure = (
-        boundary_candidate.failure
-        if (
-            context.engine_family == "legacy-v1"
-            and result.v2_status.kind == "valid"
-            and isinstance(boundary_candidate, candidate_encoder.CandidateFailure)
-        )
-        else None
+    producer_core = _mandatory_evidence_core(context, acquisition, inputs)
+    comparison = _semantic_comparison(
+        context,
+        adapter_result,
+        semantic_observation,
+        producer_core=producer_core,
+        inputs=inputs,
     )
-    with align_runtime_activity("AO-21", "selected-hashes-and-evidence-bind"):
-        bound_evidence = bind_align_evidence(
-            context,
-            producer_core,
-            acquisition=acquisition,
-            strict_input_status=strict_input_status,
-            v2_policy_status=v2_policy_status,
-            profile_status=profile.status,
-            evidence_status=evidence_resolution.status,
-            engine_family=verified.engine_family,
-            vtt_sha256=verified.vtt_sha256,
-            main_json_sha256=verified.main_json_sha256,
-        )
+    selected = _select_candidates(
+        context,
+        adapter_result,
+        producer_core=producer_core,
+        comparison=comparison,
+    )
+    observation_failure = _observation_failure(context, selected)
+    bound_evidence = _bind_selected_evidence(
+        context,
+        acquisition,
+        producer_core,
+        inputs=inputs,
+        verified=selected.verified,
+    )
     return AlignSelection(
         context,
-        result,
-        verified,
-        legacy_candidate.vtt_sha256,
-        legacy_candidate.main_json_sha256,
+        selected.result,
+        selected.verified,
+        selected.legacy_candidate.vtt_sha256,
+        selected.legacy_candidate.main_json_sha256,
         bound_evidence,
         acquisition.distribution,
         strict_input_status,
