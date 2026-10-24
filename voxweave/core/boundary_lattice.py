@@ -535,17 +535,25 @@ def _build_mixed_edges(
     """
     lang = profile.language
     canonical_admission = _no_spaces(lang) or canonical_spaced
-    max_cue_s = profile.max_cue_s
-    node_set = set(nodes)
     packer = (
         None
         if canonical_admission
         else IncrementalPacker(lang, profile.max_line_length, profile.max_lines)
     )
-    canonical_work = work if work is not None else CanonicalWork()
-    edges: list[Edge] = []
-    waivers: list[Waiver] = []
-    cap_nodes: set[int] = set()
+    scan = _MixedScan(
+        atoms=atoms,
+        node_set=set(nodes),
+        profile=profile,
+        units=units,
+        lang=lang,
+        canonical_admission=canonical_admission,
+        admit_untimed=admit_untimed,
+        packer=packer,
+        work=work if work is not None else CanonicalWork(),
+        edges=[],
+        waivers=[],
+        cap_nodes=set(),
+    )
     infeasible: Infeasible | None = None
     count = len(atoms)
     for start in nodes:
@@ -553,108 +561,151 @@ def _build_mixed_edges(
             continue
         if packer is not None:
             packer.reset()
-        surfaces: list[str] = []
-        starts: list[float | None] = []
-        ends: list[float | None] = []
-        emitted = False
-        for index in range(start, count):
-            atom = atoms[index]
-            surfaces.append(atom.text)
-            starts.append(atom.start)
-            ends.append(atom.end)
-            end_node = index + 1
-            if canonical_admission:
-                joined = _join(surfaces, lang)
-                if band_scan_lower_bound_exceeded(joined, profile):
-                    break
-                if end_node not in node_set:
-                    # This atom edge is not a candidate boundary. Keep scanning
-                    # the raw source span, but do not spend canonical work on a
-                    # projection the lattice could never admit.
-                    continue
-                measure = _canonical_pack_measure(
-                    atoms, start, end_node, profile, canonical_work
-                )
-            else:
-                assert packer is not None
-                measure = packer.extend(atom.text)
-            if not measure.fits:
-                if canonical_admission:
-                    # Only the stripped-cell lower bound above is strong enough
-                    # to terminate a canonical scan.
-                    continue
-                break
-            low = span_min(starts)
-            high = span_max(ends)
-            over = (
-                max_cue_s > 0
-                and low is not None
-                and high is not None
-                and high - low > max_cue_s + CAP_EPS_S
-            )
-            if end_node in node_set and (
-                admit_untimed or (low is not None and high is not None)
-            ):
-                waiver: Waiver | None = None
-                if over:
-                    if emitted:
-                        break
-                    resolution = resolve_cap_partition(
-                        atoms[start:end_node],
-                        units,
-                        max_cue_s=max_cue_s,
-                        lang=lang,
-                        allow_relief=False,
-                    )
-                    exposed = {start + cut for cut in resolution.cuts} - node_set
-                    if exposed:
-                        # The run IS splittable; this particular edge simply is
-                        # not legal. Expose the cuts and let the caller re-scan.
-                        cap_nodes |= exposed
-                        break
-                    if resolution.waivers:
-                        waiver = resolution.waivers[0]
-                        waivers.append(waiver)
-                    elif resolution.infeasible is not None:
-                        infeasible = resolution.infeasible
-                        break
-                    else:
-                        # No split, no evidence, no typed terminal: the run has
-                        # no legal edge from here, which the reachability check
-                        # types honestly as no-path/relief-insufficient. Claiming
-                        # ``duration-unwaivable`` would name a terminal the
-                        # duration ladder never reached.
-                        break
-                edges.append(
-                    Edge(
-                        start_node=start,
-                        end_node=end_node,
-                        text=_join(surfaces, lang),
-                        display_text=measure.text,
-                        lines=measure.lines,
-                        line_widths=measure.line_widths,
-                        span_start=low,
-                        span_end=high,
-                        waiver=waiver,
-                    )
-                )
-                emitted = True
-            if over and emitted:
-                # Every longer edge from here is over the cap as well. Before the
-                # first edge, an over-cap span at a node that is not a candidate
-                # must keep scanning: the duration ladder runs only at the next
-                # candidate node, and a held unit can hide the node in between.
-                break
+        infeasible = _scan_mixed_start(scan, start, count)
         if infeasible is not None:
             break
+    edges = scan.edges
     edges.sort(key=lambda e: (e.start_node, e.end_node))
     return MixedEdges(
         edges=tuple(edges),
-        waivers=tuple(waivers),
+        waivers=tuple(scan.waivers),
         infeasible=infeasible,
         packer_steps=0 if packer is None else packer.steps,
-        cap_nodes=tuple(sorted(cap_nodes)),
+        cap_nodes=tuple(sorted(scan.cap_nodes)),
     )
+
+
+# The inputs one mixed-branch scan holds fixed across its start nodes, and the
+# edges, waivers and exposed cap cuts every start node adds to.
+@dataclass(frozen=True)
+class _MixedScan:
+    atoms: Sequence[LatticeAtom]
+    node_set: set[int]
+    profile: DisplayProfile
+    units: Sequence[SourceUnit]
+    lang: str
+    canonical_admission: bool
+    admit_untimed: bool
+    packer: IncrementalPacker | None
+    work: CanonicalWork
+    edges: list[Edge]
+    waivers: list[Waiver]
+    cap_nodes: set[int]
+
+
+# Walk the candidate band from one start node and record its edges. Returns the
+# typed terminal that ends the whole scan, or None to go on to the next node.
+def _scan_mixed_start(scan: _MixedScan, start: int, count: int) -> Infeasible | None:
+    atoms = scan.atoms
+    node_set = scan.node_set
+    profile = scan.profile
+    lang = scan.lang
+    canonical_admission = scan.canonical_admission
+    admit_untimed = scan.admit_untimed
+    packer = scan.packer
+    canonical_work = scan.work
+    edges = scan.edges
+    max_cue_s = profile.max_cue_s
+    surfaces: list[str] = []
+    starts: list[float | None] = []
+    ends: list[float | None] = []
+    emitted = False
+    for index in range(start, count):
+        atom = atoms[index]
+        surfaces.append(atom.text)
+        starts.append(atom.start)
+        ends.append(atom.end)
+        end_node = index + 1
+        if canonical_admission:
+            joined = _join(surfaces, lang)
+            if band_scan_lower_bound_exceeded(joined, profile):
+                break
+            if end_node not in node_set:
+                # This atom edge is not a candidate boundary. Keep scanning the
+                # raw source span, but do not spend canonical work on a
+                # projection the lattice could never admit.
+                continue
+            measure = _canonical_pack_measure(
+                atoms, start, end_node, profile, canonical_work
+            )
+        else:
+            assert packer is not None
+            measure = packer.extend(atom.text)
+        if not measure.fits:
+            if canonical_admission:
+                # Only the stripped-cell lower bound above is strong enough to
+                # terminate a canonical scan.
+                continue
+            break
+        low = span_min(starts)
+        high = span_max(ends)
+        over = (
+            max_cue_s > 0
+            and low is not None
+            and high is not None
+            and high - low > max_cue_s + CAP_EPS_S
+        )
+        if end_node in node_set and (
+            admit_untimed or (low is not None and high is not None)
+        ):
+            waiver: Waiver | None = None
+            if over:
+                if emitted:
+                    break
+                waiver, infeasible = _resolve_over_cap_edge(scan, start, end_node)
+                if waiver is None:
+                    return infeasible
+            edges.append(
+                Edge(
+                    start_node=start,
+                    end_node=end_node,
+                    text=_join(surfaces, lang),
+                    display_text=measure.text,
+                    lines=measure.lines,
+                    line_widths=measure.line_widths,
+                    span_start=low,
+                    span_end=high,
+                    waiver=waiver,
+                )
+            )
+            emitted = True
+        if over and emitted:
+            # Every longer edge from here is over the cap as well. Before the
+            # first edge, an over-cap span at a node that is not a candidate must
+            # keep scanning: the duration ladder runs only at the next candidate
+            # node, and a held unit can hide the node in between.
+            break
+    return None
+
+
+# Run the duration ladder on the first over-cap candidate edge from ``start``.
+# A waiver means the edge is kept with that exemption; no waiver means the scan
+# from ``start`` stops, with the typed terminal if the ladder reached one.
+def _resolve_over_cap_edge(
+    scan: _MixedScan, start: int, end_node: int
+) -> tuple[Waiver | None, Infeasible | None]:
+    resolution = resolve_cap_partition(
+        scan.atoms[start:end_node],
+        scan.units,
+        max_cue_s=scan.profile.max_cue_s,
+        lang=scan.lang,
+        allow_relief=False,
+    )
+    exposed = {start + cut for cut in resolution.cuts} - scan.node_set
+    if exposed:
+        # The run IS splittable; this particular edge simply is not legal.
+        # Expose the cuts and let the caller re-scan.
+        scan.cap_nodes.update(exposed)
+        return None, None
+    if resolution.waivers:
+        waiver = resolution.waivers[0]
+        scan.waivers.append(waiver)
+        return waiver, None
+    # No split, no evidence: the run has no legal edge from here. Without a typed
+    # terminal the reachability check types it honestly as
+    # no-path/relief-insufficient; claiming ``duration-unwaivable`` would name a
+    # terminal the duration ladder never reached.
+    return None, resolution.infeasible
 
 
 def _scan_with_cap_nodes(
