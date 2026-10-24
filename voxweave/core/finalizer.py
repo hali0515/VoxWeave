@@ -45,7 +45,7 @@ from __future__ import annotations
 import bisect
 import copy
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from .authority import (
@@ -396,16 +396,40 @@ def apply_sweep(
     the delivered stream.
     """
     del policy  # P5 has one policy value; the parameter is the P6 seam.
-    starts = [pair[0] for pair in state]
-    ends = [pair[1] for pair in state]
-    legs: list[TraceLeg] = []
+    run = _SweepRun(
+        starts=[pair[0] for pair in state],
+        ends=[pair[1] for pair in state],
+        sweep=sweep,
+    )
     shots = tuple(sorted(evidence.shots))
     snap_s = profile.shot_snap_s
     snapping = snap_s > 0 and bool(shots)
     cap = profile.max_cue_s if profile.max_cue_s else None
     count = len(cues)
 
+    for index, cue in enumerate(cues):
+        reads = _cue_reads(run, index, count)
+        _sweep_end_slots(run, cue, reads, profile=profile)
+        if snapping:
+            _sweep_shot_slots(run, cue, reads, shots=shots, snap_s=snap_s, cap=cap)
+        # slot 6 -- the overlap ladder, which writes the PREVIOUS cue's end
+        if index > 0:
+            _sweep_ladder_slot(run, index, cues)
+
+    return tuple(zip(run.starts, run.ends)), tuple(run.legs)
+
+
+@dataclass
+class _SweepRun:
+    """The boundaries one sweep rewrites in place, and the legs it has emitted."""
+
+    starts: list[float]
+    ends: list[float]
+    sweep: int
+    legs: list[TraceLeg] = field(default_factory=list)
+
     def emit(
+        self,
         rule_id: str,
         slot: int,
         cue_index: int,
@@ -414,12 +438,13 @@ def apply_sweep(
         to_value: float,
         reads: tuple[NeighbourRead, ...],
     ) -> None:
+        """Record one rule application; a rule that moved nothing leaves no leg."""
         if from_value == to_value:
             return
-        legs.append(
+        self.legs.append(
             TraceLeg(
                 rule_id=rule_id,
-                sweep=sweep,
+                sweep=self.sweep,
                 cue_index=cue_index,
                 slot=slot,
                 target=target,
@@ -429,117 +454,153 @@ def apply_sweep(
             )
         )
 
-    for index, cue in enumerate(cues):
-        own_end = BoundaryRef(index, "end")
-        next_start = starts[index + 1] if index + 1 < count else None
-        next_read = (
-            ()
-            if next_start is None
-            else (NeighbourRead(BoundaryRef(index + 1, "start"), next_start),)
-        )
-        own_start_read = (NeighbourRead(BoundaryRef(index, "start"), starts[index]),)
 
-        # slot 1 -- absolute duration desire, guarded against the seed end
-        want = _duration_desire(
-            start=starts[index],
-            seed_end=cue.seed_end,
-            speech_end=cue.speech_end,
-            reading_chars=cue.reading_chars,
-            profile=profile,
-        )
-        new_end = _guarded_end(want, cue.seed_end, next_start)
-        emit(
-            "duration-desire",
-            1,
+@dataclass(frozen=True)
+class _CueReads:
+    """The neighbour reads every slot of one cue shares, taken before slot 1."""
+
+    index: int
+    own_end: BoundaryRef
+    next_start: float | None
+    next_read: tuple[NeighbourRead, ...]
+    own_start_read: tuple[NeighbourRead, ...]
+
+
+def _cue_reads(run: _SweepRun, index: int, count: int) -> _CueReads:
+    """Snapshot cue ``index``'s own start and its successor's start.
+
+    The own start read is taken here, before slot 4 can move it, because slots
+    1 and 3 record the start they actually read.
+    """
+    own_end = BoundaryRef(index, "end")
+    next_start = run.starts[index + 1] if index + 1 < count else None
+    next_read = (
+        ()
+        if next_start is None
+        else (NeighbourRead(BoundaryRef(index + 1, "start"), next_start),)
+    )
+    return _CueReads(
+        index=index,
+        own_end=own_end,
+        next_start=next_start,
+        next_read=next_read,
+        own_start_read=(NeighbourRead(BoundaryRef(index, "start"), run.starts[index]),),
+    )
+
+
+def _sweep_end_slots(
+    run: _SweepRun, cue: Phase1Cue, reads: _CueReads, *, profile: DisplayProfile
+) -> None:
+    """Slots 1-3 on one cue's end: desire, chaining, then the duration cap."""
+    index = reads.index
+    starts, ends = run.starts, run.ends
+    both_reads = reads.own_start_read + reads.next_read
+
+    # slot 1 -- absolute duration desire, guarded against the seed end
+    want = _duration_desire(
+        start=starts[index],
+        seed_end=cue.seed_end,
+        speech_end=cue.speech_end,
+        reading_chars=cue.reading_chars,
+        profile=profile,
+    )
+    new_end = _guarded_end(want, cue.seed_end, reads.next_start)
+    run.emit(
+        "duration-desire", 1, index, reads.own_end, ends[index], new_end, both_reads
+    )
+    ends[index] = new_end
+
+    # slot 2 -- chaining
+    new_end = _chain_end(ends[index], reads.next_start)
+    run.emit("chain", 2, index, reads.own_end, ends[index], new_end, reads.next_read)
+    ends[index] = new_end
+
+    # slot 3 -- duration cap with its held-chain waiver
+    new_end, _waived = _cap_end(
+        starts[index], ends[index], cue.word_data, reads.next_start, profile.max_cue_s
+    )
+    run.emit("cap", 3, index, reads.own_end, ends[index], new_end, both_reads)
+    ends[index] = new_end
+
+
+def _sweep_shot_slots(
+    run: _SweepRun,
+    cue: Phase1Cue,
+    reads: _CueReads,
+    *,
+    shots: Sequence[float],
+    snap_s: float,
+    cap: float | None,
+) -> None:
+    """Slots 4-5: the shot in-time zones on the start, then the out-time zones."""
+    index = reads.index
+    starts, ends = run.starts, run.ends
+
+    # slot 4 -- in-time zones
+    prev_end = ends[index - 1] if index > 0 else None
+    prev_read = (
+        ()
+        if prev_end is None
+        else (NeighbourRead(BoundaryRef(index - 1, "end"), prev_end),)
+    )
+    new_start = _shot_in(
+        starts[index],
+        ends[index],
+        speech_start=cue.speech_start,
+        prev_end=prev_end,
+        shots=shots,
+        snap_s=snap_s,
+        cap=cap,
+    )
+    run.emit(
+        "shot-in",
+        4,
+        index,
+        BoundaryRef(index, "start"),
+        starts[index],
+        new_start,
+        prev_read + (NeighbourRead(reads.own_end, ends[index]),),
+    )
+    starts[index] = new_start
+
+    # slot 5 -- out-time zones
+    new_end = _shot_out(
+        starts[index],
+        ends[index],
+        speech_end=cue.speech_end,
+        next_start=reads.next_start,
+        shots=shots,
+        snap_s=snap_s,
+        cap=cap,
+    )
+    run.emit(
+        "shot-out",
+        5,
+        index,
+        reads.own_end,
+        ends[index],
+        new_end,
+        (NeighbourRead(BoundaryRef(index, "start"), starts[index]),) + reads.next_read,
+    )
+    ends[index] = new_end
+
+
+def _sweep_ladder_slot(run: _SweepRun, index: int, cues: Sequence[Phase1Cue]) -> None:
+    """Slot 6 at cue ``index``: trim the previous cue's end off this start."""
+    starts, ends = run.starts, run.ends
+    outcome = _ladder(ends[index - 1], cues[index - 1].speech_end, starts[index])
+    if outcome is not None:
+        branch, trimmed = outcome
+        run.emit(
+            f"ladder-{branch}",
+            6,
             index,
-            own_end,
-            ends[index],
-            new_end,
-            own_start_read + next_read,
+            BoundaryRef(index - 1, "end"),
+            ends[index - 1],
+            trimmed,
+            (NeighbourRead(BoundaryRef(index, "start"), starts[index]),),
         )
-        ends[index] = new_end
-
-        # slot 2 -- chaining
-        new_end = _chain_end(ends[index], next_start)
-        emit("chain", 2, index, own_end, ends[index], new_end, next_read)
-        ends[index] = new_end
-
-        # slot 3 -- duration cap with its held-chain waiver
-        new_end, _waived = _cap_end(
-            starts[index], ends[index], cue.word_data, next_start, profile.max_cue_s
-        )
-        emit("cap", 3, index, own_end, ends[index], new_end, own_start_read + next_read)
-        ends[index] = new_end
-
-        if snapping:
-            # slot 4 -- in-time zones
-            prev_end = ends[index - 1] if index > 0 else None
-            prev_read = (
-                ()
-                if prev_end is None
-                else (NeighbourRead(BoundaryRef(index - 1, "end"), prev_end),)
-            )
-            new_start = _shot_in(
-                starts[index],
-                ends[index],
-                speech_start=cue.speech_start,
-                prev_end=prev_end,
-                shots=shots,
-                snap_s=snap_s,
-                cap=cap,
-            )
-            emit(
-                "shot-in",
-                4,
-                index,
-                BoundaryRef(index, "start"),
-                starts[index],
-                new_start,
-                prev_read + (NeighbourRead(own_end, ends[index]),),
-            )
-            starts[index] = new_start
-
-            # slot 5 -- out-time zones
-            new_end = _shot_out(
-                starts[index],
-                ends[index],
-                speech_end=cue.speech_end,
-                next_start=next_start,
-                shots=shots,
-                snap_s=snap_s,
-                cap=cap,
-            )
-            emit(
-                "shot-out",
-                5,
-                index,
-                own_end,
-                ends[index],
-                new_end,
-                (NeighbourRead(BoundaryRef(index, "start"), starts[index]),)
-                + next_read,
-            )
-            ends[index] = new_end
-
-        # slot 6 -- the overlap ladder, which writes the PREVIOUS cue's end
-        if index > 0:
-            outcome = _ladder(
-                ends[index - 1], cues[index - 1].speech_end, starts[index]
-            )
-            if outcome is not None:
-                branch, trimmed = outcome
-                emit(
-                    f"ladder-{branch}",
-                    6,
-                    index,
-                    BoundaryRef(index - 1, "end"),
-                    ends[index - 1],
-                    trimmed,
-                    (NeighbourRead(BoundaryRef(index, "start"), starts[index]),),
-                )
-                ends[index - 1] = trimmed
-
-    return tuple(zip(starts, ends)), tuple(legs)
+        ends[index - 1] = trimmed
 
 
 # ------------------------------------------------------------ report derivation
