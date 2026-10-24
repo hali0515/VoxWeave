@@ -51,6 +51,7 @@ from voxweave.voicematch import (
 from voxweave.voicestore import (
     MAX_EXEMPLARS,
     EnrollmentRefusal,
+    StoreLockHandle,
     enroll_exemplar,
     exclusive_store_lock,
     new_voice_store,
@@ -324,6 +325,32 @@ def _publish_audition(
         raise
 
 
+@dataclass(frozen=True, slots=True)
+class _AuditionInputs:
+    """The episode evidence one audition run read before taking any lock."""
+
+    media: Path
+    show: str | None
+    json_path: Path
+    manual_hint: str
+    sibling_bytes: bytes
+    data: dict[str, object]
+    pair: tuple[str, str] | None
+    sidecar_bytes: bytes | None
+    sidecar: dict[str, object] | None
+    store_stage: tuple[Path, bytes, dict[str, object]] | None
+    library_location: voicelibrary.LibraryLocation | None
+    library_scope: str | None
+    picks: dict[str, list[Span]]
+
+    def delete_stale_suggest(self) -> None:
+        _delete_stale_suggest_for_refusal(
+            self.media,
+            sibling_path=self.json_path,
+            sibling_bytes=self.sibling_bytes,
+        )
+
+
 def create_speaker_audition(
     media: Path,
     *,
@@ -347,6 +374,56 @@ def create_speaker_audition(
     quoted_media = shlex.quote(str(media))
     manual_hint = f"use `voxweave speakers serve {quoted_media} --manual`"
     json_path = swap_ext(media, ".json")
+    sibling_bytes, data = _read_audition_sibling(media, json_path, quoted_media)
+
+    declared = "voiceprint_capture" in data or "voiceprint_media" in data
+    pair: tuple[str, str] | None = None
+    sidecar_bytes: bytes | None = None
+    sidecar: dict[str, object] | None = None
+    if declared and not no_match:
+        data, pair, sidecar_bytes, sidecar = _read_declared_voiceprints(
+            media, json_path, sibling_bytes, manual_hint
+        )
+    store_stage, library_location, library_scope = _resolve_match_sources(
+        media,
+        json_path,
+        sibling_bytes,
+        voices=voices,
+        voices_dir=voices_dir,
+        show=show,
+        no_match=no_match,
+    )
+    picks = _audition_snippets(media, json_path, sibling_bytes, data, quoted_media)
+    inputs = _AuditionInputs(
+        media=media,
+        show=show,
+        json_path=json_path,
+        manual_hint=manual_hint,
+        sibling_bytes=sibling_bytes,
+        data=data,
+        pair=pair,
+        sidecar_bytes=sidecar_bytes,
+        sidecar=sidecar,
+        store_stage=store_stage,
+        library_location=library_location,
+        library_scope=library_scope,
+        picks=picks,
+    )
+    try:
+        output = _generate_audition(inputs)
+    except BaseException:
+        # A failed attempt must not leave an older machine claim behind. The
+        # helper rechecks the exact staged sibling and mapping absence under the
+        # episode lock, so it cannot erase a cooperating concurrent winner.
+        inputs.delete_stale_suggest()
+        raise
+    log.info("prepared speaker audition for %s", output.mapping_path.name)
+    return output
+
+
+def _read_audition_sibling(
+    media: Path, json_path: Path, quoted_media: str
+) -> tuple[bytes, dict[str, object]]:
     sibling_bytes: bytes | None = None
     try:
         if not json_path.exists():
@@ -372,38 +449,55 @@ def create_speaker_audition(
         )
         raise
     assert sibling_bytes is not None
+    return sibling_bytes, data
 
-    declared = "voiceprint_capture" in data or "voiceprint_media" in data
+
+def _read_declared_voiceprints(
+    media: Path, json_path: Path, sibling_bytes: bytes, manual_hint: str
+) -> tuple[dict[str, object], tuple[str, str] | None, bytes, dict[str, object]]:
     pair: tuple[str, str] | None = None
-    sidecar_bytes: bytes | None = None
-    sidecar: dict[str, object] | None = None
-    if declared and not no_match:
-        try:
-            data = strict_json_object_loads(
-                sibling_bytes,
-                max_bytes=max(1, len(sibling_bytes)),
-                source=json_path.name,
-            )
-            pair = _declared_voiceprint_pair(data)
-            sidecar_path = sidecars.voiceprints_path(media)
-            sidecar_bytes, sidecar = _load_voiceprints_exact(sidecar_path)
-        except (OSError, Phase2DataError) as exc:
-            _delete_stale_suggest_for_refusal(
-                media,
-                sibling_path=json_path,
-                sibling_bytes=sibling_bytes,
-            )
-            if isinstance(exc, FileNotFoundError) and pair is not None:
-                raise RuntimeError(
-                    "voiceprint evidence is declared but not usable: this "
-                    "episode's voiceprints were removed (voxweave speakers purge); "
-                    f"{manual_hint} to review names without suggestions"
-                ) from exc
+    try:
+        data = strict_json_object_loads(
+            sibling_bytes,
+            max_bytes=max(1, len(sibling_bytes)),
+            source=json_path.name,
+        )
+        pair = _declared_voiceprint_pair(data)
+        sidecar_path = sidecars.voiceprints_path(media)
+        sidecar_bytes, sidecar = _load_voiceprints_exact(sidecar_path)
+    except (OSError, Phase2DataError) as exc:
+        _delete_stale_suggest_for_refusal(
+            media,
+            sibling_path=json_path,
+            sibling_bytes=sibling_bytes,
+        )
+        if isinstance(exc, FileNotFoundError) and pair is not None:
             raise RuntimeError(
-                "voiceprint evidence is declared but not usable; rerun "
-                f"--diarize --voiceprints or {manual_hint}: {exc}"
+                "voiceprint evidence is declared but not usable: this "
+                "episode's voiceprints were removed (voxweave speakers purge); "
+                f"{manual_hint} to review names without suggestions"
             ) from exc
+        raise RuntimeError(
+            "voiceprint evidence is declared but not usable; rerun "
+            f"--diarize --voiceprints or {manual_hint}: {exc}"
+        ) from exc
+    return data, pair, sidecar_bytes, sidecar
 
+
+def _resolve_match_sources(
+    media: Path,
+    json_path: Path,
+    sibling_bytes: bytes,
+    *,
+    voices: Path | None,
+    voices_dir: Path | None,
+    show: str | None,
+    no_match: bool,
+) -> tuple[
+    tuple[Path, bytes, dict[str, object]] | None,
+    voicelibrary.LibraryLocation | None,
+    str | None,
+]:
     library_location: voicelibrary.LibraryLocation | None = None
     library_scope: str | None = None
     try:
@@ -421,7 +515,16 @@ def create_speaker_audition(
             sibling_bytes=sibling_bytes,
         )
         raise
+    return store_stage, library_location, library_scope
 
+
+def _audition_snippets(
+    media: Path,
+    json_path: Path,
+    sibling_bytes: bytes,
+    data: Mapping[str, object],
+    quoted_media: str,
+) -> dict[str, list[Span]]:
     turns = turns_in(data.get("speaker_turns"))
     if not turns:
         _delete_stale_suggest_for_refusal(
@@ -434,191 +537,225 @@ def create_speaker_audition(
         )
     vad_speech = spans_in(data.get("vad_speech"))
     sing_spans = spans_in(data.get("sing_spans"))
-    picks = select_snippets(turns, vad_speech, sing_spans)
+    return select_snippets(turns, vad_speech, sing_spans)
 
-    def generate_from(
-        source: Path, snapshot_fingerprint: str | None
-    ) -> SpeakerAudition:
-        if pair is not None:
-            assert sidecar is not None
-            assert snapshot_fingerprint is not None
-            try:
-                validate_voiceprint_conjunction(sidecar, data, snapshot_fingerprint)
-            except Phase2DataError as exc:
-                _delete_stale_suggest_for_refusal(
-                    media,
-                    sibling_path=json_path,
-                    sibling_bytes=sibling_bytes,
-                )
-                raise RuntimeError(
-                    "voiceprint evidence does not bind this episode; rerun "
-                    f"--diarize --voiceprints or {manual_hint}: {exc}"
-                ) from exc
 
-        embedded: dict[str, list[tuple[Span, str]]] = {label: [] for label in picks}
-        with tempfile.TemporaryDirectory(prefix="voxweave_speakers_") as tmp_dir:
-            root = Path(tmp_dir)
-            for speaker_index, (speaker_id, spans) in enumerate(picks.items()):
-                for clip_index, (start, end) in enumerate(spans):
-                    clip_path = root / f"speaker-{speaker_index}-{clip_index}.mp3"
-                    extract_clip(source, start, end, clip_path)
-                    encoded = base64.b64encode(clip_path.read_bytes()).decode("ascii")
-                    embedded[speaker_id].append(
-                        ((start, end), f"data:audio/mpeg;base64,{encoded}")
-                    )
-
-        skeleton = {
-            "version": MAPPING_VERSION,
-            "speakers": {speaker_id: "" for speaker_id in picks},
-        }
-
-        def publish_locked(store_handle=None) -> SpeakerAudition:
-            active_mapping_path = sidecars.speakers_mapping_path(media)
-            current_data = data
-            current_sidecar = sidecar
-            current_sibling_bytes = json_path.read_bytes()
-            if current_sibling_bytes != sibling_bytes:
-                raise RuntimeError("input changed during speaker generation; re-run")
-            if pair is not None:
-                assert sidecar_bytes is not None
-                assert snapshot_fingerprint is not None
-                current_data = strict_json_object_loads(
-                    current_sibling_bytes,
-                    max_bytes=max(1, len(current_sibling_bytes)),
-                    source=json_path.name,
-                )
-                current_sidecar_bytes = sidecars.voiceprints_path(media).read_bytes()
-                if current_sidecar_bytes != sidecar_bytes:
-                    raise RuntimeError(
-                        "input changed during speaker generation; re-run"
-                    )
-                current_sidecar = _voiceprints_from_bytes(
-                    current_sidecar_bytes,
-                    source=sidecars.voiceprints_path(media).name,
-                )
-                validate_voiceprint_conjunction(
-                    current_sidecar,
-                    current_data,
-                    snapshot_fingerprint,
-                )
-
-            matches: dict[str, SpeakerMatch] | None = None
-            suggest_record: dict[str, object] | None = None
-            if store_handle is not None:
-                assert pair is not None
-                assert current_sidecar is not None
-                assert store_stage is not None
-                store_path, store_bytes, _staged_store = store_stage
-                current_bytes, current_store = _read_exact_object(
-                    store_handle.store_path,
-                    VOICES_STORE_MAX_BYTES,
-                )
-                validate_voice_store(current_store)
-                if current_bytes != store_bytes:
-                    raise RuntimeError(
-                        "voices store changed during speaker generation; re-run"
-                    )
-                try:
-                    matched = _matching_record(
-                        current_sidecar,
-                        store_path,
-                        current_store,
-                    )
-                except (CompatibilityError, Phase2DataError) as exc:
-                    log.warning("voice matching skipped: %s", exc)
-                    matched = None
-                if matched is not None:
-                    matches, suggest_record, _thresholds = matched
-            elif library_location is not None and pair is not None:
-                assert current_sidecar is not None
-                assert library_scope is not None
-                try:
-                    library_matched = _library_matching(
-                        current_sidecar,
-                        media=media,
-                        location=library_location,
-                        scope=library_scope,
-                        folder_scope=show is None,
-                    )
-                except (CompatibilityError, Phase2DataError) as exc:
-                    log.warning("voice matching skipped: %s", exc)
-                    library_matched = None
-                if library_matched is not None:
-                    matches, suggest_record = library_matched
-
-            def recheck_media_before_mapping_install() -> None:
-                assert snapshot_fingerprint is not None
-                try:
-                    live_fingerprint = media_fingerprint(media)
-                except OSError as exc:
-                    raise RuntimeError(
-                        "media could not be rechecked during speaker generation; re-run"
-                    ) from exc
-                if live_fingerprint != snapshot_fingerprint:
-                    raise RuntimeError(
-                        "media changed during speaker generation; re-run"
-                    )
-
-            pristine_mapping_generation = _publish_audition(
-                media,
-                mapping_path=active_mapping_path,
-                skeleton=skeleton,
-                suggest_record=suggest_record,
-                before_mapping_install=(
-                    recheck_media_before_mapping_install if pair is not None else None
-                ),
-            )
-            page = _render_audition_html(
-                media.name,
-                active_mapping_path.name,
-                embedded,
-                matches,
-                scope=library_scope if store_handle is None else None,
-            )
-            return SpeakerAudition(
-                page=page,
-                media_path=media,
-                sibling_json_path=json_path,
-                mapping_path=active_mapping_path,
-                speaker_ids=tuple(picks),
-                pristine_mapping_generation=pristine_mapping_generation,
-            )
-
-        with episode_lock(media):
-            if pair is not None and store_stage is not None:
-                store_path, _store_bytes, _store = store_stage
-                with shared_store_lock(store_path) as lock_handle:
-                    return publish_locked(lock_handle)
-            return publish_locked()
-
-    try:
-        if pair is not None:
-            snapshots = ExitStack()
-            try:
-                snapshot = snapshots.enter_context(MediaSnapshot(media))
-            except SnapshotUnavailable as exc:
-                snapshots.close()
-                raise RuntimeError(
-                    "cannot validate declared voiceprints without a media snapshot: "
-                    f"{exc}"
-                ) from exc
-            else:
-                with snapshots:
-                    output = generate_from(snapshot.path, snapshot.fingerprint)
+def _generate_audition(inputs: _AuditionInputs) -> SpeakerAudition:
+    if inputs.pair is not None:
+        snapshots = ExitStack()
+        try:
+            snapshot = snapshots.enter_context(MediaSnapshot(inputs.media))
+        except SnapshotUnavailable as exc:
+            snapshots.close()
+            raise RuntimeError(
+                f"cannot validate declared voiceprints without a media snapshot: {exc}"
+            ) from exc
         else:
-            output = generate_from(media, None)
-    except BaseException:
-        # A failed attempt must not leave an older machine claim behind. The
-        # helper rechecks the exact staged sibling and mapping absence under the
-        # episode lock, so it cannot erase a cooperating concurrent winner.
-        _delete_stale_suggest_for_refusal(
-            media,
-            sibling_path=json_path,
-            sibling_bytes=sibling_bytes,
+            with snapshots:
+                return _generate_from(inputs, snapshot.path, snapshot.fingerprint)
+    return _generate_from(inputs, inputs.media, None)
+
+
+def _generate_from(
+    inputs: _AuditionInputs, source: Path, snapshot_fingerprint: str | None
+) -> SpeakerAudition:
+    if inputs.pair is not None:
+        _check_snapshot_binding(inputs, snapshot_fingerprint)
+    embedded = _embed_audition_clips(source, inputs.picks)
+    skeleton = {
+        "version": MAPPING_VERSION,
+        "speakers": {speaker_id: "" for speaker_id in inputs.picks},
+    }
+    with episode_lock(inputs.media):
+        if inputs.pair is not None and inputs.store_stage is not None:
+            store_path, _store_bytes, _store = inputs.store_stage
+            with shared_store_lock(store_path) as lock_handle:
+                return _publish_locked(
+                    inputs, embedded, skeleton, snapshot_fingerprint, lock_handle
+                )
+        return _publish_locked(inputs, embedded, skeleton, snapshot_fingerprint)
+
+
+def _check_snapshot_binding(
+    inputs: _AuditionInputs, snapshot_fingerprint: str | None
+) -> None:
+    assert inputs.sidecar is not None
+    assert snapshot_fingerprint is not None
+    try:
+        validate_voiceprint_conjunction(
+            inputs.sidecar, inputs.data, snapshot_fingerprint
         )
-        raise
-    log.info("prepared speaker audition for %s", output.mapping_path.name)
-    return output
+    except Phase2DataError as exc:
+        inputs.delete_stale_suggest()
+        raise RuntimeError(
+            "voiceprint evidence does not bind this episode; rerun "
+            f"--diarize --voiceprints or {inputs.manual_hint}: {exc}"
+        ) from exc
+
+
+def _embed_audition_clips(
+    source: Path, picks: Mapping[str, Sequence[Span]]
+) -> dict[str, list[tuple[Span, str]]]:
+    embedded: dict[str, list[tuple[Span, str]]] = {label: [] for label in picks}
+    with tempfile.TemporaryDirectory(prefix="voxweave_speakers_") as tmp_dir:
+        root = Path(tmp_dir)
+        for speaker_index, (speaker_id, spans) in enumerate(picks.items()):
+            for clip_index, (start, end) in enumerate(spans):
+                clip_path = root / f"speaker-{speaker_index}-{clip_index}.mp3"
+                extract_clip(source, start, end, clip_path)
+                encoded = base64.b64encode(clip_path.read_bytes()).decode("ascii")
+                embedded[speaker_id].append(
+                    ((start, end), f"data:audio/mpeg;base64,{encoded}")
+                )
+    return embedded
+
+
+def _publish_locked(
+    inputs: _AuditionInputs,
+    embedded: Mapping[str, Sequence[tuple[Span, str]]],
+    skeleton: Mapping[str, object],
+    snapshot_fingerprint: str | None,
+    store_handle: StoreLockHandle | None = None,
+) -> SpeakerAudition:
+    media = inputs.media
+    active_mapping_path = sidecars.speakers_mapping_path(media)
+    current_sidecar = _recheck_audition_inputs(inputs, snapshot_fingerprint)
+
+    matches: dict[str, SpeakerMatch] | None = None
+    suggest_record: dict[str, object] | None = None
+    if store_handle is not None:
+        matches, suggest_record = _store_matches(inputs, current_sidecar, store_handle)
+    elif inputs.library_location is not None and inputs.pair is not None:
+        matches, suggest_record = _library_matches(
+            inputs, current_sidecar, inputs.library_location
+        )
+
+    pristine_mapping_generation = _publish_audition(
+        media,
+        mapping_path=active_mapping_path,
+        skeleton=skeleton,
+        suggest_record=suggest_record,
+        before_mapping_install=(
+            _media_recheck(media, snapshot_fingerprint)
+            if inputs.pair is not None
+            else None
+        ),
+    )
+    page = _render_audition_html(
+        media.name,
+        active_mapping_path.name,
+        embedded,
+        matches,
+        scope=inputs.library_scope if store_handle is None else None,
+    )
+    return SpeakerAudition(
+        page=page,
+        media_path=media,
+        sibling_json_path=inputs.json_path,
+        mapping_path=active_mapping_path,
+        speaker_ids=tuple(inputs.picks),
+        pristine_mapping_generation=pristine_mapping_generation,
+    )
+
+
+def _recheck_audition_inputs(
+    inputs: _AuditionInputs, snapshot_fingerprint: str | None
+) -> dict[str, object] | None:
+    current_sidecar = inputs.sidecar
+    current_sibling_bytes = inputs.json_path.read_bytes()
+    if current_sibling_bytes != inputs.sibling_bytes:
+        raise RuntimeError("input changed during speaker generation; re-run")
+    if inputs.pair is not None:
+        assert inputs.sidecar_bytes is not None
+        assert snapshot_fingerprint is not None
+        current_data = strict_json_object_loads(
+            current_sibling_bytes,
+            max_bytes=max(1, len(current_sibling_bytes)),
+            source=inputs.json_path.name,
+        )
+        current_sidecar_bytes = sidecars.voiceprints_path(inputs.media).read_bytes()
+        if current_sidecar_bytes != inputs.sidecar_bytes:
+            raise RuntimeError("input changed during speaker generation; re-run")
+        current_sidecar = _voiceprints_from_bytes(
+            current_sidecar_bytes,
+            source=sidecars.voiceprints_path(inputs.media).name,
+        )
+        validate_voiceprint_conjunction(
+            current_sidecar,
+            current_data,
+            snapshot_fingerprint,
+        )
+    return current_sidecar
+
+
+def _store_matches(
+    inputs: _AuditionInputs,
+    current_sidecar: dict[str, object] | None,
+    store_handle: StoreLockHandle,
+) -> tuple[dict[str, SpeakerMatch] | None, dict[str, object] | None]:
+    assert inputs.pair is not None
+    assert current_sidecar is not None
+    assert inputs.store_stage is not None
+    store_path, store_bytes, _staged_store = inputs.store_stage
+    current_bytes, current_store = _read_exact_object(
+        store_handle.store_path,
+        VOICES_STORE_MAX_BYTES,
+    )
+    validate_voice_store(current_store)
+    if current_bytes != store_bytes:
+        raise RuntimeError("voices store changed during speaker generation; re-run")
+    try:
+        matched = _matching_record(
+            current_sidecar,
+            store_path,
+            current_store,
+        )
+    except (CompatibilityError, Phase2DataError) as exc:
+        log.warning("voice matching skipped: %s", exc)
+        matched = None
+    if matched is None:
+        return None, None
+    matches, suggest_record, _thresholds = matched
+    return matches, suggest_record
+
+
+def _library_matches(
+    inputs: _AuditionInputs,
+    current_sidecar: dict[str, object] | None,
+    location: voicelibrary.LibraryLocation,
+) -> tuple[dict[str, SpeakerMatch] | None, dict[str, object] | None]:
+    assert current_sidecar is not None
+    assert inputs.library_scope is not None
+    try:
+        library_matched = _library_matching(
+            current_sidecar,
+            media=inputs.media,
+            location=location,
+            scope=inputs.library_scope,
+            folder_scope=inputs.show is None,
+        )
+    except (CompatibilityError, Phase2DataError) as exc:
+        log.warning("voice matching skipped: %s", exc)
+        library_matched = None
+    if library_matched is None:
+        return None, None
+    matches, suggest_record = library_matched
+    return matches, suggest_record
+
+
+def _media_recheck(media: Path, snapshot_fingerprint: str | None) -> Callable[[], None]:
+    def recheck_media_before_mapping_install() -> None:
+        assert snapshot_fingerprint is not None
+        try:
+            live_fingerprint = media_fingerprint(media)
+        except OSError as exc:
+            raise RuntimeError(
+                "media could not be rechecked during speaker generation; re-run"
+            ) from exc
+        if live_fingerprint != snapshot_fingerprint:
+            raise RuntimeError("media changed during speaker generation; re-run")
+
+    return recheck_media_before_mapping_install
 
 
 @dataclass(frozen=True)
