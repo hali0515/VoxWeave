@@ -859,205 +859,212 @@ def _shadow_measure_speakers(
     artifact["speaker_evidence"]["measurement_refusal"] = measurement_refusal
 
 
-def _shadow_v2_artifact(
-    document: SegDocument, v1_cues: Sequence[Cue], thresholds: Mapping[str, Any]
-) -> dict[str, Any]:
-    """Run the complete P5 row matrix and assemble one schema-2 artifact.
+class _ShadowRun:
+    """One :func:`_shadow_v2_artifact` call, phase by phase.
 
-    Returns the admitted artifact, or an :func:`_incomplete` envelope when a row
-    the contract needs cannot be materialized. Raises
-    :class:`ShadowAdmissionError` when the assembled artifact fails the
-    contract.
+    Each phase reads what the phases before it set on the run and adds its own
+    attributes: :meth:`solve` the v1 capture, the refined document and both
+    speaker-weight solves; :meth:`stage` the lane streams and the finalizer
+    inputs every row shares; :meth:`finalize_rows` and :meth:`refiner_row` the
+    finalizer rows that :meth:`assemble` publishes.
     """
-    from voxweave.core.authority import AuthorityLedger, digest_payload
-    from voxweave.core.boundary_v2 import (
-        V1Partition,
-        _document_partition,
-        _document_waivers,
-        _optimization_reuse,
-        optimize_document,
-    )
-    from voxweave.core.finalizer import (
-        FinalizeEvidence,
-        FinalizePolicy,
-        FinalizerPreview,
-        capture_v1_reference,
-        finalize,
-        phase1_from_optimizer_selection,
-        phase1_from_v1_capture,
-        register_optimizer_selection,
-    )
-    from voxweave.core.speaker_evidence import (
-        W_SPEAKER_INTERIOR,
-        evidence_span_from_cue,
-        lyric_for_evidence,
-        project_speaker_evidence,
-        speaker_evidence,
-    )
-    from voxweave.core.subunit import empty_refine_result, refine_document
 
-    # Capture the committed v1 bytes before any legacy overlay. The finalizer
-    # input is a separate evidence-stamped copy; the delivery tripwire retains
-    # this raw reference byte for byte.
-    reference: list[Cue] = [copy.deepcopy(cue) for cue in v1_cues]
-    parent_speakers = speaker_evidence(document)
-    finalizer_reference = [copy.deepcopy(cue) for cue in reference]
-    for cue in finalizer_reference:
-        lyric = lyric_for_evidence(evidence_span_from_cue(cue), document.sing_spans)
-        if lyric:
-            cue["lyric"] = True
-        else:
-            cue.pop("lyric", None)
-    ledger = AuthorityLedger()
-    capture = capture_v1_reference(finalizer_reference, ledger=ledger)
+    def __init__(self, document: SegDocument, thresholds: Mapping[str, Any]) -> None:
+        self.document = document
+        self.thresholds = thresholds
 
-    # Refinement is the first v2 topology operation and acts on a detached copy.
-    shadow_document, split = refine_document(document)
-    projected_speakers = project_speaker_evidence(
-        parent_speakers, refined_units=split.units, origin=split.origin
-    )
-    v1_partition, v1_projection = _shadow_v1_partition(
-        document, split.origin, reference
-    )
-    v1_reference_input = (
-        None
-        if v1_partition is None
-        else V1Partition(cuts=v1_partition, cues=tuple(reference))
-    )
-    preview = _AuditedFinalizerPreview(FinalizerPreview(shadow_document.profile))
-    pricing_reuse = _optimization_reuse(shadow_document, canonical_spaced=True)
-    solution = optimize_document(
-        shadow_document,
-        v1=v1_reference_input,
-        preview=preview,
-        subunit_split=split,
-        speakers=projected_speakers,
-        speaker_weight=W_SPEAKER_INTERIOR,
-        _reuse=pricing_reuse,
-    )
-    speaker_off = optimize_document(
-        shadow_document,
-        v1=v1_reference_input,
-        preview=preview,
-        subunit_split=split,
-        speakers=projected_speakers,
-        speaker_weight=0.0,
-        _reuse=pricing_reuse,
-    )
-    optimizer_artifact_bytes = json.dumps(
-        solution.artifact, sort_keys=True, separators=(",", ":")
-    )
-    artifact = solution.artifact
-    artifact["units"] = _shadow_source_units(shadow_document.units)
-    artifact["preview_fidelity"] = preview.to_dict()
-    artifact["v1_projection"] = {
-        "cut_count": None if v1_partition is None else len(v1_partition),
-        "mode": v1_projection,
-        "unprojected": v1_partition is None,
-    }
-    if solution.invalid_profile:
-        refused = "; ".join(
-            f"{violation.key}={violation.value} ({violation.reason})"
-            for violation in solution.invalid_profile
+    # Inputs and policy: the evidence-stamped v1 capture, the refined copy of the
+    # document, and the speaker-on and speaker-off solves over one shared preview.
+    def solve(self, v1_cues: Sequence[Cue]) -> None:
+        from voxweave.core.authority import AuthorityLedger
+        from voxweave.core.boundary_v2 import (
+            V1Partition,
+            _optimization_reuse,
+            optimize_document,
         )
-        return _incomplete(
-            artifact,
-            reason="invalid-profile",
-            detail=f"optimizer profile preflight failed: {refused}",
+        from voxweave.core.finalizer import FinalizerPreview, capture_v1_reference
+        from voxweave.core.speaker_evidence import (
+            W_SPEAKER_INTERIOR,
+            evidence_span_from_cue,
+            lyric_for_evidence,
+            project_speaker_evidence,
+            speaker_evidence,
+        )
+        from voxweave.core.subunit import refine_document
+
+        document = self.document
+        # Capture the committed v1 bytes before any legacy overlay. The finalizer
+        # input is a separate evidence-stamped copy; the delivery tripwire retains
+        # this raw reference byte for byte.
+        reference: list[Cue] = [copy.deepcopy(cue) for cue in v1_cues]
+        self.reference = reference
+        self.parent_speakers = speaker_evidence(document)
+        finalizer_reference = [copy.deepcopy(cue) for cue in reference]
+        for cue in finalizer_reference:
+            span = evidence_span_from_cue(cue)
+            if lyric_for_evidence(span, document.sing_spans):
+                cue["lyric"] = True
+            else:
+                cue.pop("lyric", None)
+        self.ledger = AuthorityLedger()
+        self.capture = capture_v1_reference(finalizer_reference, ledger=self.ledger)
+
+        # Refinement is the first v2 topology operation and acts on a detached copy.
+        shadow_document, split = refine_document(document)
+        self.shadow_document, self.split = shadow_document, split
+        self.projected_speakers = project_speaker_evidence(
+            self.parent_speakers, refined_units=split.units, origin=split.origin
+        )
+        v1_partition, v1_projection = _shadow_v1_partition(
+            document, split.origin, reference
+        )
+        self.v1_partition, self.v1_projection = v1_partition, v1_projection
+        v1_reference_input = (
+            None
+            if v1_partition is None
+            else V1Partition(cuts=v1_partition, cues=tuple(reference))
+        )
+        preview = _AuditedFinalizerPreview(FinalizerPreview(shadow_document.profile))
+        self.preview = preview
+        pricing_reuse = _optimization_reuse(shadow_document, canonical_spaced=True)
+        # Speaker-on first, then speaker-off, on one reuse cache and preview.
+        self.solution, self.speaker_off = (
+            optimize_document(
+                shadow_document,
+                v1=v1_reference_input,
+                preview=preview,
+                subunit_split=split,
+                speakers=self.projected_speakers,
+                speaker_weight=weight,
+                _reuse=pricing_reuse,
+            )
+            for weight in (W_SPEAKER_INTERIOR, 0.0)
+        )
+        self.optimizer_artifact_bytes = json.dumps(
+            self.solution.artifact, sort_keys=True, separators=(",", ":")
+        )
+        artifact = self.artifact = self.solution.artifact
+        artifact["units"] = _shadow_source_units(shadow_document.units)
+        artifact["preview_fidelity"] = preview.to_dict()
+        artifact["v1_projection"] = {
+            "cut_count": None if v1_partition is None else len(v1_partition),
+            "mode": v1_projection,
+            "unprojected": v1_partition is None,
+        }
+
+    # Lane runs: the raw stage, the core and legacy-overlay streams of both
+    # engines, and the finalizer inputs every row shares.
+    def stage(self) -> None:
+        from voxweave.core.authority import digest_payload
+        from voxweave.core.boundary_v2 import _document_partition, _document_waivers
+        from voxweave.core.finalizer import (
+            FinalizeEvidence,
+            FinalizePolicy,
+            phase1_from_v1_capture,
         )
 
-    unit_count = len(shadow_document.units)
-    raw_partition = _document_partition(solution.solutions, unit_count)
-    off_partition = _document_partition(speaker_off.solutions, unit_count)
-    solver_waivers = _document_waivers(solution.solutions)
-    fallback_ranges = [
-        list(item.unit_range) for item in solution.solutions if not item.optimized
-    ]
+        solution, shadow_document = self.solution, self.shadow_document
+        unit_count = self.unit_count = len(shadow_document.units)
+        raw_partition = _document_partition(solution.solutions, unit_count)
+        self.raw_partition = raw_partition
+        self.off_partition = _document_partition(self.speaker_off.solutions, unit_count)
+        solver_waivers = _document_waivers(solution.solutions)
+        fallback_ranges = [
+            list(item.unit_range) for item in solution.solutions if not item.optimized
+        ]
+        self.fallback_ranges = fallback_ranges
 
-    raw_cues = [copy.deepcopy(cue) for item in solution.solutions for cue in item.cues]
-    # The raw stage is the optimizer's own stream, which ``optimize_document``
-    # already checked with its per-interval waivers and attribution. Reusing
-    # that check keeps ``raw.validator`` and ``validator.raw`` one answer (the
-    # one ``interval_document_agree`` was computed against).
-    raw_v2 = _shadow_stream_block(
-        raw_cues,
-        raw_partition,
-        "solver-partition",
-        document=shadow_document,
-        origin="v2",
-        stage="raw",
-        validator=copy.deepcopy(artifact["validator"]["raw"]),
-    )
-    artifact["raw"] = raw_v2
+        raw_cues = [
+            copy.deepcopy(cue) for item in solution.solutions for cue in item.cues
+        ]
+        # The raw stage is the optimizer's own stream, which ``optimize_document``
+        # already checked with its per-interval waivers and attribution. Reusing
+        # that check keeps ``raw.validator`` and ``validator.raw`` one answer (the
+        # one ``interval_document_agree`` was computed against).
+        self.artifact["raw"] = _shadow_stream_block(
+            raw_cues,
+            raw_partition,
+            "solver-partition",
+            document=shadow_document,
+            origin="v2",
+            stage="raw",
+            validator=copy.deepcopy(self.artifact["validator"]["raw"]),
+        )
+        self.core_v1, self.core_v2, self.delivery_v1, self.delivery_v2 = (
+            _shadow_lane_streams(
+                solution=solution,
+                shadow_document=shadow_document,
+                thresholds=self.thresholds,
+                raw_partition=raw_partition,
+                solver_waivers=solver_waivers,
+                fallback_ranges=fallback_ranges,
+                unit_count=unit_count,
+                reference=self.reference,
+                v1_partition=self.v1_partition,
+                v1_projection=self.v1_projection,
+            )
+        )
 
-    core_v1, core_v2, delivery_v1, delivery_v2 = _shadow_lane_streams(
-        solution=solution,
-        shadow_document=shadow_document,
-        thresholds=thresholds,
-        raw_partition=raw_partition,
-        solver_waivers=solver_waivers,
-        fallback_ranges=fallback_ranges,
-        unit_count=unit_count,
-        reference=reference,
-        v1_partition=v1_partition,
-        v1_projection=v1_projection,
-    )
-
-    # Typed fallbacks adopt COMPLETE v1 cues, and the optimizer's adoption plan
-    # grows neighbouring fallbacks until their ranges tile. An overlap here means
-    # that invariant broke: the raw-stage document validator then sees a v1 cue
-    # twice, a reporting artifact rather than a conservation result, so it is
-    # flagged where a reader meets it instead of being mistaken for evidence. It
-    # cannot arise on the public corpus, where the C13 gate forbids fallbacks.
-    overlapping = any(
-        left[1] > right[0] for left, right in zip(fallback_ranges, fallback_ranges[1:])
-    )
-    # Every row gets one typed upstream authority and one finalizer root.
-    evaluation_id = (
-        "p5:"
-        + digest_payload(
+        # Typed fallbacks adopt COMPLETE v1 cues, and the optimizer's adoption plan
+        # grows neighbouring fallbacks until their ranges tile. An overlap here
+        # means that invariant broke: the raw-stage document validator then sees a
+        # v1 cue twice, a reporting artifact rather than a conservation result, so
+        # it is flagged where a reader meets it instead of being mistaken for
+        # evidence. It cannot arise on the public corpus, where the C13 gate
+        # forbids fallbacks.
+        self.overlapping = any(
+            left[1] > right[0]
+            for left, right in zip(fallback_ranges, fallback_ranges[1:])
+        )
+        # Every row gets one typed upstream authority and one finalizer root.
+        digest = digest_payload(
             {
                 "language": shadow_document.language,
-                "profile": artifact["profile"],
+                "profile": self.artifact["profile"],
                 "units": [unit.surface for unit in shadow_document.units],
             }
-        )[:20]
-    )
-    finalizer_evidence = FinalizeEvidence(
-        shots=tuple(shadow_document.shot_changes or ()),
-        sing_spans=tuple(shadow_document.sing_spans or ()),
-    )
-    finalizer_policy = FinalizePolicy()
-    unavailable = {
-        "v2": [
-            item.interval.index for item in solution.solutions if not item.optimized
-        ],
-        "v2-speaker-off": [
-            item.interval.index for item in speaker_off.solutions if not item.optimized
-        ],
-    }
-    v1_stream = phase1_from_v1_capture(
-        capture,
-        profile=shadow_document.profile,
-        ledger=ledger,
-        row_id=f"{SHADOW_LANE_FINALIZER}/v1",
-        evaluation_id=evaluation_id,
-    )
-
-    if any(unavailable.values()):
-        # The frozen optimizer factory correctly refuses an adopted-v1 interval:
-        # it has no optimizer selection to seal. Preserve the useful core/legacy
-        # diagnostics and state the unmaterialized rows instead of letting that
-        # typed precondition collapse the whole fail-open artifact to ``error``.
-        v1_row, comparator_row, diff_classification = _shadow_v1_rows(
-            v1_stream=v1_stream,
-            capture=capture,
-            v1_partition=v1_partition,
-            v1_projection=v1_projection,
-            document=shadow_document,
-            evidence=finalizer_evidence,
-            policy=finalizer_policy,
         )
+        self.evaluation_id = "p5:" + digest[:20]
+        self.evidence = FinalizeEvidence(
+            shots=tuple(shadow_document.shot_changes or ()),
+            sing_spans=tuple(shadow_document.sing_spans or ()),
+        )
+        self.policy = FinalizePolicy()
+        self.unavailable = {
+            name: [
+                item.interval.index for item in solved.solutions if not item.optimized
+            ]
+            for name, solved in (("v2", solution), ("v2-speaker-off", self.speaker_off))
+        }
+        self.v1_stream = phase1_from_v1_capture(
+            self.capture,
+            profile=shadow_document.profile,
+            ledger=self.ledger,
+            row_id=f"{SHADOW_LANE_FINALIZER}/v1",
+            evaluation_id=self.evaluation_id,
+        )
+
+    # The v1 finalizer row, its legacy-display comparator and N11, as both exits
+    # build them.
+    def v1_rows(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        return _shadow_v1_rows(
+            v1_stream=self.v1_stream,
+            capture=self.capture,
+            v1_partition=self.v1_partition,
+            v1_projection=self.v1_projection,
+            document=self.shadow_document,
+            evidence=self.evidence,
+            policy=self.policy,
+        )
+
+    # The adopted-v1 exit. The frozen optimizer factory correctly refuses an
+    # adopted-v1 interval: it has no optimizer selection to seal. Preserve the
+    # useful core/legacy diagnostics and state the unmaterialized rows instead of
+    # letting that typed precondition collapse the whole fail-open artifact to
+    # ``error``.
+    def unmaterialized(self) -> dict[str, Any]:
+        solution, artifact, unit_count = self.solution, self.artifact, self.unit_count
+        v1_row, comparator_row, diff_classification = self.v1_rows()
         actual_fallbacks = sum(not item.optimized for item in solution.solutions)
         optimized_units = sum(
             item.interval.unit_end - item.interval.unit_start
@@ -1072,26 +1079,28 @@ def _shadow_v2_artifact(
                 for item in solution.solutions
             ),
             "fallback_intervals": actual_fallbacks,
-            "fallback_ranges_overlap": overlapping,
-            "fallback_unit_ranges": fallback_ranges,
+            "fallback_ranges_overlap": self.overlapping,
+            "fallback_unit_ranges": self.fallback_ranges,
             "optimized_intervals": len(solution.solutions) - actual_fallbacks,
             "optimized_unit_ratio": (
                 1.0 if unit_count == 0 else optimized_units / unit_count
             ),
-            "raw_conservation_trustworthy": not overlapping,
+            "raw_conservation_trustworthy": not self.overlapping,
             "unit_count": unit_count,
-            "v1_unprojected": v1_partition is None,
+            "v1_unprojected": self.v1_partition is None,
         }
-        _shadow_publish_validators(artifact, core_v2, delivery_v2, overlapping, None)
+        _shadow_publish_validators(
+            artifact, self.core_v2, self.delivery_v2, self.overlapping, None
+        )
         unmaterialized = {
             "materialized": False,
             "reason": "adopted-v1-has-no-optimizer-authority",
         }
         artifact["lanes"] = _shadow_lanes(
-            core_v1,
-            core_v2,
-            delivery_v1,
-            delivery_v2,
+            self.core_v1,
+            self.core_v2,
+            self.delivery_v1,
+            self.delivery_v2,
             {
                 "v1": v1_row,
                 "v2": dict(unmaterialized),
@@ -1100,159 +1109,175 @@ def _shadow_v2_artifact(
             comparator_row,
         )
         artifact["authorities"] = _shadow_authorities(
-            ledger, {f"{SHADOW_LANE_FINALIZER}/v1": "v1-capture"}
+            self.ledger, {f"{SHADOW_LANE_FINALIZER}/v1": "v1-capture"}
         )
         artifact["diff_classification"] = diff_classification
         artifact["canonical_fallback_rechecks"] = _shadow_fallback_rechecks(
-            v1_stream,
-            _shadow_owned_footprints(shadow_document, unit_count, v1_partition),
+            self.v1_stream,
+            _shadow_owned_footprints(
+                self.shadow_document, unit_count, self.v1_partition
+            ),
             row_id="v1",
         )
         artifact["finalizer"] = None
-        artifact["invalid_optimizer_rows"] = unavailable
+        artifact["invalid_optimizer_rows"] = self.unavailable
         artifact["refiner_comparison"] = {
             "materialized": False,
             "reason": "optimizer-selection-unavailable",
-            "refined_parent_count": split.refined_parent_count,
+            "refined_parent_count": self.split.refined_parent_count,
             "status": "unmaterialized",
         }
         artifact["speaker_evidence"]["measurement_refusal"] = (
             "optimizer-selection-unavailable"
         )
-        artifact["preview_fidelity"] = preview.to_dict()
+        artifact["preview_fidelity"] = self.preview.to_dict()
         return _incomplete(
             artifact,
             reason="optimizer-selection-unavailable",
             detail="optimizer selection authority unavailable for one or more rows",
         )
 
-    on_authority = register_optimizer_selection(solution, ledger=ledger)
-    on_stream = phase1_from_optimizer_selection(
-        on_authority,
-        ledger=ledger,
-        row_id=f"{SHADOW_LANE_FINALIZER}/v2",
-        evaluation_id=evaluation_id,
-    )
-    off_authority = register_optimizer_selection(speaker_off, ledger=ledger)
-    off_stream = phase1_from_optimizer_selection(
-        off_authority,
-        ledger=ledger,
-        row_id=f"{SHADOW_LANE_FINALIZER}/v2-speaker-off",
-        evaluation_id=evaluation_id,
-    )
-    preview.check_selected("v2", solution, on_stream)
-    preview.check_selected("v2-speaker-off", speaker_off, off_stream)
-    canonical_fallback_rechecks = [
-        *_shadow_fallback_rechecks(
-            v1_stream,
-            _shadow_owned_footprints(shadow_document, unit_count, v1_partition),
-            row_id="v1",
-        ),
-        *_shadow_fallback_rechecks(
-            on_stream,
-            _shadow_owned_footprints(shadow_document, unit_count, raw_partition),
-            row_id="v2",
-        ),
-        *_shadow_fallback_rechecks(
-            off_stream,
-            _shadow_owned_footprints(shadow_document, unit_count, off_partition),
-            row_id="v2-speaker-off",
-        ),
-    ]
-    v1_row, comparator_row, diff_classification = _shadow_v1_rows(
-        v1_stream=v1_stream,
-        capture=capture,
-        v1_partition=v1_partition,
-        v1_projection=v1_projection,
-        document=shadow_document,
-        evidence=finalizer_evidence,
-        policy=finalizer_policy,
-    )
-    on_finalized = finalize(
-        on_stream,
-        profile=shadow_document.profile,
-        evidence=finalizer_evidence,
-        policy=finalizer_policy,
-    )
-    off_finalized = finalize(
-        off_stream,
-        profile=shadow_document.profile,
-        evidence=finalizer_evidence,
-        policy=finalizer_policy,
-    )
-    on_row, on_final_cues = _shadow_finalizer_row(
-        on_finalized,
-        on_stream,
-        raw_partition,
-        document=shadow_document,
-        origin="v2",
-        evidence=finalizer_evidence,
-        policy=finalizer_policy,
-    )
-    off_row, off_final_cues = _shadow_finalizer_row(
-        off_finalized,
-        off_stream,
-        off_partition,
-        document=shadow_document,
-        origin="v2",
-        evidence=finalizer_evidence,
-        policy=finalizer_policy,
-    )
+    # Oracle checks on the selected rows: seal both optimizer selections, recheck
+    # the canonical-text fallbacks of all three rows, finalize them and measure
+    # the speaker evidence.
+    def finalize_rows(self) -> None:
+        from voxweave.core.finalizer import (
+            finalize,
+            phase1_from_optimizer_selection,
+            register_optimizer_selection,
+        )
 
-    _shadow_measure_speakers(
-        artifact=artifact,
-        solution=solution,
-        projected_speakers=projected_speakers,
-        on_finalized=on_finalized,
-        off_finalized=off_finalized,
-        on_row=on_row,
-        off_row=off_row,
-        on_final_cues=on_final_cues,
-        off_final_cues=off_final_cues,
-        raw_partition=raw_partition,
-        off_partition=off_partition,
-        unit_count=unit_count,
-    )
+        ledger, shadow_document = self.ledger, self.shadow_document
+        evidence, policy = self.evidence, self.policy
+        on_authority = register_optimizer_selection(self.solution, ledger=ledger)
+        on_stream = phase1_from_optimizer_selection(
+            on_authority,
+            ledger=ledger,
+            row_id=f"{SHADOW_LANE_FINALIZER}/v2",
+            evaluation_id=self.evaluation_id,
+        )
+        off_authority = register_optimizer_selection(self.speaker_off, ledger=ledger)
+        off_stream = phase1_from_optimizer_selection(
+            off_authority,
+            ledger=ledger,
+            row_id=f"{SHADOW_LANE_FINALIZER}/v2-speaker-off",
+            evaluation_id=self.evaluation_id,
+        )
+        self.preview.check_selected("v2", self.solution, on_stream)
+        self.preview.check_selected("v2-speaker-off", self.speaker_off, off_stream)
+        self.rechecks: list[dict[str, Any]] = []
+        for stream, partition, row_id in (
+            (self.v1_stream, self.v1_partition, "v1"),
+            (on_stream, self.raw_partition, "v2"),
+            (off_stream, self.off_partition, "v2-speaker-off"),
+        ):
+            footprints = _shadow_owned_footprints(
+                shadow_document, self.unit_count, partition
+            )
+            self.rechecks.extend(
+                _shadow_fallback_rechecks(stream, footprints, row_id=row_id)
+            )
+        v1_row, self.comparator_row, self.diff_classification = self.v1_rows()
+        on_finalized, off_finalized = (
+            finalize(
+                stream,
+                profile=shadow_document.profile,
+                evidence=evidence,
+                policy=policy,
+            )
+            for stream in (on_stream, off_stream)
+        )
+        on_row, on_final_cues = _shadow_finalizer_row(
+            on_finalized,
+            on_stream,
+            self.raw_partition,
+            document=shadow_document,
+            origin="v2",
+            evidence=evidence,
+            policy=policy,
+        )
+        off_row, off_final_cues = _shadow_finalizer_row(
+            off_finalized,
+            off_stream,
+            self.off_partition,
+            document=shadow_document,
+            origin="v2",
+            evidence=evidence,
+            policy=policy,
+        )
+
+        _shadow_measure_speakers(
+            artifact=self.artifact,
+            solution=self.solution,
+            projected_speakers=self.projected_speakers,
+            on_finalized=on_finalized,
+            off_finalized=off_finalized,
+            on_row=on_row,
+            off_row=off_row,
+            on_final_cues=on_final_cues,
+            off_final_cues=off_final_cues,
+            raw_partition=self.raw_partition,
+            off_partition=self.off_partition,
+            unit_count=self.unit_count,
+        )
+        self.rows: dict[str, Any] = {
+            "v1": v1_row,
+            "v2": on_row,
+            "v2-speaker-off": off_row,
+        }
 
     # Refiner bypass is an exact identity gate on tracked rows and a typed
     # diagnostic on genuinely refined rows. Only a fallback-free bypass can own
     # an optimizer authority/finalizer root under the frozen W1 API.
-    parent_v1_cuts, parent_v1_mode = _shadow_surface_partition(
-        document.units, reference
-    )
-    parent_v1 = (
-        None
-        if parent_v1_cuts is None
-        else V1Partition(parent_v1_cuts, tuple(reference))
-    )
-    refiner_off = optimize_document(
-        document,
-        v1=parent_v1,
-        preview=preview,
-        subunit_split=empty_refine_result(document.units, language=document.language),
-        speakers=parent_speakers,
-        speaker_weight=W_SPEAKER_INTERIOR,
-    )
-    refiner_comparison: dict[str, Any] = _shadow_refiner_comparison(
-        refiner_off=refiner_off,
-        optimizer_artifact_bytes=optimizer_artifact_bytes,
-        raw_partition=raw_partition,
-        split=split,
-        parent_unit_count=len(document.units),
-        parent_v1_mode=parent_v1_mode,
-    )
+    def refiner_row(self) -> None:
+        from voxweave.core.boundary_v2 import (
+            V1Partition,
+            _document_partition,
+            optimize_document,
+        )
+        from voxweave.core.finalizer import (
+            FinalizeEvidence,
+            finalize,
+            phase1_from_optimizer_selection,
+            register_optimizer_selection,
+        )
+        from voxweave.core.speaker_evidence import W_SPEAKER_INTERIOR
+        from voxweave.core.subunit import empty_refine_result
 
-    rows: dict[str, Any] = {
-        "v1": v1_row,
-        "v2": on_row,
-        "v2-speaker-off": off_row,
-    }
-    expected: dict[str, AuthorityKind] = {
-        f"{SHADOW_LANE_FINALIZER}/v1": "v1-capture",
-        f"{SHADOW_LANE_FINALIZER}/v2": "optimizer-selection",
-        f"{SHADOW_LANE_FINALIZER}/v2-speaker-off": "optimizer-selection",
-    }
-    if split.refined_parent_count and refiner_comparison["materialized"]:
+        document, reference, split = self.document, self.reference, self.split
+        parent_v1_cuts, parent_v1_mode = _shadow_surface_partition(
+            document.units, reference
+        )
+        parent_v1 = (
+            None
+            if parent_v1_cuts is None
+            else V1Partition(parent_v1_cuts, tuple(reference))
+        )
+        refiner_off = optimize_document(
+            document,
+            v1=parent_v1,
+            preview=self.preview,
+            subunit_split=empty_refine_result(
+                document.units, language=document.language
+            ),
+            speakers=self.parent_speakers,
+            speaker_weight=W_SPEAKER_INTERIOR,
+        )
+        self.refiner_comparison: dict[str, Any] = _shadow_refiner_comparison(
+            refiner_off=refiner_off,
+            optimizer_artifact_bytes=self.optimizer_artifact_bytes,
+            raw_partition=self.raw_partition,
+            split=split,
+            parent_unit_count=len(document.units),
+            parent_v1_mode=parent_v1_mode,
+        )
+        self.expected: dict[str, AuthorityKind] = {
+            f"{SHADOW_LANE_FINALIZER}/v1": "v1-capture",
+            f"{SHADOW_LANE_FINALIZER}/v2": "optimizer-selection",
+            f"{SHADOW_LANE_FINALIZER}/v2-speaker-off": "optimizer-selection",
+        }
+        if not (split.refined_parent_count and self.refiner_comparison["materialized"]):
+            return
         # The counterfactual is solved over the parent units, but every row of
         # the artifact is read against the refined ``units`` block. A parent
         # cut is a refined cut at the parent's first child, and each parent's
@@ -1261,14 +1286,16 @@ def _shadow_v2_artifact(
             _document_partition(refiner_off.solutions, len(document.units)),
             split.origin,
         )
-        refiner_authority = register_optimizer_selection(refiner_off, ledger=ledger)
+        refiner_authority = register_optimizer_selection(
+            refiner_off, ledger=self.ledger
+        )
         refiner_stream = phase1_from_optimizer_selection(
             refiner_authority,
-            ledger=ledger,
+            ledger=self.ledger,
             row_id=f"{SHADOW_LANE_FINALIZER}/refiner-off",
-            evaluation_id=evaluation_id,
+            evaluation_id=self.evaluation_id,
         )
-        preview.check_selected("refiner-off", refiner_off, refiner_stream)
+        self.preview.check_selected("refiner-off", refiner_off, refiner_stream)
         refiner_evidence = FinalizeEvidence(
             shots=tuple(document.shot_changes or ()),
             sing_spans=tuple(document.sing_spans or ()),
@@ -1277,73 +1304,113 @@ def _shadow_v2_artifact(
             refiner_stream,
             profile=document.profile,
             evidence=refiner_evidence,
-            policy=finalizer_policy,
+            policy=self.policy,
         )
         refiner_row, _refiner_cues = _shadow_finalizer_row(
             refiner_finalized,
             refiner_stream,
             refiner_partition,
-            document=shadow_document,
+            document=self.shadow_document,
             origin="v2",
             evidence=refiner_evidence,
-            policy=finalizer_policy,
+            policy=self.policy,
         )
-        rows["refiner-off"] = refiner_row
-        expected[f"{SHADOW_LANE_FINALIZER}/refiner-off"] = "optimizer-selection"
-        canonical_fallback_rechecks.extend(
-            _shadow_fallback_rechecks(
-                refiner_stream,
-                _shadow_owned_footprints(
-                    shadow_document, unit_count, refiner_partition
-                ),
-                row_id="refiner-off",
-            )
+        self.rows["refiner-off"] = refiner_row
+        self.expected[f"{SHADOW_LANE_FINALIZER}/refiner-off"] = "optimizer-selection"
+        footprints = _shadow_owned_footprints(
+            self.shadow_document, self.unit_count, refiner_partition
+        )
+        self.rechecks.extend(
+            _shadow_fallback_rechecks(refiner_stream, footprints, row_id="refiner-off")
         )
 
-    totals = artifact["totals"]
-    artifact["coverage"] = {
-        **artifact["coverage"],
-        "coarse_granularity_intervals": totals["coarse_granularity_intervals"],
-        "fallback_intervals": totals["fallback_intervals"],
-        "fallback_ranges_overlap": overlapping,
-        "fallback_unit_ranges": fallback_ranges,
-        "optimized_intervals": totals["optimized_intervals"],
-        "optimized_unit_ratio": totals["optimized_unit_ratio"],
-        "raw_conservation_trustworthy": not overlapping,
-        "unit_count": totals["unit_count"],
-        "v1_unprojected": v1_partition is None,
-    }
-    _shadow_publish_validators(
-        artifact, core_v2, delivery_v2, overlapping, on_row["validator"]
-    )
-    artifact["finalizer"] = on_row["finalizer"]
-    artifact["lanes"] = _shadow_lanes(
-        core_v1, core_v2, delivery_v1, delivery_v2, rows, comparator_row
-    )
-    artifact["authorities"] = _shadow_authorities(ledger, expected)
-    artifact["diff_classification"] = diff_classification
-    artifact["canonical_fallback_rechecks"] = canonical_fallback_rechecks
-    artifact["preview_fidelity"] = preview.to_dict()
-    artifact["refiner_comparison"] = refiner_comparison
-    artifact["invalid_finalizer_rows"] = [
-        name for name, row in rows.items() if not row["finalizer"]["valid"]
-    ]
-    if v1_partition is None:
-        return _incomplete(
+    # Artifact assembly: publish every lane, row and oracle block, then admit the
+    # artifact or return the typed incomplete envelope.
+    def assemble(self) -> dict[str, Any]:
+        artifact, rows = self.artifact, self.rows
+        totals = artifact["totals"]
+        artifact["coverage"] = {
+            **artifact["coverage"],
+            "coarse_granularity_intervals": totals["coarse_granularity_intervals"],
+            "fallback_intervals": totals["fallback_intervals"],
+            "fallback_ranges_overlap": self.overlapping,
+            "fallback_unit_ranges": self.fallback_ranges,
+            "optimized_intervals": totals["optimized_intervals"],
+            "optimized_unit_ratio": totals["optimized_unit_ratio"],
+            "raw_conservation_trustworthy": not self.overlapping,
+            "unit_count": totals["unit_count"],
+            "v1_unprojected": self.v1_partition is None,
+        }
+        _shadow_publish_validators(
             artifact,
-            reason="v1-unprojected",
-            detail="v1 source partition could not be projected",
+            self.core_v2,
+            self.delivery_v2,
+            self.overlapping,
+            rows["v2"]["validator"],
         )
-    if (
-        split.refined_parent_count
-        and refiner_comparison.get("materialized") is not True
-    ):
+        artifact["finalizer"] = rows["v2"]["finalizer"]
+        artifact["lanes"] = _shadow_lanes(
+            self.core_v1,
+            self.core_v2,
+            self.delivery_v1,
+            self.delivery_v2,
+            rows,
+            self.comparator_row,
+        )
+        artifact["authorities"] = _shadow_authorities(self.ledger, self.expected)
+        artifact["diff_classification"] = self.diff_classification
+        artifact["canonical_fallback_rechecks"] = self.rechecks
+        artifact["preview_fidelity"] = self.preview.to_dict()
+        artifact["refiner_comparison"] = self.refiner_comparison
+        artifact["invalid_finalizer_rows"] = [
+            name for name, row in rows.items() if not row["finalizer"]["valid"]
+        ]
+        if self.v1_partition is None:
+            return _incomplete(
+                artifact,
+                reason="v1-unprojected",
+                detail="v1 source partition could not be projected",
+            )
+        if (
+            self.split.refined_parent_count
+            and self.refiner_comparison.get("materialized") is not True
+        ):
+            return _incomplete(
+                artifact,
+                reason="refiner-off-unavailable",
+                detail="refiner-off optimizer selection authority unavailable",
+            )
+        return _shadow_admit(artifact)
+
+
+def _shadow_v2_artifact(
+    document: SegDocument, v1_cues: Sequence[Cue], thresholds: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Run the complete P5 row matrix and assemble one schema-2 artifact.
+
+    Returns the admitted artifact, or an :func:`_incomplete` envelope when a row
+    the contract needs cannot be materialized. Raises
+    :class:`ShadowAdmissionError` when the assembled artifact fails the
+    contract.
+    """
+    run = _ShadowRun(document, thresholds)
+    run.solve(v1_cues)
+    if run.solution.invalid_profile:
+        refused = "; ".join(
+            f"{violation.key}={violation.value} ({violation.reason})"
+            for violation in run.solution.invalid_profile
+        )
         return _incomplete(
-            artifact,
-            reason="refiner-off-unavailable",
-            detail="refiner-off optimizer selection authority unavailable",
+            run.artifact,
+            reason="invalid-profile",
+            detail=f"optimizer profile preflight failed: {refused}",
         )
-    return _shadow_admit(artifact)
+    run.stage()
+    if any(run.unavailable.values()):
+        return run.unmaterialized()
+    run.finalize_rows()
+    run.refiner_row()
+    return run.assemble()
 
 
 def run_shadow(

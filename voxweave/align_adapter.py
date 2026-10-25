@@ -453,31 +453,12 @@ def _w1_assemble_delivery(
     return delivery
 
 
-def _w1_delivery(
-    context: IssuedAlignContext,
-    acquisition: object,
-    payload: object,
-    *,
-    _observation_sink: list[_SemanticObservation] | None = None,
-) -> tuple[AlignDelivery, _SemanticObservation]:
-    from typing import cast
-
+# W1 admission: an issued acquisition, a verified fresh alignment and a profile.
+def _w1_admission(context: IssuedAlignContext, acquisition: object, payload: object):
     from voxweave.align_acquisition import (
         IssuedFreshAlignment,
-        _fresh_seed,
         _verify_fresh_alignment,
     )
-    from voxweave.core.authority import AuthorityLedger, check_roots, lineage_tuples
-    from voxweave.core.finalizer import (
-        FinalizeEvidence,
-        FinalizePolicy,
-        finalize,
-        phase1_from_fresh_alignment,
-    )
-    from voxweave.core.partition_check import check_partition
-    from voxweave.core.schema import Cue
-    from voxweave.core.segdoc import SourceUnit
-    from voxweave.core.trace_validator import replay_trace, stability_check
 
     if not isinstance(acquisition, IssuedFreshAlignment):
         raise AlignAdapterError(
@@ -497,6 +478,15 @@ def _w1_delivery(
         raise AlignAdapterError(
             CanonicalFailure("profile-invalid", "display-profile", "profile-shape")
         )
+    return acquisition, verified, profile, evidence_resolution
+
+
+# W1 phase 1: mint the seed stream and prove it previews to the fresh blocks.
+def _w1_phase1(context: IssuedAlignContext, acquisition, verified, profile):
+    from voxweave.align_acquisition import _fresh_seed
+    from voxweave.core.authority import AuthorityLedger
+    from voxweave.core.finalizer import phase1_from_fresh_alignment
+
     ledger = AuthorityLedger()
     stream = phase1_from_fresh_alignment(
         verified,
@@ -515,6 +505,14 @@ def _w1_delivery(
             )
         )
     _w1_check_phase1_fidelity(seed_blocks, seed_cues, profile)
+    return ledger, stream, seed, seed_blocks, seed_cues
+
+
+# W1 finalize: run the finalizer once and admit only a valid terminal.
+def _w1_finalize(stream, profile, evidence_resolution, ledger):
+    from voxweave.core.authority import lineage_tuples
+    from voxweave.core.finalizer import FinalizeEvidence, FinalizePolicy, finalize
+
     finalizer_evidence = FinalizeEvidence(
         shots=tuple(evidence_resolution.shots or ()),
         sing_spans=tuple(evidence_resolution.sing_spans or ()),
@@ -528,22 +526,21 @@ def _w1_delivery(
         policy=policy,
     )
     _w1_check_terminal(finalized)
-    semantic_observation = _SemanticObservation(
-        semantic_root_lineage,
-        deepcopy(stream.cues),
-        deepcopy(finalized.cues),
-        deepcopy(finalized.report),
-        deepcopy(finalized.trace),
-        None,
-        None,
-        None,
-    )
+    return finalizer_evidence, policy, semantic_root_lineage, finalized
 
-    def retain_observation() -> None:
-        if _observation_sink is not None:
-            _observation_sink[:] = [semantic_observation]
 
-    retain_observation()
+# W1 observation sink: hand the latest observation group to the caller's list.
+def _w1_retain(
+    sink: list[_SemanticObservation] | None, observation: _SemanticObservation
+) -> None:
+    if sink is not None:
+        sink[:] = [observation]
+
+
+# W1 root events: the ledger must name only the fresh-alignment root.
+def _w1_check_roots(ledger) -> None:
+    from voxweave.core.authority import check_roots
+
     root_errors = check_roots(
         ledger,
         expected={"align/delivery-finalizer/v2": "fresh-alignment"},
@@ -552,10 +549,23 @@ def _w1_delivery(
         raise AlignAdapterError(
             CanonicalFailure("fresh-authority-invalid", "w1-admission", "w1-root-event")
         )
-    _w1_check_footprint(seed_cues, seed_blocks)
-    ordered_units = tuple(getattr(seed, "ordered_units", ()))
-    _w1_check_cue_schema(seed_blocks, finalized.cues)
-    delivered = tuple((cue["start"], cue["end"]) for cue in finalized.cues)
+
+
+# W1 partition: the finalized cues must hold every hard predicate on the seed cuts.
+def _w1_check_partition(
+    seed_blocks,
+    ordered_units,
+    finalized,
+    profile,
+    observation: _SemanticObservation,
+    sink: list[_SemanticObservation] | None,
+) -> _SemanticObservation:
+    from typing import cast
+
+    from voxweave.core.partition_check import check_partition
+    from voxweave.core.schema import Cue
+    from voxweave.core.segdoc import SourceUnit
+
     sources = tuple(
         SourceUnit(
             unit.unit_id,
@@ -579,11 +589,11 @@ def _w1_delivery(
         reports=finalized.report.entries,
         waivers=waivers,
     )
-    semantic_observation = replace(
-        semantic_observation,
+    observation = replace(
+        observation,
         partition_result=deepcopy(partition_result),
     )
-    retain_observation()
+    _w1_retain(sink, observation)
     if partition_result.exit_driving:
         raise AlignAdapterError(
             CanonicalFailure(
@@ -592,6 +602,22 @@ def _w1_delivery(
                 "finalizer-partition",
             )
         )
+    return observation
+
+
+# W1 trace replay: the recorded trace must replay to the delivered bounds.
+def _w1_check_trace(
+    finalized,
+    stream,
+    profile,
+    finalizer_evidence,
+    policy,
+    delivered,
+    observation: _SemanticObservation,
+    sink: list[_SemanticObservation] | None,
+) -> _SemanticObservation:
+    from voxweave.core.trace_validator import replay_trace
+
     trace_errors = replay_trace(
         finalized.trace,
         stream.cues,
@@ -600,15 +626,31 @@ def _w1_delivery(
         policy=policy,
         delivered=delivered,
     )
-    semantic_observation = replace(
-        semantic_observation,
+    observation = replace(
+        observation,
         trace_problems=deepcopy(trace_errors),
     )
-    retain_observation()
+    _w1_retain(sink, observation)
     if trace_errors:
         raise AlignAdapterError(
             CanonicalFailure("finalizer-trace-failed", "trace-replay", "trace-replay")
         )
+    return observation
+
+
+# W1 stability: the delivered bounds must be stable under one more sweep.
+def _w1_check_stability(
+    finalized,
+    stream,
+    profile,
+    finalizer_evidence,
+    policy,
+    delivered,
+    observation: _SemanticObservation,
+    sink: list[_SemanticObservation] | None,
+) -> _SemanticObservation:
+    from voxweave.core.trace_validator import stability_check
+
     stability_errors = stability_check(
         delivered,
         stream.cues,
@@ -617,11 +659,11 @@ def _w1_delivery(
         policy=policy,
         terminal=finalized.trace.terminal,
     )
-    semantic_observation = replace(
-        semantic_observation,
+    observation = replace(
+        observation,
         stability_problems=deepcopy(stability_errors),
     )
-    retain_observation()
+    _w1_retain(sink, observation)
     if stability_errors:
         raise AlignAdapterError(
             CanonicalFailure(
@@ -630,6 +672,69 @@ def _w1_delivery(
                 "stability-check",
             )
         )
+    return observation
+
+
+def _w1_delivery(
+    context: IssuedAlignContext,
+    acquisition: object,
+    payload: object,
+    *,
+    _observation_sink: list[_SemanticObservation] | None = None,
+) -> tuple[AlignDelivery, _SemanticObservation]:
+    acquisition, verified, profile, evidence_resolution = _w1_admission(
+        context, acquisition, payload
+    )
+    ledger, stream, seed, seed_blocks, seed_cues = _w1_phase1(
+        context, acquisition, verified, profile
+    )
+    finalizer_evidence, policy, semantic_root_lineage, finalized = _w1_finalize(
+        stream, profile, evidence_resolution, ledger
+    )
+    semantic_observation = _SemanticObservation(
+        semantic_root_lineage,
+        deepcopy(stream.cues),
+        deepcopy(finalized.cues),
+        deepcopy(finalized.report),
+        deepcopy(finalized.trace),
+        None,
+        None,
+        None,
+    )
+    _w1_retain(_observation_sink, semantic_observation)
+    _w1_check_roots(ledger)
+    _w1_check_footprint(seed_cues, seed_blocks)
+    ordered_units = tuple(getattr(seed, "ordered_units", ()))
+    _w1_check_cue_schema(seed_blocks, finalized.cues)
+    delivered = tuple((cue["start"], cue["end"]) for cue in finalized.cues)
+    semantic_observation = _w1_check_partition(
+        seed_blocks,
+        ordered_units,
+        finalized,
+        profile,
+        semantic_observation,
+        _observation_sink,
+    )
+    semantic_observation = _w1_check_trace(
+        finalized,
+        stream,
+        profile,
+        finalizer_evidence,
+        policy,
+        delivered,
+        semantic_observation,
+        _observation_sink,
+    )
+    semantic_observation = _w1_check_stability(
+        finalized,
+        stream,
+        profile,
+        finalizer_evidence,
+        policy,
+        delivered,
+        semantic_observation,
+        _observation_sink,
+    )
     delivery = _w1_assemble_delivery(
         context,
         acquisition.receipt_digest,

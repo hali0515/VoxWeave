@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from voxweave import artifacts, backend, chunking, config, realign, songdet
@@ -26,7 +26,7 @@ from voxweave.songdet import (
 )
 from voxweave.timestamps import shift_units
 from voxweave.transcript_language import _select_transcript_language
-from voxweave.vocals import acquire_16k
+from voxweave.vocals import Acquired16k, acquire_16k
 from voxweave.voicebase import require_sha256
 from voxweave.voiceprint_capture import (
     VoiceprintCapture,
@@ -416,6 +416,358 @@ def _identify_speakers(
     return speaker_turns, voiceprint_capture
 
 
+# The per-run handles of one transcribe() call: the media, the debug sink, the
+# reporter and the temp files the run owns (deleted on every exit path).
+@dataclass(frozen=True)
+class _TranscribeRun:
+    media_path: Path
+    dbg: DebugSink
+    rep: Reporter
+    # intermediate files (fullband/vocals/16k/32k wav), deleted at end
+    tmp: list[Path] = field(default_factory=list)
+    tmp_chunks: list[Path] = field(default_factory=list)
+
+
+# Debug sink of a transcribe() run: the no-op sink unless --debug, which writes under
+# debug_root (default: the media's claimed debug directory).
+def _debug_sink(media_path: Path, *, debug: bool, debug_root: Path | None) -> DebugSink:
+    dbg: DebugSink = DebugSink()
+    if debug:
+        if debug_root is None:
+            debug_root = artifacts.claim_paths(media_path).debug
+        dbg = FileDebugSink(root=debug_root)
+    return dbg
+
+
+# Audio preparation stage of transcribe(): the voiceprint checkpoint prefetch, then
+# the 16k input (separated vocals unless --no-separate), plus the 32k vocals when
+# song detection will run. Returns whether voiceprints stay on for this run (a
+# failed prefetch turns them off) and the acquired audio.
+def _prepare_audio(
+    run: _TranscribeRun,
+    *,
+    separate: bool,
+    normalize: bool,
+    want_voc32: bool,
+    voiceprints: bool,
+    voiceprint_model: str | None,
+    lang_override: str | None,
+    source_fingerprint: str | None,
+    cache_vocals: Path | None,
+) -> tuple[bool, Acquired16k]:
+    dbg, rep = run.dbg, run.rep
+    rep.step("prepare audio")
+    if voiceprints:
+        # Idempotent after process()'s own prefetch: a cached checkpoint is
+        # only re-verified. A failure turns voiceprints off for this run.
+        voiceprints = _prefetch_voiceprint_models(voiceprint_model, lang_override, rep)
+    if separate and voiceprints:
+        require_sha256(source_fingerprint, "capture media fingerprint")
+
+    def dump_separation(fullband: Path, vocals: Path) -> None:
+        dbg.audio("00_fullband_44k.wav", fullband)
+        dbg.audio("01_vocals.flac", vocals)
+        log.info("separated vocals (local Roformer)")
+
+    acquired = acquire_16k(
+        run.media_path,
+        separate=separate,
+        normalize=normalize,
+        reporter=rep,
+        tmp=run.tmp,
+        cache=cache_vocals,
+        # A capture binds the cache to the snapshot it separated; otherwise
+        # the duration check against the source decides.
+        fingerprint=(source_fingerprint or "") if voiceprints else None,
+        purpose="capture",
+        on_separated=dump_separation,
+        want_voc32=want_voc32,
+    )
+    dbg.audio("02_speech_16k.wav", acquired.wav)
+    return voiceprints, acquired
+
+
+# Song detection stage of transcribe(): PANNs on the 32k separated vocals. Returns
+# (song_spans, sing_spans, speech_spans), all empty when detection does not run.
+def _detect_songs(
+    voc32: Path | None,
+    *,
+    enabled: bool,
+    separate: bool,
+    rep: Reporter,
+) -> tuple[
+    list[tuple[float, float]], list[tuple[float, float]], list[tuple[float, float]]
+]:
+    # Song detection must run on clean separated vocals; BGM causes speech/music confusion.
+    song_spans: list[tuple[float, float]] = []
+    sing_spans: list[tuple[float, float]] = []  # subset triggering block expansion
+    speech_spans: list[tuple[float, float]] = []  # trimmed from song core edges
+    if not enabled:
+        return song_spans, sing_spans, speech_spans
+    if not separate or voc32 is None:
+        # --no-separate + skip-songs is valid (clean input); skip detection silently.
+        log.debug(
+            "song detection requires separated vocals; skipping with --no-separate"
+        )
+        return song_spans, sing_spans, speech_spans
+    try:
+        rep.step("detect songs")
+        rep.stage("song detection (PANNs)")
+        song_spans, sing_spans, speech_spans = detect_song_spans(
+            voc32, progress=progress_bridge(rep, "song detection (PANNs)")
+        )
+        if song_spans:
+            log.info(
+                "song spans: %s",
+                [(round(a, 1), round(b, 1)) for a, b in song_spans],
+            )
+    except ModuleNotFoundError as e:
+        # panns-inference (or one of its deps) is missing from a broken
+        # environment: it is a core dependency, so reinstalling fixes it.
+        log.warning(
+            "song detection unavailable (missing module: %s) -- continuing "
+            "without song skip; panns-inference is a core dependency, so "
+            "reinstall voxweave, or pass --no-skip-songs (and drop "
+            "--keep-lyrics) to silence this",
+            e,
+        )
+    return song_spans, sing_spans, speech_spans
+
+
+# Speech finding stage of transcribe(): VAD on the 16k wav, then the chunk plan.
+def _find_speech(
+    run: _TranscribeRun,
+    wav: Path,
+    *,
+    song_spans: list[tuple[float, float]],
+    sing_spans: list[tuple[float, float]],
+    speech_spans: list[tuple[float, float]],
+    keep_lyrics: bool,
+) -> _ChunkPlan:
+    run.rep.step("find speech")
+    run.rep.stage("VAD chunking")
+    segs = vad_speech_segments(wav)
+    plan = _plan_chunks(
+        wav,
+        segs,
+        song_spans=song_spans,
+        sing_spans=sing_spans,
+        speech_spans=speech_spans,
+        keep_lyrics=keep_lyrics,
+    )
+    if not plan.chunks:
+        raise RuntimeError(f"no speech detected in {run.media_path.name}")
+    return plan
+
+
+# ASR + alignment pass of transcribe(): slices every planned chunk (each slice joins
+# tmp_chunks as soon as it exists) and runs the backend over them. Returns the chunk
+# wavs and the per-chunk (language, text, units) results, in chunk order.
+def _transcribe_planned_chunks(
+    run: _TranscribeRun,
+    wav: Path,
+    plan: _ChunkPlan,
+    *,
+    lang_override: str | None,
+    asr_model: str | None,
+    context: str | None,
+) -> tuple[list[Path], list[tuple[str | None, str, list[dict]]]]:
+    rep = run.rep
+    chunks = plan.chunks
+    rep.step("transcribe and align")
+    rep.stage("load ASR/alignment models")
+    # Slice all chunk waveforms upfront so dual-pass (full ASR -> release -> full
+    # alignment) can shave VRAM peak.
+    cwavs: list[Path] = []
+    for ch in chunks:
+        cwav = slice_wav(wav, ch["start"], ch["end"])
+        run.tmp_chunks.append(cwav)
+        cwavs.append(cwav)
+    strategy = config.conf_load_strategy()
+    rep.chunks(len(chunks) * backend.chunk_pass_count(asr_model))
+    # full_wav + bounds let CTC/MMS languages run ONE full-file alignment pass over
+    # the whole audio (chunk windows as DP silence anchors) instead of N per-chunk
+    # calls; Qwen-aligned languages (zh/yue) keep per-chunk inside transcribe_chunks.
+    results = backend.transcribe_chunks(
+        cwavs,
+        lang_override,
+        asr_model=asr_model,
+        context=context,
+        on_done=lambda _i: rep.chunk_done(),
+        strategy=strategy,
+        full_wav=wav,
+        bounds=[(ch["start"], ch["end"]) for ch in chunks],
+        # post-excise speech segments on the separated wav: the CTC full pass
+        # soft-masks emissions outside these so words cannot park in music/silence
+        speech_spans=[(s["start"], s["end"]) for s in plan.segs],
+        # final excised song intervals: muted in the full-pass waveform so mid-file
+        # songs (which survive the envelope crop) cannot host smeared sentence
+        # fragments. Empty under --keep-lyrics (songs stay transcribed -> unmuted).
+        song_spans=plan.song_spans or None,
+    )
+    return cwavs, results
+
+
+# Per-chunk results -> (text, absolute units) pairs for the non-empty chunks, plus the
+# detected languages (debug meta only). Every chunk, empty or not, reaches the sink.
+def _chunk_pairs(
+    chunks: list[dict],
+    cwavs: list[Path],
+    results: list[tuple[str | None, str, list[dict]]],
+    dbg: DebugSink,
+) -> tuple[list[tuple[str, list[dict]]], list[str]]:
+    # reinject_punct runs after language resolution (tokenization must match iso),
+    # so punctuation cannot be reinjected per-chunk.
+    chunk_pairs: list[tuple[str, list[dict]]] = []
+    detected: list[str] = []  # per-chunk detected language (debug meta only)
+    for idx, (ch, cwav, (det_lang, text, units)) in enumerate(
+        zip(chunks, cwavs, results)
+    ):
+        if not text.strip():
+            log.warning("empty ASR for chunk @%.1fs, skipping", ch["start"])
+            dbg.chunk(
+                idx,
+                wav=cwav,
+                start=ch["start"],
+                end=ch["end"],
+                text=text,
+                lang=det_lang,
+                units=None,
+            )
+            continue
+        if det_lang:
+            detected.append(det_lang)
+        dbg.chunk(
+            idx,
+            wav=cwav,
+            start=ch["start"],
+            end=ch["end"],
+            text=text,
+            lang=det_lang,
+            units=units,
+        )
+        chunk_pairs.append((text, shift_units(units, ch["offset"])))
+    return chunk_pairs, detected
+
+
+# File language and punctuated units of transcribe(). Returns (lang_name, iso, units).
+def _transcript_units(
+    media_path: Path,
+    chunk_pairs: list[tuple[str, list[dict]]],
+    results: list[tuple[str | None, str, list[dict]]],
+    lang_override: str | None,
+) -> tuple[str, str, list[dict]]:
+    # Transcript-content weighting lets long dialogue dominate without
+    # trusting the aligner whose language choice we are validating.
+    lang_name = _select_transcript_language(results, lang_override)
+    if not is_supported(lang_name):
+        log.warning(
+            "language %r is not officially supported; subtitle line breaking may"
+            " be poor — pass --language to override detection",
+            lang_name,
+        )
+    iso = to_iso_or(lang_name, "en")
+
+    # Aligner strips punctuation; reinject_punct reattaches it by time so smart_split
+    # can use it for sentence breaking and space insertion.
+    all_units: list[dict] = []
+    for txt, u in chunk_pairs:
+        all_units.extend(realign.reinject_punct(txt, u, iso))
+    if not all_units:
+        raise RuntimeError(f"no aligned units for {media_path.name}")
+    return lang_name, iso, all_units
+
+
+# Transcription stage of transcribe(): ASR + alignment over the chunk plan, the file
+# language, the punctuated units positioned against the original-audio timing
+# reference, and the debug meta. Returns (iso, units, vad_spans).
+def _transcribe_speech(
+    run: _TranscribeRun,
+    acquired: Acquired16k,
+    plan: _ChunkPlan,
+    speech_spans: list[tuple[float, float]],
+    *,
+    separate: bool,
+    skip_songs: bool,
+    lang_override: str | None,
+    asr_model: str | None,
+    context: str | None,
+) -> tuple[str, list[dict], list[tuple[float, float]]]:
+    media_path, dbg, rep = run.media_path, run.dbg, run.rep
+    cwavs, results = _transcribe_planned_chunks(
+        run,
+        acquired.wav,
+        plan,
+        lang_override=lang_override,
+        asr_model=asr_model,
+        context=context,
+    )
+    chunk_pairs, detected = _chunk_pairs(plan.chunks, cwavs, results, dbg)
+    if not chunk_pairs:
+        raise RuntimeError(f"no aligned units for {media_path.name}")
+
+    lang_name, iso, all_units = _transcript_units(
+        media_path, chunk_pairs, results, lang_override
+    )
+    vad_spans = _timing_reference_spans(
+        media_path,
+        acquired.fullband,
+        plan,
+        speech_spans,
+        separate=separate,
+        tmp=run.tmp,
+    )
+    # Qwen aligner has no CTC blank token, so word durations bleed into silence.
+    # position_units_with_vad carves true gaps, giving smart_split an accurate signal.
+    # Routed through the sink so --debug also records the pre/post snapshots and the
+    # zero-duration repair accounting; the no-op sink calls the pass unchanged.
+    all_units = dbg.position_units(all_units, vad_spans, language=lang_name)
+    dbg.meta(
+        {
+            "media": str(media_path),
+            "separate": separate,
+            "skip_songs": skip_songs,
+            "song_spans": plan.song_spans,
+            "language": iso,
+            "detected": detected,
+            "chunks": len(plan.chunks),
+            "units": len(all_units),
+            # Wall-clock seconds per step entered so far (the open step counts up
+            # to now); later steps (speaker identification, layout) are not in it.
+            "timings": dict(rep.timings()),
+        }
+    )
+    return iso, all_units, vad_spans
+
+
+# Cleanup of transcribe(), on every exit path. Each release is guarded on its own: a
+# release that raises (e.g. torch.cuda.empty_cache after a CUDA fault) must neither
+# mask the original error nor skip the remaining releases and the temp-file cleanup.
+def _release_and_clean(run: _TranscribeRun, *, panns_handoff: bool) -> None:
+    # Release ASR/alignment singleton VRAM (separation self-releases earlier).
+    try:
+        backend.release()
+    except Exception as e:
+        log.warning("releasing the ASR/alignment models failed: %r", e)
+    # No VAD pass can follow: every vad_speech_segments call happens before this.
+    try:
+        chunking.release_silero_vad()
+    except Exception as e:
+        log.warning("releasing the VAD model failed: %r", e)
+    if not panns_handoff:
+        # Safety net: an exception before the post-detection release (or before
+        # the sdh caller can take over) would otherwise strand PANNs on the card.
+        # Idempotent when the release above already ran.
+        try:
+            songdet.release_model()
+        except Exception as e:
+            log.warning("releasing the song-detection model failed: %r", e)
+    for p in run.tmp:
+        p.unlink(missing_ok=True)
+    for c in run.tmp_chunks:
+        c.unlink(missing_ok=True)
+
+
 def transcribe(
     media_path: Path,
     *,
@@ -481,221 +833,59 @@ def transcribe(
     if diarize:
         # Fail on a bad env/conf value now, not after separation and ASR.
         speaker_clustering = config.resolve_diarize_clustering(speaker_clustering)
-    dbg: DebugSink = DebugSink()
-    if debug:
-        if debug_root is None:
-            debug_root = artifacts.claim_paths(media_path).debug
-        dbg = FileDebugSink(root=debug_root)
-    tmp: list[
-        Path
-    ] = []  # intermediate files (fullband/vocals/16k/32k wav), deleted at end
-    tmp_chunks: list[Path] = []
+    dbg = _debug_sink(media_path, debug=debug, debug_root=debug_root)
+    run = _TranscribeRun(media_path=media_path, dbg=dbg, rep=rep)
     # Set only on a successful return with release_panns=False: a caller can inherit
     # the loaded model, but never as the fallout of a failed run.
     panns_handoff = False
     try:
-        rep.step("prepare audio")
-        if voiceprints:
-            # Idempotent after process()'s own prefetch: a cached checkpoint is
-            # only re-verified. A failure turns voiceprints off for this run.
-            voiceprints = _prefetch_voiceprint_models(
-                voiceprint_model, lang_override, rep
-            )
-        if separate and voiceprints:
-            require_sha256(source_fingerprint, "capture media fingerprint")
-
-        def dump_separation(fullband: Path, vocals: Path) -> None:
-            dbg.audio("00_fullband_44k.wav", fullband)
-            dbg.audio("01_vocals.flac", vocals)
-            log.info("separated vocals (local Roformer)")
-
-        acquired = acquire_16k(
-            media_path,
+        voiceprints, acquired = _prepare_audio(
+            run,
             separate=separate,
             normalize=normalize,
-            reporter=rep,
-            tmp=tmp,
-            cache=cache_vocals,
-            # A capture binds the cache to the snapshot it separated; otherwise
-            # the duration check against the source decides.
-            fingerprint=(source_fingerprint or "") if voiceprints else None,
-            purpose="capture",
-            on_separated=dump_separation,
             want_voc32=skip_songs or keep_lyrics,
+            voiceprints=voiceprints,
+            voiceprint_model=voiceprint_model,
+            lang_override=lang_override,
+            source_fingerprint=source_fingerprint,
+            cache_vocals=cache_vocals,
         )
-        wav = acquired.wav
-        fullband = acquired.fullband
-        voc32 = acquired.voc32  # 32k mono vocals: PANNs input + cache source
-        separator_identity = acquired.separator
-        dbg.audio("02_speech_16k.wav", wav)
-
-        # Song detection must run on clean separated vocals; BGM causes speech/music confusion.
-        song_spans: list[tuple[float, float]] = []
-        sing_spans: list[tuple[float, float]] = []  # subset triggering block expansion
-        speech_spans: list[tuple[float, float]] = []  # trimmed from song core edges
-        if skip_songs or keep_lyrics:
-            if not separate or voc32 is None:
-                # --no-separate + skip-songs is valid (clean input); skip detection silently.
-                log.debug(
-                    "song detection requires separated vocals; skipping with --no-separate"
-                )
-            else:
-                try:
-                    rep.step("detect songs")
-                    rep.stage("song detection (PANNs)")
-                    song_spans, sing_spans, speech_spans = detect_song_spans(
-                        voc32, progress=progress_bridge(rep, "song detection (PANNs)")
-                    )
-                    if song_spans:
-                        log.info(
-                            "song spans: %s",
-                            [(round(a, 1), round(b, 1)) for a, b in song_spans],
-                        )
-                except ModuleNotFoundError as e:
-                    # panns-inference (or one of its deps) is missing from a broken
-                    # environment: it is a core dependency, so reinstalling fixes it.
-                    log.warning(
-                        "song detection unavailable (missing module: %s) -- continuing "
-                        "without song skip; panns-inference is a core dependency, so "
-                        "reinstall voxweave, or pass --no-skip-songs (and drop "
-                        "--keep-lyrics) to silence this",
-                        e,
-                    )
+        song_spans, sing_spans, speech_spans = _detect_songs(
+            acquired.voc32,  # 32k mono vocals: PANNs input + cache source
+            enabled=skip_songs or keep_lyrics,
+            separate=separate,
+            rep=rep,
+        )
         if release_panns:
             # Last PANNs consumer of this job is done (an --sdh run defers this to
             # its own pass). Drop the ~300MB before the ASR/aligner weights load, so
             # the two never share the card. No-op when detection never ran.
             songdet.release_model()
 
-        rep.step("find speech")
-        rep.stage("VAD chunking")
-        segs = vad_speech_segments(wav)
-        plan = _plan_chunks(
-            wav,
-            segs,
+        plan = _find_speech(
+            run,
+            acquired.wav,
             song_spans=song_spans,
             sing_spans=sing_spans,
             speech_spans=speech_spans,
             keep_lyrics=keep_lyrics,
         )
-        chunks = plan.chunks
-        segs = plan.segs
-        song_spans = plan.song_spans
-        if not chunks:
-            raise RuntimeError(f"no speech detected in {media_path.name}")
-
-        rep.step("transcribe and align")
-        rep.stage("load ASR/alignment models")
-        # Slice all chunk waveforms upfront so dual-pass (full ASR -> release -> full
-        # alignment) can shave VRAM peak.
-        cwavs: list[Path] = []
-        for ch in chunks:
-            cwav = slice_wav(wav, ch["start"], ch["end"])
-            tmp_chunks.append(cwav)
-            cwavs.append(cwav)
-        strategy = config.conf_load_strategy()
-        rep.chunks(len(chunks) * backend.chunk_pass_count(asr_model))
-        # full_wav + bounds let CTC/MMS languages run ONE full-file alignment pass over
-        # the whole audio (chunk windows as DP silence anchors) instead of N per-chunk
-        # calls; Qwen-aligned languages (zh/yue) keep per-chunk inside transcribe_chunks.
-        results = backend.transcribe_chunks(
-            cwavs,
-            lang_override,
+        iso, all_units, vad_spans = _transcribe_speech(
+            run,
+            acquired,
+            plan,
+            speech_spans,
+            separate=separate,
+            skip_songs=skip_songs,
+            lang_override=lang_override,
             asr_model=asr_model,
             context=context,
-            on_done=lambda _i: rep.chunk_done(),
-            strategy=strategy,
-            full_wav=wav,
-            bounds=[(ch["start"], ch["end"]) for ch in chunks],
-            # post-excise speech segments on the separated wav: the CTC full pass
-            # soft-masks emissions outside these so words cannot park in music/silence
-            speech_spans=[(s["start"], s["end"]) for s in segs],
-            # final excised song intervals: muted in the full-pass waveform so mid-file
-            # songs (which survive the envelope crop) cannot host smeared sentence
-            # fragments. Empty under --keep-lyrics (songs stay transcribed -> unmuted).
-            song_spans=song_spans or None,
-        )
-        # reinject_punct runs after language resolution (tokenization must match iso),
-        # so punctuation cannot be reinjected per-chunk.
-        chunk_pairs: list[tuple[str, list[dict]]] = []
-        detected: list[str] = []  # per-chunk detected language (debug meta only)
-        for idx, (ch, cwav, (det_lang, text, units)) in enumerate(
-            zip(chunks, cwavs, results)
-        ):
-            if not text.strip():
-                log.warning("empty ASR for chunk @%.1fs, skipping", ch["start"])
-                dbg.chunk(
-                    idx,
-                    wav=cwav,
-                    start=ch["start"],
-                    end=ch["end"],
-                    text=text,
-                    lang=det_lang,
-                    units=None,
-                )
-                continue
-            if det_lang:
-                detected.append(det_lang)
-            dbg.chunk(
-                idx,
-                wav=cwav,
-                start=ch["start"],
-                end=ch["end"],
-                text=text,
-                lang=det_lang,
-                units=units,
-            )
-            chunk_pairs.append((text, shift_units(units, ch["offset"])))
-
-        if not chunk_pairs:
-            raise RuntimeError(f"no aligned units for {media_path.name}")
-
-        # Transcript-content weighting lets long dialogue dominate without
-        # trusting the aligner whose language choice we are validating.
-        lang_name = _select_transcript_language(results, lang_override)
-        if not is_supported(lang_name):
-            log.warning(
-                "language %r is not officially supported; subtitle line breaking may"
-                " be poor — pass --language to override detection",
-                lang_name,
-            )
-        iso = to_iso_or(lang_name, "en")
-
-        # Aligner strips punctuation; reinject_punct reattaches it by time so smart_split
-        # can use it for sentence breaking and space insertion.
-        all_units: list[dict] = []
-        for txt, u in chunk_pairs:
-            all_units.extend(realign.reinject_punct(txt, u, iso))
-        if not all_units:
-            raise RuntimeError(f"no aligned units for {media_path.name}")
-        vad_spans = _timing_reference_spans(
-            media_path, fullband, plan, speech_spans, separate=separate, tmp=tmp
-        )
-        # Qwen aligner has no CTC blank token, so word durations bleed into silence.
-        # position_units_with_vad carves true gaps, giving smart_split an accurate signal.
-        # Routed through the sink so --debug also records the pre/post snapshots and the
-        # zero-duration repair accounting; the no-op sink calls the pass unchanged.
-        all_units = dbg.position_units(all_units, vad_spans, language=lang_name)
-        dbg.meta(
-            {
-                "media": str(media_path),
-                "separate": separate,
-                "skip_songs": skip_songs,
-                "song_spans": song_spans,
-                "language": iso,
-                "detected": detected,
-                "chunks": len(chunks),
-                "units": len(all_units),
-                # Wall-clock seconds per step entered so far (the open step counts up
-                # to now); later steps (speaker identification, layout) are not in it.
-                "timings": dict(rep.timings()),
-            }
         )
         speaker_turns: list[tuple[float, float, str]] = []
         voiceprint_capture: VoiceprintCapture | None = None
         if diarize:
             speaker_turns, voiceprint_capture = _identify_speakers(
-                wav,
+                acquired.wav,
                 iso,
                 _DiarizeSettings(
                     diarize_model, speaker_clustering, min_speakers, max_speakers
@@ -705,7 +895,7 @@ def transcribe(
                 audio_profile=_diarize_audio_profile(
                     separate=separate,
                     normalize=normalize,
-                    separator_identity=separator_identity,
+                    separator_identity=acquired.separator,
                 ),
                 rep=rep,
             )
@@ -719,28 +909,4 @@ def transcribe(
             voiceprint_capture,
         )
     finally:
-        # Each release is guarded on its own: a release that raises (e.g.
-        # torch.cuda.empty_cache after a CUDA fault) must neither mask the original
-        # error nor skip the remaining releases and the temp-file cleanup below.
-        # Release ASR/alignment singleton VRAM (separation self-releases earlier).
-        try:
-            backend.release()
-        except Exception as e:
-            log.warning("releasing the ASR/alignment models failed: %r", e)
-        # No VAD pass can follow: every vad_speech_segments call lives above.
-        try:
-            chunking.release_silero_vad()
-        except Exception as e:
-            log.warning("releasing the VAD model failed: %r", e)
-        if not panns_handoff:
-            # Safety net: an exception before the post-detection release (or before
-            # the sdh caller can take over) would otherwise strand PANNs on the card.
-            # Idempotent when the release above already ran.
-            try:
-                songdet.release_model()
-            except Exception as e:
-                log.warning("releasing the song-detection model failed: %r", e)
-        for p in tmp:
-            p.unlink(missing_ok=True)
-        for c in tmp_chunks:
-            c.unlink(missing_ok=True)
+        _release_and_clean(run, panns_handoff=panns_handoff)
