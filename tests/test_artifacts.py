@@ -164,6 +164,26 @@ def test_legacy_mapping_wins_without_inspecting_poisoned_cache(tmp_path):
     assert artifacts.inspect_speaker_mapping_path(media) == legacy
 
 
+def test_same_stem_media_resolve_to_one_mapping(tmp_path):
+    mp3 = _media(tmp_path / "episode.mp3")
+    wav = _media(tmp_path / "episode.wav")
+    mp3_mapping = artifacts.claim_paths(mp3).speaker_mapping
+    wav_mapping = artifacts.claim_paths(wav).speaker_mapping
+
+    # Nothing saved yet: each source keeps its own claim.
+    assert artifacts.speaker_mapping_path(mp3) == mp3_mapping
+    assert artifacts.speaker_mapping_path(wav) == wav_mapping
+
+    mp3_mapping.write_text('{"version":1,"speakers":{}}\n', encoding="utf-8")
+    assert artifacts.speaker_mapping_path(wav) == mp3_mapping
+    assert artifacts.inspect_speaker_mapping_path(wav) == mp3_mapping
+
+    # Two existing mappings: every source picks the same one, by MEDIA_EXTS order.
+    wav_mapping.write_text('{"version":1,"speakers":{}}\n', encoding="utf-8")
+    assert artifacts.speaker_mapping_path(mp3) == wav_mapping
+    assert artifacts.speaker_mapping_path(wav) == wav_mapping
+
+
 @pytest.mark.parametrize("node_kind", ["symlink", "fifo"])
 def test_cached_episode_lock_rejects_nonregular_nodes(tmp_path, node_kind):
     media = _media(tmp_path / "episode.mp3")

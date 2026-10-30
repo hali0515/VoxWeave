@@ -937,6 +937,47 @@ def test_split_keeping_vtt_edits_refuses_a_hand_edited_vtt(tmp_path):
     assert json_path.read_bytes() == json_before
 
 
+def test_split_finds_names_saved_through_a_same_stem_media(tmp_path):
+    # `speakers episode.mp3` saves under the mp3 claim while render resolves the
+    # JSON's owner to episode.wav, which ranks first in MEDIA_EXTS.
+    json_path = _named_episode(tmp_path, {"SPEAKER_00": "Aoi", "SPEAKER_01": "Ren"})
+    legacy = tmp_path / "episode.speakers.json"
+    mp3 = tmp_path / "episode.mp3"
+    wav = tmp_path / "episode.wav"
+    mp3.write_bytes(b"compressed")
+    wav.write_bytes(b"lossless")
+    artifacts.claim_paths(wav)
+    names = legacy.read_bytes()
+    legacy.unlink()
+    saved = pipeline.speakers_mapping_path(mp3)
+    saved.write_bytes(names)
+
+    vtt_path = pipeline.split(json_path)
+
+    assert "<v Aoi>" in vtt_path.read_text(encoding="utf-8")
+    assert pipeline.speakers_mapping_path(wav) == saved
+    assert pipeline.inspect_speakers_mapping_path(wav) == saved
+
+
+def test_align_selects_the_sibling_the_voiceprint_binding_names(tmp_path):
+    media_fingerprint = pipeline.media_fingerprint
+
+    vtt = tmp_path / "episode.vtt"
+    mp3 = tmp_path / "episode.mp3"
+    wav = tmp_path / "episode.wav"
+    vtt.write_text("WEBVTT\n", encoding="utf-8")
+    mp3.write_bytes(b"compressed")
+    wav.write_bytes(b"lossless")
+    bound = media_fingerprint(mp3)
+
+    assert pipeline._select_align_media(vtt, None, bound) == (mp3, bound)
+    # An explicit --media wins, and no matching sibling keeps the extension rank.
+    explicit = media_fingerprint(wav)
+    assert pipeline._select_align_media(vtt, wav, bound) == (wav, explicit)
+    assert pipeline._select_align_media(vtt, None, "0" * 64) == (wav, explicit)
+    assert pipeline._select_align_media(vtt, None) == (wav, explicit)
+
+
 def test_split_keeping_vtt_edits_writes_a_missing_vtt(tmp_path):
     json_path = _named_episode(tmp_path, {"SPEAKER_00": "Aoi", "SPEAKER_01": "Ren"})
 

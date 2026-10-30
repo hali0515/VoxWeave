@@ -27,7 +27,7 @@ from typing import Final
 from urllib.parse import quote
 
 from voxweave import fsio
-from voxweave.paths import name_bytes, name_fits, name_limit, swap_ext
+from voxweave.paths import MEDIA_EXTS, name_bytes, name_fits, name_limit, swap_ext
 
 _MARKER_MAX_BYTES: Final = 65_536
 _CACHE_DIR_NAME: Final = "cache"
@@ -473,13 +473,35 @@ def legacy_path(source: Path, suffix: str) -> Path:
     return swap_ext(Path(source), suffix)
 
 
+def _claimed_speaker_mapping(source: Path) -> Path | None:
+    """Return the mapping held by any same-stem claim, in ``MEDIA_EXTS`` order.
+
+    Same-stem media (episode.wav + episode.mp3) share one sibling JSON and so one
+    set of speaker turns. Their names must not depend on which file a command
+    was given, so every source resolves to the same mapping file.
+    """
+    absolute = _absolute(Path(source))
+    rank = {suffix: index for index, suffix in enumerate(MEDIA_EXTS)}
+    claimed = sorted(
+        claimed_sources(absolute.parent, absolute.stem),
+        key=lambda path: (rank.get(path.suffix.lower(), len(rank)), path.name),
+    )
+    for candidate in claimed:
+        paths = inspect_paths(candidate)
+        if paths is not None and path_present(paths.speaker_mapping):
+            return paths.speaker_mapping
+    return None
+
+
 def speaker_mapping_path(source: Path, reference: Path | None = None) -> Path:
     if reference is not None:
         exact = swap_ext(Path(reference), ".speakers.json")
         if path_present(exact):
             return exact
     legacy = legacy_path(source, ".speakers.json")
-    return legacy if path_present(legacy) else claim_paths(source).speaker_mapping
+    if path_present(legacy):
+        return legacy
+    return _claimed_speaker_mapping(source) or claim_paths(source).speaker_mapping
 
 
 def inspect_speaker_mapping_path(
@@ -494,6 +516,9 @@ def inspect_speaker_mapping_path(
     legacy = legacy_path(source, ".speakers.json")
     if path_present(legacy):
         return legacy
+    claimed = _claimed_speaker_mapping(source)
+    if claimed is not None:
+        return claimed
     paths = inspect_paths(source)
     return legacy if paths is None else paths.speaker_mapping
 

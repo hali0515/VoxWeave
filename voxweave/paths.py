@@ -125,13 +125,8 @@ def detect_subtitle_language(sub: Path) -> str | None:
     return lang.to_iso_or(stem.rsplit(".", 1)[1], None)
 
 
-def find_sibling_media(ref: Path) -> Path | None:
-    """Find the source media alongside ref by stem, matching extensions case-insensitively.
-
-    Returns the best candidate by ``MEDIA_EXTS`` order (``.mkv`` before ``.mp4`` ...);
-    when more than one media sibling exists the ambiguity is logged and the selection
-    stays deterministic. ``None`` when no sibling is found.
-    """
+def sibling_media(ref: Path) -> list[Path]:
+    """Every media file alongside ref with its stem, best ``MEDIA_EXTS`` rank first."""
     ref = Path(ref)
     base = swap_ext(ref, "").name  # stem without the reference extension (dot-safe)
     order = {ext: i for i, ext in enumerate(MEDIA_EXTS)}
@@ -143,17 +138,29 @@ def find_sibling_media(ref: Path) -> Path | None:
                 rank = order.get(p.suffix.lower())
                 if rank is not None:
                     matches.append((rank, p))
+    matches.sort(key=lambda m: (m[0], str(m[1])))
+    return [path for _rank, path in matches]
+
+
+def find_sibling_media(ref: Path) -> Path | None:
+    """Find the source media alongside ref by stem, matching extensions case-insensitively.
+
+    Returns the best candidate by ``MEDIA_EXTS`` order (``.mkv`` before ``.mp4`` ...);
+    when more than one media sibling exists the ambiguity is logged and the selection
+    stays deterministic. ``None`` when no sibling is found.
+    """
+    ref = Path(ref)
+    matches = sibling_media(ref)
     if not matches:
         return None
-    matches.sort(key=lambda m: (m[0], str(m[1])))
     if len(matches) > 1:
         log.warning(
             "multiple sibling media files for %s: %s; using %s",
             ref.name,
-            [m[1].name for m in matches],
-            matches[0][1].name,
+            [path.name for path in matches],
+            matches[0].name,
         )
-    return matches[0][1]
+    return matches[0]
 
 
 def find_subtitle_media(ref: Path) -> Path | None:

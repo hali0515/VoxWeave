@@ -147,8 +147,9 @@ def commit_split(source: SplitSource, plan: SplitCommit) -> None:
                 raise VttEditsKeptError(
                     f"{vtt_path.name} was not overwritten: its cue text or timing"
                     f" differs from what {json_path.name} produces (hand edits, align"
-                    " output, or other render options); run"
-                    f" 'voxweave render {json_path}' to replace it anyway"
+                    " output, or other render options); to keep hand edits run"
+                    f" 'voxweave align {vtt_path}' first, then"
+                    f" 'voxweave render {json_path}', which replaces the VTT"
                 )
         episode_transaction.commit_primary_outputs(
             command="split",
