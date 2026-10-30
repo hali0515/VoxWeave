@@ -62,7 +62,12 @@ from voxweave.mediasnapshot import MediaSnapshot, SnapshotUnavailable
 # Path, sidecar, vocals-cache and segmentation helpers moved to their own
 # modules; the public names stay importable from here.
 from voxweave.paths import MEDIA_EXTS as MEDIA_EXTS
-from voxweave.paths import find_subtitle_media, require_output_name, swap_ext
+from voxweave.paths import (
+    find_subtitle_media,
+    require_output_name,
+    sibling_media,
+    swap_ext,
+)
 from voxweave.progress import Reporter
 from voxweave.segmentation import (
     SEGMENTATION_ENGINE as SEGMENTATION_ENGINE,
@@ -1091,11 +1096,44 @@ def _acquire_align_audio(
     return wav, selected_snapshot
 
 
-def _select_align_media(vtt_path: Path, media_path: Path | None) -> tuple[Path, str]:
-    # AO-03: the media align re-times against (explicit or the VTT's sibling) and
-    # its fingerprint.
+def _bound_sibling_media(vtt_path: Path, bound_fingerprint: str) -> Path | None:
+    # Same-stem media share one sibling JSON. Among several, the voiceprint binding
+    # names the one the episode came from; extension rank does not.
+    candidates = sibling_media(vtt_path)
+    if len(candidates) < 2:
+        return None
+    for candidate in candidates:
+        if media_fingerprint(candidate) == bound_fingerprint:
+            log.info("%s: using bound media %s", vtt_path.name, candidate.name)
+            return candidate
+    return None
+
+
+def _select_align_media(
+    vtt_path: Path,
+    media_path: Path | None,
+    bound_fingerprint: str | None = None,
+) -> tuple[Path, str]:
+    # AO-03: the media align re-times against (explicit, the sibling the voiceprint
+    # binding names, or the VTT's best-ranked sibling) and its fingerprint.
     with align_runtime_activity("AO-03", "selected-media-identity"):
-        media = Path(media_path) if media_path else find_subtitle_media(vtt_path)
+        try:
+            bound = (
+                _bound_sibling_media(vtt_path, bound_fingerprint)
+                if bound_fingerprint is not None and not media_path
+                else None
+            )
+        except OSError as exc:
+            _attach_canonical_failure(
+                exc,
+                kind="media-identity-invalid",
+                phase="media",
+                detail_code="media-fingerprint",
+            )
+            raise
+        media = (
+            Path(media_path) if media_path else bound or find_subtitle_media(vtt_path)
+        )
         if media is None or not media.exists():
             raise _media_not_found_error(vtt_path)
         try:
@@ -1220,7 +1258,11 @@ def _read_align_inputs(
             _attach_vtt_decode_failure(exc, vtt_path.name)
             raise
 
-    media, media_input_fingerprint = _select_align_media(vtt_path, media_path)
+    media, media_input_fingerprint = _select_align_media(
+        vtt_path,
+        media_path,
+        voiceprint_pair[1] if voiceprint_pair is not None else None,
+    )
     mms, ctc_model, align_route = _plan_align_route(iso)
     full_pass = align_route.full_pass
     delivery_order = (
