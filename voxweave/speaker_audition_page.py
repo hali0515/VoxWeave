@@ -454,6 +454,7 @@ fetch('serve-info', {{cache: 'no-store'}}).then(async (response) => {{
 }});
 save.addEventListener('click', async () => {{
   save.disabled = true;
+  save.textContent = 'Saving and updating subtitles...';
   const body = output.textContent;
   try {{
     const response = await fetch('save', {{
