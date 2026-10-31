@@ -205,6 +205,29 @@ def test_a_failed_render_keeps_the_save_and_says_why(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "error", [BrokenPipeError(32, "gone"), ConnectionResetError(104, "reset")]
+)
+def test_a_client_that_left_mid_reply_logs_no_traceback(tmp_path, capsys, error):
+    with _running_server(tmp_path) as (server, _mapping, _logs):
+        try:
+            raise error
+        except ConnectionError:
+            server.handle_error(None, ("127.0.0.1", 1))
+
+    assert capsys.readouterr().err == ""
+
+
+def test_a_real_handler_failure_still_logs_a_traceback(tmp_path, capsys):
+    with _running_server(tmp_path) as (server, _mapping, _logs):
+        try:
+            raise RuntimeError("handler bug")
+        except RuntimeError:
+            server.handle_error(None, ("127.0.0.1", 1))
+
+    assert "RuntimeError: handler bug" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("token", [None, "wrong-token"])
 @pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"])
 def test_save_requires_session_token(tmp_path, token, host):

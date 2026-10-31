@@ -13,12 +13,15 @@ from __future__ import annotations
 import json
 import secrets
 import shlex
+import socket
+import sys
 import threading
 import webbrowser
 from collections.abc import Callable, Sequence
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from voxweave import fsio, sidecars, turnembed
@@ -158,6 +161,17 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         self.reported_stale_ids: set[str] = set()
         super().__init__((host, port), _SpeakerRequestHandler)
         self.ngrok_origins = NgrokOrigins(self.server_port) if ngrok else None
+
+    def handle_error(
+        self,
+        request: socket.socket | tuple[bytes, socket.socket],
+        client_address: Any,
+    ) -> None:
+        # A tab closed during a slow Save render is routine: the mapping and the
+        # subtitles are already written, only the reply had nowhere to go.
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
 
     @property
     def authority(self) -> str:
