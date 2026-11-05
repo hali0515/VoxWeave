@@ -476,6 +476,11 @@ save.addEventListener('click', async () => {{
     }} else if (typeof result.render_error === 'string') {{
       saveNote.textContent = `Subtitles not updated: ${{result.render_error}}`;
     }}
+    if (result.stopped === true) {{
+      splitApplied = true;
+      for (const button of splitButtons) button.disabled = true;
+      saveNote.textContent += `${{saveNote.textContent ? ' ' : ''}}The server has stopped; you can close this tab.`;
+    }}
   }} catch (error) {{
     save.textContent = error instanceof Error && error.message ? `Save failed: ${{error.message}}` : 'Save failed';
   }}

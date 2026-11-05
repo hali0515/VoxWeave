@@ -418,7 +418,7 @@ def _serve_audition(
     create_speaker_audition: Callable[..., Any],
     serve: Callable[..., Any],
 ) -> None:
-    # Builds the audition page, then serves it until the user stops the service.
+    # Builds the audition page, then serves it until the first complete Save.
     def prepare(_rep: object) -> Any:
         owner = _episode_owner(request.episode_path, require_media=True)
         return create_speaker_audition(
@@ -574,7 +574,8 @@ def build_speakers_group(
     def group() -> None:
         """Review and name speakers, manage saved voices, or inspect an episode.
 
-        A bare EPISODE starts the audition service. Use Ctrl+C after saving.
+        A bare EPISODE starts the audition service. It stops after the names are
+        saved and the subtitles are updated; Ctrl+C stops it without saving.
         """
 
     enroll_command = _add_enroll_command(

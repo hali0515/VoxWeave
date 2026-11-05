@@ -133,6 +133,7 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         host: str = HOST,
         ngrok: bool = False,
         render: Callable[[], str] | None = None,
+        stop_after_save: bool = False,
     ) -> None:
         if host not in (HOST, "0.0.0.0"):
             raise ValueError("host must be 127.0.0.1 or 0.0.0.0")
@@ -155,6 +156,9 @@ class SpeakerHTTPServer(ThreadingHTTPServer):
         # Re-renders the episode's subtitles after a Save and returns the VTT's
         # name; None leaves rendering to the user (speakers serve --no-render).
         self.render = render
+        # Ends serve_forever after the first Save whose subtitles are up to
+        # date; a failed Save or render keeps the page usable for another try.
+        self.stop_after_save = stop_after_save
         self.action_lock = threading.Lock()
         self.split_proposal: _SplitProposal | None = None
         self.session_terminal = False
@@ -518,7 +522,16 @@ class _SpeakerRequestHandler(BaseHTTPRequestHandler):
                 reply["render_error"] = message
             else:
                 self.server.report(f"Rendered {reply['rendered']}")
+        stopping = self.server.stop_after_save and "render_error" not in reply
+        if stopping:
+            self.server.session_terminal = True
+            reply["stopped"] = True
         self._json_reply(HTTPStatus.OK, reply)
+        if stopping:
+            self.server.report("Stopped the audition server.")
+            # shutdown() waits for serve_forever to return; run it off this
+            # handler so the handler finishes without waiting on the loop.
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def _handle_split(self, payload: object) -> None:
         if self.server.session_terminal:
@@ -654,9 +667,11 @@ def make_server(
     port: int = 0,
     report: Callable[[str], None] = print,
     render: Callable[[], str] | None = None,
+    stop_after_save: bool = False,
 ) -> SpeakerHTTPServer:
     """Bind and return one audition server."""
     return SpeakerHTTPServer(
+        stop_after_save=stop_after_save,
         page=page,
         media_path=media_path,
         mapping_path=mapping_path,
@@ -700,12 +715,15 @@ def serve(
     open_browser: bool = True,
     report: Callable[[str], None] = print,
     render: Callable[[], str] | None = None,
+    stop_after_save: bool = True,
 ) -> str:
-    """Serve an audition until interrupted and return its access link.
+    """Serve an audition and return its access link.
 
     The link (the listening URL plus ``?k=`` and the access key) is the only
     way in; it is printed first and is what the browser is opened with.
     ``render`` runs after every successful Save (see :class:`SpeakerHTTPServer`).
+    With ``stop_after_save`` the server stops after the first Save that leaves
+    the subtitles up to date; otherwise, or until then, it runs until Ctrl+C.
     """
     server = make_server(
         page=page,
@@ -719,6 +737,7 @@ def serve(
         port=port,
         report=report,
         render=render,
+        stop_after_save=stop_after_save,
     )
     url = server.access_url
     report(url)

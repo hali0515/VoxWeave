@@ -90,7 +90,9 @@ to write them directly to the episode's speaker mapping. Each Save then re-rende
 episode's VTT from `<stem>.json` so it shows the new names (`--no-render` turns this off).
 The VTT is replaced only when it differs from that render in speaker names alone: if it holds
 cue text or timing the JSON does not, such as hand edits not yet aligned, it is left unchanged
-and the page says why. The server runs until Ctrl+C; use
+and the page says why. The server stops after the first Save that updates the subtitles (or,
+with `--no-render`, after the first Save); if the render fails, it keeps running so you can
+resolve the cause and save again. Ctrl+C stops it without saving. Use
 `--no-open` to print the access link without opening a browser, or `--port N` to choose its HTTP
 port. No audition HTML is written to disk. `voxweave speakers <media>` is the supported
 shorthand for `serve`; `--manual` disables voice matching for that session.

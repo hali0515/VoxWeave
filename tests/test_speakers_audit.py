@@ -149,6 +149,99 @@ def test_save_next_step_quotes_the_sibling_path(tmp_path):
     assert "'" in logs[-1]
 
 
+def _stopping_server(tmp_path: Path, render):
+    mapping = tmp_path / "episode.speakers.json"
+    mapping.write_text(json.dumps({"version": 1, "speakers": {}}), encoding="utf-8")
+    logs: list[str] = []
+    server = speakerserve.make_server(
+        page="<!doctype html><title>audition</title>",
+        media_path=tmp_path / "episode.mkv",
+        mapping_path=mapping,
+        sibling_path=tmp_path / "episode.json",
+        speaker_ids=("SPEAKER_00",),
+        port=0,
+        report=logs.append,
+        render=render,
+        stop_after_save=True,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, logs
+
+
+def test_stop_after_save_ends_the_service_once_subtitles_are_rendered(tmp_path):
+    server, thread, logs = _stopping_server(tmp_path, render=lambda: "episode.vtt")
+    try:
+        token = json.loads(_request(server, "GET", "/serve-info")[2])["token"]
+        status, _headers, body = _save(
+            server, token, {"version": 1, "speakers": {"SPEAKER_00": "Aoi"}}
+        )
+        assert status == 200
+        assert json.loads(body) == {
+            "saved": True,
+            "rendered": "episode.vtt",
+            "stopped": True,
+        }
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert logs[-2:] == ["Rendered episode.vtt", "Stopped the audition server."]
+    finally:
+        server.server_close()
+
+
+def test_stop_after_save_keeps_serving_when_the_render_fails(tmp_path):
+    def failing_render() -> str:
+        raise RuntimeError("the VTT holds edits")
+
+    server, thread, logs = _stopping_server(tmp_path, render=failing_render)
+    try:
+        token = json.loads(_request(server, "GET", "/serve-info")[2])["token"]
+        status, _headers, body = _save(server, token, {"version": 1, "speakers": {}})
+        assert status == 200
+        assert json.loads(body) == {
+            "saved": True,
+            "render_error": "the VTT holds edits",
+        }
+        thread.join(timeout=0.5)
+        assert thread.is_alive()
+        assert _save(server, token, {"version": 1, "speakers": {}})[0] == 200
+        assert "Stopped the audition server." not in logs
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_serve_stops_after_save_by_default(tmp_path, monkeypatch):
+    seen: dict[str, object] = {}
+
+    class FinishedServer:
+        access_key = "access-key"
+        access_url = "http://127.0.0.1:3210/?k=access-key"
+
+        def serve_forever(self):
+            pass
+
+        def server_close(self):
+            pass
+
+    def fake_make_server(**kwargs):
+        seen.update(kwargs)
+        return FinishedServer()
+
+    monkeypatch.setattr(speakerserve, "make_server", fake_make_server)
+    speakerserve.serve(
+        page="page",
+        media_path=tmp_path / "episode.mp4",
+        mapping_path=tmp_path / "speakers.json",
+        sibling_path=tmp_path / "episode.json",
+        speaker_ids=(),
+        open_browser=False,
+        report=lambda _line: None,
+    )
+    assert seen["stop_after_save"] is True
+
+
 @pytest.mark.parametrize(
     ("host", "mentions_ngrok"),
     [
