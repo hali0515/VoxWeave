@@ -1,6 +1,6 @@
 [project]
 name = "voxweave"
-version = "0.19.0"
+version = "0.20.0"
 description = "Local-first AI subtitle generator for anime, film, and clips: vocal separation and song-skip keep background music, OP/ED, and insert songs out of the ASR. Qwen3-ASR, word-level forced alignment, speaker diarization, edit-and-resync, SRT/VTT/ASS output. Chinese, Japanese, and English."
 requires-python = ">=3.11"
 license = "MIT"

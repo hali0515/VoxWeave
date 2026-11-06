@@ -3,6 +3,28 @@
 What changed per release, newest first. Only releases that need an action or a
 heads-up appear here.
 
+## 0.20.0
+
+Subtitle output does not change. This release changes `voxweave speakers` and the package
+metadata.
+
+### `voxweave speakers` stops after a complete Save
+
+The audition server used to keep running after Save had written the mapping and re-rendered
+the subtitles, so the terminal looked stuck until Ctrl+C. It now stops after the first Save
+whose subtitles are up to date (or the first Save with `--no-render`), and the page says so.
+A failed Save or a failed render keeps the server running so you can fix the cause and save
+again. To audition again after a Save, run `voxweave speakers` again.
+
+### Same-stem media share one speaker mapping
+
+When two media files share a stem (`episode.wav` and `episode.mp3`), they share one
+`episode.json`. Names saved from `voxweave speakers episode.mp3` went to the mp3's mapping,
+while `render` and `align` read the wav's, so they silently wrote subtitles without voice
+tags. All same-stem media now use one mapping, and `align` picks the media file that the
+voiceprint binding names. If you named speakers this way before, run `voxweave render` (or
+`align`, if you edited the VTT by hand) again to get the voice tags.
+
 ## 0.19.0
 
 Word timings for Chinese and Cantonese change slightly. The rest of this release is
