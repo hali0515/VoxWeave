@@ -1,18 +1,54 @@
 [project]
 name = "voxweave"
 version = "0.19.0"
-description = "BGM-robust subtitles for anime / film / clips: vocal separation + song-skip so ASR doesn't hallucinate on background music, OP/ED, or insert songs. Local-first Qwen3 ASR + forced alignment + edit-and-resync, CJK-aware."
+description = "Local-first AI subtitle generator for anime, film, and clips: vocal separation and song-skip keep background music, OP/ED, and insert songs out of the ASR. Qwen3-ASR, word-level forced alignment, speaker diarization, edit-and-resync, SRT/VTT/ASS output. Chinese, Japanese, and English."
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 readme = "README.md"
 authors = [{ name = "Hao Li" }]
-keywords = ["subtitles", "asr", "forced-alignment", "whisper", "qwen", "vtt"]
+keywords = [
+  "subtitles",
+  "subtitle-generator",
+  "automatic-subtitles",
+  "captions",
+  "speech-recognition",
+  "asr",
+  "qwen3-asr",
+  "whisper",
+  "whisperx",
+  "forced-alignment",
+  "word-level-timestamps",
+  "speaker-diarization",
+  "vocal-separation",
+  "anime",
+  "japanese",
+  "chinese",
+  "cjk",
+  "vtt",
+  "srt",
+  "ass",
+]
 classifiers = [
-  "Programming Language :: Python :: 3",
-  "Topic :: Multimedia :: Sound/Audio :: Speech",
-  "Topic :: Text Processing :: Linguistic",
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
   "Environment :: GPU :: NVIDIA CUDA",
+  "Intended Audience :: End Users/Desktop",
+  "Intended Audience :: Developers",
+  "Natural Language :: English",
+  "Natural Language :: Chinese (Simplified)",
+  "Natural Language :: Japanese",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Text Processing :: Linguistic",
 ]
 dependencies = [
   # Core runtime: VAD + audio I/O + CLI.
@@ -76,6 +112,13 @@ dependencies = [
   # OpenAI-compatible LLM client for `translate` and `correct` (lazy import).
   "openai>=1.40",
 ]
+
+[project.urls]
+Homepage = "https://github.com/hali0515/VoxWeave"
+Documentation = "https://github.com/hali0515/VoxWeave/tree/main/docs"
+Repository = "https://github.com/hali0515/VoxWeave"
+Issues = "https://github.com/hali0515/VoxWeave/issues"
+Changelog = "https://github.com/hali0515/VoxWeave/releases"
 
 [project.scripts]
 voxweave = "voxweave.__main__:cli"

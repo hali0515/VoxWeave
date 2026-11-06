@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/hali0515/VoxWeave/main/resources/VoxWeave_icon.png" alt="VoxWeave" width="200"/>
+<img src="https://raw.githubusercontent.com/hali0515/VoxWeave/main/resources/VoxWeave_icon.png" alt="VoxWeave logo: local-first AI subtitle generator" width="200"/>
 
 # VoxWeave
 
-**BGM-robust subtitles for anime, film, and clips.**
+**BGM-robust AI subtitle generator for anime, film, and clips.**
 
 Vocal separation and song-skip so ASR never hallucinates on background music, OP/ED, or
 insert songs. Local-first Qwen3 ASR, word-level forced alignment, speaker labels, and
