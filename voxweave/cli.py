@@ -19,13 +19,16 @@ from voxweave.cli_doctor import build_doctor_command
 from voxweave.cli_speakers import build_speakers_group
 from voxweave.cli_voices import build_voices_group
 from voxweave.export import EXPORT_RENDERERS
+from voxweave.paths import swap_ext
 from voxweave.progress import Reporter
 from voxweave.ui import (
     RichReporter,
+    batch_item_header,
     correct_summary_panel,
     error_panel,
     install_logging,
     interrupted_notice,
+    skipped_existing_notice,
     success_panel,
     summary_panel,
     translate_summary_panel,
@@ -251,6 +254,7 @@ def _resolve_llm(
                     ],
                 },
                 {"name": "Layout", "options": ["--timestamps", "--shot-snap"]},
+                {"name": "Output", "options": ["--skip-existing", "--no-clobber"]},
                 {"name": "Diagnostics", "options": ["--debug", "--help"]},
             ]
         },
@@ -277,11 +281,92 @@ def cli(ctx, verbose: bool) -> None:
         config.ensure_default_config()  # write default config template on first run
 
 
+def _preflight_no_clobber(medias: tuple[Path, ...]) -> None:
+    """Refuse up front when any target VTT already exists or two inputs collide."""
+    existing = [
+        swap_ext(item, ".vtt") for item in medias if swap_ext(item, ".vtt").exists()
+    ]
+    if existing:
+        listed = ", ".join(str(p) for p in existing[:3])
+        if len(existing) > 3:
+            listed += f", ... (+{len(existing) - 3} more)"
+        error_panel(
+            FileExistsError(
+                f"refusing to overwrite existing output (--no-clobber): {listed}"
+            )
+        )
+        sys.exit(1)
+    seen: dict[Path, Path] = {}
+    for item in medias:
+        target = swap_ext(item, ".vtt").resolve()
+        prior = seen.get(target)
+        if prior is not None:
+            error_panel(
+                FileExistsError(
+                    f"multiple inputs write the same output {swap_ext(item, '.vtt')} "
+                    f"({prior.name} and {item.name}) under --no-clobber"
+                )
+            )
+            sys.exit(1)
+        seen[target] = item
+
+
+def _run_transcribe_items(
+    medias: tuple[Path, ...],
+    *,
+    skip_existing: bool,
+    process_kwargs: dict,
+) -> None:
+    """Execute single or multi-file transcription while keeping model VRAM safe."""
+    pending: list[Path] = []
+    for item in medias:
+        target_vtt = swap_ext(item, ".vtt")
+        if skip_existing and target_vtt.exists():
+            skipped_existing_notice(item, target_vtt)
+            click.echo(target_vtt)
+            continue
+        pending.append(item)
+    if not pending:
+        return
+
+    def _process_one(item: Path) -> None:
+        out = _run(lambda rep: pipeline.process(item, reporter=rep, **process_kwargs))
+        dbg_dir = None
+        if process_kwargs["debug"]:
+            # Display only: read the claim the run made, never create or fail on it.
+            try:
+                paths = artifacts.inspect_paths(item)
+            except artifacts.ArtifactMarkerError:
+                paths = None
+            dbg_dir = paths.debug if paths is not None else None
+        summary_panel(
+            out,
+            separated=process_kwargs["separate"],
+            debug_dir=dbg_dir,
+            normalized=process_kwargs["normalize"],
+        )
+        click.echo(out)  # path -> stdout for script/pipe consumption
+
+    if len(pending) == 1:
+        _process_one(pending[0])
+        return
+
+    from voxweave import transcription
+
+    retain = (not process_kwargs["separate"]) or (config.conf_load_strategy() == "sum")
+    with transcription.batch_session(retain_models=retain):
+        for idx, item in enumerate(pending, start=1):
+            batch_item_header(idx, len(pending), item.name)
+            _process_one(item)
+
+
 @click.command(
     "transcribe", short_help="Create VTT + JSON from audio or video (default)."
 )
 @click.argument(
     "media",
+    nargs=-1,
+    required=True,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     callback=require_media,
 )
@@ -460,8 +545,20 @@ def cli(ctx, verbose: bool) -> None:
     " (Qwen) alignment ignore it. Default: off, or conf [defaults].vad_mask; same as"
     " VOXWEAVE_VAD_EMISSION_MASK=1.",
 )
+@click.option(
+    "--skip-existing",
+    is_flag=True,
+    default=False,
+    help="Skip inputs whose sibling <stem>.vtt already exists (still prints the VTT path to stdout).",
+)
+@click.option(
+    "--no-clobber",
+    is_flag=True,
+    default=False,
+    help="Refuse up front if any target sibling <stem>.vtt already exists (never overwrite).",
+)
 def cmd_transcribe(
-    media: Path,
+    media: tuple[Path, ...],
     language: str | None,
     model: str | None,
     separate: bool | None,
@@ -482,12 +579,17 @@ def cmd_transcribe(
     timestamps: bool | None,
     shot_snap: bool | None,
     vad_mask: bool | None,
+    skip_existing: bool,
+    no_clobber: bool,
 ) -> None:
-    """Transcribe audio or video into sibling VTT subtitles and timing JSON.
+    """Transcribe one or more audio or video files into sibling VTT and timing JSON.
 
-    Runs ASR and alignment models locally. Also available as voxweave MEDIA.
-    Existing sibling outputs are replaced; preserve reviewed edits before rerunning.
+    Runs ASR and alignment models locally. Also available as voxweave MEDIA [MEDIA...].
+    Existing sibling outputs are replaced by default; pass --skip-existing to resume a
+    batch or --no-clobber to refuse overwriting existing VTT files.
     """
+    if skip_existing and no_clobber:
+        raise click.UsageError("Use either --skip-existing or --no-clobber, not both.")
     log = logging.getLogger("voxweave")
     _apply_vad_mask(vad_mask)
     separate = _flag(separate, "separate", True)
@@ -561,47 +663,34 @@ def cmd_transcribe(
             "add --voiceprints to capture voiceprints",
             voiceprints_source,
         )
+    if no_clobber:
+        _preflight_no_clobber(media)
     timestamps = _flag(timestamps, "timestamps", True)
     shot_snap = _flag(shot_snap, "shot_snap", True)
-    out = _run(
-        lambda rep: pipeline.process(
-            media,
-            lang_override=language,
-            separate=separate,
-            reporter=rep,
-            debug=debug,
-            normalize=normalize,
-            skip_songs=skip_songs,
-            keep_lyrics=keep_lyrics,
-            sdh=sdh,
-            diarize=diarize,
-            diarize_model=diarize_model,
-            speaker_clustering=speaker_clustering,
-            voiceprints=voiceprints,
-            voiceprint_model=voiceprint_model,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-            asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
-            context=context,
-            timestamps=timestamps,
-            shot_snap=shot_snap,
-        )
+    _run_transcribe_items(
+        media,
+        skip_existing=skip_existing,
+        process_kwargs={
+            "lang_override": language,
+            "separate": separate,
+            "debug": debug,
+            "normalize": normalize,
+            "skip_songs": skip_songs,
+            "keep_lyrics": keep_lyrics,
+            "sdh": sdh,
+            "diarize": diarize,
+            "diarize_model": diarize_model,
+            "speaker_clustering": speaker_clustering,
+            "voiceprints": voiceprints,
+            "voiceprint_model": voiceprint_model,
+            "min_speakers": min_speakers,
+            "max_speakers": max_speakers,
+            "asr_model": "fusion" if hybrid else (model or config.conf_asr_model()),
+            "context": context,
+            "timestamps": timestamps,
+            "shot_snap": shot_snap,
+        },
     )
-    dbg_dir = None
-    if debug:
-        # Display only: read the claim the run made, never create or fail on it.
-        try:
-            paths = artifacts.inspect_paths(media)
-        except artifacts.ArtifactMarkerError:
-            paths = None
-        dbg_dir = paths.debug if paths is not None else None
-    summary_panel(
-        out,
-        separated=separate,
-        debug_dir=dbg_dir,
-        normalized=normalize,
-    )
-    click.echo(out)  # path -> stdout for script/pipe consumption
 
 
 cli.default_cmd = cmd_transcribe

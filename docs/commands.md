@@ -34,15 +34,19 @@ only the transcribe path writes it.
 
 ## Transcribe
 
-`voxweave transcribe <media>` (or `voxweave <media>`) — separation → song-skip → VAD chunking → ASR + forced alignment →
+`voxweave transcribe <media> [<media>...]` (or `voxweave <media> [<media>...]`) — separation → song-skip → VAD chunking → ASR + forced alignment →
 smart_split → writes `<stem>.vtt` (editable) + `<stem>.json` (word-level timestamp source of
 truth). Models load in-process (see `voxweave.separator` and `voxweave.backend`); the separator is released from VRAM
-before ASR+alignment load, so peak usage is ≈ max(sep, asr) rather than their sum.
+before ASR+alignment load, so peak usage is ≈ max(sep, asr) rather than their sum. When multiple
+media files are passed in one command, Python/CUDA startup runs once and ASR/alignment + VAD
+models stay resident across episodes whenever VRAM-safe (`--no-separate` or `load_strategy = "sum"`).
 
 ```bash
 voxweave episode.mkv
 voxweave transcribe episode.mkv             # explicit form of the same command
-voxweave clip.mp4 --no-separate          # clean speech (podcast/lecture): skip separation
+voxweave ep01.mkv ep02.mkv --skip-existing  # batch-transcribe, skipping finished episodes
+voxweave episode.mkv --no-clobber           # refuse up front if episode.vtt already exists
+voxweave clip.mp4 --no-separate             # clean speech (podcast/lecture): skip separation
 voxweave episode.mkv --asr-model qwen3-asr-1.7B   # larger, more accurate ASR
 voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias names/terms
 ```
@@ -75,6 +79,8 @@ routed to an in-place editing command. See the [migration notes](https://github.
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count. `--max-speakers` (e.g. `2` for an interview) is the single best lever against over-splitting on noisy material; set `--min-speakers` only when a missing speaker matters more than a split one, since a lower bound above the voices actually found splits voices (see [Speaker models](speakers.md#speaker-models)).                                                                                                                                                                                                                       |
 | `--no-shot-snap`                    | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules; `VOXWEAVE_SHOT_SNAP_MS` sets how far from a cut a boundary is moved).                                                                                                                                                                                                                                                                                                                                                                    |
 | `--vad-mask/--no-vad-mask`          | Suppress wav2vec2 CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Only languages aligned with a wav2vec2 CTC model use it (English by default); Japanese (MMS) and Chinese/Cantonese (Qwen) alignment ignore it. Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                                                                                                      |
+| `--skip-existing`                   | Skip inputs whose sibling `<stem>.vtt` already exists (useful when resuming a multi-file batch; still echoes the existing VTT path to stdout). Mutually exclusive with `--no-clobber`.                                                                                                                                                                                                                                                                                                                                                                 |
+| `--no-clobber`                      | Refuse up front before any audio or GPU work if any target sibling `<stem>.vtt` already exists or two inputs map to the same output path. Mutually exclusive with `--skip-existing`.                                                                                                                                                                                                                                                                                                                                                                   |
 | `--debug`                           | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) under `<media directory>/cache/<stem>/debug/`. Each run replaces the previous bundle.                                                                                                                                                                                                                                                                                                                                                                          |
 
 The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--voiceprints`, `--timestamps`,

@@ -106,8 +106,9 @@ your GPU backend, and ONNX providers. The default pipeline fits in about 8 GB of
 ## Quickstart
 
 ```bash
-# Transcribe a video to a timestamped VTT (+ a JSON source of truth)
+# Transcribe a video (or a batch of episodes) to timestamped VTT + JSON
 voxweave episode.mkv
+voxweave ep01.mkv ep02.mkv ep03.mkv --skip-existing
 
 # Opt in to speaker diarization (requires gated-model access; see Setup)
 voxweave interview.mkv --diarize
@@ -187,7 +188,7 @@ voxweave burn episode.zh.vtt           # hard subtitles
 
 | Command                                                 | What it does                                                                                                 |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `voxweave <media>`                                      | Transcribe: separate vocals, skip songs, ASR, align, split into cues. Writes `<stem>.vtt` and `<stem>.json`. |
+| `voxweave <media> [<media>...]`                         | Transcribe one or more files: separate vocals, skip songs, ASR, align, split into cues (`<stem>.vtt` + `<stem>.json`). |
 | `voxweave speakers serve <media>`                       | Open the page where you name the speakers; each Save re-renders the VTT.                                     |
 | `voxweave speakers enroll <media>`                      | Store the named voices in the shared voice library.                                                          |
 | `voxweave align <vtt>`                                  | Re-derive timestamps from the audio after you edit the text.                                                 |

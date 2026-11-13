@@ -209,11 +209,8 @@ class DefaultGroup(click.RichGroup):
         return results
 
 
-def require_media(ctx, param, value: Path | None):
-    """Reject subtitle/JSON inputs before an ASR invocation can touch artifacts."""
-    if value is None or ctx.resilient_parsing:
-        return value
-    suffix = value.suffix.lower()
+def _check_single_media(ctx, param, item: Path) -> Path:
+    suffix = item.suffix.lower()
     if suffix == ".vtt":
         hint = "Use 'voxweave align FILE.vtt' to align edited text (overwrites VTT and JSON)."
     elif suffix in {".srt", ".ass", ".ssa"}:
@@ -223,5 +220,14 @@ def require_media(ctx, param, value: Path | None):
             "Use 'voxweave render FILE.json' to regenerate subtitles without a model."
         )
     else:
-        return value
+        return item
     raise click.BadParameter(f"Transcribe expects audio or video. {hint}", ctx, param)
+
+
+def require_media(ctx, param, value: Path | tuple[Path, ...] | None):
+    """Reject subtitle/JSON inputs before an ASR invocation can touch artifacts."""
+    if value is None or ctx.resilient_parsing:
+        return value
+    if isinstance(value, tuple):
+        return tuple(_check_single_media(ctx, param, item) for item in value)
+    return _check_single_media(ctx, param, value)

@@ -411,6 +411,21 @@ def interrupted_notice() -> None:
     console.print(Text("Interrupted.", style=_WARNING))
 
 
+def batch_item_header(index: int, total: int, name: str) -> None:
+    """Render a per-file header on stderr before each multi-file batch item."""
+    line = Text(f"Batch [{index}/{total}] ", style=_ACTIVE)
+    line.append(name, style="bold")
+    console.print(line)
+
+
+def skipped_existing_notice(media: Path, existing: Path) -> None:
+    """Report a ``--skip-existing`` hit on stderr without touching stdout."""
+    line = Text("Skipping ", style=_MUTED)
+    line.append(media.name, style="bold")
+    line.append(f" ({existing.name} already exists)", style=_MUTED)
+    console.print(line)
+
+
 def success_panel(title: str, lines: Sequence[str]) -> None:
     """Shared completion treatment; paths and provider text are always literal."""
     console.print(
