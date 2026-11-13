@@ -34,9 +34,6 @@ def test_claim_layout_keeps_transcript_and_deliverables_adjacent(tmp_path):
     assert paths.speaker_split_undo.name == "speaker-split.undo.json"
     assert paths.episode_lock.name == "episode.episode.lock"
     assert paths.vocals_cache.name == "vocals.32k.flac"
-    assert paths.align_evidence(tmp_path / "episode.vtt").name == (
-        "episode.align-evidence.json"
-    )
     assert paths.asrfix_audit(tmp_path / "episode.vtt").name == "episode.asrfix.json"
     assert paths.translation_progress(tmp_path / "episode.vtt", "zh").name == (
         "episode.zh.progress.json"

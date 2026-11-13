@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from voxweave import artifacts, episode_transaction, pipeline, sdh, songdet
+from voxweave import artifacts, episode_transaction, pipeline, publication, sdh, songdet
 from voxweave import llm_commands
 from voxweave import paths
 from voxweave import process_publication
@@ -23,12 +23,10 @@ def _units(text: str = "hello") -> list[dict[str, object]]:
     return [{"text": text, "start": 0.0, "end": 1.0}]
 
 
-def test_align_exposes_only_the_two_permitted_private_transaction_seams():
+def test_align_exposes_only_the_permitted_private_transaction_seam():
     parameters = inspect.signature(pipeline.align).parameters
-    assert tuple(parameters)[-2:] == ("_shadow_observer", "_expected_vtt_sha256")
-    assert parameters["_shadow_observer"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert tuple(parameters)[-1:] == ("_expected_vtt_sha256",)
     assert parameters["_expected_vtt_sha256"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters["_shadow_observer"].default is None
     assert parameters["_expected_vtt_sha256"].default is None
 
 
@@ -57,8 +55,6 @@ def test_correct_apply_stale_generation_mutates_nothing(tmp_path, monkeypatch):
     original = _vtt()
     concurrent = _vtt("concurrent winner")
     vtt.write_text(original, encoding="utf-8")
-    evidence = tmp_path / "episode.align-evidence.json"
-    evidence.write_text('{"kept":true}\n', encoding="utf-8")
 
     def concurrent_fix(_payload, **_kwargs):
         vtt.write_text(concurrent, encoding="utf-8")
@@ -69,10 +65,9 @@ def test_correct_apply_stale_generation_mutates_nothing(tmp_path, monkeypatch):
         llm_commands.correct(vtt, apply=True)
     assert caught.value.failure.detail_code == "correct-generation"
     assert vtt.read_text(encoding="utf-8") == concurrent
-    assert evidence.read_text(encoding="utf-8") == '{"kept":true}\n'
 
 
-def test_correct_all_rejected_canonical_rewrite_deletes_stale_evidence(
+def test_correct_all_rejected_canonical_rewrite_returns_expected_keys(
     tmp_path, monkeypatch
 ):
     media = tmp_path / "episode.mp4"
@@ -80,10 +75,6 @@ def test_correct_all_rejected_canonical_rewrite_deletes_stale_evidence(
     vtt = tmp_path / "episode.vtt"
     original = _vtt(settings="align:start position:20%")
     vtt.write_text(original, encoding="utf-8")
-    evidence = tmp_path / "episode.align-evidence.json"
-    evidence.write_text("stale", encoding="utf-8")
-    cached_evidence = artifacts.claim_paths(media).align_evidence(vtt)
-    cached_evidence.write_text("cached stale", encoding="utf-8")
     monkeypatch.setattr(
         llm_commands.asrfix_mod,
         "correct_cues",
@@ -97,8 +88,6 @@ def test_correct_all_rejected_canonical_rewrite_deletes_stale_evidence(
     assert result["applied"] == []
     assert result["aligned"] is False
     assert vtt.read_bytes() != original.encode("utf-8")
-    assert not evidence.exists()
-    assert not cached_evidence.exists()
     assert tuple(result) == (
         "out",
         "audit",
@@ -110,12 +99,10 @@ def test_correct_all_rejected_canonical_rewrite_deletes_stale_evidence(
     )
 
 
-def test_correct_byte_identical_rewrite_retains_evidence(tmp_path, monkeypatch):
+def test_correct_byte_identical_rewrite_skips_align(tmp_path, monkeypatch):
     vtt = tmp_path / "episode.vtt"
     original = _vtt()
     vtt.write_text(original, encoding="utf-8")
-    evidence = tmp_path / "episode.align-evidence.json"
-    evidence.write_text("still-current", encoding="utf-8")
     monkeypatch.setattr(
         llm_commands.asrfix_mod, "correct_cues", lambda _payload, **_kwargs: []
     )
@@ -123,47 +110,12 @@ def test_correct_byte_identical_rewrite_retains_evidence(tmp_path, monkeypatch):
     result = llm_commands.correct(vtt, apply=True, align_after=True)
 
     assert vtt.read_text(encoding="utf-8") == original
-    assert evidence.read_text(encoding="utf-8") == "still-current"
     assert result["aligned"] is False
-
-
-def test_correct_retires_cached_evidence_created_at_commit_seam(tmp_path, monkeypatch):
-    media = tmp_path / "episode.mp4"
-    media.write_bytes(b"media")
-    vtt = tmp_path / "episode.vtt"
-    vtt.write_text(_vtt(), encoding="utf-8")
-    cached = artifacts.artifacts_root(media) / "episode" / "episode.align-evidence.json"
-    real_commit = episode_transaction.commit_correction
-
-    def create_evidence_then_commit(**kwargs):
-        claimed = artifacts.claim_paths(media).align_evidence(vtt)
-        assert claimed == cached
-        claimed.write_text("concurrent selected evidence", encoding="utf-8")
-        return real_commit(**kwargs)
-
-    monkeypatch.setattr(
-        llm_commands.asrfix_mod,
-        "correct_cues",
-        lambda _payload, **_kwargs: [
-            {"i": 0, "orig": "hello", "fixed": "hallo", "reason": "typo"}
-        ],
-    )
-    monkeypatch.setattr(
-        episode_transaction,
-        "commit_correction",
-        create_evidence_then_commit,
-    )
-
-    llm_commands.correct(vtt, apply=True)
-
-    assert not cached.exists()
 
 
 def test_correct_real_fix_hands_exact_committed_hash_to_align(tmp_path, monkeypatch):
     vtt = tmp_path / "episode.vtt"
     vtt.write_text(_vtt(), encoding="utf-8")
-    evidence = tmp_path / "episode.align-evidence.json"
-    evidence.write_text("stale", encoding="utf-8")
     monkeypatch.setattr(
         llm_commands.asrfix_mod,
         "correct_cues",
@@ -185,7 +137,6 @@ def test_correct_real_fix_hands_exact_committed_hash_to_align(tmp_path, monkeypa
     assert seen["path"] == vtt
     assert seen["_expected_vtt_sha256"] == hashlib.sha256(committed).hexdigest()
     assert result["aligned"] is True
-    assert not evidence.exists()
 
 
 def test_process_injected_words_is_media_free_with_absent_nominal_path(
@@ -194,8 +145,6 @@ def test_process_injected_words_is_media_free_with_absent_nominal_path(
     nominal = tmp_path / "absent.input.movie.mkv"
 
     def forbidden(*_args, **_kwargs):
-        # pytest.fail is not an Exception, so the SDH step's ``except Exception``
-        # cannot turn a forbidden call into a logged warning.
         pytest.fail("injected words touched media or PANNs")
 
     monkeypatch.setattr(pipeline, "transcribe", forbidden)
@@ -402,14 +351,11 @@ def test_sdh_generation_change_retains_existing_auxiliary(
     assert any("stale SDH" in record.message for record in caplog.records)
 
 
-def test_tolerant_mapping_observation_is_exact_and_rat7_recheck_is_active(
-    tmp_path,
-):
+def test_tolerant_mapping_observation_is_exact(tmp_path):
     from voxweave.episode_transaction import (
         capture_speaker_mapping,
         same_speaker_mapping_generation,
     )
-    from voxweave.p6_ratifications import SPEAKER_MAPPING_CAS_ENABLED
 
     warnings: list[str] = []
     mapping = tmp_path / "episode.speakers.json"
@@ -442,7 +388,6 @@ def test_tolerant_mapping_observation_is_exact_and_rat7_recheck_is_active(
     assert first.private_observation.lstat_value is not None
     assert same_speaker_mapping_generation(first, second)
     assert len(warnings) == 1
-    assert SPEAKER_MAPPING_CAS_ENABLED is True
 
 
 def test_tolerant_mapping_distinguishes_absence_from_broken_symlink(tmp_path):
@@ -492,15 +437,11 @@ def test_transaction_module_has_no_model_renderer_or_pipeline_dependency():
         "import pipeline",
         "from voxweave import pipeline",
         "import backend",
-        "import segmentation_projector",
-        "import align_projector",
     ):
         assert forbidden not in source
 
 
 def test_align_transaction_stages_then_publishes_json_before_vtt(tmp_path, monkeypatch):
-    from voxweave import episode_transaction
-
     json_path = tmp_path / "episode.json"
     vtt_path = tmp_path / "episode.vtt"
     cleanup = tmp_path / "episode.voiceprints.json"
@@ -538,8 +479,6 @@ def test_align_transaction_stages_then_publishes_json_before_vtt(tmp_path, monke
 
 
 def test_primary_stage_failure_is_canonical_and_mutates_nothing(tmp_path, monkeypatch):
-    from voxweave import episode_transaction
-
     json_path = tmp_path / "episode.json"
     vtt_path = tmp_path / "episode.vtt"
     json_path.write_bytes(b"old json")
@@ -576,8 +515,6 @@ def test_primary_stage_failure_is_canonical_and_mutates_nothing(tmp_path, monkey
 def test_vtt_replace_failure_reports_json_as_the_only_landed_primary(
     tmp_path, monkeypatch
 ):
-    from voxweave import episode_transaction
-
     json_path = tmp_path / "episode.json"
     vtt_path = tmp_path / "episode.vtt"
     json_path.write_bytes(b"old json")
@@ -614,8 +551,6 @@ def test_vtt_replace_failure_reports_json_as_the_only_landed_primary(
 
 
 def test_episode_lock_failure_is_canonical_and_discards_stages(tmp_path, monkeypatch):
-    from voxweave import episode_transaction
-
     json_path = tmp_path / "episode.json"
     vtt_path = tmp_path / "episode.vtt"
     json_path.write_bytes(b"old json")
@@ -646,57 +581,7 @@ def test_episode_lock_failure_is_canonical_and_discards_stages(tmp_path, monkeyp
     assert not tuple(tmp_path.glob("*.part*"))
 
 
-def test_segmentation_transaction_consumes_commit_only_after_recheck(tmp_path):
-    from voxweave.align_context import (
-        consume_context_role,
-        issue_segmentation_context,
-        role_vector,
-    )
-    from voxweave.align_snapshot import FrozenObject, freeze_json
-    from voxweave.episode_transaction import (
-        capture_file_generation,
-        commit_primary_outputs,
-    )
-
-    stable = freeze_json({"case": "transaction"})
-    assert isinstance(stable, FrozenObject)
-    json_path = tmp_path / "episode.json"
-    vtt_path = tmp_path / "episode.vtt"
-    context = issue_segmentation_context(
-        stable_fields=stable,
-        target_path=vtt_path,
-        sibling_path=json_path,
-        effective_iso="en",
-    )
-    consume_context_role(
-        context,
-        "adapter",
-        consumer="run_locked_segmentation_adapter",
-    )
-    consume_context_role(
-        context,
-        "encoder",
-        consumer="encode_segmentation_candidates",
-    )
-    expected_json = capture_file_generation(json_path)
-    expected_vtt = capture_file_generation(vtt_path)
-
-    commit_primary_outputs(
-        command="process",
-        episode_path=vtt_path,
-        json_path=json_path,
-        vtt_path=vtt_path,
-        expected_json=expected_json,
-        expected_vtt=expected_vtt,
-        main_json_bytes=b"{}",
-        vtt_bytes=b"WEBVTT\n",
-        context=context,
-    )
-
-    assert role_vector(context) == ("C", "C", "C")
-
-
-def test_split_mapping_change_is_stale_after_rat7(tmp_path, monkeypatch):
+def test_split_mapping_change_is_stale(tmp_path, monkeypatch):
     from voxweave.episode_transaction import InputStaleError
 
     json_path = tmp_path / "episode.json"
@@ -726,43 +611,9 @@ def test_split_mapping_change_is_stale_after_rat7(tmp_path, monkeypatch):
     assert not (tmp_path / "episode.vtt").exists()
 
 
-@pytest.mark.parametrize("command", ["process", "split"])
-def test_public_segmentation_requires_independent_selected_projection(
-    command, tmp_path, monkeypatch
-):
-    from voxweave import segmentation_candidates
-
-    json_path = tmp_path / "episode.json"
-    if command == "split":
-        json_path.write_text(
-            json.dumps({"language": "en", "word_segments": _units()}),
-            encoding="utf-8",
-        )
-
-    def reject_projection(*_args, **_kwargs):
-        raise RuntimeError("independent projection rejected")
-
-    monkeypatch.setattr(
-        segmentation_candidates,
-        "verify_selected_segmentation_projection",
-        reject_projection,
-    )
-    with pytest.raises(RuntimeError, match="independent projection rejected"):
-        if command == "process":
-            pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
-        else:
-            pipeline.split(json_path)
-    assert not (tmp_path / "episode.vtt").exists()
-    if command == "process":
-        assert not json_path.exists()
-
-
-def test_process_selected_candidate_enters_context_bound_transaction(
+def test_process_publishes_preencoded_primaries_through_transaction(
     tmp_path, monkeypatch
 ):
-    from voxweave import episode_transaction
-    from voxweave.align_context import IssuedSegmentationContext
-
     real_commit = episode_transaction.commit_primary_outputs
     seen: dict[str, object] = {}
 
@@ -774,7 +625,6 @@ def test_process_selected_candidate_enters_context_bound_transaction(
     out = pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
     assert out.exists()
     assert seen["command"] == "process"
-    assert isinstance(seen["context"], IssuedSegmentationContext)
     assert seen["main_json_bytes"] == (tmp_path / "episode.json").read_bytes()
     assert seen["vtt_bytes"] == out.read_bytes()
 
@@ -793,7 +643,6 @@ def test_process_output_snapshot_precedes_voiceprint_media_snapshot(
             raise AssertionError("media snapshot ran before output snapshot")
 
     monkeypatch.setattr(pipeline, "MediaSnapshot", ForbiddenSnapshot)
-    # process() preflights diarization; the gated default model needs a token.
     monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
 
     with pytest.raises(IsADirectoryError) as caught:
@@ -805,12 +654,7 @@ def test_process_output_snapshot_precedes_voiceprint_media_snapshot(
     assert caught.value.failure.detail_code == "sibling-read"
 
 
-def test_process_voiceprint_candidate_uses_the_same_context_bound_transaction(
-    tmp_path, monkeypatch
-):
-    from voxweave import episode_transaction
-    from voxweave.align_context import IssuedSegmentationContext
-
+def test_process_voiceprint_candidate_uses_the_same_transaction(tmp_path, monkeypatch):
     media = tmp_path / "episode.mkv"
     media.write_bytes(b"media")
     turns = [(0.0, 1.0, "SPEAKER_00")]
@@ -837,7 +681,6 @@ def test_process_voiceprint_candidate_uses_the_same_context_bound_transaction(
         "transcribe",
         lambda *_args, **_kwargs: ("en", _units(), None, [], turns, capture),
     )
-    # process() preflights diarization; the gated default model needs a token.
     monkeypatch.setenv("VOXWEAVE_HF_TOKEN", "hf_test_token")
     real_commit = episode_transaction.commit_primary_outputs
     seen: dict[str, object] = {}
@@ -854,35 +697,13 @@ def test_process_voiceprint_candidate_uses_the_same_context_bound_transaction(
         shot_snap=False,
     )
 
-    assert isinstance(seen["context"], IssuedSegmentationContext)
     assert seen["main_json_bytes"] == (tmp_path / "episode.json").read_bytes()
     assert seen["vtt_bytes"] == out.read_bytes()
     assert seen["machine_artifact"].path == artifacts.claim_paths(media).voiceprints
 
 
-@pytest.mark.parametrize("command", ["process", "split"])
-def test_successful_segmentation_retires_stale_align_evidence(command, tmp_path):
-    evidence = tmp_path / "episode.align-evidence.json"
-    evidence.write_text("stale", encoding="utf-8")
-    cached_evidence = artifacts.claim_paths(tmp_path / "episode.mkv").align_evidence(
-        tmp_path / "episode.vtt"
-    )
-    cached_evidence.write_text("cached stale", encoding="utf-8")
-    if command == "process":
-        pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
-    else:
-        json_path = tmp_path / "episode.json"
-        json_path.write_text(
-            json.dumps({"language": "en", "word_segments": _units()}),
-            encoding="utf-8",
-        )
-        pipeline.split(json_path)
-    assert not evidence.exists()
-    assert not cached_evidence.exists()
-
-
-def test_split_reports_a_legacy_render_failure_with_its_cause(tmp_path, monkeypatch):
-    from voxweave import candidate_encoder, segmentation_candidates
+def test_split_reports_encode_failure_with_its_cause(tmp_path, monkeypatch):
+    from voxweave import realign
 
     json_path = tmp_path / "episode.json"
     json_path.write_text(
@@ -892,76 +713,11 @@ def test_split_reports_a_legacy_render_failure_with_its_cause(tmp_path, monkeypa
     def fail_render(*_args, **_kwargs):
         raise OSError("render target vanished")
 
-    monkeypatch.setattr(
-        segmentation_candidates, "project_segmentation_delivery", fail_render
-    )
-    with pytest.raises(
-        candidate_encoder.SelectedCandidateError, match="render target vanished"
-    ):
+    monkeypatch.setattr(realign, "render_cues", fail_render)
+    with pytest.raises(publication.PublicationEncodeError) as caught:
         pipeline.split(json_path)
+    assert caught.value.detail_code == "vtt-encode"
     assert not (tmp_path / "episode.vtt").exists()
-
-
-@pytest.mark.parametrize("command", ["process", "split"])
-def test_segmentation_forgets_its_context_once_retired(command, tmp_path, monkeypatch):
-    from voxweave import (
-        align_context,
-        candidate_encoder,
-        segmentation_adapter,
-        segmentation_candidates,
-        segmentation_orchestration,
-    )
-    from voxweave.align_context import ContextAuthorityError, role_vector
-
-    registries = (
-        align_context._ISSUED,
-        candidate_encoder._SETS,
-        candidate_encoder._ENCODED,
-        candidate_encoder._VERIFIED,
-        segmentation_adapter._LEGACY,
-        segmentation_adapter._ADAPTER,
-        segmentation_candidates._ENCODED,
-        segmentation_candidates._VERIFIED,
-    )
-    issued = []
-    issue = segmentation_orchestration.issue_segmentation_context
-
-    def capture_issue(*args, **kwargs):
-        context = issue(*args, **kwargs)
-        issued.append(context)
-        return context
-
-    monkeypatch.setattr(
-        segmentation_orchestration, "issue_segmentation_context", capture_issue
-    )
-    json_path = tmp_path / "episode.json"
-    json_path.write_text(
-        json.dumps({"language": "en", "word_segments": _units()}), encoding="utf-8"
-    )
-    baseline = [len(registry) for registry in registries]
-    if command == "process":
-        pipeline.process(tmp_path / "episode.mkv", word_segments=("en", _units()))
-    else:
-        pipeline.split(json_path)
-    (context,) = issued
-    assert [len(registry) for registry in registries] == baseline
-    with pytest.raises(ContextAuthorityError) as caught:
-        role_vector(context)
-    assert caught.value.detail_code == "context-unissued"
-
-
-def test_align_legacy_evidence_writeback_retires_cached_copy(tmp_path, monkeypatch):
-    media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
-    cached = artifacts.claim_paths(media).align_evidence(vtt_path)
-    cached.write_text("cached stale", encoding="utf-8")
-    legacy = tmp_path / "episode.align-evidence.json"
-    legacy.write_text("legacy stale", encoding="utf-8")
-
-    assert pipeline.align(vtt_path) == vtt_path
-
-    assert legacy.exists()
-    assert legacy.read_bytes() != b"legacy stale"
-    assert not cached.exists()
 
 
 def test_split_invalid_declared_pair_cleans_full_machine_artifact_set(tmp_path, caplog):
@@ -976,18 +732,18 @@ def test_split_invalid_declared_pair_cleans_full_machine_artifact_set(tmp_path, 
         ),
         encoding="utf-8",
     )
-    artifacts = (
+    stale_artifacts = (
         tmp_path / "episode.voiceprints.json",
         tmp_path / "episode.speakers.suggest.json",
         tmp_path / "episode.speakers.html",
     )
-    for artifact in artifacts:
+    for artifact in stale_artifacts:
         artifact.write_text("stale", encoding="utf-8")
 
     with caplog.at_level("WARNING", logger="voxweave"):
         pipeline.split(json_path)
 
-    assert not any(artifact.exists() for artifact in artifacts)
+    assert not any(artifact.exists() for artifact in stale_artifacts)
     assert any(
         "dropping invalid voiceprint replay pair" in row.message
         for row in caplog.records
@@ -997,8 +753,7 @@ def test_split_invalid_declared_pair_cleans_full_machine_artifact_set(tmp_path, 
 def test_public_align_publishes_preencoded_primaries_through_transaction(
     tmp_path, monkeypatch
 ):
-    from voxweave import backend, episode_transaction
-    from voxweave.align_context import IssuedAlignContext
+    from voxweave import backend
 
     media = tmp_path / "episode.wav"
     media.write_bytes(b"media")
@@ -1040,372 +795,5 @@ def test_public_align_publishes_preencoded_primaries_through_transaction(
     monkeypatch.setattr(episode_transaction, "commit_primary_outputs", observed_commit)
     assert pipeline.align(vtt_path) == vtt_path
     assert seen["command"] == "align"
-    assert isinstance(seen["context"], IssuedAlignContext)
     assert seen["main_json_bytes"] == json_path.read_bytes()
     assert seen["vtt_bytes"] == vtt_path.read_bytes()
-
-
-def test_public_align_requires_independent_selected_projection(tmp_path, monkeypatch):
-    from voxweave import backend, candidate_encoder
-
-    media = tmp_path / "episode.wav"
-    media.write_bytes(b"media")
-    json_path = tmp_path / "episode.json"
-    original_json = json.dumps(
-        {
-            "language": "zh",
-            "word_segments": [
-                {"text": "你", "start": 0.0, "end": 0.5},
-                {"text": "好", "start": 0.5, "end": 1.0},
-            ],
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    json_path.write_bytes(original_json)
-    vtt_path = tmp_path / "episode.vtt"
-    original_vtt = "WEBVTT\n\n你好\n".encode()
-    vtt_path.write_bytes(original_vtt)
-    monkeypatch.setattr(
-        pipeline, "_prepare_16k_for_align", lambda *_args, **_kwargs: media
-    )
-    monkeypatch.setattr(pipeline, "slice_wav", lambda *_args, **_kwargs: media)
-    monkeypatch.setattr(
-        backend,
-        "align_text",
-        lambda _wav, text, _iso: [
-            {"text": value, "start": float(index), "end": float(index) + 0.5}
-            for index, value in enumerate(text)
-        ],
-    )
-    monkeypatch.setattr(
-        candidate_encoder,
-        "verify_selected_align_projection",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("independent align projection rejected")
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="independent align projection rejected"):
-        pipeline.align(vtt_path)
-
-    assert json_path.read_bytes() == original_json
-    assert vtt_path.read_bytes() == original_vtt
-
-
-def _stub_public_shadow_align(tmp_path, monkeypatch):
-    import wave
-
-    from voxweave import backend
-    from voxweave.align_acquisition import qwen_sample_geometry
-
-    media = tmp_path / "episode.wav"
-    with wave.open(str(media), "wb") as stream:
-        stream.setnchannels(1)
-        stream.setsampwidth(2)
-        stream.setframerate(16_000)
-        stream.writeframes(b"\x00\x00" * 32_000)
-    json_path = tmp_path / "episode.json"
-    json_path.write_text(
-        json.dumps(
-            {
-                "language": "zh",
-                "word_segments": [
-                    {"text": "你", "start": 0.0, "end": 0.5},
-                    {"text": "好", "start": 0.5, "end": 1.0},
-                ],
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    vtt_path = tmp_path / "episode.vtt"
-    vtt_path.write_text("WEBVTT\n\n你好\n", encoding="utf-8")
-    monkeypatch.setattr(
-        pipeline, "_prepare_16k_for_align", lambda *_args, **_kwargs: media
-    )
-
-    def fake_slice(
-        _wav,
-        start,
-        end,
-        *,
-        _sample_geometry_observer=None,
-        **_kwargs,
-    ):
-        geometry = qwen_sample_geometry(
-            nominal_start=float(start),
-            nominal_end=float(end),
-            sample_rate=16_000,
-            sample_count=32_000,
-        )
-        if _sample_geometry_observer is not None:
-            _sample_geometry_observer(
-                geometry.sample_start,
-                geometry.sample_end,
-                geometry.sample_rate,
-                geometry.sample_count,
-            )
-        crop = tmp_path / "qwen-crop.wav"
-        crop.write_bytes(media.read_bytes())
-        return crop
-
-    monkeypatch.setattr(pipeline, "slice_wav", fake_slice)
-    monkeypatch.setattr(
-        backend,
-        "align_text",
-        lambda _wav, text, _iso: [
-            {"text": value, "start": float(index), "end": float(index) + 0.5}
-            for index, value in enumerate(text)
-        ],
-    )
-    return media, json_path, vtt_path
-
-
-def test_align_shadow_observer_runs_once_after_disposal(tmp_path, monkeypatch):
-    from voxweave import backend
-
-    _media, json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
-    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
-    released: list[str] = []
-    observed: list[object] = []
-    monkeypatch.setattr(backend, "release", lambda: released.append("backend"))
-
-    def observer(artifact):
-        assert released == ["backend"]
-        observed.append(artifact)
-
-    assert pipeline.align(vtt_path, _shadow_observer=observer) == vtt_path
-    assert len(observed) == 1
-    artifact = observed[0]
-    assert artifact.artifact_kind == "rich"
-    assert artifact.status == "valid"
-    assert artifact.failure is None
-    assert (
-        artifact.selected["vtt_sha256"]
-        == hashlib.sha256(vtt_path.read_bytes()).hexdigest()
-    )
-    assert (
-        artifact.selected["json_sha256"]
-        == hashlib.sha256(json_path.read_bytes()).hexdigest()
-    )
-    canonical = json.loads(artifact.to_canonical_bytes())
-    assert tuple(canonical) == (
-        "schema_version",
-        "artifact_kind",
-        "status",
-        "failure",
-        "input",
-        "fresh",
-        "legacy",
-        "v2",
-        "comparison",
-        "selected",
-    )
-    assert tuple(canonical["v2"]) == ("semantic", "validators")
-    assert canonical["v2"]["semantic"] is not None
-    assert canonical["v2"]["validators"] is not None
-    assert canonical["comparison"]["result"]["active_classes"] == ["ALD-2"]
-    assert canonical["comparison"]["result"]["violations"] == []
-
-
-def test_align_shadow_observer_presence_is_inert_when_flag_is_off(
-    tmp_path, monkeypatch
-):
-    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
-    monkeypatch.delenv("VOXWEAVE_SEG_V2_SHADOW", raising=False)
-    observed: list[object] = []
-
-    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
-
-    assert observed == []
-
-
-def test_align_shadow_rich_failure_notifies_with_minimal_artifact(
-    tmp_path, monkeypatch
-):
-    from voxweave import align_shadow
-
-    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
-    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
-    monkeypatch.setattr(
-        align_shadow,
-        "build_rich_align_shadow_artifact",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("rich failed")),
-    )
-    observed: list[object] = []
-
-    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
-    assert len(observed) == 1
-    assert observed[0].artifact_kind == "minimal-failure"
-    assert observed[0].failure.kind == "shadow-internal-error"
-    assert observed[0].failure.detail_code == "rich-artifact-construction"
-    assert observed[0].failure.secondary == ()
-
-
-def test_align_shadow_reports_strict_j0_failure_before_pending_w1(
-    tmp_path, monkeypatch
-):
-    _media, json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
-    json_path.write_text(
-        '{"language":"zh","language":"zh","word_segments":'
-        '[{"text":"你","start":0.0,"end":0.5},'
-        '{"text":"好","start":0.5,"end":1.0}]}',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
-    observed: list[object] = []
-
-    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
-
-    assert len(observed) == 1
-    artifact = observed[0]
-    assert artifact.failure.kind == "v2-input-invalid"
-    assert artifact.failure.detail_code == "sibling-json-duplicate-key"
-    assert artifact.fresh["strict_input_status"] == "invalid"
-
-
-def test_align_shadow_reports_strict_raw_failure_before_pending_w1(
-    tmp_path, monkeypatch
-):
-    from voxweave import backend
-
-    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        backend,
-        "align_text",
-        lambda _wav, text, _iso: [
-            {"text": value, "start": index, "end": index + 1}
-            for index, value in enumerate(text)
-        ],
-    )
-    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
-    observed: list[object] = []
-
-    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
-
-    artifact = observed[0]
-    assert artifact.failure.kind == "fresh-time-transform-invalid"
-    assert artifact.failure.phase == "strict-capture"
-    assert artifact.failure.detail_code == "strict-raw-node"
-    assert artifact.fresh["authority_distribution_status"] == "invalid"
-
-
-def test_align_shadow_runs_seed_reconciliation_before_pending_w1(tmp_path, monkeypatch):
-    from voxweave.core import align_seed
-
-    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
-    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
-    monkeypatch.setattr(
-        align_seed,
-        "build_align_seed",
-        lambda **_kwargs: align_seed.AlignSeedResult(
-            "invalid",
-            ("footprint-reconciliation",),
-            None,
-            (),
-        ),
-    )
-    observed: list[object] = []
-
-    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
-
-    artifact = observed[0]
-    assert artifact.failure.kind == "fresh-reconciliation-invalid"
-    assert artifact.failure.detail_code == "footprint-reconciliation"
-    assert artifact.fresh["seed_status"] == "invalid"
-
-
-def test_align_shadow_runs_profile_admission_before_pending_w1(tmp_path, monkeypatch):
-    from voxweave import align_inputs
-
-    _media, _json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
-    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
-    monkeypatch.setattr(
-        align_inputs,
-        "resolve_align_profile",
-        lambda *_args, **_kwargs: align_inputs.ProfileResolution(
-            None,
-            align_inputs.ProfileStatus(
-                "invalid",
-                "stored-profile",
-                "profile-domain",
-            ),
-        ),
-    )
-    observed: list[object] = []
-
-    assert pipeline.align(vtt_path, _shadow_observer=observed.append) == vtt_path
-
-    artifact = observed[0]
-    assert artifact.failure.kind == "profile-invalid"
-    assert artifact.failure.detail_code == "profile-domain"
-    assert artifact.fresh["profile_status"] == "invalid"
-
-
-def test_qwen_align_block_keeps_nominal_legacy_and_observes_sample_origin(
-    tmp_path, monkeypatch
-):
-    import numpy as np
-    import soundfile as sf
-
-    from voxweave import backend
-
-    wav = tmp_path / "prepared.wav"
-    sf.write(wav, np.zeros(16_000, dtype=np.float32), 16_000)
-    monkeypatch.setattr(
-        backend,
-        "align_text",
-        lambda *_args, **_kwargs: [{"text": "x", "start": 0.0, "end": 0.1}],
-    )
-    chunks: list = []
-    origins: list[float] = []
-
-    def invoke_qwen(
-        backend_call,
-        _source_position,
-        _legacy_origin,
-        _nominal_end,
-        **geometry,
-    ):
-        origins.append(geometry["audio_sample_start"] / geometry["sample_rate"])
-        return backend_call()
-
-    delivered = pipeline._align_blocks(
-        wav,
-        [{"text": "x", "start": 0.10001, "end": 0.5}],
-        "zh",
-        mms=False,
-        ctc_model=None,
-        crops=[(0.10001, 0.5)],
-        reporter=pipeline.Reporter(),
-        tmp_chunks=chunks,
-        qwen_invoker=invoke_qwen,
-    )
-    try:
-        assert delivered[0][0]["start"] == 0.10001
-        assert origins == [int(0.10001 * 16_000) / 16_000]
-        assert origins[0] != delivered[0][0]["start"]
-    finally:
-        for path in chunks:
-            path.unlink(missing_ok=True)
-
-
-def test_align_shadow_observer_failure_cannot_change_selected_return(
-    tmp_path, monkeypatch, caplog
-):
-    _media, json_path, vtt_path = _stub_public_shadow_align(tmp_path, monkeypatch)
-    monkeypatch.setenv("VOXWEAVE_SEG_V2_SHADOW", "1")
-
-    def fail_observer(_artifact):
-        raise RuntimeError("observer failed")
-
-    with caplog.at_level("WARNING", logger="voxweave"):
-        assert pipeline.align(vtt_path, _shadow_observer=fail_observer) == vtt_path
-
-    assert json_path.exists() and vtt_path.exists()
-    record = next(
-        row for row in caplog.records if "align shadow observer failed" in row.message
-    )
-    assert record.failure.kind == "observer-failed"
-    assert record.failure.phase == "observer"
-    assert record.failure.detail_code == "observer-callback"

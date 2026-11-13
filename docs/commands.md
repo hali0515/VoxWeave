@@ -171,7 +171,7 @@ voxweave correct episode.vtt --glossary names.json --apply   # rewrite in place 
 | `--apply`                      | Let the LLM rewrite the original VTT in place, then re-align it (default: sidecar only, for review).                                          |
 | `--align/--no-align`           | With `--apply`, re-run alignment afterwards to refresh timestamps (default: on).                                                              |
 | `--media`                      | Media for that re-alignment when it is not a same-stem sibling of the VTT.                                                                    |
-| `--model`                      | Correction model (default `VOXWEAVE_FIX_MODEL` env, `[llm].model` in the config, or `gpt-6-luna`; `auto` = the endpoint's only served model). |
+| `--model`                      | Correction model (default `VOXWEAVE_FIX_MODEL` env, `[llm].model` in the config, or `gpt-4o-mini`; `auto` = the endpoint's only served model). |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](configuration.md#configuration)).          |
 
 </details>
@@ -243,7 +243,7 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 | `-t, --target`                 | Target language code, written to `<stem>.<target>.<ext>` (default `zh`); use `export --format` to change file formats.                                                                         |
 | `--context`                    | Show/tone context injected into the prompt.                                                                                                                                                    |
 | `--glossary`                   | Term/name glossary (`.json` → mapping; other → raw prompt).                                                                                                                                    |
-| `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env, `[llm].model` in the config, or `gpt-6-luna`; `auto` = the endpoint's only served model).                                           |
+| `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env, `[llm].model` in the config, or `gpt-4o-mini`; `auto` = the endpoint's only served model).                                           |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](configuration.md#configuration)).                                                           |
 | `--reasoning-effort`           | Model-specific effort. `VOXWEAVE_TRANSLATE_REASONING_EFFORT` > `[llm].reasoning_effort` > endpoint default; `default` explicitly omits the field.                                              |
 | `--concurrency N`              | Windows in flight at once (`VOXWEAVE_TRANSLATE_CONCURRENCY` > `[llm].concurrency` > 8 with a base URL, 1 for api.openai.com). `1` = one whole-episode request with translated-tail continuity. |

@@ -363,7 +363,8 @@ def _load_inference(
         )
     except (ImportError, AttributeError) as exc:
         raise TurnEmbeddingError(
-            "speaker splitting could not import the pyannote embedding runtime"
+            "speaker splitting requires the optional [diarize] extra (pyannote.audio); "
+            "install with voxweave[cuda,diarize] or voxweave[mps,diarize]"
         ) from exc
 
     device = torch.device(runtime.get_device())

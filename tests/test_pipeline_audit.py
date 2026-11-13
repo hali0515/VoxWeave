@@ -342,8 +342,7 @@ def test_per_cue_alignment_advances_as_each_cue_lands(tmp_path, monkeypatch):
     events: list = []
     chunks: list[Path] = []
 
-    def fake_slice(_wav, start, _end, **kwargs):
-        kwargs["_sample_geometry_observer"](int(start * 16000), 0, 16000, 1)
+    def fake_slice(_wav, _start, _end, **_kwargs):
         out = tmp_path / f"cue-{len(chunks)}.wav"
         out.write_bytes(b"x")
         return out

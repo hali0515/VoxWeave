@@ -58,8 +58,9 @@ breaks) handles Chinese/Japanese/English as first-class.
 - **Speaker labels.** `--diarize` splits cues at speaker changes and sets short two-person
   exchanges as Netflix `-line` pairs. `voxweave speakers serve` opens a page where you audition
   each speaker, name them, and split two people that were merged. Enrolled voices go into one
-  library, so names carry over to later episodes. Opt-in; needs a Hugging Face token for the
-  gated pyannote model (see [Setup](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#setup)).
+  library, so names carry over to later episodes. Opt-in via the `[diarize]` extra
+  (`voxweave[cuda,diarize]` / `voxweave[mps,diarize]`) plus a Hugging Face token for the gated
+  pyannote model (see [Setup](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#setup)).
 - **Edit-and-resync.** Fix the transcript by hand, then `align` re-derives timestamps from
   the audio — timestamps are _never_ hand-written.
 - **CJK-aware.** Japanese aligns with MMS-300m + uroman (zero-OOV, immune to the per-cue
@@ -90,16 +91,19 @@ uv tool install --torch-backend=cu128 \
   "voxweave[cuda]"
 # Apple Silicon / macOS
 uv tool install "voxweave[mps]"
+# Add ,diarize when you also want --diarize speaker labels:
+#   "voxweave[cuda,diarize]"  or  "voxweave[mps,diarize]"
 ```
 
 From a clone, `make install` does the same and picks the variant, the torch build and the
-overrides for you (`make reinstall` after pulling new code). Native Windows is unsupported
+overrides for you (`make install EXTRAS=diarize` to include speaker diarization; `make reinstall`
+after pulling new code). Native Windows is unsupported
 (POSIX file locks required); on Windows, install inside **WSL2** with NVIDIA CUDA passthrough,
 or use the [Docker image](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#docker).
 
 Both variants need `ffmpeg` on PATH. Run `voxweave doctor` after installing to verify `ffmpeg`,
 your GPU backend, and ONNX providers. The default pipeline fits in about 8 GB of VRAM.
-`--diarize` also needs a Hugging Face token for a gated model; see
+`--diarize` requires the optional `[diarize]` extra and a Hugging Face token for a gated model; see
 [Speaker models](https://github.com/hali0515/VoxWeave/blob/main/docs/speakers.md#speaker-models). Everything else about installing
 (variants, shell-portable overrides, Docker, CUDA notes, dependencies) is in [Setup](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#setup).
 

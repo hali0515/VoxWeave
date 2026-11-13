@@ -26,7 +26,7 @@ then `$XDG_CONFIG_HOME/voxweave.conf` when `XDG_CONFIG_HOME` is set, and finally
 - `VOXWEAVE_VOICEPRINT_MODEL` (default `[voiceprint].model` in the config, else `auto`; one of
   `auto`, `redimnet2`, `anime-va`, `pyannote`; same as `--voiceprint-model`)
 - `VOXWEAVE_TRANSLATE_MODEL` / `VOXWEAVE_FIX_MODEL` (default `[llm].model` in the config, else
-  `gpt-6-luna`; same as `--model` on `translate` / `correct`; `auto` = the endpoint's only served model)
+  `gpt-4o-mini`; same as `--model` on `translate` / `correct`; `auto` = the endpoint's only served model)
 - `OPENAI_BASE_URL` (default `[llm].base_url` in the config, else api.openai.com; same as `--base-url`)
 - `VOXWEAVE_TRANSLATE_REASONING_EFFORT` (default `[llm].reasoning_effort`, else the endpoint default;
   same as `translate --reasoning-effort`; `default` leaves the request field unset)
@@ -224,7 +224,7 @@ vad_mask   = false                       # suppress wav2vec2 CTC emissions outsi
 
 # LLM for translate / correct: any OpenAI-compatible chat-completions endpoint.
 # Precedence per key: CLI option > env (VOXWEAVE_TRANSLATE_MODEL / VOXWEAVE_FIX_MODEL,
-# OPENAI_BASE_URL) > this section > built-in (gpt-6-luna on api.openai.com, key from OPENAI_API_KEY).
+# OPENAI_BASE_URL) > this section > built-in (gpt-4o-mini on api.openai.com, key from OPENAI_API_KEY).
 [llm]
 model = "auto"                           # or a model name; "auto" = the endpoint's only served model
 base_url = "http://127.0.0.1:8000/v1"    # e.g. a local vLLM; remove for api.openai.com

@@ -35,7 +35,7 @@ RUN uv tool install \
         --no-cache \
         --torch-backend="${TORCH_BACKEND}" \
         --overrides overrides.txt \
-        ".[cuda]" \
+        ".[cuda,diarize]" \
     && rm -rf /tmp/voxweave-src \
     && voxweave --version
 

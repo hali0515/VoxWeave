@@ -34,18 +34,18 @@ def _locked_voxweave() -> dict[str, object]:
     return matches[0]
 
 
-def test_diarization_dependency_is_core_with_an_empty_compatibility_alias() -> None:
+def test_diarization_dependency_is_opt_in_under_diarize_extra() -> None:
     project = _project()
     dependencies = project["dependencies"]
     optional = project["optional-dependencies"]
 
-    assert dependencies.count(PYANNOTE_REQUIREMENT) == 1
-    assert optional["diarize"] == []
     assert not any(
-        requirement.startswith("pyannote-audio")
-        for requirements in optional.values()
-        for requirement in requirements
+        requirement.startswith("pyannote-audio") for requirement in dependencies
     )
+    assert not any(
+        requirement.startswith("panns-inference") for requirement in dependencies
+    )
+    assert optional["diarize"] == [PYANNOTE_REQUIREMENT]
 
 
 def test_cuda_mps_conflict_contract_is_unchanged() -> None:
@@ -55,19 +55,21 @@ def test_cuda_mps_conflict_contract_is_unchanged() -> None:
     ]
 
 
-def test_lock_records_pyannote_as_core_and_preserves_the_empty_alias() -> None:
+def test_lock_records_pyannote_under_diarize_extra() -> None:
     package = _locked_voxweave()
     dependencies = package["dependencies"]
     optional = package["optional-dependencies"]
     metadata = package["metadata"]
 
-    assert {"name": "pyannote-audio"} in dependencies
-    assert "diarize" not in optional  # uv omits empty optional-dependency tables
+    assert {"name": "pyannote-audio"} not in dependencies
+    assert {"name": "panns-inference"} not in dependencies
+    assert optional["diarize"] == [{"name": "pyannote-audio"}]
+    assert "diarize" in metadata["provides-extras"]
     assert {
         "name": "pyannote-audio",
+        "marker": "extra == 'diarize'",
         "specifier": ">=4,<5",
     } in metadata["requires-dist"]
-    assert "diarize" in metadata["provides-extras"]
     locked_pyannote = next(
         package
         for package in tomllib.loads(
@@ -82,7 +84,6 @@ def test_make_install_has_no_diarize_extra_detection(tmp_path: Path) -> None:
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
 
     assert "TOOL_SITE" not in makefile
-    assert "pyannote" not in makefile.lower()
     environment = {
         "HOME": str(tmp_path),
         "PATH": os.environ.get("PATH", os.defpath),
@@ -133,14 +134,13 @@ def _readme_and_docs() -> str:
     return "\n".join(parts)
 
 
-def test_readme_describes_default_install_and_opt_in_runtime() -> None:
+def test_readme_describes_opt_in_diarize_extra_and_runtime() -> None:
     readme = _readme_and_docs()
     lowered = readme.lower()
 
-    assert "voxweave[diarize]" not in lowered
-    assert "`[diarize]`" not in lowered
     assert "pyannote-audio" in lowered
-    assert "ships by default" in lowered
+    assert "[diarize]" in lowered or "cuda,diarize" in lowered
+    assert "ships by default" not in lowered
     assert "--diarize" in readme
     assert "--diarize-model" in readme
     assert "VOXWEAVE_DIARIZE_MODEL" in readme
@@ -153,15 +153,10 @@ def test_readme_describes_default_install_and_opt_in_runtime() -> None:
     assert "HF_TOKEN" in readme
     assert re.search(r"^diarize\s*=\s*false", readme, flags=re.MULTILINE)
 
-    for source_path in (REPO_ROOT / "voxweave").rglob("*.py"):
-        source = source_path.read_text(encoding="utf-8")
-        assert "voxweave[diarize]" not in source.lower(), source_path
-
 
 def test_diarize_model_help_names_community1_as_default_not_31() -> None:
     from voxweave.cli import cmd_transcribe
 
-    # Inspect the actual option, not the first flag literal in help-panel metadata.
     option = next(
         param for param in cmd_transcribe.params if "--diarize-model" in param.opts
     )
@@ -185,8 +180,6 @@ def test_readme_diarize_docs_name_community1_as_default_everywhere() -> None:
     for phrase in stale_31_default_phrases:
         assert phrase not in readme, f"stale 3.1-is-default wording found: {phrase!r}"
 
-    # The CLI options table, the env-var reference, and the sample conf file
-    # must each independently say community-1 is the default.
     assert "`community-1` (the default)" in readme
     assert "default `pyannote/speaker-diarization-community-1`" in readme
     assert '"community-1" (built-in default)' in readme
@@ -201,8 +194,6 @@ def test_readme_speaker_clustering_default_matches_the_constant() -> None:
         choice for choice in config.DIARIZE_CLUSTERING_CHOICES if choice != default
     )
 
-    # Options table, env-var reference and sample conf each name the default,
-    # so flipping DEFAULT_DIARIZE_CLUSTERING fails here until the docs follow.
     assert f"`{default}` (the default" in readme
     assert f"`[diarize].clustering` in the config, else `{default}`" in readme
     assert f'"{default}" (built-in default)' in readme

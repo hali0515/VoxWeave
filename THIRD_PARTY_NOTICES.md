@@ -57,6 +57,18 @@ License 2.0; the license text is shipped as
 `voxweave/vendor/speechbrain_ecapa/LICENSE` and each module header lists the
 upstream files and the modifications.
 
+### PANNs Cnn14 — `voxweave/vendor/panns_cnn14.py`
+
+`voxweave/vendor/panns_cnn14.py` adapts the Cnn14 32 kHz AudioSet tagging
+network and log-mel front end from
+[qiuqiangkong/audioset_tagging_cnn](https://github.com/qiuqiangkong/audioset_tagging_cnn)
+and [qiuqiangkong/torchlibrosa](https://github.com/qiuqiangkong/torchlibrosa)
+(MIT License, Copyright (c) 2020 Qiuqiang Kong), replacing `torchlibrosa`'s
+`librosa` filterbank setup with a pure-PyTorch Slaney HTK mel filterbank and
+embedding the 527 AudioSet class labels (Creative Commons Attribution 4.0,
+Google LLC) directly as a Python tuple so no runtime `wget` or home-directory
+writes occur.
+
 ## Models downloaded at runtime (NOT bundled in this repository)
 
 voxweave orchestrates the following models; users download the weights themselves.

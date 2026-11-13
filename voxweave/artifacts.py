@@ -64,10 +64,6 @@ class ArtifactPaths:
             self.directory, _stem(Path(subtitle)), f".{encoded}.progress.json"
         )
 
-    def align_evidence(self, subtitle: Path) -> Path:
-        """Return an input-specific durable alignment-evidence path."""
-        return _entry(self.directory, _stem(Path(subtitle)), ".align-evidence.json")
-
     def asrfix_audit(self, subtitle: Path) -> Path:
         """Return an input-specific ASR-correction audit path."""
         return _entry(self.directory, _stem(Path(subtitle)), ".asrfix.json")
@@ -547,13 +543,6 @@ def translation_progress_path(source: Path, subtitle: Path, target: str) -> Path
     )
 
 
-def align_evidence_path(source: Path, subtitle: Path) -> Path:
-    legacy = swap_ext(Path(subtitle), ".align-evidence.json")
-    return (
-        legacy if path_present(legacy) else claim_paths(source).align_evidence(subtitle)
-    )
-
-
 def asrfix_audit_path(source: Path, subtitle: Path) -> Path:
     legacy = swap_ext(Path(subtitle), ".asrfix.json")
     return (
@@ -572,12 +561,6 @@ def fixed_candidates(source: Path, suffix: str, attribute: str) -> tuple[Path, .
     """Return deterministic legacy and cache paths for invalidation or purge."""
     legacy = legacy_path(source, suffix)
     cached = getattr(claim_paths(source), attribute)
-    return _candidates(legacy, cached)
-
-
-def align_evidence_candidates(source: Path, subtitle: Path) -> tuple[Path, ...]:
-    legacy = swap_ext(Path(subtitle), ".align-evidence.json")
-    cached = claim_paths(source).align_evidence(subtitle)
     return _candidates(legacy, cached)
 
 
@@ -601,8 +584,6 @@ __all__ = [
     "ArtifactCollisionError",
     "ArtifactMarkerError",
     "ArtifactPaths",
-    "align_evidence_path",
-    "align_evidence_candidates",
     "artifacts_root",
     "asrfix_audit_path",
     "claim_paths",

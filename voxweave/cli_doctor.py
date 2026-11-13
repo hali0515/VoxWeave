@@ -284,20 +284,31 @@ def _hf_token_source() -> str | None:
 
 
 def check_hf_auth() -> CheckResult:
+    diarize_default = config.conf_default_flag("diarize", False)
+    has_pyannote = importlib.util.find_spec("pyannote") is not None
+    if diarize_default and not has_pyannote:
+        return CheckResult(
+            "hf_auth",
+            "error",
+            "pyannote.audio is not installed while [defaults].diarize = true",
+            "Install the optional [diarize] extra: voxweave[cuda,diarize] or voxweave[mps,diarize].",
+        )
     source = _hf_token_source()
     if source is not None:
-        return CheckResult("hf_auth", "ok", f"configured ({source})")
-    if config.conf_default_flag("diarize", False):
+        note = "" if has_pyannote else ", [diarize] extra not installed"
+        return CheckResult("hf_auth", "ok", f"configured ({source}{note})")
+    if diarize_default:
         return CheckResult(
             "hf_auth",
             "error",
             "no Hugging Face token found while [defaults].diarize = true",
             "Run `hf auth login` or set VOXWEAVE_HF_TOKEN / HF_TOKEN for gated pyannote models.",
         )
+    extra_note = "" if has_pyannote else "; install [diarize] extra to enable"
     return CheckResult(
         "hf_auth",
         "ok",
-        "not configured (only required for --diarize gated models)",
+        f"not configured (only required for --diarize gated models{extra_note})",
     )
 
 

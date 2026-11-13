@@ -159,19 +159,19 @@ def test_release_silero_vad_is_safe_when_nothing_is_loaded(_released_silero):
 
 
 def _fake_panns(monkeypatch, *, cuda: bool):
-    """Inject panns_inference + torch stand-ins; returns (instances, empty_cache_calls)."""
+    """Inject PannsTagger + torch stand-ins; returns (instances, empty_cache_calls)."""
     instances: list[object] = []
     empties: list[int] = []
 
-    class _AudioTagging:
+    class _FakeTagger:
         def __init__(self, checkpoint_path=None, device=None):
             self.checkpoint_path = checkpoint_path
             self.device = device
             instances.append(self)
 
-    panns = types.ModuleType("panns_inference")
-    panns.AudioTagging = _AudioTagging  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "panns_inference", panns)
+    panns_mod = types.ModuleType("voxweave.vendor.panns_cnn14")
+    panns_mod.PannsTagger = _FakeTagger  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "voxweave.vendor.panns_cnn14", panns_mod)
 
     torch_stub = types.ModuleType("torch")
     torch_stub.cuda = types.SimpleNamespace(  # type: ignore[attr-defined]
@@ -180,7 +180,6 @@ def _fake_panns(monkeypatch, *, cuda: bool):
     )
     monkeypatch.setitem(sys.modules, "torch", torch_stub)
 
-    monkeypatch.setattr(songdet, "_ensure_panns_labels", lambda: None)
     monkeypatch.setattr(songdet, "_resolve_panns_ckpt", lambda: "/fake/Cnn14.pth")
     monkeypatch.setattr(songdet, "_model", None)
     # songdet resolves the device through runtime.get_device(), which caches it

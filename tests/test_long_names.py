@@ -63,9 +63,6 @@ def test_names_that_fit_stay_exactly_as_they_are(tmp_path: Path) -> None:
     paths = artifacts.claim_paths(tmp_path / "episode.mkv")
     assert paths.directory == tmp_path / "cache" / "episode"
     assert paths.episode_lock.name == "episode.episode.lock"
-    assert paths.align_evidence(tmp_path / "episode.vtt").name == (
-        "episode.align-evidence.json"
-    )
 
 
 @pytest.mark.parametrize("stem", LONG_STEMS)
@@ -119,7 +116,6 @@ def test_per_subtitle_cache_files_round_trip(tmp_path: Path, stem: str) -> None:
     subtitle = swap_ext(media, ".vtt")
     written = {
         ".zh.progress.json": artifacts.translation_progress_path(media, subtitle, "zh"),
-        ".align-evidence.json": artifacts.align_evidence_path(media, subtitle),
         ".asrfix.json": artifacts.asrfix_audit_path(media, subtitle),
     }
     for suffix, path in written.items():
@@ -132,13 +128,6 @@ def test_per_subtitle_cache_files_round_trip(tmp_path: Path, stem: str) -> None:
     )
     assert artifacts.translation_progress_candidates(media, subtitle, "zh") == (
         written[".zh.progress.json"],
-    )
-    assert (
-        artifacts.align_evidence_path(media, subtitle)
-        == (written[".align-evidence.json"])
-    )
-    assert written[".align-evidence.json"] in (
-        artifacts.align_evidence_candidates(media, subtitle)
     )
     assert artifacts.asrfix_audit_path(media, subtitle) == written[".asrfix.json"]
     for suffix, path in written.items():
@@ -177,16 +166,16 @@ def test_readers_find_a_name_shortened_under_another_limit(
     media = tmp_path / f"{stem}.mkv"
     subtitle = swap_ext(media, ".vtt")
     monkeypatch.setattr(artifacts, "name_limit", lambda _directory: 143)
-    small = artifacts.align_evidence_path(media, subtitle)
-    _assert_shortened(small.name, stem, ".align-evidence.json")
+    small = artifacts.translation_progress_path(media, subtitle, "zh")
+    _assert_shortened(small.name, stem, ".zh.progress.json")
     assert name_bytes(small.name) <= 143
     small.write_text("{}", encoding="utf-8")
     monkeypatch.undo()
 
-    assert artifacts.fitted_name(small.parent, stem, ".align-evidence.json") == (
-        f"{stem}.align-evidence.json"
+    assert artifacts.fitted_name(small.parent, stem, ".zh.progress.json") == (
+        f"{stem}.zh.progress.json"
     )
-    assert artifacts.align_evidence_path(media, subtitle) == small
+    assert artifacts.translation_progress_path(media, subtitle, "zh") == small
     # A plain entry, where one exists, is read under its plain name.
     plain = small.with_name(f"{stem}.asrfix.json")
     plain.write_text("{}", encoding="utf-8")
