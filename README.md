@@ -213,7 +213,9 @@ Options and details: [Commands](https://github.com/hali0515/VoxWeave/blob/main/d
 | [How it works](https://github.com/hali0515/VoxWeave/blob/main/docs/internals.md)      | The edit-and-resync workflow and the pipeline stages                 |
 | [Configuration](https://github.com/hali0515/VoxWeave/blob/main/docs/configuration.md) | `voxweave.conf`, environment variables, performance knobs            |
 | [Data contract](https://github.com/hali0515/VoxWeave/blob/main/docs/data-contract.md) | Files written next to the media, JSON schema, tests                  |
-| [Migration notes](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md)        | Changes between releases                                             |
+| [Changelog](https://github.com/hali0515/VoxWeave/blob/main/CHANGELOG.md)              | User-facing additions and changes per release                        |
+| [Migration notes](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md)        | Upgrade actions and output changes between releases                  |
+| [Contributing](https://github.com/hali0515/VoxWeave/blob/main/CONTRIBUTING.md)        | Local dev setup, verification gates, and codebase conventions        |
 
 ## Support
 

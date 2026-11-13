@@ -62,10 +62,50 @@ jobs:
         run: uv run --extra cuda pyright
 
       # The oracle execution record also pins the ambient environment: locale
-      # C.UTF-8, TZ and PYTHONHASHSEED unset. Conform here rather than in the
-      # tests — the pin is the gate's contract, not an accident.
+      # C.UTF-8, TZ and PYTHONHASHSEED unset. VOXWEAVE_STRICT_ORACLE=1 forbids
+      # skipping host-pinned oracle tests on the canonical Linux x86_64 lane.
       - name: Test
-        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run --extra cuda pytest tests/ -q
+        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 VOXWEAVE_STRICT_ORACLE=1 uv run --extra cuda pytest tests/ -q
+
+  # Cross-platform and multi-Python compatibility matrix: verifies that the
+  # universal lockfile resolves, typechecks, and passes unit tests across
+  # supported Python minors (3.11, 3.12, 3.13) and Apple Silicon [mps].
+  # Host-pinned P6 oracle tests skip cleanly here while schema, vector, and
+  # unit tests run in full.
+  compat:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+            variant: cuda
+          - os: ubuntu-latest
+            python: "3.12"
+            variant: cuda
+          - os: macos-14
+            python: "3.12"
+            variant: mps
+          - os: macos-14
+            python: "3.13"
+            variant: mps
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Sync environment
+        run: uv sync --locked --extra ${{ matrix.variant }} --dev --python "${{ matrix.python }}"
+
+      - name: Type check
+        run: uv run --extra ${{ matrix.variant }} pyright
+
+      - name: Test
+        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run --extra ${{ matrix.variant }} pytest tests/ -q
 
   # The segmentation ruler measures output *quality* against the recorded
   # baseline (calibration/segmentation/baseline.json). Three gates are

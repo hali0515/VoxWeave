@@ -86,16 +86,17 @@ ORACLE_PYTHON := $(shell python3 -c "import json; print(json.load(open('calibrat
 # Development environment for code changes, synced like CI: the oracle's interpreter pin,
 # the [cuda] extra and the dev group. [cuda] and [mps] are mutually exclusive (conflicting
 # transformers pins), so sync exactly one; on Apple Silicon use: make dev VARIANT=mps.
-# The P6 oracle tests also need the oracle's recorded platform (Linux x86_64) and the full
-# git history (a shallow clone lacks its reference commits); elsewhere they fail with a
-# message naming the mismatch.
+# The host-pinned P6 oracle tests also need Linux x86_64 and full git history; on other
+# platforms, interpreters, or shallow clones they skip automatically unless
+# VOXWEAVE_STRICT_ORACLE=1 is set.
 dev:
 	uv sync --extra $(VARIANT) --dev $(if $(ORACLE_PYTHON),--python $(ORACLE_PYTHON))
 
 # Unit tests (no network). --extra $(VARIANT) keeps this hermetic on a fresh
 # clone; without it the run env lacks the backend deps and imports fail.
+# Pins LC_ALL=C.UTF-8 with TZ and PYTHONHASHSEED unset to match CI and the P6 oracle record.
 test:
-	uv run --extra $(VARIANT) pytest tests/ -v
+	env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run --extra $(VARIANT) pytest tests/ -v
 
 # Lint / format (project-wide; rules and the vendor exclusion come from [tool.ruff] in
 # pyproject.toml). Ruff is pinned so a release that changes its style cannot turn untouched

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import subprocess
 
@@ -14,6 +16,19 @@ from voxweave import cli_doctor, config, pipeline, runtime
 
 def _reset_conf_cache() -> None:
     config._WARNED.clear()
+
+
+def _mock_asr_specs(monkeypatch, present: set[str], missing: set[str] = set()) -> None:
+    real_find_spec = importlib.util.find_spec
+
+    def _fake_find_spec(name: str, *args, **kwargs):
+        if name in present:
+            return importlib.machinery.ModuleSpec(name, loader=None)
+        if name in missing:
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(cli_doctor.importlib.util, "find_spec", _fake_find_spec)
 
 
 def test_doctor_json_passes_and_skips_first_run_config_creation(tmp_path, monkeypatch):
@@ -43,6 +58,7 @@ def test_doctor_json_passes_and_skips_first_run_config_creation(tmp_path, monkey
     )
     monkeypatch.setattr(runtime, "get_device", lambda: "cpu")
     monkeypatch.setattr(runtime, "_use_mlx", lambda: False)
+    _mock_asr_specs(monkeypatch, {"qwen_asr", "faster_whisper"})
 
     runner = CliRunner()
     res = runner.invoke(cli_module.cli, ["doctor", "--json"])
@@ -88,6 +104,7 @@ def test_doctor_human_table_renders_warnings_and_exits_zero(tmp_path, monkeypatc
     )
     monkeypatch.setattr(runtime, "get_device", lambda: "cuda")
     monkeypatch.setattr(runtime, "_use_mlx", lambda: False)
+    _mock_asr_specs(monkeypatch, {"qwen_asr", "faster_whisper"})
     monkeypatch.setattr(
         ort, "get_available_providers", lambda: ["CPUExecutionProvider"]
     )
@@ -98,6 +115,17 @@ def test_doctor_human_table_renders_warnings_and_exits_zero(tmp_path, monkeypatc
     assert "VoxWeave Environment Check" in res.stdout
     assert "CUDAExecutionProvider missing" in res.stdout
     assert "--overrides" in res.stdout
+
+
+def test_doctor_asr_backend_checks_mlx_when_mlx_active(monkeypatch):
+    monkeypatch.setattr(runtime, "_use_mlx", lambda: True)
+    _mock_asr_specs(monkeypatch, {"mlx_audio", "mlx_whisper"})
+    assert cli_doctor.check_asr_backend().status == "ok"
+
+    _mock_asr_specs(monkeypatch, set(), missing={"mlx_audio", "mlx_whisper"})
+    missing = cli_doctor.check_asr_backend()
+    assert missing.status == "error"
+    assert "mlx-audio" in missing.summary
 
 
 def test_doctor_exits_one_when_ffmpeg_missing_or_config_invalid(tmp_path, monkeypatch):

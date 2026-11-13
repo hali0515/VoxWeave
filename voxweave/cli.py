@@ -304,6 +304,8 @@ def cli(ctx, verbose: bool, quiet: bool) -> None:
     if verbose and quiet:
         raise click.UsageError("Use either --quiet or --verbose, not both.")
     install_logging(verbose=verbose, quiet=quiet)
+    if verbose or quiet:
+        ctx.call_on_close(lambda: install_logging(verbose=False, quiet=False))
     if (
         ctx.invoked_subcommand
         not in {
