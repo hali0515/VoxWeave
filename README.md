@@ -84,7 +84,7 @@ are the optional `--diarize` branch. Every stage runs locally; see
 ## Install
 
 ```bash
-# NVIDIA / Linux
+# NVIDIA / Linux (or Windows via WSL2)
 uv tool install --torch-backend=cu128 \
   --overrides <(printf "onnxruntime; sys_platform == 'darwin'\n") \
   "voxweave[cuda]"
@@ -93,12 +93,15 @@ uv tool install "voxweave[mps]"
 ```
 
 From a clone, `make install` does the same and picks the variant, the torch build and the
-overrides for you (`make reinstall` after pulling new code).
+overrides for you (`make reinstall` after pulling new code). Native Windows is unsupported
+(POSIX file locks required); on Windows, install inside **WSL2** with NVIDIA CUDA passthrough,
+or use the [Docker image](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#docker).
 
-Both variants need `ffmpeg` on PATH. The default pipeline fits in about 8 GB of VRAM.
+Both variants need `ffmpeg` on PATH. Run `voxweave doctor` after installing to verify `ffmpeg`,
+your GPU backend, and ONNX providers. The default pipeline fits in about 8 GB of VRAM.
 `--diarize` also needs a Hugging Face token for a gated model; see
 [Speaker models](https://github.com/hali0515/VoxWeave/blob/main/docs/speakers.md#speaker-models). Everything else about installing
-(variants, CUDA notes, overrides, dependencies) is in [Setup](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#setup).
+(variants, shell-portable overrides, Docker, CUDA notes, dependencies) is in [Setup](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#setup).
 
 ## Quickstart
 
@@ -193,6 +196,7 @@ voxweave burn episode.zh.vtt           # hard subtitles
 | `voxweave translate <subtitle> --target zh`             | Whole-episode translation; the cue count stays the same.                                                     |
 | `voxweave export <subtitle> --to srt`                   | Convert between VTT, SRT and ASS.                                                                            |
 | `voxweave pack <subtitle>` / `voxweave burn <subtitle>` | Add subtitles to the media as tracks, or burn them into the picture.                                         |
+| `voxweave doctor`                                       | Check `ffmpeg`, GPU backend, ONNX providers, config syntax, and Hugging Face auth.                           |
 
 Options and details: [Commands](https://github.com/hali0515/VoxWeave/blob/main/docs/commands.md).
 

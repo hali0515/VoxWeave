@@ -15,6 +15,7 @@ from voxweave.cli_compat import (
     renamed_option,
     require_media,
 )
+from voxweave.cli_doctor import build_doctor_command
 from voxweave.cli_speakers import build_speakers_group
 from voxweave.cli_voices import build_voices_group
 from voxweave.export import EXPORT_RENDERERS
@@ -24,6 +25,7 @@ from voxweave.ui import (
     correct_summary_panel,
     error_panel,
     install_logging,
+    interrupted_notice,
     success_panel,
     summary_panel,
     translate_summary_panel,
@@ -34,13 +36,17 @@ def _run(fn, *, reporter: bool = True):
     """Run a pipeline call, rendering a unified error panel and exiting 1 on any failure.
 
     ``fn`` receives a :class:`RichReporter` (or ``None`` when ``reporter=False``). Centralises
-    the try/RichReporter/except wrapper shared by every subcommand.
+    the try/RichReporter/except wrapper shared by every subcommand. ``KeyboardInterrupt``
+    exits cleanly with status 130 (128 + SIGINT) without printing a traceback.
     """
     try:
         if reporter:
             with RichReporter() as rep:
                 return fn(rep)
         return fn(None)
+    except KeyboardInterrupt:
+        interrupted_notice()
+        sys.exit(130)
     except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
         error_panel(exc)
         sys.exit(1)
@@ -209,6 +215,10 @@ def _resolve_llm(
                     "name": "Deliver",
                     "commands": ["translate", "export", "pack", "burn"],
                 },
+                {
+                    "name": "Inspect",
+                    "commands": ["doctor"],
+                },
             ]
         },
         "option_groups": {
@@ -260,7 +270,7 @@ def cli(ctx, verbose: bool) -> None:
     """
     install_logging(verbose=verbose)
     if (
-        ctx.invoked_subcommand not in {"speakers", "voices", "help"}
+        ctx.invoked_subcommand not in {"speakers", "voices", "doctor", "help"}
         and not ctx.resilient_parsing
         and not ctx.meta.get(HELP_REQUESTED)
     ):
@@ -602,6 +612,7 @@ cli.add_command(cmd_transcribe)
 cmd_speakers = build_speakers_group(_run, _report_speaker_service)
 cli.add_command(cmd_speakers)
 cli.add_command(build_voices_group(_run))
+cli.add_command(build_doctor_command())
 
 
 @cli.command(

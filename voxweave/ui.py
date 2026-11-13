@@ -406,6 +406,11 @@ def error_panel(exc: Exception) -> None:
     console.print(Panel(body, title="Error", border_style=_ERROR))
 
 
+def interrupted_notice() -> None:
+    """Render a concise cancellation notice on stderr after Ctrl+C."""
+    console.print(Text("Interrupted.", style=_WARNING))
+
+
 def success_panel(title: str, lines: Sequence[str]) -> None:
     """Shared completion treatment; paths and provider text are always literal."""
     console.print(

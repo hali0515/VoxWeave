@@ -344,4 +344,21 @@ at all).
 Progress is rendered with rich: countable stages (demix windows / PANNs batches / per-chunk
 ASR+alignment / align per-cue / translate streaming per-line) show a real `x/N` bar with
 elapsed time; indeterminate stages (decode / file write) show a pulse bar. `-v/--verbose`
-enables DEBUG logging.
+enables DEBUG logging. Pressing `Ctrl+C` (`SIGINT`) cancels cleanly and exits with status `130`.
+
+## Environment check
+
+`voxweave doctor` inspects the local runtime without loading model weights or creating
+`voxweave.conf`:
+
+```bash
+voxweave doctor
+voxweave doctor --json
+```
+
+Checks reported in deterministic order: `platform`, `ffmpeg` (including NVENC / VideoToolbox
+encoders), `compute` (CUDA / MPS / CPU fallback), `asr_backend` (`qwen-asr` + `faster-whisper` or
+`mlx-audio` + `mlx-whisper`), `onnxruntime` (warns when `CUDAExecutionProvider` is shadowed on a
+CUDA host), `config` (TOML syntax and unknown keys), `hf_auth` (token source without exposing the
+secret), and `cache` (`VOXWEAVE_CACHE_ROOT` file count and disk size). Exits `0` when all checks
+report `ok` or `warn`, and `1` when any check reports `error`.

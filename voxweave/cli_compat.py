@@ -94,6 +94,15 @@ class DefaultGroup(click.RichGroup):
     media_extensions: tuple[str, ...] = ()
     _TOKEN = "\x00voxweave-default"
 
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except KeyboardInterrupt:
+            from voxweave.ui import interrupted_notice
+
+            interrupted_notice()
+            ctx.exit(130)
+
     def get_command(self, ctx, cmd_name):
         if cmd_name == self._TOKEN:
             return self.default_cmd

@@ -1,7 +1,10 @@
 # Setup
 
-Two install variants: **`voxweave[cuda]`** (NVIDIA GPU — Blackwell sm_120 / cu128 by default)
-and **`voxweave[mps]`** (Apple Silicon / macOS). Both need `ffmpeg` on PATH.
+Two install variants: **`voxweave[cuda]`** (NVIDIA GPU on Linux or **Windows via WSL2** — Blackwell
+sm_120 / cu128 by default) and **`voxweave[mps]`** (Apple Silicon / macOS). Both need `ffmpeg` on
+PATH. Native Windows (`win32`) is unsupported because the artifact cache and voice library rely on
+POSIX file locks (`fcntl`); on Windows, run VoxWeave inside WSL2 (Ubuntu 24.04 recommended — NVIDIA
+drivers on the Windows host expose `/dev/dxg` to WSL2 automatically).
 
 <details>
 <summary><b>Install ffmpeg</b></summary>
@@ -43,6 +46,20 @@ uv tool install "voxweave[mps]"                          # full pipeline + MLX W
 `--overrides` line keeps the CPU `onnxruntime` wheel (pulled in by ctc-forced-aligner) from
 shadowing `onnxruntime-gpu`, which would silently move Japanese MMS alignment onto the CPU; the
 Makefile passes the same rule from `overrides.txt`.
+
+In POSIX `sh` or `fish` (where `<(...)` process substitution is unavailable), pass a file instead:
+
+```sh
+printf "onnxruntime; sys_platform == 'darwin'\n" > overrides.txt
+uv tool install --torch-backend=cu128 --overrides overrides.txt "voxweave[cuda]"
+rm overrides.txt
+```
+
+Verify the installation at any time without loading models:
+
+```bash
+voxweave doctor
+```
 
 The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
 Japanese/CJK), layout, song-skip, and speaker-diarization support — plus CJK line-break and
@@ -102,6 +119,28 @@ make uninstall
 
 Override the detection per invocation: `make install VARIANT=mps` or
 `make install TORCH_BACKEND=cpu`.
+
+## Docker
+
+A CUDA 12.8 runtime container (`Dockerfile`) bundles `ffmpeg`, `uv`, and `voxweave[cuda]` with the
+`onnxruntime` override pre-applied:
+
+```bash
+docker build -t voxweave .
+
+# Verify GPU passthrough inside the container
+docker run --rm --gpus all voxweave doctor
+
+# Transcribe a file in the current directory, persisting model weights across runs
+docker run --rm --gpus all \
+  -u "$(id -u):$(id -g)" \
+  -v "$PWD":/work \
+  -v voxweave-cache:/cache/voxweave \
+  voxweave episode.mkv
+```
+
+Pass `-e HF_TOKEN` when running `--diarize`, or `--build-arg TORCH_BACKEND=cpu` to build a
+CPU-only image.
 
 ## Hardware
 
