@@ -24,8 +24,28 @@ def test_config_path_env_override(conf_at):
 
 def test_config_path_default(monkeypatch):
     monkeypatch.delenv("VOXWEAVE_CONFIG", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     p = config.config_path()
     assert p.name == "voxweave.conf" and p.parent.name == ".config"
+
+
+def test_config_path_xdg_config_home_and_home_backcompat(tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    xdg_dir = tmp_path / "xdg"
+    fake_home.mkdir()
+    xdg_dir.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.delenv("VOXWEAVE_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_dir))
+
+    # When ~/.config/voxweave.conf does not exist yet, XDG_CONFIG_HOME is used.
+    assert config.config_path() == xdg_dir / "voxweave.conf"
+
+    # Existing ~/.config/voxweave.conf continues to win for backward compatibility.
+    legacy = fake_home / ".config" / "voxweave.conf"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("", encoding="utf-8")
+    assert config.config_path() == legacy
 
 
 def test_load_missing_returns_empty(conf_at):

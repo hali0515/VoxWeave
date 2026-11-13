@@ -350,7 +350,11 @@ at all).
 Progress is rendered with rich: countable stages (demix windows / PANNs batches / per-chunk
 ASR+alignment / align per-cue / translate streaming per-line) show a real `x/N` bar with
 elapsed time; indeterminate stages (decode / file write) show a pulse bar. `-v/--verbose`
-enables DEBUG logging. Pressing `Ctrl+C` (`SIGINT`) cancels cleanly and exits with status `130`.
+enables DEBUG logging; `-q/--quiet` suppresses progress bars, timing lines, and completion panels
+on stderr while preserving result paths on stdout and error panels on failure. Every processing
+command (`transcribe`, `align`, `render`, `correct`, `translate`, `export`, `pack`, `burn`) also
+accepts `--json` to emit a structured JSON result object on stdout. Pressing `Ctrl+C` (`SIGINT`)
+cancels cleanly and exits with status `130`.
 
 ## Environment check
 
@@ -368,3 +372,30 @@ encoders), `compute` (CUDA / MPS / CPU fallback), `asr_backend` (`qwen-asr` + `f
 CUDA host), `config` (TOML syntax and unknown keys), `hf_auth` (token source without exposing the
 secret), and `cache` (`VOXWEAVE_CACHE_ROOT` file count and disk size). Exits `0` when all checks
 report `ok` or `warn`, and `1` when any check reports `error`.
+
+## Models, configuration, and shell completions
+
+```bash
+# Inspect model roles, upstream licenses, and local cache sizes
+voxweave models list
+voxweave models path
+
+# Pre-warm weights for VOXWEAVE_OFFLINE=1 or container images
+voxweave models pull --default --language ja
+voxweave models pull separator panns qwen3-asr-1.7b
+
+# Reclaim disk space (--dry-run previews; --yes skips confirmation)
+voxweave models clean qwen3-asr-1.7b --yes
+voxweave models clean --all --dry-run
+
+# Inspect effective settings (with env/config/default source) and manage voxweave.conf
+voxweave config path
+voxweave config show
+voxweave config show --json
+voxweave config init
+
+# Enable shell tab completion
+eval "$(voxweave completions bash)"
+eval "$(voxweave completions zsh)"
+voxweave completions fish | source
+```

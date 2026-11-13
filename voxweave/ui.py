@@ -29,6 +29,7 @@ from voxweave.progress import Reporter
 
 # Logs/errors to stderr; result paths to stdout so `voxweave x | ...` pipelines work cleanly.
 console = Console(stderr=True)
+_QUIET = False
 
 # One status palette for every command, in the terminal's own ANSI theme.
 _ACTIVE = "cyan"
@@ -113,9 +114,12 @@ def _format_duration(seconds: float) -> str:
     return f"{whole // 60}m{whole % 60:02d}s"
 
 
-def install_logging(*, verbose: bool = False) -> None:
+def install_logging(*, verbose: bool = False, quiet: bool = False) -> None:
     """Attach root logger to rich, sharing the console with the progress bar."""
     import warnings
+
+    global _QUIET
+    _QUIET = quiet
 
     # VOXWEAVE_OFFLINE=1 -> fully offline once everything is cached: hf_hub/transformers skip the
     # per-file HEAD revalidation + optional-file probing (chat_template / safetensors PR / etc.) they
@@ -139,8 +143,9 @@ def install_logging(*, verbose: bool = False) -> None:
     warnings.filterwarnings(
         "ignore", message="(?s).*torchcodec is not installed correctly.*"
     )
+    level = logging.ERROR if quiet else (logging.DEBUG if verbose else logging.INFO)
     logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
+        level=level,
         format="%(message)s",
         datefmt="[%X]",
         handlers=[RichHandler(console=console, show_path=False, rich_tracebacks=True)],
@@ -214,7 +219,7 @@ class RichReporter(Reporter):
             console=console,
             expand=True,
             transient=True,
-            disable=not console.is_terminal,
+            disable=(not console.is_terminal) or _QUIET,
         )
         self._task_id: TaskID | None = None
         self._dl_label: str | None = None
@@ -241,7 +246,7 @@ class RichReporter(Reporter):
         # One muted line on stderr answering "where did the time go" after a clean run.
         # A failed run already ends in the error panel; a run without a declared plan
         # (library helper, no steps) has nothing truthful to summarize.
-        if exc and exc[0] is not None:
+        if _QUIET or (exc and exc[0] is not None):
             return
         timings = self.timings()
         if not self._steps or not timings:
@@ -281,7 +286,7 @@ class RichReporter(Reporter):
         heading.append(label, style="bold")
         self._progress.heading = heading
         self.stage("processing")
-        if not console.is_terminal:
+        if not console.is_terminal and not _QUIET:
             # Logs remain useful under redirection, without animation/ANSI or
             # thousands of per-cue updates. Result paths still go to stdout.
             console.print(heading)
@@ -294,7 +299,7 @@ class RichReporter(Reporter):
             self._switch(label, None)
         else:
             self._progress.update(self._task_id, description=label)
-        if not console.is_terminal:
+        if not console.is_terminal and not _QUIET:
             now = time.monotonic()
             if self._last_status_at is None or now - self._last_status_at >= 30:
                 console.print(Text(label, style=_MUTED))
@@ -413,6 +418,8 @@ def interrupted_notice() -> None:
 
 def batch_item_header(index: int, total: int, name: str) -> None:
     """Render a per-file header on stderr before each multi-file batch item."""
+    if _QUIET:
+        return
     line = Text(f"Batch [{index}/{total}] ", style=_ACTIVE)
     line.append(name, style="bold")
     console.print(line)
@@ -420,6 +427,8 @@ def batch_item_header(index: int, total: int, name: str) -> None:
 
 def skipped_existing_notice(media: Path, existing: Path) -> None:
     """Report a ``--skip-existing`` hit on stderr without touching stdout."""
+    if _QUIET:
+        return
     line = Text("Skipping ", style=_MUTED)
     line.append(media.name, style="bold")
     line.append(f" ({existing.name} already exists)", style=_MUTED)
@@ -428,6 +437,8 @@ def skipped_existing_notice(media: Path, existing: Path) -> None:
 
 def success_panel(title: str, lines: Sequence[str]) -> None:
     """Shared completion treatment; paths and provider text are always literal."""
+    if _QUIET:
+        return
     console.print(
         Panel(
             Text("\n".join(lines)),
@@ -474,6 +485,8 @@ def translate_summary_panel(out_path: Path, *, to: str) -> None:
 
 def correct_summary_panel(res: dict) -> None:
     """Print correction summary: applied/rejected counts, diff preview (up to 20), and next-step hint."""
+    if _QUIET:
+        return
     applied = res.get("applied", [])
     rejected = res.get("rejected", [])
     out = Path(res["out"])

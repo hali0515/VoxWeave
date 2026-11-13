@@ -99,6 +99,13 @@ ASR_CACHE = str(CACHE_ROOT / "asr")  # Qwen ASR, faster-whisper
 ALIGN_CACHE = str(CACHE_ROOT / "align")  # Qwen aligner, en wav2vec2, ja MMS onnx
 AUDIO_CACHE = str(CACHE_ROOT / "audio")  # separator roformer, songdet PANNs
 
+
+def cache_root() -> Path:
+    """Active model cache root (honors dynamic ``VOXWEAVE_CACHE_ROOT`` overrides)."""
+    raw = (os.environ.get("VOXWEAVE_CACHE_ROOT") or "").strip()
+    return Path(raw).expanduser() if raw else CACHE_ROOT
+
+
 _TEMPLATE = """\
 # voxweave configuration  (~/.config/voxweave.conf)
 # Precedence: CLI options > environment variables > this file > built-in defaults.
@@ -254,9 +261,24 @@ _TEMPLATE = """\
 
 
 def config_path() -> Path:
-    """Config file path: ``VOXWEAVE_CONFIG`` env if set, else ``~/.config/voxweave.conf``."""
+    """Config file path.
+
+    Precedence:
+    1. ``VOXWEAVE_CONFIG`` env var if non-empty.
+    2. Existing ``~/.config/voxweave.conf`` (keeps pre-existing user setups intact).
+    3. ``$XDG_CONFIG_HOME/voxweave.conf`` if ``XDG_CONFIG_HOME`` is non-empty.
+    4. ``~/.config/voxweave.conf``.
+    """
     env = (os.environ.get("VOXWEAVE_CONFIG") or "").strip()
-    return Path(env).expanduser() if env else Path.home() / ".config" / "voxweave.conf"
+    if env:
+        return Path(env).expanduser()
+    home_default = Path.home() / ".config" / "voxweave.conf"
+    if home_default.exists():
+        return home_default
+    xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
+    if xdg:
+        return Path(xdg).expanduser() / "voxweave.conf"
+    return home_default
 
 
 # Recognized top-level keys; anything else in the file is a typo/stale setting.

@@ -198,6 +198,8 @@ voxweave burn episode.zh.vtt           # hard subtitles
 | `voxweave export <subtitle> --to srt`                   | Convert between VTT, SRT and ASS.                                                                            |
 | `voxweave pack <subtitle>` / `voxweave burn <subtitle>` | Add subtitles to the media as tracks, or burn them into the picture.                                         |
 | `voxweave doctor`                                       | Check `ffmpeg`, GPU backend, ONNX providers, config syntax, and Hugging Face auth.                           |
+| `voxweave models`                                       | List model licenses and cache status, pre-download weights (`pull`), or reclaim disk space (`clean`).        |
+| `voxweave config` / `voxweave completions <shell>`      | Inspect resolved settings and config path, or print tab-completion scripts (`bash`, `zsh`, `fish`).          |
 
 Options and details: [Commands](https://github.com/hali0515/VoxWeave/blob/main/docs/commands.md).
 

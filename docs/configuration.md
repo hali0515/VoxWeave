@@ -1,8 +1,11 @@
 # Configuration
 
-Precedence: **CLI flag > env var > `~/.config/voxweave.conf` > built-in default.** A commented
+Precedence: **CLI flag > env var > `voxweave.conf` > built-in default.** A commented
 default config is written on first run (migrated automatically from a pre-rename `qsub.conf`).
-Set `VOXWEAVE_CONFIG` to read (and create) the config file somewhere else.
+Config file resolution checks `VOXWEAVE_CONFIG` first, then an existing `~/.config/voxweave.conf`,
+then `$XDG_CONFIG_HOME/voxweave.conf` when `XDG_CONFIG_HOME` is set, and finally
+`~/.config/voxweave.conf`. Inspect the active path and effective settings at any time with
+`voxweave config path` and `voxweave config show` (`--json`).
 
 <details>
 <summary><b>Environment variables</b></summary>

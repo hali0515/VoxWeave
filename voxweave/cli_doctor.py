@@ -322,9 +322,7 @@ def _cache_stats(root: Path) -> tuple[int, int]:
 
 
 def check_cache() -> CheckResult:
-    root = Path(
-        os.environ.get("VOXWEAVE_CACHE_ROOT", str(config.CACHE_ROOT))
-    ).expanduser()
+    root = config.cache_root()
     if not root.exists():
         return CheckResult("cache", "ok", f"{root} (empty; created on first download)")
     files, total_bytes = _cache_stats(root)
