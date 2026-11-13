@@ -40,6 +40,8 @@ def _isolate_process_environment() -> None:
             del os.environ[name]
     for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL"):
         os.environ.pop(name, None)
+    if os.environ.get("TERM", "").lower() in {"dumb", "unknown"}:
+        os.environ.pop("TERM", None)
     if gated:
         return
     for name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):

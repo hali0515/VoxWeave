@@ -58,8 +58,9 @@ breaks) handles Chinese/Japanese/English as first-class.
 - **Speaker labels.** `--diarize` splits cues at speaker changes and sets short two-person
   exchanges as Netflix `-line` pairs. `voxweave speakers serve` opens a page where you audition
   each speaker, name them, and split two people that were merged. Enrolled voices go into one
-  library, so names carry over to later episodes. Opt-in; needs a Hugging Face token for the
-  gated pyannote model (see [Setup](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#setup)).
+  library, so names carry over to later episodes. Opt-in via the `[diarize]` extra
+  (`voxweave[cuda,diarize]` / `voxweave[mps,diarize]`) plus a Hugging Face token for the gated
+  pyannote model (see [Setup](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#setup)).
 - **Edit-and-resync.** Fix the transcript by hand, then `align` re-derives timestamps from
   the audio — timestamps are _never_ hand-written.
 - **CJK-aware.** Japanese aligns with MMS-300m + uroman (zero-OOV, immune to the per-cue
@@ -84,27 +85,34 @@ are the optional `--diarize` branch. Every stage runs locally; see
 ## Install
 
 ```bash
-# NVIDIA / Linux
+# NVIDIA / Linux (or Windows via WSL2)
 uv tool install --torch-backend=cu128 \
   --overrides <(printf "onnxruntime; sys_platform == 'darwin'\n") \
   "voxweave[cuda]"
 # Apple Silicon / macOS
 uv tool install "voxweave[mps]"
+# Add ,diarize when you also want --diarize speaker labels:
+#   "voxweave[cuda,diarize]"  or  "voxweave[mps,diarize]"
 ```
 
 From a clone, `make install` does the same and picks the variant, the torch build and the
-overrides for you (`make reinstall` after pulling new code).
+overrides for you (`make install EXTRAS=diarize` to include speaker diarization; `make reinstall`
+after pulling new code). Native Windows is unsupported
+(POSIX file locks required); on Windows, install inside **WSL2** with NVIDIA CUDA passthrough,
+or use the [Docker image](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#docker).
 
-Both variants need `ffmpeg` on PATH. The default pipeline fits in about 8 GB of VRAM.
-`--diarize` also needs a Hugging Face token for a gated model; see
+Both variants need `ffmpeg` on PATH. Run `voxweave doctor` after installing to verify `ffmpeg`,
+your GPU backend, and ONNX providers. The default pipeline fits in about 8 GB of VRAM.
+`--diarize` requires the optional `[diarize]` extra and a Hugging Face token for a gated model; see
 [Speaker models](https://github.com/hali0515/VoxWeave/blob/main/docs/speakers.md#speaker-models). Everything else about installing
-(variants, CUDA notes, overrides, dependencies) is in [Setup](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#setup).
+(variants, shell-portable overrides, Docker, CUDA notes, dependencies) is in [Setup](https://github.com/hali0515/VoxWeave/blob/main/docs/install.md#setup).
 
 ## Quickstart
 
 ```bash
-# Transcribe a video to a timestamped VTT (+ a JSON source of truth)
+# Transcribe a video (or a batch of episodes) to timestamped VTT + JSON
 voxweave episode.mkv
+voxweave ep01.mkv ep02.mkv ep03.mkv --skip-existing
 
 # Opt in to speaker diarization (requires gated-model access; see Setup)
 voxweave interview.mkv --diarize
@@ -184,7 +192,7 @@ voxweave burn episode.zh.vtt           # hard subtitles
 
 | Command                                                 | What it does                                                                                                 |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `voxweave <media>`                                      | Transcribe: separate vocals, skip songs, ASR, align, split into cues. Writes `<stem>.vtt` and `<stem>.json`. |
+| `voxweave <media> [<media>...]`                         | Transcribe one or more files: separate vocals, skip songs, ASR, align, split into cues (`<stem>.vtt` + `<stem>.json`). |
 | `voxweave speakers serve <media>`                       | Open the page where you name the speakers; each Save re-renders the VTT.                                     |
 | `voxweave speakers enroll <media>`                      | Store the named voices in the shared voice library.                                                          |
 | `voxweave align <vtt>`                                  | Re-derive timestamps from the audio after you edit the text.                                                 |
@@ -193,6 +201,9 @@ voxweave burn episode.zh.vtt           # hard subtitles
 | `voxweave translate <subtitle> --target zh`             | Whole-episode translation; the cue count stays the same.                                                     |
 | `voxweave export <subtitle> --to srt`                   | Convert between VTT, SRT and ASS.                                                                            |
 | `voxweave pack <subtitle>` / `voxweave burn <subtitle>` | Add subtitles to the media as tracks, or burn them into the picture.                                         |
+| `voxweave doctor`                                       | Check `ffmpeg`, GPU backend, ONNX providers, config syntax, and Hugging Face auth.                           |
+| `voxweave models`                                       | List model licenses and cache status, pre-download weights (`pull`), or reclaim disk space (`clean`).        |
+| `voxweave config` / `voxweave completions <shell>`      | Inspect resolved settings and config path, or print tab-completion scripts (`bash`, `zsh`, `fish`).          |
 
 Options and details: [Commands](https://github.com/hali0515/VoxWeave/blob/main/docs/commands.md).
 
@@ -206,7 +217,9 @@ Options and details: [Commands](https://github.com/hali0515/VoxWeave/blob/main/d
 | [How it works](https://github.com/hali0515/VoxWeave/blob/main/docs/internals.md)      | The edit-and-resync workflow and the pipeline stages                 |
 | [Configuration](https://github.com/hali0515/VoxWeave/blob/main/docs/configuration.md) | `voxweave.conf`, environment variables, performance knobs            |
 | [Data contract](https://github.com/hali0515/VoxWeave/blob/main/docs/data-contract.md) | Files written next to the media, JSON schema, tests                  |
-| [Migration notes](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md)        | Changes between releases                                             |
+| [Changelog](https://github.com/hali0515/VoxWeave/blob/main/CHANGELOG.md)              | User-facing additions and changes per release                        |
+| [Migration notes](https://github.com/hali0515/VoxWeave/blob/main/MIGRATING.md)        | Upgrade actions and output changes between releases                  |
+| [Contributing](https://github.com/hali0515/VoxWeave/blob/main/CONTRIBUTING.md)        | Local dev setup, verification gates, and codebase conventions        |
 
 ## Support
 

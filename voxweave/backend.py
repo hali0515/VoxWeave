@@ -198,7 +198,7 @@ def _get_asr(asr_model: str | None = None):
         release()
     if _asr is None:
         try:
-            from qwen_asr import Qwen3ASRModel
+            from qwen_asr import Qwen3ASRModel  # pyright: ignore[reportMissingImports]
         except ModuleNotFoundError as e:
             raise _require(e.name or "qwen_asr") from e
 
@@ -1076,7 +1076,7 @@ def _get_aligner():
     global _aligner
     if _aligner is None:
         try:
-            from qwen_asr import Qwen3ForcedAligner
+            from qwen_asr import Qwen3ForcedAligner  # pyright: ignore[reportMissingImports]
         except ModuleNotFoundError as e:
             raise _require(e.name or "qwen_asr") from e
 
@@ -1098,7 +1098,7 @@ def _qwen_units(aligner, wav_path: Path, text: str, language: str) -> list[dict]
     ``qwen_decode.decode_slot_times`` instead of the wrapper's argmax + LIS repair.
     """
     import torch
-    from qwen_asr.inference.utils import SAMPLE_RATE, normalize_audios
+    from qwen_asr.inference.utils import SAMPLE_RATE, normalize_audios  # pyright: ignore[reportMissingImports]
 
     words, prompt = aligner.aligner_processor.encode_timestamp(text, language)
     if not words:
@@ -1147,7 +1147,7 @@ def _get_whisper(model_id: str):
         release()
     if _whisper is None:
         try:
-            from faster_whisper import WhisperModel
+            from faster_whisper import WhisperModel  # pyright: ignore[reportMissingImports]
         except ModuleNotFoundError as e:
             raise _require(e.name or "faster_whisper", _MISSING_WHISPER) from e
 

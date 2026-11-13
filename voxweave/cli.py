@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -15,15 +16,23 @@ from voxweave.cli_compat import (
     renamed_option,
     require_media,
 )
+from voxweave.cli_completions import build_completions_command
+from voxweave.cli_config import build_config_group
+from voxweave.cli_doctor import build_doctor_command
+from voxweave.cli_models import build_models_group
 from voxweave.cli_speakers import build_speakers_group
 from voxweave.cli_voices import build_voices_group
 from voxweave.export import EXPORT_RENDERERS
+from voxweave.paths import swap_ext
 from voxweave.progress import Reporter
 from voxweave.ui import (
     RichReporter,
+    batch_item_header,
     correct_summary_panel,
     error_panel,
     install_logging,
+    interrupted_notice,
+    skipped_existing_notice,
     success_panel,
     summary_panel,
     translate_summary_panel,
@@ -34,16 +43,36 @@ def _run(fn, *, reporter: bool = True):
     """Run a pipeline call, rendering a unified error panel and exiting 1 on any failure.
 
     ``fn`` receives a :class:`RichReporter` (or ``None`` when ``reporter=False``). Centralises
-    the try/RichReporter/except wrapper shared by every subcommand.
+    the try/RichReporter/except wrapper shared by every subcommand. ``KeyboardInterrupt``
+    exits cleanly with status 130 (128 + SIGINT) without printing a traceback.
     """
     try:
         if reporter:
             with RichReporter() as rep:
                 return fn(rep)
         return fn(None)
+    except KeyboardInterrupt:
+        interrupted_notice()
+        sys.exit(130)
     except Exception as exc:  # noqa: BLE001 - top-level catch-all, render unified error panel
         error_panel(exc)
         sys.exit(1)
+
+
+def _emit_json(payload: dict) -> None:
+    """Write a deterministic JSON result object to stdout."""
+    click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _json_option(fn):
+    """Attach ``--json`` machine-readable stdout mode to a command."""
+    return click.option(
+        "--json",
+        "as_json",
+        is_flag=True,
+        default=False,
+        help="Print machine-readable JSON output to stdout.",
+    )(fn)
 
 
 def _report_speaker_service(message: str) -> None:
@@ -209,6 +238,10 @@ def _resolve_llm(
                     "name": "Deliver",
                     "commands": ["translate", "export", "pack", "burn"],
                 },
+                {
+                    "name": "Inspect",
+                    "commands": ["doctor", "models", "config", "completions"],
+                },
             ]
         },
         "option_groups": {
@@ -241,15 +274,25 @@ def _resolve_llm(
                     ],
                 },
                 {"name": "Layout", "options": ["--timestamps", "--shot-snap"]},
+                {
+                    "name": "Output",
+                    "options": ["--skip-existing", "--no-clobber", "--json"],
+                },
                 {"name": "Diagnostics", "options": ["--debug", "--help"]},
             ]
         },
     }
 )
 @click.option("-v", "--verbose", is_flag=True, help="Enable DEBUG-level logging.")
+@click.option(
+    "-q",
+    "--quiet",
+    is_flag=True,
+    help="Suppress progress, timing, and summary panels on stderr.",
+)
 @click.version_option(package_name="voxweave", message="voxweave %(version)s")
 @click.pass_context
-def cli(ctx, verbose: bool) -> None:
+def cli(ctx, verbose: bool, quiet: bool) -> None:
     """Turn media into editable subtitles and ready-to-share video.
 
     Capture: transcribe. Revise: correct -> edit the VTT by hand -> align;
@@ -258,13 +301,135 @@ def cli(ctx, verbose: bool) -> None:
 
     Shortcut: voxweave MEDIA runs transcribe. Use COMMAND --help for options.
     """
-    install_logging(verbose=verbose)
+    if verbose and quiet:
+        raise click.UsageError("Use either --quiet or --verbose, not both.")
+    install_logging(verbose=verbose, quiet=quiet)
+    if verbose or quiet:
+        ctx.call_on_close(lambda: install_logging(verbose=False, quiet=False))
     if (
-        ctx.invoked_subcommand not in {"speakers", "voices", "help"}
+        ctx.invoked_subcommand
+        not in {
+            "speakers",
+            "voices",
+            "doctor",
+            "models",
+            "config",
+            "completions",
+            "help",
+        }
         and not ctx.resilient_parsing
         and not ctx.meta.get(HELP_REQUESTED)
     ):
         config.ensure_default_config()  # write default config template on first run
+
+
+def _preflight_no_clobber(medias: tuple[Path, ...]) -> None:
+    """Refuse up front when any target VTT already exists or two inputs collide."""
+    existing = [
+        swap_ext(item, ".vtt") for item in medias if swap_ext(item, ".vtt").exists()
+    ]
+    if existing:
+        listed = ", ".join(str(p) for p in existing[:3])
+        if len(existing) > 3:
+            listed += f", ... (+{len(existing) - 3} more)"
+        error_panel(
+            FileExistsError(
+                f"refusing to overwrite existing output (--no-clobber): {listed}"
+            )
+        )
+        sys.exit(1)
+    seen: dict[Path, Path] = {}
+    for item in medias:
+        target = swap_ext(item, ".vtt").resolve()
+        prior = seen.get(target)
+        if prior is not None:
+            error_panel(
+                FileExistsError(
+                    f"multiple inputs write the same output {swap_ext(item, '.vtt')} "
+                    f"({prior.name} and {item.name}) under --no-clobber"
+                )
+            )
+            sys.exit(1)
+        seen[target] = item
+
+
+def _run_transcribe_items(
+    medias: tuple[Path, ...],
+    *,
+    skip_existing: bool,
+    as_json: bool,
+    process_kwargs: dict,
+) -> None:
+    """Execute single or multi-file transcription while keeping model VRAM safe."""
+    records: list[dict[str, str]] = []
+    pending: list[Path] = []
+    for item in medias:
+        target_vtt = swap_ext(item, ".vtt")
+        if skip_existing and target_vtt.exists():
+            skipped_existing_notice(item, target_vtt)
+            if as_json:
+                records.append(
+                    {
+                        "input": str(item),
+                        "output": str(target_vtt),
+                        "json": str(swap_ext(target_vtt, ".json")),
+                        "status": "skipped",
+                    }
+                )
+            else:
+                click.echo(target_vtt)
+            continue
+        pending.append(item)
+
+    def _process_one(item: Path) -> None:
+        out = _run(lambda rep: pipeline.process(item, reporter=rep, **process_kwargs))
+        dbg_dir = None
+        if process_kwargs["debug"]:
+            # Display only: read the claim the run made, never create or fail on it.
+            try:
+                paths = artifacts.inspect_paths(item)
+            except artifacts.ArtifactMarkerError:
+                paths = None
+            dbg_dir = paths.debug if paths is not None else None
+        summary_panel(
+            out,
+            separated=process_kwargs["separate"],
+            debug_dir=dbg_dir,
+            normalized=process_kwargs["normalize"],
+        )
+        if as_json:
+            records.append(
+                {
+                    "input": str(item),
+                    "output": str(out),
+                    "json": str(swap_ext(out, ".json")),
+                    "status": "transcribed",
+                }
+            )
+        else:
+            click.echo(out)  # path -> stdout for script/pipe consumption
+
+    if len(pending) == 1:
+        _process_one(pending[0])
+    elif len(pending) > 1:
+        from voxweave import transcription
+
+        retain = (not process_kwargs["separate"]) or (
+            config.conf_load_strategy() == "sum"
+        )
+        with transcription.batch_session(retain_models=retain):
+            for idx, item in enumerate(pending, start=1):
+                batch_item_header(idx, len(pending), item.name)
+                _process_one(item)
+
+    if as_json:
+        _emit_json(
+            {
+                "command": "transcribe",
+                "outputs": [r["output"] for r in records],
+                "items": records,
+            }
+        )
 
 
 @click.command(
@@ -272,6 +437,8 @@ def cli(ctx, verbose: bool) -> None:
 )
 @click.argument(
     "media",
+    nargs=-1,
+    required=True,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     callback=require_media,
 )
@@ -450,8 +617,21 @@ def cli(ctx, verbose: bool) -> None:
     " (Qwen) alignment ignore it. Default: off, or conf [defaults].vad_mask; same as"
     " VOXWEAVE_VAD_EMISSION_MASK=1.",
 )
+@click.option(
+    "--skip-existing",
+    is_flag=True,
+    default=False,
+    help="Skip inputs whose sibling <stem>.vtt already exists (still prints the VTT path to stdout).",
+)
+@click.option(
+    "--no-clobber",
+    is_flag=True,
+    default=False,
+    help="Refuse up front if any target sibling <stem>.vtt already exists (never overwrite).",
+)
+@_json_option
 def cmd_transcribe(
-    media: Path,
+    media: tuple[Path, ...],
     language: str | None,
     model: str | None,
     separate: bool | None,
@@ -472,12 +652,18 @@ def cmd_transcribe(
     timestamps: bool | None,
     shot_snap: bool | None,
     vad_mask: bool | None,
+    skip_existing: bool,
+    no_clobber: bool,
+    as_json: bool,
 ) -> None:
-    """Transcribe audio or video into sibling VTT subtitles and timing JSON.
+    """Transcribe one or more audio or video files into sibling VTT and timing JSON.
 
-    Runs ASR and alignment models locally. Also available as voxweave MEDIA.
-    Existing sibling outputs are replaced; preserve reviewed edits before rerunning.
+    Runs ASR and alignment models locally. Also available as voxweave MEDIA [MEDIA...].
+    Existing sibling outputs are replaced by default; pass --skip-existing to resume a
+    batch or --no-clobber to refuse overwriting existing VTT files.
     """
+    if skip_existing and no_clobber:
+        raise click.UsageError("Use either --skip-existing or --no-clobber, not both.")
     log = logging.getLogger("voxweave")
     _apply_vad_mask(vad_mask)
     separate = _flag(separate, "separate", True)
@@ -551,47 +737,35 @@ def cmd_transcribe(
             "add --voiceprints to capture voiceprints",
             voiceprints_source,
         )
+    if no_clobber:
+        _preflight_no_clobber(media)
     timestamps = _flag(timestamps, "timestamps", True)
     shot_snap = _flag(shot_snap, "shot_snap", True)
-    out = _run(
-        lambda rep: pipeline.process(
-            media,
-            lang_override=language,
-            separate=separate,
-            reporter=rep,
-            debug=debug,
-            normalize=normalize,
-            skip_songs=skip_songs,
-            keep_lyrics=keep_lyrics,
-            sdh=sdh,
-            diarize=diarize,
-            diarize_model=diarize_model,
-            speaker_clustering=speaker_clustering,
-            voiceprints=voiceprints,
-            voiceprint_model=voiceprint_model,
-            min_speakers=min_speakers,
-            max_speakers=max_speakers,
-            asr_model="fusion" if hybrid else (model or config.conf_asr_model()),
-            context=context,
-            timestamps=timestamps,
-            shot_snap=shot_snap,
-        )
+    _run_transcribe_items(
+        media,
+        skip_existing=skip_existing,
+        as_json=as_json,
+        process_kwargs={
+            "lang_override": language,
+            "separate": separate,
+            "debug": debug,
+            "normalize": normalize,
+            "skip_songs": skip_songs,
+            "keep_lyrics": keep_lyrics,
+            "sdh": sdh,
+            "diarize": diarize,
+            "diarize_model": diarize_model,
+            "speaker_clustering": speaker_clustering,
+            "voiceprints": voiceprints,
+            "voiceprint_model": voiceprint_model,
+            "min_speakers": min_speakers,
+            "max_speakers": max_speakers,
+            "asr_model": "fusion" if hybrid else (model or config.conf_asr_model()),
+            "context": context,
+            "timestamps": timestamps,
+            "shot_snap": shot_snap,
+        },
     )
-    dbg_dir = None
-    if debug:
-        # Display only: read the claim the run made, never create or fail on it.
-        try:
-            paths = artifacts.inspect_paths(media)
-        except artifacts.ArtifactMarkerError:
-            paths = None
-        dbg_dir = paths.debug if paths is not None else None
-    summary_panel(
-        out,
-        separated=separate,
-        debug_dir=dbg_dir,
-        normalized=normalize,
-    )
-    click.echo(out)  # path -> stdout for script/pipe consumption
 
 
 cli.default_cmd = cmd_transcribe
@@ -602,6 +776,10 @@ cli.add_command(cmd_transcribe)
 cmd_speakers = build_speakers_group(_run, _report_speaker_service)
 cli.add_command(cmd_speakers)
 cli.add_command(build_voices_group(_run))
+cli.add_command(build_doctor_command())
+cli.add_command(build_models_group(_run))
+cli.add_command(build_config_group(_run))
+cli.add_command(build_completions_command())
 
 
 @cli.command(
@@ -630,11 +808,13 @@ cli.add_command(build_voices_group(_run))
     help="Include timestamps in VTT (default: on, or conf [defaults].timestamps;"
     " use --no-timestamps for a plain-text editing draft).",
 )
+@_json_option
 def cmd_split(
     json_path: Path,
     max_line_length: int | None,
     max_lines: int | None,
     timestamps: bool | None,
+    as_json: bool,
 ) -> None:
     """Regenerate subtitle layout from sibling JSON without running a model.
 
@@ -657,7 +837,17 @@ def cmd_split(
     success_panel(
         "Render done", [f"VTT  : {out}", f"JSON : {pipeline.swap_ext(out, '.json')}"]
     )
-    click.echo(out)
+    if as_json:
+        _emit_json(
+            {
+                "command": "render",
+                "input": str(json_path),
+                "output": str(out),
+                "json": str(pipeline.swap_ext(out, ".json")),
+            }
+        )
+    else:
+        click.echo(out)
 
 
 cli.add_command(DeprecatedAlias("split", cmd_split))
@@ -701,6 +891,7 @@ cli.add_command(DeprecatedAlias("split", cmd_split))
     " alignment ignore it. Default: off, or conf [defaults].vad_mask; same as"
     " VOXWEAVE_VAD_EMISSION_MASK=1.",
 )
+@_json_option
 def cmd_align(
     vtt: Path,
     media: Path | None,
@@ -708,6 +899,7 @@ def cmd_align(
     separate: bool | None,
     normalize: bool | None,
     vad_mask: bool | None,
+    as_json: bool,
 ) -> None:
     """Re-align edited VTT text against the original audio.
 
@@ -728,7 +920,17 @@ def cmd_align(
         )
     )
     summary_panel(out, separated=separate, normalized=normalize)
-    click.echo(out)
+    if as_json:
+        _emit_json(
+            {
+                "command": "align",
+                "input": str(vtt),
+                "output": str(out),
+                "json": str(pipeline.swap_ext(out, ".json")),
+            }
+        )
+    else:
+        click.echo(out)
 
 
 @cli.command("translate", short_help="Translate subtitles into a new language sidecar.")
@@ -801,6 +1003,7 @@ def cmd_align(
         "their source text). Default: fail and keep the progress file so a rerun resumes."
     ),
 )
+@_json_option
 def cmd_translate(
     vtt: Path,
     to: str,
@@ -813,6 +1016,7 @@ def cmd_translate(
     concurrency: int | None,
     window_cues: int | None,
     allow_partial: bool,
+    as_json: bool,
 ) -> None:
     """Translate subtitles (VTT/SRT/ASS) with an OpenAI-compatible endpoint.
 
@@ -840,7 +1044,17 @@ def cmd_translate(
         )
     )
     translate_summary_panel(out, to=to)
-    click.echo(out)
+    if as_json:
+        _emit_json(
+            {
+                "command": "translate",
+                "input": str(vtt),
+                "target": to,
+                "output": str(out),
+            }
+        )
+    else:
+        click.echo(out)
 
 
 @cli.command("export", short_help="Convert subtitles between VTT, SRT, and ASS.")
@@ -859,7 +1073,8 @@ def cmd_translate(
     default=("srt",),
     help="Output format(s); repeat for several (e.g. -f srt -f ass). Default: srt.",
 )
-def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
+@_json_option
+def cmd_export(vtt: Path, formats: tuple[str, ...], as_json: bool) -> None:
     """Convert between subtitle formats: VTT/SRT/ASS in, SRT/ASS/VTT out.
 
     The aligned VTT + JSON stay the source of truth for voxweave-produced
@@ -875,8 +1090,18 @@ def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
 
     paths = _run(run_export)
     success_panel("Export done", [str(path) for path in paths])
-    for path in paths:
-        click.echo(str(path))
+    if as_json:
+        _emit_json(
+            {
+                "command": "export",
+                "input": str(vtt),
+                "formats": list(formats),
+                "outputs": [str(path) for path in paths],
+            }
+        )
+    else:
+        for path in paths:
+            click.echo(str(path))
 
 
 @cli.command("pack", short_help="Add selectable subtitle tracks; no video re-encode.")
@@ -912,11 +1137,13 @@ def cmd_export(vtt: Path, formats: tuple[str, ...]) -> None:
     " source, e.g. episode.zh.ja.pack.mkv; the languages come from the subtitle file"
     " names, just .pack when none has one).",
 )
+@_json_option
 def cmd_pack(
     vtts: tuple[Path, ...],
     media: Path | None,
     container: str | None,
     output: Path | None,
+    as_json: bool,
 ) -> None:
     """Mux subtitle file(s) (VTT/SRT/ASS) into the media as soft subtitle tracks
     (stream copy, no re-encode).
@@ -936,7 +1163,16 @@ def cmd_pack(
         ),
     )
     success_panel("Pack done", [str(out)])
-    click.echo(out)
+    if as_json:
+        _emit_json(
+            {
+                "command": "pack",
+                "inputs": [str(p) for p in vtts],
+                "output": str(out),
+            }
+        )
+    else:
+        click.echo(out)
 
 
 @cli.command("burn", short_help="Burn subtitles into video pixels; re-encodes video.")
@@ -1013,6 +1249,7 @@ def cmd_pack(
     " source, e.g. episode.zh.burn.mp4; <media stem>.burn.<container> when the"
     " subtitle file name has no language).",
 )
+@_json_option
 def cmd_burn(
     vtt: Path,
     media: Path | None,
@@ -1024,6 +1261,7 @@ def cmd_burn(
     font_size: int | None,
     output: Path | None,
     bitrate_cap: bool,
+    as_json: bool,
 ) -> None:
     """Burn subtitles (VTT/SRT/ASS) into the video pixels and drop all subtitle tracks.
 
@@ -1051,7 +1289,10 @@ def cmd_burn(
         ),
     )
     success_panel("Burn done", [str(out)])
-    click.echo(out)
+    if as_json:
+        _emit_json({"command": "burn", "input": str(vtt), "output": str(out)})
+    else:
+        click.echo(out)
 
 
 @cli.command(
@@ -1087,6 +1328,7 @@ def cmd_burn(
     "VOXWEAVE_FIX_MODEL",
     _llm_model_help("Correction", "VOXWEAVE_FIX_MODEL"),
 )
+@_json_option
 def cmd_correct(
     vtt: Path,
     glossary: Path | None,
@@ -1096,6 +1338,7 @@ def cmd_correct(
     model: str | None,
     base_url: str | None,
     api_key_env: str,
+    as_json: bool,
 ) -> None:
     """Fix obvious ASR errors (split words, garbled proper nouns) with an LLM.
 
@@ -1126,7 +1369,21 @@ def cmd_correct(
         )
     )
     correct_summary_panel(res)
-    click.echo(res["out"])
+    if as_json:
+        _emit_json(
+            {
+                "command": "correct",
+                "input": str(vtt),
+                "output": str(res["out"]),
+                "audit": str(res["audit"]) if res.get("audit") else None,
+                "applied": len(res.get("applied", ())),
+                "rejected": len(res.get("rejected", ())),
+                "n_cues": int(res.get("n_cues", 0)),
+                "aligned": bool(res.get("aligned", False)),
+            }
+        )
+    else:
+        click.echo(res["out"])
 
 
 @cli.command("help", hidden=True)

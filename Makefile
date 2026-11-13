@@ -1,12 +1,10 @@
 .PHONY: install reinstall uninstall dev test lint lint-check typecheck \
-	quality quality-segmentation quality-shadow-segmentation \
-	quality-shadow-segmentation-full \
-	quality-p6-oracle \
-	quality-record-segmentation
+	quality quality-segmentation quality-record-segmentation
 
 # Install as a global uv tool (end-user mode): puts the voxweave command on PATH.
-# Separation / layout / song-skip / diarization / CJK-break / translation support is baked into
-# the core deps; the install variant selects the compute platform AND the ASR/alignment backend:
+# Separation / layout / song-skip / CJK-break / translation support is baked into
+# the core deps; add EXTRAS=diarize for speaker diarization (--diarize). The install
+# variant selects the compute platform AND the ASR/alignment backend:
 #   VARIANT=cuda (default except on Apple Silicon) -> NVIDIA/Linux: torch Qwen3-ASR+aligner
 #                             (qwen-asr) + onnxruntime-gpu + faster-whisper, on the cu128 torch wheel
 #                             when nvidia-smi is present (Blackwell sm_120), else the CPU wheel
@@ -42,9 +40,8 @@ else
   TORCH_BACKEND ?= cpu
 endif
 
-# ---- Compatibility extras ----------------------------------------------------
-# Diarization is a core dependency. Keep explicit extras available so older source-install
-# commands such as EXTRAS=diarize still resolve through the empty compatibility alias.
+# ---- Optional extras ---------------------------------------------------------
+# Pass EXTRAS=diarize to install optional speaker diarization (pyannote.audio 4.x).
 EXTRAS ?=
 comma := ,
 INSTALL_SPEC = .[$(VARIANT)$(if $(EXTRAS),$(comma)$(EXTRAS))]
@@ -79,23 +76,17 @@ reinstall:
 uninstall:
 	uv tool uninstall voxweave
 
-# The interpreter the P6 oracle manifest was recorded under. CI syncs the same pin, and
-# the oracle tests refuse any other interpreter; empty when python3 is unavailable.
-ORACLE_PYTHON := $(shell python3 -c "import json; print(json.load(open('calibration/p6-oracle/manifest.json'))['execution']['interpreter'].split()[1])" 2>/dev/null)
-
-# Development environment for code changes, synced like CI: the oracle's interpreter pin,
-# the [cuda] extra and the dev group. [cuda] and [mps] are mutually exclusive (conflicting
-# transformers pins), so sync exactly one; on Apple Silicon use: make dev VARIANT=mps.
-# The P6 oracle tests also need the oracle's recorded platform (Linux x86_64) and the full
-# git history (a shallow clone lacks its reference commits); elsewhere they fail with a
-# message naming the mismatch.
+# Development environment for code changes, synced like CI: Python 3.13, the platform
+# variant ([cuda] or [mps]), the [diarize] extra (so diarization tests run), and dev tools.
+# [cuda] and [mps] are mutually exclusive (conflicting transformers pins), so sync
+# exactly one; on Apple Silicon use: make dev VARIANT=mps.
 dev:
-	uv sync --extra $(VARIANT) --dev $(if $(ORACLE_PYTHON),--python $(ORACLE_PYTHON))
+	uv sync --extra $(VARIANT) --extra diarize --dev --python 3.13
 
-# Unit tests (no network). --extra $(VARIANT) keeps this hermetic on a fresh
-# clone; without it the run env lacks the backend deps and imports fail.
+# Unit tests (no network). --extra $(VARIANT) --extra diarize keeps this hermetic on a
+# fresh clone. Pins LC_ALL=C.UTF-8 with TZ and PYTHONHASHSEED unset to match CI.
 test:
-	uv run --extra $(VARIANT) pytest tests/ -v
+	env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run --extra $(VARIANT) --extra diarize pytest tests/ -v
 
 # Lint / format (project-wide; rules and the vendor exclusion come from [tool.ruff] in
 # pyproject.toml). Ruff is pinned so a release that changes its style cannot turn untouched
@@ -114,7 +105,7 @@ lint-check:
 # Static type check (pyright, basic mode, production code only -- see [tool.pyright]).
 # Zero errors is the bar; CI enforces it so type noise cannot accumulate again.
 typecheck:
-	uv run --extra $(VARIANT) pyright
+	uv run --extra $(VARIANT) --extra diarize pyright
 
 # ---- Quality rulers ----------------------------------------------------------
 # `make test` answers "did behaviour change unintentionally". These answer "is the
@@ -126,13 +117,6 @@ typecheck:
 SEG_CORPUS ?= calibration/segmentation/corpus.json
 SEG_BASELINE ?= calibration/segmentation/baseline.json
 SEG_REPORT ?= build/calibration/segmentation-report.json
-SEG_SHADOW_REPORT ?= build/calibration/segmentation-shadow-report.json
-P6_ORACLE_MANIFEST ?= calibration/p6-oracle/manifest.json
-P6_ORACLE_REPORT ?= build/p6-oracle-report.json
-P6_ORACLE_ENV = env -i PATH="$(PATH)" LANG=zh_CN.UTF-8 LC_ALL=C.UTF-8
-# The command the oracle runner starts under. Tests pass their own interpreter
-# (P6_ORACLE_PYTHON=/path/to/python) so they never re-sync the environment or the lock.
-P6_ORACLE_PYTHON ?= uv run --extra $(VARIANT) python
 
 # `quality` is only the public, zero-GPU, deterministic lane: no media, no model, no
 # network, runnable from a bare checkout. The alignment ruler needs private media and
@@ -144,49 +128,6 @@ quality-segmentation:
 	  --corpus $(SEG_CORPUS) \
 	  --baseline $(SEG_BASELINE) \
 	  --json-out $(SEG_REPORT) --check
-
-# Canonical P6 oracle entry point. The runner intentionally validates its recorded
-# environment; this target supplies that environment explicitly instead of depending on
-# the invoking shell's locale, timezone, hash seed, or project-specific variables.
-quality-p6-oracle:
-	$(P6_ORACLE_ENV) $(P6_ORACLE_PYTHON) scripts/p6_oracle.py validate \
-	  --manifest $(P6_ORACLE_MANIFEST)
-	$(P6_ORACLE_ENV) $(P6_ORACLE_PYTHON) scripts/p6_oracle.py compare \
-	  --manifest $(P6_ORACLE_MANIFEST) --check --json-out $(P6_ORACLE_REPORT)
-	$(P6_ORACLE_ENV) $(P6_ORACLE_PYTHON) scripts/p6_oracle.py source-gates \
-	  --manifest $(P6_ORACLE_MANIFEST) --check
-
-# P5: full optimizer/finalizer/speaker shadow matrix beside the shipped v1 answer.
-# Same corpus, same baseline, same environment as `quality-segmentation` -- the
-# non-inferiority numbers are only comparable against a baseline recorded here.
-# Deliberately NOT part of `quality`: the shadow ships nothing, so a v2 regression
-# during soak must not block a PR that changed neither engine.
-#
-# The routine lane is an explicitly bounded smoke slice: base corpus + coarse
-# gates + two near-cliff probes in one case per language, with ablation skipped.
-# It keeps AD-2's exit driver live and is budgeted in minutes, not hours. The
-# exhaustive slice (every near-cliff probe of the three cases, plus the ablations) is
-# retained below as `quality-shadow-segmentation-full`; an independent frozen-entry-point
-# run on 2026-08-28 took 4 h 58 min (the near-cliff probe count has shrunk since), so it
-# is never described as the routine lane.
-quality-shadow-segmentation:
-	uv run --extra $(VARIANT) python scripts/calib_segmentation.py shadow \
-	  --corpus $(SEG_CORPUS) \
-	  --baseline $(SEG_BASELINE) \
-	  --no-ablation \
-	  --perturb --perturb-mode single_gap --perturb-magnitude 50 \
-	  --perturb-near-cliff-only --perturb-max-probes 2 \
-	  --perturb-case en-01 --perturb-case ja-01 --perturb-case zh-01 \
-	  --json-out $(SEG_SHADOW_REPORT) --check
-
-quality-shadow-segmentation-full:
-	uv run --extra $(VARIANT) python scripts/calib_segmentation.py shadow \
-	  --corpus $(SEG_CORPUS) \
-	  --baseline $(SEG_BASELINE) \
-	  --perturb --perturb-mode single_gap --perturb-magnitude 50 \
-	  --perturb-near-cliff-only \
-	  --perturb-case en-01 --perturb-case ja-01 --perturb-case zh-01 \
-	  --json-out $(SEG_SHADOW_REPORT) --check
 
 # Deliberately not part of `quality`, and never run by CI: recording a baseline is a
 # reviewed human action, or a regression can be laundered into the new normal.

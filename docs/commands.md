@@ -34,15 +34,19 @@ only the transcribe path writes it.
 
 ## Transcribe
 
-`voxweave transcribe <media>` (or `voxweave <media>`) — separation → song-skip → VAD chunking → ASR + forced alignment →
+`voxweave transcribe <media> [<media>...]` (or `voxweave <media> [<media>...]`) — separation → song-skip → VAD chunking → ASR + forced alignment →
 smart_split → writes `<stem>.vtt` (editable) + `<stem>.json` (word-level timestamp source of
 truth). Models load in-process (see `voxweave.separator` and `voxweave.backend`); the separator is released from VRAM
-before ASR+alignment load, so peak usage is ≈ max(sep, asr) rather than their sum.
+before ASR+alignment load, so peak usage is ≈ max(sep, asr) rather than their sum. When multiple
+media files are passed in one command, Python/CUDA startup runs once and ASR/alignment + VAD
+models stay resident across episodes whenever VRAM-safe (`--no-separate` or `load_strategy = "sum"`).
 
 ```bash
 voxweave episode.mkv
 voxweave transcribe episode.mkv             # explicit form of the same command
-voxweave clip.mp4 --no-separate          # clean speech (podcast/lecture): skip separation
+voxweave ep01.mkv ep02.mkv --skip-existing  # batch-transcribe, skipping finished episodes
+voxweave episode.mkv --no-clobber           # refuse up front if episode.vtt already exists
+voxweave clip.mp4 --no-separate             # clean speech (podcast/lecture): skip separation
 voxweave episode.mkv --asr-model qwen3-asr-1.7B   # larger, more accurate ASR
 voxweave episode.mkv --context "Ryland Grace, Astrophage, Hail Mary"   # bias names/terms
 ```
@@ -75,6 +79,8 @@ routed to an in-place editing command. See the [migration notes](https://github.
 | `--min-speakers` / `--max-speakers` | Bound the diarizer's speaker count. `--max-speakers` (e.g. `2` for an interview) is the single best lever against over-splitting on noisy material; set `--min-speakers` only when a missing speaker matters more than a split one, since a lower bound above the voices actually found splits voices (see [Speaker models](speakers.md#speaker-models)).                                                                                                                                                                                                                       |
 | `--no-shot-snap`                    | Disable shot-change detection/snapping (cue boundaries otherwise land on cuts per the Netflix zone rules; `VOXWEAVE_SHOT_SNAP_MS` sets how far from a cut a boundary is moved).                                                                                                                                                                                                                                                                                                                                                                    |
 | `--vad-mask/--no-vad-mask`          | Suppress wav2vec2 CTC emissions outside speech spans during alignment so words cannot park in music/silence (recommended for sparse-dialogue movies with songs; keep off when VAD may misjudge sung/whispered speech). Only languages aligned with a wav2vec2 CTC model use it (English by default); Japanese (MMS) and Chinese/Cantonese (Qwen) alignment ignore it. Same as `VOXWEAVE_VAD_EMISSION_MASK=1`.                                                                                                                                      |
+| `--skip-existing`                   | Skip inputs whose sibling `<stem>.vtt` already exists (useful when resuming a multi-file batch; still echoes the existing VTT path to stdout). Mutually exclusive with `--no-clobber`.                                                                                                                                                                                                                                                                                                                                                                 |
+| `--no-clobber`                      | Refuse up front before any audio or GPU work if any target sibling `<stem>.vtt` already exists or two inputs map to the same output path. Mutually exclusive with `--skip-existing`.                                                                                                                                                                                                                                                                                                                                                                   |
 | `--debug`                           | Write intermediate artifacts (full-band / vocals / per-chunk VAD + ASR + alignment) under `<media directory>/cache/<stem>/debug/`. Each run replaces the previous bundle.                                                                                                                                                                                                                                                                                                                                                                          |
 
 The boolean flags (`--separate`, `--skip-songs`, `--normalize`, `--diarize`, `--voiceprints`, `--timestamps`,
@@ -165,7 +171,7 @@ voxweave correct episode.vtt --glossary names.json --apply   # rewrite in place 
 | `--apply`                      | Let the LLM rewrite the original VTT in place, then re-align it (default: sidecar only, for review).                                          |
 | `--align/--no-align`           | With `--apply`, re-run alignment afterwards to refresh timestamps (default: on).                                                              |
 | `--media`                      | Media for that re-alignment when it is not a same-stem sibling of the VTT.                                                                    |
-| `--model`                      | Correction model (default `VOXWEAVE_FIX_MODEL` env, `[llm].model` in the config, or `gpt-6-luna`; `auto` = the endpoint's only served model). |
+| `--model`                      | Correction model (default `VOXWEAVE_FIX_MODEL` env, `[llm].model` in the config, or `gpt-4o-mini`; `auto` = the endpoint's only served model). |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](configuration.md#configuration)).          |
 
 </details>
@@ -237,7 +243,7 @@ input, endpoint, resolved model, effort, context, glossary, and target match.
 | `-t, --target`                 | Target language code, written to `<stem>.<target>.<ext>` (default `zh`); use `export --format` to change file formats.                                                                         |
 | `--context`                    | Show/tone context injected into the prompt.                                                                                                                                                    |
 | `--glossary`                   | Term/name glossary (`.json` → mapping; other → raw prompt).                                                                                                                                    |
-| `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env, `[llm].model` in the config, or `gpt-6-luna`; `auto` = the endpoint's only served model).                                           |
+| `--model`                      | Translation model (default `VOXWEAVE_TRANSLATE_MODEL` env, `[llm].model` in the config, or `gpt-4o-mini`; `auto` = the endpoint's only served model).                                           |
 | `--base-url` / `--api-key-env` | OpenAI-compatible endpoint + which env var holds the key (defaults from `[llm]` in the config; see [Configuration](configuration.md#configuration)).                                                           |
 | `--reasoning-effort`           | Model-specific effort. `VOXWEAVE_TRANSLATE_REASONING_EFFORT` > `[llm].reasoning_effort` > endpoint default; `default` explicitly omits the field.                                              |
 | `--concurrency N`              | Windows in flight at once (`VOXWEAVE_TRANSLATE_CONCURRENCY` > `[llm].concurrency` > 8 with a base URL, 1 for api.openai.com). `1` = one whole-episode request with translated-tail continuity. |
@@ -344,4 +350,52 @@ at all).
 Progress is rendered with rich: countable stages (demix windows / PANNs batches / per-chunk
 ASR+alignment / align per-cue / translate streaming per-line) show a real `x/N` bar with
 elapsed time; indeterminate stages (decode / file write) show a pulse bar. `-v/--verbose`
-enables DEBUG logging.
+enables DEBUG logging; `-q/--quiet` suppresses progress bars, timing lines, and completion panels
+on stderr while preserving result paths on stdout and error panels on failure. Every processing
+command (`transcribe`, `align`, `render`, `correct`, `translate`, `export`, `pack`, `burn`) also
+accepts `--json` to emit a structured JSON result object on stdout. Pressing `Ctrl+C` (`SIGINT`)
+cancels cleanly and exits with status `130`.
+
+## Environment check
+
+`voxweave doctor` inspects the local runtime without loading model weights or creating
+`voxweave.conf`:
+
+```bash
+voxweave doctor
+voxweave doctor --json
+```
+
+Checks reported in deterministic order: `platform`, `ffmpeg` (including NVENC / VideoToolbox
+encoders), `compute` (CUDA / MPS / CPU fallback), `asr_backend` (`qwen-asr` + `faster-whisper` or
+`mlx-audio` + `mlx-whisper`), `onnxruntime` (warns when `CUDAExecutionProvider` is shadowed on a
+CUDA host), `config` (TOML syntax and unknown keys), `hf_auth` (token source without exposing the
+secret), and `cache` (`VOXWEAVE_CACHE_ROOT` file count and disk size). Exits `0` when all checks
+report `ok` or `warn`, and `1` when any check reports `error`.
+
+## Models, configuration, and shell completions
+
+```bash
+# Inspect model roles, upstream licenses, and local cache sizes
+voxweave models list
+voxweave models path
+
+# Pre-warm weights for VOXWEAVE_OFFLINE=1 or container images
+voxweave models pull --default --language ja
+voxweave models pull separator panns qwen3-asr-1.7b
+
+# Reclaim disk space (--dry-run previews; --yes skips confirmation)
+voxweave models clean qwen3-asr-1.7b --yes
+voxweave models clean --all --dry-run
+
+# Inspect effective settings (with env/config/default source) and manage voxweave.conf
+voxweave config path
+voxweave config show
+voxweave config show --json
+voxweave config init
+
+# Enable shell tab completion
+eval "$(voxweave completions bash)"
+eval "$(voxweave completions zsh)"
+voxweave completions fish | source
+```

@@ -22,50 +22,69 @@ jobs:
     # The suite takes minutes; a hung test should not burn the 6 h default.
     timeout-minutes: 45
     steps:
-      # The P6 oracle validates its governing reference commits with
-      # `git cat-file -e`; a shallow clone lacks them, so fetch full history.
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 
-      # The tracked oracle manifest pins the exact interpreter it was recorded
-      # under (execution.interpreter); the oracle tests reject any other micro.
-      # Reading the pin from the manifest keeps CI in lockstep with each
-      # release refresh instead of hardcoding a version that drifts.
-      - name: Resolve the oracle interpreter pin
-        id: oracle-python
-        run: |
-          version=$(python3 -c "import json; print(json.load(open('calibration/p6-oracle/manifest.json'))['execution']['interpreter'].split()[1])")
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      # Mirrors `make dev`: core + [cuda] extra + dev group (pytest, pyright).
+      # Mirrors `make dev`: core + [cuda] + [diarize] extras + dev group (pytest, pyright).
       # The cuda wheels install fine on a CPU runner; all model paths are
       # lazy-imported or mocked in tests, so nothing touches a GPU.
-      # --locked: a pyproject change without its uv.lock update fails here
-      # instead of being re-resolved silently (the oracle pins the lock digest).
+      # --locked: a pyproject change without its uv.lock update fails here.
       - name: Sync environment
-        run: uv sync --locked --extra cuda --dev --python "${{ steps.oracle-python.outputs.version }}"
+        run: uv sync --locked --extra cuda --extra diarize --dev --python 3.13
 
       # The Makefile pins the ruff version, so a ruff release that changes
       # its style cannot turn untouched code red.
       - name: Lint
         run: make lint-check
 
-      # Every project `uv run` must name the cuda extra: the lock resolves
-      # forked dependency sets, and a bare `uv run` re-syncs to the base fork
-      # (huggingface-hub 1.x instead of the 0.x the model stack pins).
+      # Every project `uv run` must name the cuda + diarize extras: the lock resolves
+      # forked dependency sets, and a bare `uv run` re-syncs to the base fork.
       - name: Type check
-        run: uv run --extra cuda pyright
+        run: uv run --extra cuda --extra diarize pyright
 
-      # The oracle execution record also pins the ambient environment: locale
-      # C.UTF-8, TZ and PYTHONHASHSEED unset. Conform here rather than in the
-      # tests — the pin is the gate's contract, not an accident.
       - name: Test
-        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run --extra cuda pytest tests/ -q
+        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run --extra cuda --extra diarize pytest tests/ -q
+
+  # Cross-platform and multi-Python compatibility matrix: verifies that the
+  # universal lockfile resolves, typechecks, and passes unit tests across
+  # supported Python minors (3.11, 3.12, 3.13) and Apple Silicon [mps].
+  compat:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+            variant: cuda
+          - os: ubuntu-latest
+            python: "3.12"
+            variant: cuda
+          - os: macos-latest
+            python: "3.12"
+            variant: mps
+          - os: macos-latest
+            python: "3.13"
+            variant: mps
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Sync environment
+        run: uv sync --locked --extra ${{ matrix.variant }} --extra diarize --dev --python "${{ matrix.python }}"
+
+      - name: Type check
+        run: uv run --extra ${{ matrix.variant }} --extra diarize pyright
+
+      - name: Test
+        run: env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run --extra ${{ matrix.variant }} --extra diarize pytest tests/ -q
 
   # The segmentation ruler measures output *quality* against the recorded
   # baseline (calibration/segmentation/baseline.json). Three gates are

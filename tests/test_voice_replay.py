@@ -275,7 +275,6 @@ def test_align_publishes_json_before_vtt_after_final_media_recheck(
     assert order == [
         "episode.json",
         "episode.vtt",
-        "episode.align-evidence.json",
     ]
     assert replayed["voiceprint_capture"] == CAPTURE
     assert replayed["voiceprint_media"] == fingerprint

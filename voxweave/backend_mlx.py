@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Any
 
 from voxweave import config
 from voxweave.runtime import _hf_snapshot
@@ -55,11 +56,15 @@ _MLX_WHISPER_REPOS = {
 
 # Process-level singletons; released by release()/release_asr()/release_whisper() at end of episode
 # (mirrors backend.py).
-_asr = None  # _MlxAsr adapter
-_asr_repo = None  # currently loaded MLX ASR repo id (reloaded on --asr-model change)
-_aligner = None  # mlx_audio forced-aligner model
-_whisper = None  # _MlxWhisper adapter
-_whisper_id = None  # loaded whisper size string (reloaded on --asr-model change)
+_asr: _MlxAsr | None = None  # _MlxAsr adapter
+_asr_repo: str | None = (
+    None  # currently loaded MLX ASR repo id (reloaded on --asr-model change)
+)
+_aligner: Any = None  # mlx_audio forced-aligner model
+_whisper: _MlxWhisper | None = None  # _MlxWhisper adapter
+_whisper_id: str | None = (
+    None  # loaded whisper size string (reloaded on --asr-model change)
+)
 # custom --asr-model ids already warned about in _mlx_asr_repo (it runs once per chunk)
 _warned_asr_ids: set[str] = set()
 
@@ -68,7 +73,7 @@ def _require(mod: str) -> RuntimeError:
     return RuntimeError(_MISSING_MLX.format(mod=mod))
 
 
-def _load(repo: str, cache_dir: str):
+def _load(repo: str, cache_dir: str) -> Any:
     """Download repo into cache_dir (VoxWeave's own cache, via the shared _hf_snapshot path)
     then load from the local snapshot — mlx_audio.stt.load accepts a local dir, so it won't re-fetch
     from the hub. Keeps MLX weights under ~/.cache/voxweave alongside the separator/PANNs weights."""
@@ -136,7 +141,7 @@ class _MlxAsr:
     over mlx-audio's Qwen3-ASR `.generate()`. context maps to the model's system_prompt (best-effort
     proper-noun biasing; not identical to qwen-asr's native context= field)."""
 
-    def __init__(self, model):
+    def __init__(self, model: Any):
         self._m = model
 
     def transcribe(
@@ -164,7 +169,7 @@ class _MlxAsr:
         return [_AsrResult(det, out.text)]
 
 
-def get_asr(model_id: str | None = None):
+def get_asr(model_id: str | None = None) -> _MlxAsr:
     """Lazy-load the MLX Qwen3-ASR singleton, reloading if the requested repo changes."""
     global _asr, _asr_repo
     repo = _mlx_asr_repo(model_id)
@@ -242,15 +247,25 @@ class _MlxWhisper:
             condition_on_previous_text=condition_on_previous_text,
             word_timestamps=word_timestamps,
         )
-        segs = [_WhisperSegment(s.get("text", "")) for s in res.get("segments", [])]
-        if not segs and res.get(
-            "text"
-        ):  # no per-segment breakdown -> single full-text segment
-            segs = [_WhisperSegment(res["text"])]
-        return segs, _WhisperInfo(res.get("language"))
+        raw_segments = res.get("segments")
+        segs = (
+            [
+                _WhisperSegment(str(s.get("text", "")))
+                for s in raw_segments
+                if isinstance(s, dict)
+            ]
+            if isinstance(raw_segments, list)
+            else []
+        )
+        raw_text = res.get("text")
+        if not segs and isinstance(raw_text, str) and raw_text:
+            # no per-segment breakdown -> single full-text segment
+            segs = [_WhisperSegment(raw_text)]
+        raw_lang = res.get("language")
+        return segs, _WhisperInfo(raw_lang if isinstance(raw_lang, str) else None)
 
 
-def get_whisper(model_id: str):
+def get_whisper(model_id: str) -> _MlxWhisper:
     """Lazy-load the MLX whisper adapter singleton, reloading if the requested size changes.
 
     Mirrors backend._get_whisper: snapshot-downloads the converted repo into VoxWeave's ASR cache,
@@ -280,7 +295,7 @@ def release_whisper() -> None:
     _clear_cache()
 
 
-def _get_aligner():
+def _get_aligner() -> Any:
     """Lazy-load the MLX Qwen3-ForcedAligner singleton."""
     global _aligner
     if _aligner is None:

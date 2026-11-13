@@ -28,44 +28,13 @@ log = logging.getLogger("voxweave")
 
 
 @dataclass(frozen=True)
-class _DeferredLegacyProjection:
-    """One flat physical result awaiting the global AO-08/AO-09 cut."""
-
-    distribute: Callable[[], list[list[dict]]]
-    origin_seconds: float
-
-
-@dataclass(frozen=True)
 class _PreparedDpCall:
-    """One fully materialized full-pass physical call awaiting AO-07."""
+    """One materialized full-pass physical call."""
 
     wav_slice: Any
     texts: list[str]
     offset_seconds: float
-    audio_sample_start: int
-    audio_sample_end: int
-    sample_count: int
     identity_projection: bool
-
-
-def _project_legacy_owner(
-    owner: Sequence[dict],
-    origin_seconds: float,
-) -> list[dict]:
-    """Apply the exact route-origin projection after owner slicing."""
-
-    if origin_seconds == 0.0:
-        return [
-            {
-                "text": unit["text"],
-                "start": unit["start"],
-                "end": unit["end"],
-            }
-            for unit in owner
-        ]
-    from voxweave.timestamps import shift_units
-
-    return shift_units(list(owner), origin_seconds)
 
 
 def _env_float_in_range(
@@ -324,9 +293,6 @@ def _prepare_dp_calls(
                         wav[a:b],
                         norm,
                         lo,
-                        a,
-                        b,
-                        sample_count,
                         False,
                     )
                 ]
@@ -335,9 +301,6 @@ def _prepare_dp_calls(
                 wav,
                 norm,
                 0.0,
-                0,
-                sample_count,
-                sample_count,
                 True,
             )
         ]
@@ -388,9 +351,6 @@ def _prepare_dp_calls(
                 wav[a:b],
                 norm[p["lo"] : p["hi"]],
                 offset,
-                a,
-                b,
-                sample_count,
                 False,
             )
         )
@@ -399,83 +359,20 @@ def _prepare_dp_calls(
 
 def _execute_dp_calls(
     calls: Sequence[_PreparedDpCall],
-    pass_fn,
-    *,
-    pass_physical_geometry: bool = False,
-    legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-    legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
+    pass_fn: Callable[[Any, list[str], float], list[list[dict]]],
 ) -> list[list[dict]]:
-    """Execute prepared calls, then perform only the deferred AO-08/AO-09 work.
-
-    The full-pass aligners prepare their calls with :func:`_prepare_dp_calls` (under
-    their preparation invoker) and run them here with ``pass_physical_geometry=True``,
-    which hands each ``pass_fn`` its sample geometry as keywords; without it ``pass_fn``
-    is called as ``pass_fn(wav_slice, texts, offset_s)``.
-    """
+    """Execute prepared DP calls and shift per-chunk unit timestamps to timeline origin."""
     from voxweave.timestamps import shift_units
 
-    def run_pass(call: _PreparedDpCall):
-        if pass_physical_geometry:
-            return pass_fn(
-                call.wav_slice,
-                call.texts,
-                call.offset_seconds,
-                audio_sample_start=call.audio_sample_start,
-                audio_sample_end=call.audio_sample_end,
-                sample_count=call.sample_count,
-            )
+    if len(calls) == 1 and calls[0].identity_projection:
+        call = calls[0]
         return pass_fn(call.wav_slice, call.texts, call.offset_seconds)
 
-    def complete_deferred(
-        deferred_calls: list[_DeferredLegacyProjection],
-    ) -> list[list[dict]]:
-        if legacy_distribution_invoker is None or legacy_shift_invoker is None:
-            raise RuntimeError(
-                "deferred legacy projection requires both phase invokers"
-            )
-
-        def distribute_all() -> list[list[list[dict]]]:
-            return [call.distribute() for call in deferred_calls]
-
-        distributed = legacy_distribution_invoker(distribute_all)
-
-        def shift_all() -> list[list[dict]]:
-            projected: list[list[dict]] = []
-            for call, owners in zip(deferred_calls, distributed, strict=True):
-                projected.extend(
-                    _project_legacy_owner(owner, call.origin_seconds)
-                    for owner in owners
-                )
-            return projected
-
-        return legacy_shift_invoker(shift_all)
-
-    if len(calls) == 1 and calls[0].identity_projection:
-        result = run_pass(calls[0])
-        if isinstance(result, _DeferredLegacyProjection):
-            return complete_deferred([result])
-        return result
-
     out: list[list[dict]] = []
-    deferred: list[_DeferredLegacyProjection] = []
     for call in calls:
-        result = run_pass(call)
-        if isinstance(result, _DeferredLegacyProjection):
-            deferred.append(result)
-        elif deferred:
-            raise RuntimeError("legacy projection mode changed between physical calls")
-        else:
-            out.extend(shift_units(units, call.offset_seconds) for units in result)
-    if deferred:
-        if out or len(deferred) != len(calls):
-            raise RuntimeError("legacy projection mode changed between physical calls")
-        return complete_deferred(deferred)
+        result = pass_fn(call.wav_slice, call.texts, call.offset_seconds)
+        out.extend(shift_units(units, call.offset_seconds) for units in result)
     return out
-
-
-def _run_directly(operation: Callable[[], Any]) -> Any:
-    """Default phase invoker: run ``operation`` with no surrounding bookkeeping."""
-    return operation()
 
 
 def _preflight_over_budget_hints(
