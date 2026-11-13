@@ -40,17 +40,23 @@ def test_strict_oracle_env_var_is_preserved_by_process_isolation(
 def test_every_host_pinned_oracle_test_entry_exists_in_its_module(
     conftest_mod: Any,
 ) -> None:
-    for rel_path, names in conftest_mod._HOST_PINNED_ORACLE_TESTS.items():
-        path = conftest_mod._REPO_ROOT / rel_path
-        assert path.is_file(), f"missing test module {rel_path}"
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel_path)
-        defined = {
-            node.name
-            for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        missing = sorted(names - defined)
-        assert not missing, f"{rel_path} no longer defines {missing}"
+    tables = (
+        conftest_mod._HOST_PINNED_ORACLE_TESTS,
+        conftest_mod._ALIGN_SHADOW_PINNED_TESTS,
+        conftest_mod._SEG_BASELINE_PINNED_TESTS,
+    )
+    for table in tables:
+        for rel_path, names in table.items():
+            path = conftest_mod._REPO_ROOT / rel_path
+            assert path.is_file(), f"missing test module {rel_path}"
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=rel_path)
+            defined = {
+                node.name
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            missing = sorted(names - defined)
+            assert not missing, f"{rel_path} no longer defines {missing}"
 
 
 def test_oracle_host_mismatch_reason_detects_interpreter_platform_and_shallow_clone(
@@ -148,3 +154,87 @@ def test_pytest_runtest_setup_skips_unless_strict_oracle_is_enabled(
     # Setting VOXWEAVE_STRICT_ORACLE=1 disables the skip so CI enforces the pin.
     monkeypatch.setenv("VOXWEAVE_STRICT_ORACLE", "1")
     conftest_mod.pytest_runtest_setup(pinned_item)
+
+
+def test_align_shadow_and_seg_baseline_mismatch_reasons_and_skips(
+    conftest_mod: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    align_manifest = tmp_path / "align-manifest.json"
+    align_manifest.write_text(
+        (
+            "{\n"
+            '  "environment": {\n'
+            '    "python_major_minor": "3.13",\n'
+            '    "platform": "linux-x86_64"\n'
+            "  }\n"
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+    seg_baseline = tmp_path / "seg-baseline.json"
+    seg_baseline.write_text(
+        '{\n  "environment": {\n    "python": "3.13.12"\n  }\n}\n',
+        encoding="utf-8",
+    )
+    conftest_mod._load_align_shadow_pin.cache_clear()
+    conftest_mod._load_seg_baseline_python_minor.cache_clear()
+
+    monkeypatch.setattr(
+        conftest_mod.sys, "version_info", SimpleNamespace(major=3, minor=13, micro=0)
+    )
+    monkeypatch.setattr(conftest_mod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(conftest_mod.platform, "machine", lambda: "x86_64")
+    assert (
+        conftest_mod.align_shadow_host_mismatch_reason(manifest_path=align_manifest)
+        is None
+    )
+    assert (
+        conftest_mod.seg_baseline_host_mismatch_reason(baseline_path=seg_baseline)
+        is None
+    )
+
+    monkeypatch.setattr(conftest_mod.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(conftest_mod.platform, "machine", lambda: "arm64")
+    align_os_reason = conftest_mod.align_shadow_host_mismatch_reason(
+        manifest_path=align_manifest
+    )
+    assert align_os_reason is not None and "darwin-arm64" in align_os_reason
+    # Segmentation baseline pins only Python minor, not OS/architecture.
+    assert (
+        conftest_mod.seg_baseline_host_mismatch_reason(baseline_path=seg_baseline)
+        is None
+    )
+
+    monkeypatch.setattr(
+        conftest_mod.sys, "version_info", SimpleNamespace(major=3, minor=12, micro=9)
+    )
+    seg_py_reason = conftest_mod.seg_baseline_host_mismatch_reason(
+        baseline_path=seg_baseline
+    )
+    assert seg_py_reason is not None and "3.12" in seg_py_reason
+
+    monkeypatch.delenv("VOXWEAVE_STRICT_ORACLE", raising=False)
+    monkeypatch.setattr(
+        conftest_mod,
+        "align_shadow_host_mismatch_reason",
+        lambda: "platform is 'darwin-arm64', align-shadow manifest pins 'linux-x86_64'",
+    )
+    monkeypatch.setattr(
+        conftest_mod,
+        "seg_baseline_host_mismatch_reason",
+        lambda: "Python is '3.12', segmentation baseline pins '3.13'",
+    )
+    align_item = SimpleNamespace(
+        path=conftest_mod._REPO_ROOT / "tests" / "test_p6_align_shadow_corpus.py",
+        originalname="test_align_shadow_report_is_relocation_stable",
+        name="test_align_shadow_report_is_relocation_stable",
+    )
+    seg_item = SimpleNamespace(
+        path=conftest_mod._REPO_ROOT / "tests" / "test_p5_close.py",
+        originalname="test_shadow_cli_exits_two_for_post_construction_value_mutations",
+        name="test_shadow_cli_exits_two_for_post_construction_value_mutations",
+    )
+    with pytest.raises(Skipped, match="align-shadow calibration host pin mismatch"):
+        conftest_mod.pytest_runtest_setup(align_item)
+    with pytest.raises(Skipped, match="segmentation baseline host pin mismatch"):
+        conftest_mod.pytest_runtest_setup(seg_item)

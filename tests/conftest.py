@@ -191,6 +191,8 @@ def _isolate_voxweave_config(tmp_path: Path) -> Iterator[None]:
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _ORACLE_MANIFEST = _REPO_ROOT / "calibration" / "p6-oracle" / "manifest.json"
+_ALIGN_SHADOW_MANIFEST = _REPO_ROOT / "calibration" / "align-shadow" / "manifest.json"
+_SEG_BASELINE = _REPO_ROOT / "calibration" / "segmentation" / "baseline.json"
 
 # Tests that execute the detached P6 oracle against its recorded host pin
 # (exact interpreter micro, Linux x86_64, and full git history). Schema,
@@ -225,6 +227,37 @@ _HOST_PINNED_ORACLE_TESTS: dict[str, frozenset[str]] = {
     ),
 }
 
+# Tests that execute calibration/align-shadow/manifest.json (pins Python 3.13
+# and linux-x86_64). Layout, schema, serializer, and ownership tests in the
+# same file remain active across all platforms and Python versions.
+_ALIGN_SHADOW_PINNED_TESTS: dict[str, frozenset[str]] = {
+    "tests/test_p6_align_shadow_corpus.py": frozenset(
+        {
+            "test_align_shadow_runner_exact_zero_one_two_and_check_only_contract",
+            "test_align_shadow_report_has_exact_real_pipeline_matrix",
+            "test_align_shadow_report_pins_fresh_interpreter_import_truth",
+            "test_valid_rich_artifacts_retain_complete_atomic_semantic_facts",
+            "test_typed_invalid_observation_is_a_successful_corpus_outcome",
+            "test_post_finalize_partition_cutoff_retains_only_the_semantic_group",
+            "test_each_internal_rich_construction_failure_yields_one_minimal_callback",
+            "test_minimal_unavailable_waives_callback_and_makes_harness_exit_two",
+            "test_align_shadow_report_is_relocation_stable",
+        }
+    ),
+}
+
+# CLI shadow replay tests that compare against calibration/segmentation/baseline.json
+# without --allow-environment-drift (pins Python minor 3.13).
+_SEG_BASELINE_PINNED_TESTS: dict[str, frozenset[str]] = {
+    "tests/test_p5_close.py": frozenset(
+        {
+            "test_shadow_cli_exits_two_for_post_construction_value_mutations",
+            "test_n14_cli_marks_live_work_disagreement_invalid_with_organic_fd9",
+            "test_n14_cli_rejects_live_all_zero_work_complete_matrix",
+        }
+    ),
+}
+
 
 @functools.lru_cache(maxsize=8)
 def _load_oracle_pin(
@@ -236,6 +269,21 @@ def _load_oracle_pin(
         sorted((str(k), str(v)) for k, v in data["reference_commits"].items())
     )
     return str(execution["interpreter"]), str(execution["platform"]), commits
+
+
+@functools.lru_cache(maxsize=8)
+def _load_align_shadow_pin(manifest_path: Path) -> tuple[str, str]:
+    data = json.loads(manifest_path.read_bytes())
+    env = data["environment"]
+    return str(env["python_major_minor"]), str(env["platform"])
+
+
+@functools.lru_cache(maxsize=8)
+def _load_seg_baseline_python_minor(baseline_path: Path) -> str:
+    data = json.loads(baseline_path.read_bytes())
+    raw_py = str((data.get("environment") or {}).get("python") or "")
+    parts = raw_py.split(".")
+    return f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else raw_py
 
 
 @functools.lru_cache(maxsize=16)
@@ -284,22 +332,72 @@ def oracle_host_mismatch_reason(
     return None
 
 
+def align_shadow_host_mismatch_reason(
+    *,
+    manifest_path: Path = _ALIGN_SHADOW_MANIFEST,
+) -> str | None:
+    """Return why the current host cannot run align-shadow corpus tests, or None."""
+    if not manifest_path.is_file():
+        return None
+    recorded_py, recorded_platform = _load_align_shadow_pin(manifest_path)
+    observed_py = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if observed_py != recorded_py:
+        return f"Python is {observed_py!r}, align-shadow manifest pins {recorded_py!r}"
+    observed_platform = f"{platform.system().lower()}-{platform.machine().lower()}"
+    if observed_platform != recorded_platform:
+        return (
+            f"platform is {observed_platform!r}, "
+            f"align-shadow manifest pins {recorded_platform!r}"
+        )
+    return None
+
+
+def seg_baseline_host_mismatch_reason(
+    *,
+    baseline_path: Path = _SEG_BASELINE,
+) -> str | None:
+    """Return why the current host drifts from segmentation baseline Python minor."""
+    if not baseline_path.is_file():
+        return None
+    recorded_py = _load_seg_baseline_python_minor(baseline_path)
+    observed_py = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if recorded_py and observed_py != recorded_py:
+        return f"Python is {observed_py!r}, segmentation baseline pins {recorded_py!r}"
+    return None
+
+
 def pytest_runtest_setup(item: pytest.Item) -> None:
+    if os.environ.get("VOXWEAVE_STRICT_ORACLE") == "1":
+        return
     try:
         rel = item.path.resolve().relative_to(_REPO_ROOT).as_posix()
     except ValueError:
         return
-    pinned_names = _HOST_PINNED_ORACLE_TESTS.get(rel)
-    if pinned_names is None:
-        return
     base_name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
-    if base_name not in pinned_names:
-        return
-    if os.environ.get("VOXWEAVE_STRICT_ORACLE") == "1":
-        return
-    reason = oracle_host_mismatch_reason()
-    if reason is not None:
-        pytest.skip(
-            f"P6 oracle host pin mismatch ({reason}); "
-            "set VOXWEAVE_STRICT_ORACLE=1 to enforce"
-        )
+
+    oracle_names = _HOST_PINNED_ORACLE_TESTS.get(rel)
+    if oracle_names is not None and base_name in oracle_names:
+        reason = oracle_host_mismatch_reason()
+        if reason is not None:
+            pytest.skip(
+                f"P6 oracle host pin mismatch ({reason}); "
+                "set VOXWEAVE_STRICT_ORACLE=1 to enforce"
+            )
+
+    align_names = _ALIGN_SHADOW_PINNED_TESTS.get(rel)
+    if align_names is not None and base_name in align_names:
+        reason = align_shadow_host_mismatch_reason()
+        if reason is not None:
+            pytest.skip(
+                f"align-shadow calibration host pin mismatch ({reason}); "
+                "set VOXWEAVE_STRICT_ORACLE=1 to enforce"
+            )
+
+    seg_names = _SEG_BASELINE_PINNED_TESTS.get(rel)
+    if seg_names is not None and base_name in seg_names:
+        reason = seg_baseline_host_mismatch_reason()
+        if reason is not None:
+            pytest.skip(
+                f"segmentation baseline host pin mismatch ({reason}); "
+                "set VOXWEAVE_STRICT_ORACLE=1 to enforce"
+            )
