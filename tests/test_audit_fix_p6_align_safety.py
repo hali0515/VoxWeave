@@ -1,10 +1,8 @@
-"""Regressions for the over-budget route hints, VTT decode classes and the oracle
-dependency gate."""
+"""Regressions for over-budget route hints and VTT decode classes."""
 
 from __future__ import annotations
 
 import codecs
-import importlib.util
 import json
 from pathlib import Path
 from typing import Any
@@ -14,9 +12,6 @@ import pytest
 
 from voxweave import align_dp_safety
 from voxweave.align_dp_safety import DpRouteHintsInvalid, validate_over_budget_hints
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-ORACLE_RUNNER = REPO_ROOT / "scripts" / "p6_oracle.py"
 
 _BUDGET = {
     "sample_rate": 16_000,
@@ -145,12 +140,14 @@ def test_over_budget_chunks_never_cut_through_a_nested_cue(
     assert len(calls) > 1
     cursor = 0
     for call in calls:
+        sample_start = int(round(call.offset_seconds * sample_rate))
+        sample_end = sample_start + len(call.wav_slice)
         owned = range(cursor, cursor + len(call.texts))
         cursor += len(call.texts)
         for index in owned:
             start, end = bounds[index]
-            assert call.audio_sample_start <= int(start * sample_rate)
-            assert int(end * sample_rate) <= call.audio_sample_end
+            assert sample_start <= int(start * sample_rate)
+            assert int(end * sample_rate) <= sample_end
     assert cursor == len(texts)
 
 
@@ -169,7 +166,11 @@ def test_monotone_over_budget_plan_is_unchanged_by_the_envelope(
     calls = align_common._prepare_dp_calls(wav, sample_rate, texts, bounds, "CTC")
     plans = plan_dp_chunks(bounds, max_sec=20.0, audio_end=40.0)
     assert [
-        (call.audio_sample_start, call.audio_sample_end, tuple(call.texts))
+        (
+            int(round(call.offset_seconds * sample_rate)),
+            int(round(call.offset_seconds * sample_rate)) + len(call.wav_slice),
+            tuple(call.texts),
+        )
         for call in calls
     ] == [
         (
@@ -205,12 +206,14 @@ def _cues_outside_their_crop(
     outside: list[int] = []
     cursor = 0
     for call in calls:
+        sample_start = int(round(call.offset_seconds * 16_000))
+        sample_end = sample_start + len(call.wav_slice)
         for index in range(cursor, cursor + len(call.texts)):
             pair = bounds[index]
             if pair is None:
                 continue
-            if int(pair[0] * 16_000) < call.audio_sample_start or (
-                int(pair[1] * 16_000) > call.audio_sample_end
+            if int(pair[0] * 16_000) < sample_start or (
+                int(pair[1] * 16_000) > sample_end
             ):
                 outside.append(index + 1)
         cursor += len(call.texts)
@@ -436,100 +439,3 @@ def test_other_vtt_decode_failures_keep_their_detail(
     failure = caught.value.failure  # type: ignore[attr-defined]
     assert failure.kind == "align-input-decode-invalid"
     assert failure.detail_code == detail_code
-
-
-# -- oracle dependency gate --------------------------------------------------------
-
-
-@pytest.fixture
-def oracle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
-    spec = importlib.util.spec_from_file_location(
-        "p6_oracle_dependency_gate_under_test", ORACLE_RUNNER
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
-    return module
-
-
-def _source(root: Path, relative: str, text: str) -> Path:
-    path = root / relative
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    return path
-
-
-@pytest.mark.parametrize(
-    ("relative", "text", "expected"),
-    (
-        ("voxweave/align_dp_safety.py", "from voxweave import pipeline\n", None),
-        ("voxweave/align_dp_safety.py", "from . import pipeline\n", None),
-        ("voxweave/align_dp_safety.py", "from .pipeline import align\n", None),
-        ("voxweave/core/align_compare.py", "from .. import pipeline\n", None),
-        ("voxweave/core/align_compare.py", "from ..pipeline import align\n", None),
-        (
-            "voxweave/core/align_compare.py",
-            "from . import finalizer\n",
-            "voxweave.core.finalizer",
-        ),
-        (
-            "voxweave/core/__init__.py",
-            "from . import finalizer\n",
-            "voxweave.core.finalizer",
-        ),
-        ("voxweave/align_dp_safety.py", "import voxweave.pipeline as p\n", None),
-    ),
-)
-def test_dependency_gate_resolves_package_and_relative_imports(
-    oracle: Any, tmp_path: Path, relative: str, text: str, expected: str | None
-) -> None:
-    path = _source(tmp_path, relative, text)
-    assert (expected or "voxweave.pipeline") in oracle._imports(path)
-
-
-def test_dependency_gate_keeps_plain_absolute_imports(
-    oracle: Any, tmp_path: Path
-) -> None:
-    path = _source(
-        tmp_path,
-        "voxweave/align_dp_safety.py",
-        "import math\nfrom voxweave.align_failures import CanonicalFailure\n",
-    )
-    observed = oracle._imports(path)
-    assert {"math", "voxweave.align_failures"} <= observed
-    assert "voxweave.pipeline" not in observed
-
-
-def test_dependency_gate_rejects_a_relative_import_beyond_the_top_package(
-    oracle: Any, tmp_path: Path
-) -> None:
-    path = _source(tmp_path, "voxweave/align_dp_safety.py", "from ... import x\n")
-    with pytest.raises(oracle.OracleInvalid):
-        oracle._imports(path)
-
-
-def test_dependency_gate_reports_a_package_form_layering_violation(
-    oracle: Any, tmp_path: Path
-) -> None:
-    for relative in (
-        "voxweave/align_evidence_core.py",
-        "voxweave/core/align_compare.py",
-        "voxweave/reference_projector.py",
-        "voxweave/episode_transaction.py",
-    ):
-        _source(tmp_path, relative, "import math\n")
-    _source(tmp_path, "voxweave/align_dp_safety.py", "from voxweave import backend\n")
-    assert oracle._check_dependencies() == [
-        "dependency violation in voxweave/align_dp_safety.py: ['voxweave.backend']"
-    ]
-
-
-def test_dependency_gate_is_clean_on_the_checked_in_sources() -> None:
-    spec = importlib.util.spec_from_file_location(
-        "p6_oracle_dependency_gate_live", ORACLE_RUNNER
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    assert module._check_dependencies() == []

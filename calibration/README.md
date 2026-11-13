@@ -9,8 +9,6 @@ calibration/
   schemas/       JSON Schema (draft 2020-12) contracts, tracked and stable
   alignment/     manifest example and synthetic reference fixtures (no tracked baseline)
   segmentation/  corpus registry, golden cases, recorded baseline
-  align-shadow/  align-shadow corpus, manifest and baseline for scripts/calib_align_shadow.py
-  p6-oracle/     detached oracle corpus for scripts/p6_oracle.py (see its README)
 ```
 
 Shared helpers live in `scripts/calib_common.py`: schema validation, the single type-7

@@ -23,11 +23,10 @@ DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 DEFAULT_FUSION_WHISPER = "large-v3"
 DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
 # LLM behind `translate` / `correct` (any OpenAI-compatible chat-completions endpoint).
-# Always a concrete model name, never a "-latest" alias: OpenAI retired
-# gpt-5.3-chat-latest and both commands were broken out of the box until this
-# constant replaced it. "auto" resolves to the endpoint's only served model at run
-# time, for self-hosted servers (vLLM) whose served name drifts between restarts.
-DEFAULT_LLM_MODEL = "gpt-6-luna"
+# Always a concrete public model name, never a "-latest" alias. "auto" resolves to the
+# endpoint's only served model at run time, for self-hosted servers (vLLM) whose served
+# name drifts between restarts.
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
 DEFAULT_LLM_API_KEY_ENV = "OPENAI_API_KEY"
 LLM_MODEL_AUTO = "auto"
 # `translate` windowing for a self-hosted server: several bounded windows in flight
@@ -149,7 +148,7 @@ _TEMPLATE = """\
 #   window_cues = cues per window when concurrency > 1 (= --window /
 #                 VOXWEAVE_TRANSLATE_WINDOW_CUES; default 100, min 1).
 [llm]
-# model = "gpt-6-luna"
+# model = "gpt-4o-mini"
 # base_url = "http://127.0.0.1:8000/v1"
 # api_key_env = "OPENAI_API_KEY"
 # reasoning_effort = "low"

@@ -82,9 +82,6 @@ dependencies = [
   # wav2vec2 CTC forced alignment for English (WhisperX-equivalent; align_ctc.align_text_ctc).
   # Tracks torch ABI; lower bound only.
   "torchaudio>=2.1",
-  # Speaker diarization (--diarize): pyannote.audio 4.x supports the default
-  # pyannote/speaker-diarization-community-1 pipeline plus selectable 3.1/custom pipelines.
-  "pyannote-audio>=4,<5",
   # MMS-300m + uroman forced alignment (default aligner for ja/CJK; zero OOV; align_text_mms).
   # The onnxruntime build is platform-selected via the [cuda]/[mps] extras (onnxruntime-gpu on
   # CUDA, plain onnxruntime on macOS) — see [project.optional-dependencies] + [tool.uv] below.
@@ -94,8 +91,6 @@ dependencies = [
   "unidecode>=1.3",
   # Subtitle layout/re-wrap: smart_split logic lives in voxweave.core; PySBD is its runtime dep.
   "pysbd>=0.3.4",
-  # PANNs song-skip detection (--skip-songs).
-  "panns-inference>=0.1.0",
   # CJK line-break: BudouX phrase atoms as non-breakable units (ja/zh) + jieba word segmentation
   # to snap Qwen's off-boundary punctuation back to word edges. Both lazy-imported
   # (voxweave.realign.snap_break_punct); fall back to character-level if import fails.
@@ -157,9 +152,12 @@ mps = [
   "mlx-audio>=0.4.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-whisper>=0.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
-# Empty compatibility alias: legacy voxweave[cuda,diarize] and voxweave[mps,diarize]
-# specifications still resolve, while diarization support now ships in the core environment.
-diarize = []
+# Opt-in speaker diarization (--diarize) and speaker splitting (`speakers serve`):
+# isolates pyannote.audio 4.x + pytorch-lightning/torchmetrics/asteroid from the core install.
+# Install alongside the platform variant: voxweave[cuda,diarize] or voxweave[mps,diarize].
+diarize = [
+  "pyannote-audio>=4,<5",
+]
 
 [dependency-groups]
 # jsonschema validates the tracked calibration contracts (calibration/schemas/*.schema.json).
@@ -216,8 +214,8 @@ venvPath = "."
 venv = ".venv"
 
 [tool.ruff]
-# voxweave/vendor contains frozen third-party model code (Mel-Band Roformer, ReDimNet2,
-# SpeechBrain ECAPA-TDNN) -- skip lint/format
+# voxweave/vendor contains frozen third-party model code (Mel-Band Roformer, PANNs Cnn14,
+# ReDimNet2, SpeechBrain ECAPA-TDNN) -- skip lint/format
 extend-exclude = ["voxweave/vendor"]
 
 [tool.ruff.lint]

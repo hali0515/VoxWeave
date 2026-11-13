@@ -1883,39 +1883,6 @@ def test_no_subtitle_parser_survives_in_the_ruler() -> None:
     assert "ffmpeg" not in source
 
 
-def test_negative_perturb_max_probes_is_refused(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    # A negative cap used to slice probes off the end of every case's plan.
-    with pytest.raises(SystemExit) as excinfo:
-        calib.build_parser().parse_args(
-            ["shadow", "--perturb", "--perturb-max-probes", "-3"]
-        )
-    assert excinfo.value.code == 2
-    assert "must be >= 0" in capsys.readouterr().err
-
-
-def test_perturbation_options_without_perturb_are_invalid(tmp_path: Path) -> None:
-    args = calib.build_parser().parse_args(
-        [
-            "shadow",
-            "--corpus",
-            str(tmp_path / "never-read.json"),
-            "--perturb-case",
-            "en-01",
-            "--perturb-max-probes",
-            "2",
-        ]
-    )
-
-    with pytest.raises(cc.CalibrationError) as excinfo:
-        calib.cmd_shadow(args)
-
-    assert "--perturb-case, --perturb-max-probes only apply with --perturb" in str(
-        excinfo.value
-    )
-
-
 def test_spaced_language_mid_phrase_gate_is_labelled_structural(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

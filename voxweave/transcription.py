@@ -525,13 +525,10 @@ def _detect_songs(
                 [(round(a, 1), round(b, 1)) for a, b in song_spans],
             )
     except ModuleNotFoundError as e:
-        # panns-inference (or one of its deps) is missing from a broken
-        # environment: it is a core dependency, so reinstalling fixes it.
         log.warning(
             "song detection unavailable (missing module: %s) -- continuing "
-            "without song skip; panns-inference is a core dependency, so "
-            "reinstall voxweave, or pass --no-skip-songs (and drop "
-            "--keep-lyrics) to silence this",
+            "without song skip; reinstall voxweave to repair the environment, "
+            "or pass --no-skip-songs (and drop --keep-lyrics) to silence this",
             e,
         )
     return song_spans, sing_spans, speech_spans

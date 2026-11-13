@@ -2,7 +2,8 @@
 
 ## Speaker models
 
-Speaker diarization support ships by default on both variants but remains opt-in at runtime.
+Speaker diarization is available via the optional `[diarize]` extra (`voxweave[cuda,diarize]` or
+`voxweave[mps,diarize]`, or `make install EXTRAS=diarize`) and remains opt-in at runtime (`--diarize`).
 The default model is `pyannote/speaker-diarization-community-1`, which separates and counts
 multiple speakers noticeably better than 3.1. It is gated separately on Hugging Face: before
 using `--diarize`, accept the conditions for the model you select, then set `VOXWEAVE_HF_TOKEN` /

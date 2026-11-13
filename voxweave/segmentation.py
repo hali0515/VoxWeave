@@ -32,7 +32,6 @@ from voxweave.core.segdoc import (
     SegDocument,
     build_seg_document,
 )
-from voxweave.core.shadow_v2 import shadow_enabled
 
 log = logging.getLogger("voxweave")
 
@@ -153,12 +152,6 @@ class SegmentationResult:
     summarizing the output. Both are additive and default to ``None`` so
     existing constructors keep working; in legacy-v1 the engine consumes
     neither.
-
-    ``shadow`` is the BoundaryOptimizer v2 measurement artifact, present only
-    when :data:`SEG_V2_SHADOW_ENV` is on. It is *returned* rather than written
-    because ``segment_document`` is pinned pure; persisting it is a caller's or
-    the harness's job. Nothing in the shipped output depends on it -- a run with
-    the flag on and a run with it off produce byte-identical siblings.
     """
 
     cues: list[Cue]
@@ -167,30 +160,6 @@ class SegmentationResult:
     diagnostics: dict[str, Any]
     manifest: dict[str, Any] | None = None
     document: SegDocument | None = None
-    shadow: dict[str, Any] | None = None
-
-
-# --------------------------------------------------------- v2 shadow lane
-
-
-def _maybe_shadow_v2(
-    document: SegDocument, cues: Sequence[Cue], *, thresholds: Mapping[str, Any]
-) -> dict[str, Any] | None:
-    """Measure BoundaryOptimizer v2 beside the shipped v1 answer, or do nothing.
-
-    The flag is read FIRST and the lane (:func:`voxweave.core.shadow_v2.run_shadow`)
-    is entered only after it passes, so an off run costs one environment read
-    and a branch and never pulls a v2 module into the process at all: the lane
-    module itself imports nothing at module scope that the v1 engine does not
-    already load, and every optimizer import inside it is deferred to the call.
-    Nothing in the lane may fail the run: ``run_shadow`` records an unexpected
-    error as a typed ``error`` block and the shipped cues are returned untouched.
-    """
-    if not shadow_enabled():
-        return None
-    from voxweave.core.shadow_v2 import run_shadow
-
-    return run_shadow(document, cues, thresholds=thresholds)
 
 
 @dataclass(frozen=True)
@@ -328,11 +297,9 @@ def _build_manifest(inputs: _Inputs, stream: _Stream) -> dict[str, Any]:
 def _run_engine(
     inputs: _Inputs,
     stream: _Stream,
-    document: SegDocument,
     annotate_speakers: bool,
-) -> tuple[list[Cue], dict[str, Any] | None, int]:
-    """The engine, the shadow lane and the overlays; returns the cues, the shadow
-    artifact and the cue count before speaker formatting."""
+) -> tuple[list[Cue], int]:
+    """Run the engine and overlays; return final cues and pre-speaker cue count."""
     from voxweave.core.smart_split import smart_split_segments
 
     iso = inputs.iso
@@ -345,9 +312,6 @@ def _run_engine(
         shot_changes=inputs.cuts,
         **inputs.extra,
     )
-    # Immediately after the v1 answer and before any overlay: the shadow
-    # sees exactly the stream v1 produced from exactly the inputs v1 read.
-    shadow = _maybe_shadow_v2(document, cues, thresholds=effective)
     mark_lyric_cues(cues, inputs.sings)
     split_cue_count = len(cues)
     if inputs.turns:
@@ -366,29 +330,17 @@ def _run_engine(
         )
         # ... and its cleanup can push a boundary back across a cut, so snap again.
         cues = resnap_shots(cues, inputs.cuts, effective)
-    return cues, shadow, split_cue_count
+    return cues, split_cue_count
 
 
 def _close_manifest(
     manifest: dict[str, Any],
     degraded: list[dict[str, Any]],
-    shadow: dict[str, Any] | None,
 ) -> None:
     # Fill the reserved key in place: assigning an existing key never reorders a
     # dict, so the persisted ``segmentation`` block is byte-identical to the one
     # built after the run.
     manifest["degraded"] = degraded
-    if shadow is not None:
-        # AD3-5/AD4-4: two origin-typed ledgers and never one merged ``degraded``.
-        # ``production_degraded`` can only be copied here, once the outer capture
-        # has closed and the manifest's reserved key holds the real list;
-        # ``shadow_degraded`` was collected by the hook's own nested capture.
-        shadow["production_degraded"] = copy.deepcopy(manifest["degraded"])
-        # AD3-5's other half. Without it an artifact reader cannot tell which
-        # language providers the measured run actually resolved -- and a run
-        # whose ja POS tagger fell back to the character table is measuring a
-        # different boundary decision than one whose tagger loaded.
-        shadow["providers"] = copy.deepcopy(manifest["providers"])
 
 
 def _diagnostics(
@@ -396,7 +348,6 @@ def _diagnostics(
     stream: _Stream,
     cues: list[Cue],
     split_cue_count: int,
-    shadow: dict[str, Any] | None,
 ) -> dict[str, Any]:
     return {
         "unit_count": len(stream.snapped),
@@ -411,7 +362,6 @@ def _diagnostics(
         "speaker_formatted": bool(inputs.turns),
         "shot_resnapped": bool(inputs.turns and inputs.cuts),
         "cue_count": len(cues),
-        "shadow_v2": shadow is not None,
     }
 
 
@@ -452,11 +402,6 @@ def segment_document(
     ``degraded`` cannot be known that early; the manifest reserves the key at
     build time and the ledger is written into it once the capture closes, so the
     persisted block is byte-identical either way.
-
-    With :data:`SEG_V2_SHADOW_ENV` on, the v2 optimizer is measured between steps
-    6 and 7 and its artifact is returned on ``result.shadow``. It ships nothing:
-    the cue stream, the units and the persisted manifest are byte-identical to a
-    run with the flag off.
 
     No filesystem writes, no model loads, no ASR. Every input sequence is copied
     before use, so callers can reuse their own lists afterwards.
@@ -509,16 +454,13 @@ def segment_document(
     # passes read config/env, and ``provider_snapshot`` only *reports* identity),
     # so narrowing the window to the engine run drops no event.
     with degradation_capture() as degraded:
-        cues, shadow, split_cue_count = _run_engine(
-            inputs, stream, document, annotate_speakers
-        )
-    _close_manifest(manifest, degraded, shadow)
+        cues, split_cue_count = _run_engine(inputs, stream, annotate_speakers)
+    _close_manifest(manifest, degraded)
     return SegmentationResult(
         cues=cues,
         language=inputs.iso,
         units=stream.snapped,
-        diagnostics=_diagnostics(inputs, stream, cues, split_cue_count, shadow),
+        diagnostics=_diagnostics(inputs, stream, cues, split_cue_count),
         manifest=manifest,
         document=document,
-        shadow=shadow,
     )

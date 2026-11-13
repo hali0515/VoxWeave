@@ -61,10 +61,11 @@ Verify the installation at any time without loading models:
 voxweave doctor
 ```
 
-The full local pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
-Japanese/CJK), layout, song-skip, and speaker-diarization support — plus CJK line-break and
-translation — is baked into the **core dependencies**. The variant selects the compute platform
-**and the ASR/alignment backend**:
+The full local subtitle pipeline — vocal separation, ASR, forced alignment (incl. MMS-300m for
+Japanese/CJK), layout, and song-skip — plus CJK line-break and
+translation — is baked into the **core dependencies**; optional speaker diarization (`--diarize`)
+lives in the **`[diarize]`** extra (`voxweave[cuda,diarize]` / `voxweave[mps,diarize]`). The
+variant selects the compute platform **and the ASR/alignment backend**:
 
 - `[cuda]` (NVIDIA/Linux): the in-process PyTorch Qwen3-ASR + forced aligner (`qwen-asr`), GPU
   onnxruntime (CUDAExecutionProvider for MMS alignment), and the faster-whisper hybrid engine.
@@ -83,17 +84,19 @@ translation — is baked into the **core dependencies**. The variant selects the
 <details>
 <summary><b>Dependencies & what each variant pulls</b></summary>
 
-- The core pulls a pure-torch Mel-Band Roformer vendored in `voxweave.vendor`
-  (**no onnx/onnxruntime** —
+- The core pulls pure-torch Mel-Band Roformer and PANNs Cnn14 models vendored in `voxweave.vendor`
+  (**no onnx/onnxruntime** in core —
   `audio-separator` is intentionally avoided because it eagerly imports onnxruntime at the
-  top level) + MMS-300m forced aligner (`ctc-forced-aligner`) + layout (`pysbd`) + song-skip
-  (`panns-inference`) + CJK break (`budoux` + `jieba`) + translation (`openai`) +
-  `pyannote-audio>=4,<5` for opt-in speaker diarization.
+  top level) + MMS-300m forced aligner (`ctc-forced-aligner`) + layout (`pysbd`) + CJK break
+  (`budoux` + `jieba`) + translation (`openai`).
+- **`[diarize]`** (optional add-on): `pyannote-audio>=4,<5` for opt-in speaker diarization
+  (`--diarize` and speaker splitting in `speakers serve`). Combine with your platform variant:
+  `voxweave[cuda,diarize]` or `voxweave[mps,diarize]` (or `make install EXTRAS=diarize`).
 - **`[cuda]`** (NVIDIA/Linux): `qwen-asr` + `onnxruntime-gpu` + `faster-whisper`. **`[mps]`**
   (Apple Silicon/macOS): `mlx-audio` + plain `onnxruntime`. Declared **conflicting** in
   `[tool.uv]` (incompatible `transformers` pins), so `uv` resolves each in its own fork — pick one
   per host (`make dev VARIANT=mps` on Apple Silicon).
-- **Diarization ships by default but runs only with `--diarize`.** Both supported pyannote
+- **Diarization is opt-in (`[diarize]` extra + `--diarize`).** Both supported pyannote
   pipelines are gated independently. Accept the
   [`speaker-diarization-community-1`](https://hf.co/pyannote/speaker-diarization-community-1)
   conditions for the default, or the
@@ -103,7 +106,7 @@ translation — is baked into the **core dependencies**. The variant selects the
   `VOXWEAVE_HF_TOKEN`, or `HF_TOKEN`.
 - The device is auto-detected at runtime (cuda → mps → cpu); override with `VOXWEAVE_DEVICE`. On
   mps the MLX backend is selected automatically; force it either way with `VOXWEAVE_BACKEND=mlx|torch`.
-- **Development**: `make dev` (= `uv sync --extra cuda --dev`; on Apple Silicon use
+- **Development**: `make dev` (= `uv sync --extra cuda --extra diarize --dev --python 3.13`; on Apple Silicon use
   `make dev VARIANT=mps` — `[cuda]`/`[mps]` are conflicting extras and can't be synced together).
 
 </details>
@@ -122,7 +125,7 @@ Override the detection per invocation: `make install VARIANT=mps` or
 
 ## Docker
 
-A CUDA 12.8 runtime container (`Dockerfile`) bundles `ffmpeg`, `uv`, and `voxweave[cuda]` with the
+A CUDA 12.8 runtime container (`Dockerfile`) bundles `ffmpeg`, `uv`, and `voxweave[cuda,diarize]` with the
 `onnxruntime` override pre-applied:
 
 ```bash

@@ -86,7 +86,7 @@ def catalog() -> list[ModelEntry]:
             role="audio",
             purpose="Song-skip & SDH event tagging (Cnn14)",
             repo="thelou1s/panns-inference",
-            files=("Cnn14_mAP=0.431.pth", "class_labels_indices.csv"),
+            files=("Cnn14_mAP=0.431.pth",),
             license="Apache-2.0",
             kind="hf_file",
         ),
@@ -120,7 +120,7 @@ def catalog() -> list[ModelEntry]:
             purpose="Japanese CTC forced aligner (ONNX)",
             repo="deskpai/ctc_forced_aligner",
             files=("04ac86b67129634da93aea76e0147ef3.onnx",),
-            license="CC-BY-NC-4.0",
+            license="CC-BY-NC-4.0 (non-commercial)",
             kind="hf_file",
         ),
         ModelEntry(
@@ -155,7 +155,7 @@ def catalog() -> list[ModelEntry]:
             purpose="Voiceprint embedder (non-Japanese default)",
             repo="PalabraAI/redimnet2 (v1.0.0 release)",
             files=("b6-vb2+vox2+cnc2_v0-lm.pt",),
-            license="CC-BY-NC-SA-4.0",
+            license="CC-BY-NC-SA-4.0 (non-commercial)",
             kind="voiceprint",
         ),
         ModelEntry(
