@@ -85,10 +85,10 @@ jobs:
           - os: ubuntu-latest
             python: "3.12"
             variant: cuda
-          - os: macos-14
+          - os: macos-latest
             python: "3.12"
             variant: mps
-          - os: macos-14
+          - os: macos-latest
             python: "3.13"
             variant: mps
     steps:

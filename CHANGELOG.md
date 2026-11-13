@@ -15,7 +15,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `voxweave completions` (`bash`, `zsh`, `fish`) shell tab-completion script generator.
 - Global `-q` / `--quiet` mode and `--json` machine-readable output on `transcribe`, `render`, `align`, `translate`, `export`, `pack`, `burn`, and `correct`.
 - CUDA runtime `Dockerfile` (`.dockerignore`) and Windows WSL2 / fish / PowerShell setup instructions in `docs/install.md`.
-- Cross-platform (`macos-14` `mps` + `ubuntu-latest` `cuda`) and multi-Python (`3.11`, `3.12`, `3.13`) CI compatibility matrix, `CONTRIBUTING.md`, and structured GitHub bug-report template.
+- Cross-platform (`macos-latest` `mps` + `ubuntu-latest` `cuda`) and multi-Python (`3.11`, `3.12`, `3.13`) CI compatibility matrix, `CONTRIBUTING.md`, and structured GitHub bug-report template.
 
 ### Changed
 
