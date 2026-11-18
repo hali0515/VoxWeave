@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -522,13 +525,10 @@ def _detect_songs(
                 [(round(a, 1), round(b, 1)) for a, b in song_spans],
             )
     except ModuleNotFoundError as e:
-        # panns-inference (or one of its deps) is missing from a broken
-        # environment: it is a core dependency, so reinstalling fixes it.
         log.warning(
             "song detection unavailable (missing module: %s) -- continuing "
-            "without song skip; panns-inference is a core dependency, so "
-            "reinstall voxweave, or pass --no-skip-songs (and drop "
-            "--keep-lyrics) to silence this",
+            "without song skip; reinstall voxweave to repair the environment, "
+            "or pass --no-skip-songs (and drop --keep-lyrics) to silence this",
             e,
         )
     return song_spans, sing_spans, speech_spans
@@ -740,20 +740,55 @@ def _transcribe_speech(
     return iso, all_units, vad_spans
 
 
-# Cleanup of transcribe(), on every exit path. Each release is guarded on its own: a
-# release that raises (e.g. torch.cuda.empty_cache after a CUDA fault) must neither
-# mask the original error nor skip the remaining releases and the temp-file cleanup.
-def _release_and_clean(run: _TranscribeRun, *, panns_handoff: bool) -> None:
-    # Release ASR/alignment singleton VRAM (separation self-releases earlier).
+_RETAIN_MODELS: ContextVar[bool] = ContextVar("_RETAIN_MODELS", default=False)
+
+
+def release_resident_models() -> None:
+    """Release ASR/alignment, Silero VAD, and song-detection singletons."""
     try:
         backend.release()
     except Exception as e:
         log.warning("releasing the ASR/alignment models failed: %r", e)
-    # No VAD pass can follow: every vad_speech_segments call happens before this.
     try:
         chunking.release_silero_vad()
     except Exception as e:
         log.warning("releasing the VAD model failed: %r", e)
+    try:
+        songdet.release_model()
+    except Exception as e:
+        log.warning("releasing the song-detection model failed: %r", e)
+
+
+@contextmanager
+def batch_session(*, retain_models: bool) -> Iterator[None]:
+    """Keep ASR/alignment and VAD singletons resident across batch items when safe,
+    releasing all singletons unconditionally when the batch finishes."""
+    token = _RETAIN_MODELS.set(retain_models)
+    try:
+        yield
+    finally:
+        _RETAIN_MODELS.reset(token)
+        if retain_models:
+            release_resident_models()
+
+
+# Cleanup of transcribe(), on every exit path. Each release is guarded on its own: a
+# release that raises (e.g. torch.cuda.empty_cache after a CUDA fault) must neither
+# mask the original error nor skip the remaining releases and the temp-file cleanup.
+def _release_and_clean(
+    run: _TranscribeRun, *, panns_handoff: bool, keep_models: bool = False
+) -> None:
+    if not keep_models:
+        # Release ASR/alignment singleton VRAM (separation self-releases earlier).
+        try:
+            backend.release()
+        except Exception as e:
+            log.warning("releasing the ASR/alignment models failed: %r", e)
+        # No VAD pass can follow: every vad_speech_segments call happens before this.
+        try:
+            chunking.release_silero_vad()
+        except Exception as e:
+            log.warning("releasing the VAD model failed: %r", e)
     if not panns_handoff:
         # Safety net: an exception before the post-detection release (or before
         # the sdh caller can take over) would otherwise strand PANNs on the card.
@@ -838,6 +873,7 @@ def transcribe(
     # Set only on a successful return with release_panns=False: a caller can inherit
     # the loaded model, but never as the fallout of a failed run.
     panns_handoff = False
+    completed = False
     try:
         voiceprints, acquired = _prepare_audio(
             run,
@@ -900,6 +936,7 @@ def transcribe(
                 rep=rep,
             )
         panns_handoff = not release_panns
+        completed = True
         return (
             iso,
             all_units,
@@ -909,4 +946,8 @@ def transcribe(
             voiceprint_capture,
         )
     finally:
-        _release_and_clean(run, panns_handoff=panns_handoff)
+        _release_and_clean(
+            run,
+            panns_handoff=panns_handoff,
+            keep_models=completed and _RETAIN_MODELS.get(),
+        )

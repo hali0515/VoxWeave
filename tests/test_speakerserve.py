@@ -1,5 +1,6 @@
 import http.client
 import json
+import socket
 import stat
 import threading
 from contextlib import contextmanager
@@ -276,8 +277,41 @@ def test_reads_reject_foreign_host(tmp_path, host):
             assert server.token.encode() not in body
 
 
-@pytest.mark.parametrize("connect_host", ["127.0.0.1", "127.0.0.2"])
-def test_wildcard_binding_supports_page_info_and_save(tmp_path, connect_host):
+def _secondary_local_ipv4() -> str | None:
+    """Return a routable local IPv4 other than 127.0.0.1.
+
+    Linux routes all of 127.0.0.0/8 on ``lo`` (so ``127.0.0.2`` binds directly);
+    macOS/BSD only binds ``127.0.0.1`` on ``lo0``, so fall back to the host's
+    primary local interface IPv4 discovered via a non-transmitting UDP route lookup.
+    """
+    candidates = ["127.0.0.2"]
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            udp.connect(("192.0.2.1", 80))
+            ip = udp.getsockname()[0]
+            if ip and ip != "127.0.0.1" and ip not in candidates:
+                candidates.append(ip)
+    except OSError:
+        pass
+    for candidate in candidates:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((candidate, 0))
+            return candidate
+        except OSError:
+            continue
+    return None
+
+
+@pytest.mark.parametrize("target_kind", ["loopback", "secondary"])
+def test_wildcard_binding_supports_page_info_and_save(tmp_path, target_kind):
+    if target_kind == "loopback":
+        connect_host = "127.0.0.1"
+    else:
+        secondary = _secondary_local_ipv4()
+        if secondary is None:
+            pytest.skip("host has no secondary local IPv4 address")
+        connect_host = secondary
     with _running_server(tmp_path, host="0.0.0.0") as (server, mapping, _logs):
         assert server.server_address[0] == "0.0.0.0"
         assert server.origin == f"http://0.0.0.0:{server.server_port}"

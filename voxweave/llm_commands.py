@@ -398,10 +398,6 @@ def _write_correction(
             vtt_path=vtt_path,
             expected_vtt=episode_transaction.FileGeneration(True, vtt_input_bytes),
             rendered_vtt_bytes=rendered_bytes,
-            evidence_paths=artifacts.align_evidence_candidates(
-                owner,
-                vtt_path,
-            ),
         )
         out_path = vtt_path
     else:

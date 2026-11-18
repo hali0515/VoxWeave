@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 import soundfile as sf
@@ -443,7 +443,6 @@ def slice_wav(
     start: float,
     end: float,
     *,
-    _sample_geometry_observer: Callable[[int, int, int, int], None] | None = None,
     _canonical_qwen_failures: bool = False,
 ) -> Path:
     """Slice the [start,end] segment from a 16k wav, write to a temp wav, return path (caller deletes).
@@ -490,8 +489,6 @@ def slice_wav(
         except (ArithmeticError, TypeError, ValueError) as exc:
             classify(exc, "sample-end-index")
             raise
-        if _sample_geometry_observer is not None:
-            _sample_geometry_observer(a, b, sr, frames)
         try:
             f.seek(a)
             data = f.read(max(0, b - a), dtype="float32")

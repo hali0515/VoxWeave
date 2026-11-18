@@ -148,8 +148,6 @@ def detect_events(
     """Run PANNs over the 32 kHz ORIGINAL mix and return merged event spans."""
     from voxweave import songdet
 
-    # songdet places the labels csv before importing panns_inference (whose import
-    # otherwise shells out to wget for it).
     labels = songdet.panns_labels()
     wp = songdet.window_probs(wav32k, progress=progress)
     if wp is None:

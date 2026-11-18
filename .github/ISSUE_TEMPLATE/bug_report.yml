@@ -1,0 +1,51 @@
+name: Bug report
+description: Report a crash, wrong subtitle output, or install/GPU issue
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report. Please do **not** paste Hugging Face tokens, API keys, or private voiceprint files.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the crash, wrong timestamps/cues, or unexpected behavior vs what you expected.
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and flags
+      description: Exact command invoked (redact private file paths or keys if needed).
+      placeholder: voxweave episode.mkv -l ja --diarize
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Environment diagnostics (voxweave doctor)
+      description: Paste the output of `voxweave doctor`. If installation failed before `voxweave` could run, list your OS, Python version, `uv --version`, and GPU/CPU model.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output or verbose log
+      description: Paste the terminal error message (re-run with `-v` if helpful).
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: media
+    attributes:
+      label: Media details / reproduction steps (optional)
+      description: Language, duration, container/audio streams (`ffprobe -hide_banner episode.mkv`), or minimal steps to reproduce.
+

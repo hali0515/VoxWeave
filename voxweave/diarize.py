@@ -927,8 +927,9 @@ def _get_pipeline_locked(token: str | None, model: str):
             )
         except ModuleNotFoundError as e:
             raise RuntimeError(
-                "diarization requires the default pyannote.audio dependency; "
-                "reinstall voxweave to repair the environment"
+                "speaker diarization requires the optional [diarize] extra "
+                "(pyannote.audio); install with voxweave[cuda,diarize] or "
+                "voxweave[mps,diarize]"
             ) from e
         try:
             pl = _load_pipeline(Pipeline, token, model)

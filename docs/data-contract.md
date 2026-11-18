@@ -80,13 +80,14 @@ and are not erased by purge; delete them separately according to their retention
 
 ## Testing
 
-- Unit tests (models mocked, no network): `make test` (= `uv run --extra $(VARIANT) pytest tests/ -v`).
+- Unit tests (models mocked, no network): `make test`
+  (`env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 uv run --extra $(VARIANT) pytest tests/ -v`).
   The suite ignores inherited `VOXWEAVE_*` settings; with a real-model gate such as
   `VOXWEAVE_REAL_WEIGHT_TESTS=1` set it keeps `VOXWEAVE_CACHE_ROOT`, `VOXWEAVE_MODEL_DIR` and
-  `VOXWEAVE_HF_TOKEN`, so those tests find weights you already have. Its P6 oracle tests also
-  need the interpreter recorded in `calibration/p6-oracle/manifest.json` (`make dev` syncs it,
-  as CI does), Linux x86_64, a full clone (a shallow one lacks the oracle's reference commits)
-  and the ambient environment the oracle records, which CI sets:
-  `env -u TZ -u PYTHONHASHSEED LC_ALL=C.UTF-8 make test`.
+  `VOXWEAVE_HF_TOKEN`, so those tests find weights you already have. Host-pinned P6 oracle tests
+  need the exact interpreter recorded in `calibration/p6-oracle/manifest.json` (`make dev` syncs
+  it on Linux), Linux x86_64, and a full git clone; on other interpreters, macOS, or shallow
+  clones they skip cleanly unless `VOXWEAVE_STRICT_ORACLE=1` is set (which CI's primary `checks`
+  job enforces).
 - Lint / format: `make lint` (`make lint-check` is the read-only form CI runs; both use the
   pinned ruff version)

@@ -2,13 +2,12 @@
 
 This module owns filesystem generations, staging, publication order, and the
 post-primary SDH compare-and-swap. It never runs a model, renders or encodes:
-callers hand it final bytes produced and independently checked outside the
-episode lock. The only content it parses is split's speaker mapping, for the
-tolerant mapping observation.
+callers hand it final bytes produced outside the episode lock. The only content
+it parses is split's speaker mapping, for the tolerant mapping observation.
 
 Published VTT/JSON/SDH files are user deliverables and get ``fsio``'s
 deliverable permissions (umask for a new file, the existing mode on
-overwrite); the voiceprint sidecar and durable align evidence stay ``0o600``.
+overwrite); the voiceprint sidecar stays ``0o600``.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import errno
 import hashlib
 import os
 import stat
-import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -25,16 +23,8 @@ from pathlib import Path
 from typing import Literal
 
 from voxweave import fsio
-from voxweave.align_context import (
-    IssuedAlignContext,
-    IssuedSegmentationContext,
-    consume_context_role,
-    verify_context_binding,
-)
 from voxweave.align_failures import CanonicalFailure, SecondaryFailure
-from voxweave.align_runtime import align_runtime_activity
 from voxweave.sidecars import (
-    align_evidence_candidates,
     speaker_suggest_candidates,
     speakers_html_path,
     voiceprints_candidates,
@@ -118,9 +108,7 @@ class SpeakerMappingGeneration:
 @dataclass(frozen=True)
 class ArtifactCleanup:
     path: Path
-    detail_code: Literal[
-        "voiceprints-unlink", "suggest-unlink", "html-unlink", "evidence-unlink"
-    ]
+    detail_code: Literal["voiceprints-unlink", "suggest-unlink", "html-unlink"]
 
 
 def speaker_artifact_cleanups(
@@ -145,25 +133,8 @@ def speaker_artifact_cleanups(
     return cleanup
 
 
-def evidence_cleanups(
-    subtitle: Path, *, media: Path, keep: Path | None = None
-) -> list[ArtifactCleanup]:
-    """Return the align-evidence unlinks for ``subtitle``, skipping ``keep``."""
-    return [
-        ArtifactCleanup(path, "evidence-unlink")
-        for path in align_evidence_candidates(subtitle, media=media)
-        if path != keep
-    ]
-
-
 @dataclass(frozen=True)
 class MachineArtifactPublication:
-    path: Path
-    bytes_value: bytes
-
-
-@dataclass(frozen=True)
-class EvidencePublication:
     path: Path
     bytes_value: bytes
 
@@ -179,17 +150,6 @@ class _OwnedStage:
     target: Path
     path: Path
     private: bool = False
-
-
-@dataclass(frozen=True)
-class _SpeakerMappingBinding:
-    context: IssuedSegmentationContext
-    path: Path
-    generation: SpeakerMappingGeneration
-
-
-_SPEAKER_MAPPING_BINDINGS: dict[int, _SpeakerMappingBinding] = {}
-_SPEAKER_MAPPING_BINDINGS_LOCK = threading.RLock()
 
 
 class _PublicationError(RuntimeError):
@@ -260,7 +220,7 @@ class ArtifactCleanupError(_PublicationError):
 
 
 class TransactionOperationError(_PublicationError):
-    """A staged transaction operation failed at one closed P6 terminal."""
+    """A staged transaction operation failed."""
 
     def __init__(
         self,
@@ -348,7 +308,7 @@ def capture_speaker_mapping(
     known_ids: Sequence[str] | set[str],
     warn: Callable[[str], None],
 ) -> SpeakerMappingGeneration:
-    """Capture P11's one tolerant mapping observation and ordered name view."""
+    """Capture tolerant mapping observation and ordered name view."""
     target = Path(path)
     try:
         raw = target.read_bytes()
@@ -388,7 +348,7 @@ def capture_speaker_mapping(
 
 
 def observe_speaker_mapping_generation(path: Path) -> SpeakerMappingGeneration:
-    """Capture S1 without parsing names or emitting the tolerant S0 warning."""
+    """Capture mapping state without parsing names or emitting a warning."""
     target = Path(path)
     try:
         raw = target.read_bytes()
@@ -413,57 +373,11 @@ def observe_speaker_mapping_generation(path: Path) -> SpeakerMappingGeneration:
     return SpeakerMappingGeneration("readable-bytes", raw, "valid", None, ())
 
 
-def bind_split_speaker_mapping_generation(
-    context: IssuedSegmentationContext,
-    path: Path,
-    generation: SpeakerMappingGeneration,
-) -> None:
-    """Bind split's private S0 observation to its issued commit authority."""
-    if not isinstance(context, IssuedSegmentationContext):
-        raise TypeError("speaker mapping generation requires segmentation context")
-    if not isinstance(generation, SpeakerMappingGeneration):
-        raise TypeError("speaker mapping generation is not typed")
-    binding = _SpeakerMappingBinding(context, Path(path).resolve(), generation)
-    with _SPEAKER_MAPPING_BINDINGS_LOCK:
-        existing = _SPEAKER_MAPPING_BINDINGS.get(id(context))
-        if existing is not None:
-            raise ValueError("speaker mapping generation is already bound")
-        _SPEAKER_MAPPING_BINDINGS[id(context)] = binding
-
-
-def release_split_speaker_mapping_generation(
-    context: IssuedSegmentationContext,
-) -> None:
-    """Retire the private S0 path/observation binding with its selection."""
-    with _SPEAKER_MAPPING_BINDINGS_LOCK:
-        binding = _SPEAKER_MAPPING_BINDINGS.get(id(context))
-        if binding is not None and binding.context is context:
-            del _SPEAKER_MAPPING_BINDINGS[id(context)]
-
-
-def _require_bound_speaker_mapping(
-    context: IssuedSegmentationContext | None,
-    path: Path,
-    generation: SpeakerMappingGeneration,
-) -> None:
-    if context is None:
-        raise ValueError("split mapping CAS requires a segmentation context")
-    with _SPEAKER_MAPPING_BINDINGS_LOCK:
-        binding = _SPEAKER_MAPPING_BINDINGS.get(id(context))
-    if (
-        binding is None
-        or binding.context is not context
-        or binding.path != Path(path).resolve()
-        or binding.generation != generation
-    ):
-        raise ValueError("split speaker mapping generation is not context-bound")
-
-
 def same_speaker_mapping_generation(
     left: SpeakerMappingGeneration,
     right: SpeakerMappingGeneration,
 ) -> bool:
-    """Compare the closed RAT-7 S0/S1 domain without exception prose or paths."""
+    """Compare speaker mapping generations without exception prose or paths."""
     if left.kind != right.kind:
         return False
     if left.kind == "absent":
@@ -474,8 +388,7 @@ def same_speaker_mapping_generation(
 
 
 def _stage_bytes(target: Path, value: bytes) -> _OwnedStage:
-    """Write ``value`` to a fsynced ``0o600`` temp file next to ``target``
-    (named and swept by ``fsio``, so crash residue does not pile up)."""
+    """Write ``value`` to a fsynced ``0o600`` temp file next to ``target``."""
     destination = Path(target)
     descriptor, stage = fsio.make_temp(destination)
     try:
@@ -517,17 +430,16 @@ def _replace_primary(stage: _OwnedStage, detail_code: str) -> None:
 
 @contextmanager
 def _transaction_lock(path: Path) -> Iterator[None]:
-    with align_runtime_activity("AO-23", "episode-lock-acquire"):
-        try:
-            manager = episode_lock(Path(path))
-            manager.__enter__()
-        except Exception as exc:
-            raise TransactionOperationError(
-                "episode-lock-failed",
-                "episode-lock",
-                "episode-lock-acquire",
-                exc,
-            ) from exc
+    try:
+        manager = episode_lock(Path(path))
+        manager.__enter__()
+    except Exception as exc:
+        raise TransactionOperationError(
+            "episode-lock-failed",
+            "episode-lock",
+            "episode-lock-acquire",
+            exc,
+        ) from exc
     try:
         yield
     except BaseException as exc:
@@ -544,8 +456,6 @@ def _cleanup_after_primary(
     try:
         cleanup.path.unlink(missing_ok=True)
     except OSError as exc:
-        # A name too long to exist (a long media stem plus a legacy sidecar
-        # suffix) is absent too, as artifacts.path_present treats it.
         if exc.errno == errno.ENAMETOOLONG:
             return
         raise ArtifactCleanupError(cleanup, exc, outputs=outputs) from exc
@@ -557,13 +467,7 @@ def _defer_cleanup(
     *,
     outputs: str = "primary JSON/VTT outputs",
 ) -> None:
-    """Run one required cleanup, recording a failure instead of raising it.
-
-    The cleanups are independent of each other and of the machine artifact
-    that binds the already-landed primaries, so one undeletable file must not
-    stop them; the caller raises the first failure (later ones ride along as
-    secondaries) once they have all run.
-    """
+    """Run one required cleanup, recording a failure instead of raising it."""
     try:
         _cleanup_after_primary(cleanup, outputs=outputs)
     except ArtifactCleanupError as exc:
@@ -647,8 +551,6 @@ def _annotate_failure(
 def _stale(
     command: TransactionCommand, detail: str, problem: str = "changed"
 ) -> InputStaleError:
-    """``problem`` is a ``_generation_problem`` result: a read error is named
-    as such instead of being reported as a change."""
     messages = {
         "process": "output changed during processing; re-run",
         "split": "input changed during replay; re-run",
@@ -715,7 +617,7 @@ def require_media_pair_decision(
     voiceprint_media_fingerprint: str,
     expected_decision: bool,
 ) -> None:
-    """Recheck the snapshot-backed P11 pair decision under the episode lock."""
+    """Recheck the snapshot-backed voiceprint pair decision under the episode lock."""
     try:
         observed = media_fingerprint(Path(path))
     except OSError as exc:
@@ -727,37 +629,6 @@ def require_media_pair_decision(
         )
 
 
-def _consume_commit_role(
-    context: IssuedAlignContext | IssuedSegmentationContext | None,
-    *,
-    command: TransactionCommand,
-    vtt_path: Path,
-    json_path: Path,
-    media_path: Path | None,
-) -> None:
-    if context is None:
-        return
-    if isinstance(context, IssuedAlignContext):
-        if command != "align" or media_path is None:
-            raise ValueError("align context requires an align media transaction")
-        consumer = "align-transaction"
-        binding_media = media_path
-    elif isinstance(context, IssuedSegmentationContext):
-        if command == "align":
-            raise ValueError("segmentation context cannot authorize align")
-        consumer = "segmentation-transaction"
-        binding_media = None
-    else:
-        raise TypeError("unknown transaction context")
-    verify_context_binding(
-        context,
-        target_path=vtt_path,
-        sibling_path=json_path,
-        media_path=binding_media,
-    )
-    consume_context_role(context, "commit", consumer=consumer)
-
-
 def _validate_commit_request(
     *,
     command: TransactionCommand,
@@ -765,14 +636,11 @@ def _validate_commit_request(
     expected_media_fingerprint: str | None,
     expected_voiceprint_media_fingerprint: str | None,
     expected_pair_decision: bool | None,
-    evidence_artifact: EvidencePublication | None,
     speaker_mapping_path: Path | None,
     expected_speaker_mapping: SpeakerMappingGeneration | None,
 ) -> None:
     if command not in ("process", "split", "align"):
         raise ValueError("unknown transaction command")
-    if evidence_artifact is not None and command != "align":
-        raise ValueError("only align may publish durable evidence")
     if (speaker_mapping_path is None) != (expected_speaker_mapping is None):
         raise ValueError("split mapping CAS requires both path and S0 generation")
     if speaker_mapping_path is not None and command != "split":
@@ -801,13 +669,11 @@ class _CommitRequest:
     main_json_bytes: bytes
     vtt_bytes: bytes
     cleanup_paths: Sequence[ArtifactCleanup]
-    context: IssuedAlignContext | IssuedSegmentationContext | None
     media_path: Path | None
     expected_media_fingerprint: str | None
     expected_voiceprint_media_fingerprint: str | None
     expected_pair_decision: bool | None
     machine_artifact: MachineArtifactPublication | None
-    evidence_artifact: EvidencePublication | None
     speaker_mapping_path: Path | None
     expected_speaker_mapping: SpeakerMappingGeneration | None
 
@@ -820,7 +686,6 @@ class _CommitRun:
     landed: list[Path] = field(default_factory=list)
     machine_landed: list[Path] = field(default_factory=list)
     machine_stage: _OwnedStage | None = None
-    evidence_stage: _OwnedStage | None = None
 
 
 def _stage_outputs(request: _CommitRequest, run: _CommitRun) -> None:
@@ -839,15 +704,6 @@ def _stage_outputs(request: _CommitRequest, run: _CommitRun) -> None:
             private=True,
         )
         run.stages.append(run.machine_stage)
-    evidence_artifact = request.evidence_artifact
-    if evidence_artifact is not None:
-        run.evidence_stage = _stage_primary(
-            evidence_artifact.path,
-            evidence_artifact.bytes_value,
-            "evidence-stage",
-            private=True,
-        )
-        run.stages.append(run.evidence_stage)
 
 
 def _recheck_inputs(request: _CommitRequest) -> None:
@@ -876,16 +732,6 @@ def _recheck_inputs(request: _CommitRequest) -> None:
         )
     if request.speaker_mapping_path is not None:
         assert request.expected_speaker_mapping is not None
-        segmentation_context = (
-            request.context
-            if isinstance(request.context, IssuedSegmentationContext)
-            else None
-        )
-        _require_bound_speaker_mapping(
-            segmentation_context,
-            request.speaker_mapping_path,
-            request.expected_speaker_mapping,
-        )
         observed_mapping = observe_speaker_mapping_generation(
             request.speaker_mapping_path
         )
@@ -893,13 +739,6 @@ def _recheck_inputs(request: _CommitRequest) -> None:
             request.expected_speaker_mapping, observed_mapping
         ):
             raise _stale(command, "speaker-mapping-generation")
-    _consume_commit_role(
-        request.context,
-        command=command,
-        vtt_path=request.vtt_target,
-        json_path=request.json_target,
-        media_path=media_path,
-    )
 
 
 def _land_outputs(request: _CommitRequest, run: _CommitRun) -> None:
@@ -908,14 +747,8 @@ def _land_outputs(request: _CommitRequest, run: _CommitRun) -> None:
     ):
         _replace_primary(stage, detail_code)
         run.landed.append(stage.target)
-    # A failed cleanup is raised only after the remaining cleanups
-    # and the machine artifact (it binds the primaries that already
-    # landed) have run. Durable evidence attests a complete
-    # publication, so it is withheld once any cleanup failed.
     cleanup_failures: list[ArtifactCleanupError] = []
-    for cleanup in (
-        item for item in request.cleanup_paths if item.detail_code != "evidence-unlink"
-    ):
+    for cleanup in request.cleanup_paths:
         _defer_cleanup(cleanup, cleanup_failures)
     machine_artifact = request.machine_artifact
     if machine_artifact is not None:
@@ -935,17 +768,8 @@ def _land_outputs(request: _CommitRequest, run: _CommitRun) -> None:
             )
             raise cleanup_failures[0]
         run.machine_landed.append(machine_artifact.path)
-    for cleanup in (
-        item for item in request.cleanup_paths if item.detail_code == "evidence-unlink"
-    ):
-        _defer_cleanup(cleanup, cleanup_failures)
     if cleanup_failures:
         raise cleanup_failures[0]
-    evidence_artifact = request.evidence_artifact
-    if evidence_artifact is not None:
-        assert run.evidence_stage is not None
-        _replace_primary(run.evidence_stage, "evidence-replace")
-        run.landed.append(evidence_artifact.path)
 
 
 def commit_primary_outputs(
@@ -959,24 +783,21 @@ def commit_primary_outputs(
     main_json_bytes: bytes,
     vtt_bytes: bytes,
     cleanup_paths: Sequence[ArtifactCleanup] = (),
-    context: IssuedAlignContext | IssuedSegmentationContext | None = None,
     media_path: Path | None = None,
     expected_media_fingerprint: str | None = None,
     expected_voiceprint_media_fingerprint: str | None = None,
     expected_pair_decision: bool | None = None,
     machine_artifact: MachineArtifactPublication | None = None,
-    evidence_artifact: EvidencePublication | None = None,
     speaker_mapping_path: Path | None = None,
     expected_speaker_mapping: SpeakerMappingGeneration | None = None,
 ) -> TransactionReceipt:
-    """Stage final bytes, recheck, authorize, and publish in command order."""
+    """Stage final bytes, recheck optimistic generations, and publish in order."""
     _validate_commit_request(
         command=command,
         media_path=media_path,
         expected_media_fingerprint=expected_media_fingerprint,
         expected_voiceprint_media_fingerprint=expected_voiceprint_media_fingerprint,
         expected_pair_decision=expected_pair_decision,
-        evidence_artifact=evidence_artifact,
         speaker_mapping_path=speaker_mapping_path,
         expected_speaker_mapping=expected_speaker_mapping,
     )
@@ -989,25 +810,20 @@ def commit_primary_outputs(
         main_json_bytes=main_json_bytes,
         vtt_bytes=vtt_bytes,
         cleanup_paths=cleanup_paths,
-        context=context,
         media_path=media_path,
         expected_media_fingerprint=expected_media_fingerprint,
         expected_voiceprint_media_fingerprint=expected_voiceprint_media_fingerprint,
         expected_pair_decision=expected_pair_decision,
         machine_artifact=machine_artifact,
-        evidence_artifact=evidence_artifact,
         speaker_mapping_path=speaker_mapping_path,
         expected_speaker_mapping=expected_speaker_mapping,
     )
     run = _CommitRun()
     try:
-        with align_runtime_activity("AO-22", "primary-and-evidence-stage"):
-            _stage_outputs(request, run)
+        _stage_outputs(request, run)
         with _transaction_lock(Path(episode_path)):
-            with align_runtime_activity("AO-23", "generation-and-binding-recheck"):
-                _recheck_inputs(request)
-            with align_runtime_activity("AO-24", "commit-and-required-cleanup"):
-                _land_outputs(request, run)
+            _recheck_inputs(request)
+            _land_outputs(request, run)
     except BaseException as exc:
         leftovers = _discard_stages(run.stages)
         if leftovers:
@@ -1040,9 +856,8 @@ def commit_correction(
     vtt_path: Path,
     expected_vtt: FileGeneration,
     rendered_vtt_bytes: bytes,
-    evidence_paths: Sequence[Path],
 ) -> TransactionReceipt:
-    """Unconditionally rewrite C1 after C0 CAS and retire changed-byte evidence."""
+    """Rewrite ``vtt_path`` after optimistic generation check under the episode lock."""
     target = Path(vtt_path)
     stage = _stage_primary(target, rendered_vtt_bytes, "vtt-stage")
     landed: list[Path] = []
@@ -1058,18 +873,6 @@ def commit_correction(
                 )
             _replace_primary(stage, "vtt-replace")
             landed.append(target)
-            if rendered_vtt_bytes != expected_vtt.bytes_value:
-                cleanup_failures: list[ArtifactCleanupError] = []
-                for evidence_path in dict.fromkeys(
-                    Path(path) for path in evidence_paths
-                ):
-                    _defer_cleanup(
-                        ArtifactCleanup(evidence_path, "evidence-unlink"),
-                        cleanup_failures,
-                        outputs="the corrected VTT",
-                    )
-                if cleanup_failures:
-                    raise cleanup_failures[0]
     except BaseException as exc:
         leftovers = _discard_stages((stage,))
         if leftovers:
@@ -1130,7 +933,6 @@ def commit_auxiliary_sdh(
 __all__ = [
     "ArtifactCleanup",
     "ArtifactCleanupError",
-    "EvidencePublication",
     "FileGeneration",
     "InputStaleError",
     "MappingObservation",
@@ -1143,15 +945,12 @@ __all__ = [
     "TransactionOperationError",
     "capture_file_generation",
     "capture_speaker_mapping",
-    "bind_split_speaker_mapping_generation",
     "commit_auxiliary_sdh",
     "commit_correction",
     "commit_primary_outputs",
-    "evidence_cleanups",
-    "release_split_speaker_mapping_generation",
+    "observe_speaker_mapping_generation",
     "require_media_generation",
     "same_file_generation",
     "same_speaker_mapping_generation",
-    "observe_speaker_mapping_generation",
     "speaker_artifact_cleanups",
 ]

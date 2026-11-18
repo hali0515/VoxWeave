@@ -192,9 +192,15 @@ def test_bare_gated_model_is_still_refused_without_token(
 
 
 def _gated_repo_error() -> Exception:
+    import requests
     from huggingface_hub.errors import GatedRepoError
 
-    return GatedRepoError("Access to model X is restricted and you are not in it")
+    response = requests.Response()
+    response.status_code = 403
+    return GatedRepoError(
+        "Access to model X is restricted and you are not in it",
+        response=response,
+    )
 
 
 def _http_error(status: int) -> Exception:
@@ -203,7 +209,7 @@ def _http_error(status: int) -> Exception:
 
     response = requests.Response()
     response.status_code = status
-    return HfHubHTTPError(f"{status} Client Error", response)
+    return HfHubHTTPError(f"{status} Client Error", response=response)
 
 
 def test_pipeline_config_path_propagates_gated_error(
@@ -478,11 +484,10 @@ def _refusal(url: str | None, message: str = "403 Client Error") -> Exception:
     import requests
     from huggingface_hub.errors import HfHubHTTPError
 
-    if url is None:
-        return HfHubHTTPError(message)
     response = requests.Response()
     response.status_code = 403
-    response.url = url
+    if url is not None:
+        response.url = url
     return HfHubHTTPError(message, response=response)
 
 

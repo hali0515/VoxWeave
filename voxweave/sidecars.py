@@ -106,14 +106,5 @@ def speaker_suggest_candidates(path: Path) -> tuple[Path, ...]:
     )
 
 
-def align_evidence_candidates(
-    subtitle: Path,
-    *,
-    media: Path | None = None,
-) -> tuple[Path, ...]:
-    owner = Path(media) if media is not None else artifact_owner(Path(subtitle))
-    return artifacts.align_evidence_candidates(owner, Path(subtitle))
-
-
 def speakers_html_path(path: Path) -> Path:
     return swap_ext(Path(path), ".speakers.html")

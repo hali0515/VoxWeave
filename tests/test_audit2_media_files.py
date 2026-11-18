@@ -90,19 +90,6 @@ def test_primaries_keep_their_mode_and_machine_artifacts_stay_private(
     assert _mode(machine) == 0o600  # voice biometrics stay private
 
 
-def test_align_evidence_is_private(tmp_path, umask_022):
-    json_path, vtt_path = _primaries(tmp_path)
-    evidence = tmp_path / "episode.align-evidence.json"
-    _commit(
-        json_path,
-        vtt_path,
-        command="align",
-        evidence_artifact=et.EvidencePublication(evidence, b"{}\n"),
-    )
-    assert _mode(evidence) == 0o600
-    assert _mode(json_path) == 0o644
-
-
 def test_sdh_and_correction_are_deliverables(tmp_path, umask_022):
     json_path, vtt_path = _primaries(tmp_path)
     os.chmod(vtt_path, 0o640)
@@ -121,7 +108,6 @@ def test_sdh_and_correction_are_deliverables(tmp_path, umask_022):
         vtt_path=vtt_path,
         expected_vtt=et.capture_file_generation(vtt_path),
         rendered_vtt_bytes=b"corrected",
-        evidence_paths=(),
     )
     assert _mode(sidecar) == 0o644
     assert _mode(vtt_path) == 0o640
@@ -177,8 +163,8 @@ def test_cleanup_failure_still_publishes_the_machine_artifact(tmp_path, monkeypa
     json_path, vtt_path = _primaries(tmp_path)
     suggest = tmp_path / "episode.speakers.suggest.json"
     html = tmp_path / "episode.speakers.html"
-    evidence = tmp_path / "episode.align-evidence.json"
-    for path in (suggest, html, evidence):
+    undo = tmp_path / "episode.speaker-split.undo.json"
+    for path in (suggest, html, undo):
         path.write_bytes(b"stale")
     machine = tmp_path / "voiceprints.json"
     _fail_unlink_of(monkeypatch, suggest, html)
@@ -190,7 +176,7 @@ def test_cleanup_failure_still_publishes_the_machine_artifact(tmp_path, monkeypa
             cleanup_paths=(
                 et.ArtifactCleanup(suggest, "suggest-unlink"),
                 et.ArtifactCleanup(html, "html-unlink"),
-                et.ArtifactCleanup(evidence, "evidence-unlink"),
+                et.ArtifactCleanup(undo, "undo-unlink"),
             ),
             machine_artifact=et.MachineArtifactPublication(machine, b"new machine"),
         )
@@ -201,31 +187,10 @@ def test_cleanup_failure_still_publishes_the_machine_artifact(tmp_path, monkeypa
     assert error.landed == (json_path, vtt_path)
     assert error.machine_landed == (machine,)
     assert machine.read_bytes() == b"new machine"
-    assert not evidence.exists()  # the later, independent cleanup still ran
+    assert not undo.exists()  # the later, independent cleanup still ran
     assert suggest.exists() and html.exists()
     assert str(error).startswith("primary JSON/VTT outputs landed")
     assert "already written: episode.json, episode.vtt, voiceprints.json" in str(error)
-    assert not tuple(tmp_path.glob(".*.part*"))
-
-
-def test_cleanup_failure_withholds_align_evidence(tmp_path, monkeypatch):
-    json_path, vtt_path = _primaries(tmp_path)
-    voiceprints = tmp_path / "episode.voiceprints.json"
-    voiceprints.write_bytes(b"sensitive")
-    evidence = tmp_path / "episode.align-evidence.json"
-    _fail_unlink_of(monkeypatch, voiceprints)
-
-    with pytest.raises(et.ArtifactCleanupError) as caught:
-        _commit(
-            json_path,
-            vtt_path,
-            command="align",
-            cleanup_paths=(et.ArtifactCleanup(voiceprints, "voiceprints-unlink"),),
-            evidence_artifact=et.EvidencePublication(evidence, b"{}\n"),
-        )
-
-    assert caught.value.landed == (json_path, vtt_path)
-    assert not evidence.exists()
     assert not tuple(tmp_path.glob(".*.part*"))
 
 
@@ -260,27 +225,6 @@ def test_machine_replace_failure_after_cleanup_failure_is_secondary(
     assert caught.value.machine_landed == ()
     assert not machine.exists()
     assert not tuple(tmp_path.glob(".*.part*"))
-
-
-def test_correction_cleanup_failure_names_only_the_vtt(tmp_path, monkeypatch):
-    _json_path, vtt_path = _primaries(tmp_path)
-    evidence = tmp_path / "episode.align-evidence.json"
-    evidence.write_bytes(b"stale")
-    _fail_unlink_of(monkeypatch, evidence)
-
-    with pytest.raises(et.ArtifactCleanupError) as caught:
-        et.commit_correction(
-            episode_path=vtt_path,
-            vtt_path=vtt_path,
-            expected_vtt=et.capture_file_generation(vtt_path),
-            rendered_vtt_bytes=b"corrected",
-            evidence_paths=(evidence,),
-        )
-
-    message = str(caught.value)
-    assert message.startswith("the corrected VTT landed")
-    assert "JSON" not in message
-    assert caught.value.landed == (vtt_path,)
 
 
 # -- partial publication and read errors reach the message --------------------

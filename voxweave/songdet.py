@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import contextlib
-import csv
-import io
 import logging
 import os
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -24,19 +20,11 @@ _env_float = config._env_float
 # PANNs Cnn14 training SR — must feed 32k; 16k input causes a sample-rate mismatch.
 SR = 32000
 
-# Explicit local path wins; otherwise pulled from HF (-> config.AUDIO_CACHE) instead of
-# panns_inference's default Zenodo ~/panns_data, keeping all weights under the HF cache root.
+# Explicit local path wins; otherwise pulled from HF (-> config.AUDIO_CACHE), keeping all
+# weights under the HF cache root. AudioSet display labels ship in voxweave.vendor.panns_cnn14.
 PANNS_CKPT = os.path.expanduser(os.environ.get("VOXWEAVE_PANNS_CKPT", ""))
 PANNS_REPO = os.environ.get("VOXWEAVE_PANNS_REPO", "thelou1s/panns-inference")
 PANNS_REPO_FILE = os.environ.get("VOXWEAVE_PANNS_REPO_FILE", "Cnn14_mAP=0.431.pth")
-# panns_inference.config reads ~/panns_data/class_labels_indices.csv at import time; canonical source.
-PANNS_LABELS_FILE = "class_labels_indices.csv"
-PANNS_LABELS_URL = os.environ.get(
-    "VOXWEAVE_PANNS_LABELS_URL",
-    "https://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv",
-)
-# A complete labels csv: this header plus one row per Cnn14 output class.
-_PANNS_LABELS_HEADER = ["index", "mid", "display_name"]
 PANNS_CLASSES = 527
 
 # AudioSet class indices (class_labels_indices.csv)
@@ -83,7 +71,7 @@ MIN_KEEP_SEC = 0.4  # excised remainders shorter than this are noise shards, dro
 # shorter remainders are inter-sentence pauses (PANNs 2s windows blur them) and stay out.
 SPEECH_RESCUE_MIN_SEC = _env_float("VOXWEAVE_SPEECH_RESCUE_MIN_S", 3.0)
 
-_model = None  # AudioTagging singleton — lazy-loaded, reused within the process
+_model = None  # PannsTagger singleton — lazy-loaded, reused within the process
 
 
 def _resolve_panns_ckpt() -> str:
@@ -95,122 +83,25 @@ def _resolve_panns_ckpt() -> str:
     return _hf_download(PANNS_REPO, PANNS_REPO_FILE, cache_dir=config.AUDIO_CACHE)
 
 
-def _panns_labels_ok(data: bytes) -> bool:
-    """True when ``data`` is a complete AudioSet labels csv: the header plus one row per class.
-
-    An empty file, a truncated download or an HTML error page saved under the csv name would
-    otherwise reach panns_inference, which sizes Cnn14's output layer from the row count."""
-    try:
-        rows = [r for r in csv.reader(io.StringIO(data.decode("utf-8-sig"))) if r]
-    except (UnicodeDecodeError, csv.Error):
-        return False
-    return (
-        bool(rows)
-        and rows[0] == _PANNS_LABELS_HEADER
-        and len(rows) == PANNS_CLASSES + 1
-    )
-
-
-def _ensure_panns_labels() -> None:
-    """Pre-place ~/panns_data/class_labels_indices.csv so importing panns_inference never shells out
-    to `wget` (its config.py wgets this file at import time — wget is absent on macOS). Pulls from the
-    same HF repo as the checkpoint when available, else the canonical AudioSet URL via urllib.
-
-    An existing file is kept only when it is a complete labels csv; anything else (empty,
-    truncated, an HTML error page) is re-fetched. The write is atomic (temp file + replace), so
-    an interrupted fetch never leaves a partial csv behind. Raises RuntimeError naming the path
-    and URL when no valid copy can be obtained."""
-    dst = Path.home() / "panns_data" / PANNS_LABELS_FILE
-    try:
-        if _panns_labels_ok(dst.read_bytes()):
-            return
-        log.warning("PANNs labels %s is incomplete or corrupt; re-fetching", dst)
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        log.warning("cannot read PANNs labels %s (%r); re-fetching", dst, e)
-
-    def _fail(why: str) -> RuntimeError:
-        return RuntimeError(
-            f"cannot obtain the PANNs labels csv ({why}); download {PANNS_LABELS_URL} "
-            f"and place it manually at {dst}"
-        )
-
-    data = b""
-    try:  # prefer HF (cached under AUDIO_CACHE, same source as the checkpoint)
-        from voxweave.runtime import _hf_download
-
-        src = _hf_download(PANNS_REPO, PANNS_LABELS_FILE, cache_dir=config.AUDIO_CACHE)
-        data = Path(src).read_bytes()
-    except Exception:  # noqa: BLE001 -- repo may not host the csv; fall back to the canonical URL
-        pass
-    if not _panns_labels_ok(data):
-        import http.client
-        import urllib.request
-
-        try:
-            # fixed trusted host; the timeout keeps a stalled connection from hanging the job
-            with urllib.request.urlopen(PANNS_LABELS_URL, timeout=30) as r:  # noqa: S310
-                data = r.read()
-        except (OSError, ValueError, http.client.HTTPException) as e:
-            raise _fail(f"download failed: {e!r}") from e
-        if not _panns_labels_ok(data):
-            raise _fail(
-                f"{PANNS_LABELS_URL} did not return a {PANNS_CLASSES}-class csv"
-            )
-    try:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{PANNS_LABELS_FILE}.")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            os.replace(tmp, dst)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
-    except OSError as e:
-        raise _fail(f"write failed: {e!r}") from e
-    log.info("placed PANNs labels -> %s", dst)
-
-
 def panns_labels() -> list[str]:
-    """AudioSet display names in PANNs output order (column i of :func:`window_probs`).
+    """AudioSet display names in PANNs output order (column i of :func:`window_probs`)."""
+    from voxweave.vendor.panns_cnn14 import AUDIOSET_LABELS
 
-    Ensures the labels csv first: importing panns_inference without it runs the package's own
-    import-time ``wget`` bootstrap."""
-    _ensure_panns_labels()
-    from panns_inference import labels
-
-    return labels
+    return list(AUDIOSET_LABELS)
 
 
 def _get_model():
     global _model
     if _model is None:
-        _ensure_panns_labels()  # must precede the import: panns_inference.config reads the csv eagerly
-        from panns_inference import AudioTagging
-
         from voxweave.runtime import get_device
+        from voxweave.vendor.panns_cnn14 import PannsTagger
 
-        # Honour VOXWEAVE_DEVICE / cuda -> mps -> cpu like every other model. AudioTagging
-        # itself only knows the exact string "cuda", and then wraps the net in DataParallel
-        # over EVERY visible GPU; any other string makes it load on CPU. So pass the resolved
-        # device (bare "cuda" pinned to one card) and move the bare module there ourselves.
+        # Honour VOXWEAVE_DEVICE / cuda -> mps -> cpu like every other model, pinned to one card.
         dev = get_device()
         if dev == "cuda":
             dev = "cuda:0"
-        # Pass checkpoint explicitly so panns_inference never falls back to its ~/panns_data Zenodo download.
         ckpt = _resolve_panns_ckpt()
-        # AudioTagging print()s its setup; stdout must carry only result paths (CLI contract).
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            m = AudioTagging(checkpoint_path=ckpt, device=dev)
-        for line in out.getvalue().splitlines():
-            log.debug("panns_inference: %s", line)
-        if m.device != dev:
-            m.model.to(dev)
-            m.device = dev  # inference() moves each input batch to self.device
-        _model = m
+        _model = PannsTagger(checkpoint_path=ckpt, device=dev)
         log.info("PANNs Cnn14 loaded on %s (%s)", dev, ckpt)
     return _model
 

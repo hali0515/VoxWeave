@@ -12,15 +12,12 @@ from __future__ import annotations
 import logging
 import os
 from collections import namedtuple
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from functools import partial
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
 from voxweave import config
 from voxweave.align_common import (
-    _DeferredLegacyProjection,
     _PreparedDpCall,
     _distribute_units,
     _env_float_in_range,
@@ -29,7 +26,6 @@ from voxweave.align_common import (
     _mask_emissions_outside_speech,
     _preflight_over_budget_hints,
     _prepare_dp_calls,
-    _run_directly,
     _strip_trailing_punct,
     interp_missing,
     mute_spans_in_wav,
@@ -218,15 +214,13 @@ def _ctc_align_logp(
     words,
     nospace,
     total_samples,
-    pre_interpolation_observer: Callable[[list[dict] | None], None] | None = None,
 ):
     """[T,V] log-probs + tokens -> word/char units. Shared by per-chunk and full-file CTC.
 
     Appends a wildcard column for OOV tokens (WhisperX technique), runs forced_align + merge,
     maps frames to seconds via total_samples/T/sr. No-space langs also pass through
     :func:`interp_missing`, a guard that changes nothing in practice (every merged token
-    span covers at least one frame); ``pre_interpolation_observer`` receives the units as
-    they were before it (``None`` for spaced languages).
+    span covers at least one frame).
     """
     import torch
     import torchaudio.functional as AF
@@ -252,14 +246,8 @@ def _ctc_align_logp(
     spans = AF.merge_tokens(aligned[0], scores[0], blank=al.blank)
     ratio = total_samples / logp.shape[0] / al.sr
     units = _ctc_words_from_spans(spans, meta, words, ratio)
-    original_units: list[dict] | None = None
     if nospace:  # zero-length guard (see interp_missing); never drops a character
-        # A shallow list snapshot preserves the backend dictionaries exactly as they
-        # existed before interpolation.  No recursive AO-07 traversal occurs here.
-        original_units = list(units)
         units = interp_missing(units)
-    if pre_interpolation_observer is not None:
-        pre_interpolation_observer(original_units)
     return units
 
 
@@ -332,43 +320,25 @@ def _ctc_flat_pass(
     norm: list[str],
     nospace: bool,
     speech_spans: list[tuple[float, float]] | None = None,
-    *,
-    _raw_result_observer: Callable[[list[dict]], None] | None = None,
-    _raw_original_observer: Callable[[list[dict] | None], None] | None = None,
-    _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[dict]:
-    """Return one flat normalized result before any owner distribution."""
-
+    """Return one flat normalized result before per-block distribution."""
     toks, meta, words = _ctc_build_tokens(norm, nospace, al)
     if not words:
-        units: list[dict] = []
-    else:
-
-        def align_flat_result() -> list[dict]:
-            logp = _ctc_emit_full(al, wav)
-            if speech_spans:
-                logp = _mask_emissions_outside_speech(
-                    logp, speech_spans, wav.shape[-1], al.sr, al.blank
-                )
-            return _ctc_align_logp(
-                al,
-                logp,
-                toks,
-                meta,
-                words,
-                nospace,
-                wav.shape[-1],
-                _raw_original_observer,
-            )
-
-        units = (
-            align_flat_result()
-            if _backend_invoker is None
-            else _backend_invoker(align_flat_result)
+        return []
+    logp = _ctc_emit_full(al, wav)
+    if speech_spans:
+        logp = _mask_emissions_outside_speech(
+            logp, speech_spans, wav.shape[-1], al.sr, al.blank
         )
-    if _raw_result_observer is not None:
-        _raw_result_observer(units)
-    return units
+    return _ctc_align_logp(
+        al,
+        logp,
+        toks,
+        meta,
+        words,
+        nospace,
+        wav.shape[-1],
+    )
 
 
 def _ctc_full_pass(
@@ -378,31 +348,10 @@ def _ctc_full_pass(
     nospace: bool,
     iso: str,
     speech_spans: list[tuple[float, float]] | None = None,
-    *,
-    _raw_result_observer: Callable[[list[dict]], None] | None = None,
-    _raw_original_observer: Callable[[list[dict] | None], None] | None = None,
-    _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-    _legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
-    """Run one flat CTC pass and distribute its retained legacy owners."""
-
-    units = _ctc_flat_pass(
-        al,
-        wav,
-        norm,
-        nospace,
-        speech_spans,
-        _raw_result_observer=_raw_result_observer,
-        _raw_original_observer=_raw_original_observer,
-        _backend_invoker=_backend_invoker,
-    )
-
-    def distribute() -> list[list[dict]]:
-        return _distribute_units(units, norm, iso)
-
-    if _legacy_distribution_invoker is None:
-        return distribute()
-    return _legacy_distribution_invoker(distribute)
+    """Run one flat CTC pass and distribute units back to each block."""
+    units = _ctc_flat_pass(al, wav, norm, nospace, speech_spans)
+    return _distribute_units(units, norm, iso)
 
 
 def _prepare_ctc_calls(
@@ -439,104 +388,6 @@ def _load_fixed_rate_ctc_aligner(iso: str, model_name: str):
     return loaded
 
 
-@dataclass
-class _CtcBlockPasses:
-    """The aligner and invokers shared by the physical passes of one
-    :func:`align_blocks_full_ctc` call; ``source_cursor`` numbers the blocks."""
-
-    al: Any
-    iso: str
-    nospace: bool
-    speech_spans: list[tuple[float, float]] | None
-    raw_call_observer: Callable[..., None] | None
-    backend_invoker: Callable[[Callable[[], Any]], Any] | None
-    legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None
-    source_cursor: int = 0
-
-    def run(
-        self,
-        w,
-        sub: list[str],
-        offset_s: float = 0.0,
-        *,
-        audio_sample_start: int,
-        audio_sample_end: int,
-        sample_count: int,
-    ) -> list[list[dict]] | _DeferredLegacyProjection:
-        al = self.al
-        _raw_call_observer = self.raw_call_observer
-        source_indices = tuple(range(self.source_cursor, self.source_cursor + len(sub)))
-        self.source_cursor += len(sub)
-        spans_rel = None
-        if self.speech_spans:
-            end_s = offset_s + w.shape[-1] / al.sr
-            spans_rel = [
-                (max(0.0, s - offset_s), min(end_s, e) - offset_s)
-                for s, e in self.speech_spans
-                if e > offset_s and s < end_s
-            ]
-        raw_result: list[dict] | None = None
-        original_result: list[dict] | None = None
-
-        def capture_raw(value: list[dict]) -> None:
-            nonlocal raw_result
-            raw_result = value
-            if _raw_call_observer is not None:
-                _raw_call_observer(
-                    raw_result if raw_result is not None else [],
-                    original_result,
-                    source_indices,
-                    offset_s,
-                    audio_sample_start=audio_sample_start,
-                    audio_sample_end=audio_sample_end,
-                    sample_rate=al.sr,
-                    sample_count=sample_count,
-                    nominal_end_seconds=None,
-                )
-
-        def capture_original(value: list[dict] | None) -> None:
-            nonlocal original_result
-            original_result = value
-
-        flat_observer = capture_raw if _raw_call_observer is not None else None
-        original_observer = capture_original if _raw_call_observer is not None else None
-        if self.legacy_distribution_invoker is None:
-            out: list[list[dict]] | _DeferredLegacyProjection = _ctc_full_pass(
-                al,
-                w,
-                sub,
-                self.nospace,
-                self.iso,
-                speech_spans=spans_rel,
-                _raw_result_observer=flat_observer,
-                _raw_original_observer=original_observer,
-                _backend_invoker=self.backend_invoker,
-            )
-        else:
-            flat = _ctc_flat_pass(
-                al,
-                w,
-                sub,
-                self.nospace,
-                speech_spans=spans_rel,
-                _raw_result_observer=flat_observer,
-                _raw_original_observer=original_observer,
-                _backend_invoker=self.backend_invoker,
-            )
-
-            def distribute() -> list[list[dict]]:
-                return _distribute_units(flat, sub, self.iso)
-
-            out = _DeferredLegacyProjection(distribute, offset_s)
-        if _raw_call_observer is not None and raw_result is None:
-            raise RuntimeError("CTC flat result was not observed before distribution")
-        if self.backend_invoker is None:
-            _empty_cache()
-        else:
-            self.backend_invoker(_empty_cache)
-        return out
-
-
 def align_blocks_full_ctc(
     wav_path: Path,
     texts: list[str],
@@ -546,11 +397,6 @@ def align_blocks_full_ctc(
     speech_spans: list[tuple[float, float]] | None = None,
     crop_to_envelope: bool = False,
     mute_spans: Sequence[tuple[float, float]] | None = None,
-    _preparation_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-    _raw_call_observer: Callable[..., None] | None = None,
-    _backend_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-    _legacy_distribution_invoker: Callable[[Callable[[], Any]], Any] | None = None,
-    _legacy_shift_invoker: Callable[[Callable[[], Any]], Any] | None = None,
 ) -> list[list[dict]]:
     """Full-audio single-pass wav2vec2 CTC alignment (en analogue of align_blocks_full_mms).
 
@@ -566,46 +412,36 @@ def align_blocks_full_ctc(
 
     Every call is prepared (audio loaded at 16 kHz, hints validated, songs muted, DP
     chunks planned and checked) before the model is loaded, so unsafe long-media hints
-    are refused without model work; ``_preparation_invoker`` only wraps that step.
+    are refused without model work.
     """
-    if (_legacy_distribution_invoker is None) != (_legacy_shift_invoker is None):
-        raise ValueError("legacy projection phase invokers must be supplied together")
-
     if os.environ.get("VOXWEAVE_VAD_EMISSION_MASK", "").strip() != "1":
         speech_spans = None
 
-    prepared_calls = cast(
-        list[_PreparedDpCall],
-        (_preparation_invoker or _run_directly)(
-            partial(
-                _prepare_ctc_calls,
-                wav_path,
-                texts,
-                bounds,
-                mute_spans,
-                crop_to_envelope,
-            )
-        ),
+    prepared_calls = _prepare_ctc_calls(
+        wav_path,
+        texts,
+        bounds,
+        mute_spans,
+        crop_to_envelope,
     )
 
-    load_aligner = partial(_load_fixed_rate_ctc_aligner, iso, model_name)
-    al = load_aligner() if _backend_invoker is None else _backend_invoker(load_aligner)
-    passes = _CtcBlockPasses(
-        al=al,
-        iso=iso,
-        nospace=iso in ALIGNER_NO_SPACE_LANGS,
-        speech_spans=speech_spans,
-        raw_call_observer=_raw_call_observer,
-        backend_invoker=_backend_invoker,
-        legacy_distribution_invoker=_legacy_distribution_invoker,
-    )
-    return _execute_dp_calls(
-        prepared_calls,
-        passes.run,
-        pass_physical_geometry=True,
-        legacy_distribution_invoker=_legacy_distribution_invoker,
-        legacy_shift_invoker=_legacy_shift_invoker,
-    )
+    al = _load_fixed_rate_ctc_aligner(iso, model_name)
+    nospace = iso in ALIGNER_NO_SPACE_LANGS
+
+    def _pass(w, sub: list[str], offset_s: float = 0.0) -> list[list[dict]]:
+        spans_rel = None
+        if speech_spans:
+            end_s = offset_s + w.shape[-1] / al.sr
+            spans_rel = [
+                (max(0.0, s - offset_s), min(end_s, e) - offset_s)
+                for s, e in speech_spans
+                if e > offset_s and s < end_s
+            ]
+        out = _ctc_full_pass(al, w, sub, nospace, iso, speech_spans=spans_rel)
+        _empty_cache()
+        return out
+
+    return _execute_dp_calls(prepared_calls, _pass)
 
 
 def align_text_ctc(wav_path: Path, text: str, iso: str, model_name: str) -> list[dict]:

@@ -7,10 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from voxweave import artifacts, episode_transaction
+from voxweave import artifacts, episode_transaction, publication
 from voxweave import sdh as sdh_mod
 from voxweave.chunking import decode_to_wav
-from voxweave.core.shadow_v2 import shadow_enabled
 from voxweave.paths import swap_ext
 from voxweave.progress import Reporter, progress_bridge
 from voxweave.segmentation import segment_document
@@ -168,8 +167,6 @@ def _finish_process_from_units(
 
     rep.step("write outputs")
     rep.stage("write siblings")
-    from voxweave import segmentation_orchestration
-
     if segmented.document is None or segmented.manifest is None:
         raise RuntimeError("segmentation result lacks its production authority")
     if capture is not None and capture.turns is not speaker_turns:
@@ -197,62 +194,40 @@ def _finish_process_from_units(
                 voiceprints_path(media_path), sidecar_bytes
             )
 
-    selection = segmentation_orchestration.build_segmentation_selection(
-        command="process",
-        target_path=swap_ext(media_path, ".vtt"),
-        sibling_path=swap_ext(media_path, ".json"),
+    encoded, selected_sdh_cues = publication.encode_segmentation_outputs(
         language=iso,
         cues=cues,
         top_level_units=units,
-        document=segmented.document,
         manifest=segmented.manifest,
         vad_speech=vad_speech,
         shot_changes=shot_changes,
         sing_spans=sing_spans,
-        speaker_turns=segmentation_orchestration.semantic_speaker_turns_carrier(
-            speaker_turns
-        ),
+        speaker_turns=publication.semantic_speaker_turns_carrier(speaker_turns),
         voiceprint_pair=voiceprint_pair,
         timestamps=timestamps,
         speaker_names=(),
-        expected_json=source.expected_json,
-        expected_vtt=source.expected_vtt,
-        source_mode=source.mode,
-        mapping_generation=None,
-        mapping_path=None,
-        shadow_enabled=shadow_enabled(),
     )
     cleanup = episode_transaction.speaker_artifact_cleanups(
         media_path, media_path, voiceprints=machine_artifact is None
     )
-    cleanup.extend(
-        episode_transaction.evidence_cleanups(
-            swap_ext(media_path, ".vtt"), media=media_path
-        )
+    receipt = episode_transaction.commit_primary_outputs(
+        command="process",
+        episode_path=media_path,
+        json_path=swap_ext(media_path, ".json"),
+        vtt_path=swap_ext(media_path, ".vtt"),
+        expected_json=source.expected_json,
+        expected_vtt=source.expected_vtt,
+        main_json_bytes=encoded.main_json_bytes,
+        vtt_bytes=encoded.vtt_bytes,
+        cleanup_paths=tuple(cleanup),
+        media_path=(
+            media_path if source.expected_media_fingerprint is not None else None
+        ),
+        expected_media_fingerprint=source.expected_media_fingerprint,
+        machine_artifact=machine_artifact,
     )
-    try:
-        receipt = episode_transaction.commit_primary_outputs(
-            command="process",
-            episode_path=media_path,
-            json_path=swap_ext(media_path, ".json"),
-            vtt_path=swap_ext(media_path, ".vtt"),
-            expected_json=source.expected_json,
-            expected_vtt=source.expected_vtt,
-            main_json_bytes=selection.verified.main_json_bytes,
-            vtt_bytes=selection.verified.vtt_bytes,
-            cleanup_paths=tuple(cleanup),
-            context=selection.context,
-            media_path=(
-                media_path if source.expected_media_fingerprint is not None else None
-            ),
-            expected_media_fingerprint=source.expected_media_fingerprint,
-            machine_artifact=machine_artifact,
-        )
-    finally:
-        segmentation_orchestration.retire_segmentation_selection(selection)
     vtt_out = swap_ext(media_path, ".vtt")
     landed = receipt.landed
-    selected_sdh_cues: Sequence[Mapping[str, Any]] = selection.sdh_dialogue
     if machine_artifact is not None:
         log.info("wrote voice-biometric sidecar %s", machine_artifact.path.name)
     log.info("wrote %s + .json (%d cues, lang=%s)", vtt_out.name, len(cues), iso)
@@ -291,7 +266,7 @@ def _write_sdh_sidecar(
 ) -> Path | None:
     """Detect non-speech events on the ORIGINAL mix (effects are stripped from the
     separated-vocals stem) and write ``<stem>.sdh.vtt`` (dialogue + event tags).
-    Returns None when panns-inference is missing (warned, non-fatal)."""
+    Returns None when the PANNs module is missing (warned, non-fatal)."""
     rep.stage("SDH event detection (PANNs)")
     wav32 = decode_to_wav(media_path, sample_rate=SONGDET_SR)
     try:
@@ -300,7 +275,7 @@ def _write_sdh_sidecar(
         )
     except ModuleNotFoundError as e:
         log.warning(
-            "SDH detection requires panns-inference (not installed: %s); skipping sidecar",
+            "SDH detection unavailable (missing module: %s); skipping sidecar",
             e,
         )
         return None

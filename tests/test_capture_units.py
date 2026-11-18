@@ -603,7 +603,13 @@ def test_tags_are_split_deduplicated_and_required(
 
 def test_units_only_imports_no_model_code(sibling: Path, tmp_path: Path) -> None:
     """--units-only must not drag torch (or any inference stack) into the process."""
-    heavy = ("torch", "torchaudio", "panns_inference", "onnxruntime", "transformers")
+    heavy = (
+        "torch",
+        "torchaudio",
+        "voxweave.vendor.panns_cnn14",
+        "onnxruntime",
+        "transformers",
+    )
     preloaded = {name for name in heavy if name in sys.modules}
     capture.capture_units(
         _args(

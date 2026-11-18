@@ -23,11 +23,10 @@ DEFAULT_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 DEFAULT_FUSION_WHISPER = "large-v3"
 DEFAULT_FUSION_QWEN = "Qwen/Qwen3-ASR-1.7B"
 # LLM behind `translate` / `correct` (any OpenAI-compatible chat-completions endpoint).
-# Always a concrete model name, never a "-latest" alias: OpenAI retired
-# gpt-5.3-chat-latest and both commands were broken out of the box until this
-# constant replaced it. "auto" resolves to the endpoint's only served model at run
-# time, for self-hosted servers (vLLM) whose served name drifts between restarts.
-DEFAULT_LLM_MODEL = "gpt-6-luna"
+# Always a concrete public model name, never a "-latest" alias. "auto" resolves to the
+# endpoint's only served model at run time, for self-hosted servers (vLLM) whose served
+# name drifts between restarts.
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
 DEFAULT_LLM_API_KEY_ENV = "OPENAI_API_KEY"
 LLM_MODEL_AUTO = "auto"
 # `translate` windowing for a self-hosted server: several bounded windows in flight
@@ -99,6 +98,13 @@ ASR_CACHE = str(CACHE_ROOT / "asr")  # Qwen ASR, faster-whisper
 ALIGN_CACHE = str(CACHE_ROOT / "align")  # Qwen aligner, en wav2vec2, ja MMS onnx
 AUDIO_CACHE = str(CACHE_ROOT / "audio")  # separator roformer, songdet PANNs
 
+
+def cache_root() -> Path:
+    """Active model cache root (honors dynamic ``VOXWEAVE_CACHE_ROOT`` overrides)."""
+    raw = (os.environ.get("VOXWEAVE_CACHE_ROOT") or "").strip()
+    return Path(raw).expanduser() if raw else CACHE_ROOT
+
+
 _TEMPLATE = """\
 # voxweave configuration  (~/.config/voxweave.conf)
 # Precedence: CLI options > environment variables > this file > built-in defaults.
@@ -142,7 +148,7 @@ _TEMPLATE = """\
 #   window_cues = cues per window when concurrency > 1 (= --window /
 #                 VOXWEAVE_TRANSLATE_WINDOW_CUES; default 100, min 1).
 [llm]
-# model = "gpt-6-luna"
+# model = "gpt-4o-mini"
 # base_url = "http://127.0.0.1:8000/v1"
 # api_key_env = "OPENAI_API_KEY"
 # reasoning_effort = "low"
@@ -254,9 +260,24 @@ _TEMPLATE = """\
 
 
 def config_path() -> Path:
-    """Config file path: ``VOXWEAVE_CONFIG`` env if set, else ``~/.config/voxweave.conf``."""
+    """Config file path.
+
+    Precedence:
+    1. ``VOXWEAVE_CONFIG`` env var if non-empty.
+    2. Existing ``~/.config/voxweave.conf`` (keeps pre-existing user setups intact).
+    3. ``$XDG_CONFIG_HOME/voxweave.conf`` if ``XDG_CONFIG_HOME`` is non-empty.
+    4. ``~/.config/voxweave.conf``.
+    """
     env = (os.environ.get("VOXWEAVE_CONFIG") or "").strip()
-    return Path(env).expanduser() if env else Path.home() / ".config" / "voxweave.conf"
+    if env:
+        return Path(env).expanduser()
+    home_default = Path.home() / ".config" / "voxweave.conf"
+    if home_default.exists():
+        return home_default
+    xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
+    if xdg:
+        return Path(xdg).expanduser() / "voxweave.conf"
+    return home_default
 
 
 # Recognized top-level keys; anything else in the file is a typo/stale setting.

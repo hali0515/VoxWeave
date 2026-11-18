@@ -1,6 +1,4 @@
 import logging
-import sys
-import types
 
 import numpy as np
 import pytest
@@ -33,114 +31,33 @@ def speech_flags(probs, **kwargs):
     return speech_flags_from_scores(*reduce_scores(probs), **kwargs)
 
 
-# A complete labels csv: header + one row per class (display names may hold quoted commas).
-LABELS_CSV = (
-    "index,mid,display_name\n"
-    + "".join(f'{i},/m/{i:05d},"Label {i}, x"\n' for i in range(songdet.PANNS_CLASSES))
-).encode()
+def test_panns_labels_returns_vendored_audioset_table():
+    from voxweave.vendor.panns_cnn14 import AUDIOSET_LABELS
+
+    labels = songdet.panns_labels()
+    assert len(labels) == songdet.PANNS_CLASSES == 527
+    assert labels == list(AUDIOSET_LABELS)
+    assert labels[0] == "Speech"
+    assert labels[27] == "Singing"
+    assert labels[137] == "Music"
 
 
-class _Resp:
-    def __init__(self, body: bytes):
-        self.body = body
+def test_vendored_panns_tagger_runs_with_synthetic_checkpoint(tmp_path):
+    import torch
 
-    def __enter__(self):
-        return self
+    from voxweave.vendor.panns_cnn14 import Cnn14, PannsTagger
 
-    def __exit__(self, *a):
-        return False
-
-    def read(self):
-        return self.body
-
-
-def _labels_env(monkeypatch, tmp_path, body=None):
-    """Home -> tmp_path, HF has no csv; urlopen serves ``body`` (None: must not be called).
-
-    Returns the list of urlopen calls (args, kwargs)."""
-    monkeypatch.setattr(songdet.Path, "home", staticmethod(lambda: tmp_path))
-
-    def _hf_fail(*a, **k):
-        raise RuntimeError("repo has no csv")
-
-    monkeypatch.setattr("huggingface_hub.hf_hub_download", _hf_fail)
-    calls = []
-
-    def _urlopen(*a, **k):
-        if body is None:
-            raise AssertionError("must not download when csv already present")
-        calls.append((a, k))
-        return _Resp(body)
-
-    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
-    return calls
-
-
-def test_ensure_panns_labels_noop_when_present(monkeypatch, tmp_path):
-    # complete CSV already at ~/panns_data -> no download attempted
-    _labels_env(monkeypatch, tmp_path)
-    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
-    dst.parent.mkdir(parents=True)
-    dst.write_bytes(LABELS_CSV)
-    songdet._ensure_panns_labels()  # should return immediately, no exception
-    assert dst.read_bytes() == LABELS_CSV
-
-
-def test_ensure_panns_labels_falls_back_to_url(monkeypatch, tmp_path):
-    # HF download fails -> urllib fetches the canonical csv (with a timeout) into ~/panns_data
-    calls = _labels_env(monkeypatch, tmp_path, LABELS_CSV)
-    songdet._ensure_panns_labels()
-    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
-    assert dst.read_bytes() == LABELS_CSV
-    assert calls and calls[0][1].get("timeout") == 30
-    # atomic write: no temp file left beside the csv
-    assert sorted(p.name for p in dst.parent.iterdir()) == [dst.name]
-
-
-@pytest.mark.parametrize(
-    "stale",
-    [b"", b"index,mid,display_name\n", b"<html>503</html>", LABELS_CSV[:-200]],
-)
-def test_ensure_panns_labels_refetches_invalid_file(monkeypatch, tmp_path, stale):
-    # empty / header-only / HTML / truncated leftovers are not trusted
-    _labels_env(monkeypatch, tmp_path, LABELS_CSV)
-    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
-    dst.parent.mkdir(parents=True)
-    dst.write_bytes(stale)
-    songdet._ensure_panns_labels()
-    assert dst.read_bytes() == LABELS_CSV
-
-
-def test_ensure_panns_labels_invalid_download_raises_actionable(monkeypatch, tmp_path):
-    # the URL serves an error page -> nothing written, error names path + URL
-    _labels_env(monkeypatch, tmp_path, b"<html>blocked</html>")
-    dst = tmp_path / "panns_data" / "class_labels_indices.csv"
-    with pytest.raises(RuntimeError, match="place it manually") as exc:
-        songdet._ensure_panns_labels()
-    assert str(dst) in str(exc.value) and songdet.PANNS_LABELS_URL in str(exc.value)
-    assert not dst.exists()
-
-
-def test_ensure_panns_labels_network_error_raises_actionable(monkeypatch, tmp_path):
-    _labels_env(monkeypatch, tmp_path, LABELS_CSV)
-
-    def _down(*a, **k):
-        raise TimeoutError("timed out")
-
-    monkeypatch.setattr("urllib.request.urlopen", _down)
-    with pytest.raises(RuntimeError, match="place it manually"):
-        songdet._ensure_panns_labels()
-
-
-def test_panns_labels_ensures_csv_before_import(monkeypatch):
-    # sdh reads the label names through this helper: csv first, then the import
-    order = []
-    monkeypatch.setattr(songdet, "_ensure_panns_labels", lambda: order.append("csv"))
-    panns = types.ModuleType("panns_inference")
-    panns.labels = ["Speech", "Explosion"]  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "panns_inference", panns)
-    assert songdet.panns_labels() == ["Speech", "Explosion"]
-    assert order == ["csv"]
+    ckpt = tmp_path / "synthetic_cnn14.pth"
+    net = Cnn14()
+    torch.save({"model": net.state_dict()}, ckpt)
+    tagger = PannsTagger(checkpoint_path=str(ckpt), device="cpu")
+    audio = np.zeros((2, songdet.SR * 2), dtype=np.float32)
+    probs, emb = tagger.inference(audio)
+    assert probs.shape == (2, 527)
+    assert emb.shape == (2, 2048)
+    assert probs.dtype == np.float32
+    assert emb.dtype == np.float32
+    assert np.all((probs >= 0.0) & (probs <= 1.0))
 
 
 def test_env_float_warns_and_falls_back(monkeypatch, caplog):
@@ -154,30 +71,16 @@ def test_env_float_warns_and_falls_back(monkeypatch, caplog):
 
 
 def _fake_audio_tagging(monkeypatch, device):
-    """Stand-in panns_inference.AudioTagging mimicking the real constructor: GPU only
-    for the exact string "cuda", setup print()ed to stdout. Returns the created models."""
+    """Stand-in PannsTagger recording constructor args without loading weights."""
     made = []
 
-    class _Net:
-        def __init__(self):
-            self.moved_to = None
-
-        def to(self, dev):
-            self.moved_to = dev
-            return self
-
-    class _AudioTagging:
-        def __init__(self, checkpoint_path=None, device="cuda"):
-            print(f"Checkpoint path: {checkpoint_path}")
-            self.device = "cuda" if device == "cuda" else "cpu"
-            self.model = _Net()
-            print("GPU number: 8" if self.device == "cuda" else "Using CPU.")
+    class _FakeTagger:
+        def __init__(self, checkpoint_path, device="cpu"):
+            self.checkpoint_path = checkpoint_path
+            self.device = device
             made.append(self)
 
-    panns = types.ModuleType("panns_inference")
-    panns.AudioTagging = _AudioTagging  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "panns_inference", panns)
-    monkeypatch.setattr(songdet, "_ensure_panns_labels", lambda: None)
+    monkeypatch.setattr("voxweave.vendor.panns_cnn14.PannsTagger", _FakeTagger)
     monkeypatch.setattr(songdet, "_resolve_panns_ckpt", lambda: "/fake/Cnn14.pth")
     monkeypatch.setattr(songdet, "_model", None)
     monkeypatch.setattr("voxweave.runtime.get_device", lambda: device)
@@ -194,10 +97,7 @@ def test_get_model_uses_runtime_device_without_dataparallel(
     made = _fake_audio_tagging(monkeypatch, resolved)
     m = songdet._get_model()
     assert made == [m]
-    # never the bare "cuda" that makes AudioTagging wrap DataParallel over every GPU
     assert m.device == expected
-    assert m.model.moved_to == (None if expected == "cpu" else expected)
-    # AudioTagging's setup prints never reach stdout (it carries only result paths)
     assert capsys.readouterr().out == ""
 
 
